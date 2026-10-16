@@ -10,7 +10,10 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupContext,
     maybe_create_mla_host_dedup_context,
 )
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -80,11 +83,13 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             end_layer=2,
             index_head_dim=8,
             quant_block_size=4,
+            page_size=2,
+            index_page_size=2,
+            skip_topk_layers=[False] * 2,
         )
         indexer_host = DSAIndexerPoolHost(
-            dsa_device_pool,
-            mla_host,
-            layout="page_first",
+            decl=make_dsa_indexer_pool_decl(dsa_device_pool),
+            anchor_host=mla_host,
             pin_memory=False,
             is_dummy=True,
         )
@@ -97,6 +102,54 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             indexer_host.load_to_device_per_layer(
                 dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
             )
+
+    def test_dummy_and_physical_hosts_share_capacity_geometry(self):
+        """Dedup peers must allocate identical IDs despite different host payloads."""
+        for dcp_size in (1, 2):
+            for host_size in (0, 0.000002):
+                with self.subTest(dcp_size=dcp_size, host_size=host_size):
+                    pool = _device_pool_stub(
+                        layer_num=2,
+                        store_dtype=torch.float16,
+                        kv_lora_rank=4,
+                        qk_rope_head_dim=2,
+                        size=8,
+                        host_capacity_tokens=16,
+                        start_layer=7,
+                        end_layer=9,
+                        device="cpu",
+                        kv_buffer=[torch.zeros(10, 1, 6) for _ in range(2)],
+                    )
+                    pool.data_ptrs = torch.tensor(
+                        [buffer.data_ptr() for buffer in pool.kv_buffer],
+                        dtype=torch.uint64,
+                    )
+                    kwargs = dict(
+                        host_to_device_ratio=2,
+                        host_size=host_size,
+                        page_size=4,
+                        layout="page_first",
+                        pin_memory=False,
+                        dcp_size=dcp_size,
+                    )
+                    host = MLATokenToKVPoolHost(pool, **kwargs)
+                    dummy = MLATokenToKVPoolHost(pool, **kwargs, is_dummy=True)
+                    self.addCleanup(host.destroy)
+                    self.addCleanup(dummy.destroy)
+                    self.assertEqual(
+                        (host.size, host.page_num, host.page_size, host.size_per_token),
+                        (
+                            dummy.size,
+                            dummy.page_num,
+                            dummy.page_size,
+                            dummy.size_per_token,
+                        ),
+                    )
+                    self.assertIsNone(dummy.kv_buffer)
+                    count = host.logical_size // 4 * 4
+                    self.assertEqual(
+                        host.alloc(count).tolist(), dummy.alloc(count).tolist()
+                    )
 
     def test_layer_broadcast_reuses_full_staging_capacity(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)

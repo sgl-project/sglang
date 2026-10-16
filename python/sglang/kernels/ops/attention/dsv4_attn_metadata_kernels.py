@@ -183,7 +183,9 @@ def _expand_prefill_causally_kernel(
 
     seq_len = tl.load(seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
     ext = tl.load(extend_seq_lens_ptr + r, mask=mask, other=0).to(tl.int32)
-    start_loc = tl.sum(tl.where(started, extend[None, :], 0).to(tl.int32), axis=1) - ext
+    # start_loc == start_locs[r]. `started` selects the contiguous prefix b <= r
+    # and start_locs is monotonic, so max-reduce over the selected cumsum yields start_locs[r].
+    start_loc = tl.max(tl.where(started, start_locs[None, :], -1), axis=1)
     causal = (seq_len - ext + 1) + (t - start_loc)
     causal = tl.where(is_real, causal, 1)
 
@@ -444,11 +446,12 @@ def late_layer_tail_layout(
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
     Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
+    absolute window floor). The floor is seq_len - tail_len, so a tail shorter
+    than tail_len reads rows the request wrote before this extend."""
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
@@ -462,7 +465,7 @@ def late_layer_tail_layout(
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
     return token_indices, tail_lens_cpu, floor
 
 

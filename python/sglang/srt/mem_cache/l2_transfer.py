@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from functools import cache
 from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -81,23 +83,63 @@ class L2TransferEngine:
             resolved = translate(indices)
         return resolved.to(original_device)
 
-    def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
-        start_event = self._start_event(None)
+    def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
+        prepared = []
+        for transfer in transfers:
+            host_indices, device_indices = transfer.host_pool.prepare_transfer_indices(
+                transfer.host_indices,
+                self._resolve_device_indices(transfer),
+                self.io_backend,
+            )
+            prepared.append(
+                transfer._replace(
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            )
+        return prepared
+
+    @contextmanager
+    def _submission(self, transfers, stream, transfer_key, start_event=None):
+        start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        with device_module.stream(self.device_to_host_stream):
-            start_event.wait(self.device_to_host_stream)
-            device_indices = [self._resolve_device_indices(t) for t in transfers]
-            ack_start.record()
-            for transfer, dev_idx in zip(transfers, device_indices):
-                transfer.host_pool.backup_from_device_all_layer(
+        completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
+        domains = shared_host_layout_domains(t.host_pool for t in transfers)
+        for domain in domains:
+            domain.acquire_layout()
+        finish_recorded = False
+        try:
+            with device_module.stream(stream):
+                # Index preparation can read producer-owned device indices.
+                start_event.wait(stream)
+                prepared = self._prepare_transfers(transfers)
+                ack_start.record()
+                yield prepared, completion
+                ack_finish.record()
+                finish_recorded = True
+                self._record_stream(transfers + prepared, stream)
+        except Exception:
+            stream.synchronize()
+            raise
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout(
+                    ack_finish if finish_recorded else None,
+                    (id(self), transfer_key),
+                )
+
+    def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        with self._submission(
+            transfers, self.device_to_host_stream, "device_to_host"
+        ) as (transfers, completion):
+            for transfer in transfers:
+                transfer.host_pool.backup_from_device_all_layer_physical(
                     transfer.device_pool,
                     transfer.host_indices,
-                    dev_idx,
+                    transfer.device_indices,
                     self.io_backend,
                 )
-            ack_finish.record()
-            self._record_stream(transfers, self.device_to_host_stream, device_indices)
-        return TransferCompletion(ack_start, ack_finish, timing_enabled)
+        return completion
 
     def submit_host_to_device(
         self,
@@ -107,15 +149,12 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
-        start_event = self._start_event(start_event)
-        ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        primary = transfers[0] if transfers else None
-        with device_module.stream(self.host_to_device_stream):
-            start_event.wait(self.host_to_device_stream)
-            device_indices = [self._resolve_device_indices(t) for t in transfers]
-            ack_start.record()
+        with self._submission(
+            transfers, self.host_to_device_stream, "host_to_device", start_event
+        ) as (transfers, completion):
+            primary = transfers[0] if transfers else None
             for layer_id in range(transfer_layer_id_max):
-                for transfer, dev_idx in zip(transfers, device_indices):
+                for transfer in transfers:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
                         if transfer.layer_mapper is not None
@@ -127,19 +166,17 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
-                    transfer.host_pool.load_to_device_per_layer(
+                    transfer.host_pool.load_to_device_per_layer_physical(
                         transfer.device_pool,
                         transfer.host_indices,
-                        dev_idx,
+                        transfer.device_indices,
                         local_layer_id,
                         self.io_backend,
                         is_draft=transfer.is_draft,
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
-            ack_finish.record()
-            self._record_stream(transfers, self.host_to_device_stream, device_indices)
-        return TransferCompletion(ack_start, ack_finish, timing_enabled)
+        return completion
 
     @staticmethod
     def _start_event(start_event):

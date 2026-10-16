@@ -51,6 +51,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from ctypes import byref
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -69,7 +70,6 @@ from typing import (
     Generic,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -101,13 +101,16 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_exec,
     get_flags,
     get_model,
     get_parallel,
     get_platform,
+    get_serving,
     get_spec,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -222,16 +225,18 @@ def is_cpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return True
 
 
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
-    return torch.backends.mps.is_available()
+    return hasattr(torch, "mps") and torch.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -307,6 +312,11 @@ is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version,
         device_capability_majors=[10, 11],
         cuda_version=(12, 8),
+    )
+)
+is_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
     )
 )
 is_sm80_supported = lru_cache(maxsize=1)(
@@ -531,9 +541,26 @@ def get_available_gpu_memory(
             # available due to not including cache memory. So we use the system available
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
-        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+        else:
+            free_gpu_memory, _ = torch.musa.mem_get_info(gpu_id)
     elif device == "mps":
-        free_gpu_memory = psutil.virtual_memory().available
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        num_gpus = torch.mps.device_count()
+        assert gpu_id < num_gpus
+
+        if use_mlx():
+            # Torch's allocator does not track MLX Metal allocations.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            if empty_cache:
+                empty_device_cache(torch.mps)
+            # Bound free memory by host RAM and Metal's working-set limit.
+            total_gpu_memory = torch.mps.recommended_max_memory()
+            metal_headroom = max(
+                0, total_gpu_memory - torch.mps.driver_allocated_memory()
+            )
+            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -556,16 +583,43 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
+def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """A host list on ``device``; staged in pinned memory so the copy is enqueued
+    on the current stream instead of synchronizing like a pageable copy."""
+    pin = is_pin_memory_available(device)
+    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+
+
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
-    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
-    if not tensor.is_cuda:
-        return tensor.to("cpu", non_blocking=True)
+    """Enqueue an accelerator-to-pinned-host copy on the current stream."""
+    if tensor.device.type == "cpu":
+        return tensor
+    if not is_pin_memory_available(tensor.device):
+        return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
-    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
     return host
 
 
@@ -593,7 +647,12 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
-    return torch.get_device_module()
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):
@@ -610,11 +669,12 @@ def device_stream_context(stream):
 
 def is_device_stream_capturing(device: torch.device) -> bool:
     """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
-    # Every platform answering support_cuda_graph() already calls
-    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
-    if device.type != current_platform.device_type:
+    # Every platform declaring capabilities.graph_capture calls
+    # device_module.is_current_stream_capturing() during capture, except CPU,
+    # whose graph runner compiles instead of capturing a stream.
+    if device.type != current_platform.device_type or device.type == "cpu":
         return False
-    if not current_platform.support_cuda_graph():
+    if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
 
@@ -860,6 +920,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    # Metal's working-set limit is smaller than unified system RAM.
+    try:
+        if torch.mps.is_available():
+            return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -912,6 +982,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -930,6 +1002,9 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        return torch.backends.mps.get_name()
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -1030,6 +1105,12 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        try:
+            return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -1093,6 +1174,10 @@ def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        # MPS has no SGLang graph runner.
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -1272,15 +1357,6 @@ def get_current_device_stream_fast():
 # ==============================================================================
 
 
-class Range(NamedTuple):
-    start: int
-    end: int
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
-
-
 def assert_int64_array(values: array, name: str) -> None:
     """Require a signed int64 array suitable for zero-copy tensor views."""
     assert (
@@ -1383,7 +1459,10 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return current_platform.capabilities.supports_triton and backend not in [
+        "torch_native",
+        "intel_amx",
+    ]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -1506,10 +1585,27 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    The local layers are built inside one layer stack, so layers that declare
+    stage boundaries connect in order without naming their neighbours. Across
+    a pipeline stage boundary the stack learns the neighbouring stage from
+    ``stage_facts``: the model's shared declaration function, which returns
+    the stages the layer at a global index declares without building it (an
+    empty sequence when it declares none), and which the layer itself uses
+    for its own declarations. A model whose layers declare stages must give
+    it to run under pipeline parallelism. ``final_read`` is the stack's
+    terminal read when it is not a plain final norm (see layer_stack).
+    """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.layer_boundary.factories import (
+        check_declared_stages,
+        layer_stack,
+    )
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1523,23 +1619,78 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
+
+    def neighbour(idx):
+        if stage_facts is not None:
+            return functools.partial(stage_facts, idx)
+        return functools.partial(_no_stage_facts, layer_fn)
+
+    def build(stack, idx):
+        appended = len(stack.appends)
+        layer = layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+        if stage_facts is not None and (pp_size or 1) > 1:
+            # Another rank binds this layer's stages from stage_facts alone.
+            check_declared_stages(stack, appended, stage_facts(idx), f"layer {idx}")
+        return layer
+
+    with layer_stack(
+        previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
+        next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+        final_read=final_read,
+    ) as stack:
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+            + get_offloader().wrap_modules(
+                (build(stack, idx) for idx in range(start_layer, end_layer)),
+                **(offloader_kwargs or {}),
+            )
+            + [
+                PPMissingLayer(return_tuple=return_tuple)
+                for _ in range(end_layer, num_hidden_layers)
+            ]
         )
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
+
+
+def make_pp_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    return_tuple: bool = False,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
+) -> Tuple[torch.nn.Module, int, int]:
+    """Make this pipeline stage's layers, and return them with the stage's range.
+
+    Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    ``stage_facts`` is the model's shared declaration function (see make_layers).
+    """
+    parallel = get_parallel()
+    return make_layers(
+        num_hidden_layers,
+        layer_fn,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        prefix=prefix,
+        return_tuple=return_tuple,
+        offloader_kwargs=offloader_kwargs,
+        final_read=final_read,
+        stage_facts=stage_facts,
+    )
+
+
+def _no_stage_facts(layer_fn: LayerFn) -> None:
+    """Stands in for the shared declaration function of a model that gives
+    none: called only if this pipeline rank's layers declare stages."""
+    module = getattr(getattr(layer_fn, "func", layer_fn), "__module__", None)
+    raise ValueError(
+        f"{module} declares stage boundaries under pipeline parallelism "
+        "without a shared declaration function: give make_layers its "
+        "stage_facts, the stages a layer declares without building it"
+    )
 
 
 def set_random_seed(seed: int) -> None:
@@ -1950,7 +2101,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -1959,7 +2110,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except OSError as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2262,16 +2413,7 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 
 def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
-    """
-    Check if a package is installed and meets the minimum version requirement.
-
-    Args:
-        pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.18")
-
-    Returns:
-        True if package is installed and version >= min_version, False otherwise
-    """
+    """Check if a package is installed and meets the minimum version requirement."""
     if _should_skip_kernel_pkg_version_check(pkg):
         return True
 
@@ -3157,6 +3299,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
@@ -3516,15 +3659,54 @@ def _configure_uvicorn_access_log_filter(
             filters_list.append(filter_name)
 
 
+def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Build server metadata shared by HTTP and native gRPC.
+
+    Callers add transport-specific fields and serialize the result.
+    """
+    result = server_args.resolved_dict()
+    result["launch_command"] = server_args.launch_command
+    result.update(scheduler_info)
+    result["kv_events"] = describe_kv_events_publisher(server_args)
+    return result
+
+
+def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
+    """Expose GetServerInfo only, without constructing a TokenizerManager.
+
+    The snapshot is taken after scheduler readiness. This does not launch a
+    sidecar or enable inference/control RPCs.
+    """
+    serving = get_serving()
+    if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
+        return None
+
+    from sglang.srt.rust_extensions import load_rust_extension
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
+    return grpc_native.start_metadata_server(
+        host=serving.host,
+        port=serving.grpc_port,
+        server_info_json=json.dumps(
+            msgspec_to_builtins(
+                redact_watermark_secrets(build_server_info(server_args, scheduler_info))
+            ),
+            default=str,
+        ),
+    )
+
+
 def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
     from sglang.srt.utils.network import NetworkAddress
 
-    app = FastAPI()
+    app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
     @app.get("/ping")
     async def ping():
@@ -3958,15 +4140,22 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
 
-    # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
+
+    # elastic-EP scale-up widens num_dp_ranks on the published config
+    if get_parallel().attn_dp_enabled:
+        assert get_parallel().num_dp_ranks > 1, (
+            "attention DP needs more than one DP rank"
+        )
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3980,10 +4169,10 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif moe_a2a_backend.is_none():
             return True
-        elif get_moe_a2a_backend().is_flashinfer():
-            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
+            # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
             # replay different-sized graphs -> geometry mismatch -> illegal memory
@@ -3992,9 +4181,12 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
-            "SGLANG_MORI_RECV_BOUND", "false"
-        ):
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
+        elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
             # fan-in depends on what the *peers* send. Without a DP-synchronized
@@ -4008,7 +4200,7 @@ def require_mlp_tp_gather():
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > get_parallel().tp_size // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().num_dp_ranks
             )
     else:
         return False
@@ -4032,8 +4224,8 @@ def require_attn_tp_gather():
         not get_moe_a2a_backend().is_none()
         or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < get_parallel().tp_size
+        if get_parallel().attn_dp_enabled:
+            return get_parallel().num_dp_ranks < get_parallel().tp_size
         else:
             return True
     else:
@@ -4046,16 +4238,21 @@ def require_gathered_buffer():
 
 def require_mlp_sync():
 
-    return get_parallel().enable_dp_attention or require_gathered_buffer()
+    return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment() -> int:
+def get_cuda_graph_batch_size_alignment(
+    *, gathered_buffer_required: Optional[bool] = None
+) -> int:
+    if gathered_buffer_required is None:
+        gathered_buffer_required = require_gathered_buffer()
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer():
+    if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
-    if alignment % get_parallel().attn_cp_size != 0:
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
@@ -4083,12 +4280,12 @@ def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optiona
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
+    # A branch or tag name (default "main") maps to a commit through refs/;
+    # snapshots/ is keyed by commit only.
+    ref_path = os.path.join(cache_path, "refs", revision or "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as f:
+            revision = f.read().strip()
 
     # List files from revision directory
     if revision:
@@ -4704,7 +4901,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's checkpoint(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,
@@ -4955,6 +5152,59 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``SGLANG_FORCE_CONFIDENTIAL_COMPUTE``.
+    """
+    forced = envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.get()
+    if forced is not None:
+        return forced
+    if not is_cuda():
+        return False
+
+    try:
+        import pynvml
+    except ImportError:
+        logger.warning("pynvml not available; assuming Confidential Computing is off")
+        return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except pynvml.NVMLError:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 def init_cublas():
