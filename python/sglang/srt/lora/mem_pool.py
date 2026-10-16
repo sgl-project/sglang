@@ -39,6 +39,7 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
+    lora_adapts_routed_experts,
     shared_experts_count,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -673,7 +674,9 @@ class LoRAMemoryPool:
             has_shared_experts = (
                 getattr(cfg, "shared_expert_intermediate_size", 0) or 0
             ) > 0 or (shared_experts_count(cfg) or 0) > 0
-            has_moe = self._has_moe_module(base_model)
+            has_moe = self._has_moe_module(base_model) and lora_adapts_routed_experts(
+                base_model
+            )
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
             target_modules = target_modules - set(EMBEDDING_NAMES)
