@@ -104,7 +104,7 @@ class GluonFAv3Backend(AttentionBackend):
 
 
 class GluonFAv3Impl(AttentionImpl):
-    """Dense BF16 D128 MHA on gfx1250, with AITER as the safe fallback."""
+    """Dense BF16/FP16 D64/D128/D256 MHA on gfx1250, with AITER fallback."""
 
     def __init__(
         self,
@@ -141,7 +141,7 @@ class GluonFAv3Impl(AttentionImpl):
             return "causal attention"
         if self.dropout_p != 0.0:
             return "nonzero dropout"
-        if self.head_size != 128:
+        if self.head_size not in (64, 128, 256):
             return f"head_size={self.head_size}"
         if self.num_kv_heads != self.num_heads:
             return (
@@ -150,7 +150,7 @@ class GluonFAv3Impl(AttentionImpl):
             )
         if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
             return "non-BSHD tensors"
-        if query.dtype != torch.bfloat16:
+        if query.dtype not in (torch.bfloat16, torch.float16):
             return f"dtype={query.dtype}"
         if key.dtype != query.dtype or value.dtype != query.dtype:
             return "mismatched Q/K/V dtypes"
