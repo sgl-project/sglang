@@ -277,7 +277,8 @@ def _status_runtime(metrics=None):
         server_args=SimpleNamespace(
             model_path="z.safetensors",
             pipeline_class_name="ZImagePipeline",
-            **{k: 1 for k in _STATUS_FIELDS},
+            **{field: 1 for field in _STATUS_FIELDS.values()},
+            dit_layerwise_offload=False,
         )
     )
     if metrics is None:
@@ -292,7 +293,12 @@ def _status_runtime(metrics=None):
                 peak_reserved_mb=4000.0,
             ),
         )
-    runtime.executor = SimpleNamespace(last_metrics=metrics)
+    runtime.executor = SimpleNamespace(
+        last_metrics=metrics,
+        enable_cache_dit=True,
+        enable_spectrum=False,
+        cache_dit_params={"max_warmup_steps": 2},
+    )
     runtime._worker_processes = lambda: [SimpleNamespace(pid=7, is_alive=lambda: True)]
     runtime._is_live = lambda: False
     return runtime
@@ -302,7 +308,11 @@ def test_status_text_reads_server_args_and_request_metrics() -> None:
     text = _status_runtime().status_text()
     assert "pipeline=ZImagePipeline" in text
     assert "NOT live pids=[7]" in text
+    assert "loader settings (fixed until the worker restarts)" in text
     assert "tp_size=1" in text
+    assert "execution_mode=eager memory_mode=resident" in text
+    assert "per-run settings (apply to the next request): cache_mode=cache_dit" in text
+    assert "max_warmup_steps" in text
     assert "last DiT call: 123.4 ms" in text
     assert "peak allocated 3000 MiB, peak reserved 4000 MiB" in text
 
@@ -311,6 +321,8 @@ def test_status_text_before_first_call_and_without_worker() -> None:
     runtime = _status_runtime()
     runtime.executor.last_metrics = None
     assert "last DiT call: none yet" in runtime.status_text()
+    runtime.executor.enable_cache_dit = None
+    assert "cache_mode=worker default" in runtime.status_text()
     assert "not started" in SGLDiffusionGenerator().status_text()
 
 

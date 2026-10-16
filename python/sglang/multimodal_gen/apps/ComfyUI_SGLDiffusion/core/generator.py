@@ -268,20 +268,35 @@ _EXECUTOR_CLASSES = _load_executor_classes()
 
 _SHARED = None
 _ATEXIT_REGISTERED = False
-# ServerArgs fields shown by SGLDWorkerStatus.
-_STATUS_FIELDS = (
-    "num_gpus",
-    "tp_size",
-    "sp_degree",
-    "ulysses_degree",
-    "ring_degree",
-    "dp_size",
-    "enable_cfg_parallel",
-    "attention_backend",
-    "dit_cpu_offload",
-    "dit_layerwise_offload",
-    "component_quantizations",
-)
+# SGLDOptions name -> ServerArgs field, read when the worker starts.
+_STATUS_FIELDS = {
+    "num_gpus": "num_gpus",
+    "tp_size": "tp_size",
+    "ulysses_degree": "ulysses_degree",
+    "ring_degree": "ring_degree",
+    "attention_backend": "attention_backend",
+    "quantization": "quantization",
+    "resident_layers": "dit_layerwise_resident_layers",
+    "prefetch_layers": "dit_offload_prefetch_size",
+}
+
+
+def _execution_mode(args) -> str:
+    if getattr(args, "enable_torch_compile", False):
+        return "torch_compile"
+    if getattr(args, "enable_breakable_cuda_graph", False):
+        return "cuda_graph"
+    return "eager"
+
+
+def _cache_mode(executor) -> str:
+    """The cache_mode the next request will use, as set by SGLDOptions."""
+    if getattr(executor, "enable_spectrum", False):
+        return "spectrum"
+    cache_dit = getattr(executor, "enable_cache_dit", None)
+    if cache_dit is None:
+        return "worker default"
+    return "cache_dit" if cache_dit else "off"
 
 
 class SGLDiffusionGenerator:
@@ -412,13 +427,33 @@ class SGLDiffusionGenerator:
         import sglang
 
         args = self.generator.server_args
+        executor = self.executor
         pids = [proc.pid for proc in self._worker_processes()]
+        loader = {
+            name: getattr(args, field, None) for name, field in _STATUS_FIELDS.items()
+        }
+        loader["execution_mode"] = _execution_mode(args)
+        loader["memory_mode"] = (
+            "layerwise_offload"
+            if getattr(args, "dit_layerwise_offload", False)
+            else "resident"
+        )
         lines = [
             f"model: {args.model_path} pipeline={args.pipeline_class_name}",
             f"worker: {'live' if self._is_live() else 'NOT live'} pids={pids}",
-            " ".join(f"{name}={getattr(args, name)}" for name in _STATUS_FIELDS),
+            "loader settings (fixed until the worker restarts): "
+            + " ".join(f"{k}={v}" for k, v in loader.items()),
         ]
-        metrics = self.executor.last_metrics if self.executor is not None else None
+        if executor is None:
+            lines.append("per-run settings: no executor")
+        else:
+            params = getattr(executor, "cache_dit_params", None)
+            lines.append(
+                f"per-run settings (apply to the next request): "
+                f"cache_mode={_cache_mode(executor)}"
+                + (f" cache_dit_params={params}" if params else "")
+            )
+        metrics = getattr(executor, "last_metrics", None)
         if metrics is None:
             lines.append("last DiT call: none yet")
         else:
