@@ -184,6 +184,7 @@ from sglang.srt.utils import (
     build_server_info,
     delete_directory,
     get_bool_env_var,
+    init_http_request_metrics,
     is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,
@@ -292,16 +293,21 @@ async def lifespan(fast_api_app: FastAPI):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
         thread_label = "Tokenizer"
+        tokenizer_worker_id = None
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
         warmup_thread_kwargs = dict(server_args=server_args)
-        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+        tokenizer_worker_id = _global_state.tokenizer_manager.worker_id
+        thread_label = f"MultiTokenizer-{tokenizer_worker_id}"
 
     # Add prometheus middleware
     if get_observability().enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
+        init_http_request_metrics(
+            worker_id=None if tokenizer_worker_id is None else str(tokenizer_worker_id)
+        )
 
     # Init tracing
     if get_observability().enable_trace:
@@ -498,6 +504,12 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     )
 
     app.add_middleware(RequestDecompressionMiddleware)
+
+# Registered while this module is imported, so that every tokenizer worker
+# process gets it. With --tokenizer-worker-num > 1 uvicorn spawns workers that
+# re-import this module; a middleware added afterwards in the parent process
+# never reaches the app those workers actually serve.
+add_prometheus_track_response_middleware(app)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -2647,9 +2659,6 @@ def _setup_and_run_http_server(
     # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
-
-    if get_observability().enable_metrics:
-        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
