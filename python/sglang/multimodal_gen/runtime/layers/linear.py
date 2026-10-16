@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/linear.py
 
+import functools
 from abc import abstractmethod
 
 import torch
@@ -34,10 +35,19 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     RowvLLMParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER_GFX1250
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+
+if USE_AITER_GFX1250:
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+        gemm_a16w16 as _aiter_gemm_a16w16,
+    )
+    from aiter.ops.triton.utils.gemm_config_utils import (
+        get_gemm_config as _aiter_get_gemm_config,
+    )
 
 logger = init_logger(__name__)
 
@@ -144,10 +154,44 @@ def apply_unquantized_linear(
             None if bias is None else bias.to(torch.float32),
         ).to(x.dtype)
 
+    if USE_AITER_GFX1250 and _can_use_aiter_gemm(x, weight, bias):
+        out = _aiter_gemm_a16w16(
+            x.reshape(-1, x.shape[-1]), weight, bias=bias, dtype=x.dtype
+        )
+        return out.view(*x.shape[:-1], weight.shape[0])
+
     return (
         F.linear(x, weight, bias)
         if IS_AMP_SUPPORTED or bias is None
         else F.linear(x, weight, bias.to(x.dtype))
+    )
+
+
+@functools.cache
+def _aiter_gemm_is_tuned_cached(n: int, k: int) -> bool:
+    # aiter's untuned gfx1250 default runs ~3x slower than hipBLASLt/inductor
+    # on large-M shapes, so only route (N, K) that have a tuned config covering
+    # large M; the probe M is arbitrary above the largest tuned bucket.
+    _, is_tuned = _aiter_get_gemm_config("GEMM-A16W16", 1 << 20, n, k)
+    return is_tuned
+
+
+# Dynamo cannot trace the config file lookup, and ignores this marker on a
+# functools.cache wrapper, hence the separate plain function.
+@torch.compiler.assume_constant_result
+def _aiter_gemm_is_tuned(n: int, k: int) -> bool:
+    return _aiter_gemm_is_tuned_cached(n, k)
+
+
+def _can_use_aiter_gemm(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> bool:
+    return (
+        x.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == x.dtype
+        and weight.dim() == 2
+        and (bias is None or bias.dtype == x.dtype)
+        and _aiter_gemm_is_tuned(weight.shape[0], weight.shape[1])
     )
 
 
