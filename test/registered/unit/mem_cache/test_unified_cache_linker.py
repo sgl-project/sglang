@@ -22,7 +22,6 @@ from test_unified_radix_cache_unittest import (
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -447,6 +446,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         )
         # The store already holds the whole node: it is published without a write.
         self.assertEqual(consumer_linker.offload_calls, [])
+        self.assertEqual(consumer.linker.loaded_pages, {})
         self.assertTrue(
             consumer.tree_core.is_external_cache_stored(final_match.last_device_node)
         )
@@ -474,27 +474,6 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         self.assertTrue(consumer.tree_core.is_external_cache_stored(node))
-        consumer.sanity_check()
-
-    def test_insert_forgets_loaded_pages(self):
-        tokens = list(range(1, 9))
-        consumer, consumer_allocator, consumer_req_pool, consumer_linker = (
-            self._load_from_producer(defaultdict(set), tokens, loaded_len=8)
-        )
-        self.assertEqual(consumer_linker.offload_calls, [])
-        self.assertEqual(consumer.linker.loaded_pages, {})
-        page_hashes = consumer.tree_core.get_hash_values(
-            consumer.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", tokens)))
-            ).last_device_node
-        )
-
-        # A recompute after eviction no longer knows the pages were loaded.
-        consumer.evict(EvictParams(num_tokens=len(tokens)))
-        self._insert(consumer, consumer_allocator, consumer_req_pool, tokens)
-        self.assertEqual(len(consumer_linker.offload_calls), 1)
-        (kv_offload,) = consumer_linker.offload_calls[0]
-        self.assertEqual(kv_offload.keys, page_hashes)
         consumer.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
@@ -1034,28 +1013,10 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
 def test_linker_lifecycle_releases_private_index_references(operation):
     wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
     wrapper.private_load_indices["rid"] = torch.arange(4)
-    wrapper.loaded_pages["landed"] = _LoadedPages(4, frozenset({"h0"}))
 
     getattr(wrapper, operation)()
 
     assert wrapper.private_load_indices == {}
-    assert wrapper.loaded_pages == {}
-
-
-def test_loaded_pages_live_until_the_insert_covers_them():
-    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
-    pages = _LoadedPages(8, frozenset({"h0", "h1"}))
-    wrapper.loaded_pages["rid"] = pages
-
-    wrapper.on_request_inserted("rid", 6)  # e.g. floored to a component boundary
-    assert wrapper.loaded_pages == {"rid": pages}
-    wrapper.on_request_inserted("rid", 8)
-    assert wrapper.loaded_pages == {}
-
-    for release in (wrapper.on_request_released, wrapper.release_request):
-        wrapper.loaded_pages["rid"] = pages
-        release("rid")
-        assert wrapper.loaded_pages == {}
 
 
 def test_release_request_cancels_queued_load():

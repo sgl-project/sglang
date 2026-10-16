@@ -202,7 +202,6 @@ class ExternalCacheHitMarker(NamedTuple):
 
 
 class _LoadedPages(NamedTuple):
-    # Key length the request covers once these pages are in the tree.
     end: int
     hashes: frozenset[str]
 
@@ -250,9 +249,7 @@ class UnifiedCacheLinkerWrapper:
         # Loaded tails stay outside the tree until their forward completes.
         self.private_load_indices: dict[str, torch.Tensor] = {}
         self.private_load_pages: dict[str, _LoadedPages] = {}
-        # Landed tails not yet inserted: their pages are in the store, so the
-        # write-through of the insert skips them. Changed only at rank-agreed
-        # points (load verdict, insert, release, reset).
+        # Landed tails not yet inserted; write-through skips their pages.
         self.loaded_pages: dict[str, _LoadedPages] = {}
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
@@ -495,8 +492,7 @@ class UnifiedCacheLinkerWrapper:
                     self._publish_stored_node(node_id)
 
     def _drop_loaded_pages(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
-        """Drop the leading KV pages a landed tail loaded; the pools indexed by
-        the KV transfer follow it. Empty when the node has nothing left to write."""
+        """Drop the leading KV pages a landed tail loaded; empty if nothing is left."""
         kv_index = next(
             (i for i, t in enumerate(transfers) if t.name == PoolName.KV), None
         )
@@ -511,8 +507,7 @@ class UnifiedCacheLinkerWrapper:
         if stored == 0:
             return transfers
         if stored == len(kv.keys):
-            # Other pools (an SWA window) still need writing, and an offload
-            # cannot omit KV, so the node goes out unchanged.
+            # An offload cannot omit KV, so other pools keep the node whole.
             return [] if len(transfers) == 1 else transfers
         trimmed = replace(
             kv,
@@ -522,7 +517,6 @@ class UnifiedCacheLinkerWrapper:
         return [*transfers[:kv_index], trimmed, *transfers[kv_index + 1 :]]
 
     def _publish_stored_node(self, node_id: NodeId) -> None:
-        """Record a node the store already holds as stored, without a write."""
         tree_core = self.cache.tree_core
         tree_core.mark_external_linker_offload_pending(node_id)
         tree_core.finish_external_linker_offload([node_id], node_id, True)
@@ -643,8 +637,6 @@ class UnifiedCacheLinkerWrapper:
         self.loaded_pages.pop(rid, None)
 
     def on_request_inserted(self, rid: str, inserted_len: int) -> None:
-        """Forget a landed tail once the request's insert covers it; the insert
-        has already decided the write-through of its pages."""
         pages = self.loaded_pages.get(rid)
         if pages is not None and inserted_len >= pages.end:
             del self.loaded_pages[rid]
