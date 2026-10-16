@@ -50,7 +50,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
-        "extra_key",
         "http_worker_ipc",
         "image_max_dynamic_patch",
         "images_config",
@@ -63,13 +62,13 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "max_thinking_tokens",
         "min_dynamic_patch",
         "mm_content_hashes",
+        "mm_processor_kwargs",
         "modalities",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
         "num_items_assigned",
         "positional_embed_overrides",
-        "priority",
         "received_time",
         "require_reasoning",
         "return_bytes",
@@ -226,6 +225,8 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens",
                 "finish_reason",
                 "e2e_latency",
+                "cached_tokens",
+                "reasoning_tokens",
             ],
         )
         self.assertEqual(
@@ -245,7 +246,10 @@ class TestResponseParity(CustomTestCase):
             list(GenerateMetaInfo.__struct_fields__)[:4],
             ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
         )
-        self.assertEqual(list(GenerateMetaInfo.__struct_fields__)[-1], "e2e_latency")
+        self.assertEqual(
+            list(GenerateMetaInfo.__struct_fields__)[-3:],
+            ["e2e_latency", "cached_tokens", "reasoning_tokens"],
+        )
 
 
 if __name__ == "__main__":
