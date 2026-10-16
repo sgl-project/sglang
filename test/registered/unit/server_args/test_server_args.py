@@ -83,6 +83,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
+    validate_device_lora_backend,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
@@ -98,6 +99,7 @@ from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
 )
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -4056,6 +4058,24 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep")
         check_two_batch_overlap(args)
+
+
+class TestIntelXpuLoRABackend(CustomTestCase):
+    def test_registered_backend_is_selectable_from_cli(self):
+        self.assertIn("intel_xpu", LORA_SUPPORTED_BACKENDS)
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "dummy-model", "--lora-backend", "intel_xpu"]
+        )
+        self.assertEqual(args.lora_backend, "intel_xpu")
+
+    def test_rejected_off_xpu(self):
+        with self.assertRaisesRegex(ValueError, "requires --device xpu"):
+            validate_device_lora_backend(lora_backend="intel_xpu", device="cuda")
+
+    def test_accepted_on_xpu(self):
+        validate_device_lora_backend(lora_backend="intel_xpu", device="xpu")
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):

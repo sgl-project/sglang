@@ -353,6 +353,7 @@ def check_server_args(server_args: Any):
         raise ValueError("Communications quantization is only supported for NPU device")
 
     validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+    validate_device_lora_backend(cfg.lora_backend, cfg.device)
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
@@ -483,6 +484,15 @@ def validate_device_sampling_backend(
     if sampling_backend == "intel_xpu" and device != "xpu":
         raise ValueError(
             f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
+
+
+def validate_device_lora_backend(lora_backend: str, device: str) -> None:
+    # The intel_xpu LoRA kernels ship only in sgl-kernel-xpu; on another device the
+    # backend import fails late, inside LoRAManager init.
+    if lora_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--lora-backend intel_xpu requires --device xpu, got --device {device}"
         )
 
 
