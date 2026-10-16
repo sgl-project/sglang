@@ -846,9 +846,18 @@ class DeepSeekV4UnifiedKVPool:
 
     - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
+
+    Ratios 1 / 2 (DeepSeek-V4.1) share one compressed region across a kv_source
+    group, and every layer of the group still owns its SWA ring. The readers take
+    one tensor plus row indices, so a group is one allocation
+    ``[ring(member 0) | ring(member 1) | ... | ring(member G-1) | compressed]``
+    and member ``j`` sees the view starting at its own ring: its SWA rows keep the
+    shared ``[0, swa_pages)`` indexing and its compressed rows start at
+    ``compress_row_base[j] = (G - j) * swa_pages``.
     """
 
-    K_PER_BLOCK = {0: 0, 4: 32, 128: 1}
+    # Compressed rows per 128-token block (num_blocks is the c128 size).
+    K_PER_BLOCK = {0: 0, 1: 128, 2: 64, 4: 32, 128: 1}
 
     def __init__(
         self,
@@ -864,7 +873,10 @@ class DeepSeekV4UnifiedKVPool:
         custom_mem_pool,
         swa_ring_size: int,
         fp8: bool = False,
+        group_of: Optional[List[Optional[int]]] = None,
     ):
+        """``group_of[i]`` is the local index of the kv_source layer whose
+        compressed region local layer ``i`` reads (ratios 1 / 2), else None."""
         self.swa_ring_size = swa_ring_size
         self.fp8 = fp8
         self.rope_head_dim = qk_rope_head_dim
@@ -875,50 +887,76 @@ class DeepSeekV4UnifiedKVPool:
         self.page_size = page_size
         self.k_per_block = dict(self.K_PER_BLOCK)
 
-        bufs = []
-        rope_bufs = []
+        if group_of is None:
+            group_of = [None] * len(stage_ratios)
+        assert len(group_of) == len(stage_ratios)
+        # members of each kv_source group, source first (it is the lowest layer)
+        groups: dict = {}
+        for i, src in enumerate(group_of):
+            if src is not None:
+                assert (
+                    stage_ratios[i] in (1, 2) and stage_ratios[src] == stage_ratios[i]
+                )
+                groups.setdefault(src, []).append(i)
+        for src, members in groups.items():
+            assert members[0] == src, f"group {src} does not start at its source"
+
+        def alloc(rows: int):
+            if self.fp8:
+                nope = torch.zeros(
+                    rows,
+                    DSV4_FP8_NOPE_ROW_BYTES,
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                rope = torch.zeros(
+                    rows, self.rope_head_dim, dtype=torch.bfloat16, device=device
+                )
+                return nope, rope
+            return (
+                torch.zeros(rows, self.head_dim, dtype=torch.bfloat16, device=device),
+                None,
+            )
+
+        def padded_compress_rows(ratio: int) -> int:
+            # Pad by one extra page. The KV pool reserves a null slot
+            # (token indices run 1..size).
+            compress_rows = self.num_blocks * self.k_per_block[ratio]
+            rows_per_page = self.page_size // ratio if ratio else 0
+            return compress_rows + rows_per_page
+
+        bufs: List[Optional[torch.Tensor]] = [None] * len(stage_ratios)
+        rope_bufs: List[Optional[torch.Tensor]] = [None] * len(stage_ratios)
+        # Row where layer i's compressed region starts, in its own view.
+        self.compress_row_base: List[int] = [self.swa_pages] * len(stage_ratios)
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(custom_mem_pool)
                 if custom_mem_pool
                 else nullcontext()
             ):
-                for ratio in stage_ratios:
-                    # Pad by one extra page. The KV pool reserves a null slot
-                    # (token indices run 1..size).
-                    compress_rows = self.num_blocks * self.k_per_block[ratio]
-                    rows_per_page = self.page_size // ratio if ratio else 0
-                    padded_compress_rows = compress_rows + rows_per_page
-                    rows = self.swa_pages + padded_compress_rows
-                    if self.fp8:
-                        bufs.append(
-                            torch.zeros(
-                                rows,
-                                DSV4_FP8_NOPE_ROW_BYTES,
-                                dtype=torch.float8_e4m3fn,
-                                device=device,
-                            )
-                        )
-                        rope_bufs.append(
-                            torch.zeros(
-                                rows,
-                                self.rope_head_dim,
-                                dtype=torch.bfloat16,
-                                device=device,
-                            )
-                        )
-                    else:
-                        bufs.append(
-                            torch.zeros(
-                                rows,
-                                self.head_dim,
-                                dtype=torch.bfloat16,
-                                device=device,
-                            )
-                        )
-                        rope_bufs.append(None)
+                for i, ratio in enumerate(stage_ratios):
+                    if group_of[i] is not None:
+                        continue
+                    assert ratio not in (1, 2), (
+                        f"local layer {i} (ratio {ratio}) has no kv_source group"
+                    )
+                    bufs[i], rope_bufs[i] = alloc(
+                        self.swa_pages + padded_compress_rows(ratio)
+                    )
+                for src, members in groups.items():
+                    G = len(members)
+                    nope, rope = alloc(
+                        G * self.swa_pages + padded_compress_rows(stage_ratios[src])
+                    )
+                    for j, i in enumerate(members):
+                        start = j * self.swa_pages
+                        bufs[i] = nope[start:]
+                        rope_bufs[i] = None if rope is None else rope[start:]
+                        self.compress_row_base[i] = (G - j) * self.swa_pages
         self.kv_buffer = bufs
         self.kv_buffer_rope = rope_bufs
+        self.groups = groups
 
     def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
         return self.kv_buffer[local_layer_id]
@@ -927,12 +965,21 @@ class DeepSeekV4UnifiedKVPool:
         assert self.fp8, "rope pool only exists under SGLANG_DSV4_UNIFIED_KV_FP8"
         return self.kv_buffer_rope[local_layer_id]
 
+    def get_compress_row_base(self, local_layer_id: int) -> int:
+        return self.compress_row_base[local_layer_id]
+
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         if self.fp8:
             # one ptr/layer; PD uses get_contiguous_buf_infos / SWA_RING
             raise NotImplementedError(
                 "get_buf_infos describes one pool per layer; the fp8 rope pool "
                 "would be dropped (SGLANG_DSV4_UNIFIED_KV_FP8=1)."
+            )
+        if self.groups:
+            # group members are views into one allocation; a per-layer list would
+            # ship the shared compressed region once per member
+            raise NotImplementedError(
+                "get_buf_infos does not describe kv_source-shared (ratio 1 / 2) layers"
             )
         data_ptrs = [b.data_ptr() for b in self.kv_buffer]
         data_lens = [b.nbytes for b in self.kv_buffer]
@@ -1204,6 +1251,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             swa_ring_size = get_swa_ring_size(
                 self.sliding_window, get_spec().speculative_algorithm is not None
             )
+            # ratio 1 / 2 layers read their kv_source layer's compressed region
+            stage = range(self._stage_start, self._stage_end)
+            unified_sources = collect_sources_by_ratio(
+                compression_ratios, list(kv_source_layers), stage
+            )
+            unified_group_of: List[Optional[int]] = []
+            for idx in stage:
+                ratio = compression_ratios[idx]
+                if ratio in (1, 2):
+                    srcs = [l for l in unified_sources.get(ratio, []) if l <= idx]
+                    assert srcs, f"layer {idx} (ratio {ratio}) has no kv_source layer"
+                    unified_group_of.append(max(srcs) - self._stage_start)
+                else:
+                    unified_group_of.append(None)
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
@@ -1216,6 +1277,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 custom_mem_pool=self.custom_mem_pool,
                 swa_ring_size=swa_ring_size,
                 fp8=self._unified_kv_fp8,
+                group_of=unified_group_of,
             )
 
             self.unified_swa_window = self.sliding_window
@@ -1309,6 +1371,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv_rope(layer_id - self._stage_start)
 
+    def get_unified_compress_row_base(self, layer_id: int) -> int:
+        """Row where ``layer_id``'s compressed region starts in ``get_unified_kv``:
+        ``unified_swa_pages`` for an own buffer, ``(G - j) * swa_pages`` for member
+        ``j`` of a ratio-1/2 kv_source group of ``G`` layers."""
+        return self.unified_kv_pool.get_compress_row_base(layer_id - self._stage_start)
+
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
@@ -1361,6 +1429,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # decode reads a page whose rope half came from some other page.
         for ratio, kv_pool in self.kv_pools.items():
             if self._unified_kv:
+                if ratio in (1, 2):
+                    raise NotImplementedError(
+                        "PD transfer of the unified kv_source-shared (ratio 1 / 2) "
+                        "regions is not wired yet"
+                    )
                 for local_layer_id, layer_ratio in enumerate(stage_ratios):
                     if layer_ratio != ratio:
                         continue
@@ -1567,9 +1640,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             assert self.full_size is not None, (
                 "low compress ratios need the full pool size"
             )
-            assert not self._unified_kv, "unified_kv has no low compress ratio layout"
 
-        if not self._unified_kv:
+        if self._unified_kv:
+            # Ratio-1/2 rows live in the unified pool's kv_source group regions.
+            for ratio in low_ratio_sources:
+                self.kv_pools[ratio] = None
+        else:
             for ratio, config in configs.items():
                 pool_cls = kv_pool_cls
                 if ratio == 4 and enable_hisparse:
