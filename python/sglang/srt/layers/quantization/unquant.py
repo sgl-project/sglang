@@ -662,9 +662,6 @@ def _empty_xpu_moe_expert_weight(
     return torch.empty(num_experts, n_dim, k_dim + pad, dtype=dtype)[:, :, :k_dim]
 
 
-_W8A16_SCALE_BLOCK_K = 128
-
-
 class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
     """Opt-in gfx950 PTPC method for GLM-5.3 KDA projections."""
 
@@ -693,39 +690,48 @@ class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
                 return config
         return None
 
-    def _register_w8a16_scale(self, layer: torch.nn.Module, weight_scale) -> None:
+    def _register_w8a16_counters(self, layer: torch.nn.Module) -> None:
         if not self.w8a16_configs:
             return
-        k = layer._fp8_ptpc_weight.shape[1]
-        if k % _W8A16_SCALE_BLOCK_K:
-            raise ValueError(
-                f"GLM-5.3 KDA W8A16 decode requires K divisible by "
-                f"{_W8A16_SCALE_BLOCK_K}, got {k} for {self.module_name}"
-            )
-        # The blockscale kernel reads one scale per (row, 128-wide K block);
-        # repeat the per-channel scale instead of keeping a second FP8 copy.
+        from sglang.kernels.ops.gemm.gfx95_a16w8_preshuffle import (
+            a16w8_preshuffle_num_tiles,
+            a16w8_preshuffle_supported,
+        )
+
+        n, k = layer._fp8_ptpc_weight.shape
+        for max_m, config in self.w8a16_configs:
+            if not a16w8_preshuffle_supported(n, k, config):
+                raise ValueError(
+                    f"GLM-5.3 KDA W8A16 decode does not support N={n}, K={k} "
+                    f"with the M<={max_m} config for {self.module_name}"
+                )
+        # Each layer owns its split-K tile counters; the GEMM re-zeroes them.
         layer.register_buffer(
-            "_w8a16_weight_scale",
-            weight_scale.expand(-1, k // _W8A16_SCALE_BLOCK_K).contiguous(),
+            "_w8a16_tile_counters",
+            torch.zeros(
+                max(
+                    a16w8_preshuffle_num_tiles(max_m, n, config)
+                    for max_m, config in self.w8a16_configs
+                ),
+                dtype=torch.int32,
+                device=layer._fp8_ptpc_weight.device,
+            ),
             persistent=False,
         )
 
     @staticmethod
     def apply_w8a16(layer: torch.nn.Module, x: torch.Tensor, config: dict):
-        from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-            gemm_a16w8_blockscale_preshuffle,
+        from sglang.kernels.ops.gemm.gfx95_a16w8_preshuffle import (
+            a16w8_preshuffle_gemm,
         )
 
-        weight = layer._fp8_ptpc_weight
-        n, k = weight.shape
-        output = gemm_a16w8_blockscale_preshuffle(
+        n, k = layer._fp8_ptpc_weight.shape
+        output = a16w8_preshuffle_gemm(
             x.reshape(-1, k),
-            weight.view(n // 16, k * 16),
-            layer._w8a16_weight_scale,
-            dtype=x.dtype,
-            prequant=False,
-            # The wrapper adds derived keys to the config it is given.
-            config=dict(config),
+            layer._fp8_ptpc_weight,
+            layer._fp8_ptpc_weight_scale,
+            config,
+            layer._w8a16_tile_counters,
         )
         return output.view(*x.shape[:-1], n)
 
@@ -759,7 +765,7 @@ class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
             weight_scale.contiguous(),
             persistent=False,
         )
-        self._register_w8a16_scale(layer, weight_scale)
+        self._register_w8a16_counters(layer)
         self._fp8_ptpc_ready = True
 
     def apply(
@@ -872,7 +878,7 @@ class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
             weight_scale.contiguous(),
             persistent=False,
         )
-        self._register_w8a16_scale(layer, weight_scale)
+        self._register_w8a16_counters(layer)
         self._fp8_ptpc_ready = True
 
     def apply(

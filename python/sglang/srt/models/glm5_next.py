@@ -371,7 +371,6 @@ def _w8a16_config(block_m, block_n, num_ksplit, num_warps, num_stages, waves_per
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,
         "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
         "NUM_KSPLIT": num_ksplit,
         "num_warps": num_warps,
         "num_stages": num_stages,
@@ -382,24 +381,24 @@ def _w8a16_config(block_m, block_n, num_ksplit, num_warps, num_stages, waves_per
 
 
 # Decode W8A16 (BF16 activations x PTPC FP8 weights) configs per local (N, K):
-# ascending (max token count, gemm_a16w8_blockscale_preshuffle config) rows
-# from MI355X cold-cache sweeps; token counts above the last row stay BF16.
+# ascending (max token count, a16w8_preshuffle_gemm config) rows from MI355X
+# cold-cache sweeps; token counts above the last row stay BF16.
 GLM53_KDA_W8A16_DECODE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, dict], ...]] = {
     (6416, 4096): (
-        (1, _w8a16_config(8, 16, 4, 1, 3, 2)),
-        (4, _w8a16_config(8, 16, 8, 1, 3, 0)),
-        (8, _w8a16_config(8, 32, 8, 2, 3, 0)),
-        (16, _w8a16_config(16, 64, 4, 4, 3, 0)),
-        (32, _w8a16_config(32, 128, 4, 8, 3, 2)),
-        (64, _w8a16_config(64, 128, 4, 8, 3, 2)),
+        (1, _w8a16_config(8, 16, 4, 1, 3, 0)),
+        (4, _w8a16_config(8, 16, 4, 1, 3, 2)),
+        (8, _w8a16_config(8, 16, 4, 1, 3, 0)),
+        (16, _w8a16_config(16, 64, 4, 4, 3, 2)),
+        (32, _w8a16_config(32, 64, 2, 8, 3, 0)),
+        (64, _w8a16_config(64, 64, 2, 8, 3, 0)),
     ),
     (3344, 4096): (
-        (1, _w8a16_config(8, 16, 8, 1, 3, 0)),
-        (4, _w8a16_config(8, 16, 8, 1, 3, 2)),
-        (8, _w8a16_config(16, 16, 8, 1, 3, 2)),
-        (16, _w8a16_config(16, 16, 8, 1, 3, 0)),
-        (32, _w8a16_config(32, 128, 8, 8, 3, 0)),
-        (64, _w8a16_config(64, 64, 4, 8, 3, 0)),
+        (1, _w8a16_config(8, 16, 4, 1, 3, 2)),
+        (4, _w8a16_config(8, 16, 4, 1, 3, 0)),
+        (8, _w8a16_config(8, 128, 8, 8, 3, 2)),
+        (16, _w8a16_config(16, 16, 4, 1, 3, 2)),
+        (32, _w8a16_config(32, 32, 4, 4, 3, 2)),
+        (64, _w8a16_config(64, 32, 2, 8, 3, 2)),
     ),
 }
 

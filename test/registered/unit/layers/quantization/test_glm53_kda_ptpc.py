@@ -708,28 +708,42 @@ class TestGLM53KDAPTPC(CustomTestCase):
             method.process_weights_after_loading(layer)
         return layer, scale
 
-    def test_w8a16_scale_is_registered_only_when_enabled(self):
-        weight = torch.zeros(4, 256, dtype=torch.bfloat16)
+    def test_w8a16_tile_counters_are_registered_only_when_enabled(self):
+        from sglang.kernels.ops.gemm import gfx95_a16w8_preshuffle
+
+        def config(block_m, block_n, num_ksplit):
+            return {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": 128,
+                "NUM_KSPLIT": num_ksplit,
+            }
+
+        weight = torch.zeros(48, 512, dtype=torch.bfloat16)
         layer, _ = self._repack_with_fake_aiter(
             Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=0), weight
         )
-        self.assertNotIn("_w8a16_weight_scale", dict(layer.named_buffers()))
+        self.assertNotIn("_w8a16_tile_counters", dict(layer.named_buffers()))
 
-        layer, scale = self._repack_with_fake_aiter(
-            Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=0, w8a16_configs=((64, {}),)),
-            weight,
-        )
-        self.assertEqual(layer._w8a16_weight_scale.shape, (4, 2))
-        torch.testing.assert_close(layer._w8a16_weight_scale, scale.expand(4, 2))
-        self.assertNotIn("_w8a16_weight_scale", layer.state_dict())
-
-        with self.assertRaisesRegex(ValueError, "divisible by 128"):
-            self._repack_with_fake_aiter(
-                Glm53KdaPtpcLinearMethod(
-                    "o_proj", bf16_max_m=0, w8a16_configs=((64, {}),)
-                ),
-                torch.zeros(4, 192, dtype=torch.bfloat16),
+        table = ((4, config(8, 16, 4)), (64, config(64, 32, 2)))
+        with patch.object(gfx95_a16w8_preshuffle, "_is_gfx95", True):
+            layer, _ = self._repack_with_fake_aiter(
+                Glm53KdaPtpcLinearMethod("o_proj", bf16_max_m=0, w8a16_configs=table),
+                weight,
             )
+            # The largest row tiling (M=4 -> 1 x 3 tiles; M=64 -> 1 x 2) wins.
+            torch.testing.assert_close(
+                layer._w8a16_tile_counters, torch.zeros(3, dtype=torch.int32)
+            )
+            self.assertNotIn("_w8a16_tile_counters", layer.state_dict())
+
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                self._repack_with_fake_aiter(
+                    Glm53KdaPtpcLinearMethod(
+                        "o_proj", bf16_max_m=0, w8a16_configs=((4, config(8, 16, 8)),)
+                    ),
+                    torch.zeros(48, 512, dtype=torch.bfloat16),
+                )
 
     def test_fused_first_stage_uses_w8a16_for_decode_rows(self):
         attention = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
