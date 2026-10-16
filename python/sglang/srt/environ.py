@@ -519,6 +519,9 @@ class Envs:
     # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (hip graph) instead of falling back to the eager accept + commit path.
+    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 

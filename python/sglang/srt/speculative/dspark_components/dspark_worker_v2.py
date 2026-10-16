@@ -365,6 +365,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
+                simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -932,11 +933,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
-            # The graph accept is greedy, so a sampled simulated bonus is eager.
-            and simulate_bonus_sampling_info is None
+            # The graph accept is greedy: a sampled simulated bonus stays in the graph
+            # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
+            and (
+                simulate_bonus_sampling_info is None
+                or self._verify_executor.verify_epilogue.simulate_fold
+            )
             and not batch.has_grammar
         )
         self._verify_executor.begin_simulated_step()
+        if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
+            self._verify_executor.verify_epilogue.begin_sim_bonus(
+                bs,
+                (
+                    None
+                    if simulate_bonus_sampling_info is None
+                    else simulate_bonus_sampling_info.temperatures[:bs]
+                ),
+            )
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import Optional
 
 import msgspec
@@ -26,6 +27,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
+    simulated_bonus_sample_graph,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -537,8 +539,18 @@ class DsparkVerifyEpilogue:
         commit_ctx: Optional[CommitInjectCtx] = None,
         fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
+        simulate_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
+        # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
+        # is drawn at the simulated correct_len from these buffers, which
+        # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
+        self.simulate_fold = bool(simulate_fold) and simulated_correct_len is not None
+        self.sim_temperatures_buf = torch.zeros(
+            (self.max_bs,), dtype=torch.float32, device=device
+        )
+        self.sim_seed_buf = torch.zeros((1,), dtype=torch.int32, device=device)
+        self._sim_greedy_bs: Optional[int] = None
         self.stride = int(verify_num_draft_tokens)
         self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
@@ -616,6 +628,17 @@ class DsparkVerifyEpilogue:
         self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
+
+    def begin_sim_bonus(self, bs: int, temperatures: Optional[torch.Tensor]) -> None:
+        """The step's bonus temperatures (None: greedy) and seed, before replay."""
+        if temperatures is None:
+            if self._sim_greedy_bs != bs:
+                self.sim_temperatures_buf.zero_()
+                self._sim_greedy_bs = bs
+            return
+        self._sim_greedy_bs = None
+        self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
+        self.sim_seed_buf.fill_(random.getrandbits(31))
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
@@ -751,6 +774,20 @@ class DsparkVerifyEpilogue:
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
         )
+        if self.simulate_fold:
+            # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
+            bonus = (
+                simulated_bonus_sample_graph(
+                    target_logits=logits,
+                    correct_len=self.simulated_correct_len.repeat(bs),
+                    temperatures=self.sim_temperatures_buf[:bs],
+                    seed=self.sim_seed_buf,
+                    bs=bs,
+                    rows_per_request=self.stride,
+                )
+                .to(bonus.dtype)
+                .view_as(bonus)
+            )
         accept = build_accept_outs(
             correct_len=correct_len,
             bonus=bonus,
