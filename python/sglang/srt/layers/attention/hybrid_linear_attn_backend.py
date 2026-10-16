@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -605,6 +605,77 @@ class MambaAttnBackendBase(AttentionBackend):
             mask = torch.cat([mask, pad])
         return mask.cpu()
 
+    def _replayssm_graph_buffers(
+        self,
+        bs: int,
+        mamba_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        seq_lens_cpu: Optional[torch.Tensor],
+        in_capture: bool,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Snapshot this step's ring cursor into the static buffer and advance the
+        pool cursor in place (mirrors the eager path); returns ``(write_pos,
+        force_flush)`` for the layers, ``(None, None)`` when the ring is off.
+        Shared by the CUDA replay and the Ascend replay (which overrides the base
+        ``_replay_metadata``).
+        """
+        if self.replayssm_write_pos_list is None:
+            return None, None
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        write_pos_buf = mamba_pool.replayssm_write_pos
+        # Hand the full captured per-bs buffers to the kernel; it indexes per row.
+        static_wp = self.replayssm_write_pos_list[bs - 1]
+        static_ff = self.replayssm_force_flush_list[bs - 1]
+        if write_pos_buf is None:
+            return static_wp, static_ff
+        # this replay's per-row physical slots (padded rows == -1)
+        slots = mamba_indices.to(torch.long)
+        safe_slots = slots.clamp(min=0)
+        # Snapshot this step's cursor into the captured buffer in-place
+        # (copy_, never reassign the object).
+        static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
+        # Refresh the force-flush buffer in-place from this step's seq_lens
+        # (same condition as the radix track). Zeroed during capture.
+        force_flush_dev = None
+        # KDA: no radix coordination -> leave zeroed so the advance is a pure wrap.
+        is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
+        if not is_kda and forward_mode.is_decode_or_idle() and seq_lens_cpu is not None:
+            ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
+            force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
+            static_ff.copy_(force_flush_dev)
+        else:
+            static_ff.zero_()
+        # Defense in depth: the decode-ring advance is only meaningful for
+        # decode/idle forwards (mirrors the eager path's gating). A
+        # TARGET_VERIFY replay must never advance the cursor.
+        if not in_capture and forward_mode.is_decode_or_idle():
+            L = mamba_pool.linear_replayssm_cache_len
+            # Advance only valid (non-padded) slots; a forced flush empties
+            # the ring -> next write_pos 0, like the natural L-1 wrap.
+            valid_mask = slots >= 0
+            valid_slots = slots[valid_mask]
+            if valid_slots.numel() > 0:
+                cur_pos = write_pos_buf[safe_slots]
+                flushed = cur_pos == (L - 1)
+                if force_flush_dev is not None:
+                    flushed = flushed | (force_flush_dev != 0)
+                next_pos = torch.where(
+                    flushed,
+                    torch.zeros_like(cur_pos),
+                    (cur_pos + 1) % L,
+                )
+                # Dedup; rows sharing a slot share write_pos+flush.
+                uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
+                next_for_valid = next_pos[valid_mask]
+                new_vals = torch.empty(
+                    uniq_slots.shape[0],
+                    dtype=write_pos_buf.dtype,
+                    device=write_pos_buf.device,
+                )
+                new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
+                write_pos_buf[uniq_slots] = new_vals
+        return static_wp, static_ff
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert max_num_tokens % max_bs == 0, (
             f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
@@ -803,70 +874,11 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             track_buf = self.mamba_track_indices_buf[:bs]
             track_buf.copy_(self._translate_mamba_indices(mamba_track_indices[:bs]))
-        # Refresh the static write cursor in-place (mirrors the eager
-        # snapshot-then-advance). Skip the advance during capture: dummy slots
-        # would corrupt real ring positions.
-        replayssm_write_pos = None
-        replayssm_force_flush = None
-        if self.replayssm_write_pos_list is not None:
-            mamba_pool = self.req_to_token_pool.mamba_pool
-            write_pos_buf = mamba_pool.replayssm_write_pos
-            static_wp = self.replayssm_write_pos_list[bs - 1]
-            static_ff = self.replayssm_force_flush_list[bs - 1]
-            # Hand the full captured per-bs buffers to the kernel; it indexes per row.
-            replayssm_write_pos = static_wp
-            replayssm_force_flush = static_ff
-            if write_pos_buf is not None:
-                # this replay's per-row physical slots (padded rows == -1)
-                slots = mamba_indices.to(torch.long)
-                safe_slots = slots.clamp(min=0)
-                # Snapshot this step's cursor into the captured buffer in-place
-                # (copy_, never reassign the object).
-                static_wp[: len(mamba_indices)].copy_(write_pos_buf[safe_slots])
-                # Refresh the force-flush buffer in-place from this step's seq_lens
-                # (same condition as the radix track). Zeroed during capture.
-                force_flush_dev = None
-                # KDA: no radix coordination -> leave zeroed so the advance is a pure wrap.
-                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
-                if (
-                    not is_kda
-                    and forward_mode.is_decode_or_idle()
-                    and seq_lens_cpu is not None
-                ):
-                    ff_mask = self._replayssm_track_flush_mask(seq_lens_cpu, bs)
-                    force_flush_dev = ff_mask.to(device=self.device, dtype=torch.int32)
-                    static_ff.copy_(force_flush_dev)
-                else:
-                    static_ff.zero_()
-                # Defense in depth: the decode-ring advance is only meaningful for
-                # decode/idle forwards (mirrors the eager path's gating). A
-                # TARGET_VERIFY replay must never advance the cursor.
-                if not in_capture and forward_mode.is_decode_or_idle():
-                    L = mamba_pool.linear_replayssm_cache_len
-                    # Advance only valid (non-padded) slots; a forced flush empties
-                    # the ring -> next write_pos 0, like the natural L-1 wrap.
-                    valid_mask = slots >= 0
-                    valid_slots = slots[valid_mask]
-                    if valid_slots.numel() > 0:
-                        cur_pos = write_pos_buf[safe_slots]
-                        flushed = cur_pos == (L - 1)
-                        if force_flush_dev is not None:
-                            flushed = flushed | (force_flush_dev != 0)
-                        next_pos = torch.where(
-                            flushed,
-                            torch.zeros_like(cur_pos),
-                            (cur_pos + 1) % L,
-                        )
-                        # Dedup; rows sharing a slot share write_pos+flush.
-                        uniq_slots, inv = torch.unique(valid_slots, return_inverse=True)
-                        next_for_valid = next_pos[valid_mask]
-                        new_vals = torch.empty(
-                            uniq_slots.shape[0],
-                            dtype=write_pos_buf.dtype,
-                            device=write_pos_buf.device,
-                        )
-                        new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
-                        write_pos_buf[uniq_slots] = new_vals
+        # ReplaySSM: snapshot + advance the ring cursor for this replay. Skip the
+        # advance during capture: dummy slots would corrupt real ring positions.
+        replayssm_write_pos, replayssm_force_flush = self._replayssm_graph_buffers(
+            bs, mamba_indices, forward_mode, seq_lens_cpu, in_capture
+        )
         is_target_verify = forward_mode.is_target_verify()
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:

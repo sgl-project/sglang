@@ -208,8 +208,8 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     b_state_q = tl.zeros([BV], dtype=tl.float32)
     b_state_k = tl.zeros([BV], dtype=tl.float32)
     cur_kq = tl.zeros([1], dtype=tl.float32)
-    write_k = (not b_is_flush) and (i_v == 0) and (i_hv == i_h * (HV // H))
-    write_g_kda = IS_KDA and (not b_is_flush) and (i_v == 0)
+    write_k = (not b_is_flush) and ((i_v == 0) and (i_hv == i_h * (HV // H)))
+    write_g_kda = IS_KDA and ((not b_is_flush) and (i_v == 0))
     for kk in range(NK):
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K
@@ -428,9 +428,14 @@ def fused_recurrent_linear_replayssm_decode_kernel(
             b_d_cur.to(p_cur_d.dtype.element_ty),
             mask=mask_v & (b_write_pos < MAX_CACHE_LEN),
         )
-        if (not IS_KDA) and (i_v == 0):
-            p_cur_g = g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
-            tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
+        # Split (not `(not IS_KDA) and (i_v == 0)`): triton-ascend does not fold
+        # the constexpr operand there and would codegen this GDN-only body for KDA.
+        if not IS_KDA:
+            if i_v == 0:
+                p_cur_g = (
+                    g_cache + (state_idx * HV + i_hv) * MAX_CACHE_LEN + b_write_pos
+                )
+                tl.store(p_cur_g, g_val, mask=b_write_pos < MAX_CACHE_LEN)
 
 
 def fused_recurrent_linear_replayssm_decode(
