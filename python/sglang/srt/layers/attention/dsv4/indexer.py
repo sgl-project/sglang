@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    FP4RowgroupDecodeWorkspace,
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
@@ -1018,6 +1019,14 @@ class C4IndexerBackendMixin:
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
+            if isinstance(
+                getattr(metadata, "fp4_decode_workspace", None),
+                FP4RowgroupDecodeWorkspace,
+            ) and (is_decode or forward_batch.forward_mode.is_target_verify()):
+                # The backend built a row-group workspace for this step: target-verify
+                # rows score like decode rows, one launch over the whole batch, a
+                # request's rows sharing each key load.
+                is_decode = True
             # Hoisted: these await this layer's KV transfer, which every chunk
             # would otherwise re-await.
             k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(

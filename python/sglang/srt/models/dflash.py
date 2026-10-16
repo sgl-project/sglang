@@ -189,6 +189,11 @@ def _get_dflash_layer_attention_params(
     )
 
 
+_ROPE_DIM_SUPERSEDED_KEYS = frozenset(
+    {"rope_dim", "partial_rotary_factor", "mrope_section", "mrope_interleaved"}
+)
+
+
 class DFlashAttention(nn.Module):
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
@@ -242,6 +247,18 @@ class DFlashAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
         rope_theta, rope_scaling = get_rope_config(config)
+        rotary_dim = head_dim
+        partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 1.0))
+        if rope_scaling is not None and "rope_dim" in rope_scaling:
+            # An explicit rope_dim is the trained rotary width (HF Qwen3 ignores the
+            # copied target partial/M-RoPE fields); drafts only see 1-D positions.
+            rotary_dim = int(rope_scaling["rope_dim"])
+            partial_rotary_factor = 1.0
+            rope_scaling = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k not in _ROPE_DIM_SUPERSEDED_KEYS
+            }
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -250,12 +267,12 @@ class DFlashAttention(nn.Module):
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
         self.rotary_emb = get_rope(
             head_dim,
-            rotary_dim=head_dim,
+            rotary_dim=rotary_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
-            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
+            partial_rotary_factor=partial_rotary_factor,
         )
 
         self.scaling = head_dim**-0.5
