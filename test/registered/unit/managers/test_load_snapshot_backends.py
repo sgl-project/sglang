@@ -1,5 +1,6 @@
 """Unit tests for LoadSnapshot SHM and ZMQ backends."""
 
+import json
 import os
 import tempfile
 import time
@@ -9,15 +10,21 @@ from unittest import mock
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
+    DisaggregationMetrics,
     LoadSnapshot,
+    LoRAMetrics,
+    MemoryMetrics,
+    QueueMetrics,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
+    SpeculativeMetrics,
     ZmqLoadSnapshotWriter,
     ZmqShmLoadSnapshotReader,
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
     should_use_zmq,
+    snapshot_encoder,
     zmq_reader_owner,
 )
 from sglang.srt.runtime_context import get_context
@@ -490,6 +497,76 @@ class TestEndToEndZmqSimulation(CustomTestCase):
             reader.close()
             if os.path.exists(shm_path):
                 os.unlink(shm_path)
+
+
+# The Rust frontend's `/v1/loads` (rust/sglang-server/src/api_server/http/loads.rs)
+# renders these snapshots from the same SHM bytes; its fixture must match Python.
+RUST_LOADS_FIXTURE = os.path.join(
+    os.path.dirname(__file__),
+    *[os.pardir] * 4,
+    "rust/sglang-server/testdata/load_snapshot.json",
+)
+
+
+def build_rust_loads_fixture() -> dict:
+    """Wire payloads for a full and a minimal rank, and what Python renders from
+    them. The values are arbitrary and pairwise distinct, so a field rendered
+    under the wrong name or in the wrong slot shows. Regenerate the fixture
+    with ``json.dump(build_rust_loads_fixture(), f, indent=2)`` after a
+    ``LoadSnapshot`` change, then update the Rust renderer."""
+    from sglang.srt.entrypoints.v1_loads import _format_loads_prometheus
+
+    full = LoadSnapshot(
+        timestamp=1.25,
+        dp_rank=0,
+        num_running_reqs=7,
+        num_waiting_reqs=3,
+        num_waiting_uncached_tokens=4096,
+        num_used_tokens=81920,
+        num_total_tokens=90112,
+        num_active_tokens=88000,
+        num_prealloc_ready_tokens=512,
+        max_total_num_tokens=1048576,
+        max_running_requests=256,
+        token_usage=0.078125,
+        gen_throughput=1234.5,
+        cache_hit_rate=0.625,
+        utilization=0.5,
+        total_prefill_uncached_tokens=987654321,
+        total_prefill_busy_us=123456789,
+        decode_moments=[100.0, 2.5, 0.125],
+        memory=MemoryMetrics(
+            weight_gb=60.5, kv_cache_gb=120.25, graph_gb=2.0, token_capacity=1048576
+        ),
+        speculative=SpeculativeMetrics(accept_length=3.5, accept_rate=0.75),
+        lora=LoRAMetrics(slots_used=1, slots_total=8, utilization=0.125),
+        disaggregation=DisaggregationMetrics(
+            mode="decode", decode_prealloc_queue_reqs=2, kv_transfer_speed_gb_s=12.5
+        ),
+        queues=QueueMetrics(
+            waiting=3, grammar=1, paused=0, retracted=2, prealloc_ready=4
+        ),
+    )
+    snapshots = [full, LoadSnapshot(dp_rank=1)]
+    includes = {"all": None, "core": {"core"}, "core,queues": {"core", "queues"}}
+    return {
+        "payloads": [snapshot_encoder.encode(s).hex() for s in snapshots],
+        "to_dict": {
+            name: [s.to_dict(include) for s in snapshots]
+            for name, include in includes.items()
+        },
+        "prometheus": {
+            name: _format_loads_prometheus(snapshots, include).body.decode()
+            for name, include in includes.items()
+        },
+    }
+
+
+class TestRustLoadsFixture(CustomTestCase):
+    def test_fixture_matches_python(self):
+        with open(RUST_LOADS_FIXTURE) as f:
+            fixture = json.load(f)
+        self.assertEqual(fixture, build_rust_loads_fixture())
 
 
 if __name__ == "__main__":

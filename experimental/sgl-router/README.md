@@ -567,6 +567,12 @@ embeddings endpoint reads none.
 response. It is served as embeddings are, except that a batch of text stays text,
 since the engine takes token IDs for only one prompt.
 
+## Completions
+
+`/v1/completions` has the engine's interface and is prepared like chat (sampling
+contract, PD bootstrap, DP rank), with the prompt forwarded as sent: tokens the
+router computes for routing do not replace it.
+
 ## Rerank
 
 `/v1/rerank` has the engine's interface: the same `V1RerankReqInput` body and
@@ -681,6 +687,41 @@ fresh reading; under `--worker-urls` the fan-out happens once at startup and
 nothing re-registers. So a worker registered over h2c that later stops serving
 it (a proxy interposed on its port, say) is not detected until it
 is re-registered; its circuit breaker will open in the meantime.
+
+## Native gRPC
+
+`--grpc-port` serves the engine's own gRPC API, `sglang.runtime.v1.SglangService`
+(`proto/sglang/runtime/v1/sglang.proto`), so a gRPC client can point at the
+router or at an engine. A call is routed exactly like its HTTP route and sent to
+the same RPC on the selected engine's native gRPC server, which engines run
+beside HTTP with their own `--grpc-port`; the router reads that port from each
+worker's `/server_info`. HTTP requests are unaffected and still reach engines
+over HTTP.
+
+| RPC | Routed like |
+|---|---|
+| `ChatComplete` | `/v1/chat/completions`: same rendering, `input_ids` forwarding, PD and DP-rank handling |
+| `Complete` | `/v1/completions` |
+| `Generate`, `TextGenerate` | `/generate` with `input_ids` or `text` |
+| `Embed`, `TextEmbed`, `OpenAIEmbed` | `/v1/embeddings` |
+| `Classify`, `OpenAIClassify` | `/v1/classify` |
+| `Rerank` | `/v1/rerank` |
+
+The OpenAI RPCs carry the HTTP route's JSON body, so they are prepared exactly as
+over HTTP. A typed RPC is prepared from its fields with the same rules, and the
+router's additions (rid, PD bootstrap, DP rank, sampling defaults) are set on the
+proto it forwards. A text prompt is tokenized once, as its HTTP route forwards
+`input_ids`: `TextGenerate` is sent as `Generate` with `return_text`, so the engine
+still supplies the text, and `TextEmbed` as `Embed`. They stay text RPCs under
+`--disable-input-ids-forwarding`, without a tokenizer, or, for `TextGenerate`, with
+`return_text_in_logprobs`. Other RPCs, such as
+`Tokenize`, `HealthCheck` and the admin RPCs, answer `UNIMPLEMENTED`. Request metadata and `trace_headers`
+act as HTTP headers for routing and forwarding, and a cancelled call aborts the
+engine request. Router errors arrive as a gRPC status carrying the HTTP path's
+message and an `x-router-error-code` trailer; an engine's status passes through
+unchanged. An engine without `--grpc-port` (including one launched with
+`--api-key`, which native gRPC rejects) cannot serve gRPC calls: the router warns
+when it registers, and calls routed to it fail with `UNAVAILABLE`.
 
 ## Upgrading from `cache_aware_zmq`
 
