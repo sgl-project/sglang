@@ -55,6 +55,8 @@ pub struct SamplingParams {
     pub seed: ::core::option::Option<i64>,
     #[prost(message, optional, tag = "17")]
     pub guided_decoding: ::core::option::Option<GuidedDecoding>,
+    #[prost(bool, tag = "18")]
+    pub use_remaining_context: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GuidedDecoding {
