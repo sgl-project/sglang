@@ -229,7 +229,8 @@ class LogitsProcessorOutput:
     hidden_states_token_indices: Optional[torch.Tensor] = None
 
     # Post-norm last-layer hidden states of every token, kept under full capture
-    # when `hidden_states` holds the aux hidden states (--aux-hidden-state-capture).
+    # when `hidden_states` holds the aux hidden states
+    # (--enable-return-aux-hidden-states).
     # For in-process consumers of this output; not copied into the response path.
     last_hidden_states: Optional[torch.Tensor] = None
 

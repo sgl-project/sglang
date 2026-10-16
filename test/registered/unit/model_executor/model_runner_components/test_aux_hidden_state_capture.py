@@ -1,4 +1,4 @@
-"""Unit tests for --aux-hidden-state-capture (aux capture without a draft)."""
+"""Unit tests for --enable-return-aux-hidden-states (aux capture without a draft)."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
@@ -41,13 +42,20 @@ def _resolve(*, is_draft_worker=False, num_layers=32, num_loops=1):
 # --- server arguments --------------------------------------------------------
 
 
-def test_cli_parses_method_and_layer_ids():
+def _resolved(**fields):
+    args = ServerArgs(model_path="dummy", **fields)
+    args.resolve_once()
+    return resolving_view(args)
+
+
+def test_cli_maps_the_flag_and_algorithm_to_the_capture_method():
     args = prepare_server_args(
         [
             "--model-path",
             "dummy",
-            "--aux-hidden-state-capture",
+            "--speculative-algorithm",
             "dflash",
+            "--enable-return-aux-hidden-states",
             "--return-aux-hidden-state-layer-ids",
             "1",
             "16",
@@ -55,7 +63,10 @@ def test_cli_parses_method_and_layer_ids():
         ]
     )
     args.resolve_once()
-    assert args.aux_hidden_state_capture == "dflash"
+    resolved = resolving_view(args)
+    assert resolved.aux_hidden_state_capture == "dflash"
+    # The algorithm only named the convention; the speculative stack stays off.
+    assert resolved.speculative_algorithm is None
     assert args.return_aux_hidden_state_layer_ids == [1, 16, 31]
 
 
@@ -64,41 +75,60 @@ def test_cli_parses_method_and_layer_ids():
     [
         (
             dict(return_aux_hidden_state_layer_ids=[1, 2]),
-            "requires --aux-hidden-state-capture",
+            "requires --enable-return-aux-hidden-states",
         ),
         (
-            dict(aux_hidden_state_capture="dflash"),
+            dict(enable_return_aux_hidden_states=True),
+            "needs --speculative-algorithm",
+        ),
+        (
+            dict(enable_return_aux_hidden_states=True, speculative_algorithm="EAGLE"),
+            "needs --speculative-algorithm",
+        ),
+        (
+            dict(
+                enable_return_aux_hidden_states=True,
+                speculative_algorithm="EAGLE3",
+                speculative_draft_model_path="draft",
+            ),
+            "drop --speculative-draft-model-path",
+        ),
+        (
+            dict(enable_return_aux_hidden_states=True, speculative_algorithm="DFLASH"),
             "requires --return-aux-hidden-state-layer-ids",
         ),
         (
-            dict(aux_hidden_state_capture="dspark"),
+            dict(enable_return_aux_hidden_states=True, speculative_algorithm="DSPARK"),
             "requires --return-aux-hidden-state-layer-ids",
         ),
         (
-            dict(aux_hidden_state_capture="eagle3", speculative_algorithm="EAGLE3"),
-            "cannot be combined with --speculative-algorithm",
-        ),
-        (
-            dict(aux_hidden_state_capture="eagle3", pp_size=2),
+            dict(
+                enable_return_aux_hidden_states=True,
+                speculative_algorithm="EAGLE3",
+                pp_size=2,
+            ),
             "only supports pp_size == 1",
         ),
         (
             dict(
-                aux_hidden_state_capture="eagle3",
+                enable_return_aux_hidden_states=True,
+                speculative_algorithm="EAGLE3",
                 return_aux_hidden_state_layer_ids=[],
             ),
             "must not be empty",
         ),
         (
             dict(
-                aux_hidden_state_capture="dflash",
+                enable_return_aux_hidden_states=True,
+                speculative_algorithm="DFLASH",
                 return_aux_hidden_state_layer_ids=[1, 1],
             ),
             "must not repeat",
         ),
         (
             dict(
-                aux_hidden_state_capture="dflash",
+                enable_return_aux_hidden_states=True,
+                speculative_algorithm="DFLASH",
                 return_aux_hidden_state_layer_ids=[-1],
             ),
             "must be non-negative",
@@ -111,26 +141,33 @@ def test_invalid_combinations_are_rejected(fields, match):
 
 
 def test_eagle3_defaults_to_model_layers():
-    ServerArgs(model_path="dummy", aux_hidden_state_capture="eagle3").resolve_once()
+    resolved = _resolved(
+        enable_return_aux_hidden_states=True, speculative_algorithm="EAGLE3"
+    )
+    assert resolved.aux_hidden_state_capture == "eagle3"
+    assert resolved.speculative_algorithm is None
 
 
 def test_capture_defaults_return_hidden_states_mode_to_full():
-    args = ServerArgs(model_path="dummy", aux_hidden_state_capture="eagle3")
-    args.resolve_once()
-    assert args.return_hidden_states_mode == "full"
+    resolved = _resolved(
+        enable_return_aux_hidden_states=True, speculative_algorithm="EAGLE3"
+    )
+    assert resolved.return_hidden_states_mode == "full"
 
 
 def test_capture_keeps_an_explicit_return_hidden_states_mode():
-    args = ServerArgs(
-        model_path="dummy",
-        aux_hidden_state_capture="eagle3",
+    resolved = _resolved(
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="EAGLE3",
         return_hidden_states_mode="last",
     )
-    args.resolve_once()
-    assert args.return_hidden_states_mode == "last"
+    assert resolved.return_hidden_states_mode == "last"
 
 
 # --- aux capture config ------------------------------------------------------
+# published_topology publishes raw fields without running the resolution
+# pipeline, so these tests set aux_hidden_state_capture, the resolved form of
+# --enable-return-aux-hidden-states plus --speculative-algorithm, directly.
 
 
 def test_disabled_by_default():

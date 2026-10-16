@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
     _hisparse_validation,
     resolved_view,
     resolving_view,
@@ -690,46 +691,66 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
-def validate_aux_hidden_state_capture(server_args: Any):
+_AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
+
+
+def handle_aux_hidden_state_capture(server_args: Any):
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    Must run before anything reads speculative_algorithm: with the flag, that
+    argument only names the capture convention and is reset to None here, so
+    the speculative stack stays off.
+    """
     cfg = resolving_view(server_args)
-    method = cfg.aux_hidden_state_capture
-    if method is None:
+    if not cfg.enable_return_aux_hidden_states:
         if cfg.return_aux_hidden_state_layer_ids is not None:
             raise ValueError(
                 "--return-aux-hidden-state-layer-ids requires "
-                "--aux-hidden-state-capture."
+                "--enable-return-aux-hidden-states."
             )
         return
-    if cfg.speculative_algorithm is not None:
+    method = (cfg.speculative_algorithm or "").upper()
+    if method not in _AUX_HIDDEN_STATE_CAPTURE_METHODS:
         raise ValueError(
-            "--aux-hidden-state-capture cannot be combined with "
-            "--speculative-algorithm: the draft selects the captured target layers."
+            "--enable-return-aux-hidden-states needs --speculative-algorithm "
+            "EAGLE3, DFLASH or DSPARK to name the capture convention, got "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "--enable-return-aux-hidden-states captures without a draft; drop "
+            "--speculative-draft-model-path."
         )
     if cfg.pp_size != 1:
         raise ValueError(
-            "--aux-hidden-state-capture only supports pp_size == 1: the capture "
-            "hooks only see the layers on the last pipeline rank."
-        )
-    if method != "eagle3" and not cfg.return_aux_hidden_state_layer_ids:
-        raise ValueError(
-            f"--aux-hidden-state-capture {method} requires "
-            "--return-aux-hidden-state-layer-ids."
+            "--enable-return-aux-hidden-states only supports pp_size == 1: the "
+            "capture hooks only see the layers on the last pipeline rank."
         )
     layer_ids = cfg.return_aux_hidden_state_layer_ids
-    if layer_ids is None:
-        return
-    if len(layer_ids) == 0:
-        raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
-    if any(layer_id < 0 for layer_id in layer_ids):
+    if method != "EAGLE3" and not layer_ids:
         raise ValueError(
-            "--return-aux-hidden-state-layer-ids must be non-negative, got "
-            f"{list(layer_ids)}."
+            f"--enable-return-aux-hidden-states with {method} requires "
+            "--return-aux-hidden-state-layer-ids."
         )
-    if len(set(layer_ids)) != len(layer_ids):
-        raise ValueError(
-            "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
-            f"{list(layer_ids)}."
-        )
+    if layer_ids is not None:
+        if len(layer_ids) == 0:
+            raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
+        if any(layer_id < 0 for layer_id in layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must be non-negative, got "
+                f"{list(layer_ids)}."
+            )
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
+                f"{list(layer_ids)}."
+            )
+    declare_resolution(
+        server_args,
+        "_handle_aux_hidden_state_capture",
+        speculative_algorithm=None,
+        aux_hidden_state_capture=method.lower(),
+    )
 
 
 def check_two_batch_overlap(server_args: Any):

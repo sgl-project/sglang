@@ -88,7 +88,7 @@ def _resolve_capture_only_aux_hidden_state(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
-    """--aux-hidden-state-capture: aux capture on a target that runs no draft.
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
 
     No draft layer counts are set, so the KV pool reserves nothing for a draft.
     """

@@ -422,7 +422,7 @@ class ModelRunner:
 
         self.init_msprobe()
 
-        # Auxiliary hidden capture: from the draft, or --aux-hidden-state-capture.
+        # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
