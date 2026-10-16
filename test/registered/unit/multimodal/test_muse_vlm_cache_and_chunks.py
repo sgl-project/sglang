@@ -1,10 +1,10 @@
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
 from sglang.srt.managers import mm_schedule
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -48,10 +48,14 @@ class VideoEncoder:
 
 def video_items():
     return [
-        SimpleNamespace(
-            hash=1, offsets=[(10, 11), (15, 16)], feature=torch.arange(4.0).view(-1, 1)
+        MultimodalDataItem(
+            modality=Modality.VIDEO,
+            hash=1,
+            offsets=[(10, 11), (15, 16)],
+            feature=torch.arange(4.0).view(-1, 1),
         ),
-        SimpleNamespace(
+        MultimodalDataItem(
+            modality=Modality.VIDEO,
             hash=2,
             offsets=[(30, 31), (35, 36)],
             feature=torch.arange(4.0, 8.0).view(-1, 1),
@@ -96,16 +100,13 @@ def test_video_chunk_intersections(start, length, expected, calls):
 
 def test_video_cache_reuses_full_item_across_its_spans():
     model = VideoEncoder()
-    with (
-        patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(32)),
-        patch.object(mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits") as ack,
-    ):
-        first = run_chunk(model, video_items(), 10, 2)
-        second = run_chunk(model, video_items(), 15, 2)
+    items = video_items()
+    with patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(32)):
+        first = run_chunk(model, items, 10, 2)
+        second = run_chunk(model, items, 15, 2)
     torch.testing.assert_close(first.flatten(), torch.tensor([0.0, 1.0]))
     torch.testing.assert_close(second.flatten(), torch.tensor([2.0, 3.0]))
     assert model.calls == [[1, 2]]
-    ack.assert_called_once()
 
 
 def test_multispan_encoders_keep_full_request_contract():

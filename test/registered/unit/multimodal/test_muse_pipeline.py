@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
 from sglang.srt.multimodal.processors import muse_spark_omni as muse
@@ -119,8 +119,11 @@ def test_muse_video_decode_stays_on_cpu():
 
 
 def test_video_outside_chunk_does_not_encode():
-    item = SimpleNamespace(
-        hash=8, offsets=[(100, 101), (105, 106)], feature=torch.zeros(2, 3, 4, 4)
+    item = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=8,
+        offsets=[(100, 101), (105, 106)],
+        feature=torch.zeros(2, 3, 4, 4),
     )
     encoder = Mock()
     with patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(10000)):
@@ -137,22 +140,30 @@ def test_video_outside_chunk_does_not_encode():
     assert result is None or result.numel() == 0
 
 
-def test_batched_cache_hits_acknowledge_each_consumer():
+def test_batched_cache_hits_retain_raw_features():
     cache = MultiModalStaticCache(10000)
     cache.set(7, EmbeddingResult(embedding=torch.zeros(2, 4)))
-    items = [SimpleNamespace(hash=7, offsets=[(0, 1)], feature=None) for _ in range(2)]
+    features = [torch.arange(8.0).view(2, 4) for _ in range(2)]
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=7,
+            offsets=[(0, 1)],
+            feature=feature,
+        )
+        for feature in features
+    ]
     requests = [
         mm_schedule.PerImageRequestInfo(i, [item], [(0, 1)], 0, 2)
         for i, item in enumerate(items)
     ]
-    with (
-        patch.object(mm_schedule, "embedding_cache", cache),
-        patch.object(mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits") as ack,
-    ):
-        mm_schedule._batch_encode_per_image_misses(
+    with patch.object(mm_schedule, "embedding_cache", cache):
+        embeddings = mm_schedule._batch_encode_per_image_misses(
             Mock(side_effect=AssertionError), requests, torch.device("cpu")
         )
-    assert [call.args[0][0] for call in ack.call_args_list] == items
+    assert embeddings[(7, 2)] is cache.get_single(7).embedding
+    for item, feature in zip(items, features):
+        assert item.feature is feature
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
