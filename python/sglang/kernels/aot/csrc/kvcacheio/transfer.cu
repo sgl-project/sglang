@@ -376,7 +376,12 @@ void transfer_kv_launcher(
   const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
   const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
   dim3 grid_dim(num_blocks, 1, 1);
+#ifdef USE_ROCM
+  // Host-side WARP_SIZE is always 64 on ROCm; size blocks by the device's wave size.
+  const int32_t threads_per_block = num_warps_per_block * get_current_warp_size();
+#else
   const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
+#endif
 
   const void* src_k_ptr = src_k.defined() ? resolve_device_accessible_ptr(src_k) : nullptr;
   void* dst_k_ptr = dst_k.defined() ? resolve_device_accessible_ptr(dst_k) : nullptr;
