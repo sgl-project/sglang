@@ -75,6 +75,8 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
 
+_lm_head_tgemm = _use_aiter and get_bool_env_var("SGLANG_LM_HEAD_AITER_TGEMM")
+
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
@@ -456,6 +458,11 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # gfx1250 gpt-oss recipe: on gfx1250 F.linear picks an untuned hipBLASLt tile (MT32x16x32) for the
+        # gpt-oss LM head, 2.2x slower than aiter's tuned GEMM; SGLANG_LM_HEAD_AITER_TGEMM=1 routes
+        # the LM head through tgemm like the other bf16 linears.
+        if _lm_head_tgemm and x.dim() == 2:
+            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
