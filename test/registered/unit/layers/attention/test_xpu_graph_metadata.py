@@ -5,6 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -182,8 +183,8 @@ class TestXPUGraphMetadata(CustomTestCase):
             moe_fusions = []
 
         override = get_context().override_server_args(
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
                     backend="full",
                     bs=[1],
                     max_context_size=64,
@@ -257,8 +258,8 @@ class TestXPUGraphMetadata(CustomTestCase):
             moe_fusions = []
 
         override = get_context().override_server_args(
-            cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
                     backend="full",
                     bs=[1],
                     max_context_size=64,
