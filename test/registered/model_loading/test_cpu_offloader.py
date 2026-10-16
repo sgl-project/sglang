@@ -26,7 +26,10 @@ register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
 
 class CachedConvolution(nn.Module):
     def __init__(
-        self, projection_name: str, device: torch.device, cache_name: str = "conv_weights"
+        self,
+        projection_name: str,
+        device: torch.device,
+        cache_name: str = "conv_weights",
     ) -> None:
         super().__init__()
         if projection_name == "qkv_conv1d":
@@ -114,9 +117,9 @@ class TestCpuOffloader(CustomTestCase):
         ):
             with self.subTest(projection_name=projection_name), torch.no_grad():
                 model = CachedConvolution(projection_name, self.device, cache_name)
-                model = OffloaderV1(
-                    cpu_offload_max_bytes=1024**2
-                ).maybe_offload_to_cpu(model)
+                model = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(
+                    model
+                )
                 weight = getattr(model, projection_name).weight
                 weight.weight_loader(weight, torch.ones_like(weight, device="cpu"))
                 model.projection.weight.fill_(1)
@@ -174,9 +177,7 @@ class TestCpuOffloader(CustomTestCase):
         ):
             with self.subTest(loader=rebind.__qualname__), torch.no_grad():
                 model = CachedConvolution("conv1d", self.device)
-                model.conv1d.weight = nn.Parameter(
-                    torch.ones_like(model.conv1d.weight)
-                )
+                model.conv1d.weight = nn.Parameter(torch.ones_like(model.conv1d.weight))
                 model.projection.weight.fill_(1)
 
                 rebind(model)
