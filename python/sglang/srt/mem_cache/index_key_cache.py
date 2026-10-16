@@ -7,6 +7,12 @@ import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
+
+_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -73,9 +79,20 @@ class IndexKeyCache:
             index_k = self._kernel_view(index_k)
             # Each physical page stores all key bytes followed by all scale bytes.
             # Locations identify tokens; copying whole pages overwrites neighbors.
-            for part in (index_k[:, :key_bytes], index_k[:, key_bytes:]):
-                tokens = part.view(index_k.shape[0], page_size, -1)
-                tokens[tgt_page, tgt_offset] = tokens[src_page, src_offset]
+            keys = index_k[:, :key_bytes]
+            if _use_aiter_preshuffle:
+                tile = INDEXER_K_CACHE_PRESHUFFLE_TILE
+                keys = keys.view(
+                    index_k.shape[0], page_size // tile, -1, tile, tile
+                ).permute(0, 1, 3, 2, 4)
+                keys[tgt_page, tgt_offset // tile, tgt_offset % tile] = keys[
+                    src_page, src_offset // tile, src_offset % tile
+                ]
+            else:
+                keys = keys.view(index_k.shape[0], page_size, -1)
+                keys[tgt_page, tgt_offset] = keys[src_page, src_offset]
+            scales = index_k[:, key_bytes:].view(index_k.shape[0], page_size, -1)
+            scales[tgt_page, tgt_offset] = scales[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:

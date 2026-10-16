@@ -1,5 +1,7 @@
 """DSA relocation must move token keys and scales, preserving neighboring slots."""
 
+import sys
+
 import pytest
 import torch
 
@@ -60,3 +62,7 @@ def test_dsa_cache_move(source_slots):
         expected[target] = expected[source]
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert pool.index_key_cache.buffer[1].shape[0] == 0
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
