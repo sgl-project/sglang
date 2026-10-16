@@ -54,20 +54,18 @@ def _encode(values, codec, offsets=None):
 
 
 # Outer LZ4 wrapping is covered by the CPU payload suite; this exercises the two
-# distinct inner decoders across every slot count and both sorting settings.
+# distinct inner decoders with two output slots and both sorting settings.
 @pytest.mark.parametrize(
-    "codec,sort_chunks,stages",
+    "codec,sort_chunks",
     [
-        ("snappy-zstd", "0", 2),
-        ("snappy-zstd", "1", 3),
-        ("snappy-zstd", "0", 4),
-        ("lz4", "1", 2),
-        ("lz4", "0", 3),
-        ("lz4", "1", 4),
+        ("snappy-zstd", "0"),
+        ("snappy-zstd", "1"),
+        ("lz4", "0"),
+        ("lz4", "1"),
     ],
 )
 def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
-    codec, sort_chunks, stages, monkeypatch
+    codec, sort_chunks, monkeypatch
 ):
     monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sort_chunks)
     device = torch.device("cuda", 0)
@@ -95,17 +93,18 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
             for offset, encoded, decoded, output in frames_b
         ],
     ]
-    batches = [batches[index % 2] for index in range(2 * stages + 1)]
+    batches = [batches[index % 2] for index in range(5)]
     batches[-1] = []  # A fully omitted final batch still zeroes/reuses its slot.
     stream = torch.cuda.Stream(device=device)
-    de_streams = tuple(torch.cuda.Stream(device=device) for _ in range(stages - 1))
+    de_stream = torch.cuda.Stream(device=device)
     table, counts = _frame_table(batches)
-    plan = decoder.prepare_batches(table, counts, host, de_streams, stages)
+    plan = decoder.prepare_batches(table, counts, host, de_stream)
+    assert plan.stream is de_stream
     workspace = plan.workspace
     # Large outputs are allocated only at the paused binding boundary.
     decoded = [
         device_empty(sum(map(len, values[0])), dtype=torch.uint8, device=device)
-        for _ in range(stages)
+        for _ in range(2)
     ]
     plans = plan.bind_outputs(decoded)
     # Native status/size views exercise both typed allocation paths, including
@@ -124,20 +123,19 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     assert all(plan.metadata.stride(0) == sum(map(len, batches)) for plan in plans)
     assert plans[0].statuses.data_ptr() != plans[1].statuses.data_ptr()
     assert plans[0].actual_sizes.data_ptr() != plans[1].actual_sizes.data_ptr()
-    assert plans[0].statuses.data_ptr() == plans[stages].statuses.data_ptr()
-    assert plans[0].actual_sizes.data_ptr() == plans[stages].actual_sizes.data_ptr()
+    assert plans[0].statuses.data_ptr() == plans[2].statuses.data_ptr()
+    assert plans[0].actual_sizes.data_ptr() == plans[2].actual_sizes.data_ptr()
     assert all(plan.host_input is host for plan in plans)
-    for index, batch in enumerate(plans):
-        assert batch.stream is de_streams[index % len(de_streams)]
+    for batch in plans:
+        assert batch.stream is de_stream
         assert batch._arguments[-1] == batch.stream.cuda_stream
-        temporary = workspace.temporary[index % len(de_streams)]
+        temporary = workspace.temporary
         assert batch._arguments[5:7] == (temporary.data_ptr(), temporary.numel())
     prepared = PreparedDelta.__new__(PreparedDelta)
     prepared.device = device
-    prepared.decode_stages = stages
-    prepared.stream, prepared.de_streams = stream, de_streams
-    prepared.decoded_ready = [torch.cuda.Event() for _ in range(stages)]
-    prepared.decoded_free = [torch.cuda.Event() for _ in range(stages)]
+    prepared.stream, prepared.de_stream = stream, de_stream
+    prepared.decoded_ready = [torch.cuda.Event() for _ in range(2)]
+    prepared.decoded_free = [torch.cuda.Event() for _ in range(2)]
     # B leaves a prefix, an interior hole and a short tail; the unused part of
     # larger scratch retains its prior bytes and is not read by B's apply plan.
     output_sizes = [
@@ -177,7 +175,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
                     decoder=plan,
                     apply=None,
                     zero_ranges=[
-                        decoded[index % stages][offset : offset + length]
+                        decoded[index % 2][offset : offset + length]
                         for offset, length in gaps[0]
                     ],
                     check_status=prepare_status_check(plan, prepared.error),
@@ -187,22 +185,21 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
             output.fill_(0xA5)
         ready = torch.cuda.Event()
         ready.record(stream)
-    for de_stream in de_streams:
-        de_stream.wait_event(ready)
+    de_stream.wait_event(ready)
     assert not prepared_batches[0].zero_ranges
     assert [view.numel() for view in prepared_batches[1].zero_ranges] == [128, 256, 64]
     observations = []
 
-    # Run the production prefetch/apply loop, retaining snapshots as an ordered
+    # Run the production DE/apply loop, retaining snapshots as an ordered
     # apply consumer. Prepared metadata/output binding above is already real.
-    # Distinct A/B bytes cross two ring boundaries, including a stream change
-    # when a three-slot ring reuses its output/status row on the other DE stream.
+    # Distinct A/B bytes cross two ring boundaries, including the final empty
+    # batch reusing the first output/status slot after both earlier decodes.
     def observe(batch):
         index = len(observations)
         PreparedDelta._apply_batch(prepared, batch)
         observations.append(
             (
-                prepared.decoded[index % stages].clone(),
+                prepared.decoded[index % 2].clone(),
                 batch.decoder.statuses.clone(),
                 batch.decoder.actual_sizes.clone(),
             )
@@ -239,7 +236,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     del prepared._apply_batch, prepared._allocate_paused
     expected_slots = [bytearray([0xA5]) * output.numel() for output in decoded]
     for index, (output, statuses, sizes) in enumerate(observations):
-        expected = expected_slots[index % stages]
+        expected = expected_slots[index % 2]
         expected[: output_sizes[index]] = bytes(output_sizes[index])
         source_values = values[index % 2] if batches[index] else []
         for frame, value in zip(batches[index], source_values):
@@ -251,9 +248,9 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     assert prepared.error.item() == 0
     assert bytes(host[: len(payload_a)].numpy()) == payload_a
     assert bytes(host[input_b : input_b + len(payload_b)].numpy()) == payload_b
-    # Each actual slot's callback reads that slot's status/size row, including
-    # newly added slots. Mutate metadata only after the real DE work completes.
-    for index, batch in enumerate(prepared_batches[:stages]):
+    # Each slot's callback reads its own status/size row. Mutate metadata only
+    # after the real DE work completes.
+    for index, batch in enumerate(prepared_batches[:2]):
         field = batch.decoder.statuses if index % 2 == 0 else batch.decoder.actual_sizes
         prepared.error.zero_()
         before = field[0].clone()

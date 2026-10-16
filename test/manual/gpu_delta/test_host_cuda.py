@@ -62,16 +62,18 @@ def _publication(directory, version, repeat, codec):
             "encoding": "raw_bytes" if name == "raw" else "xor_bytes",
             "nbytes": len(value),
             "changed_bytes": len(value),
-            "frames": []
-            if name == "raw"
-            else [
-                {
-                    "encoded_offset": 0,
-                    "encoded_bytes": len(inner),
-                    "decoded_offset": 0,
-                    "decoded_bytes": len(value),
-                }
-            ],
+            "frames": (
+                []
+                if name == "raw"
+                else [
+                    {
+                        "encoded_offset": 0,
+                        "encoded_bytes": len(inner),
+                        "decoded_offset": 0,
+                        "decoded_bytes": len(value),
+                    }
+                ]
+            ),
         }
         if name == "raw":
             entry["raw"] = {
@@ -177,7 +179,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 size += len(expected[name])
             decoder = NvcompDecoder(device, codec.removesuffix("-zstd"))
             table = np.asarray(frames, dtype=np.int64).T.copy()
-            plan = decoder.prepare_batches(table, [len(frames)], source, (stream,))
+            plan = decoder.prepare_batches(table, [len(frames)], source, stream)
             decoded = [
                 torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)
             ]

@@ -598,7 +598,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
 
     def test_prepare_releases_foreign_metadata_before_local_work(self):
         backend, manifest = TestCanonicalPlanCache().publication()
-        backend.device, backend.decode_stages = torch.device("cpu"), 2
+        backend.device = torch.device("cpu")
         backend.payload_pool = object()
         manifest.update(
             codec="lz4-zstd",
@@ -716,7 +716,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             )
             self.assertEqual(backend.decoders, {})
             self.assertIsNone(backend.apply_stream)
-            self.assertEqual(backend.de_streams, ())
+            self.assertIsNone(backend.de_stream)
             backend.describe()
             backend.describe()
             read_inventory.assert_called_once()
@@ -728,15 +728,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             raise RuntimeError("decode stream failed")
 
         prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
-        prepared.de_streams = (
-            SimpleNamespace(synchronize=decode_failure),
-            SimpleNamespace(synchronize=lambda: drains.append("decode-1")),
-            SimpleNamespace(synchronize=decode_failure),
-        )
+        prepared.de_stream = SimpleNamespace(synchronize=decode_failure)
         prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
         with self.assertRaisesRegex(RuntimeError, "decode stream failed"):
             prepared.close()
-        self.assertEqual(drains, ["decode", "decode-1", "decode", "compute"])
+        self.assertEqual(drains, ["decode", "compute"])
 
     def test_glm_mapping_matches_loader_views_and_preserves_consumers(self):
         root = torch.nn.Module()

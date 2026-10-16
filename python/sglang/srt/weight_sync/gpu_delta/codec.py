@@ -190,8 +190,8 @@ class NvcompDecoder:
         self._temporary_sizes[geometry] = size.value
         return size.value
 
-    def _allocate_workspace(self, geometry, slot_count) -> DecodeWorkspace:
-        """Each DE stream owns aligned scratch; statuses/sizes belong to slots."""
+    def _allocate_workspace(self, geometry) -> DecodeWorkspace:
+        """One DE stream shares scratch; statuses/sizes belong to two slots."""
         from sglang.srt.weight_sync.gpu_delta.memory import (
             device_empty,
             require_de_capable,
@@ -199,19 +199,10 @@ class NvcompDecoder:
 
         maximum_count = max((batch[0] for batch in geometry), default=0)
         temporary = max((self.temporary_bytes(batch) for batch in geometry), default=0)
-        if temporary and slot_count > 2:
-            alignment = self.alignments.temp
-            temporary = (temporary + alignment - 1) // alignment * alignment
         workspace = DecodeWorkspace(
-            device_empty(
-                (slot_count - 1, temporary), dtype=torch.uint8, device=self.device
-            ),
-            device_empty(
-                (slot_count, maximum_count), dtype=torch.int64, device=self.device
-            ),
-            device_empty(
-                (slot_count, maximum_count), dtype=torch.int32, device=self.device
-            ),
+            device_empty((temporary,), dtype=torch.uint8, device=self.device),
+            device_empty((2, maximum_count), dtype=torch.int64, device=self.device),
+            device_empty((2, maximum_count), dtype=torch.int32, device=self.device),
         )
         if temporary and workspace.temporary.data_ptr() % self.alignments.temp:
             raise ValueError("Misaligned decoder workspace")
@@ -224,7 +215,7 @@ class NvcompDecoder:
                 require_de_capable(tensor.data_ptr())
         return workspace
 
-    def _frame_geometry(self, table, counts, input_base, input_bytes, slot_count):
+    def _frame_geometry(self, table, counts, input_base, input_bytes):
         """Validate numeric rows and derive workspace/output bounds in one pass."""
         if (
             table.dtype != np.int64
@@ -234,13 +225,13 @@ class NvcompDecoder:
             raise ValueError("Expected contiguous int64(4,N) frame metadata")
         if not 0 <= input_base <= _INT64_MAX - input_bytes:
             raise ValueError("Input pointer arithmetic exceeds signed metadata")
-        bounds, remainders, geometry = [0] * slot_count, [None] * slot_count, []
+        bounds, remainders, geometry = [0, 0], [None, None], []
         maximum = self.maximum_chunk_bytes
         offset = 0
         for index, count in enumerate(counts):
             inputs, encoded, decoded, outputs = table[:, offset : offset + count]
             offset += count
-            slot = index % slot_count
+            slot = index % 2
             if not count:
                 geometry.append((0, 0, 0))
                 continue
@@ -282,14 +273,13 @@ class NvcompDecoder:
         table: np.ndarray,
         counts: Sequence[int],
         host_input: torch.Tensor,
-        streams: Sequence[torch.cuda.Stream],
-        slot_count: int = 2,
+        stream: torch.cuda.Stream,
     ) -> PreparedDecodePlan:
         """Prepare numeric metadata and small workspace without decoded output.
 
         Rows contain relative input offsets, encoded sizes, decoded sizes and
         relative output offsets. The admitted host arena must stay immutable
-        until every DE stream drains. Only input/size rows are uploaded now;
+        until the DE stream drains. Only input/size rows are uploaded now;
         ``bind_outputs`` fills output pointers under the serving pause.
         """
         from sglang.srt.weight_sync.gpu_delta.memory import (
@@ -303,24 +293,14 @@ class NvcompDecoder:
             or not host_input.is_contiguous()
         ):
             raise ValueError("nvCOMP input must be a contiguous host arena byte view")
-        if slot_count not in (2, 3, 4):
-            raise ValueError("nvCOMP requires 2, 3 or 4 decoded output slots")
-        streams = tuple(streams)
-        if len(streams) != slot_count - 1 or len(
-            {stream.cuda_stream for stream in streams}
-        ) != len(streams):
-            raise ValueError(
-                "nvCOMP requires one distinct DE stream per prefetched batch"
-            )
-        if any(stream.device != self.device for stream in streams):
+        if stream.device != self.device:
             raise ValueError("Decoder stream/device mismatch")
-        stream = streams[0]
         input_base = host_input.data_ptr()
         geometry, bounds, remainders = self._frame_geometry(
-            table, counts, input_base, host_input.numel(), slot_count
+            table, counts, input_base, host_input.numel()
         )
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
-            workspace = self._allocate_workspace(geometry, slot_count)
+            workspace = self._allocate_workspace(geometry)
             host = torch.empty(
                 table.shape, dtype=torch.int64, device="cpu", pin_memory=True
             )
@@ -338,7 +318,7 @@ class NvcompDecoder:
             workspace,
             host,
             metadata,
-            streams,
+            stream,
             table[3].copy(),
             bounds,
             remainders,
@@ -356,27 +336,23 @@ class PreparedDecodePlan:
         workspace,
         host_metadata,
         metadata,
-        streams,
+        stream,
         output_offsets,
         output_bounds,
         output_remainders,
     ):
-        self.decoder, self.streams = decoder, streams
+        self.decoder, self.stream = decoder, stream
         self.workspace = workspace
         self.host_metadata, self.metadata = host_metadata, metadata
         self.output_bounds, self.output_remainders = output_bounds, output_remainders
-        self.slot_count = len(output_bounds)
         # Every batch retains this same list. Binding fills it only after all
         # output checks pass; dropping the plan alone cannot free in-flight slots.
         self.decoded_slots = []
         self.batches = []
-        self.metadata_ready = torch.cuda.Event() if len(streams) > 1 else None
+        temporary = workspace.temporary
         offset = 0
         for index, count in enumerate(counts):
-            slot = index % self.slot_count
-            stream_index = index % len(streams)
-            stream = streams[stream_index]
-            temporary = workspace.temporary[stream_index]
+            slot = index % 2
             rows = metadata[:, offset : offset + count]
             host_rows = host_metadata[:, offset : offset + count]
             statuses = workspace.statuses[slot, :count]
@@ -413,8 +389,7 @@ class PreparedDecodePlan:
                 )
             )
             offset += count
-        for stream in streams:
-            self.record_stream(stream)
+        self.record_stream(stream)
 
     def record_stream(self, stream):
         """Register every consumer before it can enqueue storage readers."""
@@ -439,14 +414,14 @@ class PreparedDecodePlan:
 
         Slot bounds and relative pointer alignment were computed during prepare.
         The caller waits for prior apply readers before reusing each output and
-        its status/actual-size row. DE streams have disjoint temporary slices.
+        its status/actual-size row. Temporary storage is reused on the DE stream.
         """
         from sglang.srt.weight_sync.gpu_delta.memory import (
             record_device_stream,
             require_de_capable,
         )
 
-        if len(decoded_slots) != self.slot_count:
+        if len(decoded_slots) != 2:
             raise ValueError("Decoded output count differs from prepared slots")
         for tensor in decoded_slots:
             if (
@@ -459,12 +434,11 @@ class PreparedDecodePlan:
                 )
         bases = [tensor.data_ptr() for tensor in decoded_slots]
         capacities = [tensor.numel() for tensor in decoded_slots]
-        ranges = sorted(
-            (base, base + size) for base, size in zip(bases, capacities) if size
-        )
-        if any(
-            start < previous_end
-            for (_, previous_end), (start, _) in zip(ranges, ranges[1:])
+        if (
+            capacities[0]
+            and capacities[1]
+            and bases[0] < bases[1] + capacities[1]
+            and bases[1] < bases[0] + capacities[0]
         ):
             raise ValueError("Decoded output slots must not overlap")
         for base, capacity, bound, remainder in zip(
@@ -478,24 +452,19 @@ class PreparedDecodePlan:
             ):
                 raise ValueError("Misaligned decoded frame")
         for tensor in decoded_slots:
-            for stream in self.streams:
-                record_device_stream(tensor, stream)
-        with torch.cuda.device(self.decoder.device), torch.cuda.stream(self.streams[0]):
+            record_device_stream(tensor, self.stream)
+        with torch.cuda.device(self.decoder.device), torch.cuda.stream(self.stream):
             for base, capacity in zip(bases, capacities):
                 if capacity:
                     require_de_capable(base)
             for index, batch in enumerate(self.batches):
                 np.add(
                     batch.output_offsets,
-                    bases[index % self.slot_count],
+                    bases[index % 2],
                     out=batch.output_pointers,
                 )
             if self.metadata.numel():
                 self.metadata[3].copy_(self.host_metadata[3], non_blocking=True)
-            if self.metadata_ready is not None:
-                self.metadata_ready.record(self.streams[0])
-                for stream in self.streams[1:]:
-                    stream.wait_event(self.metadata_ready)
         self.decoded_slots[:] = decoded_slots
         return self.batches
 

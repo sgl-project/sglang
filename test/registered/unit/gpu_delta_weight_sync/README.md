@@ -290,13 +290,12 @@ hardware chunk sorting once when the decoder is constructed, for either inner al
 Sorting executes inside the paused decode call; preparation does not sort or
 reorder the frames. The matched three-codec full-model matrix uses sorting off.
 
-`GPU_DELTA_DECODE_STAGES` accepts 2 (default), 3 or 4 and is frozen at backend
-initialization. Each extra stage adds one largest-batch decoded HBM buffer and
-small status/size rows, allocated at the same preparation/pause boundaries.
-Batch i reuses slot i modulo the depth only after that slot's prior apply finishes.
-DE submissions still share one ordered stream/workspace, and apply i is queued
-before the host submits DE i+1. More slots can defer a reuse wait but do not remove
-nvCOMP's calling-stream wait or guarantee lower pause latency.
+The decode/apply pipeline uses fixed double buffering: two largest-batch decoded
+HBM buffers, one ordered DE stream with a shared temporary workspace, and one
+Triton apply stream. Batch i reuses slot i modulo 2 only after that slot's prior
+apply finishes. Apply i is queued before the host submits DE i+1, preserving
+overlap even when nvCOMP waits for prior work on its calling stream. Decoded
+outputs are allocated during the pause; preparation only builds metadata.
 
 `GPU_DELTA_CPU_WORKERS` defaults to 32 (bounded to 1–32) per rank.
 Each rank uses reusable workers with independent Zstd contexts. Local tensors
@@ -390,7 +389,7 @@ and scratch release, but the scheduler's full `blocked_s` remains the pause metr
 `de_host_input_bytes` counts compressed bytes read directly by DE. `h2d_bytes`
 counts explicit raw-target and metadata transfers. Compressed frames are read
 directly by DE; these traffic categories are not a throughput estimate.
-`decode_stages` reports the configured depth; `decoded_buffers` counts actual slots.
+`decode_stages` remains 2; `decoded_buffers` counts actual slots (0 for raw-only updates).
 `decoded_scratch_bytes` is their total allocation;
 `decoder_workspace_bytes` is temporary DE workspace. Neither is peak HBM usage.
 `decoded_zero_ranges`/`decoded_zero_bytes` count omitted canonical bytes cleared

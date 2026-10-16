@@ -298,7 +298,6 @@ def test_failed_metadata_preparation_cannot_bind_and_is_retryable(planner, monke
 def owner(groups):
     value = PreparedDelta.__new__(PreparedDelta)
     value.static_plans = [(None, None, g) for g in groups]
-    value.decode_stages = 2
     value.apply_bindings, value.apply_source_patches = [], []
     value.apply_fallback_groups = set()
     size = sum(2 * len(g.sources) + g.metadata_size for g in groups if g is not None)

@@ -12,6 +12,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.weight_sync.gpu_delta.apply import (
     BLOCK,
     ByteApplyGroup,
@@ -251,7 +252,6 @@ def test_grid_stride_covers_group_boundaries_empty_groups_and_partial_tiles():
 def prepared(groups):
     owner = PreparedDelta.__new__(PreparedDelta)
     owner.static_plans = [(None, None, group) for group in groups]
-    owner.decode_stages = 2
     owner.apply_bindings = []
     owner.apply_source_patches = []
     owner.apply_fallback_groups = set()
