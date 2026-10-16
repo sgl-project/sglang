@@ -238,6 +238,42 @@ class RequestLogger:
             target.info(msg)
 
 
+# Redaction is key-based but walks every element, so redacting a whole request first
+# made each log call O(prompt length): ~40 ms for 80k input_ids, paid on receive and
+# on finish. Fields the log omits (skip_names; --log-requests-level 0/1 omit input_ids
+# and output_ids) are never redacted, and long sequences outside the watermark-bearing
+# fields skip the whole-object walk; only their printed halves are redacted.
+_WATERMARK_BEARING_FIELDS = {
+    "watermark",
+    "watermark_key",
+    "watermark_key_b",
+    "watermark_config",
+    "sampling_params",
+    "preferred_sampling_params",
+}
+
+
+def _redact_fields_for_logging(
+    values: dict, max_length: int, skip_names: Optional[Set[str]] = None
+) -> dict:
+    unwalked = {
+        k
+        for k, v in values.items()
+        if (skip_names and k in skip_names)
+        or (
+            k not in _WATERMARK_BEARING_FIELDS
+            and isinstance(v, (list, tuple))
+            and len(v) > max_length
+        )
+    }
+    if not unwalked:
+        return redact_watermark_secrets(values)
+    redacted = redact_watermark_secrets(
+        {k: v for k, v in values.items() if k not in unwalked}
+    )
+    return {k: values[k] if k in unwalked else redacted[k] for k in values}
+
+
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
@@ -261,7 +297,7 @@ def _dataclass_to_string_truncated(
         else:
             return str(redact_watermark_secrets(data))
     elif isinstance(data, dict):
-        data = redact_watermark_secrets(data)
+        data = _redact_fields_for_logging(data, max_length, skip_names)
         return (
             "{"
             + ", ".join(
@@ -273,8 +309,8 @@ def _dataclass_to_string_truncated(
         )
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
-        values = redact_watermark_secrets(
-            {f.name: getattr(data, f.name) for f in fields}
+        values = _redact_fields_for_logging(
+            {f.name: getattr(data, f.name) for f in fields}, max_length, skip_names
         )
         return (
             f"{data.__class__.__name__}("
@@ -302,10 +338,14 @@ def _transform_data_for_logging(
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
-            return list(data[:half_length]) + ["..."] + list(data[-half_length:])
+            return (
+                list(redact_watermark_secrets(list(data[:half_length])))
+                + ["..."]
+                + list(redact_watermark_secrets(list(data[-half_length:])))
+            )
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
-        data = redact_watermark_secrets(data)
+        data = _redact_fields_for_logging(data, max_length, skip_names)
         return {
             k: _transform_data_for_logging(v, max_length)
             for k, v in data.items()
@@ -313,8 +353,8 @@ def _transform_data_for_logging(
         }
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
-        values = redact_watermark_secrets(
-            {f.name: getattr(data, f.name) for f in fields}
+        values = _redact_fields_for_logging(
+            {f.name: getattr(data, f.name) for f in fields}, max_length, skip_names
         )
         return {
             f.name: _transform_data_for_logging(values[f.name], max_length)
