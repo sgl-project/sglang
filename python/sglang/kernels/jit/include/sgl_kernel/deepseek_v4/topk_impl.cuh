@@ -844,10 +844,10 @@ struct TopKStreaming : TopKRadixBase<12> {
 // CUDA only: thread-block clusters and distributed shared memory have no CDNA
 // equivalent.
 //
-// An overflowing threshold bin is not resolved here, unlike the register,
-// streaming and ROCm split paths: forward reports the row and the caller redoes
-// it with one block. Refining in place, even outlined, costs the persistent
-// kernel up to 10% on B300 through its register allocation alone.
+// Still truncates an overflowing threshold bin, unlike the register, streaming
+// and ROCm split paths: the candidate set is split across kClusterSize ranks
+// and no single block resolves the row, so refining needs cluster-wide
+// histogram and emit counters rather than the block-local ones refine_ties uses.
 // ---------------------------------------------------------------------------
 
 #if SUPPORT_CLUSTER
@@ -873,11 +873,6 @@ struct TopKCluster : TopKRadixBase<10> {
     TieValue tie_values[kMaxNumTie];
   };
 
-  /// Whether the threshold bin overflowed rank 0's tie buffer with slots left to fill.
-  SGL_DEVICE static bool is_overflow(uint32_t count_gt, uint32_t count_eq, uint32_t topk) {
-    return count_eq > kMaxNumTie && count_gt < topk;
-  }
-
   SGL_DEVICE static void barrier_cluster_arrive_relaxed() {
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
   }
@@ -890,11 +885,8 @@ struct TopKCluster : TopKRadixBase<10> {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
   }
 
-  /// Returns true for a row whose threshold bin overflows (is_overflow): rank 0
-  /// writes nothing more for it, and the caller must redo it. The peers still
-  /// emit their slots and return false, unless kPeersDefer.
-  template <bool kUsePDL, bool kPeersDefer = false>
-  SGL_DEVICE static bool forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
     const auto cluster = cooperative_groups::this_cluster();
@@ -963,8 +955,7 @@ struct TopKCluster : TopKRadixBase<10> {
       const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
       if (tx == 0) {
         const auto gt = atomicAdd(&smem_0->count_gt, local_count_gt);
-        // Uncapped, so rank 0 sees the overflow; the copy below stays capped.
-        const auto eq = atomicAdd(&smem_0->count_eq, smem->count_eq);
+        const auto eq = atomicAdd(&smem_0->count_eq, local_count_eq);
         smem->local_start_gt = gt;
         smem->local_start_eq = eq;
       }
@@ -981,12 +972,6 @@ struct TopKCluster : TopKRadixBase<10> {
 
       cluster.sync();  // bar 3
 
-      if constexpr (kPeersDefer) {
-        // Final at bar-3; the caller syncs the cluster before rank 0 reuses them or exits.
-        if (is_overflow(smem_0->count_gt, smem_0->count_eq, topk)) [[unlikely]] {
-          return true;
-        }
-      }
       const auto start_write = local_start_gt;
       const auto num_write = local_count_gt;
 #pragma unroll
@@ -1030,16 +1015,12 @@ struct TopKCluster : TopKRadixBase<10> {
       cluster.sync();  // bar-3
 
       // Phase 4: Handle ties.
-      if (is_overflow(smem->count_gt, smem->count_eq, topk)) [[unlikely]] {
-        return true;
-      }
       const auto count_gt = smem->count_gt;
       const auto count_eq = smem->count_eq;
       const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
       const auto tie_count = min(count_eq, kMaxNumTie);
       handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
     }
-    return false;
   }
 };
 

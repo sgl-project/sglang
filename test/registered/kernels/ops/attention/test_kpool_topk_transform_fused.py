@@ -1,11 +1,10 @@
-"""Parity coverage for the DSA k-pool top-k / pool-expansion / tail JIT kernels.
+"""Parity coverage for the fused DSA k-pool top-k / pool-expansion / tail JIT kernel.
 
-``fast_kpool_topk_transform_fused`` serves the pooled group budgets GLM-5.3-Flash
-uses (``index_topk=2048`` over ``index_kpool=4`` gives ``group_topk=512``) when
-``SGLANG_OPT_USE_TOPK_V2`` is off or the v2 layout gate fails; otherwise CUDA
-serves them through ``topk_transform_kpool_v2`` / ``topk_transform_kpool_ragged_v2``.
-``kpool_fp8_index`` has no Python fallback in that range, so a build or
-numerical break here takes the model down rather than making it slower.
+``fast_kpool_topk_transform_fused`` is the only implementation for the pooled
+group budgets GLM-5.3-Flash uses (``index_topk=2048`` over ``index_kpool=4``
+gives ``group_topk=512``); ``kpool_fp8_index`` has no Python fallback in that
+range, so a build or numerical break here takes the model down rather than
+making it slower.
 
 The radix selector does not specify an output order and DSA attention is
 permutation-invariant over the selected set, so the pooled columns are compared
@@ -15,26 +14,14 @@ The overfull-bin rescan is shared by CUDA and ROCm, so the tie and graph-replay
 cases run on both.
 """
 
-import sys
 import unittest
 
 import pytest
 import torch
 
-from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.occupancy import (
-    NoSchedulableClustersError,
-    get_max_active_clusters,
-)
 from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
     fast_kpool_topk_transform_fused,
 )
-from sglang.kernels.ops.attention.dsv4.topk import (
-    plan_topk_v2,
-    topk_transform_kpool_v2,
-    topk_v2_plan_is_written,
-)
-from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -190,77 +177,6 @@ def test_topk_membership_including_overfull_coarse_bins(distribution, start):
     )
 
 
-def _has_persistent_pool(rows):
-    """Whether the top-k v2 persistent cluster kernel exists here and takes `rows`
-    rows: SUPPORT_CLUSTER (SM90 / SM100) and fewer probed clusters than rows."""
-    if not 9 <= get_jit_cuda_arch().major < 11:
-        return False
-    try:
-        return rows > get_max_active_clusters(8, occupancy=2)
-    except NoSchedulableClustersError:
-        return False
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or is_hip(), reason="CUDA top-k v2 routes"
-)
-@pytest.mark.parametrize("rows", [1, 40])
-def test_planned_v2_keeps_top_pools_when_the_coarse_bin_overflows(rows):
-    """Long decode rows go to the cluster kernels where they exist (small-batch
-    at 1 row, persistent at 40), else to the non-cluster path. With more than
-    2048 distinct pool scores in one coarse bin they must still return the exact
-    top pools, not an arbitrary subset, including across graph replays that flip
-    the bin between overflowing and not.
-    """
-    torch.manual_seed(1234)
-    pools, group_topk, kpool, tail = 131072, 512, 4, 3
-    lengths = torch.full((rows,), pools, dtype=torch.int32, device="cuda")
-    token_lens = lengths * kpool + tail
-    plan = plan_topk_v2(lengths)
-    # The transform reads the plan before its PDL wait, so not back to back.
-    torch.cuda.synchronize()
-    if _has_persistent_pool(rows):
-        # Written only past the persistent pool's cluster count.
-        assert topk_v2_plan_is_written(lengths) and plan[0, 1].item() == rows
-    scores = torch.empty(rows, pools, device="cuda")
-    out = torch.empty(
-        (rows, group_topk * kpool + kpool - 1), dtype=torch.int32, device="cuda"
-    )
-
-    def run():
-        topk_transform_kpool_v2(
-            scores, lengths, out, kpool, plan, token_seq_lens=token_lens
-        )
-
-    run()  # Compile before capture.
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    for overflow in (True, False, True):
-        if overflow:
-            scores.copy_(1.0 + torch.rand(rows, pools, device="cuda") * 0.02)
-        else:
-            scores.copy_(torch.randn(rows, pools, device="cuda"))
-        graph.replay()
-        torch.cuda.synchronize()
-        groups = out[:, : group_topk * kpool : kpool].long() // kpool
-        torch.testing.assert_close(
-            scores.gather(1, groups).sort(dim=1).values,
-            scores.topk(group_topk, dim=1).values.sort(dim=1).values,
-            atol=0,
-            rtol=0,
-        )
-        torch.testing.assert_close(
-            out[:, -tail:],
-            torch.arange(
-                pools * kpool, pools * kpool + tail, dtype=torch.int32, device="cuda"
-            ).expand(rows, -1),
-            atol=0,
-            rtol=0,
-        )
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
 @pytest.mark.parametrize("long_length", [600, 32768])
 def test_graph_replay_short_rows_page_mapping_and_tail(long_length):
@@ -317,4 +233,4 @@ def test_graph_replay_short_rows_page_mapping_and_tail(long_length):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    unittest.main()
