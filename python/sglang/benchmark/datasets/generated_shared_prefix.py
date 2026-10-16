@@ -130,18 +130,22 @@ def get_gen_prefix_cache_path(
     tokenizer,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    fast_prepare: Optional[bool] = None,
 ):
     """Create cache directory under ~/.cache/sglang/benchmark.
 
-    The uniform-mode filename is preserved exactly as before so existing
-    on-disk caches remain valid. Non-default sampling modes get an extra
-    suffix encoding the parameters that affect the cached payload.
+    Leaving fast_prepare unset preserves the legacy path used by the HiCache
+    benchmark. Dataset generation specifies the preparation mode to keep
+    placeholder token counts separate from measured counts and avoid legacy
+    caches whose preparation mode is unknown.
     """
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
     suffix = ""
     if group_distribution != "uniform":
         suffix = f"_{group_distribution}_{zipf_alpha}"
+    if fast_prepare is not None:
+        suffix += "_fast" if fast_prepare else "_tokenized"
 
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
@@ -190,6 +194,7 @@ def sample_generated_shared_prefix_requests(
         tokenizer,
         group_distribution=group_distribution,
         zipf_alpha=zipf_alpha,
+        fast_prepare=fast_prepare,
     )
     # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
     # cache key; send_routing_key embeds a per-run uuid + timestamp that is
