@@ -108,7 +108,11 @@ def _build_bs_collapse_pattern(
 
     lhs: str = " ".join(names)  # type: ignore[arg-type]
 
-    rhs_names: list[str] = list(names[:lo]) + [f"({BATCH_DIM_NAME} {SEQ_DIM_NAME})"] + list(names[hi + 1 :])  # type: ignore[misc]
+    rhs_names: list[str] = (
+        list(names[:lo])
+        + [f"({BATCH_DIM_NAME} {SEQ_DIM_NAME})"]
+        + list(names[hi + 1 :])
+    )  # type: ignore[misc]
     rhs: str = " ".join(rhs_names)
 
     new_names: list[str | None] = (

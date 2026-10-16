@@ -32,7 +32,6 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 
 
 class TestMemoryConsumptionAscend(CustomTestCase):
-
     def test_memory_consumption(self):
 
         model = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-w8a8"
@@ -56,7 +55,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.8",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "1",
                 "--max-total-tokens",
                 "1024",

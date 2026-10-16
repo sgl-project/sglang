@@ -118,10 +118,10 @@ def benchmark_with_inheritance():
             cached_call_times.append(time_taken)
 
     print(
-        f"First call (with MRO lookup): {sum(first_call_times)/len(first_call_times):.6f}s avg"
+        f"First call (with MRO lookup): {sum(first_call_times) / len(first_call_times):.6f}s avg"
     )
-    print(f"Cached call: {sum(cached_call_times)/len(cached_call_times):.6f}s avg")
-    print(f"Caching improvement: {sum(first_call_times)/sum(cached_call_times):.2f}x")
+    print(f"Cached call: {sum(cached_call_times) / len(cached_call_times):.6f}s avg")
+    print(f"Caching improvement: {sum(first_call_times) / sum(cached_call_times):.2f}x")
 
 
 def benchmark_dispatchers():
@@ -158,8 +158,8 @@ def benchmark_dispatchers():
 
         print(f"for list: {list_time:.4f} s")
         print(f"for dict: {dict_time:.4f} s")
-        print(f"improvement: {list_time/dict_time:.2f} x")
-        print(f"time reduce: {(1-dict_time/list_time) * 100:.1f} %")
+        print(f"improvement: {list_time / dict_time:.2f} x")
+        print(f"time reduce: {(1 - dict_time / list_time) * 100:.1f} %")
 
 
 def test_memory_usage():
@@ -252,7 +252,7 @@ def simulate_real_workload():
 
     print(f"list version: {list_time:.4f} s")
     print(f"dict version: {dict_time:.4f} s")
-    print(f"improvement: {list_time/dict_time:.2f} x")
+    print(f"improvement: {list_time / dict_time:.2f} x")
 
 
 if __name__ == "__main__":

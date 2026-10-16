@@ -24,6 +24,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (  # noqa: F40
 )
 from sglang.srt.model_executor.runner_utils.pool import (  # noqa: F401
     get_global_graph_memory_pool,
+    get_or_create_global_graph_capture_stream,
     set_global_graph_memory_pool,
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import (  # noqa: F401

@@ -8,6 +8,17 @@ from sglang.srt.runtime_context import (
 )
 
 
+def get_mamba_tracking_slots(
+    *, extra_buffer: bool, overlap: bool, lazy: bool = False
+) -> int:
+    """Tracking slots allocated initially; lazy mode defers the second slot."""
+    if not extra_buffer:
+        return 0
+    if lazy:
+        return 1
+    return 2 if overlap else 1
+
+
 def get_alloc_page_size() -> int:
     # Mirrors _build_token_to_kv_pool_allocator's DCP branch; the platform
     # allocators that skip it page smaller, so this is an upper bound for them.
@@ -33,6 +44,11 @@ def get_alloc_len_per_decode() -> int:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec_algo = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if spec_algo.is_uno():
+        if spec_tokens is None:
+            raise RuntimeError("UNO requires speculative_num_draft_tokens")
+        # UNO retains an additional clean-root position beside Q/F draft slots.
+        return spec_tokens + 1
     if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
         return max(spec_steps * spec_topk, spec_tokens)
     else:
@@ -69,7 +85,7 @@ def page_aligned_decode_alloc_lens(
         cur = r.kv.kv_allocated_len
         nxt = max(
             cur,
-            (r.kv_committed_len + reserve + page_size - 1) // page_size * page_size,
+            (r.kv.kv_committed_len + reserve + page_size - 1) // page_size * page_size,
         )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
@@ -88,9 +104,13 @@ def get_req_to_token_extra_context_len() -> int:
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
     page_size = get_alloc_page_size()
-    if get_spec().speculative_algorithm is not None and page_size > 1:
-        # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
-        # the context limit the aligned reserve can overshoot by page_size - 1;
-        # without the headroom the row write silently lands in the neighbor row.
-        extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+    spec_algorithm = get_spec().speculative_algorithm
+    if spec_algorithm is not None:
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        spec_algo = SpeculativeAlgorithm.from_string(spec_algorithm)
+        if page_size > 1 or spec_algo.is_uno():
+            # UNO's double-buffer reserve applies at every page size. Larger
+            # pages may additionally round the allocation up by page_size - 1.
+            extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
     return extra

@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=4800,
-    suite="nightly-1-npu-a2",
+    suite="full-4-npu-a2",
     nightly=True,
 )
 
@@ -62,7 +62,7 @@ QWEN3_32B_OTHER_ARGS = [
     4,
     "--mem-fraction-static",
     0.845,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     16,
     32,
     64,

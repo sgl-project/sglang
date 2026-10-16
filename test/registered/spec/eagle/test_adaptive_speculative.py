@@ -8,17 +8,19 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=240, suite="stage-b-test-1-gpu-large-amd")
 
 HIGH_ACCEPT_PROMPT = (
@@ -39,8 +41,8 @@ MAX_DOWNSHIFT_ATTEMPTS = 6
 class TestAdaptiveSpeculativeServer(CustomTestCase):
     """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
 
-    model = DEFAULT_TARGET_MODEL_EAGLE
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
@@ -59,6 +61,7 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 f,
             )
             cls.adaptive_config_path = f.name
+        cls.server_log = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
 
         try:
             cls.process = popen_launch_server(
@@ -67,10 +70,13 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--trust-remote-code",
+                    # Target embeddings are shared with the FP16-default draft.
+                    "--dtype",
+                    "bfloat16",
                     "--attention-backend",
                     "triton",
                     "--speculative-algorithm",
-                    "EAGLE",
+                    "EAGLE3",
                     "--speculative-draft-model-path",
                     cls.draft_model,
                     "--speculative-adaptive",
@@ -81,9 +87,12 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                     "--mem-fraction-static",
                     "0.7",
                 ],
+                return_stdout_stderr=(cls.server_log, cls.server_log),
             )
         except Exception:
             os.unlink(cls.adaptive_config_path)
+            cls.server_log.close()
+            os.unlink(cls.server_log.name)
             raise
 
     @classmethod
@@ -92,6 +101,8 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             kill_process_tree(cls.process.pid)
         if os.path.exists(cls.adaptive_config_path):
             os.unlink(cls.adaptive_config_path)
+        cls.server_log.close()
+        os.unlink(cls.server_log.name)
 
     def _get_internal_state(self) -> dict:
         response = requests.get(self.base_url + "/server_info", timeout=30)
@@ -142,25 +153,27 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
                 return state
         return state
 
-    def _drive_downshift(self) -> dict:
-        """Send low-acceptance prompts until steps downshift to 1."""
-        state = self._get_internal_state()
+    def _drive_downshift(self) -> bool:
+        """Send low-acceptance prompts until the server logs a downshift to 1.
+
+        With ema_alpha=1 the steps follow the last verify, so a low-acceptance
+        request can end at either step; the log records every switch.
+        """
+        log_start = os.path.getsize(self.server_log.name)
         for _ in range(MAX_DOWNSHIFT_ATTEMPTS):
             self._generate(LOW_ACCEPT_PROMPT)
-            state = self._get_internal_state()
-            if state["speculative_num_steps"] == 1:
-                return state
-        return state
+            with open(self.server_log.name) as f:
+                f.seek(log_start)
+                if "steps 3 -> 1" in f.read():
+                    return True
+        return False
 
     def test_gsm8k_after_adaptive_switches(self):
         """Exercise up/down/up adaptive switches, then verify GSM8K accuracy."""
         state = self._drive_upshift()
         self.assertEqual(state["speculative_num_steps"], 3, f"Never upshifted: {state}")
 
-        state = self._drive_downshift()
-        self.assertEqual(
-            state["speculative_num_steps"], 1, f"Never downshifted: {state}"
-        )
+        self.assertTrue(self._drive_downshift(), "Never downshifted")
 
         self._drive_upshift()
 
@@ -168,12 +181,11 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=100,
             num_threads=64,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"GSM8K after adaptive switches: {metrics}")
         self.assertGreater(metrics["score"], 0.20)
 

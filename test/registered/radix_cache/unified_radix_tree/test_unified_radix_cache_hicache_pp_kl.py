@@ -5,20 +5,21 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
-
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kits.unified_radix_cache_kit import (
+    AccuracyTwoPassMixin,
+    UnifiedRadixTreeTestMixin,
+)
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=738, stage="nightly", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
@@ -27,9 +28,9 @@ def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
     expected = history_len + output_len
     actual = result["meta_info"]["cached_tokens"]
     lower = max(0, expected - 1)
-    assert (
-        lower <= actual <= expected
-    ), f"{label}: expected cached_tokens in [{lower}, {expected}], got {actual}"
+    assert lower <= actual <= expected, (
+        f"{label}: expected cached_tokens in [{lower}, {expected}], got {actual}"
+    )
 
 
 class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -53,7 +54,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=2048,
             parallel=self.max_running_requests,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)
@@ -85,7 +86,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(cls.max_running_requests),
                 "--max-total-tokens",
                 "14000",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -98,13 +99,15 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-mem-layout",
                 cls.hicache_mem_layout,
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
 
 class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
@@ -129,11 +132,11 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.8",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--max-total-tokens",
                 "14000",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -149,14 +152,14 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
             ],
             env={
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 

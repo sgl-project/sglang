@@ -21,7 +21,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendOffloadModes(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX

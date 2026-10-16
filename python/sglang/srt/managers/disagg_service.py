@@ -1,5 +1,6 @@
 """Start bootstrap/kv-store-related server"""
 
+import logging
 import os
 
 from sglang.srt.disaggregation.utils import (
@@ -13,18 +14,31 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
-def start_disagg_service(
-    server_args: ServerArgs,
-):
+def start_disagg_service():
     # Start kv bootstrap server on prefill
     disagg_mode = DisaggregationMode(get_disagg().disaggregation_mode)
     transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
-        # only start bootstrap server on prefill tm
+    # With role switching, run bootstrap on every instance (not just prefill) so
+    # one flipped to prefill already has it; it isn't rebuilt on flip.
+    start_bootstrap = disagg_mode == DisaggregationMode.PREFILL or (
+        get_disagg().enable_pd_role_switch and disagg_mode != DisaggregationMode.NULL
+    )
+
+    if start_bootstrap and get_disagg().enable_pd_role_switch:
+        logger.warning(
+            "Role switch starts a bootstrap server on this instance at %s:%d. "
+            "If another PD instance runs on the same host, give each one a "
+            "distinct --disaggregation-bootstrap-port or the bind will conflict.",
+            get_serving().host,
+            get_disagg().disaggregation_bootstrap_port,
+        )
+
+    if start_bootstrap:
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
@@ -32,16 +46,12 @@ def start_disagg_service(
             host=get_serving().host,
             port=get_disagg().disaggregation_bootstrap_port,
         )
-        maybe_create_ascend_config_store(
-            server_args=server_args, transfer_backend=transfer_backend
-        )
+        maybe_create_ascend_config_store(transfer_backend=transfer_backend)
 
         return bootstrap_server
 
 
-def maybe_create_ascend_config_store(
-    server_args: ServerArgs, transfer_backend: TransferBackend
-) -> None:
+def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
     """Also called directly by the rust-server scheduler: there the KV
     bootstrap registry is served by the embedded rust server's api listener
     (one rust implementation covers every transfer backend — their

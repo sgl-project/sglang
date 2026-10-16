@@ -24,9 +24,9 @@ def read_mode_per_pass(dir_data: Path):
         for record in data_pack["records"]:
             forward_pass_id = record["forward_pass_id"]
             rank = record["rank"]
-            assert (
-                gpc_of_forward_pass_and_rank[forward_pass_id].get(rank) is None
-            ), f"Duplicated {forward_pass_id=} {rank=}"
+            assert gpc_of_forward_pass_and_rank[forward_pass_id].get(rank) is None, (
+                f"Duplicated {forward_pass_id=} {rank=}"
+            )
             gpc_of_forward_pass_and_rank[forward_pass_id][rank] = record[
                 "global_physical_count"
             ]

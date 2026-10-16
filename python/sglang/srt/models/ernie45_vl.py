@@ -13,6 +13,7 @@
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -54,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 
 class Ernie4_5_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -86,7 +86,6 @@ class Ernie4_5_VisionMLP(nn.Module):
 
 
 class Ernie4_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -145,7 +144,6 @@ class Ernie4_5_VisionBlock(nn.Module):
 
 
 class Ernie4_5_VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -352,7 +350,6 @@ class VariableResolutionResamplerModel(nn.Module):
 
 
 class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.inv_freq = 1.0 / theta ** (
@@ -368,7 +365,6 @@ class Ernie4_5_VisionRotaryEmbedding(nn.Module):
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: PretrainedConfig,
@@ -593,7 +589,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         else:
             self._visual_token_ids_tensor_cache = None
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -715,9 +711,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
         self._set_visual_token_mask(input_ids, forward_batch)
 
-        assert (
-            input_ids.numel() == positions.shape[-1]
-        ), f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        assert input_ids.numel() == positions.shape[-1], (
+            f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

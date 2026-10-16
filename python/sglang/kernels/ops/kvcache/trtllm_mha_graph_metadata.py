@@ -62,38 +62,44 @@ def update_trtllm_mha_graph_metadata_kernel(
     Q_MODE: tl.constexpr,
     PAGE_BLOCK: tl.constexpr,
     BS_BLOCK: tl.constexpr,
+    # 1: the page tables are refreshed out-of-graph, so rebuild only the
+    # seqlen metadata. 0 = static pool, full rebuild.
+    SKIP_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
 
     if pid < bs:
         # One program per batch row: cache_seqlens + page table row(s).
-        req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
         seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
         tl.store(cache_seqlens_ptr + pid, seqlen)
 
-        row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
-        row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride
-        if HAS_SWA:
-            swa_row_out = swa_page_table_ptr + pid.to(tl.int64) * swa_page_table_stride
-        # Self-guard on the device-side seqlen: pages past cdiv(cache_seqlen,
-        # PAGE_SIZE) keep stale values the attention kernels never read.
-        num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
-        for i in range(tl.cdiv(num_live_pages, PAGE_BLOCK)):
-            page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
-            mask = page_idx < num_live_pages
-            token = tl.load(
-                row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
-            )
-            tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+        if not SKIP_PAGE_TABLE:
+            req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+            row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
+            row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride
             if HAS_SWA:
-                token64 = token.to(tl.int64)
-                # Real req_to_token slots are >=0; the token>=0 guard + other=-1 mirror
-                # the swa_out_cache_loc -1 sentinel (uniform handling, no wrap).
-                swa_token = tl.load(
-                    swa_mapping_ptr + token64, mask=mask & (token64 >= 0), other=-1
+                swa_row_out = (
+                    swa_page_table_ptr + pid.to(tl.int64) * swa_page_table_stride
                 )
-                swa_page = tl.where(swa_token < 0, -1, swa_token // PAGE_SIZE)
-                tl.store(swa_row_out + page_idx, swa_page.to(tl.int32), mask=mask)
+            # Self-guard on the device-side seqlen: pages past cdiv(cache_seqlen,
+            # PAGE_SIZE) keep stale values the attention kernels never read.
+            num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
+            for i in range(tl.cdiv(num_live_pages, PAGE_BLOCK)):
+                page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+                mask = page_idx < num_live_pages
+                token = tl.load(
+                    row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
+                )
+                tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+                if HAS_SWA:
+                    token64 = token.to(tl.int64)
+                    # Real req_to_token slots are >=0; the token>=0 guard + other=-1 mirror
+                    # the swa_out_cache_loc -1 sentinel (uniform handling, no wrap).
+                    swa_token = tl.load(
+                        swa_mapping_ptr + token64, mask=mask & (token64 >= 0), other=-1
+                    )
+                    swa_page = tl.where(swa_token < 0, -1, swa_token // PAGE_SIZE)
+                    tl.store(swa_row_out + page_idx, swa_page.to(tl.int32), mask=mask)
     elif pid == bs:
         # Single program: cu_seqlens_k (+ optional cu_seqlens_q) cumsum.
         offs = tl.arange(0, BS_BLOCK)
@@ -145,12 +151,18 @@ def update_trtllm_mha_graph_metadata(
     qlens=None,
     q_stride: int = 0,
     q_mode: int = Q_MODE_NONE,
+    skip_page_table: bool = False,
 ):
     """Launch the fused metadata update (one kernel for the whole replay init).
 
     Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
     page_table / swa_page_table row is (re)written; the tail keeps stale values
     across replays, so consumers must bound reads by cache_seqlens.
+
+    ``skip_page_table=True`` (the unified memory pool): the seqlen metadata is
+    still rebuilt in one launch, but the page-table writes are compiled out --
+    the bound tables are capture-stable read tables the translator
+    refreshes out-of-graph. ``page_table`` may then be None.
     """
     if bs == 0:
         return
@@ -160,6 +172,10 @@ def update_trtllm_mha_graph_metadata(
     # set small enough to stay off the register-pressure / occupancy cliff while
     # being wide enough to cover the static page-table width in few iterations.
     PAGE_BLOCK = 512
+    if skip_page_table:
+        # Dead pointers under SKIP_PAGE_TABLE=1; pass a valid dummy for codegen.
+        page_table = cache_seqlens
+        swa_page_table = None
     has_swa = swa_page_table is not None
     has_swa_out = swa_out_cache_loc is not None
 
@@ -203,4 +219,5 @@ def update_trtllm_mha_graph_metadata(
         Q_MODE=q_mode,
         PAGE_BLOCK=PAGE_BLOCK,
         BS_BLOCK=triton.next_power_of_2(bs),
+        SKIP_PAGE_TABLE=1 if skip_page_table else 0,
     )
