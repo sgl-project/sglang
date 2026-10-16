@@ -32,6 +32,11 @@ def _script_noop(t: ScriptedContext):
     yield
 
 
+def _one_page_prompt_len(t: ScriptedContext) -> int:
+    # The radix tree caches whole pages only, so the prompt must fill at least one.
+    return t.engine_stats()["page_size"] + _SHORT_PROMPT_LEN
+
+
 class TestScriptedRuntimeCore(ScriptedTestCase):
     ENGINE_KWARGS = _ENGINE_KWARGS
 
@@ -234,7 +239,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_flush_cache_clears_radix_tree(t: ScriptedContext):
-        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(prompt_len=_one_page_prompt_len(t), max_new_tokens=2)
         yield from run_until_finished(r)
         for _ in range(3):
             yield
@@ -612,7 +617,7 @@ class TestScriptedRuntimeCore(ScriptedTestCase):
 
     @staticmethod
     def _script_evict_radix(t: ScriptedContext):
-        r = t.start_req(prompt_len=_SHORT_PROMPT_LEN, max_new_tokens=2)
+        r = t.start_req(prompt_len=_one_page_prompt_len(t), max_new_tokens=2)
         yield from run_until_finished(r)
         for _ in range(3):
             yield
