@@ -1168,58 +1168,74 @@ class InklingOutputItemsTestCase(CustomTestCase):
         self.serving._spec_adapter = self.serving._build_spec_adapter()
         tokenizer = load_tml_renderers().tokenizer
         special, text = tokenizer.encode_special, tokenizer.encode_ordinary
-        output_ids = [
+        thinking = [
             special("message_model"),
             special("content_thinking"),
             *text("plan"),
             special("end_message"),
-            *text(
-                '[{"name": "weather", "parameters": {"city": "SF"}}, '
-                '{"name": "weather", "parameters": {"city": "NYC"}}]'
-            ),
-            special("content_model_end_sampling"),
         ]
-        finish = {"type": "stop", "matched": output_ids[-1]}
+        calls = text(
+            '[{"name": "weather", "parameters": {"city": "SF"}}, '
+            '{"name": "weather", "parameters": {"city": "NYC"}}]'
+        )
+        eos = special("content_model_end_sampling")
+        # Headerless after thinking, or framed as a text message as the Inkling
+        # constraint frame samples it.
+        shapes = {
+            "headerless": [*thinking, *calls, eos],
+            "framed": [
+                *thinking,
+                special("message_model"),
+                special("content_text"),
+                *calls,
+                special("end_message"),
+                eos,
+            ],
+        }
         expected = [
             ("reasoning", "plan"),
             ("weather", {"city": "SF"}),
             ("weather", {"city": "NYC"}),
         ]
-        # Engine chunks may batch tokens; arguments must not depend on where
-        # the JSON payload is split, including a final stop-only chunk.
-        chunkings = {
-            "per_token": list(range(1, len(output_ids) + 1)),
-            "stop_only_last_chunk": [len(output_ids) - 1, len(output_ids)],
-            "single_terminal_chunk": [len(output_ids)],
-        }
 
-        for tool_choice in ("required", {"type": "function", "name": "weather"}):
-            request = self.request.model_copy(update={"tool_choice": tool_choice})
-            with self.subTest(tool_choice=tool_choice, stream=False):
-                items = self.serving._make_response_output_items(
-                    request,
-                    "",
-                    Mock(),
-                    require_reasoning=False,
-                    output_ids=output_ids,
-                    finish_reason=finish,
-                )
-                self.assertEqual(
-                    self._summary([i.model_dump() for i in items]), expected
-                )
-            for chunking, ends in chunkings.items():
-                with self.subTest(tool_choice=tool_choice, stream=chunking):
-                    chunks = []
-                    for end in ends:
-                        chunk = engine_chunk("", end)
-                        chunk["output_ids"] = output_ids[:end]
-                        chunk["meta_info"]["finish_reason"] = (
-                            finish if end == len(output_ids) else None
-                        )
-                        chunks.append(chunk)
-                    events = StreamFixture(self.serving, request).run(chunks)
-                    output = event_payloads(events)[-1]["response"]["output"]
-                    self.assertEqual(self._summary(output), expected)
+        for shape, output_ids in shapes.items():
+            finish = {"type": "stop", "matched": eos}
+            # Engine chunks may batch tokens; arguments must not depend on where
+            # the JSON payload is split, including a final stop-only chunk.
+            chunkings = {
+                "per_token": list(range(1, len(output_ids) + 1)),
+                "stop_only_last_chunk": [len(output_ids) - 1, len(output_ids)],
+                "single_terminal_chunk": [len(output_ids)],
+            }
+            for tool_choice in ("required", {"type": "function", "name": "weather"}):
+                request = self.request.model_copy(update={"tool_choice": tool_choice})
+                with self.subTest(shape=shape, tool_choice=tool_choice, stream=False):
+                    items = self.serving._make_response_output_items(
+                        request,
+                        "",
+                        Mock(),
+                        require_reasoning=False,
+                        output_ids=output_ids,
+                        finish_reason=finish,
+                    )
+                    self.assertEqual(
+                        self._summary([i.model_dump() for i in items]), expected
+                    )
+                for chunking, ends in chunkings.items():
+                    with self.subTest(
+                        shape=shape, tool_choice=tool_choice, stream=chunking
+                    ):
+                        chunks = []
+                        for end in ends:
+                            chunk = engine_chunk("", end)
+                            chunk["output_ids"] = output_ids[:end]
+                            chunk["meta_info"]["finish_reason"] = (
+                                finish if end == len(output_ids) else None
+                            )
+                            chunks.append(chunk)
+                        events = StreamFixture(self.serving, request).run(chunks)
+                        output = event_payloads(events)[-1]["response"]["output"]
+                        self.assertEqual(self._summary(output), expected)
 
 
 class SpecAdapterDispatchTestCase(CustomTestCase):
