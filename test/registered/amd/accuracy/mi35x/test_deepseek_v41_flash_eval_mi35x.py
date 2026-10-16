@@ -1,6 +1,6 @@
-"""MI35x DeepSeek-V4.1-Flash GSM8K Completion Evaluation Test (4-GPU)
+"""MI35x DeepSeek-V4.1-Flash sgl-eval GSM8K Chat Evaluation Test (4-GPU)
 
-Tests deepseek-ai/DeepSeek-V4.1-Flash with the GSM8K few-shot benchmark on
+Tests deepseek-ai/DeepSeek-V4.1-Flash with the sgl-eval GSM8K benchmark on
 MI35x.
 
 Server arguments follow the MI350X High-Throughput cell of the cookbook recipe
@@ -15,11 +15,10 @@ DeepSeek-V4.1-Flash ships FP4 experts, which need gfx95x, so this runs on MI35x
 only. The recipe itself is TP4, so the job takes an 8-GPU MI35x runner and uses
 four of its GPUs, like the MiniMax TP4 jobs.
 
-The eval uses the few-shot *completion* harness, as the DeepSeek-V4-Flash MI35x
-test does. It bypasses the chat template, so V4.1's thinking mode cannot route
-the answer into `reasoning_content` and leave `message.content` empty. Scoring
-raw completions keeps this test measuring whether the ROCm kernels produce
-correct tokens.
+The eval runs through the chat template with thinking disabled, so V4.1's
+thinking mode cannot route the answer into `reasoning_content` and leave
+`message.content` empty. That keeps this test measuring whether the ROCm
+kernels produce correct tokens rather than how long the model reasons.
 
 Registry: nightly-amd-4-gpu-mi35x-deepseek-v41-flash suite
 """
@@ -32,7 +31,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -52,23 +51,24 @@ DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(
 )
 SERVER_LAUNCH_TIMEOUT = 5400
 # Measured 0.911 on all 1319 questions with the High-Throughput cell at TP4 on
-# MI35x (rocm10, sgl-project/sglang Actions run 36797490320). The threshold
-# sits 0.02 under that.
+# MI35x (rocm10, sgl-project/sglang Actions run 36797490320), using the earlier
+# 8-shot completion harness. The threshold sits 0.02 under that; recalibrate it
+# from the first sgl-eval nightly.
 ACCURACY_THRESHOLD = 0.89
 TP_SIZE = 4
 
 
 class TestDeepseekV41FlashEvalMI35x(CustomTestCase):
-    """DeepSeek-V4.1-Flash GSM8K Completion Evaluation Test for AMD MI35x."""
+    """DeepSeek-V4.1-Flash sgl-eval GSM8K Chat Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
-        cls.max_new_tokens = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "512"))
+        cls.max_tokens = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "2048"))
 
     def test_deepseek_v41_flash_gsm8k_accuracy(self):
-        """Test DeepSeek-V4.1-Flash with GSM8K few-shot completion benchmark."""
+        """Test DeepSeek-V4.1-Flash with sgl-eval GSM8K chat benchmark."""
         other_args = [
             "--tp",
             str(TP_SIZE),
@@ -119,15 +119,15 @@ class TestDeepseekV41FlashEvalMI35x(CustomTestCase):
             requests.get(self.base_url + "/flush_cache")
 
             args = SimpleNamespace(
-                num_shots=8,
-                data_path=None,
-                num_questions=self.num_questions,
-                parallel=self.num_questions,
-                max_new_tokens=self.max_new_tokens,
+                eval_name="gsm8k",
+                num_examples=self.num_questions,
+                num_threads=self.num_questions,
+                max_tokens=self.max_tokens,
+                sgl_eval_thinking=False,
                 host="127.0.0.1",
                 port=int(self.base_url.split(":")[-1]),
             )
-            metrics = run_eval_few_shot_gsm8k(args)
+            metrics = run_sgl_eval(args)
             acc = metrics["accuracy"]
 
             passed = acc >= ACCURACY_THRESHOLD

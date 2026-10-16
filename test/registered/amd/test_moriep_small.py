@@ -8,7 +8,7 @@ from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import is_port_available
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.sgl_eval_utils import run_sgl_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN,
@@ -131,15 +131,14 @@ class TestPureDP(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
@@ -175,15 +174,14 @@ class TestMTP(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
@@ -228,15 +226,14 @@ class TestNormal(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
@@ -277,15 +274,14 @@ class TestLowLatency(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
@@ -325,15 +321,14 @@ class TestTBOwithNormal(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
@@ -375,15 +370,14 @@ class TestTBOwithLowLatency(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
@@ -428,15 +422,14 @@ class TestMTPwithTBONormal(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
@@ -490,15 +483,14 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         self,
     ):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
@@ -553,15 +545,14 @@ class TestEPLBMoriStat(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=2048,
+            num_threads=128,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.9)
 
