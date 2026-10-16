@@ -434,15 +434,6 @@ ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 
-# sgl-amd-mono: the AMD monokernel plugin (--monokernel-backend amd). Pure Python
-# on top of AITER / FlyDSL; it registers its specs lazily, so it is inert unless a
-# server selects the backend. Installed on gfx950 images only (its kernels are
-# gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
-ARG ENABLE_SGL_AMD_MONO=1
-ARG SGL_AMD_MONO_REPO="https://github.com/sgl-project/sgl-amd-mono.git"
-# the commit python/pyproject_other.toml pins for srt_hip; bump both together
-ARG SGL_AMD_MONO_COMMIT="e07665c8b36f7d42a48f6615bacf911d0656f5c5"
-
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
@@ -759,6 +750,7 @@ RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
 # cannot be satisfied on the ROCm 7.2.4/1000 torch 2.11 stack. The *_rocm724
 # extras carry a 0.16.0 pin instead; all other flavors keep the extras they used before.
+# srt_hip and srt_hip_rocm724 also install the sgl-amd-mono plugin at the commit they pin.
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
@@ -890,18 +882,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     cd fast-hadamard-transform; \
     git checkout -f "${FHT_COMMIT}"; \
     PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST} python setup.py install'
-
-# -----------------------
-# sgl-amd-mono (monokernel plugin; needs the sglang install above)
-RUN /bin/bash -lc 'set -euo pipefail; \
-    [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
-    case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
-    git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
-    cd /sgl-workspace/sgl-amd-mono; \
-    git checkout -f "${SGL_AMD_MONO_COMMIT}"; \
-    python3 -m pip install --no-cache-dir --no-deps -e .; \
-    python3 -c "from importlib.metadata import entry_points; \
-assert any(e.name == \"sgl_amd_mono\" for e in entry_points(group=\"sglang.srt.plugins\")), \"sgl-amd-mono plugin not registered\""'
 
 # -----------------------
 # Python tools
