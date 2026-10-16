@@ -60,9 +60,9 @@ SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
   }
 }
 
-/// \brief Writes the inclusive prefix sum of `masked_m` to `s_row_end` and returns the total row count.
-/// Expert e owns rows [s_row_end[e - 1], s_row_end[e]) of the flattened real-row index.
-/// Requires blockDim.x >= params.num_experts and params.num_experts <= kMaxExperts.
+// Writes the inclusive prefix sum of `masked_m` to `s_row_end` and returns the total row count.
+// Expert e owns rows [s_row_end[e - 1], s_row_end[e]) of the flattened real-row index.
+// Requires blockDim.x >= params.num_experts and params.num_experts <= kMaxExperts.
 SGL_DEVICE uint32_t scan_masked_m(const SiluMulQuantVarlenParams& params, uint32_t* s_row_end) {
   using namespace device;
   static_assert(kWarpThreads == 32);
@@ -88,7 +88,7 @@ SGL_DEVICE uint32_t scan_masked_m(const SiluMulQuantVarlenParams& params, uint32
   return params.num_experts == 0 ? 0u : s_row_end[params.num_experts - 1];
 }
 
-/// \brief Returns the expert that owns flattened real row `row`, which must be below s_row_end[num_experts - 1].
+// Returns the expert that owns flattened real row `row`, which must be below s_row_end[num_experts - 1].
 SGL_DEVICE uint32_t find_expert(const uint32_t* s_row_end, uint32_t num_experts, uint32_t row) {
   uint32_t lo = 0, hi = num_experts - 1;
   while (lo < hi) {
