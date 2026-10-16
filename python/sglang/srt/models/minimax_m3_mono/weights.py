@@ -33,6 +33,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     LOCAL_Q_HEADS,
     N_ROUTED,
     O_K,
+    PADDED_SCALE_COLS,
     ROTARY_DIM,
     TOP_K,
     TOPK_BLOCKS,
@@ -244,13 +245,19 @@ class SparseMoeLayer(msgspec.Struct, frozen=True):
         )
         s13 = _attr(experts, "w13_weight_scale", f"layer {layer_id} experts")
         s2 = _attr(experts, "w2_weight_scale", f"layer {layer_id} experts")
+        # w2's scale is [E, HIDDEN, INTER // 32] before aiter's e8m0_shuffle,
+        # which pads the column count up to a multiple of 8 -- so the stored
+        # tensor is PADDED_SCALE_COLS wide, not INTER // 32. The two agree at
+        # TP4 (24) and TP2 (48) and differ at TP8, where 12 columns are stored
+        # as 16. w13's scale is HIDDEN // 32 = 192 wide and never pads.
         _need(
             s13.dtype == torch.uint8
             and s2.dtype == torch.uint8
             and s13.numel() == E * 2 * INTER * HIDDEN // 32
-            and s2.numel() == E * HIDDEN * INTER // 32,
+            and s2.numel() == E * HIDDEN * PADDED_SCALE_COLS,
             f"layer {layer_id}: expert scales {s13.dtype} {s13.numel()} / "
-            f"{s2.dtype} {s2.numel()}",
+            f"{s2.dtype} {s2.numel()}, want {E * 2 * INTER * HIDDEN // 32} / "
+            f"{E * HIDDEN * PADDED_SCALE_COLS}",
         )
 
         gate = moe.gate.weight

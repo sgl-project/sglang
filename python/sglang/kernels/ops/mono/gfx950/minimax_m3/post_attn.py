@@ -98,6 +98,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.config import (
     MOE_SLOTS,
     N_ROUTED,
     ONE_INDEX_HEAD,
+    PADDED_SCALE_COLS,
     PAGE16,
     SHARED_EXPERT,
     SPARSE_BLOCK,
@@ -116,6 +117,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.index_score import (
 )
 from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     AG_RS_FROM,
+    CAND_CAP,
     DN_ROWS,
     H_SUB,
     ISCORE_BLOCKS,
@@ -123,6 +125,7 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     MERGE_PASSES,
     MERGE_ROUNDS_WHOLE,
     MERGE_SLOTS,
+    MERGE_TAIL_SLOTS,
     MID8_ROUNDS,
     MID8_SLOTS,
     MID_COPY_ROUNDS,
@@ -136,13 +139,19 @@ from sglang.kernels.ops.mono.gfx950.minimax_m3.layout import (
     O_K_SUB,
     O_ROW,
     O_ROWS,
+    P8_WORDS,
     PAGES_PER_BLOCK,
     SCORE_COPIES,
     SCRATCH,
+    SEL_P8_WORDS,
     SH_ROWS,
     SH_TASKS,
     SPLIT_KEYS,
+    SPLIT_LIVE_G4,
     SPLIT_PASSES,
+    SPLIT_ROWS_WHOLE,
+    SPLIT_SLOTS,
+    SPLIT_SLOTS_WHOLE,
     UG_PER_SLOT,
     UG_ROWS,
     XN8_ROW,
@@ -180,7 +189,16 @@ W13_ROWS = 2 * INTER  # gate rows then up rows (GGUU)
 W13_BYTES = W13_ROWS * HIDDEN // 2  # one expert, fp4
 W2_BYTES = HIDDEN * INTER // 2
 W13_SCALE_COLS = HIDDEN // 32
-W2_SCALE_COLS = INTER // 32
+# The STORED width of an aiter-shuffled w2 scale, which is not INTER // 32.
+# e8m0_shuffle lays scales out in groups of 8 columns -- ``group_scale_byte``
+# strides by ``cols // 8`` -- and pads the column count up to a multiple of 8 so
+# that division is exact. At TP4 and TP2 the natural count (24, 48) is already a
+# multiple of 8 and the padding is a no-op, which is why the unpadded value went
+# unnoticed; at TP8 INTER // 32 is 12 against a tensor that is really 16 wide,
+# and the unpadded stride would collapse two column groups into one, reading the
+# wrong scale byte for every k past 256. w13's scale is HIDDEN // 32 = 192 wide
+# and never pads, so W13_SCALE_COLS stays as it is.
+W2_SCALE_COLS = PADDED_SCALE_COLS
 S2_BYTES = (N_ROUTED + 1) * HIDDEN * W2_SCALE_COLS  # e8m0, every expert
 S13_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
 
@@ -192,9 +210,6 @@ def _f32(x: float) -> float:
     return struct.unpack("f", struct.pack("f", x))[0]
 
 
-# blocks at least the selection floor, counted against each other (from ATOM's M3
-# select stage; more than this many ties count every block)
-CAND_CAP = 256
 # ``sel`` (LDS words): a short request's blocks, one put_key entry (two words) a
 # thread; a long request's gathered candidates reuse them
 SEL_WORDS = 2 * THREADS
@@ -214,7 +229,10 @@ assert SEL_WORDS >= 2 * N_SPLIT * TOPK_BLOCKS
 # consumed by its own PV mfma and put to ``sp_o`` first, with the end-of-pass
 # barrier ordering the two. Do not restore the old wording: it would read as a
 # guarantee the two-pass split does not provide.
-SEL_P8_WORDS = 2 * CAND_CAP + 2 + WAVES * TOPK_BLOCKS
+#
+# How wide the shared region has to be is decided in layout (``P8_WORDS``):
+# from TP8 down it is the selection, not the P, that sets the size.
+#
 # blocks a thread keys in its split task's eighth of a context (<= MAX_INDEX_BLOCKS)
 CAND_BATCH = 2
 assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
@@ -239,15 +257,12 @@ assert N_SPLIT == 2 * TOTAL_INDEX_HEADS
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
 assert MAX_TOKENS <= SPARSE_BLOCK
 
-# The merge walks its thread map in MERGE_PASSES whole rounds and has no masked
-# tail, so a TP whose map does not come out whole (TP8: H = 8 fills half a CTA)
-# would write past O_K / 4 words into the pool. Masking it belongs with the
-# H = 8 thread-map work the split and selection stages also need; until then
-# this refuses loudly at import rather than corrupting silently.
-assert MERGE_ROUNDS_WHOLE, (
-    f"the merge needs {MERGE_SLOTS} thread slots, not a whole number of "
-    f"{THREADS}-thread rounds: H = {H} needs a masked tail round"
-)
+# The merge walks its thread map in MERGE_PASSES rounds of THREADS slots. At
+# TP4 and TP2 those come out whole and every thread carries real work; at TP8
+# (H = 8) the map is 256 slots and the single round is half empty, so
+# ``merge_token`` masks its tail -- see MERGE_ROUNDS_WHOLE there. The constant
+# is imported to drive that masking, not to refuse the build.
+assert MERGE_SLOTS <= MERGE_PASSES * THREADS
 
 
 def build_post_attn_kernel(
@@ -286,7 +301,13 @@ def build_post_attn_kernel(
         # mid; wide: also the split's PV partials (the stages take turns)
         x: fx.Array[fx.Int32, POOL, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
-        p8: fx.Array[fx.Int32, H * SPLIT_KEYS // 4, 16]
+        # the split's FP8 P (H heads x SPLIT_KEYS keys), and the selection's
+        # candidates borrowed on top of it. The borrow used to fit under the P
+        # size for free; at TP8 H is 8, so P needs only 512 words while the
+        # selection still needs SEL_P8_WORDS = 642, and the region is sized for
+        # whichever is larger. At TP4 and TP2 P is the larger (1024, 2048 words)
+        # and this is the original size.
+        p8: fx.Array[fx.Int32, P8_WORDS, 16]
         q8: fx.Array[fx.Int32, O_K // 4, 16]
         # PV partials, one split pass' heads (O_K_SUB == O_K at TP4). The wide
         # MoE's up partials reuse this region through ``fpool`` instead.
@@ -389,7 +410,9 @@ def build_post_attn_kernel(
         route = lds.route.ptr
         rwt = lds.rwt.ptr
         keys = lds.sel.ptr
-        assert SEL_P8_WORDS <= H * SPLIT_KEYS // 4
+        # the borrow fits because ``p8`` is sized for it (Smem above), not
+        # because the P it shares the region with happens to be larger
+        assert SEL_P8_WORDS <= P8_WORDS
         assert 2 * THREADS * CAND_BATCH <= WAVES * 64 * 4
         long_keys = fx.recast_iter(fx.Int32, red)
         cand = p8
@@ -872,12 +895,23 @@ def build_post_attn_kernel(
                 return kw, vw
 
             def store_q8(qvs):
+                # A pass' q is SPLIT_SLOTS words, one a thread -- exactly
+                # THREADS where a GQA group is 16 heads, half of it at TP8.
+                # ``q8`` is only O_K // 4 words, so the surplus threads must not
+                # store: unguarded they would run a whole pass' worth past the
+                # array into ``opart``.
                 for p in range_constexpr(SPLIT_PASSES):
                     qv = qvs[p]
-                    fx.ptr_store(
-                        fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
-                        q8 + (p * (O_K_SUB // 4) + tid),
-                    )
+                    if const_expr(SPLIT_SLOTS_WHOLE):
+                        fx.ptr_store(
+                            fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
+                            q8 + (p * SPLIT_SLOTS + tid),
+                        )
+                    elif tid < SPLIT_SLOTS:
+                        fx.ptr_store(
+                            fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
+                            q8 + (p * SPLIT_SLOTS + tid),
+                        )
 
             for ts in range(start("split"), N_SPLIT * tokens, G):
                 ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
@@ -898,8 +932,10 @@ def build_post_attn_kernel(
                     )
                 gpu.barrier()
                 acquire()
-                # Every pass' q heads: q8 is whole-H so all of them have somewhere
-                # to land.
+                # Every pass' q heads. The surplus threads of a short map (TP8)
+                # load a neighbouring token's q and drop it in ``store_q8``;
+                # past the last token the buffer descriptor bounds the load and
+                # returns zero, so the dead lanes are harmless either way.
                 qvs = [
                     ld_bf16x4(rsrc(q), tok * O_K + p * O_K_SUB + tid * 4, CM_K1)
                     for p in range(SPLIT_PASSES)
@@ -923,6 +959,21 @@ def build_post_attn_kernel(
                 # SPLIT_PASSES is 1 at TP4, where h0 is 0, the selection and the
                 # loads were made above, and every index is the original
                 # expression.
+                #
+                # The MFMA is SPLIT_ROWS = 16 rows wide whatever H_SUB is. Where
+                # a GQA group is narrower than that (TP8: 8), rows H_SUB..15 are
+                # not heads: ``a_row`` clamps their A-operand reads onto the last
+                # real head so nothing reads out of bounds, and ``live_row``
+                # drops their C rows at every store. Both are the identity when
+                # the rows come out whole, so TP4 and TP2 emit the original code.
+                def a_row(r):
+                    return r if const_expr(SPLIT_ROWS_WHOLE) else fx.min(r, H_SUB - 1)
+
+                def live_row(r, cond):
+                    """``cond`` and-ed with "MFMA row ``r`` is a real q head"."""
+                    if const_expr(SPLIT_ROWS_WHOLE):
+                        return cond
+                    return cond & (r < H_SUB)
                 for p in range_constexpr(SPLIT_PASSES):
                     h0 = p * H_SUB  # this pass' first head, in the rank's H
                     if const_expr(SPLIT_PASSES > 1):
@@ -946,7 +997,12 @@ def build_post_attn_kernel(
                             qw = fx.Vector(
                                 fx.ptr_load(
                                     q8
-                                    + (p * (O_K_SUB // 4) + l16 * 32 + 8 * s + 2 * g4),
+                                    + (
+                                        p * SPLIT_SLOTS
+                                        + a_row(l16) * 32
+                                        + 8 * s
+                                        + 2 * g4
+                                    ),
                                     result_type=v2i,
                                 )
                             )
@@ -970,7 +1026,8 @@ def build_post_attn_kernel(
                     vmax_w = wave_max(vloc)
                     for e in range_constexpr(4):
                         mh = butterfly(fx.max(sc[0][e], sc[1][e]), (8, 4, 2, 1), fx.max)
-                        if l16 == 0:
+                        # a surplus row's max would land in wave + 1's slots
+                        if live_row(g4 * 4 + e, l16 == 0):
                             fx.ptr_store(mh, hst + (wave * H + h0 + g4 * 4 + e))
                     if lane == 0:
                         # head-independent: every pass recomputes the same value
@@ -983,16 +1040,18 @@ def build_post_attn_kernel(
                         vmax = fx.max(vmax, fx.ptr_load(hst + (3 * WAVES * H + w)))
                     mxs = []
                     for e in range_constexpr(4):
-                        mx = fx.ptr_load(hst + (h0 + g4 * 4 + e))
+                        # a surplus row reads the last real head's max rather
+                        # than another wave's slot; its results are dropped below
+                        hr = h0 + a_row(g4 * 4 + e)
+                        mx = fx.ptr_load(hst + hr)
                         for w in range_constexpr(1, WAVES):
-                            mx = fx.max(
-                                mx, fx.ptr_load(hst + (w * H + h0 + g4 * 4 + e))
-                            )
+                            mx = fx.max(mx, fx.ptr_load(hst + (w * H + hr)))
                         mxs.append(mx)
                     fscale = FP8_MAX * hw_rcp(vmax + 1e-8)
                     pscale = vmax * (1.0 / FP8_MAX)
                     for e in range_constexpr(4):
-                        head = h0 + g4 * 4 + e
+                        row = g4 * 4 + e
+                        head = h0 + row
                         mx = mxs[e]
                         ls = fx.Float32(0.0)
                         for j in range_constexpr(PPW):
@@ -1010,13 +1069,15 @@ def build_post_attn_kernel(
                             )
                             w8 = b8 | (xshfl(b8, 1) << 8)
                             w8 = w8 | (xshfl(w8, 2) << 16)
-                            if l16 % 4 == 0:
+                            # a surplus row's P would run past p8's head
+                            # dimension, over the selection's borrowed words
+                            if live_row(row, l16 % 4 == 0):
                                 kloc = wave * (PPW * PAGE16) + j * PAGE16 + l16
                                 fx.ptr_store(
                                     w8, p8 + (head * (SPLIT_KEYS // 4) + kloc // 4)
                                 )
                         ls = butterfly(ls, (8, 4, 2, 1))
-                        if l16 == 0:
+                        if live_row(row, l16 == 0):
                             fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
                             fx.ptr_store(mx, hst + (2 * WAVES * H + head))
                     gpu.barrier()
@@ -1025,7 +1086,7 @@ def build_post_attn_kernel(
                         fx.ptr_load(
                             p8
                             + (
-                                (h0 + l16) * (SPLIT_KEYS // 4)
+                                (h0 + a_row(l16)) * (SPLIT_KEYS // 4)
                                 + (wave * (PPW * PAGE16) + 8 * g4) // 4
                             ),
                             result_type=v2i,
@@ -1043,32 +1104,53 @@ def build_post_attn_kernel(
                         cv = mfma_fp8(
                             pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
                         )
-                        for e in range_constexpr(4):
-                            fx.ptr_store(
-                                cv[e],
-                                opart
-                                + (
-                                    wave * O_K_SUB
-                                    + (g4 * 4 + e) * HEAD_DIM
-                                    + 16 * jd
-                                    + l16
-                                ),
-                            )
+                        def store_pv(cv=cv, jd=jd):
+                            for e in range_constexpr(4):
+                                fx.ptr_store(
+                                    cv[e],
+                                    opart
+                                    + (
+                                        wave * O_K_SUB
+                                        + (g4 * 4 + e) * HEAD_DIM
+                                        + 16 * jd
+                                        + l16
+                                    ),
+                                )
+
+                        # A surplus row's partials would land in wave + 1's.
+                        # The guard is on the lane group alone (H_SUB is a
+                        # multiple of 4), and is absent entirely when every row
+                        # is a real head.
+                        if const_expr(SPLIT_ROWS_WHOLE):
+                            store_pv()
+                        elif g4 < SPLIT_LIVE_G4:
+                            store_pv()
                     gpu.barrier()
                     # sum the waves' partials: acc = prob_scale * PV, then * (1 / exp_sum), bf16
-                    e0 = tid * 4
-                    head = h0 + e0 // HEAD_DIM
-                    lsum = fx.ptr_load(hst + (WAVES * H + head))
-                    for w in range_constexpr(1, WAVES):
-                        lsum = lsum + fx.ptr_load(hst + (WAVES * H + w * H + head))
-                    inv_l = 1.0 / (lsum > 0.0).select(lsum, fx.Float32(1.0))
-                    ov = []
-                    for k in range_constexpr(4):
-                        acc = fx.ptr_load(opart + (e0 + k))
+                    def reduce_pass(p=p, h0=h0, pscale=pscale):
+                        e0 = tid * 4
+                        head = h0 + e0 // HEAD_DIM
+                        lsum = fx.ptr_load(hst + (WAVES * H + head))
                         for w in range_constexpr(1, WAVES):
-                            acc = acc + fx.ptr_load(opart + (w * O_K_SUB + e0 + k))
-                        ov.append((pscale * acc) * inv_l)
-                    mb_put_bf(mb("sp_o"), ts * O_K + p * O_K_SUB + e0, ov)
+                            lsum = lsum + fx.ptr_load(hst + (WAVES * H + w * H + head))
+                        inv_l = 1.0 / (lsum > 0.0).select(lsum, fx.Float32(1.0))
+                        ov = []
+                        for k in range_constexpr(4):
+                            acc = fx.ptr_load(opart + (e0 + k))
+                            for w in range_constexpr(1, WAVES):
+                                acc = acc + fx.ptr_load(opart + (w * O_K_SUB + e0 + k))
+                            ov.append((pscale * acc) * inv_l)
+                        mb_put_bf(mb("sp_o"), ts * O_K + p * O_K_SUB + e0, ov)
+
+                    # This map walks the pass' O_K_SUB dims four to a thread --
+                    # SPLIT_SLOTS of them, exactly THREADS at TP4 and TP2 and
+                    # half a CTA at TP8. The surplus threads would read past
+                    # ``opart``'s pass region, index ``hst`` past H, and publish
+                    # a whole pass' worth past the token's ``sp_o`` row.
+                    if const_expr(SPLIT_SLOTS_WHOLE):
+                        reduce_pass()
+                    elif tid < SPLIT_SLOTS:
+                        reduce_pass()
                     if const_expr(SPLIT_PASSES > 1):
                         # The next pass overwrites opart, which this one has
                         # just read -- and, less obviously, re-borrows ``p8``
@@ -1092,6 +1174,14 @@ def build_post_attn_kernel(
         stage_select_long()
         stage_split()
 
+        def merge_live(rnd):
+            """Whether this thread's slot in merge round ``rnd`` is a real dim,
+            or None when every thread's is. Only the last round can be short,
+            and only where the map does not come out in whole THREADS rounds."""
+            if const_expr(MERGE_ROUNDS_WHOLE) or rnd < MERGE_PASSES - 1:
+                return None
+            return tid < MERGE_TAIL_SLOTS
+
         def merge_token(k):
             """Token k's partitions merged (the paged decode's reduce; thread = 4 dims
             of one head) and quantized per token (standalone quant: scale = amax *
@@ -1100,7 +1190,17 @@ def build_post_attn_kernel(
 
             One round at TP4, where the CTA's threads cover every head; two at
             TP2. The quantization scale spans every round, because it is one
-            scale for the token's whole merged row."""
+            scale for the token's whole merged row.
+
+            At TP8 the map is 256 slots and the single round is half empty. The
+            surplus threads clamp onto the last real slot rather than running
+            off the end: ``hm`` would otherwise index ``sp_m`` / ``sp_l`` past H
+            into the next partition's slots, and polling a tag that is never
+            published is a hang, not a wrong number. Clamped, they recompute a
+            live thread's dims, so the amax below -- which must span the whole
+            row -- needs no mask: a duplicate changes no maximum. Only the
+            stores are masked, by ``merge_live``, since those are indexed by
+            ``tid`` and not by the clamped slot."""
             sp0 = k * N_SPLIT  # token k's partitions
             # wave 0 waits on every partition's l, then the CTA polls once: 512
             # threads x 24 loads spinning through the whole split load the memory
@@ -1118,6 +1218,8 @@ def build_post_attn_kernel(
                 """Round rnd's four merged dims: slot rnd * THREADS + tid holds
                 dims 4 slot .. + 4, which belong to head slot / (HEAD_DIM / 4)."""
                 slot = rnd * THREADS + tid
+                if const_expr(not MERGE_ROUNDS_WHOLE):
+                    slot = fx.min(slot, MERGE_SLOTS - 1)
                 hm = slot // (HEAD_DIM // 4)
                 e0 = slot * 4
                 # one batch: every partition's (m, l) and this thread's 4 outputs
@@ -1188,12 +1290,22 @@ def build_post_attn_kernel(
                     words, x_scale = merge_token(k)
                     # plain words, then the scale: its pair is the flag
                     for qstore, w in enumerate(words):
-                        bo.buffer_store(
-                            w,
-                            rsrc(mb("attnq")),
-                            k * (O_K // 4) + qstore * THREADS + tid,
-                            cache_modifier=CM_DEV,
-                        )
+
+                        def put(w=w, qstore=qstore):
+                            bo.buffer_store(
+                                w,
+                                rsrc(mb("attnq")),
+                                k * (O_K // 4) + qstore * THREADS + tid,
+                                cache_modifier=CM_DEV,
+                            )
+
+                        # a short tail round would run past this token's
+                        # O_K / 4 words into token k + 1's attnq row
+                        live = merge_live(qstore)
+                        if live is None:
+                            put()
+                        elif live:
+                            put()
                     release_stores()
                     gpu.barrier()
                     if tid == 0:
@@ -1232,8 +1344,18 @@ def build_post_attn_kernel(
                     # the merge folded in: the partitions -> this CTA's fp8 input
                     words, x_scale = merge_token(0)
                     x_scales = [x_scale]
+                    # the second consumer of the merge's rounds: a short tail
+                    # here would run past the o stage's O_K / 4 input words
                     for qo, w in enumerate(words):
-                        fx.ptr_store(w, xs + (qo * THREADS + tid))
+
+                        def put(w=w, qo=qo):
+                            fx.ptr_store(w, xs + (qo * THREADS + tid))
+
+                        live = merge_live(qo)
+                        if live is None:
+                            put()
+                        elif live:
+                            put()
                 else:
                     # the merge tasks' fp8 inputs: every token's scale (published
                     # after its plain words), then the words, 16 B a load

@@ -54,7 +54,57 @@ SPLIT_PASSES = LOCAL_KV_HEADS
 assert H % LOCAL_KV_HEADS == 0, (
     f"{H} q heads do not divide over {LOCAL_KV_HEADS} KV heads"
 )
-assert H_SUB <= 16, f"GQA group {H_SUB} exceeds the split stage's 16-row thread map"
+
+# A-operand rows of the split stage's QK and PV MFMAs. The instruction is
+# 16 x 16 x 32, and its A rows are q heads: a lane reads row ``l16`` and holds
+# C rows ``4 * g4 + e``. The stage was written when a GQA group was exactly 16
+# heads, so the two coincided and the row index needed neither clamp nor guard.
+#
+# That is a TP4 (and TP2-per-pass) coincidence, not an invariant. TP8 gives a
+# rank 8 q heads over its one KV head, so H_SUB is 8 and rows 8..15 are not
+# heads at all: unguarded, their C rows are stored into the next wave's ``hst``
+# slots, past ``p8``'s head dimension, and into the next wave's ``opart``
+# partials -- all silently, since every one of those is an in-bounds LDS word
+# belonging to someone else.
+SPLIT_ROWS = 16
+assert H_SUB <= SPLIT_ROWS, (
+    f"GQA group {H_SUB} exceeds the split stage's {SPLIT_ROWS}-row thread map"
+)
+# Whether every MFMA row is a real q head. When false the stage clamps its
+# A-operand row reads onto the last real head (so nothing reads out of bounds)
+# and drops the surplus C rows at every store.
+SPLIT_ROWS_WHOLE = H_SUB == SPLIT_ROWS
+# The surplus rows are a contiguous tail of ``4 * g4 + e``, so while H_SUB is a
+# multiple of 4 the live test is on the lane group alone and never on ``e``.
+assert H_SUB % 4 == 0, (
+    f"GQA group {H_SUB} leaves a partial 4-lane C-row group in the split stage"
+)
+SPLIT_LIVE_G4 = H_SUB // 4  # lane groups whose C rows are real heads
+# The per-pass q and PV thread maps walk O_K_SUB // 4 slots, one thread each --
+# exactly THREADS at H_SUB == 16 and half of it at TP8, where the surplus
+# threads must not store (``q8`` and the ``sp_o`` row are only O_K_SUB wide).
+SPLIT_SLOTS = O_K_SUB // 4
+SPLIT_SLOTS_WHOLE = SPLIT_SLOTS == THREADS
+assert SPLIT_SLOTS <= THREADS, (
+    f"the split stage needs {SPLIT_SLOTS} thread slots a pass, past THREADS"
+)
+# q8 holds every pass' q at once, so the passes' maps must fit it end to end.
+assert SPLIT_SLOTS * SPLIT_PASSES <= O_K // 4, (
+    f"{SPLIT_PASSES} passes of {SPLIT_SLOTS} slots overrun q8's {O_K // 4} words"
+)
+
+# ``p8`` (LDS words): the split's FP8 P, H heads x SPLIT_KEYS keys -- and, on
+# top of the same region, the indexer selection's candidates, their counter and
+# the lane groups' maxima. The borrow's safety is argued where it happens
+# (post_attn); what is decided here is only how wide the region must be.
+#
+# It used to be sized by P alone, on the reasoning that the borrow fits under
+# it. That holds at TP4 (1024 words) and TP2 (2048) and fails at TP8, where a
+# rank's 8 q heads need only 512 while the selection still needs 642: sized by
+# P, the candidates would run over the end of the region.
+CAND_CAP = 256  # blocks counted against each other in the selection floor
+SEL_P8_WORDS = 2 * CAND_CAP + 2 + WAVES * TOPK_BLOCKS
+P8_WORDS = max(H * SPLIT_KEYS // 4, SEL_P8_WORDS)
 
 # A page-16 of ONE KV head (``pre_attn.PAGE_BYTES``). The cache is
 # [page16][kv head][...] -- aiter's sparse views are k.view(-1, heads, 8, 16, 16)
@@ -283,11 +333,15 @@ O_ROW = O_K // 4 + 4
 MERGE_SLOTS = H * (HEAD_DIM // 4)
 MERGE_PASSES = -(-MERGE_SLOTS // THREADS)
 # Whether those rounds come out whole. At TP8 (H = 8) the merge needs only half
-# a CTA, so its tail round has to be masked out of both the amax reduction and
-# the store, or it writes past O_K / 4 words and corrupts the pool. The refusal
-# lives with the merge stage in post_attn, not here: this module only states
-# the map, and TP8's other constants are perfectly well defined.
+# a CTA, so its tail round is masked out of the mailbox polls, the amax
+# reduction and the store alike -- see ``merge_token`` in post_attn. Leaving it
+# unmasked was not merely wasteful: ``hm`` ran past H into the next partition's
+# ``sp_m`` / ``sp_l`` slots (a poll on a tag that is never published, i.e. a
+# hang, not a wrong number), and the store ran past O_K / 4 words into the next
+# token's ``attnq`` row.
 MERGE_ROUNDS_WHOLE = MERGE_SLOTS == MERGE_PASSES * THREADS
+# Slots the tail round actually carries (== THREADS when the rounds are whole).
+MERGE_TAIL_SLOTS = MERGE_SLOTS - (MERGE_PASSES - 1) * THREADS
 # The narrow MoE path's two mid passes, over a MOE_SLOTS * INTER region: 3840
 # at TP4, 7680 at TP2, 1920 at TP8. (The wide path, from WIDE_FROM tokens up,
 # derives its own counts from the row count it is given.) The copy moves two

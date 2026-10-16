@@ -54,6 +54,18 @@ print(json.dumps({
     "MERGE_SLOTS": l.MERGE_SLOTS,
     "MERGE_PASSES": l.MERGE_PASSES,
     "MERGE_ROUNDS_WHOLE": l.MERGE_ROUNDS_WHOLE,
+    "MERGE_TAIL_SLOTS": l.MERGE_TAIL_SLOTS,
+    "SPLIT_ROWS": l.SPLIT_ROWS,
+    "SPLIT_ROWS_WHOLE": l.SPLIT_ROWS_WHOLE,
+    "SPLIT_LIVE_G4": l.SPLIT_LIVE_G4,
+    "SPLIT_SLOTS": l.SPLIT_SLOTS,
+    "SPLIT_SLOTS_WHOLE": l.SPLIT_SLOTS_WHOLE,
+    "SPLIT_KEYS": l.SPLIT_KEYS,
+    "CAND_CAP": l.CAND_CAP,
+    "SEL_P8_WORDS": l.SEL_P8_WORDS,
+    "P8_WORDS": l.P8_WORDS,
+    "WAVES": c.WAVES,
+    "TOPK_BLOCKS": c.TOPK_BLOCKS,
     "MID_COPY_ROUNDS": l.MID_COPY_ROUNDS,
     "MID8_SLOTS": l.MID8_SLOTS,
     "MID8_ROUNDS": l.MID8_ROUNDS,
@@ -223,6 +235,135 @@ class TestMonoM3PerTP(CustomTestCase):
         self.assertEqual(v2["MID_COPY_ROUNDS"], 8)
         self.assertEqual(v2["MID8_ROUNDS"], 2)
 
+    def test_the_split_mfma_has_rows_that_are_not_heads(self):
+        """The split stage's QK / PV MFMA is SPLIT_ROWS = 16 rows wide whatever
+        a rank's GQA group is. The stage was written when the group was exactly
+        16, so an MFMA row and a q head were the same thing and the row index
+        needed neither clamp nor guard.
+
+        That is a coincidence of TP4 (and of TP2's per-pass group), not an
+        invariant: at TP8 a rank has 8 q heads over its one KV head, so rows
+        8..15 are not heads at all. The requirement is that the build knows
+        which rows are real -- SPLIT_ROWS_WHOLE -- and that the live rows are a
+        whole number of 4-lane C-row groups, since that is the granularity the
+        stage's store guards work at."""
+        for tp, v in self.v.items():
+            msg = f"TP{tp}"
+            self.assertEqual(v["SPLIT_ROWS"], 16, msg)
+            self.assertLessEqual(v["H_SUB"], v["SPLIT_ROWS"], f"{msg} group > map")
+            self.assertEqual(
+                v["SPLIT_ROWS_WHOLE"], v["H_SUB"] == v["SPLIT_ROWS"], msg
+            )
+            # the C-row guard is on the lane group alone, so H_SUB must be a
+            # whole number of them
+            self.assertEqual(v["H_SUB"] % 4, 0, f"{msg} partial C-row group")
+            self.assertEqual(v["SPLIT_LIVE_G4"], v["H_SUB"] // 4, msg)
+            self.assertLessEqual(v["SPLIT_LIVE_G4"], 4, f"{msg} past the 4 groups")
+        # TP4 and TP2 fill every row; TP8 fills half. Were this not so, the
+        # clamps and guards would be dead code at every TP and this test could
+        # not tell a correct build from the pre-fix one.
+        self.assertTrue(self.v[4]["SPLIT_ROWS_WHOLE"])
+        self.assertTrue(self.v[2]["SPLIT_ROWS_WHOLE"])
+        self.assertFalse(self.v[8]["SPLIT_ROWS_WHOLE"])
+        self.assertEqual(self.v[8]["SPLIT_LIVE_G4"], 2)
+
+    def test_the_split_per_pass_map_fits_the_q_it_stages(self):
+        """A split pass stages its q as SPLIT_SLOTS words, one a thread, and
+        ``q8`` holds every pass at once. The pre-fix stage stored one word per
+        thread unconditionally, i.e. THREADS words a pass -- correct only
+        because O_K_SUB // 4 happens to come to exactly THREADS at TP4 and at
+        TP2. The requirement is coverage both ways: the map must reach the end
+        of the pass' q, and must not run past what q8 holds."""
+        for tp, v in self.v.items():
+            msg = f"TP{tp}"
+            self.assertEqual(v["SPLIT_SLOTS"], v["O_K_SUB"] // 4, msg)
+            self.assertLessEqual(v["SPLIT_SLOTS"], v["THREADS"], f"{msg} > a CTA")
+            self.assertEqual(
+                v["SPLIT_SLOTS_WHOLE"], v["SPLIT_SLOTS"] == v["THREADS"], msg
+            )
+            self.assertLessEqual(
+                v["SPLIT_SLOTS"] * v["SPLIT_PASSES"],
+                v["O_K"] // 4,
+                f"{msg} the passes overrun q8",
+            )
+        # Negative control on the pre-fix expression: an unguarded one-word-a-
+        # thread store is THREADS * SPLIT_PASSES words. That is exactly q8 at
+        # TP4 and TP2 and twice q8 at TP8, which is the bug.
+        for tp in (2, 4):
+            v = self.v[tp]
+            self.assertEqual(v["THREADS"] * v["SPLIT_PASSES"], v["O_K"] // 4)
+        v8 = self.v[8]
+        self.assertGreater(v8["THREADS"] * v8["SPLIT_PASSES"], v8["O_K"] // 4)
+
+    def test_the_merge_tail_round_is_short_and_known_to_be(self):
+        """The merge walks H * HEAD_DIM / 4 slots in whole THREADS rounds. At
+        TP8 that is 256 slots in a 512-thread round, so the last round is half
+        empty: its surplus threads must not store (they would run past the
+        token's O_K / 4 words into the next token's attnq row) and must not
+        poll ``sp_m`` / ``sp_l`` at a head index past H, which is a tag that is
+        never published and so a hang rather than a wrong number.
+
+        The requirement is that the rounds cover the map exactly and that the
+        tail's width is known, so the stage can mask it."""
+        for tp, v in self.v.items():
+            msg = f"TP{tp}"
+            rounds, threads = v["MERGE_PASSES"], v["THREADS"]
+            # the rounds cover the map, and no round is wholly wasted
+            self.assertGreaterEqual(rounds * threads, v["MERGE_SLOTS"], msg)
+            self.assertLess((rounds - 1) * threads, v["MERGE_SLOTS"], msg)
+            self.assertEqual(
+                v["MERGE_TAIL_SLOTS"],
+                v["MERGE_SLOTS"] - (rounds - 1) * threads,
+                msg,
+            )
+            self.assertGreater(v["MERGE_TAIL_SLOTS"], 0, msg)
+            self.assertLessEqual(v["MERGE_TAIL_SLOTS"], threads, msg)
+            self.assertEqual(
+                v["MERGE_ROUNDS_WHOLE"], v["MERGE_TAIL_SLOTS"] == threads, msg
+            )
+            # a slot is 4 dims of one head, so the tail must not split a head
+            self.assertEqual(v["MERGE_TAIL_SLOTS"] % (128 // 4), 0, f"{msg} head")
+        # TP4 and TP2 come out whole; TP8 is the build that needs the mask
+        self.assertTrue(self.v[4]["MERGE_ROUNDS_WHOLE"])
+        self.assertTrue(self.v[2]["MERGE_ROUNDS_WHOLE"])
+        self.assertFalse(self.v[8]["MERGE_ROUNDS_WHOLE"])
+        self.assertEqual(self.v[8]["MERGE_TAIL_SLOTS"], 256)
+
+    def test_p8_holds_the_selection_it_lends_its_region_to(self):
+        """``p8`` carries the split's FP8 P and, on top of it, the indexer
+        selection's candidates, counter and lane maxima. Sizing it by P alone
+        is right only while P is the larger of the two -- true at TP4 (1024
+        words) and TP2 (2048), false at TP8, where a rank's 8 heads need 512
+        against the selection's 642. The requirement is that the region holds
+        both, whichever is larger."""
+        for tp, v in self.v.items():
+            msg = f"TP{tp}"
+            p_words = v["H"] * v["SPLIT_KEYS"] // 4
+            self.assertEqual(
+                v["SEL_P8_WORDS"],
+                2 * v["CAND_CAP"] + 2 + v["WAVES"] * v["TOPK_BLOCKS"],
+                msg,
+            )
+            self.assertGreaterEqual(v["P8_WORDS"], p_words, f"{msg} P short")
+            self.assertGreaterEqual(
+                v["P8_WORDS"], v["SEL_P8_WORDS"], f"{msg} selection short"
+            )
+            self.assertEqual(v["P8_WORDS"], max(p_words, v["SEL_P8_WORDS"]), msg)
+        # Negative control on the pre-fix bound, which was P alone: it holds the
+        # selection at TP4 and TP2 and is 130 words short at TP8.
+        for tp in (2, 4):
+            v = self.v[tp]
+            self.assertGreaterEqual(
+                v["H"] * v["SPLIT_KEYS"] // 4, v["SEL_P8_WORDS"], f"TP{tp}"
+            )
+        v8 = self.v[8]
+        self.assertLess(v8["H"] * v8["SPLIT_KEYS"] // 4, v8["SEL_P8_WORDS"])
+        self.assertEqual(v8["SEL_P8_WORDS"], 642)
+        self.assertEqual(v8["P8_WORDS"], 642)
+        # and the region must not have grown where it was already big enough
+        self.assertEqual(self.v[4]["P8_WORDS"], 1024)
+        self.assertEqual(self.v[2]["P8_WORDS"], 2048)
+
     def test_the_narrow_pool_holds_what_the_down_stage_stages(self):
         """The narrow MoE keeps every token's mids three ways at once -- bf16 as
         they land, then MXFP8 and its E8M0 scales -- so the pool must cover all
@@ -263,13 +404,11 @@ class TestMonoM3PerTP(CustomTestCase):
                 narrow, list(range(1, v["WIDE_FROM"])), f"TP{tp} narrow widths"
             )
 
-    def test_tp8_merge_still_needs_a_masked_tail(self):
-        """A known gap, asserted so it cannot be forgotten: at H = 8 the merge
-        fills half a CTA, so its rounds do not come out whole and post_attn
-        refuses to build. TP2 and TP4 do come out whole."""
-        self.assertFalse(self.v[8]["MERGE_ROUNDS_WHOLE"], "TP8 merge")
-        for tp in (2, 4):
-            self.assertTrue(self.v[tp]["MERGE_ROUNDS_WHOLE"], f"TP{tp} merge")
+    # The merge's half-empty TP8 round used to be asserted here as a known gap
+    # that made post_attn refuse to build. It is now masked rather than
+    # refused, and the same three facts -- TP8 short, TP4 and TP2 whole -- are
+    # asserted by test_the_merge_tail_round_is_short_and_known_to_be, together
+    # with the tail width the mask needs.
 
     def test_one_cta_per_shared_expert_task(self):
         """``has_sh = start("shared") < SH_TASKS`` with ``start`` taken mod
