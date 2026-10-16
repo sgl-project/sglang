@@ -1,5 +1,6 @@
 """CPU unit tests for Bailing serialized blockwise-FP8 TP requantization."""
 
+import contextlib
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -256,13 +257,24 @@ class TestBailingMoeV3TpRequant(CustomTestCase):
                     # experts never consult it.
                     self.assertEqual(bool(validated), not is_fp4_experts)
 
-    def _standalone_tail_supported(self, *, scale_fmt=None, dispatched=None):
+    @staticmethod
+    def _tail_quant_config(scale_fmt=None):
+        return SimpleNamespace(
+            get_name=lambda: "fp8",
+            use_mxfp8=False,
+            weight_block_size=[128, 128],
+            is_checkpoint_fp8_serialized=True,
+            scale_fmt=scale_fmt,
+        )
+
+    @contextlib.contextmanager
+    def _tail_runtime(self, *, tp_size=8, dispatched=None, deepgemm_scale_ue8m0=False):
         parallel = SimpleNamespace(
-            tp_size=8,
+            tp_size=tp_size,
             tp_rank=3,
             moe_ep_size=1,
             moe_dp_size=1,
-            moe_tp_size=8,
+            moe_tp_size=tp_size,
             moe_tp_rank=3,
         )
         runtime = SimpleNamespace(
@@ -282,13 +294,6 @@ class TestBailingMoeV3TpRequant(CustomTestCase):
                 partial(deepgemm, act_scale_ue8m0=True) if act_scale_ue8m0 else deepgemm
             )
 
-        quant_config = SimpleNamespace(
-            get_name=lambda: "fp8",
-            use_mxfp8=False,
-            weight_block_size=[128, 128],
-            is_checkpoint_fp8_serialized=True,
-            scale_fmt=scale_fmt,
-        )
         with (
             patch.object(bailing_module, "_is_cuda", True),
             patch.object(bailing_module, "_is_hip", False),
@@ -301,36 +306,61 @@ class TestBailingMoeV3TpRequant(CustomTestCase):
             ),
             patch.object(bailing_module.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
             patch.object(
-                bailing_module.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False
+                bailing_module.deep_gemm_wrapper,
+                "DEEPGEMM_SCALE_UE8M0",
+                deepgemm_scale_ue8m0,
             ),
             patch.object(
                 bailing_module, "dispatch_w8a8_block_fp8_linear", side_effect=dispatch
             ),
         ):
-            return BailingMLP.validate_standalone_fp8_tail(
-                hidden_size=4096,
-                intermediate_size=1280,
-                quant_config=quant_config,
-                tp_size=8,
-            )
+            yield
+
+    @staticmethod
+    def _tail_kwargs(quant_config, tp_size=8):
+        return dict(
+            hidden_size=4096,
+            intermediate_size=1280,
+            quant_config=quant_config,
+            tp_size=tp_size,
+        )
 
     def test_standalone_tail_gate_accepts_tp8_logical_160(self):
-        self.assertTrue(self._standalone_tail_supported())
+        kwargs = self._tail_kwargs(self._tail_quant_config())
+        with self._tail_runtime():
+            self.assertTrue(BailingMLP.validate_standalone_fp8_tail(**kwargs))
+            self.assertEqual(BailingMLP.standalone_fp8_tail_route(**kwargs), "deepgemm")
 
     def test_standalone_tail_gate_sees_through_ue8m0_activation_policy(self):
         # Dispatch wraps DeepGEMM in a partial for ue8m0 checkpoints; both the
         # gate and the down-projection pre-quant switch must still recognise it.
-        self.assertTrue(self._standalone_tail_supported(scale_fmt="ue8m0"))
+        kwargs = self._tail_kwargs(self._tail_quant_config(scale_fmt="ue8m0"))
+        with self._tail_runtime():
+            self.assertEqual(BailingMLP.standalone_fp8_tail_route(**kwargs), "deepgemm")
         deepgemm = bailing_module.deepgemm_w8a8_block_fp8_linear_with_fallback
         self.assertTrue(
             BailingMLP._is_deepgemm_block_linear(
                 partial(deepgemm, act_scale_ue8m0=True)
             )
         )
-        with self.assertRaisesRegex(NotImplementedError, "native Hopper DeepGEMM"):
-            self._standalone_tail_supported(
-                dispatched=fp8_utils_module.triton_w8a8_block_fp8_linear
-            )
+        with self._tail_runtime(
+            dispatched=fp8_utils_module.triton_w8a8_block_fp8_linear
+        ):
+            self.assertEqual(BailingMLP.standalone_fp8_tail_route(**kwargs), "triton")
+
+    def test_ue8m0_deepgemm_routes_the_standalone_tail_through_triton(self):
+        # SM100+ DeepGEMM only takes UE8M0 scales, which the requantized fp32
+        # local grid is not; the tail must fall to Triton block-FP8, not refuse.
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
+                kwargs = self._tail_kwargs(
+                    self._tail_quant_config(scale_fmt="ue8m0"), tp_size=tp_size
+                )
+                with self._tail_runtime(tp_size=tp_size, deepgemm_scale_ue8m0=True):
+                    self.assertTrue(BailingMLP.validate_standalone_fp8_tail(**kwargs))
+                    self.assertEqual(
+                        BailingMLP.standalone_fp8_tail_route(**kwargs), "triton"
+                    )
 
     def test_ep_keeps_the_padded_shared_mlp_without_consulting_the_tail_gate(self):
         quant_config = SimpleNamespace(
@@ -373,7 +403,7 @@ class TestBailingMoeV3TpRequant(CustomTestCase):
         )
         with (
             patch.object(bailing_module, "_is_cuda", False),
-            self.assertRaisesRegex(NotImplementedError, "native Hopper DeepGEMM"),
+            self.assertRaisesRegex(NotImplementedError, "pure-TP MoE"),
         ):
             BailingMLP.validate_standalone_fp8_tail(
                 hidden_size=4096,
@@ -490,29 +520,42 @@ class TestBailingMoeV3TpRequant(CustomTestCase):
         gate_up_output = torch.linspace(-1, 1, rows * 2 * local_size).reshape(
             rows, 2 * local_size
         )
-        mlp = BailingMLP.__new__(BailingMLP)
-        torch.nn.Module.__init__(mlp)
-        mlp.swiglu_limit = None
-        mlp.padded_size_per_partition = None
-        mlp.hidden_size = 256
-        mlp.act_fn = _CpuSiluAndMul()
-        mlp.gate_up_proj = _FixedGateUpProjection(gate_up_output)
-        mlp.down_proj = _CaptureDownProjection()
-        mlp.use_prequantized_fp8_tail = True
-        mlp.quant_config = SimpleNamespace(weight_block_size=[128, 128])
+        for route in ("deepgemm", "triton"):
+            with self.subTest(route=route):
+                mlp = BailingMLP.__new__(BailingMLP)
+                torch.nn.Module.__init__(mlp)
+                mlp.swiglu_limit = None
+                mlp.padded_size_per_partition = None
+                mlp.hidden_size = 256
+                mlp.act_fn = _CpuSiluAndMul()
+                mlp.gate_up_proj = _FixedGateUpProjection(gate_up_output)
+                mlp.down_proj = _CaptureDownProjection()
+                mlp.use_prequantized_fp8_tail = True
+                mlp.fp8_tail_route = route
+                mlp.quant_config = SimpleNamespace(weight_block_size=[128, 128])
+                tma_calls = []
 
-        with patch.object(
-            bailing_module.deep_gemm_wrapper,
-            "get_mn_major_tma_aligned_tensor",
-            side_effect=lambda scale: scale,
-            create=True,
-        ):
-            mlp(torch.zeros(rows, 256))
+                def tma_align(scale):
+                    tma_calls.append(scale)
+                    return scale
 
-        quantized, scale = mlp.down_proj.last_input
-        self.assertEqual(tuple(quantized.shape), (rows, local_size))
-        self.assertEqual(tuple(scale.shape), (rows, 2))
-        self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
+                with patch.object(
+                    bailing_module.deep_gemm_wrapper,
+                    "get_mn_major_tma_aligned_tensor",
+                    side_effect=tma_align,
+                    create=True,
+                ):
+                    mlp(torch.zeros(rows, 256))
+
+                quantized, scale = mlp.down_proj.last_input
+                self.assertEqual(tuple(quantized.shape), (rows, local_size))
+                self.assertEqual(tuple(scale.shape), (rows, 2))
+                self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
+                # Triton block-FP8 reads row-major (M, ceil(K / 128)) scales.
+                self.assertEqual(len(tma_calls), 0 if route == "triton" else 1)
+                if route == "triton":
+                    self.assertTrue(scale.is_contiguous())
+                    self.assertTrue(quantized.is_contiguous())
 
     def test_requantize_reblocks_tp_local_weights_on_cpu(self):
         moe = self._empty_moe()
