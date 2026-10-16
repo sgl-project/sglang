@@ -22,9 +22,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
-    get_bool_env_var,
     is_cuda,
     is_hip,
     is_musa,
@@ -36,7 +36,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
     from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8

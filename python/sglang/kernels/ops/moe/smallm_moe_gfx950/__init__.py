@@ -26,10 +26,10 @@ import torch
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
 )
+from sglang.srt.environ import envs
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "smallm_moe.hip")
-_ENV = "SGLANG_ROCM_SMALLM_MOE"
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 # Dispatch cap: above this token count aiter's flydsl path is faster (crossover ~44
@@ -168,7 +168,7 @@ def smallm_moe_enabled() -> bool:
     (hidden 4096, top-10 plus the optional fused shared expert). There is no model-name check;
     smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
-    if os.environ.get(_ENV, "1") == "0":
+    if not envs.SGLANG_ROCM_SMALLM_MOE.get():
         return False
     if _available is None:
         arch = ""

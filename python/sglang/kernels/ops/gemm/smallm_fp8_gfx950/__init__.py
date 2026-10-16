@@ -19,6 +19,7 @@ from sglang.kernels.ops.moe.smallm_moe_gfx950 import (
     _hipcc,
     _Kernel,
 )
+from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_fp8_gemm.hip")
 # (N, K) -> ((max M, n-tiles per block, k steps per wave, waves, LDS-staged activations), ...), first match wins.
@@ -47,7 +48,7 @@ class Args(ctypes.Structure):
 
 def smallm_fp8_gemm_enabled() -> bool:
     global _mod
-    if os.environ.get("SGLANG_ROCM_SMALLM_FP8_PROJ", "1") == "0":
+    if not envs.SGLANG_ROCM_SMALLM_FP8_PROJ.get():
         return False
     if _mod is None:
         _mod = False
