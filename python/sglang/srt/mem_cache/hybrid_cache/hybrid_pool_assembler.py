@@ -2263,6 +2263,13 @@ class _DsaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        config = prepare_host_pool_config(
+            decls=kvcache.host_pool_decls(),
+            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
+            transfer_layer_id_max=kvcache.layer_num,
+            transfer_page_size=params.page_size,
+            packed_draft_device_pools=params.mtp_draft_device_pools,
+        )
         mla_dedup_context = maybe_create_mla_host_dedup_context(
             kvcache,
             params.tp_cache_group,
@@ -2274,13 +2281,6 @@ class _DsaStrategy(StackStrategy):
         )
         mla_is_dummy = (
             mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
-        )
-        config = prepare_host_pool_config(
-            decls=kvcache.host_pool_decls(),
-            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
-            transfer_layer_id_max=kvcache.layer_num,
-            transfer_page_size=params.page_size,
-            packed_draft_device_pools=params.mtp_draft_device_pools,
         )
         try:
             host_pool_group = build_host_pool_group(
