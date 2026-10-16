@@ -518,6 +518,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.auxiliary_swa_host_hit_length = 0
         req.retracted_stain = False
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
