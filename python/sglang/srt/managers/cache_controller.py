@@ -589,6 +589,7 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        prefetch_policy: Optional[str] = None,
     ):
         """Attach (enable) storage backend at runtime.
 
@@ -605,6 +606,7 @@ class HiCacheController:
             validate_hicache_dcp_storage(
                 get_server_args(),
                 storage_backend=storage_backend,
+                prefetch_policy=prefetch_policy,
             )
             self._validate_dcp_storage_pools(
                 self.storage_host_pool,

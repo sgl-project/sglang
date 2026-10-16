@@ -170,6 +170,7 @@ class StorageAttachment:
                 model_name=served_model_name,
                 storage_backend_extra_config=extra_config,
                 host_pools=controller.mem_pool_host.entries,
+                prefetch_policy=cache.prefetch_stop_policy,
             )
         except Exception as e:
             (

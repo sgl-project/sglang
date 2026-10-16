@@ -1,5 +1,6 @@
 """Startup and runtime support boundaries for DCP storage."""
 
+import threading
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -233,6 +234,15 @@ class TestDcpStorageGuards(CustomTestCase):
             )
 
     def test_decode_runtime_uses_effective_prefetch_policy(self):
+        pool = _make_host_pool(0, dcp_size=2, layout="page_first")
+        self.addCleanup(pool.destroy)
+        anchor = PoolEntry(
+            PoolName.KV,
+            pool,
+            pool.device_pool,
+            lambda x: x,
+            is_primary_index_anchor=True,
+        )
         for attached in (False, True):
             for startup, current, requested, accepted in (
                 ("wait_complete", "wait_complete", "best_effort", False),
@@ -241,12 +251,23 @@ class TestDcpStorageGuards(CustomTestCase):
                 ("timeout", "timeout", "wait_complete", True),
                 ("timeout", "wait_complete", None, True),
             ):
-                controller = SimpleNamespace(
-                    storage_backend_type="file",
-                    write_policy="write_back",
-                    attach_storage_backend=mock.Mock(),
-                    mem_pool_host=SimpleNamespace(entries=[]),
-                )
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.storage_backend_type = "file"
+                controller.write_policy = "write_back"
+                controller.enable_storage = attached
+                controller.storage_host_pool = pool
+                controller.mem_pool_host = HostPoolGroup([anchor])
+                controller.host_memory_mode = "cache"
+                controller.page_size = pool.logical_page_size
+                controller.pp_group = controller.pp_prefetch_command_group = None
+                controller.storage_stop_event = threading.Event()
+                # Keep both controller validation layers real; isolate only
+                # worker/group startup and backend creation from this CPU test.
+                controller._stop_storage_threads = mock.Mock()
+                controller._start_storage_threads = mock.Mock()
+                controller._create_sync_groups = mock.Mock(return_value=[])
+                controller._generate_storage_config = mock.Mock()
+
                 cache = SimpleNamespace(
                     cache_controller=controller,
                     enable_storage=attached,
@@ -279,6 +300,13 @@ class TestDcpStorageGuards(CustomTestCase):
                         "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
                         return_value=True,
                     ),
+                    mock.patch(
+                        "sglang.srt.managers.cache_controller.get_parallel",
+                        return_value=SimpleNamespace(attn_dcp_size=2),
+                    ),
+                    mock.patch(
+                        "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
+                    ),
                     mock.patch.object(attachment, "apply_runtime_config"),
                 ):
                     ok, reason = attachment.attach(
@@ -295,7 +323,7 @@ class TestDcpStorageGuards(CustomTestCase):
                         self.assertEqual(controller.write_policy, "write_back")
                         self.assertEqual(cache.write_through_threshold, 2)
                         self.assertTrue(cache.is_write_back)
-                        controller.attach_storage_backend.assert_not_called()
+                        self.assertEqual(controller.enable_storage, attached)
 
     def test_decode_storage_keeps_promised_prefetches_complete(self):
         # Decode promises the probed L3 span to prefill before the read runs;

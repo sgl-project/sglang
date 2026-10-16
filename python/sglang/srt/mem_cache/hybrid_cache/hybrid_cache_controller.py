@@ -303,6 +303,7 @@ class HybridCacheController(BaseHiCacheController):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
+        prefetch_policy: Optional[str] = None,
     ):
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
@@ -334,6 +335,7 @@ class HybridCacheController(BaseHiCacheController):
                 prefetch_threshold=prefetch_threshold,
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
+                prefetch_policy=prefetch_policy,
             )
         except Exception:
             if self.pp_prefetch_command_group is not None:
