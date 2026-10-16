@@ -15,10 +15,11 @@ from sglang.srt.models.dspark import (
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
-    sample_draft_block,
+    resolve_draft_params,
+    run_draft_proposal,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-    DsparkDraftSampler,
+from sglang.srt.speculative.dspark_components.dspark_proposal_graph_tail import (
+    DraftProposalGraphTail,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -123,18 +124,37 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
             prev = (base[:, step].float() + bias).argmax(-1)
             self.assertEqual(eager_tokens[0, step].item(), prev.item())
 
-    def test_captured_sampler_matches_eager_block(self):
+    def test_graph_tail_matches_eager_proposal(self):
         # The real tail (staging, static buffers, [:bs] views) against eager.
+        for sample_from_anchor in (True, False):
+            for greedy_draft in (False, True):
+                for with_confidence in (True, False):
+                    with self.subTest(
+                        sample_from_anchor=sample_from_anchor,
+                        greedy_draft=greedy_draft,
+                        with_confidence=with_confidence,
+                    ):
+                        self._check_graph_tail_matches_eager(
+                            sample_from_anchor=sample_from_anchor,
+                            greedy_draft=greedy_draft,
+                            with_confidence=with_confidence,
+                        )
+
+    def _check_graph_tail_matches_eager(
+        self, *, sample_from_anchor, greedy_draft, with_confidence
+    ):
         torch.manual_seed(1)
         head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(DEVICE)
         head = head.to(torch.bfloat16)
         weight = torch.randn(VOCAB, 64, device=DEVICE).to(torch.bfloat16)
         model = SimpleNamespace(
             markov_head=head,
-            confidence_head=DSparkConfidenceHead(hidden_size=64, markov_rank=RANK).to(
-                DEVICE
+            confidence_head=(
+                DSparkConfidenceHead(hidden_size=64, markov_rank=RANK).to(DEVICE)
+                if with_confidence
+                else None
             ),
-            sample_from_anchor=True,
+            sample_from_anchor=sample_from_anchor,
             lm_head=SimpleNamespace(org_vocab_size=VOCAB, weight=weight),
             compute_base_logits=lambda hidden: (hidden @ weight.T, hidden),
         )
@@ -145,27 +165,28 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         noise = DraftNoise(
             key=5, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
-        sampler = DsparkDraftSampler(
+        tail = DraftProposalGraphTail(
             model=model,
             gamma=GAMMA,
             max_bs=2 * BS,
             device=DEVICE,
             noise=noise,
             tp_sync=tp_sync,
-            greedy_draft=False,
+            greedy_draft=greedy_draft,
         )
-        hidden = torch.randn(BS * GAMMA, 64, device=DEVICE).to(torch.bfloat16)
-        input_ids = torch.randint(0, VOCAB, (BS * GAMMA,), device=DEVICE)
+        query_token_num = GAMMA if sample_from_anchor else GAMMA + 1
+        hidden = torch.randn(BS * query_token_num, 64, device=DEVICE).to(torch.bfloat16)
+        input_ids = torch.randint(0, VOCAB, (BS * query_token_num,), device=DEVICE)
         sampling_info = SimpleNamespace(
             is_all_greedy=False,
             temperatures=(torch.rand(BS, 1, device=DEVICE) + 0.3),
             top_ks=torch.tensor([1, 40] * (BS // 2), device=DEVICE),
         )
-        sampler.stage_sampling_params(bs=BS, sampling_info=sampling_info)
-        sampler(hidden, input_ids)  # warm up outside the capture
+        tail.stage_sampling_params(bs=BS, sampling_info=sampling_info)
+        tail(hidden, input_ids)  # warm up outside the capture
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            sampler(hidden, input_ids)
+            tail(hidden, input_ids)
         noise.offset.zero_()
         graph.replay()
         torch.cuda.synchronize()
@@ -173,30 +194,29 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         eager_noise = DraftNoise(
             key=5, offset=torch.zeros(1, dtype=torch.int64, device=DEVICE)
         )
-        eager = sample_draft_block(
-            base_logits=model.compute_base_logits(hidden)[0].view(BS, GAMMA, -1),
-            anchor_tokens=input_ids.view(BS, GAMMA)[:, 0],
-            draft_hidden=hidden.view(BS, GAMMA, -1),
-            sampling_info=sampling_info,
-            markov_head=head,
+        params = resolve_draft_params(sampling_info=sampling_info, bs=BS, device=DEVICE)
+        eager = run_draft_proposal(
+            model=model,
+            hidden_states=hidden,
+            anchor_tokens=input_ids.view(BS, query_token_num)[:, 0],
+            bs=BS,
+            gamma=GAMMA,
+            step_temperatures=params.step_temperatures,
             noise=eager_noise,
-            device=DEVICE,
             tp_sync=tp_sync,
-            greedy_draft=False,
+            greedy_draft=greedy_draft,
         )
-        self.assertTrue(
-            torch.equal(sampler.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
-        )
-        self.assertTrue(torch.equal(sampler.step_logits[:BS], eager.corrected_logits))
+        folded, _ = tail.views(BS)
         self.assertEqual(noise.offset.item(), eager_noise.offset.item())
-        # Folded steps carry the confidence the eager proposal computes.
-        confidence, confidence_raw = model.compute_confidence(
-            anchor_tokens=input_ids.view(BS, GAMMA)[:, 0],
-            draft_tokens=eager.draft_tokens,
-            confidence_features=hidden,
-        )
-        self.assertTrue(torch.equal(sampler.confidence_out[:BS], confidence))
-        self.assertTrue(torch.equal(sampler.confidence_raw_out[:BS], confidence_raw))
+        if greedy_draft:
+            self.assertIsNone(folded.step_logits)
+            self.assertIsNone(eager.step_logits)
+        if not with_confidence:
+            self.assertIsNone(folded.confidence)
+            self.assertIsNone(eager.confidence)
+        for name, value in eager._asdict().items():
+            if value is not None:
+                self.assertTrue(torch.equal(getattr(folded, name), value), name)
 
 
 if __name__ == "__main__":
