@@ -177,12 +177,14 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
                 "SGLANG_DSV4_KV_LAYOUT=auto or v4 and "
                 "SGLANG_DSV4_COMPRESSED_KV_LAYOUT=auto or fp8."
             )
-        if get_exec().kernel.dsv4_attn_backend == "trtllm":
+        if get_exec().kernel.dsv4_attn_backend in ("trtllm", "flashmla_mega"):
             raise ValueError(
-                "DeepSeek V4 HiSparse requires packed V4 KV pages and does not "
-                "support --dsv4-attn-backend trtllm."
+                "DeepSeek V4 HiSparse requires packed V4 KV pages; use "
+                "--dsv4-attn-backend flashmla instead of trtllm or flashmla_mega."
             )
         return KVLayout.V4, None if option == "auto" else option
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+        mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
             "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
