@@ -873,9 +873,9 @@ def is_swa_req_ring(allocator) -> bool:
 
 
 def swa_kept_out_of_tree(allocator) -> bool:
-    """Whether radix-tree nodes do not own the SWA state: a per-request SWA ring,
-    or the DeepSeek-V4.1 encoder-replay request window, which replay rebuilds on a
-    prefix hit. SWA bookkeeping must not gate prefix matching for either."""
+    """Whether the SWA state must not gate prefix matching: a per-request SWA ring,
+    or a paged SWA pool beside the target's encoder-replay request window, which
+    then holds only a draft's SWA (DSpark on HIP still addresses it paged)."""
     if not isinstance(allocator, SWATokenToKVPoolAllocator):
         return False
     if allocator.swa_req_ring:

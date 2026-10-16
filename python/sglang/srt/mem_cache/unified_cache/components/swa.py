@@ -359,8 +359,8 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # SWA state that tree nodes do not own (a per-request ring, or a request
-        # window rebuilt by replay) must not gate prefix matching.
+        # SWA state that tree nodes do not own (a per-request ring, or a paged pool
+        # holding only a draft's SWA) must not gate prefix matching.
         swa_out_of_tree = swa_kept_out_of_tree(self.cache.token_to_kv_pool_allocator)
 
         def validator(node: UnifiedTreeNode) -> bool:
