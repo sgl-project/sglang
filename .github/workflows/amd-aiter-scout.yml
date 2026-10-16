@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: 'main'
+      sglang_ref:
+        description: 'SGLang branch the test jobs check out. Default: amd/aiter-ci'
+        required: false
+        type: string
+        default: 'amd/aiter-ci'
       job_filter:
         description: 'Workflows: nightly-amd, pr-test-amd. Default: all'
         required: false
@@ -89,7 +94,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
-      ref: amd/aiter-ci
+      ref: ${{ inputs.sglang_ref || 'amd/aiter-ci' }}
       rocm_version: all
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
       job_filter: 'all'
@@ -102,7 +107,7 @@ jobs:
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
-      ref: amd/aiter-ci
+      ref: ${{ inputs.sglang_ref || 'amd/aiter-ci' }}
       rocm_version: all
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
@@ -120,7 +125,7 @@ jobs:
         run: |
           echo "## AMD AITER Scout Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **SGLang ref:** \`amd/aiter-ci\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SGLang ref:** \`${{ inputs.sglang_ref || 'amd/aiter-ci' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
