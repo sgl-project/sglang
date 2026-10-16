@@ -188,7 +188,7 @@ class DeltaSession:
                 # A process range spans separate apply/resume RPCs. Thread-local
                 # push/pop ranges must not be left open across those calls.
                 session.nvtx_pause_id = profiling.nvtx.range_start("gpu_delta.pause")
-        if profiling.DETAIL:
+        if profiling.ENABLED:
             fence = profiling.annotate("gpu_delta.pause.reader_fence")(fence)
             retract = profiling.annotate("gpu_delta.pause.retract")(retract)
             if flush is not None:

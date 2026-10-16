@@ -64,8 +64,8 @@ class TestCanonicalPlanCache(unittest.TestCase):
         )
         for enabled in (False, True):
             with (
-                self.subTest(detail=enabled),
-                patch.object(layout.profiling, "DETAIL", enabled),
+                self.subTest(enabled=enabled),
+                patch.object(layout.profiling, "ENABLED", enabled),
                 patch.object(layout.profiling, "nvtx", nvtx, create=True),
                 patch.object(
                     torch.cuda, "Event", side_effect=AssertionError("new event")

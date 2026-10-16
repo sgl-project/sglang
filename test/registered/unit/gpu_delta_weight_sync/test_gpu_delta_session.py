@@ -690,12 +690,8 @@ def test_nvtx_disabled_identity_and_worker_exception_balance(monkeypatch):
 
     monkeypatch.setattr(profiling, "ENABLED", False)
     assert profiling.annotate("unused")(work) is work
-    assert profiling.annotate("unused", detail=True)(work) is work
     monkeypatch.setattr(profiling, "ENABLED", True)
-    monkeypatch.setattr(profiling, "DETAIL", False)
-    assert profiling.annotate("unused", detail=True)(work) is work
-    monkeypatch.setattr(profiling, "DETAIL", True)
-    wrapped = profiling.annotate("gpu_delta.worker", detail=True)(work)
+    wrapped = profiling.annotate("gpu_delta.worker")(work)
     with delta_runtime.ThreadPoolExecutor(max_workers=1) as pool:
         worker_id = pool.submit(wrapped).result()
         with pytest.raises(RuntimeError, match="worker failure"):
@@ -718,7 +714,6 @@ def test_nvtx_pause_ends_only_after_successful_unpause(
     events = []
     profiling = delta_runtime.profiling
     monkeypatch.setattr(profiling, "ENABLED", True)
-    monkeypatch.setattr(profiling, "DETAIL", False)
 
     def start(name):
         events.append(("start", name))
@@ -728,6 +723,8 @@ def test_nvtx_pause_ends_only_after_successful_unpause(
         profiling,
         "nvtx",
         SimpleNamespace(
+            range_push=lambda name: None,
+            range_pop=lambda: None,
             range_start=start,
             range_end=lambda handle: events.append(("end", handle)),
             mark=lambda name: events.append(("mark", name)),

@@ -32,7 +32,6 @@ import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta import profiling
-
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
 
 
@@ -129,7 +128,7 @@ def _write_record(directory, name, record):
     temporary.replace(directory / (name + ".json"))
 
 
-@profiling.annotate("gpu_delta.host.read_verify_worker", detail=True)
+@profiling.annotate("gpu_delta.host.read_verify_worker")
 def _read_verify_payload(source, destination, expected, skip_payload_hash):
     started = time.perf_counter()
     with source.open("rb", buffering=0) as incoming:
@@ -160,7 +159,7 @@ def _read_verify_payload(source, destination, expected, skip_payload_hash):
     return read_s, time.perf_counter() - started
 
 
-@profiling.annotate("gpu_delta.host.read_verify", detail=True)
+@profiling.annotate("gpu_delta.host.read_verify")
 def _read_verify_payloads(
     publication, files, definitions, pool, metrics, skip_payload_hash
 ):
@@ -201,7 +200,7 @@ def _natural_key(name):
     )
 
 
-@profiling.annotate("gpu_delta.host.tensor_layout", detail=True)
+@profiling.annotate("gpu_delta.host.tensor_layout")
 def _tensor_layout(entries):
     layout, size = {}, 0
     for entry in entries:
@@ -229,7 +228,7 @@ _PREPARE_METRICS = (
 )
 
 
-@profiling.annotate("gpu_delta.host.outer_zstd_worker", detail=True)
+@profiling.annotate("gpu_delta.host.outer_zstd_worker")
 def _decode_zstd_group(jobs, destination, files, pool):
     metrics = {name: 0 for name in _PREPARE_METRICS}
     for entry, record in jobs:
@@ -249,7 +248,7 @@ def _decode_zstd_group(jobs, destination, files, pool):
     return metrics
 
 
-@profiling.annotate("gpu_delta.host.copy_worker", detail=True)
+@profiling.annotate("gpu_delta.host.copy_worker")
 def _copy_group(jobs, destination, files, pool):
     metrics = {name: 0 for name in _PREPARE_METRICS}
     for entry, record in jobs:
@@ -274,7 +273,7 @@ def _copy_group(jobs, destination, files, pool):
     return metrics
 
 
-@profiling.annotate("gpu_delta.host.prepare_arena", detail=True)
+@profiling.annotate("gpu_delta.host.prepare_arena")
 def _prepare_arena(destination, layout, files, entries, pool, metrics, codec):
     started = time.perf_counter()
     jobs, futures, error = [], [], None
@@ -390,7 +389,7 @@ class HostArena:
         metrics["host_rank_allocation_calls"] = int(allocation is not None)
         metrics["host_rank_allocation_bytes"] = self.capacity["capacity"]
 
-    @profiling.annotate("gpu_delta.host.prepare_encoded", detail=True)
+    @profiling.annotate("gpu_delta.host.prepare_encoded")
     def prepare_encoded(
         self,
         manifest_path,
@@ -562,7 +561,7 @@ class HostArena:
         timings.update(metrics)
         return index, files
 
-    @profiling.annotate("gpu_delta.host.prepare_local", detail=True)
+    @profiling.annotate("gpu_delta.host.prepare_local")
     def prepare_local(self, index, files, local_entries, pool, timings):
         """Prepare local payloads; the caller retains file views until this returns."""
         metrics = {

@@ -396,8 +396,11 @@ directly by DE; these traffic categories are not a throughput estimate.
 before decode. Batch/group/contract/grid counts describe the runtime work;
 `apply_kernel_cache_reused` is a per-rank boolean, not a number of reused groups. `host_batch_plan_reused` reports cached active tensor geometry.
 
-`GPU_DELTA_NVTX=1` labels preparation and scheduler controls; level `2` adds
-worker, planning and enqueue detail for Nsight Systems. CUDA timing events are
+`SGLANG_ENABLE_NVTX_OPERATIONS=1` labels preparation, scheduler controls,
+worker, planning and enqueue work for Nsight Systems. The benchmark enables it
+with `--profile-version`; it also enables other SGLang operation annotations.
+The separate benchmark NVTX range still limits capture to the selected update.
+CUDA timing events are
 not collected in receipts. CPU timings and counters remain available for W&B
 metrics independently of profiling. GPU work and host ranges can overlap;
 nvCOMP can wait inside an Async call, so enqueue durations can contain GPU

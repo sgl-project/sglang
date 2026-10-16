@@ -267,7 +267,7 @@ class NvcompDecoder:
             geometry.append((count, int(decoded.max()), int(decoded.sum())))
         return geometry, bounds, remainders
 
-    @profiling.annotate("gpu_delta.prepare.decoder_metadata", detail=True)
+    @profiling.annotate("gpu_delta.prepare.decoder_metadata")
     def prepare_batches(
         self,
         table: np.ndarray,
@@ -406,7 +406,7 @@ class PreparedDecodePlan:
         ):
             record_device_stream(tensor, stream)
 
-    @profiling.annotate("gpu_delta.pause.bind_decoder_outputs", detail=True)
+    @profiling.annotate("gpu_delta.pause.bind_decoder_outputs")
     def bind_outputs(
         self, decoded_slots: Sequence[torch.Tensor]
     ) -> list[PreparedDecode]:
@@ -485,7 +485,7 @@ class PreparedDecode:
     output_offsets: np.ndarray
     output_pointers: np.ndarray
 
-    @profiling.annotate("gpu_delta.pause.nvcomp_enqueue", detail=True)
+    @profiling.annotate("gpu_delta.pause.nvcomp_enqueue")
     def enqueue(self) -> None:
         """Launch only; caller checks statuses/sizes on device before applying weights.
 
