@@ -2,7 +2,7 @@
 
 Each server configuration lives in its own file under
 ``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
-configurations partition independently across GB300 runners. Both use default
+configurations partition independently across GB300 runners. All use default
 decoder bounded replay and explicitly enabled breakable prefill graphs.
 """
 
