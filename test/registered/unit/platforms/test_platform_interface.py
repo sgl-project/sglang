@@ -543,6 +543,42 @@ class TestMpsDeviceMixin(CustomTestCase):
                 common.get_device.cache_clear()
 
 
+class TestMusaAvailableMemory(CustomTestCase):
+    def test_integrated_and_discrete_memory_sources(self):
+        from sglang.srt.utils import common
+
+        gpu_id = 3
+        for integrated in (True, False):
+            for empty_cache in (True, False):
+                with self.subTest(integrated=integrated, empty_cache=empty_cache):
+                    musa = MagicMock()
+                    musa.device_count.return_value = 4
+                    musa.current_device.return_value = gpu_id
+                    musa.get_device_properties.return_value.is_integrated = integrated
+                    musa.mem_get_info.return_value = (2 << 30, 16 << 30)
+                    with (
+                        patch.object(torch, "musa", musa, create=True),
+                        patch.object(common.psutil, "virtual_memory") as host_memory,
+                        patch.object(common, "empty_device_cache") as clear_cache,
+                    ):
+                        host_memory.return_value.available = 6 << 30
+                        self.assertEqual(
+                            common.get_available_gpu_memory(
+                                "musa", gpu_id, empty_cache=empty_cache
+                            ),
+                            6.0 if integrated else 2.0,
+                        )
+                        if integrated:
+                            musa.mem_get_info.assert_not_called()
+                        else:
+                            musa.mem_get_info.assert_called_once_with(gpu_id)
+                            host_memory.assert_not_called()
+                        if empty_cache:
+                            clear_cache.assert_called_once_with(musa)
+                        else:
+                            clear_cache.assert_not_called()
+
+
 class TestPinMemoryAvailability(CustomTestCase):
     """Tests for common pin-memory helper dispatch through platforms."""
 
