@@ -193,10 +193,21 @@ _page_cache_dropped = False
 def _drop_checkpoint_page_cache() -> tuple[int, int]:
     """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
     try:
-        model_path = get_model().model_path
+        model = get_model()
+        model_path, revision = model.model_path, model.revision
     except (ValueError, AttributeError):
         # No published runtime context (unit tests, offline tools): nothing to drop.
         return 0, 0
+    if not os.path.isdir(model_path):
+        # A hub id: the files live in the local snapshot the loader read.
+        try:
+            from huggingface_hub import snapshot_download
+
+            model_path = snapshot_download(
+                model_path, revision=revision, local_files_only=True
+            )
+        except Exception:
+            return 0, 0
     files, nbytes = 0, 0
     for f in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
         try:
@@ -419,18 +430,22 @@ class _HostTableVMM:
             start, end = 0, bounds[-1]
             nbytes = _table_nbytes(end - start, dim)
             if group.rank_in_group == 0:
-                vmm = VMMHostMemory(nbytes)
+                vmm = self._allocate(nbytes, group)
                 size = group.broadcast_object(vmm.size(), src=0)
                 fd = exchange_fd(group, vmm.export_fd(), name=name)
             else:
                 size = group.broadcast_object(None, src=0)
+                if size is None:
+                    raise RuntimeError(
+                        "engram host table: rank 0 could not allocate the VMM table"
+                    )
                 fd = exchange_fd(group, None, name=name)
                 vmm = VMMHostMemory(size, fd)
             os.close(fd)
         else:
             start, end = load_rows
             nbytes = _table_nbytes(end - start, dim)
-            vmm = VMMHostMemory(nbytes)
+            vmm = self._allocate(nbytes)
         device_ptr = vmm.ptr()
         buffer = (ctypes.c_uint8 * nbytes).from_address(device_ptr)
         self.vmm = vmm
@@ -446,6 +461,19 @@ class _HostTableVMM:
             is_full=layout != EngramTableLayout.PRIVATE,
             device_ptr=device_ptr,
         )
+
+    @staticmethod
+    def _allocate(nbytes: int, peers=None) -> VMMHostMemory:
+        # cuMemCreate on a host NUMA node does not reclaim page cache, and the
+        # checkpoint's cached pages can take most of the node.
+        _drop_page_cache_once("before allocating the VMM host table")
+        try:
+            return VMMHostMemory(nbytes)
+        except RuntimeError:
+            if peers is not None:
+                # The peers wait for the size; None makes them raise too.
+                peers.broadcast_object(None, src=0)
+            raise
 
     def mark_loaded(self):
         self.dirty = True
