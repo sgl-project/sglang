@@ -8,15 +8,17 @@ Verifies the contract that:
      mm_hashes — the property external KV routers depend on.
 
 The wiring step that copies GenerateReqInput.mm_hashes into per-item
-MultimodalDataItem.hash lives in tokenizer_manager.py and is exercised by
-the e2e serve tests; this file pins the unit-level invariants the wiring
-relies on.
+MultimodalDataItem.hash lives in tokenizer_manager.py
+(TokenizerManager._apply_caller_mm_hashes); the gating tests below exercise
+it directly. Issue #44641: the copy is only performed when the server is
+launched with --trust-caller-mm-hashes.
 """
 
 import asyncio
 import pickle
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -31,6 +33,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
 )
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -233,6 +236,54 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
         item.hash = item.pad_value = None
         with self.assertRaisesRegex(RuntimeError, "shutdown"):
             await self.executor.set_pad_values([item])
+
+
+class TestCallerMmHashesGating(CustomTestCase):
+    """Issue #44641: caller mm_hashes must not steer the prefix-cache
+    identity unless --trust-caller-mm-hashes is set."""
+
+    def _manager(self, trust: bool) -> TokenizerManager:
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.server_args = SimpleNamespace(trust_caller_mm_hashes=trust)
+        manager._warned_caller_mm_hashes_ignored = False
+        return manager
+
+    def _run(self, manager, mm_hashes, num_items=1):
+        req = GenerateReqInput(
+            text="hi",
+            image_data=["http://example.com/img.png"] * num_items,
+            mm_hashes=mm_hashes,
+        )
+        items = [MultimodalDataItem(modality=Modality.IMAGE) for _ in range(num_items)]
+        mm_inputs = SimpleNamespace(mm_items=items)
+        manager._apply_caller_mm_hashes(req, mm_inputs)
+        return items
+
+    def test_ignored_by_default(self):
+        """Default: caller hashes are ignored; items keep hash=None so the
+        content-based hash is recomputed downstream."""
+        items = self._run(self._manager(trust=False), ["deadbeef00000001"])
+        self.assertIsNone(items[0].hash)
+        self.assertIsNone(items[0].pad_value)
+
+    def test_honored_with_flag(self):
+        """--trust-caller-mm-hashes: caller hash drives item hash/pad_value,
+        preserving the external-KV-router use case."""
+        items = self._run(self._manager(trust=True), ["deadbeef00000001"])
+        self.assertEqual(items[0].hash, 0xDEADBEEF00000001)
+        self.assertEqual(items[0].pad_value, _compute_pad_value(0xDEADBEEF00000001))
+
+    def test_length_mismatch_ignored_with_flag(self):
+        items = self._run(self._manager(trust=True), ["aa", "bb"], num_items=1)
+        self.assertIsNone(items[0].hash)
+
+    def test_malformed_entry_ignored_with_flag(self):
+        items = self._run(self._manager(trust=True), ["not-a-hex!!"])
+        self.assertIsNone(items[0].hash)
+
+    def test_no_mm_hashes_is_noop(self):
+        items = self._run(self._manager(trust=True), None)
+        self.assertIsNone(items[0].hash)
 
 
 if __name__ == "__main__":

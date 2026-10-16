@@ -547,6 +547,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
+        self._warned_caller_mm_hashes_ignored = False
 
         # Init model config
         self.init_model_config()
@@ -1093,6 +1094,68 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    def _apply_caller_mm_hashes(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        mm_inputs,
+    ) -> None:
+        """Apply caller-declared mm_hashes to multimodal items, if trusted.
+
+        Setting MultimodalDataItem.hash here short-circuits the internal
+        hash_feature() recompute inside set_pad_value(), making the derived
+        pad_value deterministic from the caller's hash. That lets an external
+        KV router's routing decision agree with sglang's prefix-cache key
+        for the same image.
+
+        A caller-declared hash becomes the prefix-cache identity of the image
+        segment, so honoring it is opt-in behind --trust-caller-mm-hashes:
+        without the flag, any client could declare another image's hash and
+        silently reuse (or observe) its cached KV, including across tenants.
+        With the flag unset, caller mm_hashes are ignored and the
+        content-based hash is recomputed downstream as before — mirroring the
+        embedding path, which never accepts caller mm_hashes (see #34411).
+
+        On any per-item parse error or list-length mismatch we fall back to
+        the internal recompute so a malformed mm_hashes never blocks a
+        request.
+        """
+        caller_mm_hashes = getattr(obj, "mm_hashes", None)
+        if not (caller_mm_hashes and mm_inputs and mm_inputs.mm_items):
+            return
+        if not self.server_args.trust_caller_mm_hashes:
+            self._warn_caller_mm_hashes_ignored()
+            return
+        if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+            logger.warning(
+                "mm_hashes length (%d) != mm_items length (%d); "
+                "ignoring caller hashes for this request.",
+                len(caller_mm_hashes),
+                len(mm_inputs.mm_items),
+            )
+            return
+        for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+            if not isinstance(item, MultimodalDataItem):
+                continue
+            try:
+                item.set_hash(int(hex_hash, 16))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring malformed mm_hashes entry %r; "
+                    "this item will fall back to hash_feature().",
+                    hex_hash,
+                )
+
+    def _warn_caller_mm_hashes_ignored(self) -> None:
+        """Log once per worker that caller mm_hashes were ignored."""
+        if getattr(self, "_warned_caller_mm_hashes_ignored", False):
+            return
+        self._warned_caller_mm_hashes_ignored = True
+        logger.warning(
+            "Ignoring caller-provided mm_hashes: --trust-caller-mm-hashes "
+            "is not set, so the multimodal prefix-cache identity is derived "
+            "from the content-based hash instead."
+        )
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1230,35 +1293,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     token_type_ids = token_type_ids.flatten().tolist()
             # Caller-supplied per-image hashes (external KV routers, e.g.
             # routing-aware orchestrators that compute a content-addressed
-            # hash before dispatch). Setting MultimodalDataItem.hash here
-            # short-circuits the internal hash_feature() recompute inside
-            # set_pad_value(), making the derived pad_value deterministic
-            # from the caller's hash. That alignment lets the router's
-            # routing decision agree with sglang's prefix-cache key for
-            # the same image. On any per-item parse error or list-length
-            # mismatch we fall back to the internal recompute so a
-            # malformed mm_hashes never blocks a request.
-            caller_mm_hashes = getattr(obj, "mm_hashes", None)
-            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
-                    logger.warning(
-                        "mm_hashes length (%d) != mm_items length (%d); "
-                        "ignoring caller hashes for this request.",
-                        len(caller_mm_hashes),
-                        len(mm_inputs.mm_items),
-                    )
-                else:
-                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
-                        if not isinstance(item, MultimodalDataItem):
-                            continue
-                        try:
-                            item.set_hash(int(hex_hash, 16))
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring malformed mm_hashes entry %r; "
-                                "this item will fall back to hash_feature().",
-                                hex_hash,
-                            )
+            # hash before dispatch). Honoring them is opt-in via
+            # --trust-caller-mm-hashes; see _apply_caller_mm_hashes for why
+            # the default is to ignore them.
+            self._apply_caller_mm_hashes(obj, mm_inputs)
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
