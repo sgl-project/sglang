@@ -181,13 +181,11 @@ class NgramEmbeddingManager:
             for req in batch.reqs:
                 # full_untruncated_fill_ids is only refreshed on the extend and
                 # decode paths, which a PD decode request has not run yet.
-                fill_ids = req.origin_input_ids + req.output_ids
-                end = len(fill_ids) - 1
-                ids = fill_ids[max(0, end - n1) : end]
+                # Slice the tail first: origin_input_ids can be ~100k tokens.
+                tail = (req.origin_input_ids[-(n1 + 1) :] + req.output_ids)[-(n1 + 1) :]
+                ids = tail[:-1]
                 rows.append([0] * (n1 - len(ids)) + list(ids))
-            # PD admission fences the schedule stream behind the in-flight
-            # forward. Keep these history seeds asynchronous so that fence
-            # does not also block the CPU from preparing the next step.
+            # Pinned copies keep the admission fence from stalling the CPU.
             slots = async_h2d(
                 [req.kv.req_pool_idx for req in batch.reqs],
                 dtype=torch.int64,
