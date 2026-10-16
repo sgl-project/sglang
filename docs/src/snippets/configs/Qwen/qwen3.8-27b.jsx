@@ -15,7 +15,7 @@
 export const config = {
   modelName: "Qwen3.8-27B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300"],
+  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300", "mi355x"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs, so they are not in the shared catalog.
@@ -61,6 +61,10 @@ export const config = {
       // to bf16 here rather than fp8_e4m3; the cells pin fp8_e4m3 explicitly,
       // which makes the launch command and the KV pool identical either way.
       { id: "nvfp4-nvidia",    label: "NVFP4-NVIDIA"    },
+      // AMD's Quark export for CDNA4 (MI355X): MXFP4 W4A4 language model,
+      // vision encoder kept in bf16. OCP MXFP4, not NVFP4 -- only the
+      // mi355x cell serves it.
+      { id: "mxfp4",           label: "MXFP4"           },
     ] },
     { id: "nodes", title: "Nodes", options: [
       { id: "single", label: "Single Node" },
@@ -134,9 +138,15 @@ export const config = {
           // EAGLE. No --min-free-slots-delay: at --max-running-requests 1 it
           // is a strict no-op, and its real semantic (disable the delayer)
           // would silently bite anyone raising concurrency to 8+.
-          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
-          disableReason:
-            "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
+          // Off on MI355X: the row pins a FlashInfer draft attention backend,
+          // which ROCm does not ship.
+          disabled: (sel) =>
+            sel.hw === "mi355x" ||
+            (sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4")),
+          disableReason: (sel) =>
+            sel.hw === "mi355x"
+              ? "DSpark's FlashInfer draft attention backend is not available on ROCm"
+              : "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
           stripPrefixes: (sel) =>
             sel.hw === "rtx5090"
               ? ["--mem-fraction-static", "--mamba-full-memory-ratio",
@@ -329,6 +339,7 @@ export const config = {
     "default|nvfp4-bf16-head": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
     "default|nvfp4-fp4-head":  "RadixArk/Qwen3.8-27B-NVFP4",
     "default|nvfp4-nvidia":    "nvidia/Qwen3.8-27B-NVFP4",
+    "default|mxfp4":           "amd/Qwen3.8-27B-Quark-AWQ-MXFP4",
   },
 
   placeholders: {
@@ -377,6 +388,8 @@ export const config = {
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
+    // gfx950 build; the generic image is CUDA-only.
+    mi355x:  "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261014",
   },
 
   github: {
@@ -996,6 +1009,33 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // MI355X 288GB, AMD Quark MXFP4 (W4A4 language model, bf16 vision
+      // encoder). SGLANG_USE_AITER selects the AITER MXFP4 GEMM, attention,
+      // norm and rope kernels; the ROCm image sets it, a bare-pip host does
+      // not. The flags follow the AMD nightly performance config for this
+      // checkpoint at TP1. Accuracy on this card is still being run, so the
+      // whole envelope reports in-progress.
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_USE_AITER=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--quantization quark",
+        "--kv-cache-dtype fp8_e4m3",
+        "--mem-fraction-static 0.9",
+        "--attention-backend aiter",
+        "--chunked-prefill-size 16384",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
