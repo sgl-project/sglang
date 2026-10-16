@@ -176,16 +176,17 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
                 kvcache.finalize_backing(
                     SimpleNamespace(unified_memory_pool_bytes=4096)
                 )
+        final = SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
+        kvcache.finalize_backing(final)
+        with self.subTest("allocation between finalize_backing and resize"):
+            with self.assertRaisesRegex(RuntimeError, "before resize"):
+                allocator.alloc(_PAGE_SIZE)
+        allocator.resize(final)
         with self.subTest("resize with live allocations"):
-            kvcache.finalize_backing(
-                SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-            )
             handed = allocator.alloc(_PAGE_SIZE)
             self.assertIsNotNone(handed)
             with self.assertRaisesRegex(RuntimeError, "non-empty"):
-                allocator.resize(
-                    SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-                )
+                allocator.resize(final)
             allocator.free(handed)
 
         eager = _bundle(total_bytes=_FINAL_BYTES, post_capture_active=False)

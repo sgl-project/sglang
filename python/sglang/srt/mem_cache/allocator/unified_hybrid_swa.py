@@ -783,6 +783,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
 class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
     """Two-ended FULL/SWA allocator with asymmetric shared-byte reservations."""
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._awaiting_resize = self.unified_buffer.post_capture_active
+
     def _build_swa_attn_allocator(self, **kwargs) -> MultiEndedAllocator:
         """The swa sub-allocator: an END pool in the 2-pool pair."""
         return MultiEndedAllocator(
@@ -1098,6 +1102,11 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
     def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
         """Gate one allocation and compact both sides on shortfall."""
+        if self._awaiting_resize:
+            raise RuntimeError(
+                "UnifiedSWATokenToKVPoolAllocator cannot allocate before resize: "
+                "post-capture capacity still spans the unbacked reservation"
+            )
         if full_tokens < 0 or swa_tokens < 0:
             return False
         if full_tokens == 0 and swa_tokens == 0:
@@ -1284,6 +1293,7 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
                 host_capacity
                 * self.unified_buffer.spec(allocator.sub_pool_name).entry_bytes()
             )
+        self._awaiting_resize = False
 
 
 class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
