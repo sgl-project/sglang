@@ -112,6 +112,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with speculative decoding "
                     f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
+            if cfg.enable_hierarchical_cache and cfg.pp_size > 1:
+                raise ValueError(
+                    "Decode HiCache (--disaggregation-decode-enable-radix-cache "
+                    "with --enable-hierarchical-cache) does not support "
+                    f"pipeline parallelism (--pp-size {cfg.pp_size})"
+                )
 
             if attn_dp_enabled_of(resolved_view(server_args)):
                 logger.warning(
