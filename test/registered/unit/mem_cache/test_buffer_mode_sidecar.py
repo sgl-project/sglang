@@ -157,7 +157,13 @@ class TestBufferModeSidecar(unittest.TestCase):
                         storage_backend=backend,
                         page_size=2,
                         prefetch_hits_sync_groups=[],
+                        storage_sync_failed=False,
                         _all_reduce=capture,
+                    )
+                    controller._storage_sync_all_reduce = (
+                        HybridCacheController._storage_sync_all_reduce.__get__(
+                            controller
+                        )
                     )
                     _, hit_tokens = HybridCacheController._storage_hit_query(
                         controller, operation
@@ -238,7 +244,11 @@ class TestBufferModeSidecar(unittest.TestCase):
             storage_backend=None,
             page_size=2,
             prefetch_hits_sync_groups=[],
+            storage_sync_failed=False,
             _all_reduce=lambda values, *_: None,
+        )
+        controller._storage_sync_all_reduce = (
+            HybridCacheController._storage_sync_all_reduce.__get__(controller)
         )
         _, hit_tokens = HybridCacheController._storage_hit_query(controller, operation)
         operation.storage_hit_count = HybridCacheController._sync_prefetch_hit_query(
@@ -362,6 +372,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             components={ComponentType.FULL: SimpleNamespace()},
             sidecar_pool_specs=sidecar_pool_specs,
             storage_existence_cache=StorageExistenceCache(),
+            storage_unavailable=False,
         )
         cache._build_sidecar_transfers = (
             UnifiedRadixCache._build_sidecar_transfers.__get__(cache)
@@ -442,6 +453,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         cache.cache_controller = controller
         cache.page_size = page_size
         cache.enable_storage = True
+        cache.storage_unavailable = False
         cache.enable_storage_metrics = False
         cache.hicache_storage_pass_prefix_keys = True
         cache.components = {ComponentType.FULL: MagicMock()}

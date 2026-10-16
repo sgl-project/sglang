@@ -2223,6 +2223,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.hicache_storage_healthy = Gauge(
+            name="sglang:hicache_storage_healthy",
+            documentation="1 while the L3 storage workers of every rank are "
+            "alive and their rank-sync collectives complete; 0 once the "
+            "scheduler degraded to no-L3 (storage_failure_policy=disable), "
+            "until the storage backend is re-attached.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
         bucket_io = [
             1,
             5,
@@ -2305,6 +2315,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+
+    def log_storage_healthy(self, healthy: bool) -> None:
+        self.hicache_storage_healthy.labels(**self.labels).set(int(healthy))
 
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:
