@@ -473,6 +473,12 @@ pub struct GenerateMetaInfo {
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]
     pub e2e_latency: ::core::option::Option<f64>,
+    /// Prompt tokens served from the prefix cache, and output tokens spent
+    /// reasoning so far; reported on every frame.
+    #[prost(uint32, tag = "13")]
+    pub cached_tokens: u32,
+    #[prost(uint64, tag = "14")]
+    pub reasoning_tokens: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
