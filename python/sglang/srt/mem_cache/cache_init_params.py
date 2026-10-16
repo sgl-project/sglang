@@ -56,6 +56,7 @@ class CacheInitParams:
     sliding_window_size: Optional[int] = None
     # Tokens a trailing-window replay covers; None disables SWA recompute.
     swa_recompute_len: Optional[int] = None
+    decoder_swa_bounded_replay: bool = False
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

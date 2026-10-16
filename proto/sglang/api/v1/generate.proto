@@ -2,7 +2,7 @@
 // rust/sglang-server/src/message/request.rs's GenerateBody (request) and
 // api_core/frame.rs's frame shape (response). Unknown JSON keys on the
 // request are IGNORED: `deny_unknown_fields` broke real clients that send
-// Python-only `GenerateReqInput` fields (priority, session_id,
+// Python-only `GenerateReqInput` fields (session_id,
 // ...), pinned by request.rs's unported-fields test.
 
 syntax = "proto3";
@@ -57,6 +57,9 @@ message GenerateRequest {
   // key. One key for every batch item, or one per item; an empty key means
   // none.
   StringOrList extra_key = 23;
+  // Scheduling priority, one value for every batch item; the scheduler
+  // validates it against its priority-scheduling mode.
+  optional int64 priority = 24;
 }
 
 message SamplingParamsOrList {

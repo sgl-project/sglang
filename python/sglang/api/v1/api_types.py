@@ -258,6 +258,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
     extra_key: Optional[StringOrList] = None
+    priority: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -1099,6 +1100,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
         elif key == "extra_key":
             kw["extra_key"] = None if x is None else decode_StringOrList(x)
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
     return GenerateRequest(**kw)
 
 
@@ -1150,6 +1153,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["audio_data"] = encode_MediaInput(v.audio_data)
     if v.extra_key is not None:
         d["extra_key"] = encode_StringOrList(v.extra_key)
+    if v.priority is not None:
+        d["priority"] = v.priority
     return d
 
 

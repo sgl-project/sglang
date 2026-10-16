@@ -47,6 +47,22 @@ def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
+def suffix_page_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    prefix_len: int,
+    seq_len: int,
+    page_size: int,
+) -> np.ndarray:
+    """Pages of a request's tokens [prefix_len, seq_len).
+
+    PD prefill and decode both call this with the same page-aligned prefix
+    (decode_prefix_len), so their lists pair up page by page even though their
+    rows point at different physical pages.
+    """
+    return kv_to_page_indices(req_to_token[req_pool_idx, prefix_len:seq_len], page_size)
+
+
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
@@ -178,9 +194,9 @@ def _req_radix_key(
     token_ids: array[int],
     max_prefix_len: Optional[int] = None,
 ) -> RadixKey:
-    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
-    # prefix carries stale SWA; cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
+    # bounded replay); cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
     if max_prefix_len is not None:
         key_limit = (
