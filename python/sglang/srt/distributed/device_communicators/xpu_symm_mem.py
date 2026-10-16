@@ -97,19 +97,35 @@ class XpuSymmMemCommunicator:
     def _compile_kernel(self, workspace: SymmMemWorkspace) -> bool:
         """Build both kernels for every supported dtype up front, so a build
         failure becomes a fallback here instead of an error on a forward pass.
-        Every rank runs the same calls, so the call counters stay in step."""
+
+        No barrier: the ranks have not yet agreed the workspace is usable, and
+        a device barrier waiting on a rank still in rendezvous spins forever.
+        Every rank runs the same calls, so the call counters stay in step.
+        """
         from sglang.srt.hardware_backend.xpu.kernels.comm.one_shot_all_reduce import (
             SUPPORTED_DTYPES,
+            one_shot_all_reduce,
+            stage,
         )
 
         try:
             for dtype in SUPPORTED_DTYPES:
                 probe = torch.zeros(64, dtype=dtype, device=self.device)
-                self._stage_and_reduce(
-                    workspace=workspace,
+                staging = workspace.buffer.view(dtype)
+                stage(
                     inp=probe,
+                    staging=staging,
+                    counter=self._counter,
+                    snapshot=self._snapshot,
+                )
+                # Reads whatever peers hold; only the build matters here.
+                one_shot_all_reduce(
+                    peer_ptrs=workspace.peer_ptrs,
                     out=probe,
-                    staging=workspace.buffer.view(dtype),
+                    world_size=self.world_size,
+                    half_numel=staging.numel() // 2,
+                    counter=self._counter,
+                    snapshot=self._snapshot,
                 )
             torch.xpu.synchronize()
         except Exception as e:
