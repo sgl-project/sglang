@@ -1688,6 +1688,16 @@ class Envs:
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
+    # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
+    # FP4 MQA logits kernel, a request's verify rows sharing each key load.
+    SGLANG_HIP_FP4_INDEXER_ROWGROUP = EnvBool(_default_hip)
+    # DeepSeek-V4 C4 decode / target-verify indexer: the same row-group kernel (aiter >= #6145),
+    # its workspace built in the graph without a schedule; a request's verify rows share each
+    # key load.
+    SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP = EnvBool(False)
+    # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
+    # 64-slot page), so a candidate consumer layer scores only its published blocks.
+    SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
