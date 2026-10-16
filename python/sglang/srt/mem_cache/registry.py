@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.mem_cache.allocation_sizing import uses_pd_decode_kv_only_mamba_cache
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
@@ -169,11 +170,23 @@ def create_unified_radix_cache(
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
         params.mamba_state_from_prefill = (
-            not ctx.disable_radix_cache
-            and get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_radix_cache
-            and get_spec().speculative_algorithm is None
+            not ctx.disable_radix_cache and uses_pd_decode_kv_only_mamba_cache()
         )
+        if (
+            params.mamba_state_from_prefill
+            and get_spec().speculative_algorithm is not None
+        ):
+            if (
+                get_spec().speculative_algorithm != "EAGLE"
+                or get_spec().speculative_eagle_topk not in (None, 1)
+                or get_disagg().disaggregation_transfer_backend != "nixl"
+                or ctx.is_hybrid_swa
+            ):
+                raise ValueError(
+                    "PD decode KV-only hybrid radix cache with speculation "
+                    "currently requires linear EAGLE (topk=1), NIXL, and "
+                    "a model without sliding-window attention."
+                )
         if params.mamba_state_from_prefill and (
             ctx.enable_hierarchical_cache
             or get_memory().enable_unified_cache_external_linker
