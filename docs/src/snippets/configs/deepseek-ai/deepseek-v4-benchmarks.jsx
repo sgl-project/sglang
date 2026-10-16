@@ -1,11 +1,16 @@
 // DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
 // deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
-// Measured on sglang v0.5.15 / v0.5.15.post1 / v0.5.16 (per-cell sglang_version).
+// Measured on sglang v0.5.15 / v0.5.15.post1 / v0.5.16 / v0.5.17 (per-cell sglang_version).
 // tokens_per_sec_per_gpu is total (input+output) tok/s/GPU = output/GPU × (isl+osl)/osl.
 export const benchmarks = [
   // ====================================================================
   // B200 + FP4
   // ====================================================================
+  {
+    match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.17",
+    accuracy: { gpqa_pct: 89.7, aime25_pct: 98.1, gsm8k_pct: 96.13 },
+  },
   {
     match: { hw: "b200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.16",
