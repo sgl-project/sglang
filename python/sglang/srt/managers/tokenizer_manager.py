@@ -2286,20 +2286,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if obj.mode != "abort":
                 await self._async_dispatch_to_scheduler(obj)
             else:
-                self.auto_create_handle_loop()
-                while True:
-                    self.abort_request(abort_all=True)
-                    is_locked = await self.model_update_lock.is_locked()
-                    # A disconnected HTTP handler releases its reader lock before
-                    # the scheduler has drained its request and overlap results.
-                    # Wait for every scheduler, keeping inference enabled so the
-                    # normal abort cleanup can finish before memory is released.
-                    results = await self.get_scheduler_idle_communicator(
-                        GetSchedulerIdleReqInput()
-                    )
-                    if not is_locked and all(r.is_idle for r in results):
-                        break
-                    await asyncio.sleep(0.01)
+                await self._abort_requests_and_wait_for_idle()
+
+    async def _abort_requests_and_wait_for_idle(self):
+        self.auto_create_handle_loop()
+        while True:
+            self.abort_request(abort_all=True)
+            is_locked = await self.model_update_lock.is_locked()
+            # A disconnected HTTP handler can release its reader lock before
+            # scheduler cleanup finishes. Keep inference enabled while draining.
+            probe = asyncio.create_task(
+                self.get_scheduler_idle_communicator(GetSchedulerIdleReqInput())
+            )
+            # A cancelled caller must not cancel an in-flight communicator call:
+            # its uncorrelated replies could otherwise satisfy the next probe.
+            # Let it collect all replies and release its FIFO lock normally.
+            self.asyncio_tasks.add(probe)
+            probe.add_done_callback(self.asyncio_tasks.discard)
+            results = await asyncio.shield(probe)
+            if not is_locked and all(r.is_idle for r in results):
+                return
+            await asyncio.sleep(0.01)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
