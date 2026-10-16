@@ -428,6 +428,19 @@ class FusedMoE(torch.nn.Module):
                 self.intermediate_size_per_partition, 128
             )
 
+        if _is_npu:
+            from sglang.srt.runtime_context import get_flags
+
+            online_scheme = (get_flags().moe.online_quantization or {}).get("moe")
+            if online_scheme is not None:
+                if online_scheme != "W8A8_MXFP8":
+                    raise ValueError(
+                        "Online MoE conversion currently supports only W8A8_MXFP8"
+                    )
+                if quant_config is None:
+                    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+                    quant_config = Fp8Config(use_mxfp8=True)
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic

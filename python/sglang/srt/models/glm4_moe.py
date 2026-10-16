@@ -407,6 +407,8 @@ class Glm4MoeGate(nn.Module):
         )
 
     def forward(self, hidden_states):
+        if getattr(self, "_npu_gate_method", None) is not None:
+            return self._npu_gate_method.apply(self, hidden_states).float()
         logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
         return logits
 
@@ -454,6 +456,17 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
 
         self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+            )
+
+            # Opt-in --online-quantization gate:SCHEME converts the loaded
+            # FP32 gate weight once after loading; without it the float gate
+            # stays and the fused norm boundary stays disabled.
+            self._npu_gate_online = configure_online_gate(
+                self.gate, add_prefix("gate", prefix), quant_config
+            )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts + self.num_fused_shared_experts,
@@ -614,6 +627,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.moe.contracts import (
+                    QuantizedOperand,
+                )
+
+                if isinstance(hidden_states, QuantizedOperand):
+                    # The decoder boundary already fused norm+quant.
+                    return self.forward_normal_quantized(hidden_states)
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
@@ -626,6 +647,45 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_normal_quantized(self, operand) -> torch.Tensor:
+        """MoE forward when every consumer takes the boundary's typed operand
+        (fused add+RMSNorm+quant; quantized router gate, W13 and shared
+        experts share the one activation)."""
+        from sglang.srt.hardware_backend.npu.moe.norm_gate import gate_forward
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            record_quantized_operand,
+        )
+
+        record_quantized_operand(operand)
+        data = operand.data
+        if data.shape[0] > 0:
+            router_logits = gate_forward(self.gate, operand)
+            topk_output = self.topk(data, router_logits)
+            shared_output = self._forward_shared_experts(operand, operand)
+        else:
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(data.device)
+
+        if (
+            self._fuse_npu_tp_shared and not get_is_capture_mode()
+        ) and shared_output is not None:
+            final_hidden_states = self.experts(
+                operand,
+                topk_output,
+                pre_quant_input=operand,
+                shared_output=shared_output,
+            )
+            shared_output = None
+        else:
+            final_hidden_states = self.experts(
+                operand, topk_output, pre_quant_input=operand
+            )
+        if not self._fuse_npu_tp_routed_scale:
+            final_hidden_states *= self.routed_scaling_factor
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        return final_hidden_states
 
     def forward_normal_dual_stream(
         self,
@@ -865,6 +925,30 @@ class Glm4MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # NPU: fuse add+RMSNorm+quant into the FFN boundary read when every
+        # sparse-MoE consumer (router gate, W13, shared experts) accepts one
+        # typed activation contract. A float gate without online
+        # quantization keeps the unfused reference norm.
+        self.ffn_quant_format = ""
+        if _is_npu:
+            import dataclasses as _dataclasses
+
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                select_linear_boundary_quant_format,
+                select_moe_boundary_quant_format,
+            )
+            from sglang.srt.layers.layer_boundary.residual.add_norm import (
+                NORM_QUANT_READOUT,
+            )
+
+            self.ffn_quant_format = (
+                select_moe_boundary_quant_format(self.mlp)
+                if self.is_layer_sparse
+                else select_linear_boundary_quant_format([self.mlp.gate_up_proj])
+            )
+            if self.ffn_quant_format:
+                ffn = _dataclasses.replace(ffn, read=NORM_QUANT_READOUT)
+
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
@@ -911,6 +995,15 @@ class Glm4MoeDecoderLayer(nn.Module):
         return ""
 
     def _detect_attn_quant_format(self):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                select_linear_boundary_quant_format,
+            )
+
+            self.attn_quant_format = select_linear_boundary_quant_format(
+                [self.self_attn.qkv_proj]
+            )
+            return
         self.attn_quant_format = self._detect_fp8_per_token_quant(
             self.self_attn.qkv_proj, "attn"
         )
@@ -962,7 +1055,15 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            **(
+                {"quant_format": self.ffn_quant_format}
+                if getattr(self, "ffn_quant_format", "")
+                else {}
+            ),
+        )
 
         hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)

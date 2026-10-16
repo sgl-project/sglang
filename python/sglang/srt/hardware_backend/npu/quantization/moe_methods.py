@@ -251,6 +251,26 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
     def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
         """Set dispatcher output dtype if the layer has a dispatcher."""
         if hasattr(layer, "dispatcher"):
+            if dtype == "bf16":
+                from sglang.srt.hardware_backend.npu.moe.contracts import (
+                    INT4,
+                    MXFP4,
+                    moe_input_contract,
+                )
+                from sglang.srt.hardware_backend.npu.moe.init_routing import (
+                    supports_packed_routing,
+                )
+                from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+                    AscendTPDispatcher,
+                )
+
+                contract = moe_input_contract(getattr(layer, "w13_kernel", None))
+                if (
+                    isinstance(layer.dispatcher, AscendTPDispatcher)
+                    and contract in (INT4, MXFP4)
+                    and supports_packed_routing(contract.kind)
+                ):
+                    dtype = contract.kind
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
 
     @staticmethod

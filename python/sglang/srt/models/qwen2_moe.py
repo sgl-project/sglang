@@ -391,13 +391,39 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if _is_npu and self._npu_tp_shared_overlap and self.alt_stream is None:
             self.alt_stream = get_stream("npu_moe")
 
+        # The router gate follows the checkpoint: a ModelSlim description
+        # that quantizes "...gate.weight" loads the quantized gate natively
+        # (default-on); otherwise the gate stays float. Only ModelSlim is
+        # conditionally passed through — other quant methods never change
+        # the gate's construction.
+        gate_quant_config = None
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                offline_gate_config,
+            )
+
+            gate_quant_config = offline_gate_config(
+                quant_config, add_prefix("gate", prefix)
+            )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=gate_quant_config,
             prefix=add_prefix("gate", prefix),
         )
+        # Opt-in --online-quantization gate:SCHEME converts the loaded float
+        # gate once after loading. The sigmoid shared-expert gate is a distinct
+        # consumer and always stays float.
+        self._npu_gate_online = False
+        if _is_npu and gate_quant_config is None:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+            )
+
+            self._npu_gate_online = configure_online_gate(
+                self.gate, add_prefix("gate", prefix)
+            )
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
@@ -660,7 +686,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._npu_router_logits(hidden_states)
             if enable_dual_stream:
                 from sglang.srt.hardware_backend.npu.cmo import (
                     shared_expert_on_independent_stream,
@@ -734,7 +760,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         topk_ids = None
         topk_weights = None
         if num_tokens > 0:
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._npu_router_logits(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -796,7 +822,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._npu_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -835,6 +861,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.shared_expert_gate.weight.squeeze(0),
             shared_output,
         )
+
+    def _npu_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Router logits via the configured gate: the opt-in online adapter
+        when installed, otherwise the module's own (float or offline
+        ModelSlim-quantized) forward."""
+        if getattr(self, "_npu_gate_online", False):
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import gate_forward
+
+            return gate_forward(self.gate, hidden_states)
+        router_logits, _ = self.gate(hidden_states)
+        return router_logits
 
     def forward_normal_dual_stream(
         self,

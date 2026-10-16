@@ -34,6 +34,7 @@ class AscendTPDispatchOutput(NamedTuple):
     expanded_row_idx: torch.Tensor
     expert_tokens: torch.Tensor
     group_list_type: int
+    source_dtype: Optional[torch.dtype] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -90,6 +91,22 @@ class AscendTPDispatcher(BaseDispatcher):
             self.init = NPUMoEInitRouting_v2(quant_mode=MXFP8_QUANT_MODE)
             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
             self.group_list_type = 1
+        elif self.ascend_dispatcher_output_dtype in (
+            DispatcherOutputDtype.MXFP4,
+            DispatcherOutputDtype.INT4,
+        ):
+            from sglang.srt.hardware_backend.npu.moe.init_routing import (
+                INT4_QUANT_MODE,
+                MXFP4_QUANT_MODE,
+            )
+
+            self.init = NPUMoEInitRouting_v2(
+                MXFP4_QUANT_MODE
+                if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.MXFP4
+                else INT4_QUANT_MODE
+            )
+            self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+            self.group_list_type = 1
         else:
             raise ValueError(
                 f"Unsupported ascend_dispatcher_output_dtype: {self.ascend_dispatcher_output_dtype}"
@@ -106,10 +123,13 @@ class AscendTPDispatcher(BaseDispatcher):
         topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
+        source_shape = tuple(hidden_states.shape)
+        source_dtype = hidden_states.dtype
         input_scale = None
         if pre_quant_input is not None:
             from sglang.srt.hardware_backend.npu.moe.contracts import (
                 INT8,
+                MXFP4,
                 MXFP8,
                 QuantizedOperand,
             )
@@ -122,6 +142,7 @@ class AscendTPDispatcher(BaseDispatcher):
             expected = {
                 DispatcherOutputDtype.MXFP8: MXFP8,
                 DispatcherOutputDtype.INT8: INT8,
+                DispatcherOutputDtype.MXFP4: MXFP4,
             }.get(self.ascend_dispatcher_output_dtype)
             pre_quant_input.validate(expected)
             if pre_quant_input.source_shape != tuple(hidden_states.shape):
@@ -140,6 +161,12 @@ class AscendTPDispatcher(BaseDispatcher):
             self.num_experts,
             top_k,
             input_scale=input_scale,
+            **(
+                {"source_shape": source_shape}
+                if self.ascend_dispatcher_output_dtype
+                in (DispatcherOutputDtype.MXFP4, DispatcherOutputDtype.INT4)
+                else {}
+            ),
         )
 
         self._dispatch_output = AscendTPDispatchOutput(
@@ -150,6 +177,7 @@ class AscendTPDispatcher(BaseDispatcher):
             expanded_row_idx=expanded_row_idx,
             expert_tokens=expert_tokens,
             group_list_type=self.group_list_type,
+            source_dtype=source_dtype,
         )
         return self._dispatch_output
 

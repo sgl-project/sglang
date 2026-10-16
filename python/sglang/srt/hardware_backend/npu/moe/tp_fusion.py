@@ -223,7 +223,9 @@ def shared_gmm1_mode(mlp=None):
 
     gate = mlp.gate_up_proj
     fp4 = isinstance(linear_kernel(gate), NPUMXFP4W4A8OfflineLinearMethod)
-    scale = gate.weight_scale if fp4 else gate.weight_scale_inv
+    scale = getattr(gate, "weight_scale" if fp4 else "weight_scale_inv", None)
+    if scale is None:
+        return "baseline"
     weight, scale = shared_gmm1_weight_views(gate.weight, scale)
     if not supports_fused_mxfp_gmm(linear_kernel(gate), weight, scale):
         return "baseline"
@@ -280,8 +282,11 @@ def tp_fused_shared_expert_reason(config, quant_config):
     """Validate matching routed/shared projection contracts before loading."""
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.layers.moe.utils import is_sbo_enabled, is_tbo_enabled
-    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.runtime_context import get_exec, get_flags, get_parallel
 
+    online = get_flags().moe.online_quantization or {}
+    if "moe" in online or "shared_expert" in online:
+        return "Role-specific online conversion keeps shared experts separate."
     parallel = get_parallel()
     shared_count = getattr(config, "n_shared_experts", None)
     if shared_count is None:

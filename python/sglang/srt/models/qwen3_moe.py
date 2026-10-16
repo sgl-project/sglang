@@ -292,6 +292,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+                offline_gate_config,
+            )
+
+            gate_prefix = add_prefix("gate", prefix)
+            if offline_gate_config(quant_config, gate_prefix) is None:
+                configure_online_gate(self.gate, gate_prefix)
+
         if is_deepep_class_backend():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size

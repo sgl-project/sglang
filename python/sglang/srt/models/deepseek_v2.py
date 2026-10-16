@@ -562,6 +562,8 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if getattr(self, "_npu_gate_method", None) is not None:
+            return self._npu_gate_method.apply(self, hidden_states).float()
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
 
@@ -723,6 +725,18 @@ class DeepseekV2MoE(nn.Module):
             is_deepseek_v4=is_deepseek_v4,
             vl_correction_bias=vl_correction_bias,
         )
+        # Opt-in --online-quantization gate:SCHEME converts the loaded FP32
+        # gate weight once after loading. The hash-moe vocabulary router is
+        # not a linear gate; it never converts.
+        self._npu_gate_online = False
+        if _is_npu and not self.is_hash:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+            )
+
+            self._npu_gate_online = configure_online_gate(
+                self.gate, add_prefix("gate", prefix), quant_config
+            )
 
         # scaling factor for fused shared experts on AMD-platform.
         # DeepEP/MegaMOE doesn't need this: shared expert is only computed on home rank
@@ -1043,6 +1057,29 @@ class DeepseekV2MoE(nn.Module):
         a boundary that owns reduction and the replicated shared add."""
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.contracts import QuantizedOperand
+
+            if isinstance(hidden_states, QuantizedOperand):
+                # The decoder boundary already fused add+RMSNorm+quant.
+                boundary_operand = hidden_states
+                return self.forward_normal(
+                    boundary_operand,
+                    gemm_output_zero_allocator,
+                    input_ids,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=skip_shared_experts,
+                    num_token_non_padded=(
+                        forward_batch.moe_num_token_non_padded()
+                        if forward_batch is not None
+                        else None
+                    ),
+                    use_vision_topk=self.gate.e_score_correction_bias_vl is not None,
+                    return_moe_output=return_moe_output,
+                    leave_output_sum=leave_output_sum,
+                    boundary_operand=boundary_operand,
+                )
+
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
                 self,
@@ -1346,6 +1383,7 @@ class DeepseekV2MoE(nn.Module):
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        boundary_operand=None,
     ) -> Union[torch.Tensor, MoEOutput]:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1364,12 +1402,16 @@ class DeepseekV2MoE(nn.Module):
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
         if hidden_states.shape[0] > 0:
-            # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
-            # the shared expert also runs here on the same tensor.
+            # The boundary operand (fused add+RMSNorm+quant) replaces the
+            # quantize-once pass: gate, W13 and shared experts share it.
             pre_quant_input = (
-                None
-                if skip_shared_experts
-                else self._maybe_quant_moe_input_once(hidden_states)
+                boundary_operand
+                if boundary_operand is not None
+                else (
+                    None
+                    if skip_shared_experts
+                    else self._maybe_quant_moe_input_once(hidden_states)
+                )
             )
             if (
                 not defer_shared
@@ -1389,6 +1431,11 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     fused_gate=not use_vision_topk,
                 )
+            elif boundary_operand is not None:
+                from sglang.srt.hardware_backend.npu.moe.norm_gate import gate_forward
+
+                router_logits = gate_forward(self.gate, boundary_operand)
+                router_logits_partials = None
             else:
                 router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
                 router_logits_partials = None
@@ -1408,7 +1455,9 @@ class DeepseekV2MoE(nn.Module):
                 )
             else:
                 topk_output = self.topk(
-                    hidden_states,
+                    hidden_states.data
+                    if boundary_operand is not None
+                    else hidden_states,
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
@@ -2766,6 +2815,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
+        # NPU: fuse add+RMSNorm+quant into the FFN boundary read when every
+        # sparse-MoE consumer accepts one typed activation contract.
+        self.ffn_quant_format = ""
 
         # A subclass that brings its own norms builds the stages after them.
         if build_stages:
@@ -2824,6 +2876,25 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn, ffn = self.stage_facts(
             self.config, self.layer_id, is_nextn=self.is_nextn, **modules
         )
+        if _is_npu and type(self.post_attention_layernorm) is RMSNorm:
+            import dataclasses as _dataclasses
+
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                select_linear_boundary_quant_format,
+                select_moe_boundary_quant_format,
+            )
+            from sglang.srt.layers.layer_boundary.residual.add_norm import (
+                NORM_QUANT_READOUT,
+            )
+
+            if isinstance(self.mlp, DeepseekV2MoE):
+                self.ffn_quant_format = select_moe_boundary_quant_format(self.mlp)
+            elif isinstance(self.mlp, DeepseekV2MLP):
+                self.ffn_quant_format = select_linear_boundary_quant_format(
+                    [self.mlp.gate_up_proj]
+                )
+            if self.ffn_quant_format:
+                ffn = _dataclasses.replace(ffn, read=NORM_QUANT_READOUT)
         attn_boundary, ffn_boundary = append_stages(
             (
                 attn,
@@ -2917,7 +2988,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            **(
+                {"quant_format": self.ffn_quant_format}
+                if getattr(self, "ffn_quant_format", "")
+                else {}
+            ),
+        )
 
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
@@ -2973,7 +3052,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.pop("hidden_states_after_attn"), state.forward_batch
         )
         state.hidden_states_mlp_input = self.ffn_boundary.prepare(
-            hidden_states, state.forward_batch
+            hidden_states,
+            state.forward_batch,
+            **(
+                {"quant_format": self.ffn_quant_format}
+                if getattr(self, "ffn_quant_format", "")
+                else {}
+            ),
         )
 
     def op_comm_postprocess_layer(self, state):
