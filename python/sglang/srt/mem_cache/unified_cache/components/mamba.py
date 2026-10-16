@@ -889,7 +889,6 @@ class MambaComponent(TreeComponent):
             return
         if self._mamba_host_only_checkpoint():
             self._release_unused_host_checkpoint(insert_result, insert_params)
-
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
