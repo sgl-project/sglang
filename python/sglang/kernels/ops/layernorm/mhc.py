@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx942_supported, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
 _is_hip = is_hip()
