@@ -736,6 +736,10 @@ class ModelConfig:
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+        # Block-wise FP8 ckpts may instead serve their routed experts as MXFP8.
+        self.is_mxfp8_experts: bool = routed_experts_quant_method == "mxfp8"
+        if self.is_mxfp8_experts:
+            logger.info("Detected mixed checkpoint layout: routed experts are MXFP8.")
 
         # MiMo-V2 mxfp4 ckpts declare the routed-expert layout via store_dtype.
         if (

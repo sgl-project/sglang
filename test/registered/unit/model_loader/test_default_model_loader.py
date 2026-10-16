@@ -28,6 +28,7 @@ class TestDefaultModelLoader(CustomTestCase):
                     quantization="fp8",
                     dtype=torch.bfloat16,
                     is_fp4_experts=is_fp4,
+                    is_mxfp8_experts=False,
                     hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
                     nvfp4_moe_meta=None,
                 )
@@ -65,6 +66,39 @@ class TestDefaultModelLoader(CustomTestCase):
                             loader_mod._get_quantization_config(model_config, object()),
                             config,
                         )
+
+    def test_mxfp8_routed_expert_layout_reaches_the_fp8_config(self):
+        for is_mxfp8 in (True, False):
+            with self.subTest(is_mxfp8=is_mxfp8):
+                config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
+                model_config = SimpleNamespace(
+                    quantization="fp8",
+                    dtype=torch.bfloat16,
+                    is_fp4_experts=False,
+                    is_mxfp8_experts=is_mxfp8,
+                    hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+                    nvfp4_moe_meta=None,
+                )
+                with (
+                    patch.object(
+                        loader_mod,
+                        "get_model_architecture",
+                        return_value=(type("Model", (), {}), None),
+                    ),
+                    patch.object(loader_mod, "get_quant_config", return_value=config),
+                    patch.object(
+                        loader_mod, "get_device_capability", return_value=(10, 0)
+                    ),
+                    loader_mod.envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+                ):
+                    self.assertIs(
+                        loader_mod._get_quantization_config(model_config, object()),
+                        config,
+                    )
+                self.assertEqual(config.is_mxfp8_experts, is_mxfp8)
 
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
