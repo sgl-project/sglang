@@ -45,6 +45,8 @@ class TestResidualStream(CustomTestCase):
 
     def test_written_input_does_not_repeat_first_stage_initialization(self):
         class Read:
+            completing_fusions = ()
+            bind = None
             is_plain_norm = False
             enters = 0
 
@@ -66,7 +68,7 @@ class TestResidualStream(CustomTestCase):
         steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
-            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION, row_transport=None),
         )
         value = torch.ones(2, 4)
         hidden, stream = stage._prepare(value, ResidualStream(), None, steps)
@@ -78,6 +80,8 @@ class TestResidualStream(CustomTestCase):
 
     def test_consumer_executes_the_carried_update_not_the_bound_producers(self):
         class Update:
+            bind = None
+            replay_update = None
             is_plain_add = False
             applied_at_exit = False
 
@@ -90,6 +94,8 @@ class TestResidualStream(CustomTestCase):
                 return value + residual + self.increment
 
         class Read:
+            completing_fusions = ()
+            bind = None
             is_plain_norm = False
 
             def update_and_read(self, update, value, residual, norm, **kwargs):
@@ -109,7 +115,7 @@ class TestResidualStream(CustomTestCase):
         steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
-            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION, row_transport=None),
         )
         for increment in (2, 7):
             with self.subTest(increment=increment):
@@ -209,7 +215,9 @@ class TestResidualStream(CustomTestCase):
             )
 
     def test_snapshot_rejects_stateful_update_without_touching_main_state(self):
-        update = SimpleNamespace(is_plain_add=False, update=Mock())
+        update = SimpleNamespace(
+            is_plain_add=False, update=Mock(), bind=None, replay_update=None
+        )
         stream = ResidualStream(self.residual)
         hidden = stream.record(UnreducedOutput(self.partial, group=self.group), update)
         with self.assertRaisesRegex(NotImplementedError, "plain residual update"):
@@ -394,6 +402,8 @@ class TestResidualStream(CustomTestCase):
 
     def test_prepare_releases_the_consumed_contribution(self):
         class Read:
+            completing_fusions = ()
+            bind = None
             is_plain_norm = True
 
             def update_and_read(self, update, value, residual, norm, **kwargs):
@@ -409,7 +419,7 @@ class TestResidualStream(CustomTestCase):
         steps = StagePath(EntryPath(boundary.prepare, rows), OutputContract(rows), None)
         stage = StageBoundary(
             SimpleNamespace(norm=None),
-            declaration=SimpleNamespace(kind=StageKind.ATTENTION),
+            declaration=SimpleNamespace(kind=StageKind.ATTENTION, row_transport=None),
         )
         partial = torch.ones(4, 4)
         partial_ref = weakref.ref(partial)
@@ -467,6 +477,8 @@ class TestBatchStageOwnership(CustomTestCase):
         from sglang.srt.layers.layer_boundary.residual import batch
 
         class Read:
+            completing_fusions = ()
+            bind = None
             is_plain_norm = False
 
             def init_residual(self, value):

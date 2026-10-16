@@ -138,6 +138,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.auxiliary_swa_host_hit_length = 0
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
@@ -496,7 +497,9 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.discard_storage_prefetch_accounting.assert_called_once_with(
             req.cache_request_handle
         )
-        self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            req.cache_request_handle, fulfilled_tokens=0, reason=None
+        )
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
