@@ -14,6 +14,9 @@ from diffusers.models import ModelMixin
 from diffusers.utils import logging
 from PIL import Image
 
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_contract import (
+    validate_minimax_h3_vae_tiling,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
@@ -173,6 +176,15 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
         self.decoder_tile_overlap_min = kwargs.get(
             "decoder_tile_overlap_min", self.tile_overlap_min
+        )
+        validate_minimax_h3_vae_tiling(
+            self.tile_size, self.tile_overlap_min, self.vae_ratio
+        )
+        validate_minimax_h3_vae_tiling(
+            self.decoder_tile_size,
+            self.decoder_tile_overlap_min,
+            self.vae_ratio,
+            prefix="decoder_",
         )
         self._blend_weight_cache = {}
         self.latent_patch_size = kwargs.get("latent_patch_size", 1)
