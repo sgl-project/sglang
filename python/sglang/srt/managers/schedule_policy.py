@@ -221,8 +221,8 @@ class SchedulePolicy:
         )
         self.last_req_rid = None
         self.classified_reqs: Set[str] = set()
-        self.finished_reqs_token: Dict[str, List[int]] = {}
-        self.estimated_cached_token: Dict[str, List[int]] = {}
+        self.finished_req_lengths: Dict[str, int] = {}
+        self.estimated_cached_tokens: Dict[str, int] = {}
 
     def calc_priority(
         self,
@@ -379,8 +379,6 @@ class SchedulePolicy:
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
-            extra_key = r.extra_key
-            cache_salt = r.cache_salt
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -391,19 +389,10 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                match_result = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(
-                            token_ids=prefix_ids,
-                            extra_key=extra_key,
-                            cache_salt=cache_salt,
-                        )
-                    )
+                match_result = self._match_batch_prefix_for_req(
+                    req=r,
+                    token_ids=prefix_ids,
                 )
-                if envs.SGLANG_RADIX_FORCE_MISS.get():
-                    match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result, extra_key=extra_key
-                    )
                 if (
                     match_result.device_prefix_len
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
@@ -411,15 +400,9 @@ class SchedulePolicy:
                     temporary_deprioritized.add(r.rid)
                 else:
                     # Insert with a dummy key
-                    self.waiting_queue_radix_tree.insert(
-                        InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids,
-                                extra_key=extra_key,
-                                cache_salt=cache_salt,
-                            ),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
-                        )
+                    self._insert_inbatch_tree(
+                        req=r,
+                        prefix_ids=prefix_ids,
                     )
         return temporary_deprioritized
 
@@ -434,21 +417,12 @@ class SchedulePolicy:
             return
         key = r.routing_key
         if key is not None:
-            if key in self.finished_reqs_token:
-                finished_rounds = self.finished_reqs_token[key][0] + 1
-            else:
-                finished_rounds = 1
-            prompt_len = len(r.origin_input_ids) + len(r.output_ids)
-            self.finished_reqs_token[key] = [finished_rounds, prompt_len]
+            completed_sequence_len = len(r.origin_input_ids) + len(r.output_ids)
+            self.finished_req_lengths[key] = completed_sequence_len
 
-            if len(self.finished_reqs_token) > 1e6:
-                oldest_key = next(iter(self.finished_reqs_token))
-                del self.finished_reqs_token[oldest_key]
-
-    def _match_global_prefix_for_req(
-        self, req: Req, token_ids: Optional[array[int]] = None
-    ):
-        return match_kv_cache(req, self.tree_cache, token_ids)
+            if len(self.finished_req_lengths) > 1e6:
+                oldest_key = next(iter(self.finished_req_lengths))
+                del self.finished_req_lengths[oldest_key]
 
     def _match_batch_prefix_for_req(
         self, req: Req, token_ids: Optional[array[int]] = None
@@ -496,20 +470,21 @@ class SchedulePolicy:
             key = r.routing_key
             if key is None:
                 continue
-            if key in self.finished_reqs_token:
-                self.estimated_cached_token[key] = list(self.finished_reqs_token[key])
+            if key in self.finished_req_lengths:
+                self.estimated_cached_tokens[key] = self.finished_req_lengths[key]
                 no_multi_turn = False
             else:
                 prefix_ids = r.origin_input_ids + r.output_ids
-                match_result = self._match_global_prefix_for_req(r, prefix_ids)
-                self.estimated_cached_token[key] = [
-                    0,
-                    match_result.device_prefix_len,
-                ]
+                match_result = match_kv_cache(
+                    req=r,
+                    tree_cache=self.tree_cache,
+                    token_ids=prefix_ids,
+                )
+                self.estimated_cached_tokens[key] = match_result.device_prefix_len
 
-            if len(self.estimated_cached_token) > 1e6:
-                oldest_key = next(iter(self.estimated_cached_token))
-                del self.estimated_cached_token[oldest_key]
+            if len(self.estimated_cached_tokens) > 1e6:
+                oldest_key = next(iter(self.estimated_cached_tokens))
+                del self.estimated_cached_tokens[oldest_key]
 
         if no_multi_turn and self._prefix_weave_early_exit(
             waiting_queue, max_token, max_req_num
@@ -517,7 +492,7 @@ class SchedulePolicy:
             return False
 
         waiting_queue.sort(
-            key=lambda r: -self.estimated_cached_token.get(r.routing_key, (0, 0))[1]
+            key=lambda r: -self.estimated_cached_tokens.get(r.routing_key, 0)
         )
         return True
 
@@ -531,7 +506,7 @@ class SchedulePolicy:
         classified_tokens = sum(
             len(r.origin_input_ids)
             + len(r.output_ids)
-            - self.estimated_cached_token.get(r.routing_key, (0, r.prefix_len))[1]
+            - self.estimated_cached_tokens.get(r.routing_key, r.prefix_len)
             for r in waiting_queue
             if r.rid in self.classified_reqs
         )
@@ -546,7 +521,11 @@ class SchedulePolicy:
         overlap_tolerance = 0.05
 
         def compute_cache_ratio(req: Req, prefix_ids: array[int]) -> tuple[float, int]:
-            match_result = self._match_global_prefix_for_req(req, prefix_ids)
+            match_result = match_kv_cache(
+                req=req,
+                tree_cache=self.tree_cache,
+                token_ids=prefix_ids,
+            )
             cached_tokens = match_result.device_prefix_len
             cache_ratio = cached_tokens / len(prefix_ids) if prefix_ids else 0.0
             return cache_ratio, cached_tokens
@@ -564,10 +543,10 @@ class SchedulePolicy:
         ) -> float:
             if (
                 req.routing_key is not None
-                and req.routing_key in self.finished_reqs_token
+                and req.routing_key in self.finished_req_lengths
             ):
                 high_cache_hit = (
-                    self.finished_reqs_token[req.routing_key][1] * high_cache_ratio
+                    self.finished_req_lengths[req.routing_key] * high_cache_ratio
                 )
                 return high_cache_hit / prefix_len if prefix_len > 0 else 0.0
             return min((rolling_prefix + high_cache_ratio) / 2, high_cache_ratio)
@@ -583,6 +562,7 @@ class SchedulePolicy:
         tier_2: Set[str] = set()
         tier_3: Set[str] = set()
         deferred: List[tuple[Req, int, float]] = []
+        # Build a reusable candidate window; PrefillAdder enforces live admission.
         new_token_budget = self.token_batch_size * 2
         total_new_tokens = 0
         rolling_prefix = 0.0
@@ -601,8 +581,7 @@ class SchedulePolicy:
             rolling_prefix = update_rolling_prefix(rolling_prefix, cache_ratio)
 
             if r.routing_key is not None:
-                estimate = self.estimated_cached_token.setdefault(r.routing_key, [0, 0])
-                estimate[1] = cached_tokens
+                self.estimated_cached_tokens[r.routing_key] = cached_tokens
 
             if cache_ratio > cache_threshold:
                 if overlap_ratio < overlap_threshold:
@@ -610,7 +589,7 @@ class SchedulePolicy:
                 else:
                     tier_2.add(r.rid)
                 total_new_tokens += len(prefix_ids) - cached_tokens
-                self._insert_inbatch_tree(r, prefix_ids)
+                self._insert_inbatch_tree(req=r, prefix_ids=prefix_ids)
             else:
                 deferred.append((r, cached_tokens, overlap_threshold))
 
@@ -623,7 +602,7 @@ class SchedulePolicy:
             if overlap_ratio < overlap_threshold:
                 tier_3.add(r.rid)
                 total_new_tokens += len(prefix_ids) - cached_tokens
-                self._insert_inbatch_tree(r, prefix_ids)
+                self._insert_inbatch_tree(req=r, prefix_ids=prefix_ids)
 
         return tier_1, tier_2, tier_3
 

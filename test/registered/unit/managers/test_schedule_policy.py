@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
@@ -225,6 +226,130 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestPrefixWeave(CustomTestCase):
+    def setUp(self):
+        self.policy = SchedulePolicy(
+            policy="prefix-weave",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            chunked_prefill_size=64,
+            max_prefill_tokens=128,
+        )
+
+    @staticmethod
+    def make_req(rid, *, routing_key=None, prefix_len=0):
+        req = _make_req(
+            rid,
+            "",
+            list(range(10)),
+            routing_key=routing_key or f"key-{rid}",
+        )
+        req.prefix_len = prefix_len
+        return req
+
+    def test_tier_precedence_overrides_cached_prefix_length(self):
+        """A lower tier must not jump ahead because its prefix_len is larger.
+
+        PrefixWeave combines global-cache reuse with marginal in-batch overlap.
+        Reversing either comparison silently changes which requests are admitted
+        first, even though every request still receives a valid numeric score.
+        """
+        tier_1 = self.make_req("tier-1", prefix_len=1)
+        tier_2 = self.make_req("tier-2", prefix_len=9)
+        tier_3 = self.make_req("tier-3", prefix_len=8)
+        unclassified = self.make_req("unclassified", prefix_len=10)
+        queue = [unclassified, tier_3, tier_2, tier_1]
+
+        global_cached = {
+            "tier-1": 8,
+            "tier-2": 8,
+            "tier-3": 1,
+            "unclassified": 1,
+        }
+        batch_overlap = {
+            "tier-1": 0,
+            "tier-2": 9,
+            "tier-3": 0,
+            "unclassified": 2,
+        }
+
+        with (
+            patch(
+                "sglang.srt.managers.schedule_policy.match_kv_cache",
+                side_effect=lambda req, tree_cache, token_ids=None: SimpleNamespace(
+                    device_prefix_len=global_cached[req.rid]
+                ),
+            ),
+            patch.object(
+                self.policy,
+                "_match_batch_prefix_for_req",
+                side_effect=lambda req, token_ids=None: SimpleNamespace(
+                    device_prefix_len=batch_overlap[req.rid]
+                ),
+            ),
+            patch.object(self.policy, "_insert_inbatch_tree"),
+        ):
+            self.policy.calc_priority(queue, max_req_num=4, token_budget=128)
+
+        self.assertEqual(
+            [req.rid for req in queue],
+            ["tier-1", "tier-2", "tier-3", "unclassified"],
+        )
+        self.assertEqual(self.policy.classified_reqs, {"tier-1", "tier-2", "tier-3"})
+
+        self.policy.update_classified_reqs([tier_1, tier_3])
+        self.assertEqual(self.policy.classified_reqs, {"tier-2"})
+
+    def test_full_classification_budget_keeps_existing_order(self):
+        """Previously classified work filling the request budget is not reshuffled.
+
+        This preserves the admission decision across scheduler passes and keeps
+        the policy's calculation counter limited to actual classifications.
+        """
+        first = self.make_req("first")
+        second = self.make_req("second")
+        queue = [first, second]
+        self.policy.classified_reqs = {first.rid}
+
+        with patch(
+            "sglang.srt.managers.schedule_policy.match_kv_cache",
+            return_value=SimpleNamespace(device_prefix_len=0),
+        ):
+            self.policy.calc_priority(queue, max_req_num=1, token_budget=128)
+
+        self.assertEqual(queue, [first, second])
+        self.assertEqual(self.policy.classified_reqs, {first.rid})
+        self.assertEqual(self.policy.calc_count, 0)
+
+    def test_finished_routing_length_is_reused_for_next_turn(self):
+        """The latest completed length seeds the next turn's cache estimate.
+
+        The completion path and the next scheduling pass are separate call sites;
+        losing their routing-key handoff degrades multi-turn cache prioritization
+        without causing a request failure.
+        """
+        finished = self.make_req("finished", routing_key="conversation")
+        finished.output_ids.extend([10, 11])
+        self.policy.update_finished_reqs_info(finished)
+        finished.output_ids.append(12)
+        self.policy.update_finished_reqs_info(finished)
+
+        next_turn = self.make_req("next", routing_key="conversation")
+        with patch(
+            "sglang.srt.managers.schedule_policy.match_kv_cache"
+        ) as global_match:
+            calculated = self.policy._prefix_weave_phase0_presort(
+                [next_turn], max_req_num=1, max_token=128
+            )
+
+        self.assertTrue(calculated)
+        self.assertEqual(self.policy.finished_req_lengths["conversation"], 13)
+        self.assertEqual(self.policy.estimated_cached_tokens["conversation"], 13)
+        global_match.assert_not_called()
 
 
 if __name__ == "__main__":
