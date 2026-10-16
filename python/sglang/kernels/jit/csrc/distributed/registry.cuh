@@ -17,24 +17,26 @@ BasePlane::BasePlane(uint32_t rank, uint32_t world_size) : rank(rank), world_siz
 PushPlaneObj::PushPlaneObj(
     uint32_t rank,
     uint32_t world_size,
-    std::vector<TensorView> workspaces,  // world_size * [2 * world_size][slot_bytes]
+    std::vector<TensorView> workspaces,  // world_size * [2 * world_size or 4 * world_size][slot_bytes]
     TensorView counter,                  // [num_blocks]
     intptr_t mc_workspace_ptr)
     : BasePlane(rank, world_size),  //
       num_blocks(),
       slot_bytes(),
+      has_scatter(),
       counter(),
       workspaces{},
       mc_workspace() {
   CHECK_HOST(workspaces.size() == world_size) << "Bad push workspace count";
   // Shared symbolic sizes and device enforce consistency across ranks; the
   // matchers also require contiguity (no strides given) and uint8 dtype.
+  auto R = SymbolicSize{"num_slots"};
   auto N = SymbolicSize{"slot_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
   device_sym.set_options<kDLCUDA>();
   for (uint32_t i = 0; i < world_size; ++i) {
-    TensorMatcher({2 * world_size, N})  //
+    TensorMatcher({R, N})  //
         .with_dtype<uint8_t>()
         .with_device(device_sym)
         .verify(workspaces[i]);
@@ -44,10 +46,15 @@ PushPlaneObj::PushPlaneObj(
       .with_device(device_sym)
       .verify(counter);
   CHECK_HOST(N.unwrap() > 0 && M.unwrap() > 0) << "A push plane needs a non-empty workspace and counter";
+  // 2 phases x one slot per peer; doubled again when the plane's second half
+  // carries the 2shot_push scatter region.
+  CHECK_HOST(R.unwrap() == 2 * world_size || R.unwrap() == 4 * world_size)
+      << "A push plane holds 2 * world_size slots, or 4 * world_size with a scatter region; got " << R.unwrap();
 
   // only set the value safely after the symbolic size has been verified
   this->num_blocks = static_cast<uint32_t>(M.unwrap());
   this->slot_bytes = N.unwrap();
+  this->has_scatter = R.unwrap() == 4 * world_size;
   this->counter = static_cast<Counter*>(counter.data_ptr());
   for (uint32_t i = 0; i < world_size; ++i) {
     this->workspaces[i] = static_cast<uint8_t*>(workspaces[i].data_ptr());
@@ -124,7 +131,8 @@ inline void register_communicator() {
       .def_ro("rank", &dist::PushPlaneObj::rank)
       .def_ro("world_size", &dist::PushPlaneObj::world_size)
       .def_ro("num_blocks", &dist::PushPlaneObj::num_blocks)
-      .def_ro("slot_bytes", &dist::PushPlaneObj::slot_bytes);
+      .def_ro("slot_bytes", &dist::PushPlaneObj::slot_bytes)
+      .def_ro("has_scatter", &dist::PushPlaneObj::has_scatter);
 
   refl::ObjectDef<dist::PullPlaneObj>()
       .def(refl::init<uint32_t, uint32_t, Tensors, Tensors, intptr_t, intptr_t>(), "__init__")

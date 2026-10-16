@@ -135,16 +135,25 @@ def multigpu_launch(
     `timeout`, if given, bounds each per-world-size torchrun invocation (in
     seconds). On expiry the child's whole process group is killed and the
     launcher exits non-zero. `None` (the default) waits indefinitely.
+
+    An *external* torchrun is honoured as-is: the relaunch below only knows how
+    to fill one node, so a multi-node run has to be started by the caller, and
+    this detects that and runs the body in place rather than nesting a
+    single-node torchrun underneath it.
     """
     pid_key = env_key + "_PID"
     if env_key in os.environ:
         assert pid_key in os.environ
+    # either the relaunch below, or someone else's torchrun -- which is how a
+    # multi-node run gets started, since the relaunch only fills one node
+    if env_key in os.environ or "TORCHELASTIC_RUN_ID" in os.environ:
         if name != "__main__":
             return
-        rank = int(os.environ["LOCAL_RANK"])
-        if rank != 0:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        # gate on the global rank: on a multi-node run every node has a rank 0
+        if int(os.environ.get("RANK", local_rank)) != 0:
             sys.stdout = open(os.devnull, "w")
-        torch.cuda.set_device(rank)
+        torch.cuda.set_device(local_rank)
         return sys.exit(inner())
     assert pid_key not in os.environ
     if name != "__main__":
