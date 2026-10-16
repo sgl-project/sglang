@@ -87,9 +87,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Constants
-DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
-
 # Block constraint from flashinfer requirements
 # From flashinfer.decode._check_trtllm_gen_mla_shape:
 #   block_num % (128 / block_size) == 0
@@ -255,7 +252,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        self.workspace_size = envs.SGLANG_TRTLLM_WORKSPACE_MB.get() * 1024 * 1024
         if self.backend == "cute-dsl":
             # Separate buffer from trtllm-gen (see note above); safe to share
             # among cute-dsl instances.
