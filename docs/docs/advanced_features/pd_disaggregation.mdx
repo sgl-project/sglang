@@ -563,6 +563,33 @@ python -m sglang.launch_server \
   --max-running-requests 128
 ```
 
+### Runtime role switching
+
+NIXL instances started with `--enable-pd-role-switch` can switch between
+prefill and decode through `POST /pd_role_switch`. Remove the instance from
+routing and drain all requests before switching. The scheduler retains the
+model and KV pools while replacing the role's transport resources.
+
+For example, switch an idle decode instance to prefill:
+
+```bash
+curl -X POST http://127.0.0.1:30001/pd_role_switch \
+  -H 'Content-Type: application/json' \
+  -d '{"new_role": "prefill"}'
+```
+
+When switching to decode before decode CUDA graphs have been captured, also
+provide `decode_cuda_graph_memory_gb`, measured on a matching decode instance.
+The scheduler checks this memory headroom before tearing down the current role.
+After a successful switch, register the instance with the router in its new role.
+
+The rebuilt role has a new transport endpoint and NIXL agent. Existing peers must
+refresh their bootstrap metadata before reusing that instance; changing the router
+registration alone does not invalidate a peer's cached transport connection.
+
+Runtime role switching does not support staging buffers. If teardown or rebuild
+fails, the instance becomes unhealthy and must be restarted before serving again.
+
 ### Advanced Configuration
 
 #### NIXL Backend Selection
