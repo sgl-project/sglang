@@ -3,7 +3,7 @@ from typing import Callable, List, Optional, Sequence
 
 import pytest
 
-from sglang.kernels.ops.communication.mp import multigpu_launch
+from sglang.test.kernels.multigpu import multigpu_launch
 
 
 def multigpu_pytest_main(
