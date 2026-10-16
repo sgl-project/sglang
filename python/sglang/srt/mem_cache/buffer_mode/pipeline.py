@@ -680,7 +680,7 @@ class BufferModePipeline:
     def enqueue_backup_intent(self, node_id: NodeId) -> None:
         """Queue one intent per pool with something to write; rejected intents
         are counted and the node re-triggers on a later hit."""
-        if not self._cache.enable_storage:
+        if not self._cache.enable_storage or self._cache.storage_unavailable:
             return
         admitted = self._walk_admitted
         if admitted is not None:

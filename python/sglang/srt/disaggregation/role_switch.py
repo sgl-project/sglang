@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageWedgedError
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -279,6 +280,10 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
                 clear_storage()
             except Exception:
                 logger.exception("hicache storage release on role switch failed")
-        tree_cache.reset()
+        try:
+            tree_cache.reset()
+        except HiCacheStorageWedgedError as e:
+            # The tree is reset; the stuck storage worker only degrades L3.
+            logger.error("hicache storage worker stuck during role switch: %s", e)
     scheduler.req_to_token_pool.clear()
     scheduler.token_to_kv_pool_allocator.clear()

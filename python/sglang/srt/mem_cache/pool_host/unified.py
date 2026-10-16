@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager
+from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    HostKVCache,
+    HostSlotQuarantine,
+    host_memory_budget_bytes,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda, is_hip
+
+# Seconds a pool-wide clear waits for in-flight layout leases; longer than a
+# healthy backend call, shorter than the operator's patience with a flush.
+_CLEAR_LEASE_WAIT_S = 10.0
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -24,6 +34,8 @@ class _SharedPageEnvelopeHostBacking:
     class _LayoutLeaseState(threading.local):
         def __init__(self):
             self.depth = 0
+            # The lease token this thread holds while depth > 0.
+            self.token: Optional[int] = None
 
     class _Side:
         def __init__(
@@ -50,6 +62,8 @@ class _SharedPageEnvelopeHostBacking:
             self.physical_to_logical: dict[int, int] = {}
             self.free_physical_pages: set[int] = set()
             self.watermark = 0 if grow_direction == "up" else page_num - 1
+            # Logical pages an orphaned storage call still uses; see HostKVCache.
+            self.page_quarantine = HostSlotQuarantine()
 
         @property
         def live_page_count(self) -> int:
@@ -191,6 +205,15 @@ class _SharedPageEnvelopeHostBacking:
         # the backend returns. Compaction blocks new leases and drains both.
         self._layout_condition = threading.Condition(self.lock)
         self._layout_users = 0
+        # Lease token -> ident of the thread holding it. A token in
+        # _abandoned_lease_tokens belongs to a storage call nobody waits for
+        # (an orphaned or abandoned worker): compaction does not wait for it
+        # and leaves the pages that call may still write where they are.
+        # Tokens rather than idents: an ident is reused once its thread exits,
+        # and a later lease taken under it must be waited for.
+        self._next_lease_token = 0
+        self._layout_holders: dict[int, int] = {}
+        self._abandoned_lease_tokens: set[int] = set()
         self._layout_lease_state = self._LayoutLeaseState()
         self._compacting = False
         self._pending_transfer_events = {}
@@ -327,18 +350,55 @@ class _SharedPageEnvelopeHostBacking:
             page_counts,
         )
 
-    def _begin_compaction(self) -> list:
+    def _begin_compaction(self, timeout: Optional[float] = None) -> list:
         if self._layout_lease_state.depth:
             raise RuntimeError(
                 "Cannot compact a unified host pool while the current thread "
                 "holds a layout lease."
             )
         self._compacting = True
-        while self._layout_users:
-            self._layout_condition.wait()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._awaited_layout_users():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                self._finish_compaction()
+                holders = sorted(
+                    ident
+                    for token, ident in self._layout_holders.items()
+                    if token not in self._abandoned_lease_tokens
+                )
+                raise RuntimeError(
+                    "Unified host pool layout is still leased by an in-flight "
+                    f"storage call on thread(s) {holders}; it cannot be cleared "
+                    "until that call returns."
+                )
+            self._layout_condition.wait(remaining)
         events = list(self._pending_transfer_events.values())
         self._pending_transfer_events = {}
         return events
+
+    def _awaited_layout_users(self) -> int:
+        return sum(
+            1
+            for token in self._layout_holders
+            if token not in self._abandoned_lease_tokens
+        )
+
+    def abandon_leases_of(self, idents: set[int]) -> None:
+        """Stop waiting for the leases these threads hold right now: they are
+        inside a storage call nobody waits for, and the pages it may still
+        write are quarantined, so compaction leaves them in place."""
+        with self._layout_condition:
+            abandoned = {
+                token
+                for token, ident in self._layout_holders.items()
+                if ident in idents
+            }
+            if not abandoned:
+                return
+            self._abandoned_lease_tokens |= abandoned
+            if self._awaited_layout_users() == 0:
+                self._layout_condition.notify_all()
 
     def _finish_compaction(self) -> None:
         self._compacting = False
@@ -353,6 +413,10 @@ class _SharedPageEnvelopeHostBacking:
             while self._compacting:
                 self._layout_condition.wait()
             self._layout_users += 1
+            token = self._next_lease_token
+            self._next_lease_token += 1
+            self._layout_holders[token] = threading.get_ident()
+            self._layout_lease_state.token = token
             self._layout_lease_state.depth = 1
 
     def _prune_completed_transfer_events_locked(self) -> None:
@@ -383,7 +447,11 @@ class _SharedPageEnvelopeHostBacking:
             if self._layout_lease_state.depth:
                 return
             self._layout_users -= 1
-            if self._layout_users == 0:
+            token = self._layout_lease_state.token
+            self._layout_lease_state.token = None
+            self._layout_holders.pop(token, None)
+            self._abandoned_lease_tokens.discard(token)
+            if self._awaited_layout_users() == 0:
                 self._layout_condition.notify_all()
 
     @contextmanager
@@ -396,15 +464,28 @@ class _SharedPageEnvelopeHostBacking:
 
     def _compact_side(self, side: _Side) -> None:
         reverse = side.grow_direction == "down"
-        live = sorted(side.physical_to_logical.items(), reverse=reverse)
-        if reverse:
-            targets = range(side.page_num - 1, side.page_num - 1 - len(live), -1)
-        else:
-            targets = range(len(live))
+        # Quarantined pages may still be written by an abandoned storage call
+        # whose lease compaction did not wait for, so they stay in place.
+        pinned = side.page_quarantine.pinned()
+        immovable = {
+            physical
+            for physical, logical in side.physical_to_logical.items()
+            if logical in pinned
+        }
+        live = sorted(
+            (
+                item
+                for item in side.physical_to_logical.items()
+                if item[0] not in immovable
+            ),
+            reverse=reverse,
+        )
+        slots = range(side.page_num - 1, -1, -1) if reverse else range(side.page_num)
+        targets = (slot for slot in slots if slot not in immovable)
 
         new_logical_to_physical = {}
         new_physical_to_logical = {}
-        for (source, logical), target in zip(live, targets, strict=True):
+        for (source, logical), target in zip(live, targets):
             if source != target:
                 source_offset = source * side.page_bytes
                 target_offset = target * side.page_bytes
@@ -413,13 +494,31 @@ class _SharedPageEnvelopeHostBacking:
                 )
             new_logical_to_physical[logical] = target
             new_physical_to_logical[target] = logical
+        for physical in immovable:
+            logical = side.physical_to_logical[physical]
+            new_logical_to_physical[logical] = physical
+            new_physical_to_logical[physical] = logical
 
         side.logical_to_physical = new_logical_to_physical
         side.physical_to_logical = new_physical_to_logical
-        side.free_physical_pages.clear()
-        side.watermark = (
-            len(live) if side.grow_direction == "up" else side.page_num - 1 - len(live)
-        )
+        self._reset_physical_free_state(side)
+
+    @staticmethod
+    def _reset_physical_free_state(side: _Side) -> None:
+        """Rebuild the watermark and the holes behind it from the live pages."""
+        occupied = set(side.physical_to_logical)
+        if side.grow_direction == "up":
+            side.watermark = max(occupied) + 1 if occupied else 0
+            side.free_physical_pages = {
+                page for page in range(side.watermark) if page not in occupied
+            }
+        else:
+            side.watermark = min(occupied) - 1 if occupied else side.page_num - 1
+            side.free_physical_pages = {
+                page
+                for page in range(side.watermark + 1, side.page_num)
+                if page not in occupied
+            }
 
     def _compact(self) -> None:
         events = self._begin_compaction()
@@ -608,6 +707,9 @@ class _SharedPageEnvelopeHostBacking:
                 raise AssertionError("Host pages cannot be freed more than once.")
             if any(page not in side.logical_to_physical for page in logical_pages):
                 raise AssertionError(f"Host pages are not allocated in {name!r}.")
+            logical_pages = side.page_quarantine.hold_freed(
+                torch.tensor(logical_pages, dtype=torch.int64)
+            ).tolist()
             for logical_page in logical_pages:
                 physical_page = side.logical_to_physical.pop(logical_page)
                 del side.physical_to_logical[physical_page]
@@ -621,18 +723,54 @@ class _SharedPageEnvelopeHostBacking:
             self._release_center_holes(side)
             return len(indices)
 
+    def quarantine(self, name: str, indices: torch.Tensor) -> None:
+        with self.lock:
+            side = self.sides[name]
+            side.page_quarantine.pin(
+                torch.tensor(self._page_ids(indices, side.page_size), dtype=torch.int64)
+            )
+
+    def release_quarantine(self, name: str, indices: torch.Tensor) -> None:
+        with self.lock:
+            side = self.sides[name]
+            held = side.page_quarantine.unpin(
+                torch.tensor(self._page_ids(indices, side.page_size), dtype=torch.int64)
+            )
+            if held.numel():
+                self.free(name, self._expand_pages(held.tolist(), side.page_size))
+
     def clear(self, name: str) -> None:
         with self.lock:
-            events = self._begin_compaction()
+            # Leases of abandoned storage calls are not waited for: the pages
+            # they may still write stay mapped and quarantined. Any other lease
+            # held past the bound fails the clear instead of blocking the
+            # scheduler forever.
+            events = self._begin_compaction(timeout=_CLEAR_LEASE_WAIT_S)
             try:
                 for event in events:
                     event.synchronize()
                 side = self.sides[name]
-                side.free_logical_extents = [(0, side.page_num)]
-                side.logical_to_physical.clear()
-                side.physical_to_logical.clear()
-                side.free_physical_pages.clear()
-                side.watermark = 0 if side.grow_direction == "up" else side.page_num - 1
+                kept = {
+                    logical: side.logical_to_physical[logical]
+                    for logical in sorted(side.page_quarantine.pinned())
+                    if logical in side.logical_to_physical
+                }
+                side.logical_to_physical = dict(kept)
+                side.physical_to_logical = {
+                    physical: logical for logical, physical in kept.items()
+                }
+                extents = []
+                start = 0
+                for logical in kept:
+                    if logical > start:
+                        extents.append((start, logical))
+                    start = logical + 1
+                if start < side.page_num:
+                    extents.append((start, side.page_num))
+                side.free_logical_extents = extents
+                self._reset_physical_free_state(side)
+                # The owner of every kept page is gone with the clear.
+                side.page_quarantine.hold_all_pinned()
             finally:
                 self._finish_compaction()
 
@@ -841,6 +979,12 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
 
     def free(self, indices: torch.Tensor) -> int:
         return self._shared_backing.free(self.pool_label, indices)
+
+    def quarantine(self, indices: torch.Tensor) -> None:
+        self._shared_backing.quarantine(self.pool_label, indices)
+
+    def release_quarantine(self, indices: torch.Tensor) -> None:
+        self._shared_backing.release_quarantine(self.pool_label, indices)
 
     def prepare_transfer_indices(
         self, host_indices, device_indices, io_backend

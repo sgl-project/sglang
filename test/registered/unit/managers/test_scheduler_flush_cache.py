@@ -6,6 +6,7 @@ from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageWedgedError
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -38,6 +39,20 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertFalse(output.success)
         scheduler.flush_cache.assert_called_once()
+
+    def test_wedged_storage_worker_is_reported_not_raised(self):
+        """A flush that completed but could not stop a HiCache storage worker
+        raises out of the scheduler's flush_cache; the wrapper reports it in
+        the output instead of letting it out of the event loop."""
+        scheduler = self._new_scheduler()
+        scheduler.flush_cache.side_effect = HiCacheStorageWedgedError(
+            "worker X did not stop"
+        )
+
+        output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=None))
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "Cache flushed, but worker X did not stop")
 
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""

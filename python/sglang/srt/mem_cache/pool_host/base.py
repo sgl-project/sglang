@@ -6,7 +6,7 @@ import threading
 from collections.abc import Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import wraps
+from functools import cached_property, wraps
 from typing import Optional, TypeGuard
 
 import torch
@@ -159,6 +159,75 @@ def synchronized(func):
     return wrapper
 
 
+class HostSlotQuarantine:
+    """Host slots a timed-out storage-backend call may still read or write.
+
+    Their owner keeps freeing them as usual; a free of pinned slots is held
+    back here and completed when the call returns, so the allocator never hands
+    a slot to a new owner while the old call can still touch it. Pins are
+    counted per slot: overlapping calls (a KV read and its sidecar read, a
+    whole-operation write over its per-batch writes) each pin and unpin once,
+    and a slot is protected until the last of them returns. Callers hold the
+    pool lock.
+    """
+
+    def __init__(self):
+        self._pins: dict[int, int] = {}
+        # Pinned slots their owner has already freed.
+        self._held: set[int] = set()
+        self._pinned_tensor = torch.empty(0, dtype=torch.int64)
+
+    def _refresh_pinned_tensor(self) -> None:
+        self._pinned_tensor = torch.tensor(sorted(self._pins), dtype=torch.int64)
+
+    def pin(self, indices: torch.Tensor) -> None:
+        for slot in indices.to(dtype=torch.int64, device="cpu").flatten().tolist():
+            self._pins[slot] = self._pins.get(slot, 0) + 1
+        self._refresh_pinned_tensor()
+
+    def hold_freed(self, indices: torch.Tensor) -> torch.Tensor:
+        """Split an owner's free: the pinned part is held, the rest returned."""
+        if not self._pins or indices.numel() == 0:
+            return indices
+        pinned_mask = torch.isin(indices, self._pinned_tensor)
+        if not bool(pinned_mask.any()):
+            return indices
+        self._held.update(indices[pinned_mask].tolist())
+        return indices[~pinned_mask]
+
+    def pinned(self) -> set[int]:
+        return set(self._pins)
+
+    def hold_all_pinned(self) -> None:
+        """A pool-wide clear freed every slot: hold the pinned ones until
+        their calls return."""
+        self._held = set(self._pins)
+
+    def carve_after_clear(self, free_slots: torch.Tensor) -> torch.Tensor:
+        """A pool-wide clear freed every slot: keep the pinned ones out of the
+        rebuilt free list and hold them until their calls return."""
+        if not self._pins:
+            return free_slots
+        self.hold_all_pinned()
+        return free_slots[~torch.isin(free_slots, self._pinned_tensor)]
+
+    def unpin(self, indices: torch.Tensor) -> torch.Tensor:
+        """Drop one pin from ``indices``; returns the slots that became
+        unprotected while their owner had already freed them."""
+        released = []
+        for slot in indices.to(dtype=torch.int64, device="cpu").flatten().tolist():
+            count = self._pins.get(slot, 0) - 1
+            if count > 0:
+                self._pins[slot] = count
+                continue
+            self._pins.pop(slot, None)
+            if slot in self._held:
+                self._held.discard(slot)
+                released.append(slot)
+        self._refresh_pinned_tensor()
+        return torch.tensor(released, dtype=torch.int64)
+
+
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
@@ -223,6 +292,11 @@ class HostKVCache(abc.ABC):
             self._allocate_host_buffer()
         self.lock = threading.RLock()
         self.clear()
+
+    @cached_property
+    def slot_quarantine(self) -> HostSlotQuarantine:
+        # Created on first use: several side pools skip HostKVCache.__init__.
+        return HostSlotQuarantine()
 
     def _allocate_host_buffer(self) -> None:
         if self.size <= self.device_capacity_tokens:
@@ -503,6 +577,20 @@ class HostKVCache(abc.ABC):
         # Per-slot flag used to detect double-free.
         # slot_used[k] is true if slot k is allocated.
         self.slot_used = torch.zeros(self.logical_size, dtype=torch.bool)
+        self.free_slots = self.slot_quarantine.carve_after_clear(self.free_slots)
+
+    @synchronized
+    def quarantine(self, indices: torch.Tensor) -> None:
+        """Keep ``indices`` unallocatable after their owner frees them, until
+        ``release_quarantine``; for spans a timed-out storage call still uses."""
+        self.slot_quarantine.pin(indices)
+
+    @synchronized
+    def release_quarantine(self, indices: torch.Tensor) -> None:
+        released = self.slot_quarantine.unpin(indices)
+        if released.numel():
+            self.release_slots.append(released)
+            self.num_release_slots += len(released)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -562,6 +650,8 @@ class HostKVCache(abc.ABC):
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
         )
         self.slot_used[indices_cpu] = False
-        self.release_slots.append(indices_cpu)
-        self.num_release_slots += len(indices_cpu)
+        indices_cpu = self.slot_quarantine.hold_freed(indices_cpu)
+        if indices_cpu.numel():
+            self.release_slots.append(indices_cpu)
+            self.num_release_slots += len(indices_cpu)
         return len(indices)

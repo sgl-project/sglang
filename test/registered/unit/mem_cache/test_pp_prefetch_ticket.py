@@ -26,6 +26,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_call_guard import (
+    StorageCallGuard,
+    StorageCallTimeouts,
+)
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -53,6 +57,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
         c.pp_prefetch_command_thread = None
         c.prefetch_hits_sync_groups = c.prefetch_completion_sync_groups = ["pp", "tp"]
+        c.storage_sync_failed, c.storage_sync_failure = False, None
+        c._storage_sync_lock = threading.Lock()
+        c.storage_failure_policy = "raise"
         c.pp_prefetch_states, c.pp_prefetch_decisions = {}, {}
         c.pp_prefetch_state_lock = threading.Lock()
         c.pp_prefetch_command_queue = Queue()
@@ -62,6 +69,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.host_mem_release_queue = Queue()
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
+        c.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
+        c._init_storage_worker_tracking()
         c.prefetch_tokens_occupied = 0
         c.mem_pool_host = Mock(page_size=4)
         c.mem_pool_host.layout_lease.side_effect = nullcontext
@@ -86,6 +95,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c
         cache._all_reduce = Mock()
+        cache.storage_unavailable = False
         cache.ongoing_prefetch = {}
         cache.prefetch_loaded_tokens_by_reqid = {}
         cache.prefetch_loaded_storage_start_by_reqid = {}
@@ -349,7 +359,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertEqual(c.mem_pool_host.free.call_args.kwargs["pool"], PoolName.SWA)
 
     def test_command_failure_finishes_queue_task_and_is_reported_on_poll(self):
+        """A broken ticket broadcast is a storage sync failure: the pending
+        ticket fails loud on poll under the raise policy and stays not-ready
+        under the disable policy until the rank-agreed degrade retires it."""
         c = self.c
+        self.assertTrue(self.submit().decision)
         with (
             patch(
                 f"{HybridCacheController.__module__}.broadcast_pyobj",
@@ -362,15 +376,27 @@ class TestPPPrefetchTicket(unittest.TestCase):
             )
             c.pp_prefetch_command_thread = worker
             worker.start()
-            self.submit()
             worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(c.pp_prefetch_command_queue.unfinished_tasks, 0)
+        self.assertTrue(c.storage_sync_failed)
+        with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
+            c.is_pp_prefetch_ready("hit")
+        c.storage_failure_policy = "disable"
+        self.assertFalse(c.is_pp_prefetch_ready("hit"))
+        # The TP-local hit groups did not fail, so a later request is still
+        # ticketed; PP0's degraded verdict then retires every pending ticket,
+        # and a ticket PP0 declared ready never blocks a dead stage.
+        self.assertTrue(self.submit("next").decision)
+        self.cache.pp_rank = 0
+        self.cache.storage_unavailable = True
         for rid in ("hit", "next"):
-            if rid == "next":
-                self.submit(rid)
-            with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
-                c.is_pp_prefetch_ready(rid)
+            self.assertTrue(
+                self.cache.check_prefetch_progress(CacheRequestHandle(rid, 0))
+            )
+        self.assertEqual(c.pp_prefetch_decisions, {})
+        with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
+            c.take_ready_pp_prefetch("hit")
 
     def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
         c = self.c

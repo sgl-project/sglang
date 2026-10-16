@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.storage_call_guard import StorageCallGuardStats
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -2223,6 +2224,41 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.hicache_storage_healthy = Gauge(
+            name="sglang:hicache_storage_healthy",
+            documentation="1 while the L3 storage workers of every rank are "
+            "alive and their rank-sync collectives complete; 0 once the "
+            "scheduler degraded to no-L3 (storage_failure_policy=disable), "
+            "until the storage backend is re-attached.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.storage_call_timeouts_total = Counter(
+            name="sglang:hicache_storage_call_timeouts_total",
+            documentation="Storage backend calls that missed their deadline "
+            "(storage_{query,get,set}_timeout_s) and were published as a miss "
+            "while the call kept running on an orphaned worker.",
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.storage_call_errors_total = Counter(
+            name="sglang:hicache_storage_call_errors_total",
+            documentation="Storage backend calls published as a miss because "
+            "they raised, or because every worker of that kind was still "
+            "pinned by an earlier hung call.",
+            labelnames=list(labels.keys()) + ["kind"],
+        )
+        self.storage_orphaned_calls = Gauge(
+            name="sglang:hicache_storage_orphaned_calls",
+            documentation="Timed-out storage backend calls still running; the "
+            "host memory they may touch stays quarantined until they return.",
+            labelnames=list(labels.keys()) + ["kind"],
+            multiprocess_mode="mostrecent",
+        )
+        for kind in ("query", "probe", "get", "set"):
+            self.storage_call_timeouts_total.labels(**self.labels, kind=kind)
+            self.storage_call_errors_total.labels(**self.labels, kind=kind)
+            self.storage_orphaned_calls.labels(**self.labels, kind=kind)
+
         bucket_io = [
             1,
             5,
@@ -2306,11 +2342,28 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
 
+    def log_storage_healthy(self, healthy: bool) -> None:
+        self.hicache_storage_healthy.labels(**self.labels).set(int(healthy))
+
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
+
+    def log_storage_call_guard(self, stats: StorageCallGuardStats) -> None:
+        for kind, count in stats.timeouts.items():
+            if count > 0:
+                self.storage_call_timeouts_total.labels(**self.labels, kind=kind).inc(
+                    count
+                )
+        for kind, count in stats.errors.items():
+            if count > 0:
+                self.storage_call_errors_total.labels(**self.labels, kind=kind).inc(
+                    count
+                )
+        for kind, count in stats.orphaned.items():
+            self.storage_orphaned_calls.labels(**self.labels, kind=kind).set(count)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

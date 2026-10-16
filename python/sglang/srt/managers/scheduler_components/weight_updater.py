@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageWedgedError
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -122,14 +123,20 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Flush the cache the old weights produced. A flush refused because
         requests are still running or queued fails the update call."""
-        if recv_req.flush_cache and not self.flush_cache(
-            empty_cache=recv_req.torch_empty_cache
-        ):
-            return False, (
-                "Weights were updated, but the cache was not flushed because "
-                "requests are still running or queued. Retract or finish them, "
-                "then call /flush_cache."
-            )
+        if recv_req.flush_cache:
+            try:
+                flushed = self.flush_cache(empty_cache=recv_req.torch_empty_cache)
+            except HiCacheStorageWedgedError as e:
+                # The cache is flushed; the stuck L3 worker does not fail the
+                # update, it is reported.
+                logger.error("Cache flushed after the weight update, but %s", e)
+                flushed = True
+            if not flushed:
+                return False, (
+                    "Weights were updated, but the cache was not flushed because "
+                    "requests are still running or queued. Retract or finish them, "
+                    "then call /flush_cache."
+                )
         return success, message
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
@@ -363,7 +370,10 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
-            self.flush_cache()
+            try:
+                self.flush_cache()
+            except HiCacheStorageWedgedError as e:
+                logger.error("Cache flushed to release memory, but %s", e)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")

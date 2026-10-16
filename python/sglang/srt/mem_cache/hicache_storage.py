@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
+class HiCacheStorageWedgedError(RuntimeError):
+    """A HiCache storage worker could not be stopped by a cache reset."""
+
+    # Raised by the tree cache's reset() after it completed with fresh
+    # workers: the stuck one keeps its host memory quarantined and the
+    # rank-agreed storage health bit degrades L3 at the next drain.
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -171,6 +179,11 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
         name: (rs.index(False) if False in rs else len(rs))
         for name, rs in results.items()
     }
+
+
+def pool_transfer_misses(transfers: List[PoolTransfer]) -> dict[str, List[bool]]:
+    """The batch v2 result for a call that returned nothing."""
+    return {transfer.name: [False] * len(transfer.keys or ()) for transfer in transfers}
 
 
 class HiCacheStorage(ABC):

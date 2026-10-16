@@ -299,6 +299,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageWedgedError
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -5413,12 +5414,23 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
-        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+    def flush_cache(self, empty_cache: bool = True) -> bool:
+        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+
+        Raises HiCacheStorageWedgedError after the pools are flushed when a
+        HiCache storage worker could not be stopped: the flush itself is
+        complete and the engine keeps serving with L3 degraded.
+        """
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
+            storage_error: Optional[HiCacheStorageWedgedError] = None
+            try:
+                self.tree_cache.reset()
+            except HiCacheStorageWedgedError as e:
+                # The tree is reset; the device pools are flushed below, then
+                # the stuck worker is reported.
+                storage_error = e
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -5430,6 +5442,9 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
+            if storage_error is not None:
+                logger.error("Cache flushed, but %s", storage_error)
+                raise storage_error
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:

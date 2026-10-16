@@ -58,6 +58,7 @@ def _staged_fixture(full_match=2):
     )
     cache.host_memory_mode = "buffer_only"
     cache.linker = None
+    cache.storage_unavailable = False
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache.prefetch_loaded_tokens_by_reqid = {_REQ: 6}
     cache.prefetch_loaded_storage_start_by_reqid = {_REQ: 2}
@@ -140,6 +141,7 @@ def _hit_drain_fixture():
     """A buffer-mode cache whose hit drain and outcome accounting are real."""
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.host_memory_mode = "buffer_only"
+    cache.storage_unavailable = False
     cache.prefetch_threshold = 2
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None

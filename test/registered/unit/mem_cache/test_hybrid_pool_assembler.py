@@ -42,6 +42,10 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     make_kv_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.storage_call_guard import (
+    StorageCallGuard,
+    StorageCallTimeouts,
+)
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1178,6 +1182,8 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
         )
         cc = HybridCacheController.__new__(HybridCacheController)
         cc.storage_backend = FailingStorage()
+        cc.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
+        cc._init_storage_worker_tracking()
         cc.prefetch_sync_queue = Queue()
         operation = PrefetchOperation(
             CacheRequestHandle("r", 0),

@@ -2999,7 +2999,9 @@ def initialize_model_parallel(
 
 
 def create_custom_parallel_group(
-    group_ranks: List[int], backend: str = "gloo"
+    group_ranks: List[int],
+    backend: str = "gloo",
+    timeout: Optional[timedelta] = None,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """
     Create a custom parallel group based on the provided ranks.
@@ -3008,6 +3010,7 @@ def create_custom_parallel_group(
         group_ranks: The list of ranks that the CURRENT process wants to join.
                      (e.g., Rank 0 passes [0...7], Rank 8 passes [8...15])
         backend: The communication backend (default: "gloo").
+        timeout: Collective timeout for the new groups; None keeps torch's default.
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
@@ -3060,7 +3063,9 @@ def create_custom_parallel_group(
     my_new_group = None
 
     for g_ranks in unique_groups:
-        group = torch.distributed.new_group(ranks=g_ranks, backend=backend)
+        group = torch.distributed.new_group(
+            ranks=g_ranks, backend=backend, timeout=timeout
+        )
 
         if set(g_ranks) == set(local_config):
             my_new_group = group

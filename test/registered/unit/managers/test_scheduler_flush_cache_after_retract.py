@@ -9,6 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageWedgedError
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -86,6 +87,18 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()
+
+    def test_flush_cache_reports_a_wedged_storage_worker_after_flushing(self):
+        """A HiCache storage worker that will not stop must not abort the
+        flush: the pools are still cleared, then the error surfaces."""
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = [_make_req(is_retracted=True)]
+        scheduler.tree_cache.reset.side_effect = HiCacheStorageWedgedError("stuck")
+
+        with self.assertRaises(HiCacheStorageWedgedError):
+            scheduler.flush_cache()
+        scheduler.req_to_token_pool.clear.assert_called_once()
+        scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
 
     def test_paused_flush_refuses_waiting_req_holding_kv(self):
         """A PD-decode request whose KV has arrived waits holding its request
