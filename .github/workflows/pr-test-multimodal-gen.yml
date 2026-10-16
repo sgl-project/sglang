@@ -452,6 +452,14 @@ jobs:
             sglang/multimodal_gen/test/unit/test_mxfp8_online_gemm.py \
             sglang/multimodal_gen/test/unit/test_wan_gelu_mlp.py
 
+      - name: Run 4-GPU diffusion unit tests
+        timeout-minutes: 15
+        working-directory: python
+        run: |
+          python3 -m pytest -v \
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sequence_parallel.py::test_joint_video_audio_tensor_sequence_parallel \
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py::test_sr_four_gpus
+
       - name: Run diffusion server tests
         timeout-minutes: 240
         env:
