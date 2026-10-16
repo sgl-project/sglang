@@ -31,26 +31,32 @@ class Range(NamedTuple):
 class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
-    Four algos are tried in order of preference (fastest first):
+    Five algos are tried in order of preference (fastest first):
       1. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
-      2. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
-      3. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
+      2. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
+      3. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
+      4. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
                             (only when multicast is enabled at runtime)
-      4. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
+      5. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
     Above all of these, the caller falls back to NCCL.
 
     Setting two adjacent thresholds equal effectively disables the middle
-    algo; leaving ``mc`` at the default disables multicast.
+    algo; leaving ``mc`` / ``two_shot_push_threshold`` at the default
+    disables that algo.
     """
 
     one_shot_push_threshold: int
     one_shot_pull_threshold: int
     two_shot_pull_threshold: int
     mc: Range = Range(0, 0)  # default: multicast disabled in this context
+    two_shot_push_threshold: int = 0  # default: 2shot_push disabled
 
-    @property
-    def max_push_bytes(self) -> int:
-        return self.one_shot_push_threshold
+    def max_push_bytes(self, world_size: int) -> int:
+        """Per-slot push plane bytes this heuristic needs."""
+        return max(
+            self.one_shot_push_threshold,
+            two_shot_push_slot_bytes(self.two_shot_push_threshold, world_size),
+        )
 
     @property
     def max_pull_bytes(self) -> int:
@@ -62,13 +68,25 @@ class Heuristic(NamedTuple):
             self.mc.max_bytes,
         )
 
-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> "Heuristic":
+    def clip(
+        self, *, max_push_bytes: int, max_pull_bytes: int, world_size: int
+    ) -> "Heuristic":
         return Heuristic(
             min(self.one_shot_push_threshold, max_push_bytes),
             min(self.one_shot_pull_threshold, max_pull_bytes),
             min(self.two_shot_pull_threshold, max_pull_bytes),
             self.mc.clip(max_pull_bytes),
+            min(
+                self.two_shot_push_threshold,
+                world_size * 16 * (max_push_bytes // 32),
+            ),
         )
+
+
+def two_shot_push_slot_bytes(nbytes: int, world_size: int) -> int:
+    """A 2shot_push slot holds a partial half and a gathered half of one
+    ``ceil(nbytes / world_size)`` chunk, in 16 B vectors."""
+    return 32 * -(-nbytes // (16 * world_size))
 
 
 class AllReduceConfig(NamedTuple):
@@ -88,22 +106,19 @@ class AllReduceConfig(NamedTuple):
     num_pull_blocks: int
     num_mc_blocks: Optional[int]
 
-    @property
-    def max_push_bytes(self) -> int:
-        return max(self.graph.max_push_bytes, self.eager.max_push_bytes)
+    def max_push_bytes(self, world_size: int) -> int:
+        return max(
+            self.graph.max_push_bytes(world_size),
+            self.eager.max_push_bytes(world_size),
+        )
 
     @property
     def max_pull_bytes(self) -> int:
         return max(self.graph.max_pull_bytes, self.eager.max_pull_bytes)
 
-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> "AllReduceConfig":
+    def clip(self, **kwargs) -> "AllReduceConfig":
         return self._replace(
-            graph=self.graph.clip(
-                max_push_bytes=max_push_bytes, max_pull_bytes=max_pull_bytes
-            ),
-            eager=self.eager.clip(
-                max_push_bytes=max_push_bytes, max_pull_bytes=max_pull_bytes
-            ),
+            graph=self.graph.clip(**kwargs), eager=self.eager.clip(**kwargs)
         )
 
 
@@ -112,7 +127,8 @@ def _pack_heuristic(*args) -> Heuristic:
     return Heuristic(*arg_list)
 
 
-# SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200.
+# SM100 (Blackwell, B200/B300/GB200). Tuned on B200 (148 SMs); world 16 on GB200;
+# the 2shot_push rows (world 4 / 8) on B300.
 @cache
 def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     mc_blocks = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
@@ -139,8 +155,8 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         4: config(
             4,
-            graph=(2.250 * MB, 2.250 * MB, 128.0 * MB),
-            eager=(3.000 * MB, 3.000 * MB, 32.00 * MB),
+            graph=(0.625 * MB, 0.625 * MB, 128.0 * MB, Range(0, 0), 8 * MB),
+            eager=(0.625 * MB, 0.625 * MB, 32.00 * MB, Range(0, 0), 8 * MB),
         ),
         5: config(
             5,
@@ -159,8 +175,8 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         8: config(
             8,
-            graph=(0.500 * MB, 0.500 * MB, 128.0 * MB, Range(8 * MB, 128 * MB)),
-            eager=(0.750 * MB, 0.750 * MB, 128.0 * MB, Range(0, 128 * MB)),
+            graph=(256 * KB, 256 * KB, 128.0 * MB, Range(8 * MB, 128 * MB), 8 * MB),
+            eager=(256 * KB, 256 * KB, 128.0 * MB, Range(0, 128 * MB), 8 * MB),
         ),
         16: config(
             16,
