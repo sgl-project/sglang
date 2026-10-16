@@ -22,6 +22,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.multimodal.cache.identity import _read_media_bytes  # noqa: E402
 from sglang.srt.multimodal.processors.inkling import _resolve_media_item  # noqa: E402
+from sglang.srt.multimodal.processors.moss_vl import MossVLImageProcessor  # noqa: E402
 from sglang.srt.utils import common  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -85,6 +86,14 @@ class TestMediaUrlResolvers(CustomTestCase):
         audio = common.load_audio("fake://bucket/clip.wav", sr=_AUDIO_SAMPLE_RATE)
         self.assertEqual(len(audio), _AUDIO_SAMPLES)
         self.assertEqual(self.seen_urls, ["fake://bucket/clip.wav"])
+
+    def test_moss_vl_video_routes_registered_scheme(self):
+        processor = object.__new__(MossVLImageProcessor)
+        path, temp_path = processor._normalize_video_string("fake://bucket/clip.mp4")
+        self.addCleanup(processor._remove_temp_video_paths, [temp_path])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), self.payload)
+        self.assertEqual(self.seen_urls, ["fake://bucket/clip.mp4"])
 
     def test_inkling_media_item_routes_registered_scheme(self):
         self.assertEqual(_resolve_media_item("fake://bucket/img.png"), self.payload)
