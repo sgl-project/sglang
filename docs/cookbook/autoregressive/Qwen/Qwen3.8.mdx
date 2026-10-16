@@ -203,7 +203,6 @@ Recommended: **MI355X + MXFP4, single node, TP8**. MI350X emits the identical co
 - **`--mem-fraction-static` looks aggressive on purpose.** With the aiter backend above 8192 context SGLang multiplies it by **0.85** before allocating, so MI355X's `0.9` lands at ≈0.765 and MI300X's `1.0` at ≈0.85. Don't "fix" these downward. MI300X must stay at 1.0 or the weights stop fitting.
 - **`--disable-custom-all-reduce` belongs on every MI300X rank** — SGLang resolves it per process, so setting it on one node would leave the two pipeline stages reducing through different code paths.
 - MI300X runs `--kv-cache-dtype fp8_e4m3` with `--page-size 16`: at 8 × 192GB per node the shape is memory-bound.
-- **Mono decode for latency-bound MI355X serving.** `SGLANG_QWEN3_5_MONO_DECODE=1` runs each layer of a decode step of 8 rows or fewer as two persistent FlyDSL launches (MXFP4, TP8, gfx950). Add `--disable-shared-experts-fusion`. Without MTP, also drop ReplaySSM; the SSM state can be fp32 or `--mamba-ssm-dtype bfloat16`. With NEXTN it covers the verify steps of 1 or 2 requests. Steps of more than 8 rows take the stock path, so the gain is at 8 or fewer concurrent requests.
 
 ### ReplaySSM
 
