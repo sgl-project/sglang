@@ -403,31 +403,18 @@ def _wan_temb_table_slices(
     so the result is bit-identical to the eager chain; the first call still
     verifies ``torch.equal`` and falls back permanently on mismatch.
     """
-    verified = _WAN_TEMB_SLICES.verified
-    if (
-        not _WAN_TEMB_SLICES.disabled
-        and _is_cuda
-        and temb.is_cuda
-        and (verified or _WAN_TEMB_SLICES.can_attempt_once())
-    ):
-        try:
-            buf = fused_temb_table_slices(table, temb)
-        except Exception as exc:
-            _WAN_TEMB_SLICES.on_exception(exc, logger=logger)
-        else:
-            out = tuple(buf[j] for j in range(6))
-            if verified:
-                return out
-            return _WAN_TEMB_SLICES.accept_or_fallback(
-                out,
-                _eager_temb_table_slices(table, temb),
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "Wan fused temb-table slices are not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+
+    def fused():
+        buf = fused_temb_table_slices(table, temb)
+        return tuple(buf[j] for j in range(6))
+
+    if _is_cuda and temb.is_cuda:
+        return _WAN_TEMB_SLICES.run(
+            fused,
+            lambda: _eager_temb_table_slices(table, temb),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return _eager_temb_table_slices(table, temb)
 
 

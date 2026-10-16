@@ -144,7 +144,6 @@ def test_bitexact_gate_mismatch_disables_permanently():
     out = gate.accept_or_fallback(
         torch.tensor([1.0]),
         torch.tensor([2.0]),
-        mismatch_msg="mismatch",
     )
     assert torch.equal(out, torch.tensor([2.0]))
     assert gate.disabled and not gate.verified

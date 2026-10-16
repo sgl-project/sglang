@@ -178,10 +178,6 @@ def _qwen_norm_out(
         reference,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "Qwen-Image fused norm_out is not bit-exact on this platform; "
-            "falling back to eager"
-        ),
     )
 
 

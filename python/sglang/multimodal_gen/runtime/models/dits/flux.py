@@ -153,10 +153,6 @@ def _flux_fused_ln_modulate(
         ref,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX fused LN+modulate fast path is not bit-exact against this "
-            "platform's LayerNorm dispatch; falling back to eager"
-        ),
     )
 
 

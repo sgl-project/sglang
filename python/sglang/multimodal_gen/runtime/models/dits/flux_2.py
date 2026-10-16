@@ -125,10 +125,8 @@ def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
             allow_strided_qk=current_platform.is_rocm(),
         )
 
-    gate = _FLUX2_STRIDED_QK_ROPE
     if (
-        gate.disabled
-        or head_dim != 128
+        head_dim != 128
         or type(q_norm) is not RMSNorm
         or type(k_norm) is not RMSNorm
         or q_norm.variance_epsilon != k_norm.variance_epsilon
@@ -145,23 +143,12 @@ def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
         )
     ):
         return reference()
-    sig = (q.device, q.shape, q.stride(), cache.stride(), q_norm.variance_epsilon)
-    verified = gate.is_verified(sig)
-    if not verified and torch.cuda.is_current_stream_capturing():
-        return reference()
-    try:
-        out = flux2_strided_qknorm_rope(
+    return _FLUX2_STRIDED_QK_ROPE.run(
+        lambda: flux2_strided_qknorm_rope(
             q, k, q_norm.weight, k_norm.weight, cache, q_norm.variance_epsilon
-        )
-    except Exception as exc:
-        gate.on_exception(exc, logger=logger)
-        return reference()
-    if verified:
-        return out
-    return gate.accept_or_fallback(
-        out,
-        reference(),
-        sig=sig,
+        ),
+        reference,
+        sig=(q.device, q.shape, q.stride(), cache.stride(), q_norm.variance_epsilon),
         equal=lambda a, b: all(
             torch.equal(x.view(torch.int16), y.view(torch.int16)) for x, y in zip(a, b)
         ),
@@ -244,10 +231,6 @@ def _try_flux2_norm_modulate_fp8(
         reference,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX.2 fused LN+modulate+FP8 quant fast path is not bit-exact "
-            "on this platform; falling back to the split path"
-        ),
     )
 
 
@@ -409,10 +392,6 @@ def _flux2_norm_modulate(
         ref,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX.2 fused LN+modulate fast path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 
@@ -459,10 +438,6 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
                 F.silu(x[..., :half]) * x[..., half:],
                 sig=sig,
                 logger=logger,
-                mismatch_msg=(
-                    "FLUX.2 fused SwiGLU fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
             )
     return F.silu(x[..., :half]) * x[..., half:]
 

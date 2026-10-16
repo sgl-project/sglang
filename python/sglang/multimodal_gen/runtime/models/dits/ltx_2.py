@@ -181,10 +181,6 @@ def _ltx2_modulate(
                     out,
                     x * (1 + scale) + shift,
                     logger=logger,
-                    mismatch_msg=(
-                        "LTX-2 fused modulate is not bit-exact on this "
-                        "platform; falling back to eager"
-                    ),
                 )
     return x * (1 + scale) + shift
 

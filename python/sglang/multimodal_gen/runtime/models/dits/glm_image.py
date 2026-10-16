@@ -21,10 +21,8 @@ import torch.nn.functional as F
 from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     BitExactFusionGate,
-    can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
     can_use_linear_gelu,
-    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
     fused_qk_head_layernorm,
     is_plain_layer_norm,
@@ -58,6 +56,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -98,33 +99,15 @@ def _glm_ln_modulate(
     the first call verifies ``torch.equal`` against the eager chain and
     disables the fast path permanently on any mismatch.
     """
-    verified = _GLM_LN_MOD.verified
-    if (
-        not _GLM_LN_MOD.disabled
-        and _is_cuda
-        and x.is_cuda
-        and dtype is x.dtype
-        and is_plain_layer_norm(norm, x.shape[-1])
-        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-        and (verified or _GLM_LN_MOD.can_attempt_once())
-    ):
-        try:
-            out = fused_layernorm_modulate(x, scale, shift, norm.eps)
-        except Exception as exc:
-            _GLM_LN_MOD.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _GLM_LN_MOD.accept_or_fallback(
-                out,
-                _eager_ln_modulate(norm, x, scale, shift, dtype),
-                logger=logger,
-                mismatch_msg=(
-                    "GLM fused LN+modulate fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
-            )
-
+    if _is_cuda and dtype is x.dtype:
+        return layernorm_modulate_bitexact(
+            _GLM_LN_MOD,
+            norm,
+            x,
+            scale,
+            shift,
+            lambda: _eager_ln_modulate(norm, x, scale, shift, dtype),
+        )
     return _eager_ln_modulate(norm, x, scale, shift, dtype)
 
 
@@ -140,10 +123,8 @@ def _glm_qk_layernorm(
     First call verifies ``torch.equal`` against the eager pair and falls
     back permanently on any mismatch.
     """
-    verified = _GLM_QK_LN.verified
     if (
-        not _GLM_QK_LN.disabled
-        and _is_cuda
+        _is_cuda
         and query.is_cuda
         and dtype is query.dtype
         and dtype is key.dtype
@@ -151,30 +132,13 @@ def _glm_qk_layernorm(
         and is_plain_layer_norm(norm_k, key.shape[-1])
         and norm_q.eps == norm_k.eps
         and can_use_fused_qk_head_layernorm(query.dtype, query.shape[-1])
-        and (verified or _GLM_QK_LN.can_attempt_once())
     ):
-        try:
-            out = fused_qk_head_layernorm(query, key, norm_q.eps)
-        except Exception as exc:
-            _GLM_QK_LN.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            ref = (
-                norm_q(query).to(dtype=dtype),
-                norm_k(key).to(dtype=dtype),
-            )
-            return _GLM_QK_LN.accept_or_fallback(
-                out,
-                ref,
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "GLM fused qk-LayerNorm fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
-            )
-
+        return _GLM_QK_LN.run(
+            lambda: fused_qk_head_layernorm(query, key, norm_q.eps),
+            lambda: (norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
 
 

@@ -84,62 +84,32 @@ def _ideogram_rope(
     equals the eager ``round(round(q1*cos1) - round(q2*sin1))`` exactly), so
     it mounts by default with first-call self-verification.
     """
-    verified = _IDEOGRAM_ROPE.verified
     if (
-        not _IDEOGRAM_ROPE.disabled
-        and q.is_cuda
+        q.is_cuda
         and q.dtype is torch.bfloat16
         and q.is_contiguous()
         and k.is_contiguous()
-        and (verified or _IDEOGRAM_ROPE.can_attempt_once())
     ):
-        try:
-            q_fused = fused_rope_rotate_half_bitexact(q, cos, sin)
-            k_fused = fused_rope_rotate_half_bitexact(k, cos, sin)
-        except Exception as exc:
-            _IDEOGRAM_ROPE.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return q_fused, k_fused
-            return _IDEOGRAM_ROPE.accept_or_fallback(
-                (q_fused, k_fused),
-                qwen3_apply_rotary_pos_emb(q, k, cos, sin),
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "Ideogram fused RoPE fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+        return _IDEOGRAM_ROPE.run(
+            lambda: (
+                fused_rope_rotate_half_bitexact(q, cos, sin),
+                fused_rope_rotate_half_bitexact(k, cos, sin),
+            ),
+            lambda: qwen3_apply_rotary_pos_emb(q, k, cos, sin),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return qwen3_apply_rotary_pos_emb(q, k, cos, sin)
 
 
 def _ideogram_swiglu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """``silu(a) * b`` in one kernel, bit-exact vs the eager pair."""
-    verified = _IDEOGRAM_SWIGLU.verified
-    if (
-        not _IDEOGRAM_SWIGLU.disabled
-        and _is_cuda
-        and a.is_cuda
-        and a.dtype is torch.bfloat16
-        and (verified or _IDEOGRAM_SWIGLU.can_attempt_once())
-    ):
-        try:
-            out = fused_silu_mul_bitexact(a, b)
-        except Exception as exc:
-            _IDEOGRAM_SWIGLU.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _IDEOGRAM_SWIGLU.accept_or_fallback(
-                out,
-                F.silu(a) * b,
-                logger=logger,
-                mismatch_msg=(
-                    "Ideogram fused SiLU-mul fast path is not bit-exact on "
-                    "this platform; falling back to eager"
-                ),
-            )
+    if _is_cuda and a.is_cuda and a.dtype is torch.bfloat16:
+        return _IDEOGRAM_SWIGLU.run(
+            lambda: fused_silu_mul_bitexact(a, b),
+            lambda: F.silu(a) * b,
+            logger=logger,
+        )
     return F.silu(a) * b
 
 

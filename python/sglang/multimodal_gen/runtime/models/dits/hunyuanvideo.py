@@ -172,9 +172,6 @@ def _hunyuan_pack_qkv(
         sig=sig,
         equal=tensors_equal,
         logger=logger,
-        mismatch_msg=(
-            "HunyuanVideo fused QKV RoPE pack is not bit-exact on this platform"
-        ),
     )
 
 
