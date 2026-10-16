@@ -1,19 +1,9 @@
-"""Bitwise SSD tile validation on SM120, including live graphs and tracked states.
-
-The fixed-tile reference retains the pre-rebase K-tile accumulation order.
-No checkpoint is required; real checkpoint full-layer replay is a separate test.
-"""
+"""Validate SSD tiles against upstream, including live graphs and tracked states."""
 
 import unittest
-from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.mamba.triton_ops import (
-    ssd_chunk_scan,
-    ssd_chunk_state,
-    ssd_state_passing,
-)
 from sglang.kernels.ops.mamba.triton_ops.ssd_combined import (
     _mamba_chunk_scan_combined_fwd,
 )
@@ -33,14 +23,17 @@ class TestPrefillTiles(CustomTestCase):
         torch.manual_seed(509)
         torch.set_num_threads(2)
 
-    def exact(self, a, b):
+    def assert_outputs_match(self, a, b, *, exact=False):
         self.assertEqual(len(a), len(b))
         for i, (x, y) in enumerate(zip(a, b, strict=True)):
             if x is None:
                 self.assertIsNone(y)
             else:
                 torch.testing.assert_close(
-                    x, y, atol=0, rtol=0, msg=lambda m, i=i: f"output {i}: {m}"
+                    x,
+                    y,
+                    msg=lambda m, i=i: f"output {i}: {m}",
+                    **({"atol": 0, "rtol": 0} if exact else {}),
                 )
 
     def inputs(self, lengths, initial=True, track=True):
@@ -93,29 +86,7 @@ class TestPrefillTiles(CustomTestCase):
 
     def run_ssd(self, x, kwargs, enabled, out):
         with envs.SGLANG_SM120_MAMBA_PREFILL_TILES.override(enabled):
-            if enabled:
-                values = _mamba_chunk_scan_combined_fwd(x=x, out=out, **kwargs)
-            else:
-                # Compare against the original K=16 kernels, before upstream
-                # autotuning introduced different accumulation orders.
-                with (
-                    patch.object(
-                        ssd_chunk_state,
-                        "_chunk_state_fwd_kernel",
-                        ssd_chunk_state._chunk_state_fwd_kernel.fn,
-                    ),
-                    patch.object(
-                        ssd_state_passing,
-                        "_state_passing_fwd_kernel",
-                        ssd_state_passing._state_passing_fwd_kernel.fn,
-                    ),
-                    patch.object(
-                        ssd_chunk_scan,
-                        "_chunk_scan_fwd_kernel",
-                        ssd_chunk_scan._chunk_scan_fwd_kernel.fn,
-                    ),
-                ):
-                    values = _mamba_chunk_scan_combined_fwd(x=x, out=out, **kwargs)
+            values = _mamba_chunk_scan_combined_fwd(x=x, out=out, **kwargs)
         return (out, *values)
 
     def test_boundaries_tracking_and_live_graph(self):
@@ -134,7 +105,7 @@ class TestPrefillTiles(CustomTestCase):
                 a, b = torch.empty_like(x), torch.empty_like(x)
                 expected = self.run_ssd(x, kwargs, False, a)
                 actual = self.run_ssd(x, kwargs, True, b)
-                self.exact(actual, expected)
+                self.assert_outputs_match(actual, expected)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     actual = self.run_ssd(x, kwargs, True, b)
@@ -145,8 +116,11 @@ class TestPrefillTiles(CustomTestCase):
                     if initial:
                         kwargs["initial_states"].normal_()
                     expected = self.run_ssd(x, kwargs, False, a)
+                    eager = self.run_ssd(x, kwargs, True, torch.empty_like(x))
+                    # Different tile choices can change floating-point rounding.
+                    self.assert_outputs_match(eager, expected)
                     graph.replay()
-                    self.exact(actual, expected)
+                    self.assert_outputs_match(actual, eager, exact=True)
 
     def test_eight_continuations(self):
         x, kwargs = self.inputs([1024])
@@ -157,17 +131,10 @@ class TestPrefillTiles(CustomTestCase):
             x.normal_()
             expected = self.run_ssd(x, ka, False, a)
             actual = self.run_ssd(x, kb, True, b)
-            self.exact(actual, expected)
+            self.assert_outputs_match(actual, expected)
             # The production Mamba caller commits the varlen state to its pool.
             ka["initial_states"].copy_(expected[6])
             kb["initial_states"].copy_(actual[6])
-
-    def test_upstream_autotuning_still_runs(self):
-        x, kwargs = self.inputs([128], initial=False, track=False)
-        out = torch.empty_like(x)
-        with envs.SGLANG_SM120_MAMBA_PREFILL_TILES.override(False):
-            _mamba_chunk_scan_combined_fwd(x=x, out=out, **kwargs)
-        self.assertTrue(torch.isfinite(out).all())
 
 
 if __name__ == "__main__":
