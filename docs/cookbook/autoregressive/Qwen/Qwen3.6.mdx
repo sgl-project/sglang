@@ -5,8 +5,6 @@ metatags:
 ---
 
 import { Qwen36Deployment } from '/src/snippets/autoregressive/qwen36-deployment.jsx';
-import { Deployment } from '/src/snippets/_deployment.jsx';
-import { config as sparkConfig } from '/src/snippets/configs/nvidia/qwen3.6-35b-a3b-nvfp4.jsx';
 
 ## 1. Model Introduction
 
@@ -114,7 +112,7 @@ the FlashInfer CUTLASS MoE runner,
 `extra_buffer` Mamba radix caching, and a static memory fraction of `0.8`.
 Speculative decoding is not enabled.
 
-<Deployment config={sparkConfig} />
+Select **RTX Spark** in the generator above to get this command.
 
 The contributor reported **75 output tokens/s for a single request** on SGLang
 `main`. The exact commit, OS/runtime, memory configuration, input/output lengths,
