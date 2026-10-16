@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.spec_tree import (
@@ -647,7 +648,7 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        target_predict = sampling_argmax(next_token_logits)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
@@ -719,12 +720,10 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
-
         target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
+            next_token_logits,
+            sampling_info.temperatures,
+            rows_per_request=verify_input.draft_token_num,
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
@@ -785,7 +784,6 @@ def eagle_sample(
             deterministic=True,
         )
         del (
-            expanded_temperature,
             target_probs,
             draft_probs,
             coins,
@@ -826,7 +824,7 @@ def eagle_sample(
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
             if target_predict is None:
-                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                target_predict = sampling_argmax(next_token_logits).reshape(
                     bs, verify_input.draft_token_num
                 )
         accept_index = generate_simulated_accept_index(
