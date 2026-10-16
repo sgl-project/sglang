@@ -212,25 +212,37 @@ class TestInklingOutputParser(unittest.TestCase):
                     self.assertEqual(parsed.content, expected)
 
     def test_call_arguments_keep_the_sampled_json(self):
-        """Arguments keep the model's key order, raw UTF-8 and integers wider than
-        64 bits, as json.dumps of the sampled args would."""
-        payload = '{"name":"f","args":{"z":1,"big":18446744073709551616,"c":"北京"}}'
-        token_ids = _ids(
+        """Arguments keep the model's key order, raw UTF-8, integers wider than 64
+        bits and specials spelled inside strings, as json.dumps of the sampled args."""
+        wide = _ids(
             "<|message_model|>",
             "f",
             "<|content_invoke_tool_json|>",
-            payload,
+            '{"name":"f","args":{"z":1,"big":18446744073709551616,"c":"北京"}}',
             "<|end_message|>",
         )
-        for mode, parse in (("batch", _batch), ("stream", _stream)):
-            with self.subTest(mode=mode):
-                parsed = parse(
-                    token_ids, separate_reasoning=True, parse_tool_calls=True
-                )
-                self.assertEqual(
-                    [call.arguments for call in parsed.tool_calls],
-                    ['{"z": 1, "big": 18446744073709551616, "c": "北京"}'],
-                )
+        special_in_string = _ids(
+            "<|message_model|>",
+            "f",
+            "<|content_invoke_tool_json|>",
+            '{"name":"f","args":{"q":"a',
+            "<|content_text|>",
+            'b"}}',
+            "<|end_message|>",
+        )
+        cases = [
+            (wide, '{"z": 1, "big": 18446744073709551616, "c": "北京"}'),
+            (special_in_string, '{"q": "a<|content_text|>b"}'),
+        ]
+        for token_ids, expected in cases:
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(expected=expected, mode=mode):
+                    parsed = parse(
+                        token_ids, separate_reasoning=True, parse_tool_calls=True
+                    )
+                    self.assertEqual(
+                        [call.arguments for call in parsed.tool_calls], [expected]
+                    )
 
     def test_finish_flushes_once(self):
         """A finish_reason stays set on later stream chunks; finishing again must

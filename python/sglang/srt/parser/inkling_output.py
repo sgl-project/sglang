@@ -258,7 +258,7 @@ class InklingOutputParser:
         function = oss[0]["tool_calls"][0]["function"]
         # The bridge re-serializes args with sorted keys, ASCII escapes and big ints
         # as floats; build them from the sampled payload instead.
-        args = json.loads(self._payload_text())["args"]
+        args = json.loads(self._payload_json())["args"]
         return InklingToolCall(
             index=self._num_tool_calls,
             name=function["name"],
@@ -281,16 +281,26 @@ class InklingOutputParser:
         self._at_message_boundary = True
         self._in_unframed_text = False
 
-    def _payload_text(self) -> str:
+    def _payload_ids(self) -> list[int]:
         ids = self._message_ids
         kind_index = next(
             (i for i, token_id in enumerate(ids) if token_id in self._content_kind_ids),
             -1,
         )
+        return ids[kind_index + 1 :]
+
+    def _payload_text(self) -> str:
         tokenizer = self._tml.tokenizer
         return tokenizer.decode(
-            [t for t in ids[kind_index + 1 :] if not tokenizer.is_special_token(t)]
+            [t for t in self._payload_ids() if not tokenizer.is_special_token(t)]
         )
+
+    def _payload_json(self) -> str:
+        # A special inside the payload keeps its spelling, as in the library's parse.
+        ids = self._payload_ids()
+        if ids and ids[-1] == self._end_message_id:
+            ids = ids[:-1]
+        return self._tml.tokenizer.decode(ids)
 
 
 class _DeltaBuilder:
