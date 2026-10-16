@@ -688,7 +688,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     layout._plan_layers(backend, bindings, entries, count), grouped
                 )
 
-    def test_backend_reads_inventory_once_and_drains_both_streams_on_failure(self):
+    def test_backend_reads_inventory_once_and_drains_all_streams_on_failure(self):
         fake_plan = SimpleNamespace(
             check_identity=lambda: None,
             rank_plan_digest="digest",
@@ -711,7 +711,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             )
             self.assertEqual(backend.decoders, {})
             self.assertIsNone(backend.apply_stream)
-            self.assertIsNone(backend.de_stream)
+            self.assertEqual(backend.de_streams, ())
             backend.describe()
             backend.describe()
             read_inventory.assert_called_once()
@@ -723,11 +723,15 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             raise RuntimeError("decode stream failed")
 
         prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
-        prepared.de_stream = SimpleNamespace(synchronize=decode_failure)
+        prepared.de_streams = (
+            SimpleNamespace(synchronize=decode_failure),
+            SimpleNamespace(synchronize=lambda: drains.append("decode-1")),
+            SimpleNamespace(synchronize=decode_failure),
+        )
         prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
         with self.assertRaisesRegex(RuntimeError, "decode stream failed"):
             prepared.close()
-        self.assertEqual(drains, ["decode", "compute"])
+        self.assertEqual(drains, ["decode", "decode-1", "decode", "compute"])
 
     def test_glm_mapping_matches_loader_views_and_preserves_consumers(self):
         root = torch.nn.Module()

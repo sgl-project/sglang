@@ -177,7 +177,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 size += len(expected[name])
             decoder = NvcompDecoder(device, codec.removesuffix("-zstd"))
             table = np.asarray(frames, dtype=np.int64).T.copy()
-            plan = decoder.prepare_batches(table, [len(frames)], source, stream)
+            plan = decoder.prepare_batches(table, [len(frames)], source, (stream,))
             decoded = [
                 torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)
             ]

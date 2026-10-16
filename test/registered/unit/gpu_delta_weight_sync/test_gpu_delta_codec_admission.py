@@ -207,6 +207,104 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
 
 
 @pytest.mark.parametrize("stages", [2, 3, 4])
+def test_prepared_stream_scratch_and_slot_status_ownership(monkeypatch, stages):
+    # Real tensor views/pointers exercise nonzero, non-aligned native workspace
+    # requirements without a device. Native tests cover actual DE and ring reuse.
+    decoder = object.__new__(codec.NvcompDecoder)
+    decoder.device = torch.device("cpu")
+    decoder.alignments = codec._Alignments(16, 16, 16)
+    decoder._options = codec._SnappyOptions()
+    decoder.temporary_bytes = lambda geometry: geometry[0] * 13
+    recorded, events = [], []
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.weight_sync.gpu_delta.memory",
+        SimpleNamespace(
+            device_empty=lambda shape, dtype, device: torch.empty(shape, dtype=dtype),
+            require_de_capable=lambda _: None,
+            record_device_stream=lambda tensor, stream: recorded.append(
+                (tensor.untyped_storage().data_ptr(), stream.cuda_stream)
+            ),
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda: SimpleNamespace(
+            record=lambda stream: events.append(("record", stream.cuda_stream))
+        ),
+    )
+    streams = tuple(
+        SimpleNamespace(
+            device=decoder.device,
+            cuda_stream=index + 1,
+            wait_event=lambda event, index=index: events.append(("wait", index + 1)),
+        )
+        for index in range(stages - 1)
+    )
+    counts = [1, 2, 0, 3] * 3
+    workspace = decoder._allocate_workspace(
+        [(count, 32, count * 32) for count in counts], stages
+    )
+    metadata = torch.zeros((4, sum(counts)), dtype=torch.int64)
+    host_metadata = metadata.clone()
+    plan = codec.PreparedDecodePlan(
+        decoder,
+        counts,
+        torch.empty(128, dtype=torch.uint8),
+        workspace,
+        host_metadata,
+        metadata,
+        streams,
+        np.zeros(sum(counts), dtype=np.int64),
+        [128] * stages,
+        [0] * stages,
+    )
+    scratch = [workspace.temporary[index] for index in range(len(streams))]
+    assert [t.numel() for t in scratch] == [39 if stages == 2 else 48] * len(streams)
+    assert all(t.data_ptr() % decoder.alignments.temp == 0 for t in scratch)
+    assert all(
+        a.data_ptr() + a.numel() <= b.data_ptr() for a, b in zip(scratch, scratch[1:])
+    )
+    for index, batch in enumerate(plan.batches):
+        stream_index, slot = index % len(streams), index % stages
+        assert batch.stream is streams[stream_index]
+        assert batch._arguments[-1] == streams[stream_index].cuda_stream
+        assert batch._arguments[5:7] == (
+            scratch[stream_index].data_ptr(),
+            scratch[stream_index].numel(),
+        )
+        assert batch.statuses.storage_offset() == slot * 3
+        assert batch.actual_sizes.storage_offset() == slot * 3
+    outputs = [torch.empty(128, dtype=torch.uint8) for _ in range(stages)]
+    assert plan.bind_outputs(outputs) is plan.batches
+    assert events == (
+        []
+        if stages == 2
+        else [("record", 1), *[("wait", i + 1) for i in range(1, len(streams))]]
+    )
+    for tensor in (
+        metadata,
+        workspace.temporary,
+        workspace.statuses,
+        workspace.actual_sizes,
+        *outputs,
+    ):
+        assert {
+            (tensor.untyped_storage().data_ptr(), s.cuda_stream) for s in streams
+        } <= set(recorded)
+    offset = 0
+    for index, count in enumerate(counts):
+        assert (
+            metadata[3, offset : offset + count].tolist()
+            == [outputs[index % stages].data_ptr()] * count
+        )
+        offset += count
+
+
+@pytest.mark.parametrize("stages", [2, 3, 4])
 def test_host_input_plans_reject_invalid_geometry_before_device_work(
     monkeypatch, stages
 ):

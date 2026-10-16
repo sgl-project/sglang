@@ -96,10 +96,11 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         ],
     ]
     batches = [batches[index % 2] for index in range(2 * stages + 1)]
+    batches[-1] = []  # A fully omitted final batch still zeroes/reuses its slot.
     stream = torch.cuda.Stream(device=device)
-    de_stream = torch.cuda.Stream(device=device)
+    de_streams = tuple(torch.cuda.Stream(device=device) for _ in range(stages - 1))
     table, counts = _frame_table(batches)
-    plan = decoder.prepare_batches(table, counts, host, de_stream, stages)
+    plan = decoder.prepare_batches(table, counts, host, de_streams, stages)
     workspace = plan.workspace
     # Large outputs are allocated only at the paused binding boundary.
     decoded = [
@@ -126,10 +127,16 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     assert plans[0].statuses.data_ptr() == plans[stages].statuses.data_ptr()
     assert plans[0].actual_sizes.data_ptr() == plans[stages].actual_sizes.data_ptr()
     assert all(plan.host_input is host for plan in plans)
+    for index, batch in enumerate(plans):
+        assert batch.stream is de_streams[index % len(de_streams)]
+        assert batch._arguments[-1] == batch.stream.cuda_stream
+        temporary = workspace.temporary[index % len(de_streams)]
+        assert batch._arguments[5:7] == (temporary.data_ptr(), temporary.numel())
     prepared = PreparedDelta.__new__(PreparedDelta)
+    prepared.device = device
     prepared.timing_enabled = False
     prepared.decode_stages = stages
-    prepared.stream, prepared.de_stream = stream, de_stream
+    prepared.stream, prepared.de_streams = stream, de_streams
     prepared.decoded_ready = [torch.cuda.Event() for _ in range(stages)]
     prepared.decoded_free = [torch.cuda.Event() for _ in range(stages)]
     # B leaves a prefix, an interior hole and a short tail; the unused part of
@@ -138,6 +145,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         decoded[0].numel() if index % 2 == 0 else frames_b[-1][3] + frames_b[-1][2] + 64
         for index in range(len(batches))
     ]
+    output_sizes[-1] = 64
     prepared_batches = []
     # Output/workspace allocation happened on the current stream. The setup
     # event below carries this dependency onward to the DE stream as well.
@@ -180,36 +188,61 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
             output.fill_(0xA5)
         ready = torch.cuda.Event()
         ready.record(stream)
-    de_stream.wait_event(ready)
+    for de_stream in de_streams:
+        de_stream.wait_event(ready)
     assert not prepared_batches[0].zero_ranges
     assert [view.numel() for view in prepared_batches[1].zero_ranges] == [128, 256, 64]
     observations = []
-    # Alternating A/B batches cross two ring boundaries and reuse every slot.
-    # DE overlaps prior apply; reuse waits until output/status readers complete.
-    # One final apply fence joins all work, including metadata upload on DE.
-    with torch.cuda.device(device), torch.cuda.stream(stream):
-        prepared._decode_batch(prepared_batches[0], 0)
-        for index, (plan, batch) in enumerate(zip(plans, prepared_batches)):
-            stream.wait_event(prepared.decoded_ready[index % stages])
-            prepared._apply_batch(batch)
-            observations.append(
-                (
-                    decoded[index % stages].clone(),
-                    plan.statuses.clone(),
-                    plan.actual_sizes.clone(),
-                )
+
+    # Run the production prefetch/apply loop, retaining snapshots as an ordered
+    # apply consumer. Prepared metadata/output binding above is already real.
+    # Distinct A/B bytes cross two ring boundaries, including a stream change
+    # when a three-slot ring reuses its output/status row on the other DE stream.
+    def observe(batch):
+        index = len(observations)
+        PreparedDelta._apply_batch(prepared, batch)
+        observations.append(
+            (
+                prepared.decoded[index % stages].clone(),
+                batch.decoder.statuses.clone(),
+                batch.decoder.actual_sizes.clone(),
             )
-            prepared.decoded_free[index % stages].record(stream)
-            if index + 1 < len(plans):
-                prepared._decode_batch(prepared_batches[index + 1], index + 1)
-        complete = torch.cuda.Event()
-        complete.record(stream)
-    complete.synchronize()
+        )
+
+    prepared.backend = SimpleNamespace(
+        layout=SimpleNamespace(check_identity=lambda: None)
+    )
+    prepared._allocate_paused = lambda: None
+    prepared._apply_batch = observe
+    prepared.timings, prepared.events = {}, {}
+    prepared.raw_copies, prepared.derived = {}, []
+    prepared.batches = list(prepared_batches)
+    prepared.status_checks, prepared.apply_bindings, prepared.apply_source_patches = (
+        [],
+        [],
+        [],
+    )
+    prepared.apply_fallback_groups = set()
+    prepared.decoded, prepared.workspace, prepared.decode_plan = (
+        decoded,
+        workspace,
+        None,
+    )
+    prepared.target_version, prepared.matrix_tensor_count, prepared.raw_tensor_count = (
+        1,
+        1,
+        0,
+    )
+    prepared.h2d_bytes = 0
+    error = prepared.error
+    assert prepared.apply()["applied"]
+    prepared.error = error
+    del prepared._apply_batch, prepared._allocate_paused
     expected_slots = [bytearray([0xA5]) * output.numel() for output in decoded]
     for index, (output, statuses, sizes) in enumerate(observations):
         expected = expected_slots[index % stages]
         expected[: output_sizes[index]] = bytes(output_sizes[index])
-        source_values = values[index % 2]
+        source_values = values[index % 2] if batches[index] else []
         for frame, value in zip(batches[index], source_values):
             expected[frame[3] : frame[3] + len(value)] = value
         assert statuses.tolist() == [0] * len(batches[index])
@@ -271,7 +304,7 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     plans.clear()
     del plan, batch
     assert all(ref() is None for ref in output_refs)
-    # Original host input is released only after both streams' readers finish.
+    # Original host input is released only after all streams' readers finish.
     del host
     allocation.close()
 
