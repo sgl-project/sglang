@@ -517,25 +517,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
     ) -> None:
         """Write ``cache`` into the SWA pool at flat token positions ``loc``.
 
         ``cache`` shape: (num_tokens, num_kv_heads=1, dim). The buffer view is
         (num_pages, page_size, 1, dim) so we flatten the first two dims and
-        index_put. ``positions`` is only consumed by the read-only [WSTAGE]
-        probe (row -> absolute position); it never affects the write.
+        index_put.
         """
         # Index by PP-stage-local layer_id (see get_swa_buffer).
         buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if is_npu_arch35():
-            self._write_a5_packed_kv(
-                buf=buf,
-                loc=loc,
-                cache=cache,
-                layer_id=layer_id,
-                positions=positions,
-            )
+            self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
         # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
@@ -550,8 +542,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         buf: torch.Tensor,
         loc: torch.Tensor,
         cache: torch.Tensor,
-        layer_id: Optional[int] = None,
-        positions: Optional[torch.Tensor] = None,
     ) -> None:
         cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         if cache.shape[-1] != cache_dim:
@@ -568,33 +558,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-
-        # READ-ONLY write-side staged probe (env: DSV4_DUMP_WSTAGE).
-        # S4 = pre-epilog bf16 row (the epilog's input row); S5 = the packed
-        # fp8/int8 row read back from the same slot after the epilog. Keyed by
-        # absolute position so a MISS-vs-HIT diff isolates the epilog (E) from
-        # the upstream GEMM/norm/rope (A/C) stages emitted in deepseek_v4.py.
-        # No positions (e.g. the compressor path) => probe disabled. Never
-        # touches compute; guarded end to end.
-        _wstage = None
-        _wstage_rows: list = []
-        if positions is not None:
-            try:
-                import os as _wstage_os
-
-                if _wstage_os.environ.get("DSV4_DUMP_WSTAGE"):
-                    from sglang.srt.hardware_backend.npu.dsv4 import (
-                        dsv4_wstage_probe as _wstage,
-                    )
-
-                    _wstage_rows = _wstage.select_rows(positions)
-            except Exception:
-                _wstage = None
-                _wstage_rows = []
-
-        if _wstage is not None:
-            _wstage.emit_bf16("S4", layer_id, cache_2d, _wstage_rows)
-
         torch.ops.npu.kv_compress_epilog(
             buf.view(-1, 1, buf.shape[-1]),
             cache_2d,
@@ -604,15 +567,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             round_scale_flag=True,
             layout=1,
         )
-
-        if _wstage is not None:
-            _wstage.emit_raw_rows(
-                "S5",
-                layer_id,
-                buf.reshape(-1, buf.shape[-1]),
-                slot_mapping,
-                _wstage_rows,
-            )
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
@@ -650,7 +604,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_id,
             safe_swa_loc,
             kv_out,
-            positions=positions,
         )
 
     def set_compress_buffer(
@@ -684,9 +637,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
             if is_npu_arch35():
-                self._write_a5_packed_kv(
-                    buf=buf, loc=loc, cache=kv, layer_id=layer_id
-                )
+                self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)
             kv_view = kv.to(buf_flat.dtype)
