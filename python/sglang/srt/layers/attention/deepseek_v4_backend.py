@@ -46,8 +46,9 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
+    BuildDsparkSwaRingIndices,
     ComputeDsparkWindowGather,
-    build_dspark_swa_ring_indices,
+    swa_ring_rows,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -2314,7 +2315,7 @@ class DeepseekV4AttnBackend(
                 )[self.speculative_step_id]
             if (
                 self.token_to_kv_pool.request_window is None
-                and self.token_to_kv_pool.swa_ring_valid_from is None
+                and self.token_to_kv_pool.swa_req_ring_size is None
             ):
                 metadata.core_attn_metadata.swa_out_cache_loc = (
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -2353,9 +2354,9 @@ class DeepseekV4AttnBackend(
                 )
                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
-                if self.token_to_kv_pool.swa_ring_valid_from is not None:
+                if self.token_to_kv_pool.swa_req_ring_size is not None:
                     metadata.core_attn_metadata.swa_out_cache_loc = (
-                        self._dspark_ring_out_loc(
+                        self._dspark_swa_ring_out_cache_loc(
                             seq_lens_casual=seq_lens_casual,
                             req_pool_indices_repeated=req_pool_indices_repeated,
                         )
@@ -4339,8 +4340,8 @@ class DeepseekV4AttnBackend(
                 )
             else:
                 swa_page_indices, swa_topk_lengths = dspark_swa_buffers
-            if self.token_to_kv_pool.swa_ring_valid_from is not None:
-                swa_out_cache_loc = self._dspark_ring_out_loc(
+            if self.token_to_kv_pool.swa_req_ring_size is not None:
+                swa_out_cache_loc = self._dspark_swa_ring_out_cache_loc(
                     seq_lens_casual=seq_lens_casual,
                     req_pool_indices_repeated=req_pool_indices_repeated,
                 )
@@ -4412,11 +4413,11 @@ class DeepseekV4AttnBackend(
         block_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pool = self.token_to_kv_pool
-        if pool.swa_ring_valid_from is not None:
-            return build_dspark_swa_ring_indices(
+        if pool.swa_req_ring_size is not None:
+            return BuildDsparkSwaRingIndices.execute(
                 seq_lens_casual=seq_lens_casual,
                 req_pool_indices_repeated=req_pool_indices_repeated,
-                valid_from=pool.swa_ring_valid_from,
+                valid_from=pool.swa_req_ring_valid_from,
                 ring_size=pool.swa_req_ring_size,
                 block_size=block_size,
                 swa_window=SWA_WINDOW,
@@ -4443,16 +4444,16 @@ class DeepseekV4AttnBackend(
         )
         return swa_page_indices, swa_topk_lengths
 
-    def _dspark_ring_out_loc(
+    def _dspark_swa_ring_out_cache_loc(
         self, *, seq_lens_casual: torch.Tensor, req_pool_indices_repeated: torch.Tensor
     ) -> torch.Tensor:
         """Ring rows the draft block writes: row ``i`` sits at position
         ``seq_lens_casual[i] - 1`` of its request."""
-        ring = self.token_to_kv_pool.swa_req_ring_size
-        positions = seq_lens_casual.to(torch.int64) - 1
-        return (req_pool_indices_repeated.to(torch.int64) * ring + positions % ring).to(
-            torch.int32
-        )
+        return swa_ring_rows(
+            req_pool_indices_repeated,
+            seq_lens_casual.to(torch.int64) - 1,
+            self.token_to_kv_pool.swa_req_ring_size,
+        ).to(torch.int32)
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):

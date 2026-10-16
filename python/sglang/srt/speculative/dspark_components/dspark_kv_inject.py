@@ -2,9 +2,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
-    build_unified_commit_inject_layout,
+    build_ring_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
@@ -181,7 +182,7 @@ class TargetHiddenKvInjector:
     ) -> torch.Tensor:
         """Ring row for target-hidden injection into a per-request SWA ring.
 
-        loc = state_slot * ring + pos % ring, with two skip (-1) rules:
+        loc = swa_ring_rows(state_slot, pos, ring), with two skip (-1) rules:
           * SWA window: only the last ``win`` tokens per req land in the ring;
             older tokens share a ring slot (pos % ring) and would race, so drop
             them (needed for long prefill chunks).
@@ -195,7 +196,7 @@ class TargetHiddenKvInjector:
         ring = pool.swa_req_ring_size
         win = pool.sliding_window
         pos = positions.to(torch.int64)
-        loc = state_slot.to(torch.int64) * ring + pos % ring
+        loc = swa_ring_rows(state_slot, pos, ring)
         if final_pos is not None:
             keep = pos > (final_pos.to(torch.int64) - win)
             loc = torch.where(keep, loc, torch.full_like(loc, -1))
@@ -225,7 +226,7 @@ class TargetHiddenKvInjector:
             if hidden_strided.numel() == 0:
                 return
             if pool.swa_req_ring_size is not None:
-                inject_layout = build_unified_commit_inject_layout(
+                inject_layout = build_ring_commit_inject_layout(
                     req_pool_indices=batch.req_pool_indices,
                     prefix_lens=prefix_lens,
                     block_pos_offsets=self._block_pos_offsets[:stride],

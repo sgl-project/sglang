@@ -119,6 +119,11 @@ def uses_draft_swa_ring() -> bool:
     return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
 
 
+def get_draft_swa_ring_size(sliding_window: int, max_draft_tokens: int) -> int:
+    # A draft block and a verify commit write past the committed window.
+    return sliding_window + max_draft_tokens
+
+
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     # A verify batch writes its draft tokens ahead of the committed position.
     spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
@@ -1091,7 +1096,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.request_window = None
         self.full_to_swa_index_mapping = None
         # Per req slot, the first position the draft SWA ring holds KV for.
-        self.swa_ring_valid_from: Optional[torch.Tensor] = None
+        self.swa_req_ring_valid_from: Optional[torch.Tensor] = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # Under encoder replay the target keeps SWA in a per-request window. A
         # draft without its own ring still reads the target's full-to-SWA mapping,
@@ -1135,10 +1140,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # The DSpark draft writes SWA rows only from target hidden states, never
             # while attending, so it addresses its ring directly with no workspace.
             self.unified_kv_pool = None
-            self.swa_req_ring_size = self.sliding_window + (
-                online_mtp_max_draft_tokens or 0
+            self.swa_req_ring_size = get_draft_swa_ring_size(
+                self.sliding_window, online_mtp_max_draft_tokens or 0
             )
-            self.swa_ring_valid_from = torch.zeros(
+            self.swa_req_ring_valid_from = torch.zeros(
                 self.num_req_slots, dtype=torch.int64, device=device
             )
             self.swa_kv_pool = self._make_kv_pool(
@@ -1198,16 +1203,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 cls=kv_pool_cls,
             )
 
+        if self.request_window is not None:
+            swa_storage = "request_window"
+        elif self.swa_req_ring_size is not None:
+            swa_storage = "ring"
+        else:
+            swa_storage = "paged"
         logger.info(
             "DSV4 SWA storage: worker=%s, storage=%s, paged_allocator=%s",
             "draft" if is_draft_worker else "target",
-            (
-                "request_window"
-                if self.request_window is not None
-                else "ring"
-                if self.swa_ring_valid_from is not None
-                else "paged"
-            ),
+            swa_storage,
             self.needs_paged_swa_allocator,
         )
         self.full_size = full_size
@@ -1258,10 +1263,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def reset_swa_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
+    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
         """Restart the draft SWA ring of ``slots`` at ``valid_from``; the rows
         before it belong to the slot's previous owner, not this request."""
-        self.swa_ring_valid_from[slots] = valid_from
+        self.swa_req_ring_valid_from[slots] = valid_from
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

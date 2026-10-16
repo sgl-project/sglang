@@ -10,9 +10,9 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     is_valid_kv_layout_pair,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+    BuildDsparkSwaRingIndices,
     build_block_seq_lens_causal,
     build_dspark_swa_page_indices,
-    build_dspark_swa_ring_indices,
     compute_dspark_window_gather,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -480,7 +480,7 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
             swa_window=128,
             page_index_aligned_size=64,
         )
-        ring = build_dspark_swa_ring_indices(
+        ring = BuildDsparkSwaRingIndices.torch(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_rep,
             valid_from=torch.zeros(3, dtype=torch.int64),
@@ -495,12 +495,12 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
     def test_ring_window_starts_at_valid_from(self):
         draft = self.make_pool(draft=True)
         # Slot 1 was placed at a 290-token prefix hit; 10 positions are its own.
-        draft.reset_swa_ring(torch.tensor([1]), torch.tensor([290]))
+        draft.reset_swa_req_ring(torch.tensor([1]), torch.tensor([290]))
         seq_lens_casual, req_rep = self._block_inputs([300], [1])
-        indices, lengths = build_dspark_swa_ring_indices(
+        indices, lengths = BuildDsparkSwaRingIndices.torch(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_rep,
-            valid_from=draft.swa_ring_valid_from,
+            valid_from=draft.swa_req_ring_valid_from,
             ring_size=self.RING,
             block_size=5,
             swa_window=128,

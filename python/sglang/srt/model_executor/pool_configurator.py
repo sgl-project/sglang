@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
+    get_draft_swa_ring_size,
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
     resolve_compress_state_ring_size,
@@ -1198,8 +1199,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + slots * 128
                 + self.page_size
             )
-            draft_ring_size = (
-                self.sliding_window_size + self.online_c128_mtp_max_draft_tokens
+            draft_ring_size = get_draft_swa_ring_size(
+                self.sliding_window_size, self.online_c128_mtp_max_draft_tokens
             )
             self.request_window_bytes = (
                 (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)

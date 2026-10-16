@@ -18,7 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildRaggedVerifyWindow,
     RaggedVerifyWindow,
     ScatterCompactToStrided,
-    build_unified_commit_inject_layout,
+    build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
@@ -773,7 +773,7 @@ class DsparkVerifyEpilogue:
             * self.inject_gate_buf
         )
         if pool.swa_req_ring_size is not None:
-            inject_layout = build_unified_commit_inject_layout(
+            inject_layout = build_ring_commit_inject_layout(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=seq_lens[:bs],
                 block_pos_offsets=ctx.block_pos_offsets[: self.stride],
