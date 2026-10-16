@@ -219,8 +219,8 @@ def get_distributed_input_state(
 
     The packed wire tensor is FP32. Token IDs are therefore packed only while
     the vocabulary fits exactly in FP32 integer precision. Local row reduction
-    and Top-N stay on their existing implementations; this helper only compacts
-    their communication. With normalize=True, selected scores and Top-N values
+    keeps its existing implementation; bounded CUDA Top-N uses tiled selection
+    with a Torch fallback. With normalize=True, selected scores and Top-N values
     are returned as logprobs; row statistics remain available in either mode.
     """
     if row_indices.ndim != 1 or token_ids.ndim != 1:
@@ -271,10 +271,24 @@ def get_distributed_input_state(
     top_values = top_indices = None
     if valid_vocab_size:
         valid_logits = local_logits[:, :valid_vocab_size]
-        local_max, local_log_sum = compute_row_log_normalizer(valid_logits)
         local_k = min(max_k, valid_vocab_size)
+        fused_local = False
+        if local_logits.is_cuda and torch.version.hip is None and local_k:
+            from sglang.srt.layers.local_logprob_topk import (
+                can_use_local_topk,
+                local_logsumexp_topk,
+            )
+
+            if can_use_local_topk(valid_logits, local_k):
+                local_max, local_log_sum, top_values, top_indices = (
+                    local_logsumexp_topk(valid_logits, local_k)
+                )
+                fused_local = True
+        if not fused_local:
+            local_max, local_log_sum = compute_row_log_normalizer(valid_logits)
+            if local_k:
+                top_values, top_indices = valid_logits.topk(local_k, dim=-1)
         if local_k:
-            top_values, top_indices = valid_logits.topk(local_k, dim=-1)
             if not use_fused_pack:
                 local_values[:, :local_k] = top_values.float()
                 local_indices[:, :local_k] = (top_indices + vocab_start_index).float()
