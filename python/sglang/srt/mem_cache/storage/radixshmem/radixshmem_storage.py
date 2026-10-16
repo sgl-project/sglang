@@ -118,6 +118,18 @@ def _prefix_keys_enabled() -> Optional[bool]:
     return bool(HybridCacheController.parse_storage_backend_extra_config(raw)[4])
 
 
+def _decode_offload_enabled() -> bool:
+    try:
+        from sglang.srt.runtime_context import get_disagg
+
+        disagg = get_disagg()
+        return disagg.disaggregation_mode == "decode" and bool(
+            disagg.disaggregation_decode_enable_offload_kvcache
+        )
+    except Exception:
+        return False
+
+
 def _as_comm(group, src: int):
     if group is None:
         return _Solo()
@@ -214,6 +226,11 @@ class RadixShmemStorage(HiCacheStorage):
             )
         if _prefix_keys_enabled() is False:
             raise ValueError(_PREFIX_KEYS_REQUIRED)
+        if _decode_offload_enabled():
+            raise ValueError(
+                "radixshmem does not support --disaggregation-decode-enable-"
+                "offload-kvcache: the decode offload path writes without prefix keys"
+            )
         self.radixshmem = radixshmem
         self.config = storage_config
         cfg = storage_config.extra_config or {}
@@ -802,6 +819,8 @@ class RadixShmemStorage(HiCacheStorage):
         ready = self._ready()
         comm = self.write_comm if pool.sharded else _Solo()
         buf = torch.full((n + 1,), -1, dtype=torch.int64)
+        if self.leader and ready and self._deferred:
+            self._publish_deferred()
         if self.leader and ready:
             slots = self._allocate(n, pool.kind)
             if slots is not None:
@@ -838,7 +857,7 @@ class RadixShmemStorage(HiCacheStorage):
     def _read(
         self,
         n: int,
-        fetch: Callable[[], Tuple[Sequence[int], List[Callable]]],
+        fetch: Callable[[List[Callable]], Sequence[int]],
         copy: Callable[[List[Tuple[int, int]]], None],
     ) -> List[bool]:
         ready = self._ready()
@@ -846,13 +865,14 @@ class RadixShmemStorage(HiCacheStorage):
         finalizers: List[Callable] = []
         if self.leader and ready:
             try:
-                slots, finalizers = fetch()
+                slots = fetch(finalizers)
                 if len(slots):
                     buf[: len(slots)] = torch.as_tensor(
                         np.asarray(slots, dtype=np.int64)
                     )
             except Exception:
                 logger.exception("radixshmem: fetch failed")
+                buf.fill_(-1)
         self.read_comm.bcast(buf)
         slots = buf.numpy()
         ok = torch.from_numpy((slots >= 0).astype(np.int64))
@@ -961,9 +981,10 @@ class RadixShmemStorage(HiCacheStorage):
             return [True] * n
         chain, start = self._chain(pool, keys, extra_info)
 
-        def fetch():
+        def fetch(finalizers):
             slots, finalize = self._fetch(chain)
-            return slots[start : start + n], [finalize]
+            finalizers.append(finalize)
+            return slots[start : start + n]
 
         ok = self._read(
             n, fetch, lambda pairs: self._copy(pool, host_indices, pairs, False)
@@ -1032,10 +1053,13 @@ class RadixShmemStorage(HiCacheStorage):
             self.index.recycle_slots(unused, kind)
         return result.error == self.insert_ok
 
-    def _publish_deferred(self) -> None:
+    def _publish_deferred(self, drop: bool = False) -> None:
         now, pending = time.monotonic(), self._deferred
         self._deferred = []
         for since, chain, slots, kind in pending:
+            if drop:
+                self.index.recycle_slots(slots, kind)
+                continue
             result = self.index.insert(chain, slots, 0, False, component=kind)
             if result.error == self.full_path_missing and now - since < self.defer_s:
                 self._deferred.append((since, chain, slots, kind))
@@ -1054,8 +1078,8 @@ class RadixShmemStorage(HiCacheStorage):
         ends = self._component_ends(pool, chain, n)
         mask = self.full_mask | pool.mask
 
-        def fetch():
-            slots, finalizers = [-1] * n, []
+        def fetch(finalizers):
+            slots = [-1] * n
             for i, end in enumerate(ends):
                 result = self._pull(chain[:end], mask)
                 if result is None:
@@ -1072,7 +1096,7 @@ class RadixShmemStorage(HiCacheStorage):
                     at = first + j - int(result.swa_start)
                     if 0 <= at < len(window):
                         slots[j] = int(window[at])
-            return slots, finalizers
+            return slots
 
         return self._read(
             n, fetch, lambda pairs: self._copy(pool, host_indices, pairs, False)
@@ -1113,13 +1137,13 @@ class RadixShmemStorage(HiCacheStorage):
         if n == 0:
             return []
 
-        def fetch():
-            slots, finalizers = [], []
+        def fetch(finalizers):
+            slots = []
             for key in keys:
                 got, finalize = self._fetch(self._single(pool, key))
-                slots.append(int(got[0]) if len(got) else -1)
                 finalizers.append(finalize)
-            return slots, finalizers
+                slots.append(int(got[0]) if len(got) else -1)
+            return slots
 
         return self._read(
             n, fetch, lambda pairs: self._copy(pool, host_indices, pairs, False)
@@ -1133,6 +1157,11 @@ class RadixShmemStorage(HiCacheStorage):
         return True
 
     def close(self) -> None:
+        if self._deferred and self.index is not None:
+            try:
+                self._publish_deferred(drop=True)
+            except Exception:
+                logger.exception("radixshmem: recycling deferred slots failed")
         if self.client is not None:
             self.client.close()
         if self._own_groups:
