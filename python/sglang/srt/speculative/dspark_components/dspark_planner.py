@@ -302,6 +302,10 @@ class DSparkVerifyPlanner:
     def attach_adaptive_scheduler(self, scheduler: AdaptiveVerifyScheduler) -> None:
         self._adaptive_scheduler = scheduler
 
+    @property
+    def has_adaptive_scheduler(self) -> bool:
+        return self._adaptive_scheduler is not None
+
     def begin_adaptive_step(self) -> Optional[torch.cuda.Event]:
         if self._adaptive_scheduler is None:
             return None
@@ -334,7 +338,7 @@ class DSparkVerifyPlanner:
                 return
             draft_input.verify_token_budget = self._adaptive_scheduler.plan_budget(
                 req_pool_indices_cpu=batch.req_pool_indices_cpu,
-                resolved=future_map.resolve_confidence_cpu(batch),
+                resolved=future_map.resolve_confidence_cpu(batch, wait=True),
             )
             return
         if self._budget_planner is None:

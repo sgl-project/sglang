@@ -8,14 +8,16 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildRaggedVerifyWindow,
     RaggedVerifyWindow,
-    ScatterCompactToStrided,
 )
 from sglang.srt.speculative.acceptance_estimator import (
     AcceptancePrediction,
     OnlineAcceptanceEstimator,
 )
 from sglang.srt.speculative.adaptive_verify_scheduler import AdaptiveVerifyScheduler
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    gather_compact_to_strided,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -37,10 +39,9 @@ class RaggedVerifyForward(msgspec.Struct, frozen=True):
             logits_output.hidden_states = self._to_strided(logits_output.hidden_states)
 
     def _to_strided(self, compact: torch.Tensor) -> torch.Tensor:
-        return ScatterCompactToStrided.execute(
-            compact=compact,
-            layout=self.layout,
-            fill_value=0.0,
+        return gather_compact_to_strided(
+            compact,
+            verify_lens=self.layout.verify_lens,
             verify_num_draft_tokens=self.num_draft_tokens,
         )
 
@@ -102,7 +103,7 @@ class EagleAdaptiveVerifier:
             return
         draft_input.verify_token_budget = self.scheduler.plan_budget(
             req_pool_indices_cpu=batch.req_pool_indices_cpu,
-            resolved=future_map.resolve_confidence_cpu(batch),
+            resolved=future_map.resolve_confidence_cpu(batch, wait=True),
         )
 
     def begin_step(self):

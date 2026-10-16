@@ -222,7 +222,7 @@ class ConfidenceRelay(msgspec.Struct):
         self.ring_pos += 1
 
     def resolve(
-        self, batch: ScheduleBatch, *, stream, publish_ready
+        self, batch: ScheduleBatch, *, stream, publish_ready, wait: bool = False
     ) -> Optional[ResolvedConfidence]:
         if not self.initialized:
             return None
@@ -244,7 +244,9 @@ class ConfidenceRelay(msgspec.Struct):
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
-        if not self.copy_done[slot].query():
+        if wait:
+            self.copy_done[slot].synchronize()
+        elif not self.copy_done[slot].query():
             return None
 
         idx_cpu = batch.req_pool_indices_cpu
@@ -422,14 +424,17 @@ class FutureMap:
         )
 
     def resolve_confidence_cpu(
-        self, batch: ScheduleBatch
+        self, batch: ScheduleBatch, *, wait: bool = False
     ) -> Optional[ResolvedConfidence]:
+        """``wait`` blocks on the relay copy so every TP rank resolves the same
+        confidences; without it a rank whose copy is late gets None."""
         if not self.needs_confidence_relay:
             return None
         return self.confidence_relay.resolve(
             batch,
             stream=self.fwd_prepare_d2h_stream,
             publish_ready=self.publish_ready,
+            wait=wait,
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:

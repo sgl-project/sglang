@@ -41,7 +41,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    gather_compact_to_strided,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
@@ -473,11 +476,9 @@ class TargetVerifyExecutor:
             strided_logits = strided_logits[: bs * stride]
             hidden_strided = hidden_strided[: bs * stride]
         else:
-            compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=0.0,
+            strided_logits = gather_compact_to_strided(
+                logits_output.next_token_logits,
+                verify_lens=layout.verify_lens,
                 verify_num_draft_tokens=stride,
             )
             compact_hidden = logits_output.hidden_states
@@ -725,12 +726,11 @@ class DsparkVerifyEpilogue:
             )
 
     def _scatter(self, compact_logits, compact_hidden, verify_lens, bs: int) -> None:
-        scatter_compact_to_strided_into(
-            compact=compact_logits,
+        gather_compact_to_strided(
+            compact_logits,
             verify_lens=verify_lens,
+            verify_num_draft_tokens=self.stride,
             out=self.strided_logits[: bs * self.stride],
-            stride=self.stride,
-            fill_value=0.0,
         )
         scatter_compact_to_strided_into(
             compact=compact_hidden,

@@ -966,11 +966,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                     inject_gate=fold_eligible,
                 )
             else:
-                if (
-                    self._verify_epilogue is not None
-                    and self._verify_planner.mode_value == "static"
-                ):
-                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
+                if self._verify_epilogue is not None:
+                    if self._verify_planner.mode_value == "static":
+                        self._verify_epilogue.begin_static_step(bs, fold_eligible)
+                    elif self._verify_planner.has_adaptive_scheduler:
+                        # The uniform verify graph still runs the compact epilogue;
+                        # verify every row and keep its in-graph commit disarmed.
+                        self._verify_epilogue.begin_static_step(bs, False)
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,

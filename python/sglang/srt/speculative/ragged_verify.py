@@ -216,6 +216,27 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
+def gather_compact_to_strided(
+    compact: torch.Tensor,
+    *,
+    verify_lens: torch.Tensor,
+    verify_num_draft_tokens: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """[bs * verify_num_draft_tokens, ...] rows from the packed ``compact`` rows;
+    a request's unverified steps repeat its last verified row, so per-row
+    sampling sees a real distribution there instead of a flat fill."""
+    lens = verify_lens.to(torch.int64)
+    starts = (torch.cumsum(lens, dim=0) - lens).unsqueeze(1)
+    last = (lens - 1).clamp(min=0).unsqueeze(1)
+    steps = torch.arange(verify_num_draft_tokens, device=compact.device)
+    rows = (starts + torch.minimum(steps.unsqueeze(0), last)).reshape(-1)
+    rows = rows.clamp(max=compact.shape[0] - 1)
+    if out is None:
+        return compact.index_select(0, rows)
+    return torch.index_select(compact, 0, rows, out=out)
+
+
 def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
     """Layout riding the batch's spec input, or None. Tolerates the runner's
     ad-hoc replay batch views, which may not carry spec_info at all."""

@@ -176,12 +176,9 @@ class AdaptiveVerifyScheduler:
         req_pool_indices_cpu: torch.Tensor,
         resolved: Optional[ResolvedConfidence],
     ) -> Optional[int]:
-        budget = self._local_budget(
+        return self._local_budget(
             req_pool_indices_cpu=req_pool_indices_cpu, resolved=resolved
         )
-        if self._tp_group.world_size > 1:
-            budget = self._tp_group.broadcast_object(budget, src=0)
-        return budget
 
     def plan_budget_now(
         self, *, req_pool_indices_cpu: torch.Tensor, confidence: torch.Tensor

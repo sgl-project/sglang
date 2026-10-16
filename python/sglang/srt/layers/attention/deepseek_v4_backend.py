@@ -3094,7 +3094,7 @@ class DeepseekV4AttnBackend(
             and not self.is_dspark_draft
             and layer.compress_ratio in (1, 2)
             and layer.compressor.use_fused_compress
-            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and resolve_ragged_verify_layout(forward_batch) is None
             and self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 1
             and x.shape[0]

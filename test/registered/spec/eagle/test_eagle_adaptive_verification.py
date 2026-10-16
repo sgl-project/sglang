@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.speculative.acceptance_estimator import OnlineAcceptanceEstimator
 from sglang.srt.speculative.eagle_adaptive_verify import EagleAdaptiveVerifier
+from sglang.srt.speculative.ragged_verify import gather_compact_to_strided
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -112,6 +113,22 @@ class TestOnlineAcceptanceEstimator(CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
 class TestAdaptiveVerifyChain(CustomTestCase):
+    def test_gather_repeats_last_verified_row(self):
+        """Unverified steps must read their request's last verified row (a flat
+        fill sends top-p sampling down its slowest path), and padded requests of
+        a full tier must stay in bounds."""
+        device = torch.device("cuda")
+        compact = torch.arange(7, device=device, dtype=torch.float32).view(7, 1)
+        strided = gather_compact_to_strided(
+            compact,
+            verify_lens=torch.tensor([1, 4, 2, 0], device=device),
+            verify_num_draft_tokens=4,
+        )
+        self.assertEqual(
+            strided.view(4, 4).tolist(),
+            [[0, 0, 0, 0], [1, 2, 3, 4], [5, 6, 6, 6], [6, 6, 6, 6]],
+        )
+
     def test_truncated_chain_ends_at_last_verified_slot(self):
         device = torch.device("cuda")
         verifier = EagleAdaptiveVerifier.__new__(EagleAdaptiveVerifier)
