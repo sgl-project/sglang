@@ -12,7 +12,7 @@ from sglang_simulator.hook import (
     is_class_hook_matched,
     validate_required_class_hooks,
 )
-from sglang_simulator.hook.utils import get_obj_from_args
+from sglang_simulator.hook.utils import get_hook_target, get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
@@ -65,7 +65,7 @@ class C_SglangPrefillAdderHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_add_one_req = target.add_one_req
+        original_add_one_req = get_hook_target(target, "add_one_req")
 
         def wrapped_add_one_req(self, *args, **kwargs):
             req = get_obj_from_args(
@@ -259,7 +259,7 @@ class C_SchedulerRequestReceiver(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_recv_requests = target.recv_requests
+        original_recv_requests = get_hook_target(target, "recv_requests")
 
         def wrapped_recv_requests(self, *args, **kwargs):
             recv_reqs = original_recv_requests(self, *args, **kwargs)
@@ -289,12 +289,11 @@ class C_SchedulerHook(BaseHook):
     def hook(cls, target):
         original_init = target.__init__
         original_recv_requests = getattr(target, "recv_requests", None)
-        original_prefetch_kvcache = target._prefetch_kvcache
-        original_get_new_batch_prefill = target.get_new_batch_prefill
-        original_run_batch = target.run_batch
-        original_process_batch_result = target.process_batch_result
-        original_event_loop_normal = target.event_loop_normal
-        original_init_request_dispatcher = target.init_request_dispatcher
+        original_process_batch_result = get_hook_target(target, "process_batch_result")
+        original_event_loop_normal = get_hook_target(target, "event_loop_normal")
+        original_init_request_dispatcher = get_hook_target(
+            target, "init_request_dispatcher"
+        )
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -325,7 +324,7 @@ class C_SchedulerHook(BaseHook):
 
             try:
                 if ConfigManager.get_model_info() is None:
-                    model = resolve_model_info(self.model_config)
+                    model = resolve_model_info(self.parts.model_config)
                     ConfigManager.set_model_info(model)
 
                 model = ConfigManager.get_model_info()
@@ -334,8 +333,8 @@ class C_SchedulerHook(BaseHook):
 
                 if ConfigManager.get_scheduler_config() is None:
                     sched_config = resolve_scheduler_config(
-                        server_args=self.server_args,
-                        model_config=self.model_config,
+                        server_args=self.parts.server_args,
+                        model_config=self.parts.model_config,
                     )
                     ConfigManager.set_scheduler_config(sched_config)
                 sched_config = ConfigManager.get_scheduler_config()
@@ -353,124 +352,6 @@ class C_SchedulerHook(BaseHook):
             recv_reqs = original_recv_requests(self, *args, **kwargs)
             C_SchedulerHook.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerHook.REQ_DISPATCHER.dispatch()
-
-        def wrapped_get_new_batch_prefill(self, *args, **kwargs):
-            start = time.perf_counter()
-            result = original_get_new_batch_prefill(self, *args, **kwargs)
-            C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST = (
-                time.perf_counter() - start
-            )
-
-            # Accept both a plan wrapper and a direct batch return value.
-            new_batch = getattr(result, "batch_to_run", result)
-
-            # The requests already decoding; this step's admissions join them
-            # at launch.
-            num_decoding = len(self.decoding)
-
-            now = time.time()
-            if new_batch is not None:
-                for req in new_batch.reqs:
-                    req_stats = request_stats_manager.get_req_stats(req.rid)
-                    req_stats.final_device_hit_len = req.cached_tokens
-                    if req_stats.queue_end == -1:
-                        if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                            req_stats.queue_end = now
-                        else:
-                            req_stats.queue_end = StateManager.get_global_clock()
-                    else:
-                        # Chunked request
-                        pass
-            elif num_decoding == 0 and len(self.waiting_queue) > 0:
-                # Prefetching
-                StateManager.step_global_clock(0.005)
-                StateManager.set_current_inference_dur(0.005)
-            else:
-                # Idle stage, there are some requests pendding in the future queue.
-                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
-                    C_SchedulerHook.REQ_DISPATCHER.has_next() and num_decoding == 0
-                ):
-                    next_created_time = (
-                        C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
-                    )
-                    StateManager.set_global_clock(next_created_time + 1e-6)
-            logger.debug(
-                f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
-                f"new batch={new_batch.batch_size() if new_batch is not None else 0}, "
-                f"waiting queue={len(self.waiting_queue)}"
-            )
-
-            return result
-
-        def wrapped_prefetch_kvcache(self, *args, **kwargs):
-            original_prefetch_kvcache(self, *args, **kwargs)
-
-            req = get_obj_from_args(
-                "sglang.srt.managers.schedule_batch.Req",
-                *args,
-                **kwargs,
-            )
-            req_stats = request_stats_manager.get_req_stats(req.rid)
-            req_stats.recv_device_hit_len = req.prefix_len
-            req_stats.recv_host_hit_len = req.host_hit_length
-
-        def wrapped_run_batch(self, *args, **kwargs):
-            ret = original_run_batch(self, *args, **kwargs)
-
-            batch = get_obj_from_args(
-                "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
-            )
-
-            if ret.__class__.__name__ == "GenerationBatchResult":
-                simulation_batch = SimulationScheduleBatch(reqs=[])
-                if batch.forward_mode.is_extend():
-                    for req in batch.reqs:
-                        extend_length = getattr(req, "extend_input_len", None)
-                        if extend_length is None:
-                            extend_length = req.extend_len
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=extend_length,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
-                            )
-                        )
-                elif batch.forward_mode.is_decode():
-                    for req in batch.reqs:
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=1,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
-                            )
-                        )
-
-                if not simulation_batch.is_empty():
-                    StateManager.inc_iteration()
-                    pred_start = time.perf_counter()
-                    predicted_latency = (
-                        C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
-                            simulation_batch
-                        )
-                    )
-                    # Accumulate predictor execution time for performance analysis.
-                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                        time.perf_counter() - pred_start
-                    )
-                    predicted_latency = float(predicted_latency)
-
-                    forward_latency = 0
-                    if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                        time.sleep(abs(predicted_latency))
-                        now = time.time()
-                        forward_latency = now - StateManager.get_last_real_time_ts()
-                        StateManager.set_last_real_time_ts(now)
-                    else:
-                        forward_latency = predicted_latency
-
-                    StateManager.set_current_inference_dur(forward_latency)
-
-                C_SchedulerHook.SIMULATION_BATCH = simulation_batch
-
-            return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
             process_batch_result_start = time.perf_counter()
@@ -625,21 +506,174 @@ class C_SchedulerHook(BaseHook):
         def wrapped_init_request_dispatcher(self, *args, **kwargs):
             ret = original_init_request_dispatcher(self, *args, **kwargs)
 
-            _request_dispatcher = getattr(self, "_request_dispatcher", None)
-
-            if _request_dispatcher is not None:
-                for ty in _request_dispatcher._mapping.keys():
-                    if ty.__name__ == "ProfileReq":
-                        _request_dispatcher._mapping[ty] = override_profile
+            mapping = self._request_dispatcher._mapping
+            profile_types = [ty for ty in mapping if ty.__name__ == "ProfileReq"]
+            if not profile_types:
+                raise RuntimeError(
+                    "SGLang Simulator could not hook the ProfileReq handler. The "
+                    "simulator must be adapted to this SGLang revision."
+                )
+            for ty in profile_types:
+                mapping[ty] = override_profile
             return ret
 
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
-        target.get_new_batch_prefill = wrapped_get_new_batch_prefill
-        target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
-        target._prefetch_kvcache = wrapped_prefetch_kvcache
         target.init_request_dispatcher = wrapped_init_request_dispatcher
 
         if original_recv_requests:
             target.recv_requests = wrapped_recv_requests
+
+
+class C_StepPlannerHook(BaseHook):
+    HOOK_CLASS_NAME = "StepPlanner"
+    HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.step_planner"
+
+    @classmethod
+    def hook(cls, target):
+        original_get_new_batch_prefill = get_hook_target(
+            target, "get_new_batch_prefill"
+        )
+
+        def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+            start = time.perf_counter()
+            result = original_get_new_batch_prefill(self, *args, **kwargs)
+            C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST = (
+                time.perf_counter() - start
+            )
+
+            # Accept both a plan wrapper and a direct batch return value.
+            new_batch = getattr(result, "batch_to_run", result)
+
+            # The requests already decoding; this step's admissions join them
+            # at launch.
+            num_decoding = len(self.core_lists.decoding)
+
+            now = time.time()
+            if new_batch is not None:
+                for req in new_batch.reqs:
+                    req_stats = request_stats_manager.get_req_stats(req.rid)
+                    req_stats.final_device_hit_len = req.cached_tokens
+                    if req_stats.queue_end == -1:
+                        if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
+                            req_stats.queue_end = now
+                        else:
+                            req_stats.queue_end = StateManager.get_global_clock()
+                    else:
+                        # Chunked request
+                        pass
+            elif num_decoding == 0 and len(self.core_lists.waiting_queue) > 0:
+                # Prefetching
+                StateManager.step_global_clock(0.005)
+                StateManager.set_current_inference_dur(0.005)
+            else:
+                # Idle stage, there are some requests pendding in the future queue.
+                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
+                    C_SchedulerHook.REQ_DISPATCHER.has_next() and num_decoding == 0
+                ):
+                    next_created_time = (
+                        C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
+                    )
+                    StateManager.set_global_clock(next_created_time + 1e-6)
+            logger.debug(
+                f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
+                f"new batch={new_batch.batch_size() if new_batch is not None else 0}, "
+                f"waiting queue={len(self.core_lists.waiting_queue)}"
+            )
+
+            return result
+
+        target.get_new_batch_prefill = wrapped_get_new_batch_prefill
+
+
+class C_RequestIntakeHook(BaseHook):
+    HOOK_CLASS_NAME = "RequestIntake"
+    HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.request_intake"
+
+    @classmethod
+    def hook(cls, target):
+        original_prefetch_kvcache = get_hook_target(target, "_prefetch_kvcache")
+
+        def wrapped_prefetch_kvcache(self, *args, **kwargs):
+            original_prefetch_kvcache(self, *args, **kwargs)
+
+            req = get_obj_from_args(
+                "sglang.srt.managers.schedule_batch.Req",
+                *args,
+                **kwargs,
+            )
+            req_stats = request_stats_manager.get_req_stats(req.rid)
+            req_stats.recv_device_hit_len = req.prefix_len
+            req_stats.recv_host_hit_len = req.host_hit_length
+
+        target._prefetch_kvcache = wrapped_prefetch_kvcache
+
+
+class C_StepLauncherHook(BaseHook):
+    HOOK_CLASS_NAME = "StepLauncher"
+    HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.step_launcher"
+
+    @classmethod
+    def hook(cls, target):
+        original_run_batch = get_hook_target(target, "run_batch")
+
+        def wrapped_run_batch(self, *args, **kwargs):
+            ret = original_run_batch(self, *args, **kwargs)
+
+            batch = get_obj_from_args(
+                "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
+            )
+
+            if ret.__class__.__name__ == "GenerationBatchResult":
+                simulation_batch = SimulationScheduleBatch(reqs=[])
+                if batch.forward_mode.is_extend():
+                    for req in batch.reqs:
+                        extend_length = getattr(req, "extend_input_len", None)
+                        if extend_length is None:
+                            extend_length = req.extend_len
+                        simulation_batch.reqs.append(
+                            ScheduleRequest(
+                                extend_length=extend_length,
+                                past_kv_length=req.prefix_len + len(req.output_ids),
+                            )
+                        )
+                elif batch.forward_mode.is_decode():
+                    for req in batch.reqs:
+                        simulation_batch.reqs.append(
+                            ScheduleRequest(
+                                extend_length=1,
+                                past_kv_length=req.prefix_len + len(req.output_ids),
+                            )
+                        )
+
+                if not simulation_batch.is_empty():
+                    StateManager.inc_iteration()
+                    pred_start = time.perf_counter()
+                    predicted_latency = (
+                        C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
+                            simulation_batch
+                        )
+                    )
+                    # Accumulate predictor execution time for performance analysis.
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
+                        time.perf_counter() - pred_start
+                    )
+                    predicted_latency = float(predicted_latency)
+
+                    forward_latency = 0
+                    if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
+                        time.sleep(abs(predicted_latency))
+                        now = time.time()
+                        forward_latency = now - StateManager.get_last_real_time_ts()
+                        StateManager.set_last_real_time_ts(now)
+                    else:
+                        forward_latency = predicted_latency
+
+                    StateManager.set_current_inference_dur(forward_latency)
+
+                C_SchedulerHook.SIMULATION_BATCH = simulation_batch
+
+            return ret
+
+        target.run_batch = wrapped_run_batch
