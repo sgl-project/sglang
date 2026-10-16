@@ -528,19 +528,38 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         return json_output
 
-    def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str]:
-        """Extract function name, arguments and end marker from regex match.
+    def _match_partial_tool_call(
+        self, text: str
+    ) -> Optional[tuple[str, str, str, int]]:
+        """Match the first, possibly unfinished, tool call in a streaming buffer.
 
-        Args:
-            match: Regex match object
+        Same result as searching for
+        ``<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)`` (DOTALL),
+        but with ``str.find``: the lazy regex walks the whole buffer one
+        character at a time on every streamed chunk.
 
         Returns:
-            (func_name, func_args_raw, is_tool_end)
+            (func_name, func_args_raw, is_tool_end, match_end), or None. ``match_end``
+            is the index after the end token, or -1 while the call is unfinished.
         """
-        func_name = match.group(1).strip()
-        func_args_raw = match.group(2).strip() if match.group(2) else ""
-        is_tool_end = match.group(3) or ""
-        return func_name, func_args_raw, is_tool_end
+        start = text.find(self.bot_token)
+        if start == -1:
+            return None
+        name_start = start + len(self.bot_token)
+        arg_start = text.find("<arg_key", name_start)
+        end_start = text.find(self.eot_token, name_start)
+        call_end = end_start if end_start != -1 else len(text)
+        if arg_start != -1 and arg_start < call_end:
+            name_end = arg_start
+            func_args_raw = text[arg_start:call_end].strip()
+        else:
+            name_end = call_end
+            func_args_raw = ""
+
+        func_name = text[name_start:name_end].strip()
+        if end_start == -1:
+            return func_name, func_args_raw, "", -1
+        return func_name, func_args_raw, self.eot_token, end_start + len(self.eot_token)
 
     def _send_tool_name_if_needed(
         self, func_name: str, has_arg_key: bool, is_tool_end: str
@@ -770,20 +789,12 @@ class Glm47MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            # Use a single flexible regex pattern that handles all cases
-            partial_match = re.search(
-                r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
-                current_text,
-                re.DOTALL,
-            )
+            partial_match = self._match_partial_tool_call(current_text)
 
             if not partial_match:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            # Extract match groups using helper method
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
-                partial_match
-            )
+            func_name, func_args_raw, is_tool_end, match_end = partial_match
 
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
@@ -833,7 +844,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         func_name,
                         func_args_raw,
                         tools,
-                        partial_match.end(),
+                        match_end,
                         current_text,
                     )
                     calls.extend(finalize_calls)
