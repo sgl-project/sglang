@@ -972,6 +972,11 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
     SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    # Smaller MegaMoEV2 capacity for decode steps; a step with an extend on any
+    # DP rank keeps SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR. Must hold one rank's
+    # largest decode forward (checked at startup). 0 disables it; otherwise a
+    # power of two no larger than SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.
+    SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR = EnvInt(0)
     SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
