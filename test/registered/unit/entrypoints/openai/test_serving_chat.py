@@ -1605,10 +1605,7 @@ class ServingChatTestCase(CustomTestCase):
             tools=[
                 {
                     "type": "function",
-                    "function": {
-                        "name": "weather",
-                        "parameters": {"type": "string", "pattern": "["},
-                    },
+                    "function": {"name": "weather", "parameters": {"pattern": "["}},
                 }
             ],
         )
