@@ -82,7 +82,7 @@ def ranks_per_host() -> int:
 
 
 def host_memory_budget_bytes(
-    requested_bytes: int = 0, *, auto_size: bool = False
+    requested_bytes: int = 0, *, auto_size: bool = False, split_by_ranks: bool = True
 ) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
@@ -94,6 +94,8 @@ def host_memory_budget_bytes(
 
     Inside host_memory_budget_scope, requested_bytes is booked against the
     snapshot when it fits; the allowance before booking is returned.
+    Outside a scope, split_by_ranks=False returns the host-wide budget for
+    callers that distribute it according to physical host-pool ownership.
     """
     available = _host_memory_budget.get()
     if available is not None:
@@ -105,7 +107,7 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
-    return free // ranks_per_host()
+    return free // ranks_per_host() if split_by_ranks else free
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:

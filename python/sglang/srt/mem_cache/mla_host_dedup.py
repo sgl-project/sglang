@@ -50,6 +50,17 @@ def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
     )
 
 
+def mla_host_dedup_enabled(
+    kv_cache, storage_backend: Optional[str], enabled: bool
+) -> bool:
+    """Use the same gate for host budgeting and host-pool construction."""
+    return (
+        enabled
+        and mla_host_dedup_eligible(kv_cache, storage_backend)
+        and mla_dedup_rank_and_size()[1] > 1
+    )
+
+
 class MLAHostDedupBroadcaster:
     """Layerwise MLA/DSA broadcast over a dedicated NCCL group."""
 
@@ -165,7 +176,10 @@ class MLAHostDedupBroadcaster:
             self.device_pool.kv_cache_dim,
             layer_id,
         )
-        if self.idx_bufs is not None:
+        skip_topk_layers = getattr(self.device_pool, "skip_topk_layers", None)
+        if self.idx_bufs is not None and not (
+            skip_topk_layers is not None and skip_topk_layers[layer_id]
+        ):
             assert page_idx is not None
             self._bcast_layer(
                 self.idx_bufs,
@@ -250,15 +264,12 @@ def maybe_create_mla_host_dedup_context(
     tp_group: torch.distributed.ProcessGroup,
     attn_cp_group: Optional[torch.distributed.ProcessGroup],
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: Optional[torch.distributed.ProcessGroup],
     storage_backend: Optional[str],
     enabled: bool = False,
 ) -> Optional[MLAHostDedupContext]:
     """Create dedup state before host allocation, or preserve the original path."""
-    if not enabled:
-        return None
-    if not mla_host_dedup_eligible(kv_cache, storage_backend):
-        return None
-    if mla_dedup_rank_and_size()[1] <= 1:
+    if not mla_host_dedup_enabled(kv_cache, storage_backend, enabled):
         return None
 
     broadcaster = MLAHostDedupBroadcaster.build(kv_cache, tp_group, attn_tp_group)
@@ -266,10 +277,10 @@ def maybe_create_mla_host_dedup_context(
     prefetch_completion_sync_groups = None
     if storage_backend is not None:
         prefetch_hits_sync_groups = _prebuild_prefetch_sync_groups(
-            tp_group, attn_cp_group, attn_tp_group
+            tp_group, attn_cp_group, attn_tp_group, pp_group
         )
         prefetch_completion_sync_groups = _prebuild_prefetch_sync_groups(
-            tp_group, attn_cp_group, attn_tp_group
+            tp_group, attn_cp_group, attn_tp_group, pp_group
         )
     return MLAHostDedupContext(
         broadcaster,
@@ -282,6 +293,7 @@ def _prebuild_prefetch_sync_groups(
     tp_group: torch.distributed.ProcessGroup,
     attn_cp_group: Optional[torch.distributed.ProcessGroup],
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: Optional[torch.distributed.ProcessGroup],
 ) -> List[torch.distributed.ProcessGroup]:
     """Prebuild one set of HiCache storage synchronization groups."""
     from sglang.srt.distributed.parallel_state import create_custom_parallel_group
@@ -292,6 +304,8 @@ def _prebuild_prefetch_sync_groups(
         base_groups = [attn_cp_group, attn_tp_group]
     else:
         base_groups = [tp_group]
+    if pp_group is not None:
+        base_groups.append(pp_group)
     for group in base_groups:
         if group is None or torch.distributed.get_world_size(group=group) == 1:
             continue

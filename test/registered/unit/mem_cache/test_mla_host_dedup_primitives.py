@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.mla_host_dedup import (
     maybe_create_mla_host_dedup_context,
 )
 from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerHostPoolBuilder,
     DSAIndexerPoolHost,
     make_dsa_indexer_pool_decl,
 )
@@ -32,13 +33,17 @@ class _FakeStream:
     pass
 
 
+def _allocate_torch_cpu(dims, dtype, device, **_kwargs):
+    return torch.empty(dims, dtype=dtype, device=device)
+
+
 class TestMLAHostDedupPrimitives(unittest.TestCase):
     def test_disabled_flag_is_a_noop(self):
         with mock.patch(
             "sglang.srt.mem_cache.mla_host_dedup.mla_host_dedup_eligible"
         ) as eligible:
             context = maybe_create_mla_host_dedup_context(
-                object(), object(), None, None, None, enabled=False
+                object(), object(), None, None, None, None, enabled=False
             )
 
         self.assertIsNone(context)
@@ -103,7 +108,38 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                 dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
             )
 
-    def test_dummy_and_physical_hosts_share_capacity_geometry(self):
+    def test_dsa_builder_inherits_dummy_mode_from_anchor(self):
+        builder = DSAIndexerHostPoolBuilder()
+        anchor = SimpleNamespace(_is_dummy=True)
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.dsa.DSAIndexerPoolHost",
+            return_value=mock.sentinel.host_pool,
+        ) as pool_cls:
+            result = builder.build(
+                decl=mock.sentinel.decl,
+                anchor_host=anchor,
+                allocator_type="default",
+                packed_draft_device_pools=(),
+            )
+
+        self.assertIs(result, mock.sentinel.host_pool)
+        pool_cls.assert_called_once_with(
+            decl=mock.sentinel.decl,
+            anchor_host=anchor,
+            packed_draft_device_pools=(),
+            allocator_type="default",
+            is_dummy=True,
+        )
+
+    @mock.patch(
+        "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+        return_value=1 << 40,
+    )
+    @mock.patch.dict(
+        "sglang.srt.mem_cache.pool_host.mla.ALLOC_MEMORY_FUNCS",
+        {"cpu": _allocate_torch_cpu},
+    )
+    def test_dummy_and_physical_hosts_share_capacity_geometry(self, _host_budget):
         """Dedup peers must allocate identical IDs despite different host payloads."""
         for dcp_size in (1, 2):
             for host_size in (0, 0.000002):
@@ -284,6 +320,26 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "page-aligned device indices"):
             broadcaster.prepare_broadcast(torch.arange(7), _FakeStream())
+
+    def test_skipped_indexer_layer_is_not_broadcast(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros(2, 1), torch.zeros(2, 1)],
+            kv_cache_dim=1,
+            skip_topk_layers=[True, False],
+        )
+        broadcaster.kv_staging = torch.empty(2)
+        broadcaster.idx_bufs = [torch.empty(0, 1), torch.zeros(2, 1)]
+        broadcaster.idx_staging = torch.empty(2)
+        broadcaster.idx_elem = 1
+        broadcaster._bcast_layer = mock.Mock()
+
+        prepared = (torch.arange(2), torch.arange(2))
+        broadcaster.broadcast_loaded_layer(0, prepared)
+        self.assertEqual(broadcaster._bcast_layer.call_count, 1)
+
+        broadcaster.broadcast_loaded_layer(1, prepared)
+        self.assertEqual(broadcaster._bcast_layer.call_count, 3)
 
     def test_context_destroys_all_owned_process_groups(self):
         broadcaster = mock.Mock()

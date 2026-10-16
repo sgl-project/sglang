@@ -83,6 +83,10 @@ class L2TransferEngine:
             resolved = translate(indices)
         return resolved.to(original_device)
 
+    def resolve_device_indices(self, transfer: L2Transfer) -> torch.Tensor:
+        """Resolve one transfer for an external layerwise consumer."""
+        return self._resolve_device_indices(transfer)
+
     def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
         prepared = []
         for transfer in transfers:
@@ -140,6 +144,17 @@ class L2TransferEngine:
                     self.io_backend,
                 )
         return completion
+
+    @contextmanager
+    def host_to_device_submission(self, transfers, *, start_event=None):
+        """Prepare a custom layerwise H2D submission on the managed stream."""
+        with self._submission(
+            transfers,
+            self.host_to_device_stream,
+            "host_to_device",
+            start_event,
+        ) as submission:
+            yield submission
 
     def submit_host_to_device(
         self,
