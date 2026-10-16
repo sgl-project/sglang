@@ -95,16 +95,20 @@ __global__ __launch_bounds__(Shape::kCTASize)  //
     my_id = params.ids[static_cast<int64_t>(m) * params.ids_stride + col + lane_id];
   }
   const auto out_row = params.out + static_cast<uint64_t>(m) * K + col * kHeadDim;
-#pragma unroll
-  for (uint32_t i = 0; i < Shape::kNumSweeps; ++i) {
+  table_vec_t payload[Shape::kNumSweeps];
+  uint8_t scale_e8m0[Shape::kNumSweeps];
+  const auto load = [&](const uint32_t i) {
     const uint32_t row = i * Shape::kRowsPerSweep + row_lane_id;
     const uint32_t id = __shfl_sync(0xffffffffu, my_id, row);
     const auto owner = (col + row) / kColsPerRank;
-    table_vec_t payload;
-    payload.load(params.w[owner] + static_cast<uint64_t>(id) * kHeadDim + byte_of_row);
+    payload[i].load(params.w[owner] + static_cast<uint64_t>(id) * kHeadDim + byte_of_row);
     // A lane's 16 bytes sit inside one 32-value scale block.
-    const float scale = e8m0_to_float(params.s[owner][static_cast<uint64_t>(id) * kScalesPerRow + (byte_of_row >> 5)]);
-    const auto bytes = reinterpret_cast<const fp8x2_e4m3_t*>(&payload);
+    scale_e8m0[i] = params.s[owner][static_cast<uint64_t>(id) * kScalesPerRow + (byte_of_row >> 5)];
+  };
+  const auto store = [&](const uint32_t i) {
+    const uint32_t row = i * Shape::kRowsPerSweep + row_lane_id;
+    const float scale = e8m0_to_float(scale_e8m0[i]);
+    const auto bytes = reinterpret_cast<const fp8x2_e4m3_t*>(&payload[i]);
     vec_t lo, hi;
 #pragma unroll
     for (uint32_t e = 0; e < 4; ++e) {
@@ -115,7 +119,15 @@ __global__ __launch_bounds__(Shape::kCTASize)  //
     }
     lo.store(out_row + row * kHeadDim + byte_of_row);
     hi.store(out_row + row * kHeadDim + byte_of_row + 8);
-  }
+  };
+  // Issue every row's load before the first store: a load cannot move above a store
+  // that may alias it, and a host-memory read takes microseconds.
+#pragma unroll
+  for (uint32_t i = 0; i < Shape::kNumSweeps; ++i)
+    load(i);
+#pragma unroll
+  for (uint32_t i = 0; i < Shape::kNumSweeps; ++i)
+    store(i);
 }
 
 }  // namespace engram_gather
