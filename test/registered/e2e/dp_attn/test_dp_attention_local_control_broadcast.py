@@ -49,9 +49,8 @@ class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCa
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "2",
-                "--enable-dp-attention",
                 "--enable-dp-attention-local-control-broadcast",
             ],
         )

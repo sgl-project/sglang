@@ -342,6 +342,8 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
         gemm1_alpha=1.702,
         gemm1_clamp_limit=7.0,
     )
+    # The fused func reads the layer's MoE placement off the config.
+    config.layer = layer
     method.moe_runner_config = config
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
     method._process_weights_for_sm120_cutlass(layer)

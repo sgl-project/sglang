@@ -94,12 +94,12 @@ class XverseMoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        self.rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         self.n_routed_experts = config.num_experts
         self.top_k = config.moe_top_k
@@ -134,6 +134,7 @@ class XverseMoE(nn.Module):
         )
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=getattr(self.config, "norm_topk_prob", False),
         )
 
@@ -305,6 +306,7 @@ class XverseDecoderLayer(nn.Module):
         if config.num_experts is not None:
             self.mlp = XverseMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )

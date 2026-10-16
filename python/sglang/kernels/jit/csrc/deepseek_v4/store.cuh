@@ -15,7 +15,9 @@
 
 #include <bit>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_fp8.h>
+#endif
 #include <optional>
 
 namespace sglang {

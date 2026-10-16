@@ -17,7 +17,7 @@ fn worker(id: &str, mode: WorkerMode) -> Arc<Worker> {
         url: format!("http://{id}:30000"),
         mode,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }))
 }
 

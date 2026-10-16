@@ -92,8 +92,8 @@ The following system-level tuning steps reduce OS interference and improve CPU s
   </thead>
   <tbody>
     <tr>
-      <td>`HCCL_BUFFSIZE`</td>
-      <td>Sets the HCCL communication buffer size in MB. Larger buffers increase throughput for bulk transfers but consume more host memory. The optimal value depends on your communication pattern — larger values benefit prefill (bulk token transfers), while smaller values are sufficient for decode (small batches). Tune based on your expected token dispatch volume.</td>
+      <td>`DEEPEP_HCCL_BUFFSIZE`</td>
+      <td>Sets the HCCL communication buffer size in MB for DeepEP MoE dispatch/combine groups. Larger buffers increase throughput for bulk transfers but consume more host memory. The optimal value depends on your communication pattern — larger values benefit prefill (bulk token transfers), while smaller values are sufficient for decode (small batches). Falls back to `HCCL_BUFFSIZE` (CANN's global HCCL buffer variable) when unset.</td>
       <td>Prefill: `1200`, Decode: `400`</td>
     </tr>
     <tr>
@@ -127,8 +127,8 @@ The following system-level tuning steps reduce OS interference and improve CPU s
     </tr>
     <tr>
       <td>`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
-      <td>Sets the maximum number of tokens that a single rank can dispatch in one DeepEP operation (hard upper limit: `1024`). Larger values accommodate more tokens per dispatch but increase buffer allocation overhead. For prefill, use a large value or unbounded (`0`) since many tokens are processed. For decode, set to match your expected tokens per iteration. Must satisfy: `max-running-requests * (1 + draft_tokens) <= this value`.</td>
-      <td>Prefill: `0` (unbounded), Decode: `8`</td>
+      <td>Sets the per-rank dispatch buffer capacity (in tokens) for DeepEP low-latency mode, bounding how many tokens one rank can dispatch per decode iteration. Hard upper limit: `1024`. Larger values allocate larger buffers. Size it to the tokens actually dispatched per iteration: `max-running-requests * --speculative-num-draft-tokens` with speculative decoding (just `max-running-requests` without it) — exceeding the buffer fails at runtime inside DeepEP. Not needed for prefill: normal-mode dispatch is dynamic and does not use this value.</td>
+      <td>Decode: `8`</td>
     </tr>
     <tr>
       <td>`DEEP_NORMAL_MODE_USE_INT8_QUANT`</td>
@@ -187,16 +187,6 @@ These arguments and environment variables are critical for tuning prefill perfor
       <td>true</td>
     </tr>
     <tr>
-      <td>`--enable-dsa-prefill-context-parallel`</td>
-      <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Enables context parallelism for the long-sequence prefill phase of DeepSeek V3.2 with DSA (DeepSeek Sparse Attention). Distributes the sequence across CP ranks to parallelize the computationally expensive DSA prefill for ultra-long contexts.</td>
-      <td>Enabled</td>
-    </tr>
-    <tr>
-      <td>`--dsa-prefill-cp-mode`</td>
-      <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Controls how the long sequence is split across context parallel ranks: `in-seq-split` divides each sequence uniformly across CP ranks, optimal for single-request prefill. `round-robin-split` (code default) distributes tokens by index mod CP size, supporting multi-batch prefill. Only effective when `--enable-dsa-prefill-context-parallel` is enabled.</td>
-      <td>`in-seq-split`</td>
-    </tr>
-    <tr>
       <td>`--attn-cp-size`</td>
       <td>Specifies the context parallelism group size for attention computation. Larger values distribute the sequence across more ranks, reducing per-rank memory and compute at the cost of increased communication. For models with DSA, this controls the CP size for sparse attention prefill. Set to the number of available devices for maximum parallelization.</td>
       <td>`32`</td>
@@ -218,19 +208,14 @@ These arguments and environment variables are critical for tuning decode perform
   </thead>
   <tbody>
     <tr>
-      <td>`--dp-size` / `--data-parallel-size`</td>
-      <td>Sets the data parallelism degree for the decode server. With DP attention enabled, attention layers are sharded across DP ranks while FFN/MoE layers use tensor parallelism. Higher values create more independent decode instances, increasing throughput through parallel request processing. Choose a value that divides evenly into your total card count, with remaining cards used for TP/EP.</td>
+      <td>`--attn-dp-size` / `--attention-data-parallel-size`</td>
+      <td>Sets the attention DP size for the decode server: the number of data-parallel attention groups inside the TP group. This is a key optimization for decode throughput — attention is DP-sharded to reduce KV cache duplication, while FFN/MoE layers remain TP-sharded to leverage expert parallelism. Best suited for MoE models where attention is not the compute bottleneck. Higher values create more independent decode instances, increasing throughput through parallel request processing. Choose a value that divides the TP size evenly.</td>
       <td>`8`</td>
     </tr>
     <tr>
       <td>`--ep` / `--ep-size` / `--expert-parallel-size`</td>
       <td>Sets the expert parallelism degree. For MoE models, this distributes experts across cards, reducing per-card expert loading overhead and enabling all-to-all dispatch. The code default is `1`; set explicitly for MoE models. The optimal value depends on your model's expert count and architecture. DeepSeek V3.2 with 256 routed experts uses `ep=32`. For models with fewer experts, use a proportionally smaller value.</td>
       <td>`32`</td>
-    </tr>
-    <tr>
-      <td>`--enable-dp-attention`</td>
-      <td>Enables data parallelism for attention layers while keeping tensor parallelism for FFN/MoE layers. This is a key optimization for decode throughput — attention is DP-sharded to reduce KV cache duplication, while MoE layers remain TP-sharded to leverage expert parallelism. Best suited for MoE models where attention is not the compute bottleneck.</td>
-      <td>Enabled</td>
     </tr>
     <tr>
       <td>`--enable-dp-lm-head`</td>
@@ -285,7 +270,7 @@ Speculative decoding reduces per-token latency by generating draft tokens that a
     </tr>
     <tr>
       <td>`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`</td>
-      <td>Enables the overlap plan stream feature for EAGLE v2/v3 speculative decoding workers. This overlaps draft model computation with target model verification, effectively hiding draft latency. Enable when using EAGLE-based speculative decoding; not applicable for NEXTN.</td>
+      <td>Enables a dedicated plan stream for spec-v2 speculative decoding workers (EAGLE/NEXTN, EAGLE3, STANDALONE, DFLASH, etc.). Batch-preparation kernels such as draft-extend metadata and KV-location planning run on this separate stream, overlapping scheduling prep overhead with other enqueued work instead of serializing it. Incompatible with LoRA.</td>
       <td>`1`</td>
     </tr>
   </tbody>
@@ -304,7 +289,7 @@ Speculative decoding reduces per-token latency by generating draft tokens that a
   <tbody>
     <tr>
       <td>`--quantization modelslim`</td>
-      <td>Uses the Ascend ModelSlim quantization tool to load W4A4/W4A8/W8A8/W4A16 pre-quantized model weights. This reduces model weight footprint by approximately 50% (for w8) or 75% (for w4) compared to BF16, allowing larger models to fit in NPU memory with minimal accuracy degradation. The quantization method is auto-detected from the model's `quant_model_description.json` file.</td>
+      <td>Uses the Ascend ModelSlim quantization tool to load W4A4/W8A8/W4A8 pre-quantized model weights (plus MXFP8/MXFP4 variants). This reduces model weight footprint by approximately 50% (for w8) or 75% (for w4) compared to BF16, allowing larger models to fit in NPU memory with minimal accuracy degradation. The quantization method is auto-detected from the model's `quant_model_description.json` file.</td>
       <td>`modelslim`</td>
     </tr>
   </tbody>
@@ -354,8 +339,8 @@ The following environment variables are used in other best practice configuratio
   <tbody>
     <tr>
       <td>`HCCL_OP_EXPANSION_MODE=AIV`</td>
-      <td>Configures the HCCL communication algorithm scheduling to use AIV (Ascend Intelligent Vision) expansion mode, which can improve communication efficiency for certain collective operations.</td>
-      <td>Used in Qwen MoE and R1 non-DSA configurations</td>
+      <td>Sets where HCCL communication algorithms are orchestrated and executed: `AIV` places them on the device's AI Vector cores, offloading communication from the AI Core compute units so it can overlap with compute (the alternative is `AI_CPU`). Recommended for PD-hybrid deployments in CANN's tuning guide; verify the benefit for your workload, as gains are workload-dependent.</td>
+      <td>Used in Qwen MoE, DeepSeek R1, Kimi K2.6, and MiMo configurations</td>
     </tr>
     <tr>
       <td>`SGLANG_NPU_USE_MLAPO=1`</td>
@@ -727,9 +712,9 @@ The symbols used are defined as follows:
 
 Splits model weights across multiple NPU devices so that large models can be loaded and run cooperatively. Each device holds a shard of every weight tensor and communicates via HCCL all-reduce. This is the primary mechanism for deploying models that exceed single-device memory.
 
-### Data Parallelism (`--dp-size`, `--enable-dp-attention`)
+### Data Parallelism (`--dp-size`, `--attn-dp-size`)
 
-Replicates the model across independent device groups to increase throughput by processing multiple requests in parallel. With --enable-dp-attention, the attention layers are replicated across DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed.
+`--dp-size` replicates the model across independent device groups to increase throughput by processing multiple requests in parallel. `--attn-dp-size` instead runs attention data parallel inside the TP group: the attention layers are replicated across attention DP ranks while the FFN/MoE layers remain tensor-parallel/expert-parallel. This reduces the communication overhead of attention layers in TP (which is significant during small-batch decode) while keeping the heavy compute and memory demands of MoE layers distributed. Model replicas (`--dp-size` > 1) cannot be combined with attention DP.
 
 ### Expert Parallelism (`--ep-size`)
 
@@ -746,8 +731,8 @@ Separates the prefill (P) and decode (D) phases onto different device groups, al
 ### Quantization (`--quantization`)
 
 Reduces model weight and activation precision (e.g., W8A8, W4A8, W4A16) to decrease memory usage and increase throughput.
-On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static).
-Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors) depends on the availability
+On Ascend, the natively supported and highly optimized quantization method is ModelSlim (supporting W4A4, W8A8, W4A8 dynamic/static, plus MXFP8/MXFP4 variants).
+Support for other community formats (such as AWQ, GPTQ, Auto-round, and Compressed-tensors — the source of W4A16 support) depends on the availability
 of specific Ascend custom kernels in your environment;
 see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization) for details and compatibility matrices.
 
@@ -755,17 +740,13 @@ see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/q
 
 Breaks large prefill computations into smaller, fixed-size chunks for better scheduling interleaving with decode batches. This prevents long prefill requests from blocking decode latency. Use `-1` to disable chunked prefill on dedicated prefill nodes. Has partial compatibility with most features because chunk boundaries introduce scheduling complexity.
 
-### NPU Graph (`--cuda-graph-bs-decode`)
+### NPU Graph (`--cuda-graph-bs-decode`, `--cuda-graph-max-bs-decode`)
 
-Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs-decode`). Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
-
-<Note>
-  `--enable-torch-compile` is incompatible with NPU Graph. When torch.compile is enabled, NPU Graph must be disabled via `--disable-cuda-graph`.
-</Note>
+Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes: capture an explicit batch-size list via `--cuda-graph-bs-decode`, or let sizes be bucketed automatically up to `--cuda-graph-max-bs-decode`. Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
 
 ### Speculative Decoding (`--speculative-algorithm`)
 
-Reduces per-token latency by predicting multiple future tokens in a single forward pass, then verifying them against the model. Ascend supports `NEXTN` (for DeepSeek models, using the model's own hidden states) and `EAGLE3` (for Qwen MoE models, using a separate draft model). Controlled by `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. On Ascend, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` enables the optimized overlap scheduler for speculative decoding.
+Reduces per-token latency by predicting multiple future tokens in a single forward pass, then verifying them against the model. Ascend supports `NEXTN` (for DeepSeek models, using the model's own hidden states) and `EAGLE3` (for Qwen MoE models, using a separate draft model). Controlled by `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. On Ascend, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` moves speculative-decoding batch-preparation kernels to a dedicated stream (see the Speculative Decoding table above); it is incompatible with LoRA.
 
 For non-greedy requests, Ascend target verification applies request-level `temperature`, `top_k`, and `top_p`. The default target-only mode supports linear and tree-shaped candidates. Classic rejection sampling is available with `--speculative-use-rejection-sampling` for linear chains configured with `--speculative-eagle-topk 1`.
 
@@ -775,11 +756,11 @@ Reuses KV cache across requests that share common prompt prefixes (Radix Cache),
 
 ### Overlap Schedule
 
-On Ascend, this is primarily controlled via environment variable SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1, which enables the optimized overlap scheduler for speculative decoding scenarios. Most effective during decode with speculative decoding and DP attention, where expert dispatch/reduce communication can be overlapped with the next batch's computation.
+Overlaps CPU scheduling work with NPU compute so the next batch is prepared while the current one runs. Enabled by default; disable with `--disable-overlap-schedule`. Note that `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` is a separate, complementary optimization: it moves speculative-decoding batch-preparation kernels to a dedicated device stream (see the Speculative Decoding table above).
 
 ### DP LM Head (`--enable-dp-lm-head`)
 
-Shards the language model head (the final vocabulary projection layer) across DP ranks to reduce memory consumption and improve decode throughput. Without this, each DP rank holds a full copy of the LM head, which is wasteful for large vocabularies. Typically used together with `--enable-dp-attention`.
+Shards the language model head (the final vocabulary projection layer) across DP ranks to reduce memory consumption and improve decode throughput. Without this, each DP rank holds a full copy of the LM head, which is wasteful for large vocabularies. Typically used together with `--attn-dp-size`.
 
 ### MLAPO (`SGLANG_NPU_USE_MLAPO=1`)
 

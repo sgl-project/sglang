@@ -8,7 +8,6 @@ use serde::Serialize;
 
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
-use super::types::TokenIds;
 use super::types::{Tagged, control_messages, wire_struct};
 use crate::utils::error::Error;
 
@@ -18,7 +17,7 @@ wire_struct! {
     /// later field on the wire.
     pub(super) TokenizedGenerateReqInput<'a> {
         input_text: Option<&'a str>,
-        /// Always nil: the ids ride the ring's columnar buffer, not msgpack.
+        /// Always nil: the ids ride the ring as the `input_ids` buffer, not msgpack.
         input_ids: (),
         input_embeds: (),
         mm_inputs: (),
@@ -27,7 +26,8 @@ wire_struct! {
         return_logprob: bool,
         logprob_start_len: i64,
         top_logprobs_num: i64,
-        token_ids_logprob: Option<&'a TokenIds>,
+        /// Always nil: rides the ring as the `token_ids_logprob` buffer.
+        token_ids_logprob: (),
         stream: bool,
         /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
@@ -43,9 +43,9 @@ wire_struct! {
         lora_id: (),
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        /// PD-disaggregation block. Everything after `extra_key` (the last
+        /// field emitted) has a msgspec default in Python and is omitted
+        /// (short arrays decode with defaulted tails).
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,6 +53,14 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        /// The scheduler decodes this header by position (Python's
+        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so
+        /// `routing_key` and `require_reasoning` are sent at their defaults for
+        /// `priority` and `extra_key` to land in their slots.
+        routing_key: (),
+        require_reasoning: bool,
+        priority: Option<i64>,
+        extra_key: Option<&'a str>,
     }
 }
 
@@ -71,6 +79,15 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// `/weights_checker`'s control request: every scheduler rank runs the
+    /// weight checker's `action` on the runners `selector` names.
+    CheckWeightsReqInput {
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    }
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -94,7 +111,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_logprob: req.return_logprob,
             logprob_start_len: req.logprob_start_len,
             top_logprobs_num: req.top_logprobs_num,
-            token_ids_logprob: req.token_ids_logprob.as_ref(),
+            token_ids_logprob: (),
             stream: req.stream,
             return_sampling_mask: req.return_sampling_mask,
             return_flat_raw_top_logprobs: false,
@@ -114,6 +131,10 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: (),
+            require_reasoning: false,
+            priority: req.priority,
+            extra_key: req.extra_key.as_deref(),
         }
     }
 }
@@ -121,6 +142,24 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+impl CheckWeightsReqInput {
+    pub fn new(
+        rid: String,
+        action: String,
+        allow_quant_error: bool,
+        skip_tensor_list: Option<Vec<String>>,
+        selector: String,
+    ) -> Self {
+        Self {
+            rid,
+            action,
+            allow_quant_error,
+            skip_tensor_list,
+            selector,
+        }
     }
 }
 
@@ -157,6 +196,34 @@ mod tests {
         assert!(arr[5].is_nil());
     }
 
+    #[test]
+    fn check_weights_req_msgpack_shape() {
+        let b = CheckWeightsReqInput::new(
+            "7".into(),
+            "fingerprint".into(),
+            true,
+            Some(vec!["lm_head".into()]),
+            "target".into(),
+        )
+        .encode()
+        .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            7,
+            "CheckWeightsReqInput = [tag, rid, http_ipc, action, \
+             allow_quant_error, skip_tensor_list, selector]"
+        );
+        assert_eq!(arr[0].as_str(), Some("CheckWeightsReqInput"));
+        assert_eq!(arr[1].as_str(), Some("7"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_str(), Some("fingerprint"));
+        assert_eq!(arr[4].as_bool(), Some(true));
+        assert_eq!(arr[5][0].as_str(), Some("lm_head"));
+        assert_eq!(arr[6].as_str(), Some("target"));
+    }
+
     /// The header must be positionally aligned: `input_embeds` (idx 5) /
     /// `token_type_ids` (idx 7) present as nil so `sampling_params` lands at idx 8 and
     /// the array reaches msgspec's min length. Regression guard for that decode failure.
@@ -180,9 +247,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        // msgspec requires >= 14 (through `stream`); we emit 36 (through
+        // `extra_key`). Trailing defaulted fields are omitted.
+        assert_eq!(arr.len(), 36, "header ends at extra_key");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -216,7 +283,7 @@ mod tests {
     /// block (17–24) holding its defaults — a shift here silently routes KV
     /// transfers to the wrong host/room.
     #[test]
-    fn header_bootstrap_block_is_positionally_aligned() {
+    fn header_bootstrap_block_and_extra_key_are_positionally_aligned() {
         let req = GenerateRequest {
             rid: "r1".into(),
             text: Some("hi".into()),
@@ -227,6 +294,8 @@ mod tests {
             decode_tp_size: Some(2),
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
+            extra_key: Some("salt".into()),
+            priority: Some(-2),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -245,5 +314,9 @@ mod tests {
         assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
+        assert!(arr[32].is_nil(), "routing_key at 32");
+        assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
+        assert_eq!(arr[34].as_i64(), Some(-2), "priority at 34");
+        assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
     }
 }
