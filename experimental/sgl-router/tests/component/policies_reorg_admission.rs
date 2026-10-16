@@ -171,7 +171,8 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
             None => assert!(result.is_ok()),
             Some(reason) => assert!(matches!(
                 result,
-                Err(PickError::AdmissionRejected(rejected)) if rejected.reason == reason
+                Err(PickError::NoAdmissibleEngine(rejected))
+                    if rejected.len() == 1 && rejected[0].reason == reason
             )),
         }
     }

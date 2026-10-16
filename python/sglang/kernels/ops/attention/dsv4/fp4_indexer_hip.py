@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _ceil_ue8m0_exp,
     quantize_fp4_indexer_row,
     quantize_fp4_indexer_tensor,
 )
@@ -744,6 +746,120 @@ def _reduce_scale_bf16_kernel(
 
 
 @triton.jit
+def _fp4_e2m1_code_rne_lean(x):
+    """_fp4_e2m1_code_rne for every fp32 x (checked over all 2**32): within each spacing of the
+    e2m1 grid, rint's ties-to-even picks the even code at the midpoints."""
+    ax = tl.minimum(tl.abs(x), 6.0)
+    lo = ax < 2.0
+    mid = ax < 4.0
+    rstep = tl.where(lo, 2.0, tl.where(mid, 1.0, 0.5))
+    idx = (libdevice.rint(ax * rstep) + tl.where(lo, 0.0, tl.where(mid, 2.0, 4.0))).to(
+        tl.uint8
+    )
+    idx = tl.where(ax == ax, idx, 0)
+    sign = ((x < 0) & (idx != 0)).to(tl.uint8)
+    return idx | (sign << 3)
+
+
+@triton.jit
+def _index_q_quant_groups(v, AMAX_FLOOR: tl.constexpr):
+    """[16, G, 32] fp32 through the fake-quant of rope_tail_fake_quant_fp4_row (rounded to bf16
+    as the standalone kernel stores it) and quantize_fp4_indexer_row (RNE): (packed codes
+    [16, G * 16], ue8m0 exponents [16, G]). The power-of-two divisions run as multiplies by
+    exact reciprocals, which round identically."""
+    amax = tl.maximum(tl.max(tl.abs(v), axis=2), AMAX_FLOOR) * (1.0 / 6.0)
+    bits = amax.to(tl.int32, bitcast=True)
+    expo = ((bits >> 23) & 0xFF) - 127
+    expo = expo + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = ((expo + 127) << 23).to(tl.float32, bitcast=True)
+    # 1 / scale: 2^-expo for a finite amax (expo <= 126), 0 for inf (scale = inf),
+    # -inf for nan (expo = 129 wraps scale to -0.0)
+    rscale = tl.where(
+        expo <= 126,
+        ((127 - expo) << 23).to(tl.float32, bitcast=True),
+        tl.where(expo == 128, 0.0, float("-inf")),
+    )
+    s = tl.minimum(tl.maximum(v * rscale[:, :, None], -6.0), 6.0)
+    mag = tl.abs(s)
+    rstep = tl.where(mag < 2.0, 2.0, tl.where(mag < 4.0, 1.0, 0.5))
+    step = ((254 << 23) - rstep.to(tl.int32, bitcast=True)).to(tl.float32, bitcast=True)
+    # rint is odd-symmetric, so the sign rides along; a zero may come out as -0, which neither
+    # the amax nor the codes below tell apart
+    values = (libdevice.rint(s * rstep) * step * scale[:, :, None]).to(tl.bfloat16)
+    values = values.to(tl.float32)
+
+    exp = _ceil_ue8m0_exp(tl.maximum(tl.max(tl.abs(values), axis=2) / 6.0, 1.0e-4))
+    # 1 / 2^(exp - 127); exp = 254 (an inf / nan group) as 0.5 * 2^-126, where any value
+    # rounded differently is below 2^-126 and codes 0 either way
+    top = exp == 254
+    ra = tl.where(top, 0.5, 1.0)
+    rb = tl.where(top, 2.0**-126, ((254 - exp) << 23).to(tl.float32, bitcast=True))
+    code = _fp4_e2m1_code_rne_lean(values * ra[:, :, None] * rb[:, :, None])
+    G: tl.constexpr = v.shape[1]
+    c0, c1 = tl.split(tl.reshape(code, (16, G * 16, 2)))
+    return (c0 & 0x0F) | ((c1 & 0x0F) << 4), exp
+
+
+@triton.jit
+def _index_q_rope_pack_kernel(
+    q_ptr,  # [T, H * 128] bf16 (wq_b output)
+    f_ptr,  # [max_pos, RD // 2, 2] fp32: the real view of the complex freqs table
+    pos_ptr,  # [T] int
+    q_fp4_ptr,  # [T, H, 64] int8
+    q_scale_ptr,  # [T, 1, 4, 16, 4] uint8
+    stride_qt,
+    num_pos,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+):
+    """Grid (T, H // 16): 16 heads of one token per program, through _index_q_quant_groups, in
+    the FlyDSL MQA-logits layout."""
+    NOPE: tl.constexpr = D - RD
+    t = tl.program_id(0)
+    h0 = tl.program_id(1) * 16
+    hh = h0 + tl.arange(0, 16)
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+    # the caller owns positions < num_pos; an out-of-range row reads entry 0 instead of past the table
+    pos = tl.where((pos >= 0) & (pos < num_pos), pos, 0)
+    q_row = q_ptr + t.to(tl.int64) * stride_qt + hh[:, None] * D
+    out_row = q_fp4_ptr + (t.to(tl.int64) * H + hh[:, None]) * (D // 2)
+
+    x = tl.load(q_row + tl.arange(0, NOPE)[None, :]).to(tl.float32)
+    packed, exp_nope = _index_q_quant_groups(
+        tl.reshape(x, (16, NOPE // 32, 32)), AMAX_FLOOR
+    )
+    tl.store(out_row + tl.arange(0, NOPE // 2)[None, :], packed)
+
+    # RoPE on the last RD features, adjacent pairs as one complex number
+    x = tl.load(q_row + NOPE + tl.arange(0, RD)[None, :]).to(tl.float32)
+    re, im = tl.split(tl.reshape(x, (16, RD // 2, 2)))
+    j = tl.arange(0, RD // 2)
+    fr = tl.load(f_ptr + pos * RD + 2 * j)[None, :]
+    fi = tl.load(f_ptr + pos * RD + 2 * j + 1)[None, :]
+    re_rot = (re * fr - im * fi).to(tl.bfloat16).to(tl.float32)
+    im_rot = (re * fi + im * fr).to(tl.bfloat16).to(tl.float32)
+    packed, exp_rope = _index_q_quant_groups(
+        tl.reshape(tl.join(re_rot, im_rot), (16, RD // 32, 32)), AMAX_FLOOR
+    )
+    tl.store(out_row + NOPE // 2 + tl.arange(0, RD // 2)[None, :], packed)
+
+    # scale bytes: chunk c of head h at [t, 0, c, h % 16, h // 16]
+    base = q_scale_ptr + t.to(tl.int64) * (4 * 16 * 4)
+    i = tl.arange(0, 16)[:, None]
+    c_nope = tl.arange(0, NOPE // 32)[None, :]
+    c_rope = NOPE // 32 + tl.arange(0, RD // 32)[None, :]
+    tl.store(base + (c_nope * 16 + i) * 4 + h0 // 16, exp_nope.to(tl.uint8))
+    tl.store(base + (c_rope * 16 + i) * 4 + h0 // 16, exp_rope.to(tl.uint8))
+    if h0 == 0:
+        # groups this head count does not have stay zero
+        slot = (tl.arange(0, 4)[None, :] * 16 + i) * 4
+        for g in tl.static_range(H // 16, 4):
+            tl.store(base + slot + g, tl.zeros((16, 4), dtype=tl.uint8))
+
+
+@triton.jit
 def _index_q_pack_weights_kernel(
     q_ptr,  # [T, H * 128] bf16 (wq_b output)
     f_ptr,  # [max_pos, RD // 2, 2] fp32: the real view of the complex freqs table
@@ -815,6 +931,54 @@ def _index_q_pack_weights_kernel(
             SPLIT_K=SPLIT_K,
             BLOCK=W_BLOCK,
         )
+
+
+def index_q_rope_pack_flydsl(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    *,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The index-Q RoPE and fp4 pack at any row count: (q_fp4 [T, H, 64] int8, q_scale
+    [T, 1, 4, 16, 4] uint8), bitwise pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128),
+    freqs_cis[positions], rope_dim)) without the bf16 fake-quant round trip through memory."""
+    T = q.shape[0]
+    H = num_heads
+    assert q.dtype == torch.bfloat16 and q.dim() == 2 and q.shape[1] == H * 128
+    assert q.stride(1) == 1
+    assert H % 16 == 0 and 0 < H <= 64, H
+    assert freqs_cis.dtype == torch.complex64 and freqs_cis.shape[1] == rope_dim // 2
+    # the plain and rotated halves are each whole 32-groups of a power-of-two width
+    assert rope_dim == 64, rope_dim
+    assert positions.shape == (T,)
+    # the kernel reads positions[t] at pos_ptr + t
+    positions = positions.contiguous()
+    f_real = torch.view_as_real(freqs_cis)
+    assert f_real.is_contiguous()
+    q_fp4 = torch.empty((T, H, 64), dtype=torch.int8, device=q.device)
+    q_scale = torch.empty((T, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    if T == 0:
+        return q_fp4, q_scale
+    _index_q_rope_pack_kernel[(T, H // 16)](
+        q,
+        f_real,
+        positions,
+        q_fp4,
+        q_scale,
+        q.stride(0),
+        f_real.shape[0],
+        H=H,
+        D=128,
+        RD=rope_dim,
+        AMAX_FLOOR=FP4_AMAX_FLOOR,
+        num_warps=2,
+        # bitwise parity with the standalone RoPE kernel: a contracted FMA in the rotation flips
+        # the bf16 rounding of a few values in 10^8
+        enable_fp_fusion=False,
+    )
+    return q_fp4, q_scale
 
 
 def index_q_rope_pack_weights_flydsl(

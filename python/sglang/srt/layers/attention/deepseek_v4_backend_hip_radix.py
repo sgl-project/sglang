@@ -65,6 +65,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
+    _prefill_graph_max_seq_len,
     _tail_rows,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -853,6 +854,9 @@ class DeepseekV4HipRadixBackend(
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
+    # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
+    # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
+    can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
     _low_ratio_compress_decode = DeepseekV4AttnBackend._low_ratio_compress_decode
@@ -2081,8 +2085,7 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
-        replay: each request's last SWA_WINDOW extend tokens, whose window is floored at the
-        tail start since no window KV before it is written at those layers."""
+        replay: each request's last SWA_WINDOW extend tokens."""
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
@@ -2239,6 +2242,15 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
         )
 
+    @staticmethod
+    def _graph_metadata_max_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
+        """
+        Capture and replay build the metadata at this fixed context length, so a
+        replay's metadata is never larger than the captured one. Longer contexts run
+        eager.
+        """
+        return forward_batch.max_seq_len_override or _prefill_graph_max_seq_len()
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
@@ -2272,7 +2284,10 @@ class DeepseekV4HipRadixBackend(
                 "breakable prefill CUDA graphs on HIP do not support attention CP"
             )
         assert forward_batch.forward_mode.is_extend(), forward_batch.forward_mode
-        metadata = self._prefill_metadata_for_batch(forward_batch)
+        max_seq_len = self._graph_metadata_max_seq_len(forward_batch)
+        metadata = self._prefill_metadata_for_batch(
+            forward_batch, max_seq_len_override=max_seq_len
+        )
         self.forward_metadata = metadata
         # the captured store kernels bind this target's address
         self.init_forward_metadata_in_graph(forward_batch)
@@ -2311,9 +2326,9 @@ class DeepseekV4HipRadixBackend(
         if static_forward_batch is None:
             static_forward_batch = forward_batch
         # break-time consumers read the live batch's eager build; the padded loc feeds only the target
+        max_seq_len = self._graph_metadata_max_seq_len(static_forward_batch)
         live = self._prefill_metadata_for_batch(
-            forward_batch,
-            max_seq_len_override=static_forward_batch.max_seq_len_override,
+            forward_batch, max_seq_len_override=max_seq_len
         )
         self.forward_metadata = live
         self.init_forward_metadata_in_graph(static_forward_batch)
@@ -2900,6 +2915,7 @@ class DeepseekV4HipRadixBackend(
             swa_page_size=self.token_to_kv_pool.swa_kv_pool.page_size,
             num_qo_tokens=num_tokens,
             max_seq_len=max(seq_lens_cpu),
+            seq_lens_cpu=seq_lens_cpu,
             total_swa=total_swa,
         )
 

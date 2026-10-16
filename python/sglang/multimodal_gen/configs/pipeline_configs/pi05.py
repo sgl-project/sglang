@@ -6,9 +6,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
-    ModelDeploymentConfig,
-)
 
 
 @dataclass
@@ -161,9 +158,6 @@ class Pi05PipelineConfig(PipelineConfig):
         return float(
             self.action_horizon * self.action_dim * self.default_num_inference_steps
         )
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
 
 
 def register():

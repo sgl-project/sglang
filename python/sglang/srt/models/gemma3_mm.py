@@ -494,6 +494,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             # For EAGLE3, head might not be needed
             return embed, None
 
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.language_model.get_embed_and_head_for_draft(draft_embedding)
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
             self.language_model.set_eagle3_layers_to_capture(layer_ids)

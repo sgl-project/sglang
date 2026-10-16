@@ -168,7 +168,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
 
         # Not a literal: the prefill default is BREAKABLE on CUDA and
-        # TC_PIECEWISE elsewhere, and this file runs on the CPU runner.
+        # disabled elsewhere, and this file runs on the CPU runner.
         self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
         self.assertEqual(
             backends(["--disable-cuda-graph"]),

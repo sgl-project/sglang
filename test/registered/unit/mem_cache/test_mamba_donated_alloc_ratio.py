@@ -393,6 +393,44 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
 
+    def test_pd_prefill_does_not_reserve_speculative_scratch(self):
+        """A PD prefill server's hybrid req pool never allocates the per-draft-token
+        verify snapshots, so none of the three capacity branches may charge them."""
+        prefill = dict(disaggregation_mode="prefill")
+        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the (4 + 1) * 2 * 4 MiB
+        # scratch is only charged outside PD prefill.
+        self.assertEqual(
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8), (8, 44 << 20)
+        )
+        self.assertEqual(
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8, **prefill),
+            (8, 84 << 20),
+        )
+        # Capacity from max_running_requests with the radix cache disabled.
+        fixed = dict(disable_radix_cache=True, max_running_requests=8)
+        self.assertEqual(self._size(0, draft_tokens=2, **fixed), (8, 12 << 20))
+        self.assertEqual(
+            self._size(0, draft_tokens=2, **fixed, **prefill), (8, 84 << 20)
+        )
+        # Auto capacity sizes like a non-speculative server.
+        self.assertEqual(self._size(0, draft_tokens=2, **prefill), self._size(0))
+        # Prefill pools that still allocate the snapshots keep the reserve.
+        for allocates in (
+            dict(enable_pd_role_switch=True),
+            dict(enable_unified_memory=True),
+        ):
+            with self.subTest(**allocates):
+                self.assertEqual(
+                    self._size(
+                        0,
+                        draft_tokens=2,
+                        max_mamba_cache_size=8,
+                        **prefill,
+                        **allocates,
+                    ),
+                    (8, 44 << 20),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

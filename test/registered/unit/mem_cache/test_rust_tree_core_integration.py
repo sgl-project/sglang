@@ -13,15 +13,19 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=17, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -32,6 +36,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -39,6 +45,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
@@ -56,11 +63,17 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    TreePathNodeInfo,
+    UnifiedTreeCoreInterface,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
-def _tree_core(**params_overrides) -> RustUnifiedTreeCore:
+def _tree_core(backend="rust", **params_overrides) -> UnifiedTreeCoreInterface:
     params = dict(
         disable=False,
         req_to_token_pool=None,
@@ -69,7 +82,19 @@ def _tree_core(**params_overrides) -> RustUnifiedTreeCore:
         tree_components=(ComponentType.FULL,),
     )
     params.update(params_overrides)
-    return RustUnifiedTreeCore(CacheInitParams(**params))
+    params = CacheInitParams(**params)
+    if backend == "rust":
+        return RustUnifiedTreeCore(params)
+
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+    cache = SimpleNamespace(enable_session_radix_cache=False)
+    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+
+
+def _path_indices(core: RustUnifiedTreeCore, node_id) -> torch.Tensor:
+    return core.collect_full_device_indices(node_id, core.root_node_handle(None))
 
 
 def _key(token_ids: list[int]) -> RadixKey:
@@ -128,7 +153,7 @@ def _accumulate_step(result, tracker, device_frees, host_frees):
 def test_match_on_the_empty_tree_returns_no_indices():
     core = _tree_core()
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert result.device_indices.numel() == 0
+    assert result.device_prefix_len == 0
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
@@ -153,7 +178,7 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_ba
     assert isinstance(cache.tree_core, RustUnifiedTreeCore)
     cache.insert(InsertParams(key=_key([1, 2, 3]), value=torch.tensor([11, 12, 13])))
     matched = cache.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert matched.device_indices.tolist() == [11, 12, 13]
+    assert cache.path_device_indices(matched.last_device_node).tolist() == [11, 12, 13]
     cache.tree_core.sanity_check([], [])
 
 
@@ -164,7 +189,7 @@ def test_insert_then_match_back_returns_the_exact_indices():
     assert result.cache_actions == []
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.last_device_node == matched.last_device_node
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
 
 
 def test_root_node_handle_is_namespace_independent():
@@ -708,7 +733,7 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
     core.reset()
     live_root = core.root_node_handle()
     result = MatchResult(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=0,
         last_device_node=live_root,
         last_host_node=live_root,
         best_match_node=live_root,
@@ -945,7 +970,165 @@ def test_extension_insert_frees_the_duplicate_overlap():
     assert isinstance(action, FreeDeviceKV)
     assert torch.cat(action.indices).tolist() == [20, 21, 22]
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4, 5])))
-    assert matched.device_indices.tolist() == [10, 11, 12, 13, 14]
+    assert _path_indices(core, matched.last_device_node).tolist() == [
+        10,
+        11,
+        12,
+        13,
+        14,
+    ]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("is_eagle", [False, True], ids=["unigram", "bigram"])
+def test_path_order_namespaces_and_detached_snapshots(backend, is_eagle):
+    """Both backends report root-relative half-open spans per node in input
+    order, keep namespaces apart, and return frozen records that a later
+    split or reset does not rewrite."""
+    core = _tree_core(backend, is_eagle=is_eagle)
+    assert isinstance(core, UnifiedTreeCoreInterface)
+    root = core.root_node_handle()
+    assert core.collect_path_info(()) == ()
+    assert core.collect_path_info([root]) == ((),)
+
+    def insert(tokens, namespace):
+        key = RadixKey(array("q", tokens), extra_key=namespace, is_bigram=is_eagle)
+        return _pump_insert(
+            core, InsertParams(key=key, value=torch.arange(10, 10 + len(key)))
+        ).last_device_node
+
+    tokens = [1, 2, 3, 4, 5, 6]
+    length = len(tokens) - int(is_eagle)
+    leaf = insert(tokens, "first")
+    other = insert(tokens, "second")
+    before = core.collect_path_info((other, root, leaf, other))
+    assert before == (
+        (TreePathNodeInfo(other, root, 0, length, length),),
+        (),
+        (TreePathNodeInfo(leaf, root, 0, length, length),),
+        (TreePathNodeInfo(other, root, 0, length, length),),
+    )
+    with pytest.raises(AttributeError):
+        before[0][0].path_end = 99
+
+    insert([1, 2, 3, 7, 8, 9], "first")
+    path = core.collect_path_info([leaf])[0]
+    split = 3 - int(is_eagle)
+    assert len(path) == 2
+    assert path[0] == TreePathNodeInfo(path[0].node_id, root, 0, split, split)
+    assert path[1] == TreePathNodeInfo(
+        leaf, path[0].node_id, split, length, length - split
+    )
+    assert before[2] == (TreePathNodeInfo(leaf, root, 0, length, length),)
+    core.reset()
+    with pytest.raises(KeyError):
+        core.collect_path_info([leaf])
+    assert before[0] == before[3]
+    assert before[2][0].full_value_len == length
+    assert core.collect_path_info([core.root_node_handle()]) == ((),)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("is_eagle", [False, True], ids=["unigram", "bigram"])
+def test_host_only_and_root_adjustments_are_noops(backend, is_eagle):
+    """A root or a node with no device value is on neither ledger, so an
+    adjustment must leave both ledgers at zero instead of underflowing."""
+    core = _tree_core(backend, is_eagle=is_eagle)
+    root = core.root_node_handle()
+    key = RadixKey(array("q", [1, 2, 3, 4]), extra_key="host", is_bigram=is_eagle)
+    host = core.insert_host(
+        root, key, torch.arange(100, 100 + len(key)), ["hash"] * len(key)
+    ).inserted_host_node
+    assert core.collect_path_info([host]) == (
+        (TreePathNodeInfo(host, root, 0, len(key), None),),
+    )
+    for node in (root, host):
+        for delta in (-10, 0, 10):
+            core.adjust_component_size(node, ComponentType.FULL, delta)
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
+    assert core.collect_path_info([host])[0][0].full_value_len is None
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("is_eagle", [False, True], ids=["unigram", "bigram"])
+@pytest.mark.parametrize("locked", [False, True], ids=["evictable", "protected"])
+def test_failed_adjustments_preserve_accounting_and_tree(backend, is_eagle, locked):
+    """Rejected handles and disabled components raise the documented error
+    classes on both backends without moving either ledger or the path."""
+    core = _tree_core(backend, is_eagle=is_eagle)
+    key = RadixKey(array("q", [1, 2, 3, 4]), is_bigram=is_eagle)
+    leaf = _pump_insert(
+        core, InsertParams(key=key, value=torch.arange(10, 10 + len(key)))
+    ).last_device_node
+    if locked:
+        lock = core.inc_lock_ref(leaf)
+    before = core.full_evictable_size(), core.full_protected_size()
+    path = core.collect_path_info([leaf])
+    invalid_node = (1 << 63) - 1
+    for node, component, delta, error in (
+        (invalid_node, ComponentType.FULL, 0, KeyError),
+        (leaf, ComponentType.SWA, 0, ValueError),
+        (leaf, 99, 0, ValueError),
+    ):
+        with pytest.raises(error):
+            core.adjust_component_size(node, component, delta)
+        assert (core.full_evictable_size(), core.full_protected_size()) == before
+        assert core.collect_path_info([leaf]) == path
+    with pytest.raises(KeyError):
+        core.collect_path_info((leaf, invalid_node, leaf))
+    core.adjust_component_size(leaf, ComponentType.FULL, 0)
+    assert (core.full_evictable_size(), core.full_protected_size()) == before
+    if locked:
+        core.dec_lock_ref(leaf, lock.to_dec_params())
+    core.sanity_check([], [])
+    _accumulate_step(core.evict_device_leaf(leaf, False), {}, {}, {})
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
+    with pytest.raises(KeyError):
+        core.adjust_component_size(leaf, ComponentType.FULL, 0)
+
+
+def test_adjustment_follows_real_backing_changes_across_lock_transitions():
+    """The adjusted figure moves with the node between the evictable and
+    protected ledgers, and eviction reclaims the component's own figure."""
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+    class SideBackingFullComponent(FullComponent):
+        def reclaimable_tokens(self, node):
+            backing = node.component_data[ComponentType.FULL].metadata.get(
+                "side_backing"
+            )
+            return super().reclaimable_tokens(node) + (
+                0 if backing is None else backing.numel()
+            )
+
+    params = CacheInitParams(
+        False, None, None, 1, tree_components=(ComponentType.FULL,)
+    )
+    cache = SimpleNamespace(enable_session_radix_cache=False)
+    core = UnifiedTreeCore(
+        params, {ComponentType.FULL: SideBackingFullComponent(cache, params)}
+    )
+    leaf = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13]).last_device_node
+    metadata = core.node_by_id(leaf).component_data[ComponentType.FULL].metadata
+    metadata["side_backing"] = torch.tensor([100, 101])
+    core.adjust_component_size(leaf, ComponentType.FULL, 2)
+    assert (core.full_evictable_size(), core.full_protected_size()) == (6, 0)
+
+    lock = core.inc_lock_ref(leaf)
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 6)
+    metadata["side_backing"] = metadata["side_backing"][:1]
+    core.adjust_component_size(leaf, ComponentType.FULL, -1)
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 5)
+    del metadata["side_backing"]
+    core.adjust_component_size(leaf, ComponentType.FULL, -1)
+    core.dec_lock_ref(leaf, lock.to_dec_params())
+    assert (core.full_evictable_size(), core.full_protected_size()) == (4, 0)
+    core.sanity_check([], [])
+    tracker = {}
+    _accumulate_step(core.evict_device_leaf(leaf, False), tracker, {}, {})
+    assert tracker[ComponentType.FULL] == 4
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
 
 
 def test_lock_and_unlock_move_tokens_between_protected_and_evictable():
@@ -1094,7 +1277,9 @@ def test_binding_stays_usable_after_a_failed_insert():
     )
     assert result.prefix_len == 0
     matched = binding.match_prefix(mem_cache.MatchParamsBinding(array("q", [1, 2, 3])))
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert binding.collect_full_device_indices(
+        matched.last_device_node_id, binding.root_node_handle(None)
+    ).tolist() == [10, 11, 12]
 
 
 @pytest.mark.parametrize("prior_hash", ["abcd", "z" * 64])
@@ -1152,13 +1337,13 @@ def test_extra_key_isolates_namespaces():
     salted = core.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3]), extra_key="salt"))
     )
-    assert salted.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, salted.last_device_node).tolist() == [10, 11, 12]
     unsalted = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert unsalted.device_indices.numel() == 0
+    assert unsalted.device_prefix_len == 0
     other = core.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3]), extra_key="other"))
     )
-    assert other.device_indices.numel() == 0
+    assert other.device_prefix_len == 0
     assert core.prefetch_anchor_info(salted.best_match_node) == ("salt", None)
     assert core.prefetch_anchor_info(core.root_node_handle()) == (None, None)
 
@@ -1177,20 +1362,23 @@ def test_cache_salt_is_supported_by_all_key_entry_points():
         InsertParams(key=second_key, value=torch.tensor([20, 21], dtype=torch.int64)),
     )
 
-    assert core.match_prefix(
-        MatchPrefixParams(key=first_key)
-    ).device_indices.tolist() == [
+    assert _path_indices(
+        core, core.match_prefix(MatchPrefixParams(key=first_key)).last_device_node
+    ).tolist() == [
         10,
         11,
     ]
-    assert core.match_prefix(
-        MatchPrefixParams(key=second_key)
-    ).device_indices.tolist() == [
+    assert _path_indices(
+        core, core.match_prefix(MatchPrefixParams(key=second_key)).last_device_node
+    ).tolist() == [
         20,
         21,
     ]
     assert (
-        core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).device_indices.numel()
+        _path_indices(
+            core,
+            core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).last_device_node,
+        ).numel()
         == 0
     )
 
@@ -1249,7 +1437,7 @@ def test_page_size_two_drops_the_ragged_tail():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4, 5])))
-    assert matched.device_indices.tolist() == [10, 11, 12, 13]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12, 13]
 
 
 def test_insert_value_none_materializes_the_token_ids():
@@ -1257,22 +1445,23 @@ def test_insert_value_none_materializes_the_token_ids():
     result = _pump_insert(core, InsertParams(key=_key([1, 2, 3])))
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert matched.device_indices.tolist() == [1, 2, 3]
+    assert _path_indices(core, matched.last_device_node).tolist() == [1, 2, 3]
 
 
 @pytest.mark.parametrize("swa", [False, True])
 def test_empty_match_result_is_root_anchored(swa):
     core = _swa_tree_core() if swa else _tree_core()
     empty = core.empty_match_result
-    assert empty.device_indices.numel() == 0
+    assert empty.device_prefix_len == 0
     assert empty.host_hit_length == 0
     probe = core.match_prefix(MatchPrefixParams(key=_key([9])))
     assert empty.best_match_node == probe.best_match_node
     assert empty.last_device_node == probe.last_device_node
     assert empty.last_host_node == probe.last_host_node
-    core.dec_lock_ref(empty.best_match_node, DecLockRefParams())
-    core.dec_host_lock_ref(empty.best_match_node, DecLockRefParams())
-    released = core.dec_swa_lock_only(empty.best_match_node, DecLockRefParams())
+    receipt = DecLockRefParams(node_id=empty.best_match_node)
+    core.dec_lock_ref(empty.best_match_node, receipt)
+    core.dec_host_lock_ref(empty.best_match_node, receipt)
+    released = core.dec_swa_lock_only(empty.best_match_node, receipt)
     assert not released.device_frees
     assert not released.host_frees
     core.sanity_check([], [])
@@ -1312,7 +1501,7 @@ def test_hicache_write_through_and_load_back_round_trip():
     )
     assert actions == []
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert result.device_indices.tolist() == [50, 51]
+    assert _path_indices(core, result.last_device_node).tolist() == [50, 51]
     core.finish_load_back(leaf)
     core.sanity_check([], [])
 
@@ -1658,6 +1847,55 @@ def test_salted_events_match_python_hash_and_metadata_contract():
     ]
 
 
+def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
+    """In the dynamo format, the Rust tree publishes the Python namespaced hashes
+    and the adapter name."""
+    lora_id = "a" * 32
+    lora_names = LoRANameTable()
+    lora_names.register(lora_id=lora_id, lora_name="adapter-a")
+    core = _tree_core(
+        enable_kv_cache_events=True,
+        page_size=2,
+        dynamo_kv_event_format=True,
+        kv_event_lora_names=lora_names,
+    )
+    key = RadixKey(array("q", [1, 2, 7, 8]), extra_key="user-" + lora_id)
+    _pump_insert(
+        core,
+        InsertParams(key=key, value=torch.tensor([10, 11, 12, 13], dtype=torch.int64)),
+    )
+    token_only = [
+        hash_str_to_int64(value)
+        for value in mem_cache.get_hash_str(array("q", [1, 2, 7, 8]), None, 2)
+    ]
+    seed = kv_event_namespace_seed(extra_key=key.extra_key, cache_salt=None)
+    namespaced = [namespaced_block_hash(h, namespace_seed=seed) for h in token_only]
+    assert namespaced != token_only
+    assert core.take_events() == [
+        BlockStored(
+            block_hashes=namespaced,
+            parent_block_hash=None,
+            token_ids=[1, 2, 7, 8],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.GPU,
+            lora_name="adapter-a",
+        )
+    ]
+
+    tracker = {ComponentType.FULL: 0}
+    core.evict_device_start(ComponentType.FULL, 4)
+    candidate = core.evict_device_next_node(ComponentType.FULL, tracker).node_id
+    assert candidate is not None
+    evicted = core.evict_device_leaf(candidate, is_write_back=False)
+    evicted.device_frees.clear()
+    evicted.host_frees.clear()
+    core.evict_device_end(ComponentType.FULL)
+    assert core.take_events() == [
+        BlockRemoved(block_hashes=namespaced, medium=StorageMedium.GPU)
+    ]
+
+
 def test_salted_eagle_events_match_the_bigram_hash_contract():
     core = _tree_core(enable_kv_cache_events=True, page_size=2, is_eagle=True)
     raw_tokens = array("q", [1, 2, 3, 4, 5])
@@ -1852,7 +2090,9 @@ def test_empty_cache_salt_uses_the_default_namespace_at_the_binding():
         )
     )
     result = binding.match_prefix(mem_cache.MatchParamsBinding(array("q", [1])))
-    assert result.device_indices.tolist() == [10]
+    assert binding.collect_full_device_indices(
+        result.last_device_node_id, binding.root_node_handle(None)
+    ).tolist() == [10]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1870,13 +2110,13 @@ def test_cuda_core_resolves_the_current_device():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert matched.device_indices.device == core.device
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, matched.last_device_node).device == core.device
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
     # The value=None fallback also lands on the resolved device.
     fallback = _pump_insert(core, InsertParams(key=_key([7, 8])))
     assert fallback.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_key([7, 8])))
-    assert matched.device_indices.tolist() == [7, 8]
+    assert _path_indices(core, matched.last_device_node).tolist() == [7, 8]
 
 
 def test_unsupported_component_sets_are_rejected():
@@ -1934,7 +2174,7 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
     assert tracker[ComponentType.FULL] == 2
     assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert result.device_indices.numel() == 0
+    assert result.device_prefix_len == 0
     core.sanity_check([], [])
 
 
@@ -2175,12 +2415,7 @@ def test_swa_host_pressure_retains_device_resident_backups(backend, guard):
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("resident_full", [(), (0,), (0, 1, 2, 3)])
-def test_swa_load_back_preserves_full_anchors_across_holes(backend, resident_full):
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        HybridCacheController,
-    )
-    from sglang.srt.mem_cache.pool_host.group import PoolEntry
-
+def test_swa_load_back_spec_skips_resident_swa_holes(backend, resident_full):
     core, _ = _swa_transfer_core(backend)
     nodes = []
     boundaries = (0, 2, 5, 6, 8)
@@ -2224,52 +2459,10 @@ def test_swa_load_back_preserves_full_anchors_across_holes(backend, resident_ful
         )
         core.finish_load_back(nodes[index])
 
-    kv, auxiliary = core.build_load_back_spec(nodes[-1])
+    _, auxiliary = core.build_load_back_spec(nodes[-1])
     (swa,) = auxiliary[ComponentType.SWA]
     assert swa.nodes_to_load == [nodes[0], nodes[2], nodes[3]]
     assert swa.host_indices.tolist() == [300, 301, 305, 306, 307]
-    expected = {
-        (): [slice(0, 2), slice(5, 6), slice(6, 8)],
-        (0,): [torch.tensor([10, 11]), slice(3, 4), slice(4, 6)],
-        (0, 1, 2, 3): [
-            torch.tensor([10, 11]),
-            torch.tensor([15]),
-            torch.tensor([16, 17]),
-        ],
-    }[resident_full]
-    assert swa.anchor_index_parts is not None
-    assert len(swa.anchor_index_parts) == len(expected)
-    for actual, wanted in zip(swa.anchor_index_parts, expected):
-        if isinstance(wanted, slice):
-            assert actual == wanted
-        else:
-            torch.testing.assert_close(actual, wanted)
-
-    # Exercise the consumer too: new Full rows and resident virtual IDs must
-    # bind the same five SWA rows, without consuming the resident-SWA hole.
-    bind = Mock(side_effect=lambda indices: indices + 1000)
-    controller = object.__new__(HybridCacheController)
-    controller.mem_pool_host = SimpleNamespace(
-        entry_map={
-            PoolName.SWA: PoolEntry(
-                name=PoolName.SWA,
-                host_pool=SimpleNamespace(),
-                device_pool=SimpleNamespace(),
-                layer_mapper=lambda i: i,
-                device_indices_from_anchor_fn=bind,
-                device_free_fn=Mock(),
-            )
-        }
-    )
-    loaded = torch.arange(200, 200 + len(kv.host_indices))
-    assert controller._resolve_device_transfers([swa], loaded) is not None
-    expected_bound = {
-        (): [1200, 1201, 1205, 1206, 1207],
-        (0,): [1010, 1011, 1203, 1204, 1205],
-        (0, 1, 2, 3): [1010, 1011, 1015, 1016, 1017],
-    }[resident_full]
-    assert swa.device_indices.tolist() == expected_bound
-    assert bind.call_count == 1
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -2725,7 +2918,7 @@ def test_internal_swa_write_back_preserves_window_until_ack(
             MatchPrefixParams(key=_key(list(range(case.segment))))
         )
         assert matched.best_match_node == parent
-        assert matched.device_indices.numel() == 0
+        assert matched.device_prefix_len == 0
         assert matched.full_kv_hit_length == case.segment
         assert matched.swa_host_hit_length == case.segment
         assert matched.mamba_host_hit_length == int(with_mamba)
@@ -3801,7 +3994,9 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     cache.tree_core.has_swa_host_pool = has_swa_host_pool
     matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
     assert matched.full_kv_hit_length == 8
-    assert matched.device_indices.tolist() == (indices[:8].tolist() if ring else [])
+    assert cache.path_device_indices(matched.last_device_node).tolist() == (
+        indices[:8].tolist() if ring else []
+    )
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
@@ -4196,7 +4391,7 @@ def test_mamba_tree_round_trips_through_the_adapter():
     assert not result.mamba_exist
 
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
-    assert matched.device_indices.tolist() == [10, 11]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
     assert matched.mamba_host_hit_length == 0
     assert core.mamba_evictable_size() == 1
     assert core.all_mamba_values_flatten().tolist() == [7]
@@ -5001,7 +5196,7 @@ def test_bigram_insert_then_a_longer_match_returns_the_inserted_prefix():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_bigram_key([1, 2, 3, 4, 5])))
-    assert matched.device_indices.tolist() == [10, 11, 12]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
 
 
 def test_bigram_match_diverges_on_the_pair_not_the_token():
@@ -5015,7 +5210,7 @@ def test_bigram_match_diverges_on_the_pair_not_the_token():
     )
     # (1, 2) matches; (2, 9) diverges from (2, 3) despite the shared token 2.
     matched = core.match_prefix(MatchPrefixParams(key=_bigram_key([1, 2, 9])))
-    assert matched.device_indices.tolist() == [10]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10]
 
 
 def test_bigram_empty_and_single_token_keys_match_nothing():
@@ -5028,9 +5223,9 @@ def test_bigram_empty_and_single_token_keys_match_nothing():
         ),
     )
     empty = core.match_prefix(MatchPrefixParams(key=_bigram_key([])))
-    assert empty.device_indices.numel() == 0
+    assert empty.device_prefix_len == 0
     single = core.match_prefix(MatchPrefixParams(key=_bigram_key([1])))
-    assert single.device_indices.numel() == 0
+    assert single.device_prefix_len == 0
 
 
 def test_bigram_insert_truncates_a_raw_length_value_to_the_bigram_count():
@@ -5044,7 +5239,7 @@ def test_bigram_insert_truncates_a_raw_length_value_to_the_bigram_count():
     )
     assert result.prefix_len == 0
     matched = core.match_prefix(MatchPrefixParams(key=_bigram_key([1, 2, 3])))
-    assert matched.device_indices.tolist() == [10, 11]
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
 
 
 def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
@@ -5205,6 +5400,71 @@ def test_insert_reports_whether_it_reached_the_swa_branch_boundary():
             ),
         )
         assert result.swa_branch_inserted is expected, branching_seqlen
+
+
+# ---- request priority at the i64 boundary ----
+
+
+class _RecordingUnifiedRadixCache(UnifiedRadixCache):
+    def __init__(self, params):
+        self.insert_priorities = []
+        super().__init__(params)
+
+    def insert(self, params):
+        self.insert_priorities.append(params.priority)
+        return super().insert(params)
+
+
+@pytest.mark.parametrize("priority", [(1 << 63) - 2, (1 << 63) - 1])
+def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
+    """Caching a finished request re-inserts its prompt one priority above the
+    request so eviction drops the output first. The core stores priority as a
+    signed 64-bit integer, so the boost must saturate at INT64_MAX instead of
+    overflowing the binding and failing the insert."""
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    # release_kv_cache reads the serving config off the published bags.
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+    req_to_token_pool = ReqToTokenPool(
+        size=2, max_context_len=16, device="cpu", enable_memory_saver=False
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=16, dtype=torch.float32, device="cpu", kvcache=None, need_sort=False
+    )
+    cache = _RecordingUnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+            tree_core_backend="rust",
+        )
+    )
+    req = Req(
+        rid="priority",
+        origin_input_text=None,
+        origin_input_ids=array("q", [1, 2, 3]),
+        sampling_params=SamplingParams(max_new_tokens=2),
+        priority=priority,
+    )
+    req.output_ids = array("q", [4, 5])
+    req.finished_reason = "finished"
+    (req.kv.req_pool_idx,) = req_to_token_pool.alloc([req])
+    req.lock = cache.lock(cache.root_node_handle())
+    indices = allocator.alloc(5)
+    assert indices is not None
+    req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), indices)
+    req.kv.kv_committed_len = req.kv.kv_allocated_len = 5
+
+    release_kv_cache(req, cache, checkpoint=True)
+
+    assert req.priority == priority
+    assert cache.insert_priorities == [priority, (1 << 63) - 1]
+    match = cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(req.origin_input_ids + req.output_ids))
+    )
+    assert torch.equal(cache.path_device_indices(match.last_device_node), indices)
 
 
 if __name__ == "__main__":
