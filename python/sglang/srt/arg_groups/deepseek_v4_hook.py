@@ -163,7 +163,9 @@ def validate_deepseek_v41_sm80_experimental(server_args: ServerArgs) -> None:
         ("LoRA", cfg.enable_lora),
         (
             "vision / multimodal pipeline (use --language-model-only)",
-            model_config.is_multimodal and not cfg.language_model_only,
+            model_config.is_multimodal
+            and not cfg.language_model_only
+            and envs.SGLANG_DSV41_SM80_ALLOW_VISION.get() != "1",
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
     )
@@ -184,10 +186,17 @@ def validate_deepseek_v41_sm80_experimental(server_args: ServerArgs) -> None:
                 "and prefill backend disabled."
             )
         # Unresolved defaults must not widen the capture set after this guard.
+        # Opt-in escape hatch for multi-concurrency: the full-graph path was
+        # pinned to max_running_requests=1 / bs=[1] / max_bs=1 because only that
+        # shape was validated; the graph runner itself accepts a bs list. With
+        # this flag set, batched decode is captured for the configured bs list.
         if (
-            cfg.max_running_requests != 1
-            or decode_graph.bs != [1]
-            or decode_graph.max_bs != 1
+            envs.SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS.get() != "1"
+            and (
+                cfg.max_running_requests != 1
+                or decode_graph.bs != [1]
+                or decode_graph.max_bs != 1
+            )
         ):
             raise ValueError(
                 f"{prefix} full-graph experiment requires max_running_requests=1 "

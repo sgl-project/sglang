@@ -9,6 +9,8 @@ import numbers
 
 import torch
 
+from sglang.srt.environ import envs
+
 from .kv_layout import KVLayout
 from .sparse_attention_sm80 import sparse_attention_sm80
 
@@ -206,7 +208,16 @@ def flash_mla_with_kvcache_sm80(
     # prefill is faster with the serial component. Never promote tiled prefill
     # merely because the decode benchmark improves.
     attention = sparse_attention_sm80
-    if tokens == 1:
+    # The tiled split-K path was gated on `tokens == 1`, which also excludes
+    # *batched decode* (there tokens == the running batch size, 2..8) and drops
+    # it onto the serial kernel -- ~14x slower per step, which is exactly what
+    # made multi-concurrency slow. Allow multi-row decode up to a token
+    # threshold; large prefill chunks keep the serial component (the original
+    # reason for the gate was prefill, whose mixed cache favors serial).
+    _multirow_max = int(
+        envs.SGLANG_DSV41_SM80_TILED_MULTIROW_MAX_TOKENS.get() or 0
+    )
+    if tokens == 1 or (0 < tokens <= _multirow_max):
         from functools import partial
 
         from .sparse_attention_sm80_tiled import sparse_attention_sm80_tiled

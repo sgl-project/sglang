@@ -1577,10 +1577,12 @@ class Envs:
 
     # Experimental runtime route, not complete end-to-end SM80 support. Only
     # the literal value "1", DeepSeek-V4.1 and CUDA capability (8, 0) opt in.
+    SGLANG_DSV41_SM80_ALLOW_VISION = EnvStr(None)
     SGLANG_DSV41_SM80_EXPERIMENTAL = EnvStr("0")
     # Keep exact string opt-ins: only "1" enables these default-off experiments.
     SGLANG_DSV41_SM80_FFN_GRAPH = EnvStr(None)
     SGLANG_DSV41_SM80_FULL_GRAPH = EnvStr(None)
+    SGLANG_DSV41_SM80_FULL_GRAPH_MULTI_BS = EnvStr(None)
     SGLANG_DSV41_SM80_GRAPH_VARIANTS = EnvStr(None)
     SGLANG_DSV41_SM80_INDEXER_FINISH = EnvStr(None)
     SGLANG_DSV41_SM80_LOW_RATIO_MULTISTREAM = EnvStr(None)
@@ -1593,6 +1595,7 @@ class Envs:
     SGLANG_DSV41_SM80_MHC_SIMT_STATS = EnvStr(None)
     SGLANG_DSV41_SM80_PARTIAL_SIDE_STREAM = EnvStr(None)
     SGLANG_DSV41_SM80_PARTIAL_WORD_LOADS = EnvStr(None)
+    SGLANG_DSV41_SM80_TILED_MULTIROW_MAX_TOKENS = EnvStr(None)
 
     # Model and Quantization
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
