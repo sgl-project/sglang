@@ -210,6 +210,8 @@ class _BankReadout:
     is not the residual's plain norm and no add+norm kernel may claim it. It
     reads this rank's own rows, which the bank holds, before any DP gather."""
 
+    bind = None
+
     is_plain_norm = False
     reads_before_dp_gather = True
     completing_fusions = ()

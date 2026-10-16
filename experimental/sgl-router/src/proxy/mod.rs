@@ -4,6 +4,7 @@
 //! HTTP proxy — forwards requests to the upstream SGLang worker.
 
 mod abort;
+pub mod grpc;
 pub mod sse;
 
 use abort::AbortOnDrop;
@@ -54,6 +55,16 @@ enum BreakerOutcome {
     /// an in-progress failure streak intact — but still resolves a half-open
     /// probe so a recovered-but-busy worker isn't wedged shut.
     Neutral,
+}
+
+impl BreakerOutcome {
+    fn record(self, breaker: &CircuitBreaker) {
+        match self {
+            BreakerOutcome::Success => breaker.record_success(),
+            BreakerOutcome::Failure => breaker.record_failure(),
+            BreakerOutcome::Neutral => breaker.record_backpressure(),
+        }
+    }
 }
 
 /// Classify an upstream status for circuit-breaker accounting.
