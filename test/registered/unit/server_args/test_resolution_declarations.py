@@ -692,10 +692,7 @@ class TestResolutionDeclarations(CustomTestCase):
         )
 
     def test_kimi_k3_rocm_drops_symm_mem_only_under_graph_capture(self):
-        """Kimi-K3 on ROCm with symm-mem under graph capture corrupts spec decode.
-
-        The pass must drop it there, and leave eager ROCm runs and CUDA alone.
-        """
+        """Kimi-K3 on ROCm drops symm-mem under graph capture, and leaves eager runs and CUDA alone."""
         from sglang.srt.runtime_context import override_platform
 
         k3_config = dict(
