@@ -313,6 +313,16 @@ doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
 Set the initial backoff to 0 to retry immediately. A backoff never waits past
 the request's stale deadline.
 
+### Circuit breaker
+
+`--cb-threshold N` enables a per-worker circuit breaker: after N consecutive
+failures the worker is taken out of routing until a request already sent to it
+succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a probe request
+does. Without `--cb-threshold` no breaker opens. Under `--worker-urls` nothing
+else takes a dead worker out of routing, since there is no active health check,
+so with retries off (the default) every request routed to it fails; a static
+fleet should set `--cb-threshold 3` or `--retry-max-attempts 3`.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its

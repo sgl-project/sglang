@@ -238,7 +238,9 @@ fn router_ctx_with(workers: &[(WorkerMode, &str, Option<u16>)], proxy: Proxy) ->
             dp_ranks: 1,
             grpc_port,
         };
-        registry.add_with_cb(spec, None, profile).unwrap();
+        registry
+            .add_with_cb(spec, Some(Default::default()), profile)
+            .unwrap();
     }
     Arc::new(AppContext::new(
         cfg.clone(),
