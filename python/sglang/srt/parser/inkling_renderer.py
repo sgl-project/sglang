@@ -103,6 +103,11 @@ def _to_oss_messages(
         }
         if oss_message.get("role") == "developer":
             oss_message["role"] = "system"
+        reasoning = oss_message.pop("reasoning_content", None)
+        if reasoning and oss_message.get("role") == "assistant":
+            oss_message["content"] = _with_leading_thinking(
+                reasoning, oss_message.get("content")
+            )
         for call in oss_message.get("tool_calls") or ():
             if call.get("id") and call["function"].get("name"):
                 call_names[call["id"]] = call["function"]["name"]
@@ -121,6 +126,25 @@ def _to_oss_messages(
             ]
         oss_messages.append(oss_message)
     return oss_messages, media_kinds
+
+
+def _with_leading_thinking(reasoning: str, content: Any) -> list[Any]:
+    # tml-renderers reads prior reasoning only from thinking content parts.
+    parts: list[Any] = [{"type": "thinking", "thinking": reasoning}]
+    if isinstance(content, str):
+        if content:
+            parts.append({"type": "text", "text": content})
+    elif content:
+        if any(
+            isinstance(part, Mapping) and part.get("type") in _THINKING_PART_TYPES
+            for part in content
+        ):
+            raise ValueError(
+                "assistant message cannot mix reasoning_content with ordered "
+                "thinking parts"
+            )
+        parts.extend(content)
+    return parts
 
 
 def _to_oss_part(
