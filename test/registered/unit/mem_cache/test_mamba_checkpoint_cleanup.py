@@ -131,10 +131,7 @@ class TestMambaCheckpointCleanup(CustomTestCase):
             with self.subTest(lazy=lazy):
                 cache, pool, req = self.make_fixture(lazy=lazy)
                 slots = req.kv.mamba_ping_pong_track_buffer.clone()
-                component = cache.components[ComponentType.MAMBA]
-                component.cleanup_after_caching_req(
-                    req, is_finished=False, insert_params=InsertParams()
-                )
+                cache.checkpoint(req, up_to=128)
                 self.assertEqual(req.kv.mamba_last_track_seqlen, 128)
                 self.assertEqual(req.kv.mamba_prev_track_seqlen, None if lazy else 64)
                 torch.testing.assert_close(req.kv.mamba_ping_pong_track_buffer, slots)
