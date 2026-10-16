@@ -73,7 +73,6 @@ def _last_chunk() -> TransferKVChunk:
         prefill_kv_indices=np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
         is_last_chunk=True,
-        chunk_id=0,
         prefill_aux_index=0,
         state_indices=[[1]],
     )

@@ -1192,7 +1192,7 @@ class _MemcpyNixlAgent:
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
-    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif):
+    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif=b""):
         return src_descs, dst_descs
 
     def transfer(self, handle):
@@ -1269,7 +1269,6 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             [dst_ptrs],
             [self.DST_PAGES],
             0,
-            "7_state_0",
             decode_tp,
             decode_tp_rank=dst_rank,
             dst_state_item_lens=[[item_len] * len(dst_ptrs)],
