@@ -139,6 +139,7 @@ class TestUnifiedFp8BackendPrefill(CustomTestCase):
             pf_chunk_start=_ints([0] * tokens),
             pf_cu_q=_ints(CU_Q),
             pf_final_pos=_ints([max(POSITIONS)] * tokens),
+            pf_swa_floor=None,
         )
         core_meta = SimpleNamespace(
             unified=unified_meta,
@@ -151,7 +152,9 @@ class TestUnifiedFp8BackendPrefill(CustomTestCase):
             req_pool_indices=_ints(STATE_SLOT),
         )
         fake_self = SimpleNamespace(
-            token_to_kv_pool=pool, softmax_scale=V_HEAD_DIM**-0.5
+            token_to_kv_pool=pool,
+            softmax_scale=V_HEAD_DIM**-0.5,
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
         )
         reader_calls = []
 

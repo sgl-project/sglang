@@ -344,13 +344,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
             is_unified_kv_triton() and not is_unified_kv_fp8(),
         ),
+        # the decoder replay floors the late layers' window (pf_swa_floor); the
+        # encoder replay moves the window into a RequestWindow pool unified lacks
         (
-            "the unified KV layout with SWA bounded replay",
-            is_unified_kv_triton()
-            and (
-                cfg.enable_encoder_swa_bounded_replay
-                or cfg.enable_decoder_swa_bounded_replay
-            ),
+            "the unified KV layout with encoder SWA bounded replay",
+            is_unified_kv_triton() and cfg.enable_encoder_swa_bounded_replay,
         ),
         (
             "the unified KV layout with speculative decoding",

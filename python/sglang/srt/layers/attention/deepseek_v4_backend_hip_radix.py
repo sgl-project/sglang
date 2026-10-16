@@ -310,6 +310,9 @@ class UnifiedKvMetadata:
     pf_chunk_start: Optional[torch.Tensor] = None
     pf_cu_q: Optional[torch.Tensor] = None
     pf_final_pos: Optional[torch.Tensor] = None
+    # decoder SWA bounded replay: per-token floor of the SWA window (the paged
+    # layout's swa_replay_start); None outside the late-layer tail
+    pf_swa_floor: Optional[torch.Tensor] = None
 
     # Per-token req-slot map for the target-verify SWA ring store (num_draft*bs
     # tokens); unused by plain decode, whose store reads req_pool_indices live.
@@ -347,6 +350,7 @@ class UnifiedKvMetadata:
         "c2_indptr",
         "c2_len",
     )
+    _OPTIONAL_FIELDS = (*_LOW_RATIO_FIELDS, "pf_swa_floor")
 
     def copy_(self, other: UnifiedKvMetadata) -> None:
         copy_metadata(
@@ -381,7 +385,7 @@ class UnifiedKvMetadata:
                 # target-verify path builds it outside the graph.
                 "swa_loc",
             ]
-            + [f for f in self._LOW_RATIO_FIELDS if getattr(other, f) is not None],
+            + [f for f in self._OPTIONAL_FIELDS if getattr(other, f) is not None],
             assign_fields=[],
         )
 
@@ -418,7 +422,7 @@ class UnifiedKvMetadata:
                 "c4_out_loc",
                 "c128_out_loc",
             ]
-            + [f for f in self._LOW_RATIO_FIELDS if getattr(other, f) is not None],
+            + [f for f in self._OPTIONAL_FIELDS if getattr(other, f) is not None],
         )
 
 
@@ -1021,16 +1025,6 @@ class DeepseekV4HipRadixBackend(
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
         )
-        if self.enable_decoder_swa_bounded_replay:
-            # both read the store target off the full batch, not the tail metadata
-            from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-                is_unified_kv_triton,
-            )
-
-            if is_unified_kv_triton():
-                raise NotImplementedError(
-                    "decoder SWA bounded replay is not wired for unified_kv_triton"
-                )
         # the model switches onto it at the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # The source layer whose KV write_tail_source_kv wrote for every row; cleared in
@@ -1286,6 +1280,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens,
             num_tokens,
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
+            swa_replay_start=swa_replay_start,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
@@ -2808,6 +2803,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
         exact_num_tokens: bool = True,
+        swa_replay_start: Optional[torch.Tensor] = None,
     ) -> None:
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
@@ -2856,6 +2852,15 @@ class DeepseekV4HipRadixBackend(
         core.unified.pf_chunk_start = chunk_start
         core.unified.pf_cu_q = cu_q
         core.unified.pf_final_pos = final_pos
+        # padded rows floor at 0, which leaves their (inert) window as it was
+        core.unified.pf_swa_floor = (
+            None
+            if swa_replay_start is None
+            else F.pad(
+                swa_replay_start.to(torch.int32),
+                (0, max(0, padded_num_tokens - swa_replay_start.shape[0])),
+            )
+        )
 
     def _unified_low_ratio_stream(
         self,
@@ -3102,6 +3107,13 @@ class DeepseekV4HipRadixBackend(
         cu_q = core_attn_metadata.unified.pf_cu_q
         final_pos = core_attn_metadata.unified.pf_final_pos
 
+        swa_floor = core_attn_metadata.unified.pf_swa_floor
+        # Decoder SWA bounded replay: the late layers run the extend's tail rows,
+        # so the positions are the tail's, not forward_batch's.
+        tail = getattr(self.forward_metadata, "late_layer_tail", None)
+        if tail is not None:
+            positions = tail.positions.to(torch.int64)[:T]
+
         # Slice CP query metadata while keeping cache-write metadata global.
         _cp_active = is_cp_active(forward_batch)
         state_slot_full = state_slot
@@ -3111,14 +3123,29 @@ class DeepseekV4HipRadixBackend(
             _cp_size = get_parallel().attn_cp_size
             # pf_* were built on the padded global layout before the reindex.
             assert state_slot.shape[0] == _cp_size * T, (state_slot.shape, T)
-            _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
+            # This rank's rows, picked the way apply_cp_reindex picked the core fields:
+            # by the CP layout's local_index when it has one (the late-layer tail
+            # gives each row to the rank that owns it in the full extend, which is
+            # not every cp_size-th tail row), else by stride (plain interleave).
+            _local_index = getattr(forward_batch.attn_cp_metadata, "local_index", None)
+            _sl = (
+                _local_index
+                if _local_index is not None
+                else slice(get_parallel().attn_cp_rank, None, _cp_size)
+            )
             state_slot, chunk_start, cu_q, final_pos = (
                 v[_sl].contiguous() for v in (state_slot, chunk_start, cu_q, final_pos)
             )
+            if swa_floor is not None:
+                swa_floor = swa_floor[_sl].contiguous()
             # Already CP-reindexed; padding rows carry the inert expansion position.
             positions = core_attn_metadata.positions_casual.to(torch.int64)
             assert positions.shape[0] == T
-            positions_full = forward_batch.positions.to(torch.int64)
+            positions_full = (
+                tail.pos_global
+                if tail is not None
+                else forward_batch.positions.to(torch.int64)
+            )
 
         kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
             compress_ratio=compress_ratio,
@@ -3132,6 +3159,7 @@ class DeepseekV4HipRadixBackend(
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
             low_ratio_page_indices=low_pi,
+            swa_floor=swa_floor,
         )
 
         if kpre_p.shape[0] < T + 1:
@@ -3776,6 +3804,16 @@ class DeepseekV4HipRadixBackend(
                     swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
                 )
             swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+        elif getattr(self.token_to_kv_pool, "_unified_kv", False):
+            # decoder SWA bounded replay under unified_kv: the floor reaches the
+            # ring through pf_swa_floor; only the (floored) lengths matter here
+            swa_page_indices = seq_lens_casual.new_zeros(
+                (seq_lens_casual.shape[0], SWA_WINDOW)
+            )
+            floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
+            swa_topk_lengths = torch.minimum(
+                torch.clamp(seq_lens_casual, max=SWA_WINDOW), floored.clamp_min(0)
+            )
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(
                 req_to_token=self.req_to_token,
