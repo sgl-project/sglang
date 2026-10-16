@@ -838,7 +838,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         backend = object.__new__(DeepseekV4TrtllmAttnBackend)
         backend.device = torch.device("cpu")
-        backend.forward_metadata = SimpleNamespace(core_attn_metadata=core)
+        backend.forward_metadata = SimpleNamespace(
+            core_attn_metadata=core, late_layer_tail=None
+        )
         backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
         backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
         backend.trtllm_eager_output_buffer = None
