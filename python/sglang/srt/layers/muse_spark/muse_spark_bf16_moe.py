@@ -23,7 +23,9 @@ from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm im
     FusedPostExpertNormWeightedSumTRTLLM,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.muse_spark_fp4_moe import finalize_with_post_expert_norm
+from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
+    finalize_with_post_expert_norm,
+)
 from sglang.srt.utils.common import next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -190,14 +192,14 @@ class MuseSpark1xBf16Experts(nn.Module):
                 self.use_triton = True
             return
         if getattr(self, "use_megamoe", False):
-            from sglang.srt.layers.moe.muse_spark_megamoe import (
+            from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 build_bf16_megamoe_weights,
             )
 
             build_bf16_megamoe_weights(self)
         self._shuffle_weights()
         if getattr(self, "use_megamoe", False):
-            from sglang.srt.layers.moe.muse_spark_megamoe import (
+            from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 bind_megamoe_shared_weights,
             )
 
@@ -269,7 +271,9 @@ class MuseSpark1xBf16Experts(nn.Module):
         """
         if post_expert_norm is None:
             return
-        from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNormWithInputScale
+        from sglang.srt.layers.muse_spark.muse_spark_layers import (
+            MuseSpark1xRMSNormWithInputScale,
+        )
 
         weight = post_expert_norm._get_effective_weight()
         if weight is None:
@@ -543,7 +547,9 @@ class MuseSpark1xBf16Experts(nn.Module):
             return None, 1e-8, True
         if getattr(self, "_finalize_norm_src", None) is post_expert_norm:
             return self._finalize_norm_cache
-        from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNormWithInputScale
+        from sglang.srt.layers.muse_spark.muse_spark_layers import (
+            MuseSpark1xRMSNormWithInputScale,
+        )
 
         getter = getattr(post_expert_norm, "_get_effective_weight", None)
         weight = (

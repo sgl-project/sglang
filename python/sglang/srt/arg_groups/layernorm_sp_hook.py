@@ -52,7 +52,7 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
                     "--enable-mixed-chunk: mixed batches bypass SP prefill."
                 )
             from sglang.srt.arg_groups.overrides import declare_resolution
-            from sglang.srt.layers.moe.muse_spark_megamoe import (
+            from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 require_muse_megamoe_patch,
             )
             from sglang.srt.model_executor.cuda_graph_config import (

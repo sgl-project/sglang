@@ -253,7 +253,9 @@ def _is_capturing():
 def _is_weight_first(norm):
     if norm is None:
         return False
-    from sglang.srt.layers.muse_spark_layers import MuseSpark1xRMSNormWithInputScale
+    from sglang.srt.layers.muse_spark.muse_spark_layers import (
+        MuseSpark1xRMSNormWithInputScale,
+    )
 
     return isinstance(norm, MuseSpark1xRMSNormWithInputScale)
 
