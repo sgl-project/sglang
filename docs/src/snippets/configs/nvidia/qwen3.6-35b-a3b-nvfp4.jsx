@@ -2,6 +2,7 @@
 // Keep this scoped recipe separate from the legacy Qwen3.6 deployment selector.
 export const config = {
   modelName: "Qwen3.6-35B-A3B-NVFP4",
+  showPlaygroundLink: false,
   supportedHardware: ["rtx-spark"],
   hardware: [{ id: "rtx-spark", label: "RTX Spark", vram: "Up to 128GB unified", vendor: "blackwell" }],
   variants: [{ id: "default", label: "35B-A3B" }],
