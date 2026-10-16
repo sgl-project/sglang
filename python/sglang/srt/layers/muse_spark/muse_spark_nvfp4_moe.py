@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 
+from sglang.srt.layers.muse_spark import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4FusedMoEMethod,
     _compute_gemm1_alphas,
@@ -186,6 +187,8 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
             bind_megamoe_shared_weights(layer, "nvfp4xnvfp4")
+        elif expert_tp.helion_verify_enabled():
+            layer.bind_helion_verify_bank()
 
 
 __all__ = [
