@@ -58,6 +58,13 @@ def create_uno_cublas_backend():
     return UnoCublasLoRABackend
 
 
+@register_lora_backend("intel_xpu")
+def create_intel_xpu_backend():
+    from sglang.srt.lora.backend.intel_xpu_backend import IntelXpuLoRABackend
+
+    return IntelXpuLoRABackend
+
+
 def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:
     """
     Get corresponding backend class from backend's name
