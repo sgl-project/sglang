@@ -1,57 +1,39 @@
-"""KL guards for the HiCache buffer-only host memory mode.
+"""KL guards for FULL and FULL+SWA in HiCache buffer-only mode.
 
-Buffer-only mode is a different read path from cache mode rather than the same
-code under a flag: completed storage fetches park as op-owned host bounces and
-are consumed at prefill admission via a device alloc, a layer-gated H2D and a
-plain tree insert. Every other HiCache KL test in this directory runs the host
-tier as a cache and never reaches that path.
+The explicit storage test seeds L3, flushes the device tree, and requires a
+prefix hit before comparing restored generation with recomputed logprobs.
+The multi-turn tests additionally exercise branching under device-pool pressure;
+their cached-token bounds alone do not establish a storage load-back.
 
-Thresholds are inherited from the same model's cache-mode test --
-test_unified_radix_cache_kl_full.py for FULL, test_unified_radix_cache_kl_swa.py
-for FULL+SWA -- rather than calibrated here. The claim under test is that
-staging KV out through the host buffer and back reproduces what the host tier
-returns, so a number of its own would have nothing to compare against.
-
-buffer_only accepts FULL and FULL+SWA trees only; Mamba is fenced off in
-UnifiedRadixCache.init_hicache, which is why the bit-exact Inkling harness in
-test_unified_radix_cache_kl_hybrid_bitexact.py has no buffer-only counterpart
-and these classes gate on a threshold instead of on an exact zero.
-
-Measured on 2x H200 (SM90), avg_kl_div per helper:
-
-                                    FULL (thr 0.0025)   SWA (thr 0.03)
-  logprobs_match                          4.23e-04         9.26e-04
-  prefill_cache_hit                       6.85e-04         7.77e-04
-  decode_cache_hit                        5.85e-04         9.69e-04
-
-The FULL number sits where the same config reads in cache mode (7.00e-04 on the
-same box), which is the comparison these classes exist to make: the staging
-round trip costs nothing numerically. The run wrote 738 files to the file
-backend, so the storage path is reached rather than assumed.
-
-What this does NOT guard: reverting #35769 (buffer-mode load-back ownership
-races) leaves all six cases green, at 9 branches and again at 16. The harness
-covers the read path but does not reproduce that interleaving, so a future
-change there can still land silently -- do not read a green run here as
-evidence that load-back ownership is sound.
+Thresholds match the corresponding cache-mode model tests. FULL+SWA+Mamba has
+separate near-bit-exact coverage in test_unified_radix_cache_kl_hybrid_bitexact.py
+(introduced by #36345). These tests do not deterministically reproduce the
+load-back ownership race fixed by #35769.
 """
 
 import shutil
 import tempfile
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
-from sglang.test.kl_multiturn_utils import get_input_ids
+from sglang.test.kl_multiturn_utils import (
+    _extract_output_logprobs,
+    _flush_cache,
+    _generate,
+    _replay_and_compare_kl,
+    get_input_ids,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=400, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
 
 FULL_MODEL = "Qwen/Qwen3-32B"
 SWA_MODEL = "openai/gpt-oss-20b"
@@ -75,9 +57,9 @@ def _make_decode_cache_assert(min_cached: int):
     def _check(result: dict, history_len: int, output_len: int, label: str):
         expected = history_len + output_len
         actual = result["meta_info"]["cached_tokens"]
-        assert (
-            min_cached <= actual <= expected
-        ), f"{label}: expected cached_tokens in [{min_cached}, {expected}], got {actual}"
+        assert min_cached <= actual <= expected, (
+            f"{label}: expected cached_tokens in [{min_cached}, {expected}], got {actual}"
+        )
 
     return _check
 
@@ -88,7 +70,7 @@ def _buffer_only_args(hicache_ratio: str) -> list[str]:
         "--hicache-host-memory-mode",
         "buffer_only",
         # buffer_only has no tier to fall back on: all cached data lives in
-        # storage, so it requires a backend and rejects write_back.
+        # storage, so configure a backend and write through to it.
         "--hicache-storage-backend",
         "file",
         "--hicache-write-policy",
@@ -108,12 +90,7 @@ def _buffer_only_args(hicache_ratio: str) -> list[str]:
 
 
 class BufferOnlyKLMixin(UnifiedRadixTreeTestMixin):
-    """Launches a buffer-only server against a per-class file-backend directory.
-
-    The anchor lock (SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK) stays at its
-    default off: it keeps eviction from wasting a completed fetch, which changes
-    how often a load-back is reached but not what it restores.
-    """
+    """Launch a buffer-only server against a per-class file-backend directory."""
 
     model_path: str
     hicache_ratio: str
@@ -132,14 +109,54 @@ class BufferOnlyKLMixin(UnifiedRadixTreeTestMixin):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=_buffer_only_args(cls.hicache_ratio) + cls.extra_args,
-            env={"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir},
+            env=unified_radix_tree_server_env(
+                "python", SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.storage_dir
+            ),
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         shutil.rmtree(cls.storage_dir, ignore_errors=True)
+
+    def test_prefill_cache_hit_from_storage(self):
+        # A small batch fits on device: flushing, rather than incidental pool
+        # pressure, forces the next request to restore its prefix from L3.
+        seed_tokens = 2048
+        full_ids = [ids[: seed_tokens + 256] for ids in self.input_ids[:2]]
+        # Isolate this test's storage keys from the multi-turn mixin cases,
+        # whose file-backend entries survive flush_cache.
+        for ids in full_ids:
+            ids[0] = 42 if ids[0] != 42 else 43
+        self.assertEqual(len(full_ids), 2)
+        self.assertTrue(all(len(ids) == seed_tokens + 256 for ids in full_ids))
+        _flush_cache(self.base_url, timeout_s=600)
+        _generate(self.base_url, [ids[:seed_tokens] for ids in full_ids], 0)
+        _flush_cache(self.base_url, timeout_s=600)
+
+        results = _generate(self.base_url, full_ids, 256, return_logprob=True)
+        self.assertEqual(len(results), len(full_ids))
+        for result in results:
+            self.assertEqual(len(result["output_ids"]), 256)
+            self.assertEqual(len(_extract_output_logprobs(result)), 256)
+            cached = result["meta_info"]["cached_tokens"]
+            # Both models use 64-token pages here. The final seed page may
+            # be recomputed because prefix matching excludes its last token.
+            self.assertGreaterEqual(cached, seed_tokens - 64)
+            self.assertLessEqual(cached, seed_tokens)
+
+        _flush_cache(self.base_url, timeout_s=600)
+        _replay_and_compare_kl(
+            self.base_url,
+            self.model,
+            self.kl_threshold,
+            [ids + result["output_ids"] for ids, result in zip(full_ids, results)],
+            [_extract_output_logprobs(result) for result in results],
+            label="buffer_only_prefill_cache_hit_from_storage",
+            batch_size=len(full_ids),
+            sampling_temperature=0,
+        )
 
 
 class TestUnifiedFullBufferOnly(BufferOnlyKLMixin, CustomTestCase):
@@ -178,7 +195,9 @@ class TestUnifiedSWABufferOnly(BufferOnlyKLMixin, CustomTestCase):
         "2",
         "--mem-fraction-static",
         "0.7",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
+        "--page-size",
+        "64",
         # See the FULL class: same sizing argument, ~23k at the last turn here.
         "--max-total-tokens",
         "24576",

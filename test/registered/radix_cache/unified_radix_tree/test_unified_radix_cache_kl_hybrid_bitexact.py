@@ -84,7 +84,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=3140, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=3440, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -564,6 +564,61 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             label="buffer_only_prefill_cache_hit",
             # One batch avoids repeated 30s flushes while replay writes drain.
             batch_size=BUFFER_ONLY_SAMPLES,
+            sampling_temperature=0,
+        )
+
+    def test_decode_checkpoint_from_storage_branching(self):
+        # Two groups, each with two branches sharing a 512-token prefix.
+        # Interleave groups so restores exercise distinct and shared paths.
+        prompts = [
+            self.input_ids[group][:BUFFER_ONLY_SEED_TOKENS]
+            + self.input_ids[group * 2 + branch][
+                BUFFER_ONLY_SEED_TOKENS:BUFFER_ONLY_PROMPT_TOKENS
+            ]
+            for branch in range(2)
+            for group in range(2)
+        ]
+        # L3 survives flush_cache. Keep these keys separate from the existing
+        # prefill test while preserving the shared prefix within each group.
+        for ids in prompts:
+            ids[0] = 42 if ids[0] != 42 else 43
+        self.assertTrue(all(len(ids) == BUFFER_ONLY_PROMPT_TOKENS for ids in prompts))
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+        seeds = _generate(self.base_url, prompts, BUFFER_ONLY_MAX_NEW_TOKENS)
+        self.assertEqual(len(seeds), len(prompts))
+        histories = []
+        for prompt, result in zip(prompts, seeds):
+            self.assertEqual(len(result["output_ids"]), BUFFER_ONLY_MAX_NEW_TOKENS)
+            histories.append(prompt + result["output_ids"])
+        # Wait for decode checkpoints to reach L3 and remove all device hits.
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+
+        next_turn = [history + [42] * 64 for history in histories]
+        results = _generate(
+            self.base_url, next_turn, BUFFER_ONLY_MAX_NEW_TOKENS, return_logprob=True
+        )
+        self.assertEqual(len(results), len(next_turn))
+        for history, result in zip(histories, results):
+            self.assertEqual(len(result["output_ids"]), BUFFER_ONLY_MAX_NEW_TOKENS)
+            self.assertEqual(
+                len(_extract_output_logprobs(result)), BUFFER_ONLY_MAX_NEW_TOKENS
+            )
+            cached = result["meta_info"]["cached_tokens"]
+            # A prompt-only or shared-prefix hit must fail: the restored state
+            # must have been produced during decode, beyond the original prompt.
+            self.assertGreater(cached, BUFFER_ONLY_PROMPT_TOKENS)
+            self.assertLessEqual(cached, len(history))
+            self.assertEqual(cached % TRACK_INTERVAL, 0)
+
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+        _replay_and_compare_kl(
+            self.base_url,
+            self.model,
+            KL_DIV_THRESHOLD,
+            [ids + result["output_ids"] for ids, result in zip(next_turn, results)],
+            [_extract_output_logprobs(result) for result in results],
+            label="buffer_only_decode_checkpoint_from_storage_branching",
+            batch_size=len(next_turn),
             sampling_temperature=0,
         )
 
