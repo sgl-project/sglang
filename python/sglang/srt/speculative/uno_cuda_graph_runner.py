@@ -128,8 +128,8 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         attention_variant=None,
     ):
         if self._tree_draft_mode:
-            self._lora_state.capture_draft(size)
             try:
+                self._lora_state.capture_draft(size)
                 return super().capture_one_shape(
                     size,
                     forward,
@@ -153,21 +153,23 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             finally:
                 self.model_runner.lora_manager.reset_lora_batch()
 
-        if variant_label == "lora":
-            self._capture_spec_input_type = SpecInputType.UNO_DRAFT
-            self._lora_state.capture_draft(size)
-        else:
-            self._capture_spec_input_type = SpecInputType.UNO_VERIFY
-            self._lora_state.reset()
+        try:
+            if variant_label == "lora":
+                self._capture_spec_input_type = SpecInputType.UNO_DRAFT
+                self._lora_state.capture_draft(size)
+            else:
+                self._capture_spec_input_type = SpecInputType.UNO_VERIFY
+                self._lora_state.reset()
 
-        super().capture_one_shape(
-            size,
-            forward,
-            stream_idx,
-            variant_label,
-            attention_variant,
-        )
-        self._lora_state.reset()
+            super().capture_one_shape(
+                size,
+                forward,
+                stream_idx,
+                variant_label,
+                attention_variant,
+            )
+        finally:
+            self._lora_state.reset()
 
     def get_spec_info(self, num_tokens: int):
         if self._tree_draft_mode:
