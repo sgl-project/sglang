@@ -228,9 +228,7 @@ def all_gather_kv_cache_for_mha_extend(
         prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
     if prefix_k_pe.dtype != k_pe.dtype:
         prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
-    # Interleave each request's prefix KV with its extend KV. Offsets come from
-    # the host lengths: slicing at device offsets would sync once per bound, and
-    # this runs once per MLA layer.
+    # Host lengths avoid a device sync per slice bound, and this runs once per MLA layer.
     prefix_starts = [0, *itertools.accumulate(extend_prefix_lens_cpu)]
     extend_starts = [0, *itertools.accumulate(extend_seq_lens_cpu)]
     kv_a_parts = []
