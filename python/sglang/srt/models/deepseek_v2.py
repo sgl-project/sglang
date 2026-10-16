@@ -1804,10 +1804,10 @@ class DeepseekV2MoE(nn.Module):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if _is_npu and pre_quant_input is not None:
                 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                    supports_mxfp8_linear,
+                    supports_quantized_linear,
                 )
 
-                if not supports_mxfp8_linear(self.shared_experts.gate_up_proj):
+                if not supports_quantized_linear(self.shared_experts.gate_up_proj):
                     pre_quant_input = None
             if pre_quant_input is None and _is_hip:
                 # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows

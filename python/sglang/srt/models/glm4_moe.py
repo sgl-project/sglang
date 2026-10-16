@@ -753,10 +753,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if _is_npu and pre_quant_input is not None:
                 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                    supports_mxfp8_linear,
+                    supports_quantized_linear,
                 )
 
-                if supports_mxfp8_linear(self.shared_experts.gate_up_proj):
+                if supports_quantized_linear(self.shared_experts.gate_up_proj):
                     return self.shared_experts(
                         hidden_states, gateup_pre_quant=pre_quant_input
                     )

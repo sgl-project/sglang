@@ -301,9 +301,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             npu_shared_fusion = (
                 tp_fused_shared_expert_reason(config, quant_config) is None
             )
-        if npu_shared_fusion or (
-            support_shared_expert_fusion
-            and (_use_aiter or (_is_cuda and enable_cuda_shared_expert_fusion))
+        if support_shared_expert_fusion and (
+            npu_shared_fusion
+            or _use_aiter
+            or (_is_cuda and enable_cuda_shared_expert_fusion)
         ):
             self.enable_shared_expert_fusion = (
                 self.num_shared_experts > 0
@@ -472,7 +473,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Only AITER fuses sigmoid + cast in-kernel; on CUDA keep the legacy
         # eager activation so the NVIDIA path behavior is unchanged.
         if not _use_aiter:
-            return F.sigmoid(shared_logits) * scale, 1.0
+            return F.sigmoid(
+                shared_logits.float() if _is_npu else shared_logits
+            ) * scale, 1.0
         return shared_logits, scale
 
     def _shared_expert_scale(self) -> float:
@@ -558,11 +561,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                    supports_mxfp8_linear,
+                    supports_quantized_linear,
                 )
 
                 self.shared_expert._npu_tp_shared = self._fuse_npu_tp_shared
-                if pre_quant_input is not None and supports_mxfp8_linear(
+                if pre_quant_input is not None and supports_quantized_linear(
                     self.shared_expert.gate_up_proj
                 ):
                     shared_output = self.shared_expert(

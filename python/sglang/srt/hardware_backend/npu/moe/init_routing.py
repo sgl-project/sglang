@@ -102,9 +102,14 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         quant_mode = self.quant_mode if input_scale is None else -1
         scale_kwargs = {}
         if input_scale is not None:
-            if self.quant_mode != MXFP8_QUANT_MODE:
-                raise ValueError("Prequantized routing requires an MXFP8 dispatcher")
-            scale_kwargs["scale"] = input_scale.view(torch.uint8)
+            if self.quant_mode == MXFP8_QUANT_MODE:
+                scale_kwargs["scale"] = input_scale.view(torch.uint8)
+            elif self.quant_mode == 1 and hidden_states.dtype == torch.int8:
+                scale_kwargs["scale"] = input_scale.flatten()
+            else:
+                raise ValueError(
+                    "Prequantized routing requires matching INT8/MXFP8 input"
+                )
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,

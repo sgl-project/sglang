@@ -1065,6 +1065,12 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    record_tp_shared_load,
+                )
+
+                record_tp_shared_load(self, param, shard_id, expert_id)
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1130,6 +1136,12 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                record_tp_shared_load,
+            )
+
+            record_tp_shared_load(self, param, shard_id, expert_id)
 
     def _load_gguf_weight(
         self,
@@ -1610,7 +1622,9 @@ class FusedMoE(torch.nn.Module):
             # Shared compute must finish before finalization reads its output.
             if shared_output_ready is not None:
                 shared_output_ready()
-                shared_output.record_stream(torch.get_device_module().current_stream())
+                shared_output.record_stream(
+                    torch.get_device_module(shared_output.device).current_stream()
+                )
             combine_input = combine_input._replace(shared_output=shared_output)
 
         with use_symmetric_memory(

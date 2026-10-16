@@ -227,6 +227,18 @@ class NPUSwigluStepAndMul(BaseActivation):
         return gate * up
 
 
+class NPUSwigluClamp(BaseActivation):
+    def __init__(self, limit: float):
+        self.limit = float(limit)
+
+    def _apply_activation(self, hidden_states):
+        # DeepSeek clamps the gate before SiLU; StepAndMul clamps its result.
+        gate, up = hidden_states.chunk(2, dim=-1)
+        return F.silu(gate.clamp(max=self.limit)) * up.clamp(
+            -self.limit, self.limit
+        ), None
+
+
 class NPUSwigluMxfp8Quant(BaseActivation):
     """DeepSeek-V4 grouped SwiGLU with MXFP8 requantization for GMM2."""
 

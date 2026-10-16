@@ -108,11 +108,25 @@ class AscendTPDispatcher(BaseDispatcher):
         top_k = topk_weights.shape[-1]
         input_scale = None
         if pre_quant_input is not None:
+            from sglang.srt.hardware_backend.npu.moe.contracts import (
+                INT8,
+                MXFP8,
+                QuantizedOperand,
+            )
             from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
-                record_mxfp8_operand,
+                record_quantized_operand,
             )
 
-            record_mxfp8_operand(pre_quant_input)
+            if not isinstance(pre_quant_input, QuantizedOperand):
+                raise ValueError("Prequantized TP routing requires a typed NPU operand")
+            expected = {
+                DispatcherOutputDtype.MXFP8: MXFP8,
+                DispatcherOutputDtype.INT8: INT8,
+            }.get(self.ascend_dispatcher_output_dtype)
+            pre_quant_input.validate(expected)
+            if pre_quant_input.source_shape != tuple(hidden_states.shape):
+                raise ValueError("Prequantized TP operand does not match routing input")
+            record_quantized_operand(pre_quant_input)
             hidden_states, input_scale = pre_quant_input
 
         (

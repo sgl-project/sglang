@@ -5,6 +5,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe.contracts import MXFP4
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -428,6 +429,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
+            contract=MXFP4,
         )
 
     def process_weights_after_loading(

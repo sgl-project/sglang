@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSitu,
     NPUSituMXFP8Quant,
     NPUSwiglu,
+    NPUSwigluClamp,
     NPUSwigluDeepEPKernel,
     NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
@@ -30,13 +31,29 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 
 def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     """The fused activation emits MXFP8, which W2 must consume directly."""
+    from sglang.srt.hardware_backend.npu.moe.contracts import MXFP8, moe_input_contract
+
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if not isinstance(
         config.layer.w2_kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)
     ):
         return False
-    if config.activation != "silu" or config.swiglu_limit is not None:
+    if (
+        moe_input_contract(kernel) != MXFP8
+        or moe_input_contract(config.layer.w2_kernel) != MXFP8
+        or getattr(config.layer, "w13_scale_bias", None) is not None
+        or getattr(config.layer, "w13_weight_bias", None) is not None
+    ):
+        return False
+    if (
+        config.activation != "silu"
+        or not config.is_gated
+        or config.swiglu_limit is not None
+        or config.gemm1_alpha is not None
+        or config.gemm1_beta is not None
+        or config.gemm1_clamp_limit is not None
+    ):
         return False
     return isinstance(kernel, NPUMXFP8MoEMethod) or kernel.use_fused_gmm1
 
@@ -107,8 +124,15 @@ class AscendRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
+        self.use_fused_gmm1 = _uses_fused_gmm1(config.layer.w13_kernel, config)
+        if self.use_fused_gmm1:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                supports_fused_mxfp_gmm,
+            )
 
-        if _uses_fused_gmm1(config.layer.w13_kernel, config):
+            self.use_fused_gmm1 = supports_fused_mxfp_gmm(config.layer.w13_kernel)
+
+        if self.use_fused_gmm1:
             # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
@@ -124,6 +148,8 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
+        elif config.activation == "silu" and config.swiglu_limit is not None:
+            self.activation = NPUSwigluClamp(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
@@ -158,8 +184,22 @@ class AscendRunnerCore(MoeRunnerCore):
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
-            if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+            if (
+                isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+                and config.activation == "silu"
+                and config.gemm1_alpha is None
+                and config.gemm1_clamp_limit is None
+                and config.swiglu_limit is None
+            ):
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    supports_npu_op,
+                )
+
+                inner = (
+                    NPUSwigluQuant()
+                    if supports_npu_op("npu_dequant_swiglu_quant")
+                    else NPUSwiglu()
+                )
             elif config.activation == "situ":
                 # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
                 # gmm2 requantizes the activations itself, so no quant is
@@ -207,7 +247,7 @@ class AscendRunnerCore(MoeRunnerCore):
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if _uses_fused_gmm1(w13_kernel, self.config):
+        if self.use_fused_gmm1:
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.
