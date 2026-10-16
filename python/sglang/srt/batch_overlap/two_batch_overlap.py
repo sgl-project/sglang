@@ -682,6 +682,15 @@ class TboForwardBatchPreparer:
 
         output_dict = dict()
 
+        if batch.mix_decode_bs is not None:
+            assert batch.forward_mode.is_mixed()
+            assert 0 <= batch.mix_decode_bs <= num_seqs
+            # Intersect this child's request range with the parent's decode tail.
+            decode_start = num_seqs - batch.mix_decode_bs
+            output_dict["mix_decode_bs"] = max(
+                0, end_seq_index - max(start_seq_index, decode_start)
+            )
+
         for key in [
             "input_ids",
             "positions",

@@ -34,7 +34,7 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # the report -- if the assert below fires, add the new backend name here in
 # the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
 # (highest test volume historically), then accelerators that have been
-# wired into the registry more recently (XPU, MUSA, MLX, PPU).
+# wired into the registry more recently (XPU, MUSA, MLX, MPS, PPU, MLU).
 BACKEND_DISPLAY_ORDER = (
     "CUDA",
     "AMD",
@@ -45,6 +45,7 @@ BACKEND_DISPLAY_ORDER = (
     "MLX",
     "MPS",
     "PPU",
+    "MLU",
 )
 assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
     "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
@@ -74,6 +75,7 @@ _MM_GEN_SUBDIR_BACKENDS = {
     # mirrors the same suite on AMD runners.
     "server": ("CUDA", "AMD"),
     "server/musa": ("MUSA",),
+    "server/mlu": ("MLU",),
     "server/ascend": ("NPU",),
     "layers": ("CUDA",),
     # unit/ are portable CPU-style unit tests. The `unit` suite also runs on
@@ -132,6 +134,7 @@ _MM_GEN_HELPER_FILENAMES = frozenset({"test_utils.py"})
 # flips the nightly flag without changing the backend.
 _MM_GEN_FILENAME_BACKEND_TOKENS = {
     "musa": ("MUSA",),
+    "mlu": ("MLU",),
     "npu": ("NPU",),
 }
 
