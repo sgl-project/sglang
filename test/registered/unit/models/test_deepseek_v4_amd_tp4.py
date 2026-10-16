@@ -390,14 +390,16 @@ def _engram_table(rows):
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
         torch.device("cuda"),
     ):
-        embed = EngramEmbedding(rows, 128, layer_id=1)
+        # One hash column per TP4 rank: the table shards on column boundaries.
+        bounds = tuple(rows * c // 4 for c in range(5))
+        embed = EngramEmbedding(rows, 128, layer_id=1, bounds=bounds)
     embed.weight.weight_loader(embed.weight, weight)
     embed.scale.weight_loader(embed.scale, scale.view(torch.float8_e8m0fnu))
     embed.finish_load(label="test")
     return embed, reference
 
 
-@pytest.mark.parametrize("rows", [1, 17], ids=["1", "17"])
+@pytest.mark.parametrize("rows", [4, 17], ids=["4", "17"])
 def test_engram_eager_and_graph_reconstruction(group, rows):
     """Reconstructing a sharded row must retain signed zero and BF16 subnormals."""
     embed, reference = _engram_table(rows)

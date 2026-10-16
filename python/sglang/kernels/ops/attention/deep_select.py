@@ -84,7 +84,7 @@ SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
 # (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
 @cache_once
 def _cluster_tiers() -> Tuple[Tuple[int, int], ...]:
-    from sglang.kernels.jit.utils.occupancy import (
+    from sglang.kernels.jit.utils.cuda.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
