@@ -2214,8 +2214,6 @@ def _swa_transfer_core(
     )
     allocator.device = torch.device("cpu")
     allocator.swa_req_ring = False
-    if request_window:
-        allocator._kvcache = SimpleNamespace(request_window=object())
     params = CacheInitParams(
         disable=False,
         req_to_token_pool=Mock(spec=HybridReqToTokenPool) if mamba else None,
@@ -2225,6 +2223,7 @@ def _swa_transfer_core(
         tree_components=(ComponentType.FULL, ComponentType.SWA)
         + ((ComponentType.MAMBA,) if mamba else ()),
         sliding_window_size=window,
+        swa_gates_prefix_match=not request_window,
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -2678,6 +2677,7 @@ def _swa_cache(
                 page_size=page_size,
                 disable=False,
                 sliding_window_size=window,
+                swa_gates_prefix_match=not (ring or request_window),
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
             )
         )
