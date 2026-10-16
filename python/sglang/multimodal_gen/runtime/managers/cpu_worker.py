@@ -30,6 +30,7 @@ class CPUWorker(GPUWorker):
         master_port: int,
         server_args: ServerArgs,
     ):
+        os.environ["LOCAL_SIZE"] = str(server_args.num_gpus // server_args.nnodes)
         super().__init__(local_rank, rank, master_port, server_args)
         if _is_cpu_amx_available:
             self.init_cpu_threads_binding()
@@ -70,7 +71,3 @@ class CPUWorker(GPUWorker):
 
         # Bind OpenMP threads to CPU cores
         torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
-
-        # Set local size to hint SGLang to use shared memory based AllReduce
-        os.environ["LOCAL_SIZE"] = str(self.server_args.tp_size)
-        torch.ops.sgl_kernel.initialize(self.server_args.tp_size, self.rank)

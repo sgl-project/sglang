@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -350,6 +351,9 @@ class ReqState:
     customized_info_accumulated: Dict[str, List[Any]] = dataclasses.field(
         default_factory=dict
     )
+    # Accumulated keys written to meta_info. Cumulative streams re-report only
+    # these, so a subclass can accumulate values it keeps out of responses.
+    customized_info_reported_keys: Set[str] = dataclasses.field(default_factory=set)
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
@@ -452,6 +456,9 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    tokenized_generate_req_type = TokenizedGenerateReqInput
+    batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -1589,7 +1596,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            tokenized_obj = TokenizedGenerateReqInput(
+            tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -1843,7 +1850,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+                batch_req = self.batch_tokenized_generate_req_type(batch=tokenized_objs)
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
@@ -2002,12 +2009,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     is_stream
                     and not incremental_stream
-                    and state.customized_info_accumulated
+                    and state.customized_info_reported_keys
                 ):
                     meta_info = out.get("meta_info")
                     if meta_info is not None:
                         for key, values in state.customized_info_accumulated.items():
-                            meta_info.setdefault(key, list(values))
+                            if key in state.customized_info_reported_keys:
+                                meta_info.setdefault(key, list(values))
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -2824,6 +2832,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         accumulated = state.customized_info_accumulated.setdefault(key, [])
         accumulated.extend(values)
         meta_info[key] = accumulated
+        state.customized_info_reported_keys.add(key)
 
     def update_request_meta_info(
         self,
