@@ -1,4 +1,4 @@
-"""Correctness-gated AITER BF16 vs Gluon FAv3 benchmark on gfx1250."""
+"""Correctness-gated AITER vs BF16/FP16 Gluon FAv3 benchmark on gfx1250."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ PRESETS = {
 
 
 def aiter_attention(query, key, value):
-    """Match the default BF16 AITerImpl call, including RTZ conversion."""
+    """Match AITerImpl, including its BF16 conversion setting."""
     return aiter.flash_attn_func(
         query,
         key,
@@ -90,12 +90,13 @@ def check_sampled_fp64(query, key, value, outputs):
         difference = actual - reference
         rms_error = difference.square().mean().sqrt().item()
         relative_rms = rms_error / max(reference_rms, 1e-30)
-        if not torch.isfinite(actual).all() or relative_rms > 0.005:
+        tolerance = 0.003 if query.dtype == torch.bfloat16 else 0.001
+        if not torch.isfinite(actual).all() or relative_rms > tolerance:
             raise AssertionError(
                 f"{name} failed independent FP64 check: relative RMS={relative_rms}"
             )
         torch.testing.assert_close(
-            actual, reference, rtol=0.02, atol=0.01 * reference_rms
+            actual, reference, rtol=0.01, atol=0.01 * reference_rms
         )
         metrics[name] = {
             "relative_rms": relative_rms,
@@ -168,7 +169,7 @@ def print_provenance(device):
         "aiter": package_provenance(aiter),
         "ENABLE_CK": bool(ENABLE_CK),
         "ENABLE_CK_env": os.environ.get("ENABLE_CK", "<unset>"),
-        "aiter_baseline": "AITerImpl-equivalent BF16, default scale, how_v3_bf16_cvt=2",
+        "aiter_baseline": "AITerImpl-equivalent, input dtype, default scale, how_v3_bf16_cvt=2",
     }
     print("provenance=" + json.dumps(provenance, sort_keys=True))
 
@@ -184,6 +185,8 @@ def parse_args():
     parser.add_argument("--sq", type=int)
     parser.add_argument("--sk", type=int)
     parser.add_argument("--heads", type=int)
+    parser.add_argument("--head-size", type=int, choices=(64, 128, 256), default=128)
+    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--rounds", type=int, default=5)
@@ -208,22 +211,23 @@ def main():
     seqlen_k = args.sk or seqlen_k
     num_heads = args.heads or num_heads
 
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     torch.manual_seed(0)
     query = torch.randn(
         batch,
         seqlen_q,
         num_heads,
-        128,
+        args.head_size,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     key = torch.randn(
         batch,
         seqlen_k,
         num_heads,
-        128,
+        args.head_size,
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     value = torch.randn_like(key)
 
@@ -234,6 +238,8 @@ def main():
         num_heads,
         seqlen_q,
         seqlen_k=seqlen_k,
+        head_size=args.head_size,
+        dtype=dtype,
     )
     if args.schedule not in (None, "auto"):
         schedule_configs = {
@@ -261,7 +267,11 @@ def main():
             query,
             key,
             value,
-            launch_config=config,
+            launch_config=(
+                None
+                if args.schedule in (None, "auto") and args.scheduler is None
+                else config
+            ),
         )
 
     if args.trace_provider is not None:
@@ -277,35 +287,34 @@ def main():
         print(f"traced {args.trace_provider}")
         return
 
-    if not args.skip_check:
-        expected = aiter_attention(query, key, value)
-        actual = gluon_attention()
-        torch.cuda.synchronize()
-        for name, output in (("aiter", expected), ("gluon", actual)):
-            if not torch.isfinite(output).all():
-                raise AssertionError(f"{name} produced non-finite output")
-        check_sampled_fp64(query, key, value, {"aiter": expected, "gluon": actual})
-        difference = (actual.float() - expected.float()).abs()
-        torch.testing.assert_close(
-            actual.float(),
-            expected.float(),
-            rtol=0.04,
-            atol=0.04,
-        )
-        print(
-            "correctness "
-            f"max={difference.max().item():.6f} "
-            f"mean={difference.mean().item():.6f}"
-        )
-
-    print(f"shape=B{batch},Sq{seqlen_q},Sk{seqlen_k},H{num_heads},D128 config={config}")
-
     all_functions = {
         "aiter": lambda: aiter_attention(query, key, value),
         "gluon": gluon_attention,
     }
     names = ("aiter", "gluon") if args.provider == "both" else (args.provider,)
     functions = {name: all_functions[name] for name in names}
+
+    if not args.skip_check:
+        outputs = {name: function() for name, function in functions.items()}
+        torch.cuda.synchronize()
+        for name, output in outputs.items():
+            if not torch.isfinite(output).all():
+                raise AssertionError(f"{name} produced non-finite output")
+        check_sampled_fp64(query, key, value, outputs)
+        if args.provider == "both":
+            actual, expected = outputs["gluon"].float(), outputs["aiter"].float()
+            difference = (actual - expected).abs()
+            torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.04)
+            print(
+                "correctness "
+                f"max={difference.max().item():.6f} "
+                f"mean={difference.mean().item():.6f}"
+            )
+
+    print(
+        f"shape=B{batch},Sq{seqlen_q},Sk{seqlen_k},H{num_heads},D{args.head_size} dtype={args.dtype} config={config}"
+    )
+
     timings = {name: [] for name in functions}
     for round_index in range(args.rounds):
         order = (
@@ -319,7 +328,7 @@ def main():
             )
             timings[name].append(float(milliseconds))
 
-    flops = 4.0 * batch * seqlen_q * seqlen_k * num_heads * 128
+    flops = 4.0 * batch * seqlen_q * seqlen_k * num_heads * args.head_size
     means = {}
     for name in names:
         mean_ms = statistics.fmean(timings[name])

@@ -99,22 +99,26 @@ def test_fallback_lazily_preserves_attention_configuration():
     )
 
 
-def test_runtime_head_sharding_remains_supported_for_mha():
-    impl = _impl(num_heads=8, num_kv_heads=8)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+def test_runtime_head_sharding_remains_supported_for_mha(dtype, head_size):
+    impl = _impl(
+        num_heads=8, num_kv_heads=8, head_size=head_size, softmax_scale=head_size**-0.5
+    )
 
     def tensor(shape):
         result = mock.Mock()
         result.ndim = 4
-        result.dtype = torch.bfloat16
+        result.dtype = dtype
         result.is_cuda = True
         result.device = torch.device("cuda:0")
         result.shape = shape
         result.stride.return_value = 1
         return result
 
-    query = tensor((1, 16, 4, 128))
-    key = tensor((1, 16, 4, 128))
-    value = tensor((1, 16, 4, 128))
+    query = tensor((1, 16, 4, head_size))
+    key = tensor((1, 16, 4, head_size))
+    value = tensor((1, 16, 4, head_size))
     kernel = mock.Mock()
 
     with (
@@ -127,7 +131,7 @@ def test_runtime_head_sharding_remains_supported_for_mha():
     ):
         assert impl._unsupported_reason(query, key, value) is None
 
-    key.shape = (1, 16, 2, 128)
+    key.shape = (1, 16, 2, head_size)
     value.shape = key.shape
     assert "runtime grouped-query attention" in impl._unsupported_reason(
         query, key, value
@@ -359,3 +363,13 @@ def test_kernel_execution_errors_propagate(error):
         impl.forward(query, query, query)
 
     impl._aiter_fallback.forward.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "head_size,dtype,reason",
+    [(32, torch.bfloat16, "head_size=32"), (128, torch.float32, "dtype=torch.float32")],
+)
+def test_extended_contract_keeps_unsupported_fallback(head_size, dtype, reason):
+    impl = _impl(head_size=head_size)
+    query = torch.empty(1, 2, 8, head_size, dtype=dtype)
+    assert impl._unsupported_reason(query, query, query) == reason
