@@ -4,7 +4,13 @@
 
 mod models;
 
+#[cfg(feature = "openai")]
+use serde_json::{Map, Value};
+
+use self::models::KimiK3Detector;
 pub(crate) use self::models::think_config;
+#[cfg(feature = "openai")]
+use crate::kimi_k3_format;
 
 /// The request settings Python passes its reasoning parser. Dynamo-backed
 /// names only honour `force_reasoning`; `None` keeps the parser's default.
@@ -28,9 +34,80 @@ impl Default for ReasoningOptions {
     }
 }
 
+/// The detector one `--reasoning-parser` name selects.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ThinkConfig {
+    /// `BaseReasoningFormatDetector` over these tokens.
+    Tags(TagConfig),
+    /// `KimiK3Detector`, which overrides the base splitting.
+    KimiK3,
+}
+
+#[cfg(feature = "openai")]
+impl ThinkConfig {
+    /// `_get_reasoning_from_request` for a template without a reasoning
+    /// config, by the detector's `reasoning_default`. `None` for `"always"`,
+    /// which the host resolves from the template instead.
+    pub(crate) fn default_thinking(&self, kwargs: &Map<String, Value>) -> Option<bool> {
+        match self {
+            ThinkConfig::Tags(_) => None,
+            // `"thinking"`: on unless the merged kwargs turn `thinking` off.
+            ThinkConfig::KimiK3 => Some(kwargs.get("thinking") != Some(&Value::Bool(false))),
+        }
+    }
+
+    /// The detector's `think_start_token` and `think_end_token`.
+    pub(crate) fn think_tokens(&self) -> [&'static str; 2] {
+        match self {
+            ThinkConfig::Tags(tags) => [tags.start, tags.end],
+            ThinkConfig::KimiK3 => [kimi_k3_format::THINK_OPEN, kimi_k3_format::THINK_CLOSE],
+        }
+    }
+}
+
+/// Streaming and one-shot reasoning splitting for one choice.
+#[derive(Debug, Clone)]
+pub(crate) enum ThinkDetector {
+    Tags(TagDetector),
+    KimiK3(KimiK3Detector),
+}
+
+impl ThinkDetector {
+    pub(crate) fn new(config: ThinkConfig, options: &ReasoningOptions) -> Self {
+        match config {
+            ThinkConfig::Tags(tags) => Self::Tags(TagDetector::new(tags, options)),
+            ThinkConfig::KimiK3 => Self::KimiK3(KimiK3Detector::new(options)),
+        }
+    }
+
+    /// `detect_and_parse`: `(reasoning_text, normal_text)` of a whole output.
+    pub(crate) fn parse(&mut self, text: &str) -> (String, String) {
+        match self {
+            Self::Tags(detector) => detector.parse(text),
+            Self::KimiK3(detector) => detector.parse(text),
+        }
+    }
+
+    /// `parse_streaming_increment`: the `(reasoning, normal)` delta of one chunk.
+    pub(crate) fn push(&mut self, text: &str) -> (String, String) {
+        match self {
+            Self::Tags(detector) => detector.push(text),
+            Self::KimiK3(detector) => detector.push(text),
+        }
+    }
+
+    /// `finish`: flush what the stream still holds when it ends.
+    pub(crate) fn finish(&mut self) -> (String, String) {
+        match self {
+            Self::Tags(detector) => detector.finish(),
+            Self::KimiK3(detector) => detector.finish(),
+        }
+    }
+}
+
 /// The tokens one `--reasoning-parser` configures the base detector with.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ThinkConfig {
+pub(crate) struct TagConfig {
     pub start: &'static str,
     pub end: &'static str,
     pub tool_start: Option<&'static str>,
@@ -39,7 +116,7 @@ pub(crate) struct ThinkConfig {
 
 /// Streaming and one-shot `<think>` splitting, as SGLang's base detector does it.
 #[derive(Debug, Clone)]
-pub(crate) struct ThinkDetector {
+pub(crate) struct TagDetector {
     start: &'static str,
     end: &'static str,
     tool_start: Option<&'static str>,
@@ -54,8 +131,8 @@ pub(crate) struct ThinkDetector {
     accumulated_reasoning: String,
 }
 
-impl ThinkDetector {
-    pub(crate) fn new(config: ThinkConfig, options: &ReasoningOptions) -> Self {
+impl TagDetector {
+    pub(crate) fn new(config: TagConfig, options: &ReasoningOptions) -> Self {
         let previous_content = options.previous_content.clone().unwrap_or_default();
         let mut in_reasoning = options.force_reasoning.unwrap_or(false);
         if previous_content.contains(config.start) {
