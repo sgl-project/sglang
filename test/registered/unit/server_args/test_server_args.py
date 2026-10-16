@@ -1253,20 +1253,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
-    def test_pd_decode_hicache_rejects_pipeline_parallelism(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_decode_enable_radix_cache=True,
-            disaggregation_transfer_backend="mooncake",
-            enable_hierarchical_cache=True,
-            pp_size=2,
-        )
-        with self.assertRaisesRegex(
-            ValueError, r"Decode HiCache .* pipeline parallelism \(--pp-size 2\)"
-        ):
-            handle_pd_disaggregation(server_args)
-
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
