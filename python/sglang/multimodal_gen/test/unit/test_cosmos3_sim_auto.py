@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3_sim_auto import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     COSMOS3_MADS_CAMERAS,
+    MULTIVIEW_BACKEND_ENV_VAR,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_sim_auto import (
     Cosmos3SimAutoConfig,
@@ -36,8 +37,14 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+    fa4_sparse_available,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import (
+    ReplayBlockMask,
     build_replay_block_mask,
+    build_replay_fa4_mask,
+    build_replay_mask,
     build_replay_plan,
     dense_token_mask,
     replay_attention,
@@ -683,6 +690,67 @@ def _dense_oracle(q, k, v, mask):
     return torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), values)
 
 
+def _expand_fa4_mask(mask):
+    """Token mask exactly as the CuTe kernel resolves it: skipped, full and partial tiles.
+
+    Partial tiles read bit ``k_run % 32`` of word ``q_word_base[q] + k_run // 32``.
+    """
+    sparsity = mask.sparsity
+    q_block, kv_block = sparsity.q_block_size, sparsity.kv_block_size
+    k_runs = sparsity.k_group_ids.long()
+    base = sparsity.q_word_base.long()
+    words = sparsity.allowed_words.long() & 0xFFFFFFFF
+    table = (
+        (words[base[:, None] + k_runs[None, :] // 32] >> (k_runs[None, :] % 32)) & 1
+    ).bool()
+    dense = torch.zeros(mask.padded_q_len, mask.padded_kv_len, dtype=torch.bool)
+    for q_index in range(mask.padded_q_len // q_block):
+        rows = slice(q_index * q_block, (q_index + 1) * q_block)
+        count = int(sparsity.full_counts[q_index])
+        for k_index in sparsity.full_indices[q_index, :count].tolist():
+            dense[rows, k_index * kv_block : (k_index + 1) * kv_block] = True
+        count = int(sparsity.partial_counts[q_index])
+        for k_index in sparsity.partial_indices[q_index, :count].tolist():
+            cols = slice(k_index * kv_block, (k_index + 1) * kv_block)
+            dense[rows, cols] = table[rows, cols]
+    return dense[: mask.q_len, : mask.kv_len]
+
+
+def _wide_plan(grid=SensorGrid(5, 7, 1, 1), lengths=(30, 40, 50)):
+    """Chunk 1 of a three-camera RGB rollout whose runs span several tiles."""
+    schedule = _schedule()
+    items = build_chunk_items(
+        schedule[1], num_views=3, rgb_grid=grid, rgb_seconds_per_frame=4 / 30
+    )
+    history = [
+        (
+            0,
+            committed_metadata(
+                chunk_token_metadata(
+                    build_chunk_items(
+                        schedule[0],
+                        num_views=3,
+                        rgb_grid=grid,
+                        rgb_seconds_per_frame=4 / 30,
+                    ),
+                    step=0,
+                    pass_kind=PASS_NOISY,
+                )
+            ),
+        )
+    ]
+    captions = caption_metadata(
+        build_caption_documents(lengths=lengths, sink_tokens=4, horizon_seconds=1.0)
+    )
+    return build_replay_plan(
+        current=chunk_token_metadata(items, step=1, pass_kind=PASS_NOISY),
+        history=history,
+        history_tokens=2 * chunk_token_count(items),
+        captions=captions,
+        window_seconds=0.4,
+    )
+
+
 class TestBlockMask(unittest.TestCase):
     def _check(self, plan):
         device = torch.device("cpu")
@@ -713,41 +781,78 @@ class TestBlockMask(unittest.TestCase):
 
     def test_wide_grid_crosses_blocks(self):
         torch.manual_seed(1)
-        grid = SensorGrid(5, 7, 1, 1)
-        schedule = _schedule()
-        items = build_chunk_items(
-            schedule[1], num_views=3, rgb_grid=grid, rgb_seconds_per_frame=4 / 30
+        self._check(_wide_plan())
+
+    def test_fa4_tiles_and_packed_table_resolve_the_predicate(self):
+        """Hopper (128x128) and Blackwell (256x128) maps classify tiles and pack bits like the predicate."""
+        plans = (
+            _plan(2, PASS_NOISY, joint=True, lengths=(9, 13), sink=4)[0],
+            _wide_plan(grid=SensorGrid(9, 11, 1, 1), lengths=(130, 70, 90)),
         )
-        history = [
-            (
-                0,
-                committed_metadata(
-                    chunk_token_metadata(
-                        build_chunk_items(
-                            schedule[0],
-                            num_views=3,
-                            rgb_grid=grid,
-                            rgb_seconds_per_frame=4 / 30,
-                        ),
-                        step=0,
-                        pass_kind=PASS_NOISY,
+        for block_size in ((256, 128), (128, 128)):
+            for index, plan in enumerate(plans):
+                with self.subTest(block_size=block_size, plan=index):
+                    mask = build_replay_fa4_mask(
+                        plan, device=torch.device("cpu"), block_size=block_size
                     )
-                ),
-            )
-        ]
-        captions = caption_metadata(
-            build_caption_documents(
-                lengths=(30, 40, 50), sink_tokens=4, horizon_seconds=1.0
-            )
+                    self.assertEqual(mask.padded_q_len % block_size[0], 0)
+                    self.assertEqual(mask.padded_kv_len % block_size[1], 0)
+                    # FA4 wraps aux reads modulo the padded lengths; shorter tensors alias.
+                    sparsity = mask.sparsity
+                    self.assertEqual(sparsity.q_word_base.numel(), mask.padded_q_len)
+                    self.assertEqual(sparsity.k_group_ids.numel(), mask.padded_kv_len)
+                    torch.testing.assert_close(
+                        _expand_fa4_mask(mask), dense_token_mask(plan)
+                    )
+                    if index == 1:
+                        # The wide plan must exercise all three tile classes.
+                        tiles = sparsity.full_indices.numel()
+                        full = int(sparsity.full_counts.sum())
+                        partial = int(sparsity.partial_counts.sum())
+                        self.assertGreater(full, 0)
+                        self.assertGreater(partial, 0)
+                        self.assertLess(full + partial, tiles)
+
+    def test_build_replay_mask_dispatch(self):
+        plan = _plan(1, PASS_NOISY)[0]
+        cpu = torch.device("cpu")
+        self.assertIsInstance(
+            build_replay_mask(plan, device=cpu, backend="triton"), ReplayBlockMask
         )
-        plan = build_replay_plan(
-            current=chunk_token_metadata(items, step=1, pass_kind=PASS_NOISY),
-            history=history,
-            history_tokens=2 * chunk_token_count(items),
-            captions=captions,
-            window_seconds=0.4,
+        with self.assertRaisesRegex(ValueError, "CUDA device"):
+            build_replay_mask(plan, device=cpu, backend="fa4")
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            build_replay_mask(plan, device=cpu, backend="flex")
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and fa4_sparse_available(torch.device("cuda")),
+        "needs an SM90 or SM100 device with the flash-attn-4 CuTe package",
+    )
+    def test_cuda_fa4_matches_dense_oracle_and_triton(self):
+        torch.manual_seed(2)
+        device = torch.device("cuda")
+        plan = _wide_plan(grid=SensorGrid(9, 11, 1, 1), lengths=(130, 70, 90))
+        heads, kv_heads, head_dim = 4, 2, 128
+        shape = (1, plan.num_key_tokens, kv_heads, head_dim)
+        q = torch.randn(
+            1,
+            plan.num_query_tokens,
+            heads,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
         )
-        self._check(plan)
+        k = torch.randn(shape, device=device, dtype=torch.bfloat16)
+        v = torch.randn(shape, device=device, dtype=torch.bfloat16)
+        fa4 = replay_attention(
+            q, k, v, build_replay_mask(plan, device=device, backend="fa4")
+        )
+        expected = _dense_oracle(q, k, v, dense_token_mask(plan).to(device))
+        torch.testing.assert_close(fa4.float(), expected, atol=3e-2, rtol=3e-2)
+        triton = replay_attention(
+            q, k, v, build_replay_mask(plan, device=device, backend="triton")
+        )
+        torch.testing.assert_close(fa4.float(), triton.float(), atol=3e-2, rtol=3e-2)
 
 
 class TestPositions(unittest.TestCase):
@@ -963,6 +1068,20 @@ def _adjusted(params, config):
 
 
 class TestConfigAndSamplingParams(unittest.TestCase):
+    def test_attention_backend_switch_is_shared_with_transfer_auto(self):
+        """Config field, then the multiview env var, then auto; unknown kernels are rejected."""
+        config = _config()
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: ""}):
+            self.assertEqual(config.resolved_multiview_backend(), "auto")
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: "fa4"}):
+            self.assertEqual(config.resolved_multiview_backend(), "fa4")
+            config.multiview_attention_backend = "triton"
+            self.assertEqual(config.resolved_multiview_backend(), "triton")
+            config.multiview_attention_backend = None
+        with mock.patch.dict(os.environ, {MULTIVIEW_BACKEND_ENV_VAR: "maskless"}):
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                config.resolved_multiview_backend()
+
     def test_config_resolves_manifest_and_rejects_sequence_parallel(self):
         config = _config()
         self.assertEqual(config.sim_auto_manifest.frames_per_chunk, 3)

@@ -11,10 +11,16 @@ denoising stage is the Sim-Auto rollout.
 import importlib.util
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
+    COSMOS3_MULTIVIEW_AUTO_BACKEND,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_sim_auto import (
     Cosmos3SimAutoConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+    resolve_masked_backend,
+)
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
     Cosmos3SimAutoTransformer,
 )
@@ -85,6 +91,19 @@ class Cosmos3NanoSimAutoPipeline(ComposedPipelineBase):
                 f"{type(transformer).__name__}."
             )
         vae = self.get_module("vae")
+        requested = pipeline_config.resolved_multiview_backend()
+        backend = (
+            resolve_masked_backend(get_local_torch_device())
+            if requested == COSMOS3_MULTIVIEW_AUTO_BACKEND
+            else requested
+        )
+        logger.info(
+            "Cosmos3-Nano-Sim-Auto attention backend: %s (%s)",
+            backend,
+            "device default"
+            if requested == COSMOS3_MULTIVIEW_AUTO_BACKEND
+            else "pinned",
+        )
         lidar_encoder = None
         lidar_decoder = None
         if deployment.supports_lidar:
@@ -125,7 +144,9 @@ class Cosmos3NanoSimAutoPipeline(ComposedPipelineBase):
             )
         )
         self.add_stage(
-            Cosmos3SimAutoRolloutStage(transformer=transformer, manifest=manifest)
+            Cosmos3SimAutoRolloutStage(
+                transformer=transformer, manifest=manifest, attention_backend=backend
+            )
         )
         self.add_stage(
             Cosmos3MultiviewDecodingStage(

@@ -506,6 +506,29 @@ def parse_multiview_deployment_config(
     )
 
 
+def resolve_multiview_backend_request(explicit: str | None) -> tuple[str, str]:
+    """Explicit config field, then the env override, then ``auto``; with its source.
+
+    ``auto`` is resolved by the pipeline against the device it runs on. Shared
+    by every pipeline that runs the multiview kernels (Transfer-Auto, Sim-Auto).
+    """
+    backend = explicit
+    source = "pipeline config multiview_attention_backend"
+    if backend is None:
+        backend = envs.SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND
+        source = MULTIVIEW_BACKEND_ENV_VAR
+    if not backend:
+        backend = COSMOS3_MULTIVIEW_AUTO_BACKEND
+        source = "device default"
+    allowed = (*COSMOS3_MULTIVIEW_ATTENTION_BACKENDS, COSMOS3_MULTIVIEW_AUTO_BACKEND)
+    if backend not in allowed:
+        raise ValueError(
+            "Cosmos3 multiview attention backend must be one of "
+            f"{list(allowed)}, got {backend!r} (from {source})."
+        )
+    return backend, source
+
+
 @dataclass
 class Cosmos3MultiviewConfig(Cosmos3Config):
     """Cosmos3 Multiview-AV: 11-camera WSM-to-RGB transfer in one denoising pass."""
@@ -549,33 +572,12 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
             )
 
     def _resolve_multiview_backend(self) -> tuple[str, str]:
-        """Explicit config field, then the env override, then ``auto``.
-
-        ``auto`` is resolved by the pipeline against the device it runs on.
-        """
         if self.multiview_deployment is None:
             raise ValueError(
                 "Cosmos3 multiview deployment config has not been resolved; "
                 "set model_path first."
             )
-        backend = self.multiview_attention_backend
-        source = "pipeline config multiview_attention_backend"
-        if backend is None:
-            backend = envs.SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND
-            source = MULTIVIEW_BACKEND_ENV_VAR
-        if not backend:
-            backend = COSMOS3_MULTIVIEW_AUTO_BACKEND
-            source = "device default"
-        allowed = (
-            *COSMOS3_MULTIVIEW_ATTENTION_BACKENDS,
-            COSMOS3_MULTIVIEW_AUTO_BACKEND,
-        )
-        if backend not in allowed:
-            raise ValueError(
-                "Cosmos3 multiview attention backend must be one of "
-                f"{list(allowed)}, got {backend!r} (from {source})."
-            )
-        return backend, source
+        return resolve_multiview_backend_request(self.multiview_attention_backend)
 
     def resolved_multiview_backend(self) -> str:
         """``triton``, ``fa4``, or ``auto`` (the device decides)."""

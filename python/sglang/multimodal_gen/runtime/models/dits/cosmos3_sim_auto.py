@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     unpatchify_lidar,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import (
-    ReplayBlockMask,
+    ReplayMask,
     replay_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
@@ -76,7 +76,7 @@ def _replay_layer_attention(
     rope_positions: torch.Tensor,
     history: KVPair,
     captions: KVPair,
-    mask: ReplayBlockMask,
+    mask: ReplayMask,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V."""
     batch_size, seq_len = hidden.shape[:2]
@@ -361,14 +361,14 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         text_extent: int,
         und_kv: Sequence[KVPair],
         history_kv: Sequence[KVPair],
-        block_mask: ReplayBlockMask,
+        mask: ReplayMask,
         rig_view_ids: torch.Tensor,
     ) -> Cosmos3SimAutoForwardOutput:
         """Denoise (``timestep`` set) or clean-refresh (``timestep`` None) one chunk.
 
         ``und_kv`` holds the per-layer caption K/V ``[1, U, H_kv, D]`` and
         ``history_kv`` the per-layer ring K/V ``[1, R, H_kv, D]`` over the whole
-        ring capacity; the plan behind ``block_mask`` decides which of their
+        ring capacity; the plan behind ``mask`` decides which of their
         tokens a query may read.
         """
         if (
@@ -403,7 +403,7 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 rope_positions=rope_positions,
                 history=history_kv[layer_idx],
                 captions=und_kv[layer_idx],
-                mask=block_mask,
+                mask=mask,
             )
             current_kv.append((k, v))
         hidden = self.norm_moe_gen(hidden)

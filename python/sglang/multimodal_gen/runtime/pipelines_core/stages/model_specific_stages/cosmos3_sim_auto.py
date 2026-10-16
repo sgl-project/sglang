@@ -37,8 +37,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
     KVPair,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import (
-    ReplayBlockMask,
-    build_replay_block_mask,
+    REPLAY_BACKENDS,
+    ReplayMask,
+    build_replay_mask,
     build_replay_plan,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
@@ -329,7 +330,7 @@ class _Session(msgspec.Struct, eq=False, kw_only=True):
     captions: CaptionMetadata
     und_kv: list[KVPair]
     ring: ReplayRing
-    masks: dict[tuple[Any, ...], ReplayBlockMask]
+    masks: dict[tuple[Any, ...], ReplayMask]
     device: torch.device
 
 
@@ -458,14 +459,21 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         *,
         transformer: Cosmos3SimAutoTransformer,
         manifest: Cosmos3SimAutoManifest,
+        attention_backend: str,
     ) -> None:
         super().__init__()
         if not isinstance(transformer, Cosmos3SimAutoTransformer):
             raise TypeError(
                 f"Cosmos3-Nano-Sim-Auto requires Cosmos3SimAutoTransformer, got {type(transformer).__name__}."
             )
+        if attention_backend not in REPLAY_BACKENDS:
+            raise ValueError(
+                "Cosmos3-Nano-Sim-Auto attention backend must be one of "
+                f"{list(REPLAY_BACKENDS)}, got {attention_backend!r}."
+            )
         self.transformer = transformer
         self.manifest = manifest
+        self.attention_backend = attention_backend
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -506,7 +514,8 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
             f"Sim-Auto rollout: {session.num_views} cameras x {session.latent_frames} latent frames in "
             f"{len(session.schedule)} chunks, {'joint RGB+LiDAR' if session.joint else 'RGB'}, "
             f"ring {session.ring.cache_chunks} x {session.ring.frame_unit} tokens, captions "
-            f"{session.captions.num_tokens} tokens (text extent {session.text_extent}), seed {session.seed}"
+            f"{session.captions.num_tokens} tokens (text extent {session.text_extent}), seed {session.seed}, "
+            f"attention {self.attention_backend}"
         )
         for chunk in session.schedule:
             self._run_chunk(session, chunk)
@@ -806,7 +815,7 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         items: Sequence[StreamItem],
         metadata: TokenMetadata,
         pass_kind: str,
-    ) -> ReplayBlockMask:
+    ) -> ReplayMask:
         # Plans depend on the chunk shape, on which ring slots are populated and
         # on whether chunk 0 is still inside the cross-view window (chunk 1
         # only); absolute time otherwise shifts every stream together.
@@ -827,7 +836,9 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 captions=session.captions,
                 window_seconds=self.manifest.cross_view_past_window_seconds,
             )
-            mask = build_replay_block_mask(plan, device=session.device)
+            mask = build_replay_mask(
+                plan, device=session.device, backend=self.attention_backend
+            )
             session.masks[key] = mask
         return mask
 
@@ -838,7 +849,7 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         items: Sequence[StreamItem],
         latents: Sequence[torch.Tensor],
         timestep: torch.Tensor | None,
-        mask: ReplayBlockMask,
+        mask: ReplayMask,
         step_index: int,
     ):
         with set_forward_context(current_timestep=step_index, attn_metadata=None):
@@ -849,7 +860,7 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 text_extent=session.text_extent,
                 und_kv=session.und_kv,
                 history_kv=session.ring.layer_kv(),
-                block_mask=mask,
+                mask=mask,
                 rig_view_ids=session.rig_view_ids,
             )
 

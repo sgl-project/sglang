@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replay visibility and FlexAttention execution for Cosmos3-Nano-Sim-Auto.
+"""Replay visibility and masked attention execution for Cosmos3-Nano-Sim-Auto.
 
 Every current-chunk token attends one softmax over the keys the replay policy
 admits from three streams: the current chunk, the KV ring of committed chunks
 and the per-camera caption documents. The policy is evaluated once per chunk on
 metadata runs (contiguous tokens agreeing on every predicate field), giving a
-small run-level truth table; the kernel sees it as a block-sparse FlexAttention
-mask whose partial tiles consult the table through per-token run ids. A dense
+small run-level truth table; the kernel (FlexAttention Triton anywhere, or
+FlashAttention-4 block-sparse on Hopper and Blackwell) sees it as a block map
+whose partial tiles consult the table through per-token run ids. A dense
 token-level expansion serves tests.
 
 Semantics follow the imaginaire4 maskless replay plan the student trained with:
@@ -27,7 +28,13 @@ from torch.nn.attention.flex_attention import BlockMask
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
     TRITON_KV_BLOCK_SIZE,
     TRITON_Q_BLOCK_SIZE,
+    fa4_sparse_block_sizes,
     flex_attention,
+    pack_allowed_bits,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_fa4 import (
+    Fa4BlockSparsity,
+    fa4_block_sparse_attention,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
     CAPTION_SCOPE_ALL,
@@ -46,6 +53,8 @@ WINDOW_EPS = 1e-4
 CAPTION_EPS = 1e-4
 
 REPLAY_BLOCK_SIZE = (TRITON_Q_BLOCK_SIZE, TRITON_KV_BLOCK_SIZE)
+# Kernels behind the replay mask; both count every admitted key exactly once.
+REPLAY_BACKENDS = ("triton", "fa4")
 
 _RUN_FIELDS = (
     "start",
@@ -333,13 +342,50 @@ def dense_token_mask(plan: ReplayPlan) -> torch.Tensor:
 
 
 class ReplayBlockMask(msgspec.Struct, eq=False):
-    """A FlexAttention block mask over the padded query and key streams of one plan."""
+    """FlexAttention block mask over the padded query and key streams of one plan."""
 
     block_mask: BlockMask
     q_len: int
     kv_len: int
     padded_q_len: int
     padded_kv_len: int
+
+
+class ReplayFa4Mask(msgspec.Struct, eq=False):
+    """FlashAttention-4 block map and packed run table over the padded streams of one plan."""
+
+    sparsity: Fa4BlockSparsity
+    q_len: int
+    kv_len: int
+    padded_q_len: int
+    padded_kv_len: int
+
+
+ReplayMask = ReplayBlockMask | ReplayFa4Mask
+
+
+class _PaddedStreams(msgspec.Struct, eq=False):
+    """Run ids of the zero-padded query and key streams and the padded truth table.
+
+    Padding queries form an extra run that attends everything, which keeps
+    their rows finite (the outputs are discarded); padding keys form an extra
+    run no query may read.
+    """
+
+    q_ids: torch.Tensor
+    k_ids: torch.Tensor
+    allowed: torch.Tensor
+    padded_q_len: int
+    padded_kv_len: int
+
+
+class _BlockMap(msgspec.Struct, eq=False):
+    """FlexAttention KV-block layout: per query block, its partial and full key blocks."""
+
+    partial_counts: torch.Tensor
+    partial_indices: torch.Tensor
+    full_counts: torch.Tensor
+    full_indices: torch.Tensor
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -361,18 +407,7 @@ def _block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return counts, indices.to(torch.int32)
 
 
-def build_replay_block_mask(
-    plan: ReplayPlan,
-    *,
-    device: torch.device,
-    block_size: tuple[int, int] = REPLAY_BLOCK_SIZE,
-) -> ReplayBlockMask:
-    """Project the run-level table onto blocks; partial tiles consult it per token.
-
-    Query and key streams are zero-padded to the block size. Padding keys are
-    never admitted; padding queries attend everything, which keeps their rows
-    finite, and their outputs are discarded.
-    """
+def _padded_streams(plan: ReplayPlan, block_size: tuple[int, int]) -> _PaddedStreams:
     q_block, kv_block = block_size
     num_q_runs, num_k_runs = plan.allowed.shape
     padded_q = _round_up(plan.num_query_tokens, q_block)
@@ -386,16 +421,47 @@ def build_replay_block_mask(
     allowed = torch.zeros((num_q_runs + 1, num_k_runs + 1), dtype=torch.bool)
     allowed[:num_q_runs, :num_k_runs] = plan.allowed
     allowed[num_q_runs, :] = True
-    q_presence = _presence(q_ids, q_block, num_q_runs + 1).to(torch.float32)
-    k_presence = _presence(k_ids, kv_block, num_k_runs + 1).to(torch.float32)
-    visible = (q_presence @ allowed.to(torch.float32) @ k_presence.T) > 0
-    forbidden = (q_presence @ (~allowed).to(torch.float32) @ k_presence.T) > 0
+    return _PaddedStreams(
+        q_ids=q_ids,
+        k_ids=k_ids,
+        allowed=allowed,
+        padded_q_len=padded_q,
+        padded_kv_len=padded_kv,
+    )
+
+
+def _project_blocks(streams: _PaddedStreams, block_size: tuple[int, int]) -> _BlockMap:
+    """Classify every tile as skipped, full or partial from the runs present in it."""
+    q_block, kv_block = block_size
+    num_q_runs, num_k_runs = streams.allowed.shape
+    q_presence = _presence(streams.q_ids, q_block, num_q_runs).to(torch.float32)
+    k_presence = _presence(streams.k_ids, kv_block, num_k_runs).to(torch.float32)
+    allowed = streams.allowed.to(torch.float32)
+    visible = (q_presence @ allowed @ k_presence.T) > 0
+    forbidden = (q_presence @ (1.0 - allowed) @ k_presence.T) > 0
     full_blocks = visible & ~forbidden
     partial_counts, partial_indices = _block_indices(visible & ~full_blocks)
     full_counts, full_indices = _block_indices(full_blocks)
-    allowed_dev = allowed.to(device)
-    q_ids_dev = q_ids.to(device)
-    k_ids_dev = k_ids.to(device)
+    return _BlockMap(
+        partial_counts=partial_counts,
+        partial_indices=partial_indices,
+        full_counts=full_counts,
+        full_indices=full_indices,
+    )
+
+
+def build_replay_block_mask(
+    plan: ReplayPlan,
+    *,
+    device: torch.device,
+    block_size: tuple[int, int] = REPLAY_BLOCK_SIZE,
+) -> ReplayBlockMask:
+    """Triton FlexAttention mask; partial tiles consult the run table per token."""
+    streams = _padded_streams(plan, block_size)
+    blocks = _project_blocks(streams, block_size)
+    allowed_dev = streams.allowed.to(device)
+    q_ids_dev = streams.q_ids.to(device)
+    k_ids_dev = streams.k_ids.to(device)
 
     def mask_mod(
         batch: torch.Tensor,
@@ -407,25 +473,75 @@ def build_replay_block_mask(
         return allowed_dev[q_ids_dev[q_idx], k_ids_dev[kv_idx]]
 
     block_mask = BlockMask.from_kv_blocks(
-        partial_counts[None, None].to(device),
-        partial_indices[None, None].to(device),
-        full_counts[None, None].to(device),
-        full_indices[None, None].to(device),
+        blocks.partial_counts[None, None].to(device),
+        blocks.partial_indices[None, None].to(device),
+        blocks.full_counts[None, None].to(device),
+        blocks.full_indices[None, None].to(device),
         BLOCK_SIZE=block_size,
         mask_mod=mask_mod,
-        seq_lengths=(padded_q, padded_kv),
+        seq_lengths=(streams.padded_q_len, streams.padded_kv_len),
         compute_q_blocks=False,
     )
     return ReplayBlockMask(
         block_mask=block_mask,
         q_len=plan.num_query_tokens,
         kv_len=plan.num_key_tokens,
-        padded_q_len=padded_q,
-        padded_kv_len=padded_kv,
+        padded_q_len=streams.padded_q_len,
+        padded_kv_len=streams.padded_kv_len,
     )
 
 
-def _pad_sequence(tensor: torch.Tensor, length: int) -> torch.Tensor:
+def build_replay_fa4_mask(
+    plan: ReplayPlan,
+    *,
+    device: torch.device,
+    block_size: tuple[int, int] | None = None,
+) -> ReplayFa4Mask:
+    """FlashAttention-4 block map at the device's tile geometry plus the packed run table.
+
+    ``block_size`` pins the geometry for CPU tests; on CUDA it follows the
+    compute capability (Hopper 128x128, Blackwell 256x128).
+    """
+    if block_size is None:
+        block_size = fa4_sparse_block_sizes(device)
+    streams = _padded_streams(plan, block_size)
+    blocks = _project_blocks(streams, block_size)
+    allowed_words, words_per_row = pack_allowed_bits(streams.allowed)
+    sparsity = Fa4BlockSparsity(
+        partial_counts=blocks.partial_counts.to(device),
+        partial_indices=blocks.partial_indices.to(device),
+        full_counts=blocks.full_counts.to(device),
+        full_indices=blocks.full_indices.to(device),
+        q_word_base=(streams.q_ids * words_per_row).to(torch.int32).to(device),
+        k_group_ids=streams.k_ids.to(torch.int32).to(device),
+        allowed_words=allowed_words.to(device),
+        q_block_size=block_size[0],
+        kv_block_size=block_size[1],
+    )
+    return ReplayFa4Mask(
+        sparsity=sparsity,
+        q_len=plan.num_query_tokens,
+        kv_len=plan.num_key_tokens,
+        padded_q_len=streams.padded_q_len,
+        padded_kv_len=streams.padded_kv_len,
+    )
+
+
+def build_replay_mask(
+    plan: ReplayPlan, *, device: torch.device, backend: str
+) -> ReplayMask:
+    """The mask representation ``backend`` consumes; see ``REPLAY_BACKENDS``."""
+    if backend == "triton":
+        return build_replay_block_mask(plan, device=device)
+    if backend == "fa4":
+        return build_replay_fa4_mask(plan, device=device)
+    raise ValueError(
+        "Cosmos3-Nano-Sim-Auto attention backend must be one of "
+        f"{list(REPLAY_BACKENDS)}, got {backend!r}."
+    )
+
+
+def _pad_bhsd(tensor: torch.Tensor, length: int) -> torch.Tensor:
     """Zero-pad ``[B, S, H, D]`` along ``S`` and return ``[B, H, length, D]`` contiguous."""
     pad = length - tensor.shape[1]
     if pad:
@@ -433,8 +549,16 @@ def _pad_sequence(tensor: torch.Tensor, length: int) -> torch.Tensor:
     return tensor.transpose(1, 2).contiguous()
 
 
+def _pad_bshd(tensor: torch.Tensor, length: int) -> torch.Tensor:
+    """Zero-pad ``[B, S, H, D]`` along ``S``, contiguous."""
+    pad = length - tensor.shape[1]
+    if pad:
+        return torch.nn.functional.pad(tensor, (0, 0, 0, 0, 0, pad))
+    return tensor.contiguous()
+
+
 def replay_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: ReplayBlockMask
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: ReplayMask
 ) -> torch.Tensor:
     """Masked GQA attention of ``[B, S_q, H, D]`` queries over ``[B, S_k, H_kv, D]`` keys."""
     if q.shape[1] != mask.q_len or k.shape[1] != mask.kv_len or k.shape != v.shape:
@@ -442,10 +566,18 @@ def replay_attention(
             "Cosmos3-Nano-Sim-Auto attention geometry does not match its plan: "
             f"q={tuple(q.shape)}, k={tuple(k.shape)}, plan=({mask.q_len}, {mask.kv_len})."
         )
+    if isinstance(mask, ReplayFa4Mask):
+        out = fa4_block_sparse_attention(
+            _pad_bshd(q, mask.padded_q_len),
+            _pad_bshd(k, mask.padded_kv_len),
+            _pad_bshd(v, mask.padded_kv_len),
+            sparsity=mask.sparsity,
+        )
+        return out[:, : mask.q_len]
     out = flex_attention(
-        _pad_sequence(q, mask.padded_q_len),
-        _pad_sequence(k, mask.padded_kv_len),
-        _pad_sequence(v, mask.padded_kv_len),
+        _pad_bhsd(q, mask.padded_q_len),
+        _pad_bhsd(k, mask.padded_kv_len),
+        _pad_bhsd(v, mask.padded_kv_len),
         block_mask=mask.block_mask,
         backend="triton",
     )

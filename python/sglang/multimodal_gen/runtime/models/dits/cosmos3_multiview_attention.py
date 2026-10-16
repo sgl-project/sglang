@@ -523,7 +523,7 @@ def _block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return counts, indices.to(torch.int32)
 
 
-def _pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
+def pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Pack the ``[q_group, k_group]`` truth table into int32 bit words.
 
     Bit ``g_k`` of word ``g_q * words_per_row + g_k // 32`` is the answer for
@@ -664,7 +664,7 @@ def build_multiview_block_sparsity(
 
     # Fold the table row stride into the query-side id so the kernel needs no
     # compile-time shape constant and one compiled mask_mod serves every layout.
-    allowed_words, words_per_row = _pack_allowed_bits(group_allowed)
+    allowed_words, words_per_row = pack_allowed_bits(group_allowed)
     q_word_base = (q_group_ids * words_per_row).to(torch.int32).contiguous()
 
     return MultiviewBlockSparsity(

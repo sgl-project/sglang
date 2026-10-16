@@ -28,10 +28,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     Cosmos3MultiviewDeploymentConfig,
+    resolve_multiview_backend_request,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -45,6 +49,9 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
     # duration and resolution sentences, per-camera rig headers).
     use_duration_template: bool = True
     use_system_prompt: bool = True
+    # Kernel behind the replay attention: "triton", "fa4", or None for the env
+    # override / device default; the same switch as Cosmos3-Nano-Transfer-Auto.
+    multiview_attention_backend: str | None = None
     # Parsed once from transformer/config.json in update_config_from_dict.
     sim_auto_manifest: Cosmos3SimAutoManifest | None = None
     # The stage contract derived from the manifest; the multiview sampling
@@ -60,6 +67,13 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
             self._validate_scheduler(manifest)
             self.sim_auto_manifest = manifest
             self.multiview_deployment = multiview_deployment_from_manifest(manifest)
+            # Fail on a bad backend name at launch, not on the first request.
+            backend, source = resolve_multiview_backend_request(
+                self.multiview_attention_backend
+            )
+            logger.info(
+                "Cosmos3-Nano-Sim-Auto attention backend: %s (from %s)", backend, source
+            )
 
     def _validate_scheduler(self, manifest: Cosmos3SimAutoManifest) -> None:
         if self.distilled_sigmas is None:
@@ -76,6 +90,10 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
                 f"fixed-step schedules: scheduler={self.distilled_sigmas}, "
                 f"transformer={list(manifest.t_list)}."
             )
+
+    def resolved_multiview_backend(self) -> str:
+        """``triton``, ``fa4``, or ``auto`` (the device decides)."""
+        return resolve_multiview_backend_request(self.multiview_attention_backend)[0]
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # The student runs one branch per step, so CFG parallel would only

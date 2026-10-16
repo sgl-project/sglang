@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FlashAttention-4 backend for Cosmos3 multiview sparse attention.
+"""FlashAttention-4 backend for Cosmos3 block-sparse attention.
 
 FA4 expresses a sparse mask the same way FlexAttention does: a block map that
 classifies every (q_tile, kv_tile) as skipped, full, or partial, plus a
-``mask_mod`` that resolves individual pairs inside partial tiles. The block map
-this module hands over is the one ``build_multiview_block_sparsity`` already
-builds; only the ``mask_mod`` is new, because FA4 compiles CuTe DSL rather than
-tracing Python.
+``mask_mod`` that resolves individual pairs inside partial tiles. The block maps
+this module hands over are the ones the model modules already build (the
+Transfer-Auto multiview map of ``build_multiview_block_sparsity`` and the
+Sim-Auto replay map of ``build_replay_fa4_mask``); only the ``mask_mod`` is
+new, because FA4 compiles CuTe DSL rather than tracing Python.
 
 Rather than re-implement the visibility algebra in CuTe, the kernel reads a
 truth table that the host already computed over semantic runs. Every token
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
@@ -36,6 +38,27 @@ logger = init_logger(__name__)
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
 _OP_NAMESPACE = "sglang_diffusion"
 _OP_NAME = "cosmos3_multiview_fa4"
+
+
+# eq=False: the fields are tensors, so a generated __eq__ would return a tensor
+# rather than a bool. Instances are cache values compared by identity.
+class Fa4BlockSparsity(msgspec.Struct, frozen=True, eq=False):
+    """Block map and packed run table in the layout the FA4 custom op consumes.
+
+    ``partial_*``/``full_*`` are the FlexAttention KV-block layout. The aux
+    tensors resolve pairs inside partial tiles and must be exactly as long as
+    the padded query/key streams (see ``_build_mask_mod``).
+    """
+
+    partial_counts: torch.Tensor
+    partial_indices: torch.Tensor
+    full_counts: torch.Tensor
+    full_indices: torch.Tensor
+    q_word_base: torch.Tensor
+    k_group_ids: torch.Tensor
+    allowed_words: torch.Tensor
+    q_block_size: int
+    kv_block_size: int
 
 
 class _Fa4Entry(NamedTuple):
@@ -125,53 +148,27 @@ def _load_fa4() -> _Fa4Entry:
     return _entry
 
 
-def _validate(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    sparsity: MultiviewBlockSparsity,
-) -> None:
+def _validate_tensors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.ndim != 4:
             raise ValueError(
-                f"Cosmos3 multiview FA4 expects [B, S, H, D] {name}, got {tuple(tensor.shape)}."
+                f"Cosmos3 FA4 expects [B, S, H, D] {name}, got {tuple(tensor.shape)}."
             )
         if tensor.device.type != "cuda":
             raise ValueError(
-                f"Cosmos3 multiview FA4 requires CUDA tensors, {name} is on {tensor.device}."
+                f"Cosmos3 FA4 requires CUDA tensors, {name} is on {tensor.device}."
             )
         if tensor.dtype not in _SUPPORTED_DTYPES:
             raise ValueError(
-                f"Cosmos3 multiview FA4 supports {[str(d) for d in _SUPPORTED_DTYPES]}, "
+                f"Cosmos3 FA4 supports {[str(d) for d in _SUPPORTED_DTYPES]}, "
                 f"{name} has dtype {tensor.dtype}."
             )
         if not tensor.is_contiguous():
-            raise ValueError(
-                f"Cosmos3 multiview FA4 requires contiguous [B, S, H, D] {name}."
-            )
+            raise ValueError(f"Cosmos3 FA4 requires contiguous [B, S, H, D] {name}.")
     if k.shape[:3] != v.shape[:3]:
         raise ValueError(
-            "Cosmos3 multiview FA4 key/value geometry mismatch: "
+            "Cosmos3 FA4 key/value geometry mismatch: "
             f"k={tuple(k.shape)}, v={tuple(v.shape)}."
-        )
-    if q.shape[1] != sparsity.q_len:
-        raise ValueError(
-            "Cosmos3 multiview FA4 padded query length must match the block map: "
-            f"q={q.shape[1]}, mask={sparsity.q_len}."
-        )
-    if k.shape[1] != sparsity.kv_len:
-        raise ValueError(
-            "Cosmos3 multiview FA4 padded key length must match the block map: "
-            f"k={k.shape[1]}, mask={sparsity.kv_len}."
-        )
-    # FA4 wraps aux reads modulo these lengths; a shorter tensor would alias.
-    if sparsity.q_word_base.numel() != sparsity.q_len:
-        raise ValueError(
-            "Cosmos3 multiview FA4 q_word_base must have one entry per padded query token."
-        )
-    if sparsity.k_group_ids.numel() != sparsity.kv_len:
-        raise ValueError(
-            "Cosmos3 multiview FA4 k_group_ids must have one entry per padded key token."
         )
 
 
@@ -248,29 +245,39 @@ if not hasattr(getattr(torch.ops, _OP_NAMESPACE), _OP_NAME):
 _cosmos3_multiview_fa4_op = getattr(getattr(torch.ops, _OP_NAMESPACE), _OP_NAME)
 
 
-def multiview_fa4_attention(
+def fa4_block_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    sparsity: MultiviewBlockSparsity,
+    *,
+    sparsity: Fa4BlockSparsity,
 ) -> torch.Tensor:
-    """Run FA4 over contiguous ``[B, S, H, D]`` tensors with the multiview mask.
+    """Run FA4 over contiguous ``[B, S, H, D]`` tensors with a block-sparse mask.
 
     ``softmax_scale`` is left to FA4's default of ``1/sqrt(head_dim)``, which is
-    also the FlexAttention default the Triton path relies on. Validation stays
+    also the FlexAttention default the Triton paths rely on. Validation stays
     outside the custom op so shape errors name this function rather than a
     schema mismatch.
     """
-    _validate(q, k, v, sparsity)
-
+    _validate_tensors(q, k, v)
+    # FA4 wraps aux reads modulo these lengths; a shorter tensor would alias.
+    if q.shape[1] != sparsity.q_word_base.numel():
+        raise ValueError(
+            "Cosmos3 FA4 padded query length must match the block map: "
+            f"q={q.shape[1]}, q_word_base={sparsity.q_word_base.numel()}."
+        )
+    if k.shape[1] != sparsity.k_group_ids.numel():
+        raise ValueError(
+            "Cosmos3 FA4 padded key length must match the block map: "
+            f"k={k.shape[1]}, k_group_ids={sparsity.k_group_ids.numel()}."
+        )
     expected = fa4_sparse_block_sizes(q.device)
     if (sparsity.q_block_size, sparsity.kv_block_size) != expected:
         raise ValueError(
-            f"Cosmos3 multiview FA4 requires a {expected} sparse block map on compute "
+            f"Cosmos3 FA4 requires a {expected} sparse block map on compute "
             f"capability {torch.cuda.get_device_capability(q.device)[0]}.x, got "
             f"({sparsity.q_block_size}, {sparsity.kv_block_size})."
         )
-
     return _cosmos3_multiview_fa4_op(
         q,
         k,
@@ -284,4 +291,34 @@ def multiview_fa4_attention(
         sparsity.allowed_words,
         sparsity.q_block_size,
         sparsity.kv_block_size,
+    )
+
+
+def multiview_fa4_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sparsity: MultiviewBlockSparsity,
+) -> torch.Tensor:
+    """FA4 over the Transfer-Auto ``[UND | GEN]`` stream with its multiview block map."""
+    if q.shape[1] != sparsity.q_len or k.shape[1] != sparsity.kv_len:
+        raise ValueError(
+            "Cosmos3 multiview FA4 padded geometry must match the block map: "
+            f"q={q.shape[1]}, k={k.shape[1]}, mask=({sparsity.q_len}, {sparsity.kv_len})."
+        )
+    return fa4_block_sparse_attention(
+        q,
+        k,
+        v,
+        sparsity=Fa4BlockSparsity(
+            partial_counts=sparsity.partial_counts,
+            partial_indices=sparsity.partial_indices,
+            full_counts=sparsity.full_counts,
+            full_indices=sparsity.full_indices,
+            q_word_base=sparsity.q_word_base,
+            k_group_ids=sparsity.k_group_ids,
+            allowed_words=sparsity.allowed_words,
+            q_block_size=sparsity.q_block_size,
+            kv_block_size=sparsity.kv_block_size,
+        ),
     )
