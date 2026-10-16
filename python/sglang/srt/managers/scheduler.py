@@ -1106,6 +1106,11 @@ class Scheduler(
         tic = time.perf_counter()
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
+        if self.enable_unified_memory:
+            # The first compaction move must not happen while serving with a
+            # full pool (see MultiEndedAllocator.prewarm_compaction); prewarm it
+            # before graph capture and KV sizing account for its memory.
+            self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
