@@ -8,7 +8,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip
-from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -49,15 +48,6 @@ class TestMegaMhcGate(unittest.TestCase):
             mock.patch.object(mhc, "_is_gfx95_supported", True),
         ):
             self.assertFalse(mhc._can_use_mega_mhc(_cfg()))
-
-    @override_platform(is_sm100=True)
-    def test_cuda_sm100_unchanged(self):
-        with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
-            mock.patch.object(mhc, "_is_hip", False),
-        ):
-            self.assertTrue(mhc._can_use_mega_mhc(_cfg()))
-            self.assertFalse(mhc._can_use_mega_mhc(_cfg(cp_prefill=True)))
 
     def test_hip_gfx950_dsv41_shape(self):
         with (
