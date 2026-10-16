@@ -269,6 +269,7 @@ class TestFlux3Fp8Construction(unittest.TestCase):
         self.assertEqual(block.to_qkv.output_size_per_partition, 768)
         self.assertEqual(_roles(block), {**_ALL_ROLES, "to_qkv": None})
 
+    @_requires_flashinfer
     def test_swiglu_layout_rejects_generic_apply(self):
         layer = _tiny_native_model(_flux3_fp8_config()).single_blocks[0].mlp_in
         layer.quant_method.process_weights_after_loading(layer)
