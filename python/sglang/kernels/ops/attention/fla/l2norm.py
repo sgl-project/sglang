@@ -9,6 +9,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.op import load_block, make_block_ptr, store_block
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -62,12 +63,12 @@ def l2norm_fwd_kernel(
     BD: tl.constexpr,
 ):
     i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    p_x = make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    b_x = load_block(p_x, (0, 1)).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y = make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    store_block(p_y, b_y, (0, 1))
 
 
 def l2norm_fwd(
@@ -150,7 +151,7 @@ def gdn_prefill_qkv_prepare_kernel(
     if head_idx < H_QK:
         # Match l2norm_fwd_kernel's block layout so the BF16 reduction tree is
         # unchanged for strided inputs.
-        q_block = tl.make_block_ptr(
+        q_block = make_block_ptr(
             q + head_idx * q_stride_h,
             (T, D),
             (q_stride_t, q_stride_d),
@@ -158,7 +159,7 @@ def gdn_prefill_qkv_prepare_kernel(
             (BT, BD),
             (1, 0),
         )
-        k_block = tl.make_block_ptr(
+        k_block = make_block_ptr(
             k + head_idx * k_stride_h,
             (T, D),
             (k_stride_t, k_stride_d),
@@ -166,9 +167,9 @@ def gdn_prefill_qkv_prepare_kernel(
             (BT, BD),
             (1, 0),
         )
-        q_values = tl.load(q_block, boundary_check=(0, 1)).to(tl.float32)
-        k_values = tl.load(k_block, boundary_check=(0, 1)).to(tl.float32)
-        q_output_block = tl.make_block_ptr(
+        q_values = load_block(q_block, (0, 1)).to(tl.float32)
+        k_values = load_block(k_block, (0, 1)).to(tl.float32)
+        q_output_block = make_block_ptr(
             q_out + head_idx * D,
             (T, D),
             (H_QK * D, 1),
@@ -176,7 +177,7 @@ def gdn_prefill_qkv_prepare_kernel(
             (BT, BD),
             (1, 0),
         )
-        k_output_block = tl.make_block_ptr(
+        k_output_block = make_block_ptr(
             k_out + head_idx * D,
             (T, D),
             (H_QK * D, 1),
@@ -184,19 +185,11 @@ def gdn_prefill_qkv_prepare_kernel(
             (BT, BD),
             (1, 0),
         )
-        tl.store(
-            q_output_block,
-            q_values.to(q_output_block.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            k_output_block,
-            k_values.to(k_output_block.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
+        store_block(q_output_block, q_values, (0, 1))
+        store_block(k_output_block, k_values, (0, 1))
     else:
         value_head = head_idx - H_QK
-        v_block = tl.make_block_ptr(
+        v_block = make_block_ptr(
             v + value_head * v_stride_h,
             (T, D),
             (v_stride_t, v_stride_d),
@@ -204,8 +197,8 @@ def gdn_prefill_qkv_prepare_kernel(
             (BT, BD),
             (1, 0),
         )
-        v_values = tl.load(v_block, boundary_check=(0, 1))
-        v_output_block = tl.make_block_ptr(
+        v_values = load_block(v_block, (0, 1))
+        v_output_block = make_block_ptr(
             v_out + value_head * D,
             (T, D),
             (H_V * D, 1),
@@ -213,7 +206,7 @@ def gdn_prefill_qkv_prepare_kernel(
             (BT, BD),
             (1, 0),
         )
-        tl.store(v_output_block, v_values, boundary_check=(0, 1))
+        store_block(v_output_block, v_values, (0, 1))
 
 
 def gdn_prefill_qkv_prepare_fwd(

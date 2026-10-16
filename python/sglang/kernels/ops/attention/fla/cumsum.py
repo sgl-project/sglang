@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import load_block, make_block_ptr, store_block
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
@@ -50,24 +51,24 @@ def chunk_local_cumsum_scalar_kernel(
         bos, eos = i_b * T, i_b * T + T
 
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
+        p_s = make_block_ptr(
             s + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,)
         )
-        p_o = tl.make_block_ptr(
+        p_o = make_block_ptr(
             o + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,)
         )
     else:
-        p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        p_s = make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        p_o = make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     # [BT]
-    b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+    b_s = load_block(p_s, (0,)).to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
         b_o = -b_o + b_z[None] + b_s
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
+    store_block(p_o, b_o, (0,))
 
 
 @triton.autotune(
@@ -118,7 +119,7 @@ def chunk_local_cumsum_vector_kernel(
         m_s = tl.where(o_i[:, None] >= o_i[None, :], 1.0, 0.0)
 
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
+        p_s = make_block_ptr(
             s + (bos * H + i_h * T) * S,
             (T, S),
             (S, 1),
@@ -126,7 +127,7 @@ def chunk_local_cumsum_vector_kernel(
             (BT, BS),
             (1, 0),
         )
-        p_o = tl.make_block_ptr(
+        p_o = make_block_ptr(
             o + (bos * H + i_h * T) * S,
             (T, S),
             (S, 1),
@@ -135,7 +136,7 @@ def chunk_local_cumsum_vector_kernel(
             (1, 0),
         )
     else:
-        p_s = tl.make_block_ptr(
+        p_s = make_block_ptr(
             s + (bos * H + i_h) * S,
             (T, S),
             (H * S, 1),
@@ -143,7 +144,7 @@ def chunk_local_cumsum_vector_kernel(
             (BT, BS),
             (1, 0),
         )
-        p_o = tl.make_block_ptr(
+        p_o = make_block_ptr(
             o + (bos * H + i_h) * S,
             (T, S),
             (H * S, 1),
@@ -152,11 +153,11 @@ def chunk_local_cumsum_vector_kernel(
             (1, 0),
         )
     # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    b_s = load_block(p_s, (0, 1)).to(tl.float32)
     b_o = tl.dot(m_s, b_s, allow_tf32=False)
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    store_block(p_o, b_o, (0, 1))
 
 
 def chunk_local_cumsum_scalar(

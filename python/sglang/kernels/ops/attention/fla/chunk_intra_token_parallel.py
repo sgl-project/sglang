@@ -6,7 +6,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.fla.op import exp2
+from sglang.kernels.ops.attention.fla.op import (
+    exp2,
+    load_block,
+    make_block_ptr,
+    store_block,
+)
 from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
 
@@ -92,32 +97,32 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     m_h = (i_hg * BH + o_h) < H
     m_k = o_k < K
 
-    p_q = tl.make_block_ptr(
+    p_q = make_block_ptr(
         q + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
     )
-    p_k = tl.make_block_ptr(
+    p_k = make_block_ptr(
         k + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
     )
-    p_g = tl.make_block_ptr(
+    p_g = make_block_ptr(
         g + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
     )
-    p_beta = tl.make_block_ptr(beta + i_t * H, (H,), (1,), (i_hg * BH,), (BH,), (0,))
+    p_beta = make_block_ptr(beta + i_t * H, (H,), (1,), (i_hg * BH,), (BH,), (0,))
     # [BH, BK]
-    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-    b_k = b_k * tl.load(p_beta, boundary_check=(0,)).to(tl.float32)[:, None]
+    b_q = load_block(p_q, (0, 1)).to(tl.float32)
+    b_k = load_block(p_k, (0, 1)).to(tl.float32)
+    b_g = load_block(p_g, (0, 1)).to(tl.float32)
+    b_k = b_k * load_block(p_beta, (0,)).to(tl.float32)[:, None]
 
     for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
-        p_kj = tl.make_block_ptr(
+        p_kj = make_block_ptr(
             k + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
         )
-        p_gj = tl.make_block_ptr(
+        p_gj = make_block_ptr(
             g + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
         )
         # [BH, BK]
-        b_kj = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32)
-        b_gj = tl.load(p_gj, boundary_check=(0, 1)).to(tl.float32)
+        b_kj = load_block(p_kj, (0, 1)).to(tl.float32)
+        b_gj = load_block(p_gj, (0, 1)).to(tl.float32)
 
         b_kgj = b_kj * exp2(b_g - b_gj)
 

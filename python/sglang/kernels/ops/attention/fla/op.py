@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import inspect
 import os
 
 import triton
@@ -40,6 +41,46 @@ if not is_gather_supported:
 
 else:
     gather = tl.gather
+
+
+# Triton main removed block pointers, and with them tl.load/tl.store's boundary_check
+# (triton-lang/triton#10833). Where they are gone, a "block pointer" is a
+# (pointers, mask) pair, which covers the 1D/2D boundary-checked blocks used here.
+if "boundary_check" in inspect.signature(tl.load).parameters:
+    make_block_ptr = tl.make_block_ptr
+
+    @triton.jit
+    def load_block(p, boundary_check: tl.constexpr):
+        return tl.load(p, boundary_check=boundary_check)
+
+    @triton.jit
+    def store_block(p, value, boundary_check: tl.constexpr):
+        tl.store(p, value.to(p.dtype.element_ty), boundary_check=boundary_check)
+
+else:
+
+    @triton.jit
+    def make_block_ptr(
+        base, shape, strides, offsets, block_shape: tl.constexpr, order: tl.constexpr
+    ):
+        o0 = offsets[0] + tl.arange(0, block_shape[0]).to(tl.int64)
+        if len(block_shape) == 1:
+            return base + o0 * strides[0], (o0 >= 0) & (o0 < shape[0])
+        else:
+            o1 = offsets[1] + tl.arange(0, block_shape[1]).to(tl.int64)
+            ptrs = base + o0[:, None] * strides[0] + o1[None, :] * strides[1]
+            mask = ((o0 >= 0) & (o0 < shape[0]))[:, None] & (
+                (o1 >= 0) & (o1 < shape[1])
+            )[None, :]
+            return ptrs, mask
+
+    @triton.jit
+    def load_block(p, boundary_check: tl.constexpr):
+        return tl.load(p[0], mask=p[1], other=0)
+
+    @triton.jit
+    def store_block(p, value, boundary_check: tl.constexpr):
+        tl.store(p[0], value.to(p[0].dtype.element_ty), mask=p[1])
 
 
 if hasattr(triton.language, "_experimental_make_tensor_descriptor"):

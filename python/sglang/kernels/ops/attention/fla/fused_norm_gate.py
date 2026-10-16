@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.fla.op import load_block, make_block_ptr, store_block
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -58,22 +59,22 @@ def layer_norm_gated_fwd_kernel(
     o_d = tl.arange(0, BD)
     m_d = o_d < D
 
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    p_x = make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    b_x = load_block(p_x, (0, 1)).to(tl.float32)
     if HAS_RESIDUAL:
-        p_res = tl.make_block_ptr(
+        p_res = make_block_ptr(
             residual, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
         )
-        b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
+        b_x += load_block(p_res, (0, 1)).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        p_res_out = tl.make_block_ptr(
+        p_res_out = make_block_ptr(
             residual_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
         )
-        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), boundary_check=(0, 1))
+        store_block(p_res_out, b_x, (0, 1))
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=1) / D
-        p_mean = tl.make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
-        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), boundary_check=(0,))
+        p_mean = make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
+        store_block(p_mean, b_mean, (0,))
         b_xbar = tl.where(m_d[None, :], b_x - b_mean[:, None], 0.0)
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     else:
@@ -81,8 +82,8 @@ def layer_norm_gated_fwd_kernel(
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     b_rstd = 1 / tl.sqrt(b_var + eps)
 
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
+    p_rstd = make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
+    store_block(p_rstd, b_rstd, (0,))
 
     if HAS_WEIGHT:
         b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
@@ -98,16 +99,16 @@ def layer_norm_gated_fwd_kernel(
         b_y = b_y + b_b[None, :]
 
     # swish/sigmoid output gate
-    p_g = tl.make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
+    p_g = make_block_ptr(g, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    b_g = load_block(p_g, (0, 1)).to(tl.float32)
     if ACTIVATION == "swish" or ACTIVATION == "silu":
         b_y = b_y * b_g * tl.sigmoid(b_g)
     elif ACTIVATION == "sigmoid":
         b_y = b_y * tl.sigmoid(b_g)
 
     # Write output
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y = make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    store_block(p_y, b_y, (0, 1))
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
