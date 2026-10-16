@@ -44,6 +44,23 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="speculative.tree_speculative_sampling_target_only_triton",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.speculative.tree_sampling:"
+            "tree_speculative_sampling_target_only_triton"
+        ),
+        capabilities=frozenset((CapabilityRequirement.CUDA, CapabilityRequirement.HIP)),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32", "int32", "int64"),
+            in_place=True,
+            description="target-only stochastic tree verification and bonus sampling",
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="speculative.div_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
