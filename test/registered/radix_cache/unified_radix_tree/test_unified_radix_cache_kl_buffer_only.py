@@ -6,9 +6,10 @@ The multi-turn tests additionally exercise branching under device-pool pressure;
 their cached-token bounds alone do not establish a storage load-back.
 
 Thresholds match the corresponding cache-mode model tests. FULL+SWA+Mamba has
-separate near-bit-exact coverage in test_unified_radix_cache_kl_hybrid_bitexact.py
-(introduced by #36345). These tests do not deterministically reproduce the
-load-back ownership race fixed by #35769.
+separate near-bit-exact coverage in
+test_unified_radix_cache_kl_hybrid_bitexact_buffer_only.py (introduced by #36345).
+These tests do not deterministically reproduce the load-back ownership race
+fixed by #35769.
 """
 
 import shutil
@@ -33,7 +34,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 
 FULL_MODEL = "Qwen/Qwen3-32B"
 SWA_MODEL = "openai/gpt-oss-20b"
