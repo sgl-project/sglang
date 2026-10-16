@@ -1,6 +1,6 @@
-"""Pause, resume and shutdown under pipeline parallelism: the PP ring runs
-nothing after intake while the engine is paused, and leaves its loop on the
-shutdown request a SIGTERM sends.
+"""Pause, resume and shutdown under pipeline parallelism: the PP ring launches
+nothing while the engine is paused, and leaves its loop on the shutdown
+request a SIGTERM sends.
 
 Usage:
 python3 -m unittest test_pp_pause_shutdown.TestPPPauseResume

@@ -664,9 +664,10 @@ class Scheduler:
                 self.hub.invariant_checker.self_check_during_busy()
 
     def paused_pass(self) -> bool:
-        """Whether the engine is paused; a paused pass runs nothing after
-        intake: it records the scheduler's state and yields the GIL. The flat
-        and the ring driver both ask it."""
+        """Whether the engine is paused; a paused pass records the
+        scheduler's state and yields the GIL. The flat driver then runs
+        nothing after intake; the PP ring launches nothing but keeps its
+        exchanges and commits."""
         if not self.parts.flags._engine_paused:
             return False
         self._record_scheduler_state_for_paused_engine()
