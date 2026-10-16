@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import math
@@ -127,7 +128,15 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 _TOOL_SCHEMA_VALIDATOR = jsonschema_rs.Draft202012Validator(
-    Draft202012Validator.META_SCHEMA
+    Draft202012Validator.META_SCHEMA,
+    validate_formats=True,
+    # Check the metaschema's formats with check_schema's Python checkers.
+    formats={
+        name: functools.partial(
+            Draft202012Validator.FORMAT_CHECKER.conforms, format=name
+        )
+        for name in ("regex", "uri", "uri-reference")
+    },
 )
 
 

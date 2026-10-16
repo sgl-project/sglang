@@ -1599,20 +1599,22 @@ class ServingChatTestCase(CustomTestCase):
                 )
 
     def test_invalid_tool_parameters_schema_is_rejected(self):
-        request = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Weather?"}],
-            tools=[
-                {
-                    "type": "function",
-                    "function": {"name": "weather", "parameters": {"type": 5}},
-                }
-            ],
-        )
-        self.assertIn(
-            "Tool 0 function has invalid 'parameters' schema",
-            self.chat._validate_request(request),
-        )
+        for parameters in ({"type": 5}, {"type": "string", "pattern": "["}):
+            with self.subTest(parameters=parameters):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {"name": "weather", "parameters": parameters},
+                        }
+                    ],
+                )
+                self.assertIn(
+                    "Tool 0 function has invalid 'parameters' schema",
+                    self.chat._validate_request(request),
+                )
 
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
