@@ -243,7 +243,7 @@ export const config = {
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
