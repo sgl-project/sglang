@@ -7,6 +7,11 @@ from contextlib import nullcontext
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+try:
+    from torch.nn.attention.varlen import varlen_attn as torch_varlen_attn
+except ImportError:
+    torch_varlen_attn = None
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -17,6 +22,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Ordered by preference, which only takes effect with ``set_priority=True``;
+# without it this is the set PyTorch already picks from, so the flag was inert.
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
     SDPBackend.FLASH_ATTENTION,
@@ -25,6 +32,16 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 ]
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
+
+def torch_default_sdpa_backends():
+    """Context in which SDPA picks from every PyTorch backend, cuDNN included.
+
+    The CUDA platform disables cuDNN SDPA process-wide (diffusers#9704). Modules
+    whose reference outputs were produced with PyTorch's defaults opt back in
+    around their own ``scaled_dot_product_attention`` calls.
+    """
+    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
 
 
 class SDPABackend(AttentionBackend):
@@ -65,7 +82,7 @@ class SDPAImpl(AttentionImpl):
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
-            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
         return nullcontext()
 
     def forward(
@@ -118,12 +135,77 @@ class SDPAImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del max_seqlen
+        if (
+            type(self) is SDPAImpl
+            and torch_varlen_attn is not None
+            and not torch.compiler.is_compiling()
+            and not torch.is_grad_enabled()
+            and query.is_cuda
+            and torch.version.hip is None
+            and query.ndim == 3
+            and query.shape == key.shape == value.shape
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and query.dtype == key.dtype == value.dtype
+            and query.device == key.device == value.device == cu_seqlens.device
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+            and query.numel() > 0
+            and query.shape[-1] <= 256
+            and query.shape[-1] % 8 == 0
+            and cu_seqlens.dtype == torch.int32
+            and cu_seqlens.ndim == 1
+            and cu_seqlens.is_contiguous()
+            and cu_seqlens.numel() > 2
+            and max_seqlen > 0
+            and self.dropout == 0.0
+            and not self.allow_cudnn_sdp
+            and torch.backends.cuda.flash_sdp_enabled()
+            and not torch.backends.cuda.cudnn_sdp_enabled()
+            and torch.cuda.get_device_capability(query.device)[0] == 9
+        ):
+            # Keep the existing Flash SDPA arithmetic while consuming all
+            # packed windows in one call, including ragged and empty windows.
+            # Call the Flash op directly: from torch 2.14, varlen_attn silently
+            # routes sm90/sm100 to cuDNN, which changes outputs versus the Flash path.
+            output, *_ = torch.ops.aten._flash_attention_forward(
+                query,
+                key,
+                value,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                0.0,
+                self.causal,
+                return_debug_mask=False,
+                scale=self.softmax_scale,
+                window_size_left=-1,
+                window_size_right=0 if self.causal else -1,
+            )
+            return output
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None
             else tuple(int(item) for item in cu_seqlens.tolist())
         )
+        lengths = {stop - start for start, stop in zip(bounds[:-1], bounds[1:])}
+        covers_query = bounds[0] == 0 and bounds[-1] == query.shape[0]
+        if (
+            type(self) is not SDPAImpl
+            and query.device.type != "mps"
+            and covers_query
+            and len(lengths) == 1
+            and 0 not in lengths
+        ):
+            # Subclasses (cuDNN SDPA) never take the native varlen op above, so
+            # equal segments (e.g. packed CFG pairs) run as one batch instead.
+            segments = len(bounds) - 1
+            output = self.forward(
+                query.reshape(segments, -1, *query.shape[1:]),
+                key.reshape(segments, -1, *key.shape[1:]),
+                value.reshape(segments, -1, *value.shape[1:]),
+                None,
+            )
+            return output.reshape(query.shape)
         output = torch.empty_like(query)
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if start == stop:
@@ -265,7 +347,7 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             except RuntimeError as e:
                 # cuDNN raises "No available kernel" for some shapes; pin the
                 # FA fail-safe path for this layer and keep going.
-                logger.warning(
+                logger.warning_once(
                     "cuDNN SDPA failed (%s); falling back to FlashAttention for %s.",
                     e,
                     type(self).__name__,

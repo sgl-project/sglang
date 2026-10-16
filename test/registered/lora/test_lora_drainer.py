@@ -10,7 +10,6 @@ from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
 )
-from sglang.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=52, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
@@ -33,9 +32,6 @@ def make_req(lora_id, wait_queue_entry_time, max_new_tokens, output_len=0):
 
 class TestLoRADrainer(unittest.TestCase):
     def test_update_draining_marks_adapter(self):
-        if is_in_ci():
-            return
-
         with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
             drainer = LoRADrainer(
                 max_loras_per_batch=1, max_wait_time_secs=LORA_DRAIN_WAIT_THRESHOLD
@@ -86,9 +82,6 @@ class TestLoRADrainer(unittest.TestCase):
             self.assertEqual(drainer.adapter_to_stats["C"].is_draining_for, "D")
 
     def test_can_schedule_respects_draining_tolerance(self):
-        if is_in_ci():
-            return
-
         with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
             drainer = LoRADrainer(
                 max_loras_per_batch=1, max_wait_time_secs=LORA_DRAIN_WAIT_THRESHOLD

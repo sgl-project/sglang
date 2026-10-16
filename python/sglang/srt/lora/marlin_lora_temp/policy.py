@@ -47,7 +47,6 @@ def validate_experimental_sgl_marlin_server_args(
         or cfg.enable_eplb
         or cfg.elastic_ep_backend is not None
         or cfg.enable_elastic_expert_backup
-        or cfg.elastic_ep_rejoin
     ):
         raise ValueError(
             "experimental_sgl_marlin EP requires trivial expert placement "

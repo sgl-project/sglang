@@ -14,7 +14,7 @@ without spec, then with spec) and runs four checks:
   2. distinct — each adapter's output differs from base (LoRA really applied)
   3. mixed    — a batch interleaving every adapter matches the solo outputs
                 (crossed verify segments serve a request the wrong adapter)
-  4. eager    — a batch wider than --cuda-graph-max-bs still matches
+  4. eager    — a batch wider than --cuda-graph-max-bs-decode still matches
                 (exercises the non-cuda-graph target-verify path)
 
 It also reports per-adapter accept length from each response's
@@ -99,7 +99,7 @@ CONFIGS = {
         common_args=[
             "--mem-fraction-static=0.7",
             "--max-lora-rank=128",
-            "--cuda-graph-max-bs=2",
+            "--cuda-graph-max-bs-decode=2",
         ],
         tp=1,
     ),
@@ -813,7 +813,7 @@ def main() -> int:
         "--wide-batch",
         type=int,
         default=16,
-        help="batch size for the eager-path check; keep it above --cuda-graph-max-bs",
+        help="batch size for the eager-path check; keep it above --cuda-graph-max-bs-decode",
     )
     parser.add_argument(
         "--lora-backend", help="override the config's LoRA kernel backend"

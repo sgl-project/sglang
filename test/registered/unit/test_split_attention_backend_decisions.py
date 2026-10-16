@@ -21,6 +21,8 @@ fallback applied. The tests below exercise the callable decisions directly.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.runtime_context import attention_backends, get_context
 from sglang.srt.server_args import ServerArgs
@@ -153,21 +155,26 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
     def test_the_flashinfer_version_guard_sees_a_split_launch(self):
         # The launcher runs before any publish, so it asks the record; the
         # member and the accessor answer the same pair.
-        args = ServerArgs.__new__(ServerArgs)
+        args = ServerArgs(model_path="dummy")
         for name, value in (
             ("attention_backend", None),
             ("prefill_attention_backend", None),
             ("decode_attention_backend", "flashinfer"),
         ):
-            object.__setattr__(args, name, value)
+            setattr(args, name, value)
         self.assertIn("flashinfer", attention_backends_of(resolved_view(args)))
 
     def test_support_triton_is_the_regression_being_guarded(self):
+        from sglang.srt.platforms.interface import PlatformCapabilities
         from sglang.srt.utils.common import support_triton
 
         # This is why a base-only read is not merely imprecise: the unset field
         # reads as "supported".
-        self.assertTrue(support_triton(None))
+        with mock.patch(
+            "sglang.srt.utils.common.current_platform",
+            SimpleNamespace(capabilities=PlatformCapabilities(supports_triton=True)),
+        ):
+            self.assertTrue(support_triton(None))
 
 
 class TestDraftFactoryStamping(CustomTestCase):
