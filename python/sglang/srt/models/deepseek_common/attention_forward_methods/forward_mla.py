@@ -254,6 +254,12 @@ class DeepseekMLAForwardMixin:
         """
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        # Custom preparation must see the absorbed query before FP8 packing.
+        if (
+            getattr(self.prepare_mla_qkv, "__func__", None)
+            is not DeepseekMLAForwardMixin.prepare_mla_qkv
+        ):
+            return None
         if llama_4_scaling is not None:
             return None
         if _is_hip or _is_cpu:

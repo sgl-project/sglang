@@ -20,13 +20,14 @@ MLA = forward_mla.DeepseekMLAForwardMixin
     "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY]
 )
 @pytest.mark.parametrize("reuse_indices", [False, True])
+@pytest.mark.parametrize("born_fp8", [False, True])
 def test_prepare_dispatches_hooks_and_preserves_index_reuse(
-    monkeypatch, mode, reuse_indices
+    monkeypatch, mode, reuse_indices, born_fp8
 ):
     torch.manual_seed(0)
-    rows, heads, rank, rope = 3, 2, 4, 2
+    rows, heads, rank, rope = 3, 2, 128 if born_fp8 else 4, 2
     latent = torch.randn(rows, rank + rank + rope)
-    query = torch.randn(rows, heads, rank + rope)
+    query = torch.randn(rows, heads, rank + rope).to(torch.bfloat16)
     positions = torch.arange(rows)
     hidden = torch.randn(rows, 8)
     batch = SimpleNamespace(forward_mode=mode)
@@ -49,7 +50,7 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         q_a_layernorm=lambda x: x,
         kv_a_layernorm=lambda x: x,
         q_b_proj_forward=lambda x: query,
-        w_kc=torch.randn(heads, rank, rank),
+        w_kc=torch.randn(heads, rank, rank).to(torch.bfloat16),
         rotary_emb=rotary,
         indexer=Mock(return_value=indices),
         current_attention_backend="dsa",
@@ -61,6 +62,7 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         "should_run_indexer",
         "_can_fuse_bmm_into_attention",
         "_make_mla_bmm_fusion_plan",
+        "_q8kv8_born_fp8_q_backend",
     ):
         setattr(attn, name, MethodType(getattr(MLA, name), attn))
     attn.run_mla_indexer = Mock(wraps=MethodType(MLA.run_mla_indexer, attn))
@@ -81,9 +83,17 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         lambda: SimpleNamespace(fetch_qkv_latent=lambda: latent),
     )
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
-    monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: True)
+    monkeypatch.setattr(
+        forward_mla, "is_graph_dsa_split_op_surface", lambda _: not born_fp8
+    )
     monkeypatch.setattr(forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
-    monkeypatch.setattr(forward_mla, "_ENABLE_DSA_Q8KV8_BORN_FP8_Q", False)
+    monkeypatch.setattr(forward_mla, "_ENABLE_DSA_Q8KV8_BORN_FP8_Q", born_fp8)
+    monkeypatch.setattr(forward_mla, "_is_cpu", False)
+    monkeypatch.setattr(forward_mla, "_is_hip", False)
+    monkeypatch.setattr(forward_mla, "get_tc_piecewise_forward_context", lambda: None)
+    monkeypatch.setattr(forward_mla, "is_in_breakable_cuda_graph", lambda: False)
+    backend = SimpleNamespace(q8kv8_born_fp8_q_eligible=lambda batch, heads: True)
+    monkeypatch.setattr(forward_mla, "get_attn_backend", lambda: backend)
     monkeypatch.setattr(
         forward_mla, "maybe_capture_indexer_topk", lambda layer, value: value
     )
@@ -128,6 +138,38 @@ def test_default_prepare_keeps_bmm_attention_fusion(monkeypatch):
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
     monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: True)
     assert MLA._can_fuse_bmm_into_attention(attn, SimpleNamespace())
+
+
+@pytest.mark.parametrize("custom_prepare", [False, True])
+def test_born_fp8_requires_default_query_preparation(monkeypatch, custom_prepare):
+    attn = SimpleNamespace(
+        current_attention_backend="dsa",
+        use_deep_gemm_bmm=False,
+        w_kc=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+        rotary_emb=Mock(),
+        _fuse_rope_for_trtllm_mla=lambda batch: False,
+        dcp_size=1,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        kv_lora_rank=128,
+        num_local_heads=2,
+    )
+    attn.prepare_mla_qkv = (
+        Mock() if custom_prepare else MethodType(MLA.prepare_mla_qkv, attn)
+    )
+    monkeypatch.setattr(forward_mla, "_is_cpu", False)
+    monkeypatch.setattr(forward_mla, "_is_hip", False)
+    monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
+    monkeypatch.setattr(forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
+    monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: False)
+    monkeypatch.setattr(forward_mla, "get_tc_piecewise_forward_context", lambda: None)
+    monkeypatch.setattr(forward_mla, "is_in_breakable_cuda_graph", lambda: False)
+    backend = SimpleNamespace(q8kv8_born_fp8_q_eligible=lambda batch, heads: True)
+    monkeypatch.setattr(forward_mla, "get_attn_backend", lambda: backend)
+
+    result = MLA._q8kv8_born_fp8_q_backend(attn, SimpleNamespace(), None)
+
+    assert result is (None if custom_prepare else backend)
 
 
 @pytest.mark.parametrize("piecewise", [False, True])
