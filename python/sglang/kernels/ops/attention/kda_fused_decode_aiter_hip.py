@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 _HEADS = 12
@@ -15,15 +14,7 @@ _WARMED: set[tuple[int, float, float]] = set()
 
 
 def enabled() -> bool:
-    return os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower() == "aiter"
-
-
-# (decode with fused f_b, support predicate): the SGLang-vendored names, then the
-# ones ROCm/aiter#6026 exports from aiter.ops.flydsl with the same signatures.
-_OP_NAMES = (
-    ("flydsl_kimi_k3_kda_decode_with_f_b", "is_flydsl_kimi_k3_kda_decode_supported"),
-    ("flydsl_kda_decode_with_f_b", "is_flydsl_kda_decode_supported"),
-)
+    return envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "aiter"
 
 
 def _ops():
@@ -36,13 +27,22 @@ def _ops():
         )
     except (ImportError, ModuleNotFoundError):
         return None, None
-    for run_name, supported_name in _OP_NAMES:
-        try:
-            return getattr(module, run_name), getattr(module, supported_name)
-        except (AttributeError, ImportError):
-            # aiter.ops.flydsl without ROCm/aiter#6026 has neither name.
-            continue
-    return None, None
+    # Vendored names, then the names ROCm/aiter#6026 exports from aiter.ops.flydsl.
+    try:
+        return (
+            module.flydsl_kimi_k3_kda_decode_with_f_b,
+            module.is_flydsl_kimi_k3_kda_decode_supported,
+        )
+    except AttributeError:
+        pass
+    try:
+        return (
+            module.flydsl_kda_decode_with_f_b,
+            module.is_flydsl_kda_decode_supported,
+        )
+    except AttributeError:
+        # aiter.ops.flydsl without ROCm/aiter#6026 has neither name.
+        return None, None
 
 
 def available(device: torch.device | None = None) -> bool:

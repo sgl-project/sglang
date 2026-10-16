@@ -513,13 +513,14 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
         _run(inputs)
 
 
-def test_fused_kda_backend_is_opt_in(monkeypatch):
+def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+    from sglang.srt.environ import envs
 
-    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
-    assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
-    assert kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override(""):
+        assert not kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
+        assert kda_fused_decode_aiter_hip.enabled()
 
 
 def test_aiter_source_resolves_rocm_aiter_6026_names(monkeypatch):
@@ -549,14 +550,16 @@ def test_aiter_source_resolves_rocm_aiter_6026_names(monkeypatch):
 @pytest.mark.parametrize("batch", [1, 8, 16])
 def test_vendored_and_aiter_f_b_decode_agree(batch: int) -> None:
     flydsl = pytest.importorskip("aiter.ops.flydsl")
-    if not hasattr(flydsl, "flydsl_kda_decode_with_f_b"):
+    try:
+        aiter_decode = flydsl.flydsl_kda_decode_with_f_b
+    except AttributeError:
         pytest.skip("aiter without ROCm/aiter#6026")
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     vendored_inputs = _copy_inputs(seed)
     aiter_inputs = _copy_inputs(seed)
 
     vendored = _run_with_f_b(f_a, f_b_weight, vendored_inputs)
-    aiter_out = flydsl.flydsl_kda_decode_with_f_b(
+    aiter_out = aiter_decode(
         f_a=f_a,
         f_b_weight=f_b_weight,
         x=aiter_inputs.x,

@@ -973,6 +973,11 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Fused AITER KDA decode. Empty keeps the unfused chain; "aiter" selects
+    # the gfx950 FlyDSL kernel.
+    SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
