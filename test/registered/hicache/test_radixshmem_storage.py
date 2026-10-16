@@ -4,6 +4,7 @@ import enum
 import hashlib
 import sys
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -133,6 +134,7 @@ class _FakeServer:
     def __init__(self):
         self.geometry = None
         self.index = None
+        self.down = False
 
     def configure(self, geometry):
         if self.geometry is None:
@@ -170,6 +172,8 @@ class _FakeClient:
             self.configure(geometry)
 
     def configure(self, geometry):
+        if self.server.down:
+            raise RuntimeError("UNAVAILABLE: failed to connect to all addresses")
         self.server.configure(geometry)
 
     def wait_ready(self, timeout_s):
@@ -365,10 +369,39 @@ class TestRadixShmemStorage(CustomTestCase):
             storage.register_mem_host_pool_v2(
                 _FakeHostPool(2, token_bytes=3 * TOKEN_BYTES), PoolName.SWA
             )
-        # Another engine with another page shape is refused by the server.
         other, _ = self._backend(pages=2)
-        with self.assertRaises(_GeometryMismatch):
-            other.batch_exists(_keys(1), _info([]))
+        other.register_mem_host_pool_v2(
+            _FakeHostPool(2, token_bytes=3 * TOKEN_BYTES), PoolName.INDEXER
+        )
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(other.batch_exists(_keys(1), _info([])), 0)
+        self.assertIn("_GeometryMismatch", logs.output[0])
+
+    def test_unavailable_server_degrades(self):
+        server = _FakeClient.servers.setdefault("test", _FakeServer())
+        server.down = True
+        storage, pool = self._backend()
+        storage.retry_s = 0.2
+        keys = _keys(2)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(storage.batch_exists(keys, _info([])), 0)
+            self.assertEqual(
+                storage.batch_set_v1(keys, _indices(2), _info([])), [False] * 2
+            )
+            self.assertEqual(
+                storage.batch_get_v1(keys, _indices(2), _info([])), [False] * 2
+            )
+        self.assertEqual(len(logs.output), 1)
+        server.down = False
+        self.assertEqual(storage.batch_exists(keys, _info([])), 0)
+        self.assertIsNone(storage.index)
+        time.sleep(0.25)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(
+                storage.batch_set_v1(keys, _indices(2), _info([])), [True] * 2
+            )
+        self.assertIn("reachable", logs.output[0])
+        self.assertEqual(storage.batch_exists(keys, _info([])), 2)
 
     def test_write_then_read_roundtrip(self):
         storage, pool = self._backend()

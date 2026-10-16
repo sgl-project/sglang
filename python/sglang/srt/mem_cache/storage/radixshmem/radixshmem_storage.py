@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import logging
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -165,6 +166,7 @@ class RadixShmemStorage(HiCacheStorage):
         self.max_outstanding = int(cfg.get("radixshmem_max_outstanding", 256))
         self.ready_timeout_s = float(cfg.get("radixshmem_timeout_s", 300))
         self.pull_timeout_ms = int(cfg.get("radixshmem_pull_timeout_ms", 30000))
+        self.retry_s = float(cfg.get("radixshmem_retry_s", 30))
         self.full = radixshmem.ComponentType.FULL
         self.full_mask = int(radixshmem.COMPONENT_MASK_FULL)
         self.components = {
@@ -188,6 +190,8 @@ class RadixShmemStorage(HiCacheStorage):
         self.slot_bytes = 0
         self.kind_slot_bytes: Dict[Any, int] = {}
         self._attach_lock = threading.Lock()
+        self._retry_at = 0.0
+        self._down_since: Optional[float] = None
         self.set_shard_groups(None, None)
 
     def read_barrier(self, go: bool) -> bool:
@@ -206,7 +210,7 @@ class RadixShmemStorage(HiCacheStorage):
         cp_parts: int = 1,
         leader_rank: int = 0,
     ) -> None:
-        if self.index is not None:
+        if self.pools:
             raise RuntimeError("radixshmem: shard groups must be set before first use")
         if (write_group is None) != (tp_parts * cp_parts == 1):
             raise ValueError("radixshmem: shard groups do not match the shard identity")
@@ -228,7 +232,7 @@ class RadixShmemStorage(HiCacheStorage):
 
     def _register(self, name, host_pool: Any) -> None:
         self.host_pools[name] = host_pool
-        if self.index is None:
+        if not self.pools:
             return
         pool = self._make_pool(name, host_pool, self.pools[PoolName.KV])
         if pool.slot_bytes > self.kind_slot_bytes.get(pool.kind, 0):
@@ -408,15 +412,15 @@ class RadixShmemStorage(HiCacheStorage):
             name, host_pool, page_bytes, parts, part, salt, kind, mask, layout, writes
         )
 
-    def _attach(self) -> None:
-        if self.index is not None:
+    def _plan(self) -> None:
+        if self.pools:
             return
         with self._attach_lock:
-            if self.index is not None:
+            if self.pools:
                 return
-            block_size = int(self.host_pools[PoolName.KV].page_size)
+            self.block_size = int(self.host_pools[PoolName.KV].page_size)
             if not self.swa_window_pages and PoolName.SWA in self.host_pools:
-                self.swa_window_pages = self._swa_window(block_size)
+                self.swa_window_pages = self._swa_window(self.block_size)
             anchor = self._make_pool(PoolName.KV, self.host_pools[PoolName.KV], None)
             pools = {
                 name: anchor
@@ -427,70 +431,118 @@ class RadixShmemStorage(HiCacheStorage):
             sizes: Dict[Any, int] = {}
             for p in pools.values():
                 sizes[p.kind] = max(sizes.get(p.kind, 0), p.slot_bytes)
-            slot_bytes = sizes.get(self.full, 0)
-            if slot_bytes == 0:
+            if sizes.get(self.full, 0) == 0:
                 raise RuntimeError("radixshmem: no registered host pool carries data")
-            swa_kind, _ = self.components[PoolName.SWA]
-            mamba_kind, _ = self.components[PoolName.MAMBA]
-            client = self.radixshmem.RadixClient(
-                self.server_name,
-                endpoint=self.endpoint,
-                max_outstanding=self.max_outstanding,
-                local_read_only=not self.leader,
-            )
+            self.slot_bytes = sizes[self.full]
+            self.kind_slot_bytes = sizes
+            self.pools = pools
+
+    def _ready(self) -> bool:
+        self._plan()
+        if self.index is not None:
+            return True
+        if time.monotonic() < self._retry_at:
+            return False
+        with self._attach_lock:
+            if self.index is not None:
+                return True
+            if time.monotonic() < self._retry_at:
+                return False
+            try:
+                self._connect()
+            except Exception as e:
+                self._retry_at = time.monotonic() + self.retry_s
+                if self._down_since is None:
+                    self._down_since = time.monotonic()
+                    logger.warning(
+                        "radixshmem: server %s unavailable (%s: %s); storage calls "
+                        "miss, retrying every %.0f s",
+                        self.server_name,
+                        type(e).__name__,
+                        str(e).splitlines()[0][:200] if str(e) else "",
+                        self.retry_s,
+                    )
+                else:
+                    logger.debug(
+                        "radixshmem: server %s still unavailable: %s",
+                        self.server_name,
+                        e,
+                    )
+                return False
+            if self._down_since is not None:
+                logger.warning(
+                    "radixshmem: server %s reachable after %.0f s",
+                    self.server_name,
+                    time.monotonic() - self._down_since,
+                )
+                self._down_since = None
+            return True
+
+    def _connect(self) -> None:
+        swa_kind, _ = self.components[PoolName.SWA]
+        mamba_kind, _ = self.components[PoolName.MAMBA]
+        sizes = self.kind_slot_bytes
+        client = self.radixshmem.RadixClient(
+            self.server_name,
+            endpoint=self.endpoint,
+            max_outstanding=self.max_outstanding,
+            local_read_only=not self.leader,
+        )
+        try:
             client.configure(
                 self.radixshmem.Geometry(
-                    block_size=block_size,
-                    full_slot_bytes=slot_bytes,
+                    block_size=self.block_size,
+                    full_slot_bytes=self.slot_bytes,
                     swa_slot_bytes=sizes.get(swa_kind, 0),
                     swa_window_blocks=self.swa_window_pages if swa_kind in sizes else 0,
                     mamba_slot_bytes=sizes.get(mamba_kind, 0),
                 )
             )
             info = client.wait_ready(self.ready_timeout_s)
-            self.client = client
-            self.store = client.store
-            self._data_view = self.store.data_view()
-            self._data_base = np.frombuffer(self._data_view, dtype=np.uint8).ctypes.data
-            self._data = torch.frombuffer(self._data_view, dtype=torch.uint8)
-            self.distributed = self.leader and bool(client.is_distributed())
-            self.block_size = block_size
-            self.slot_bytes = slot_bytes
-            self.kind_slot_bytes = sizes
-            self.pools = pools
-            logger.info(
-                "RadixShmemStorage ready: tp part %d/%d, cp %d/%d, leader=%s "
-                "block_size=%d slot_bytes=%d slots=%d distributed=%s pools=%s",
-                self.tp_part,
-                self.tp_parts,
-                self.cp_rank,
-                self.cp_parts,
-                self.leader,
-                block_size,
-                slot_bytes,
-                info.geometry["pools"]["full"]["num_slots"],
-                self.distributed,
-                {
-                    str(n): (str(p.kind), p.page_bytes, p.slot_bytes)
-                    for n, p in pools.items()
-                },
-            )
-            self.index = client.index
+            store = client.store
+            index = client.index
+        except Exception:
+            client.close()
+            raise
+        self.client = client
+        self.store = store
+        self._data_view = store.data_view()
+        self._data_base = np.frombuffer(self._data_view, dtype=np.uint8).ctypes.data
+        self._data = torch.frombuffer(self._data_view, dtype=torch.uint8)
+        self.distributed = self.leader and bool(client.is_distributed())
+        logger.info(
+            "RadixShmemStorage ready: tp part %d/%d, cp %d/%d, leader=%s "
+            "block_size=%d slot_bytes=%d slots=%d distributed=%s pools=%s",
+            self.tp_part,
+            self.tp_parts,
+            self.cp_rank,
+            self.cp_parts,
+            self.leader,
+            self.block_size,
+            self.slot_bytes,
+            info.geometry["pools"]["full"]["num_slots"],
+            self.distributed,
+            {
+                str(n): (str(p.kind), p.page_bytes, p.slot_bytes)
+                for n, p in self.pools.items()
+            },
+        )
+        self.index = index
 
     # ---- HiCacheStorage: KV pool ----
 
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        self._attach()
+        self._plan()
         return self._hit(self.pools[PoolName.KV], keys, extra_info)
 
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
-        self._attach()
+        self._plan()
         return self._store(self.pools[PoolName.KV], keys, host_indices, extra_info)
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
-        self._attach()
+        self._plan()
         return self._load(self.pools[PoolName.KV], keys, host_indices, extra_info)
 
     # ---- HiCacheStorage: extra pools ----
@@ -535,11 +587,11 @@ class RadixShmemStorage(HiCacheStorage):
         return PoolTransferResult(final, hits, restorable)
 
     def batch_set_v2(self, transfers, extra_info=None) -> dict:
-        self._attach()
+        self._plan()
         return {t.name: self._write_transfer(t, extra_info) for t in transfers}
 
     def batch_get_v2(self, transfers, extra_info=None) -> dict:
-        self._attach()
+        self._plan()
         return {t.name: self._read_transfer(t, extra_info) for t in transfers}
 
     def _write_transfer(self, transfer: PoolTransfer, extra_info) -> List[bool]:
@@ -642,9 +694,10 @@ class RadixShmemStorage(HiCacheStorage):
     ) -> List[bool]:
         if not pool.sharded and not self.leader:
             return [True] * n
+        ready = self._ready()
         comm = self.write_comm if pool.sharded else _Solo()
         buf = torch.full((n + 1,), -1, dtype=torch.int64)
-        if self.leader:
+        if self.leader and ready:
             slots = self._allocate(n, pool.kind)
             if slots is not None:
                 buf[0] = 1
@@ -654,7 +707,9 @@ class RadixShmemStorage(HiCacheStorage):
             return [False] * n
         slots = buf[1:].numpy().astype(np.int32)
         ok = torch.ones(1, dtype=torch.int64)
-        if pool.writes:
+        if pool.writes and not ready:
+            ok[0] = 0
+        elif pool.writes:
             try:
                 copy(slots)
             except Exception:
@@ -681,9 +736,10 @@ class RadixShmemStorage(HiCacheStorage):
         fetch: Callable[[], Tuple[Sequence[int], List[Callable]]],
         copy: Callable[[List[Tuple[int, int]]], None],
     ) -> List[bool]:
+        ready = self._ready()
         buf = torch.full((n,), -1, dtype=torch.int64)
         finalizers: List[Callable] = []
-        if self.leader:
+        if self.leader and ready:
             try:
                 slots, finalizers = fetch()
                 if len(slots):
@@ -695,11 +751,14 @@ class RadixShmemStorage(HiCacheStorage):
         self.read_comm.bcast(buf)
         slots = buf.numpy()
         ok = torch.from_numpy((slots >= 0).astype(np.int64))
-        try:
-            copy([(i, int(s)) for i, s in enumerate(slots) if s >= 0])
-        except Exception:
-            logger.exception("radixshmem: copy out of slots failed")
+        if not ready:
             ok.zero_()
+        else:
+            try:
+                copy([(i, int(s)) for i, s in enumerate(slots) if s >= 0])
+            except Exception:
+                logger.exception("radixshmem: copy out of slots failed")
+                ok.zero_()
         self.read_comm.min(ok)
         for finalize in finalizers:
             finalize()
@@ -762,6 +821,8 @@ class RadixShmemStorage(HiCacheStorage):
             return 0
         if pool.slot_bytes == 0 or not self.leader:
             return len(keys)
+        if not self._ready():
+            return 0
         chain, start = self._chain(pool, keys, extra_info)
         return max(0, min(self._query(chain) - start, len(keys)))
 
@@ -809,6 +870,8 @@ class RadixShmemStorage(HiCacheStorage):
             return 0
         if not self.leader:
             return len(keys)
+        if not self._ready():
+            return 0
         chain, start = self._chain(pool, keys, extra_info)
         q = self.index.query(
             chain,
@@ -890,6 +953,8 @@ class RadixShmemStorage(HiCacheStorage):
     def _present(self, pool: _Pool, keys, extra_info=None) -> List[bool]:
         if not self.leader:
             return [True] * len(keys)
+        if not self._ready():
+            return [False] * len(keys)
         return [self._query(self._single(pool, key, extra_info)) == 1 for key in keys]
 
     def _store_pages(self, pool: _Pool, keys, host_indices) -> List[bool]:
@@ -933,8 +998,7 @@ class RadixShmemStorage(HiCacheStorage):
     # ---- misc ----
 
     def clear(self) -> bool:
-        self._attach()
-        if self.leader:
+        if self.leader and self._ready():
             self.index.reset()
         return True
 
