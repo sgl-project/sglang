@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
+    BufferLoadBackContext,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -67,7 +68,9 @@ class MambaComponent(TreeComponent):
         assert isinstance(params.req_to_token_pool, HybridReqToTokenPool), (
             f"MambaComponent requires HybridReqToTokenPool, got {type(params.req_to_token_pool)}"
         )
-        if not params.enable_mamba_extra_buffer:
+        # Without the extra buffer only the sequence-end state exists, so a cached
+        # state needs page 1; a disabled tree caches none.
+        if not params.enable_mamba_extra_buffer and not params.disable:
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
@@ -163,7 +166,7 @@ class MambaComponent(TreeComponent):
     ) -> MatchResult:
         last_node = result.best_match_node
 
-        mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+        mamba_boundary_len = result.device_prefix_len + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
@@ -536,6 +539,28 @@ class MambaComponent(TreeComponent):
         else:
             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
+    def _select_finished_checkpoint(
+        self, req: Req, token_ids_len: int
+    ) -> Optional[tuple[int, int]]:
+        # None means donate nothing, not "no slot found".
+        pool = self.cache.req_to_token_pool
+        keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
+        cache_len = req.kv.mamba_last_track_seqlen or 0
+
+        if cache_len <= token_ids_len:
+            return cache_len, keep_idx
+
+        # Overshoot: the latest state ran past the key. The other slot always
+        # holds a tensor; only this seqlen says whether a key can name it.
+        previous_cache_len = req.kv.mamba_prev_track_seqlen
+        if (
+            pool.mamba_ping_pong_track_buffer_size != 2
+            or previous_cache_len is None
+            or previous_cache_len > token_ids_len
+        ):
+            return None
+        return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -564,9 +589,11 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
-                    req
-                )
+                checkpoint = self._select_finished_checkpoint(req, token_ids_len)
+                if checkpoint is None:
+                    return 0
+                cache_len, keep_idx = checkpoint
+                insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
@@ -639,11 +666,11 @@ class MambaComponent(TreeComponent):
                 return
 
             if self.cache.enable_mamba_extra_buffer:
-                keep_idx = (
-                    pool.get_mamba_ping_pong_keep_idx(req)
-                    if mamba_value_inserted
-                    else None
+                # Keep the slot prepare picked, so cleanup cannot pick another.
+                prepared_keep_idx = (
+                    insert_params.mamba_keep_idx if insert_params is not None else None
                 )
+                keep_idx = prepared_keep_idx if mamba_value_inserted else None
                 pool.free_mamba_cache(
                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )
@@ -657,6 +684,7 @@ class MambaComponent(TreeComponent):
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.kv.mamba_last_track_seqlen = None
+            req.kv.mamba_prev_track_seqlen = None
 
     def build_external_linker_transfer(
         self,
@@ -684,13 +712,18 @@ class MambaComponent(TreeComponent):
             )
         ):
             return PrepareLoadBackResult()
+        dst = self._alloc_request_state_slot(req)
+        assert dst is not None, "Cannot alloc mamba for load_back"
+        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
-        req.kv.mamba_pool_idx = dst[0]
-        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+        if dst is not None:
+            req.kv.mamba_pool_idx = dst[0]
+        return dst
 
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
@@ -699,6 +732,23 @@ class MambaComponent(TreeComponent):
         if not success and prep.allocated_mamba_slot is not None:
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
+
+    def prepare_buffer_load_back(
+        self, req: Req, staged: list[PoolTransfer]
+    ) -> Optional[BufferLoadBackContext]:
+        node_copy = next((t for t in staged if t.name == PoolName.MAMBA), None)
+        assert (
+            node_copy is not None
+            and node_copy.host_indices is not None
+            and node_copy.host_indices.numel() == 1
+        ), "Mamba buffer load-back requires one staged checkpoint"
+        prep = PrepareLoadBackResult()
+        if not req.kv.holds_mamba:
+            dst = self._alloc_request_state_slot(req)
+            if dst is None:
+                return None
+            prep = PrepareLoadBackResult(allocated_mamba_slot=dst)
+        return _MambaBufferLoadBackContext(self, req, node_copy, prep)
 
     def prepare_prefetch(
         self,
@@ -955,3 +1005,52 @@ class MambaComponent(TreeComponent):
         raise AssertionError(
             f"MambaComponent: unhandled ComponentAction {type(action).__name__}"
         )
+
+
+class _MambaBufferLoadBackContext(BufferLoadBackContext):
+    """Loads the staged state into the published node's slot and, layer-gated,
+    into the request's own: a device CoW would run before the layer gate."""
+
+    def __init__(
+        self,
+        component: MambaComponent,
+        req: Req,
+        node_copy: PoolTransfer,
+        prep: PrepareLoadBackResult,
+    ):
+        self.component = component
+        self.req = req
+        self.node_copy = node_copy
+        self.prep = prep
+        self.load_xfers = (
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=node_copy.host_indices,
+                device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
+            ),
+        )
+
+    def finalize_allocation(self, success: bool) -> None:
+        req = self.req
+        if not success:
+            self.component.finalize_load_back(req, self.prep, success=False)
+            return
+        # The H2D supersedes the replay cursor and the deferred CoW/clear.
+        req_to_token_pool = self.component.cache.req_to_token_pool
+        write_pos = req_to_token_pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None:
+            slot = req.kv.mamba_pool_idx.unsqueeze(0)
+            write_pos[req_to_token_pool.translate_mamba_indices(slot)] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+
+    def get_insert_fields(self) -> dict[str, torch.Tensor]:
+        return {"mamba_value": self.node_copy.device_indices}
+
+    def get_redundant_device_slots(
+        self, insert_result: InsertResult
+    ) -> list[tuple[PoolName, torch.Tensor]]:
+        # A SWA-only repair can keep the tail's existing checkpoint.
+        if not insert_result.mamba_exist:
+            return []
+        return [(PoolName.MAMBA, self.node_copy.device_indices)]

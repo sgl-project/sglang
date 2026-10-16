@@ -88,6 +88,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         slots = torch.arange(batch_size + 1, 1, -1, device="cuda", dtype=torch.int32)
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.arange(batch_size, device="cuda", dtype=torch.int32),
             spec_info=SimpleNamespace(draft_token_num=steps, ragged_verify_layout=None),
         )
         rounds = [
@@ -132,6 +133,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         # conv rollback below all use the production backend and GPU kernels.
         backend = KDAAttnBackend.__new__(KDAAttnBackend)
         backend.req_to_token_pool = SimpleNamespace(
+            size=state.temporal.shape[1],
             mamba2_layer_cache=state.at_layer_idx,
             get_speculative_mamba2_params_all_layers=lambda: state,
             mamba_pool=SimpleNamespace(replayssm_is_kda=ring),

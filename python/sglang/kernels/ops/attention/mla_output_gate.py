@@ -12,13 +12,11 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _THREADS: int = 256
-_is_npu = is_npu()
 
 
 @cache_once
@@ -35,7 +33,8 @@ def _jit_mla_output_gate_module() -> Module:
 
 def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
     return (
-        not _is_npu
+        x.is_cuda
+        and gate.is_cuda
         and x.dtype == torch.bfloat16
         and gate.dtype == torch.bfloat16
         and x.shape == gate.shape

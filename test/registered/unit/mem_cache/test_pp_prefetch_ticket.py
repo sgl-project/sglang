@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
@@ -34,8 +38,18 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
-        c.pp_rank = c.tp_rank = 0
-        c.pp_size, c.tp_size = 4, 2
+        c.storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=4,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name=None,
+        )
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
         c.pp_prefetch_command_thread = None
         c.prefetch_hits_sync_groups = c.prefetch_completion_sync_groups = ["pp", "tp"]
@@ -61,7 +75,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         patcher = patch.object(
-            torch.distributed, "get_rank", side_effect=lambda: c.pp_rank * 2 + c.tp_rank
+            torch.distributed,
+            "get_rank",
+            side_effect=lambda: c.storage_config.pp_rank * 2 + c.storage_config.tp_rank,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -98,7 +114,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.c.pp_prefetch_command_queue.put(None)
 
         def broadcast(objects, *args, **kwargs):
-            return [next(commands)] if self.c.pp_rank else objects
+            return [next(commands)] if self.c.storage_config.pp_rank else objects
 
         with patch(f"{HybridCacheController.__module__}.broadcast_pyobj", broadcast):
             self.c.pp_prefetch_command_thread_func()
@@ -179,7 +195,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         handle = CacheRequestHandle("hit", 3)
         ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
         ticket.last_hash = None
-        c.pp_rank = 1
+        c.storage_config.pp_rank = 1
         c.pp_prefetch_states.clear()
         cache.bind_prefetch_ticket("hit")
         self.assertFalse(cache.check_prefetch_progress(handle))
@@ -216,7 +232,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         ticket = c.pp_prefetch_states.pop("hit").ticket
         following = pickle.loads(pickle.dumps(ticket))
         following.handle = CacheRequestHandle("next", 0)
-        c.pp_rank = 1
+        c.storage_config.pp_rank = 1
         kv = torch.arange(8)
         c.mem_pool_host.alloc.side_effect = [
             kv,
@@ -257,7 +273,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c, cache = self.c, self.cache
         self.submit(pools=[PoolTransfer(PoolName.SWA, host_indices=torch.arange(4))])
         ticket = c.pp_prefetch_states.pop("hit").ticket
-        c.pp_rank = 1
+        c.storage_config.pp_rank = 1
         cache.bind_prefetch_ticket("hit")
         cache.finish(ticket.handle, CacheRequestOutcome.ABORT)
         cache.finish(ticket.handle, CacheRequestOutcome.ABORT)
@@ -290,7 +306,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
         for rank in (0, 1):
             with self.subTest(rank=rank):
-                c.pp_rank = rank
+                c.storage_config.pp_rank = rank
                 if rank:
                     c.pp_prefetch_states.clear()
                 c.mem_pool_host.alloc.reset_mock()
@@ -358,7 +374,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
     def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
         c = self.c
-        c.tp_rank = 1  # The source is a global rank, not pp_rank=0.
+        c.storage_config.tp_rank = 1  # The source is a global rank, not pp_rank=0.
         operation = self.submit().operation
         c.pp_prefetch_command_queue.put(None)
         get = c.pp_prefetch_command_queue.get
@@ -397,7 +413,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c = self.c
         self.submit()
         ticket = c.pp_prefetch_states.pop("hit").ticket
-        c.pp_rank = 1
+        c.storage_config.pp_rank = 1
         with (
             patch(
                 f"{HybridCacheController.__module__}.broadcast_pyobj",

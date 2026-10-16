@@ -45,9 +45,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -73,7 +74,7 @@ from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -154,7 +155,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            reduce_results=True,
+            reduce_results=False,
             prefix=add_prefix(f"mlps", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -162,17 +163,12 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
-                declare_ffn(sparse=False, next_sparse=False),
+                declare_ffn(sparse=False, next_layer_sparse=False),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn() if self.layer_id != 0 else None,
-            terminal=self.layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -195,7 +191,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.ffn_boundary.postprocess(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 
@@ -227,9 +223,10 @@ class LongcatFlashModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("eh_proj", ""),
         )
-        self.decoder = LongcatFlashDenseDecoderLayer(
-            config, 0, quant_config=quant_config, alt_stream=self.alt_stream
-        )
+        with layer_stack():
+            self.decoder = LongcatFlashDenseDecoderLayer(
+                config, 0, quant_config=quant_config, alt_stream=self.alt_stream
+            )
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -275,7 +272,7 @@ class LongcatFlashModelNextN(nn.Module):
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.final_layernorm
             )
         return hidden_states

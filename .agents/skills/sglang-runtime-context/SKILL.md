@@ -227,7 +227,7 @@ slack (`>= len(...) - 1`) or compared key names instead of value sources.
 read-through over the canonical getters, so they answer with the live process
 groups. Everything else — `tp_size`, `pp_size`, `attn_cp_size`, `dcp_size`,
 `moe_dp_size` included, alongside config-only leaves like `nccl_port`,
-`enable_dp_attention`, `dp_size`, `ep_size`, `dwdp_size` — is answered from the
+`dp_size`, `ep_size`, `dwdp_size` — is answered from the
 published `parallel` bag. Reading a leaf before publish raises a `ValueError`
 naming the namespace; an unknown name is an `AttributeError`.
 

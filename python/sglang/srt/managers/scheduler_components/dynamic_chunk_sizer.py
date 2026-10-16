@@ -131,16 +131,25 @@ class DynamicChunkSizer:
         return predicted_size
 
     def _profile_prefill_latency(self) -> Tuple[List[int], List[float]]:
+        from sglang.srt.model_executor.runner_utils.buffers import (
+            allocate_pp_proxy_tensors,
+        )
+
         seq_lens: List[int] = []
         latencies: List[float] = []
         model_runner = self.model_runner
         model_config = model_runner.model_config
         input_ids_list: List[array[int]] = []
+        # Each sample is a complete request. Allocating past its mapping row
+        # would leave KV slots that release_kv_cache cannot address.
+        max_profile_tokens = min(
+            int(self.chunked_prefill_size * 1.25),
+            model_config.context_len,
+            self.req_to_token_pool.max_context_len,
+        )
+        step = max(1, max_profile_tokens // 128)
         for i in range(128):
-            chunk_size = int(
-                self.chunked_prefill_size * 1.25
-                - i * (self.chunked_prefill_size * 1.25 // 128)
-            )
+            chunk_size = max_profile_tokens - i * step
             if chunk_size <= 0:
                 break
             input_ids = array(
@@ -169,12 +178,8 @@ class DynamicChunkSizer:
             # Walk the same match -> lock -> alloc lifecycle as a scheduled
             # request so release_kv_cache can release it symmetrically.
             req.init_next_round_input(self.tree_cache)
-            req.lock_receipt = self.tree_cache.inc_lock_ref(
-                req.last_node
-            ).to_dec_params()
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
+            req.lock = self.tree_cache.lock(req.last_node)
+            req.extend_end = len(req.full_untruncated_fill_ids)
 
             # Prepare batch
             batch = ScheduleBatch.init_new(
@@ -187,39 +192,28 @@ class DynamicChunkSizer:
                 self.spec_algorithm,
             )
 
-            current_seq_len = req.extend_range.end
+            current_seq_len = req.extend_end
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.
-                dp_size = get_parallel().attn_dp_size
-                global_num_tokens = [0] * dp_size
+                global_num_tokens = [0] * get_parallel().attn_dp_size
                 dp_rank = get_parallel().attn_dp_rank
                 global_num_tokens[dp_rank] = current_seq_len
                 batch.global_num_tokens = global_num_tokens
                 batch.global_num_tokens_for_logprob = global_num_tokens
 
-            hs = (
-                getattr(model_config, "hc_hidden_size", None)
-                or model_config.hidden_size
-            )
-            proxy_tensors = {
-                "hidden_states": torch.zeros(
-                    (current_seq_len, hs),
+            # Keyed and shaped like the runner's PP buffers.
+            with torch.device(self.device):
+                proxy_tensors = allocate_pp_proxy_tensors(
+                    max_num_tokens=current_seq_len,
+                    max_hidden_tokens=current_seq_len,
+                    hidden_size=model_config.hidden_size,
                     dtype=model_config.dtype,
-                    device=self.device,
-                ),
-                "residual": torch.zeros(
-                    (current_seq_len, model_config.hidden_size),
-                    dtype=model_config.dtype,
-                    device=self.device,
-                ),
-            }
-            pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
-            if pp_proxy_topk_size is not None:
-                proxy_tensors["topk_indices"] = torch.zeros(
-                    (current_seq_len, pp_proxy_topk_size),
-                    dtype=torch.int32,
-                    device=self.device,
+                    hc_hidden_size=getattr(model_config, "hc_hidden_size", None),
+                    pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
+                    pp_proxy_residual_num_blocks=(
+                        model_runner.get_pp_proxy_residual_num_blocks()
+                    ),
                 )
 
             pp_proxy = PPProxyTensors(proxy_tensors)
@@ -232,35 +226,36 @@ class DynamicChunkSizer:
             start = time.perf_counter()
             batch.prepare_for_extend()
 
-            # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
-            if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
-                batch.input_ids = batch.prefill_input_ids_cpu.to(
-                    self.device, non_blocking=True
+            try:
+                # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
+                if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+                    batch.input_ids = batch.prefill_input_ids_cpu.to(
+                        self.device, non_blocking=True
+                    )
+                    batch.prefill_input_ids_cpu = None
+
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    model_runner,
+                    return_hidden_states_before_norm=False,
                 )
-                batch.prefill_input_ids_cpu = None
+                set_is_extend_in_batch(batch.forward_mode.is_extend())
 
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                model_runner,
-                return_hidden_states_before_norm=False,
-            )
-            set_is_extend_in_batch(batch.forward_mode.is_extend())
+                _ = model_runner.forward(
+                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
+                )
 
-            _ = model_runner.forward(
-                forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
-            )
+                # Synchronize after forward to ensure GPU operations complete
+                device_module.synchronize()
 
-            # Synchronize after forward to ensure GPU operations complete
-            device_module.synchronize()
-
-            latency_seconds = time.perf_counter() - start
-            latency_ms = latency_seconds * 1e3  # Convert to milliseconds
-            seq_lens.append(len(input_ids))
-            latencies.append(latency_ms)
-
-            # Release KV and Mamba cache
-            if req.kv.holds_kv:
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                latency_seconds = time.perf_counter() - start
+                latency_ms = latency_seconds * 1e3  # Convert to milliseconds
+                seq_lens.append(len(input_ids))
+                latencies.append(latency_ms)
+            finally:
+                # Profiling failures disable the predictor; they must still
+                # return the synthetic request's KV and recurrent state.
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         logger.info(
             f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "

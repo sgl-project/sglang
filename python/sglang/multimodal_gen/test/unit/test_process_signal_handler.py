@@ -5,6 +5,7 @@ import os
 import signal
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROCESS_PATH = Path(__file__).parents[2] / "runtime" / "utils" / "process.py"
 SPEC = importlib.util.spec_from_file_location("multimodal_process", PROCESS_PATH)
@@ -45,7 +46,25 @@ class TestKillProcessTreeSignalHandler(unittest.TestCase):
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            os.waitpid(child_pid, 0)
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                # psutil.wait_procs may already have reaped the child.
+                pass
+
+    def test_wait_timeout_preserves_handler(self):
+        parent = mock.Mock(pid=12345)
+        parent.children.return_value = []
+        with (
+            mock.patch.object(PROCESS.psutil, "Process", return_value=parent),
+            mock.patch.object(
+                PROCESS.psutil, "wait_procs", return_value=([], [parent])
+            ) as wait,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not exit"):
+                PROCESS.kill_process_tree(parent.pid, wait_timeout=0.01)
+        wait.assert_called_once_with([parent], timeout=0.01)
+        self.assertIs(signal.getsignal(signal.SIGCHLD), self.handler)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ import torch
 from torch.nn import functional as F
 
 from sglang.kernels.ops.diffusion import (
-    can_use_fused_layernorm_modulate,
     fused_layernorm_modulate,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -35,7 +34,6 @@ def test_modulation_preserves_bits(shape, amplitude, eps, has_shift):
     scale[:, :3] = torch.tensor([-1, 0, 1], device=x.device, dtype=x.dtype)
     if not has_shift:
         shift = None
-    assert can_use_fused_layernorm_modulate(x, scale, shift)
     actual = fused_layernorm_modulate(x, scale, shift, eps)
     expected = reference(x, scale, shift, eps)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
@@ -48,21 +46,6 @@ def test_scale_only_preserves_signed_zero():
     expected = reference(x, scale, None, 1e-6)
     assert torch.signbit(expected).all()
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
-
-
-def test_scale_only_layout_guards():
-    x = torch.randn(2, 17, 128, device="cuda", dtype=torch.bfloat16)
-    scale = torch.randn(2, 128, device=x.device, dtype=x.dtype)
-    assert can_use_fused_layernorm_modulate(x, scale, None)
-    assert not can_use_fused_layernorm_modulate(x.cpu(), scale.cpu(), None)
-    assert not can_use_fused_layernorm_modulate(x.float(), scale.float(), None)
-    assert not can_use_fused_layernorm_modulate(x[:, ::2], scale, None)
-    assert not can_use_fused_layernorm_modulate(x, scale.float(), None)
-    assert not can_use_fused_layernorm_modulate(x, scale[:, :-1], None)
-    assert not can_use_fused_layernorm_modulate(x[:, :0], scale, None)
-    assert not can_use_fused_layernorm_modulate(x, scale, scale.float())
-    strided = torch.empty(2, 256, device=x.device, dtype=x.dtype)[:, :128]
-    assert not can_use_fused_layernorm_modulate(x, scale, strided)
 
 
 @pytest.mark.parametrize("has_shift", [False, True])

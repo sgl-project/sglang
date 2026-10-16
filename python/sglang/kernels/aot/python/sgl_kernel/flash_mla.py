@@ -14,6 +14,9 @@ _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
 
+# 512 fp8 values + 4 fp32 scales; FlashMLA's V4.1 format has the same size.
+_V32_NO_ROPE_BYTES_PER_TOKEN = 528
+
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -103,6 +106,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    kv_format: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -119,6 +123,7 @@ def flash_mla_with_kvcache(
         descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
         is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
         indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
+        kv_format: Optional[str]. Sparse attention only: the layout of `k_cache` ("V32", "V32_NO_ROPE", "V4", "V41"). When omitted it is detected from the shape. V3.2-no-RoPE and V4.1 are both 528 bytes per token with head_dim 512: with FlashMLASchedMeta such a cache is read as V41, with tensor tile_scheduler_metadata as V32_NO_ROPE.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -147,6 +152,7 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            kv_format=kv_format,
         )
 
     assert num_splits is not None
@@ -163,7 +169,34 @@ def flash_mla_with_kvcache(
         "descale_q and descale_k should be both None or both not None"
     )
 
-    if indices is None and q.element_size() == 1:
+    if indices is not None:
+        assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
+        # The tensor-metadata API predates V4.1, so its 528 B/token cache is V3.2 without RoPE.
+        if (
+            kv_format is None
+            and q.shape[-1] == 512
+            and k_cache.shape[-1] == _V32_NO_ROPE_BYTES_PER_TOKEN
+        ):
+            kv_format = "V32_NO_ROPE"
+        out, softmax_lse, _, _ = torch.ops.sgl_kernel.sparse_decode_fwd.default(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            tile_scheduler_metadata,
+            num_splits,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            head_dim_v,
+            softmax_scale,
+            kv_format,
+        )
+        return out, softmax_lse
+
+    assert kv_format is None, "kv_format only applies to sparse attention"
+    if q.element_size() == 1:
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
             q,
             k_cache,
@@ -189,7 +222,7 @@ def flash_mla_with_kvcache(
             tile_scheduler_metadata,
             num_splits,
             is_fp8_kvcache,
-            indices,
+            None,
             attn_sink,
             extra_k_cache,
             extra_indices_in_kvcache,
@@ -216,6 +249,7 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    kv_format: Optional[str],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -279,9 +313,11 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
+                kv_format,
             )
         )
     else:
+        assert kv_format is None, "kv_format only applies to sparse attention"
         assert block_table is not None and cache_seqlens is not None
         assert attn_sink is None
         assert extra_k_cache is None

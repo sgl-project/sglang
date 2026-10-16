@@ -6,10 +6,14 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     _eager_temb_table_slices,
     _wan_temb_table_slices,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 class TestWanTembTableSlices(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @unittest.skipUnless(
+        torch.cuda.is_available() and current_platform.is_cuda(),
+        "requires NVIDIA CUDA fusion",
+    )
     def test_fused_matches_eager_and_is_contiguous(self):
         torch.manual_seed(0)
         for batch, seq, hidden in [(1, 517, 3072), (2, 64, 1536)]:
