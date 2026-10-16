@@ -1,6 +1,5 @@
 """The verify attention-boundary megakernel (T = 8 and 16) on TP4 against the
-stock sequence after attention: O-projection, all-reduce, norm/residual, pooler,
-NVFP4 quant, router and top-8.
+stock sequence after the pre-FFN norm: pooler, NVFP4 quant, router and top-8.
 
 Run with ``python <this file>``; it relaunches itself under torchrun on 4 GPUs.
 """
@@ -19,7 +18,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from sglang.kernels.ops.muse_spark.norm_fp4_quant import fused_norm_fp4_quant
-from sglang.kernels.ops.muse_spark.norm_residual import fused_norm_residual
 from sglang.kernels.ops.muse_spark.routing import fused_muse_spark_routing
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -56,7 +54,7 @@ pytestmark = [
 ]
 
 HIDDEN, EXPERT_HIDDEN, EXPERTS, TOPK = 8192, 4096, 256, 8
-POST_EPS, NORM_EPS = 1.0e-8, 1.0e-5
+NORM_EPS = 1.0e-5
 MULT, ROUTE_EPS, GSI = 1.0 / math.sqrt(32.0), 1.0e-15, 1.0 / (448.0 * 6.0)
 
 
@@ -73,8 +71,6 @@ def _init_group_once() -> dist.ProcessGroup:
 def _boundary_once(tokens: int) -> MuseAttentionBoundaryVerifyMegakernel:
     group = _init_group_once()
     scalars = AttentionBoundaryVerifyScalars(
-        post_eps=POST_EPS,
-        pre_eps=NORM_EPS,
         quant_eps=NORM_EPS,
         router_multiplier=MULT,
         route_scale=1.0,
@@ -108,18 +104,10 @@ def _randn(shape, seed: int, scale: float = 1.0, dtype=torch.float32):
 def _make_case(
     boundary: MuseAttentionBoundaryVerifyMegakernel, seed: int, rank: int, world: int
 ) -> tuple[dict, dict]:
-    tokens = boundary.tokens
-    """Full weights plus this rank's attention-boundary shard."""
+    """Full weights plus this rank's boundary shard, and a pre-FFN-normed input."""
 
-    # add_attn gate -> (alpha, beta), as MuseSpark1xNormPreservingResidualConnection.
-    gate = _randn((HIDDEN,), seed + 1, 0.1) / 0.3
-    beta = torch.sigmoid(gate)
-    alpha = torch.sqrt(torch.clamp(torch.sigmoid(-gate) * (1.0 + beta), min=1e-3))
+    tokens = boundary.tokens
     w = {
-        "o_proj": _randn((HIDDEN, HIDDEN), seed + 2, HIDDEN**-0.5, torch.bfloat16),
-        "alpha": alpha,
-        "beta": beta,
-        "pre_ffn_norm": (1.0 + _randn((HIDDEN,), seed + 3, 0.02)).bfloat16(),
         "pre_expert": _randn(
             (EXPERT_HIDDEN, HIDDEN), seed + 4, HIDDEN**-0.5, torch.bfloat16
         ),
@@ -127,25 +115,15 @@ def _make_case(
         "router": _randn((EXPERTS, HIDDEN), seed + 6, 0.01),
         "router_bias": _randn((EXPERTS,), seed + 7, 0.01),
     }
-    cols = slice(rank * HIDDEN // world, (rank + 1) * HIDDEN // world)
-    w["o_proj_local"] = w["o_proj"][:, cols].contiguous()
     w["prepared"] = boundary.prepare_weights(
-        o_proj=w["o_proj_local"],
         pre_expert=w["pre_expert"],
         router=w["router"],
-        alpha=alpha,
-        beta=beta,
-        pre_ffn_norm=w["pre_ffn_norm"],
         pre_expert_norm=w["pre_expert_norm"],
         router_bias=w["router_bias"],
         rank=rank,
         world=world,
     )
-    a = {
-        "gated": _randn((tokens, HIDDEN), seed + 100, dtype=torch.bfloat16),
-        "stream": _randn((tokens, HIDDEN), seed + 101),
-    }
-    a["gated_local"] = a["gated"][:, cols].contiguous()
+    a = {"ffn_in": _randn((tokens, HIDDEN), seed + 100, dtype=torch.bfloat16)}
     return w, a
 
 
@@ -153,8 +131,8 @@ def _run_boundary(
     boundary: MuseAttentionBoundaryVerifyMegakernel, w: dict, a: dict
 ) -> dict[str, torch.Tensor]:
     inputs = _expert_inputs_once(boundary.tokens)
-    out = boundary(a["gated_local"], a["stream"], w["prepared"], inputs)
-    return _collect(out, inputs, boundary.tokens)
+    topk_ids = boundary(a["ffn_in"], w["prepared"], inputs)
+    return _collect({"topk_ids": topk_ids}, inputs, boundary.tokens)
 
 
 def _collect(out: dict, inputs: MoeVerifyInputs, tokens: int) -> dict:
@@ -174,21 +152,8 @@ def _collect(out: dict, inputs: MoeVerifyInputs, tokens: int) -> dict:
     }
 
 
-def _stock(w: dict, a: dict, world: int) -> dict[str, torch.Tensor]:
-    partial = F.linear(a["gated_local"], w["o_proj_local"])
-    # CustomAllReduceV2 one-shot numerics: FP32 sum of BF16 peers in rank order.
-    peers = [torch.empty_like(partial) for _ in range(world)]
-    dist.all_gather(peers, partial)
-    branch = torch.stack(peers).float().sum(0).bfloat16()
-    ffn_input, new_stream, _ = fused_norm_residual(
-        branch,
-        a["stream"],
-        POST_EPS,
-        NORM_EPS,
-        pre_weight=w["pre_ffn_norm"],
-        alpha=w["alpha"],
-        beta=w["beta"],
-    )
+def _stock(w: dict, a: dict) -> dict[str, torch.Tensor]:
+    ffn_input = a["ffn_in"]
     expert_input = F.linear(ffn_input, w["pre_expert"])
     fp4, scales, token_scale, _ = fused_norm_fp4_quant(
         expert_input, w["pre_expert_norm"], NORM_EPS, GSI
@@ -206,8 +171,6 @@ def _stock(w: dict, a: dict, world: int) -> dict[str, torch.Tensor]:
         packed_topk_ids=packed,
     )
     return {
-        "new_stream": new_stream,
-        "ffn_in": ffn_input,
         "fp4": fp4,
         "scales": scales,
         "per_token_scale": token_scale.view(-1),
@@ -219,22 +182,7 @@ def _stock(w: dict, a: dict, world: int) -> dict[str, torch.Tensor]:
 
 
 def _fp64_logits(w: dict, a: dict) -> torch.Tensor:
-    x = a["gated"].double() @ w["o_proj"].double().t()
-    s = a["stream"].double()
-    upd = w["beta"].double() * x * torch.rsqrt((x * x).mean(-1, True) + POST_EPS)
-    upd = upd + w["alpha"].double() * s
-    out = upd * torch.rsqrt((upd * upd).mean(-1, True) + NORM_EPS)
-    return (out * w["pre_ffn_norm"].double()) @ w["router"].double().t()
-
-
-def _rel(ref: torch.Tensor, act: torch.Tensor) -> float:
-    r, x = ref.double().view(-1), act.double().view(-1)
-    return float((r - x).norm() / r.norm().clamp_min(1e-30))
-
-
-def _max_rel(ref: torch.Tensor, act: torch.Tensor) -> float:
-    r, x = ref.double(), act.double()
-    return float(((r - x).abs() / r.abs().amax(-1, True).clamp_min(1e-30)).max())
+    return a["ffn_in"].double() @ w["router"].double().t()
 
 
 def _top8_valid(logits: torch.Tensor, bias: torch.Tensor, ids: torch.Tensor) -> bool:
@@ -260,8 +208,6 @@ def _metrics(stock: dict, act: dict) -> dict[str, float]:
     w_act = _route_weights(act["packed"]).gather(-1, order_act)
     w_err = (w_stock - w_act).abs()[match].max() if match.any() else 0.0
     return {
-        "new_stream_max_rel": _max_rel(stock["new_stream"], act["new_stream"]),
-        "ffn_in_rel": _rel(stock["ffn_in"], act["ffn_in"]),
         "route_id_match": float(match.float().mean()),
         "route_weight_max_abs": float(w_err),
         "packed_match": float((stock["packed"] == act["packed"]).float().mean()),
@@ -280,7 +226,7 @@ def _metrics(stock: dict, act: dict) -> dict[str, float]:
 def _failures(
     boundary: MuseAttentionBoundaryVerifyMegakernel, w: dict, a: dict, world: int
 ) -> list[str]:
-    stock = _stock(w, a, world)
+    stock = _stock(w, a)
     exact = _fp64_logits(w, a)
     torch.cuda.synchronize()
     dist.barrier()
@@ -291,10 +237,6 @@ def _failures(
     if dist.get_rank() == 0:
         print(" ".join(f"{k}={v:.3e}" for k, v in m.items()), flush=True)
     failures = []
-    if m["new_stream_max_rel"] > 1e-3:
-        failures.append(f"new_stream vs stock {m['new_stream_max_rel']:.2e}")
-    if m["ffn_in_rel"] > 1e-3:
-        failures.append(f"ffn_in vs stock {m['ffn_in_rel']:.2e}")
     if m["per_token_scale_rel"] > 1e-2:
         failures.append(f"per_token_scale vs stock {m['per_token_scale_rel']:.2e}")
     if m["fp4_byte_match"] < 0.95 or m["scale_byte_match"] < 0.95:
@@ -305,7 +247,7 @@ def _failures(
         failures.append(f"invalid top-8 {act['topk_ids'].tolist()}")
     if not torch.equal(act["packed"] >> 16, act["topk_ids"]):
         failures.append("packed ids != topk_ids")
-    for k in ("new_stream", "fp4", "scales", "per_token_scale", "packed"):
+    for k in ("fp4", "scales", "per_token_scale", "packed"):
         mine = act[k].contiguous().view(torch.uint8)
         peers = [torch.empty_like(mine) for _ in range(world)]
         dist.all_gather(peers, mine)
@@ -349,21 +291,20 @@ def test_attention_boundary_verify_cuda_graph(tokens: int) -> None:
     boundary = _boundary_once(tokens)
     cases = [_make_case(boundary, s, group.rank(), group.size()) for s in (5000, 6000)]
     w, a = cases[0]
-    gated, stream = a["gated_local"].clone(), a["stream"].clone()
-    _run_boundary(boundary, w, {"gated_local": gated, "stream": stream})
+    ffn_in = a["ffn_in"].clone()
+    _run_boundary(boundary, w, {"ffn_in": ffn_in})
     torch.cuda.synchronize()
     dist.barrier()
     inputs = _expert_inputs_once(tokens)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = boundary(gated, stream, w["prepared"], inputs)
+        topk_ids = boundary(ffn_in, w["prepared"], inputs)
     failures = []
     for _ in range(2):
         for _, case in cases:
-            gated.copy_(case["gated_local"])
-            stream.copy_(case["stream"])
+            ffn_in.copy_(case["ffn_in"])
             graph.replay()
-            replayed = _collect(out, inputs, tokens)
+            replayed = _collect({"topk_ids": topk_ids}, inputs, tokens)
             eager = _run_boundary(boundary, w, case)
             torch.cuda.synchronize()
             for k, v in eager.items():
