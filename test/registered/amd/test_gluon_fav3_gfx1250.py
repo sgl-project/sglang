@@ -886,6 +886,21 @@ def test_extended_launch_selection_cpu(dtype, head_size):
         select_fav3_launch_config,
     )
 
+    pipeline_scheduler = (
+        "" if dtype == torch.float16 else "amdgpu-sched-strategy=max-ilp"
+    )
+    small_config = select_fav3_launch_config(
+        2,
+        3,
+        129,
+        seqlen_k=257,
+        num_cus=256,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    assert small_config.schedule == "pipeline"
+    assert small_config.llvm_fn_attrs == pipeline_scheduler
+
     config = select_fav3_launch_config(
         1,
         40,
@@ -900,6 +915,7 @@ def test_extended_launch_selection_cpu(dtype, head_size):
     elif head_size == 256:
         assert config.schedule == "pipeline"
         assert not config.tdm_output
+        assert config.llvm_fn_attrs == pipeline_scheduler
     else:
         assert config.schedule == "pingpong"
         assert config.tdm_output is (head_size == 128)
@@ -914,6 +930,41 @@ def _assert_extended_attention_fp64(query, key, value, output, scale):
     tolerance = 0.003 if query.dtype == torch.bfloat16 else 0.001
     assert (actual - expected).square().mean().sqrt() <= tolerance * rms
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.01 * rms.item())
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("shifted_inputs", ["q", "k", "v", "qkv"])
+def test_fp16_auto_pipeline_storage_offsets_repeated_fp64(head_size, shifted_inputs):
+    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import gluon_fav3_attention
+
+    torch.manual_seed(1)
+    query = torch.randn(2, 129, 3, head_size, device="cuda", dtype=torch.float16)
+    key = torch.randn(2, 257, 3, head_size, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+    expected = _fp64_attention(query, key, value, head_size**-0.5)
+    reference_rms = expected.square().mean().sqrt().item()
+
+    inputs = []
+    for name, tensor in zip("qkv", (query, key, value)):
+        if name in shifted_inputs:
+            shifted = torch.empty(
+                tensor.numel() + 1, device=tensor.device, dtype=tensor.dtype
+            )[1:].view(tensor.shape)
+            tensor = shifted.copy_(tensor)
+            assert tensor.storage_offset() == 1
+            assert tensor.is_contiguous()
+        inputs.append(tensor)
+
+    # max-ilp corruption was intermittent even on identical inputs. Check every
+    # launch against independent FP64 attention, including separate Q/K/V shifts.
+    for _ in range(500):
+        actual = gluon_fav3_attention(*inputs).double()
+        assert torch.isfinite(actual).all()
+        assert (actual - expected).square().mean().sqrt() <= 0.001 * reference_rms
+        torch.testing.assert_close(
+            actual, expected, rtol=0.01, atol=0.01 * reference_rms
+        )
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")

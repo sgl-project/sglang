@@ -98,6 +98,7 @@ class _AttentionConfig:
     NUM_BUFFERS: gl.constexpr
     FAST_EXP: gl.constexpr
     NORM_EXP: gl.constexpr
+    FULL_TDM_WAIT: gl.constexpr
     query_axis: gl.constexpr
 
     qk_layout: gl.constexpr
@@ -121,6 +122,7 @@ class _AttentionConfig:
         num_warps,
         fast_exp=False,
         norm_exp=False,
+        full_tdm_wait=False,
     ):
         self.SEQLEN_Q = gl.constexpr(seqlen_q)
         self.SEQLEN_K = gl.constexpr(seqlen_k)
@@ -130,6 +132,7 @@ class _AttentionConfig:
         self.NUM_BUFFERS = gl.constexpr(num_buffers)
         self.FAST_EXP = gl.constexpr(fast_exp)
         self.NORM_EXP = gl.constexpr(norm_exp)
+        self.FULL_TDM_WAIT = gl.constexpr(full_tdm_wait)
         # Keep nearby long-sequence query tiles on the same head to improve
         # K/V cache reuse across workgroups.
         self.query_axis = gl.constexpr(
@@ -340,7 +343,7 @@ class _AttentionProgram:
 
     @gluon.jit
     def load_k(self, buffer_index, wait_count):
-        gl.amd.cdna5.tdm.async_wait(wait_count)
+        gl.amd.cdna5.tdm.async_wait(0 if self.cfg.FULL_TDM_WAIT else wait_count)
         return (
             self.k_buffer.index(buffer_index)
             .permute([1, 0])
@@ -349,7 +352,7 @@ class _AttentionProgram:
 
     @gluon.jit
     def load_v(self, buffer_index, wait_count):
-        gl.amd.cdna5.tdm.async_wait(wait_count)
+        gl.amd.cdna5.tdm.async_wait(0 if self.cfg.FULL_TDM_WAIT else wait_count)
         return self.v_buffer.index(buffer_index).load(layout=self.cfg.v_layout)
 
     @gluon.jit
@@ -554,6 +557,10 @@ def _attention_forward_pipeline(
         BLOCK_N,
         NUM_BUFFERS,
         NUM_WARPS,
+        # Partial TDM waits intermittently corrupt FP16 storage-offset inputs,
+        # including D64 with default scheduling. Drain pending loads before
+        # reading K/V until the underlying synchronization issue is understood.
+        full_tdm_wait=q_ptr.dtype.element_ty == gl.float16,
     )
     program = _AttentionProgram.create(
         cfg,
@@ -1535,13 +1542,15 @@ def select_fav3_launch_config(
             else ""
         )
         return FAv3LaunchConfig("pingpong", 256, 64, 8, head_size == 128, scheduler)
+    # max-ilp intermittently corrupts FP16 inputs with nonzero storage offsets.
+    # Use default pipeline scheduling until the affected cases are understood.
     return FAv3LaunchConfig(
         "pipeline",
         128,
         64,
         4,
         False,
-        "amdgpu-sched-strategy=max-ilp",
+        "" if dtype == torch.float16 else "amdgpu-sched-strategy=max-ilp",
     )
 
 
