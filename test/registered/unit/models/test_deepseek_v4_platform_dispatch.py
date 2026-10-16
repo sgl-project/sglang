@@ -246,5 +246,29 @@ class TestStageLifecycle(unittest.TestCase):
             self.assertFalse(layer._can_fuse_attn_mhc)
 
 
+class _LinkedLayer(platform_stage.NonCudaDecoderMixin, torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hc_pre_from_prev_sublayer = True
+        self.engram = None
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+
+class TestBindNext(unittest.TestCase):
+    def test_linked_layers_keep_their_own_parameter_names(self):
+        """A layer linked to its successor must not adopt it as a submodule,
+        or weight updates after the first load miss layers 1 and up."""
+        layers = torch.nn.ModuleList(_LinkedLayer() for _ in range(3))
+        for _ in range(2):  # post_load_weights relinks after every load
+            for i, layer in enumerate(layers):
+                layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
+
+        self.assertEqual(
+            [name for name, _ in layers.named_parameters()],
+            ["0.weight", "1.weight", "2.weight"],
+        )
+        self.assertIs(layers[0]._next_layer, layers[1])
+
+
 if __name__ == "__main__":
     unittest.main()
