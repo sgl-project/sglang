@@ -1,5 +1,6 @@
 import pickle
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, MagicMock, patch
 
@@ -192,6 +193,7 @@ def _make_router() -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
+    router.metrics = None
     router._pick = lambda key: {
         "worker-a": "detok-a",
         "worker-b": "detok-b",
@@ -200,6 +202,63 @@ def _make_router() -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_router_metrics_count_grouped_outputs_and_control_broadcasts(self):
+        from prometheus_client import CollectorRegistry, Counter
+
+        from sglang.srt.observability.detokenizer_router_metrics import (
+            DetokenizerRouterMetrics,
+        )
+
+        registry = CollectorRegistry()
+        with patch(
+            "sglang.srt.observability.detokenizer_router_metrics.Counter",
+            partial(Counter, registry=registry),
+        ):
+            metrics = DetokenizerRouterMetrics()
+        router = _make_router()
+        router.metrics = metrics
+        router.recv_from_scheduler = object()
+        router.socket_mapping = MagicMock()
+        output = _make_batch_str_output()
+        output.http_worker_ipcs = ["worker-a", "worker-a"]
+        idle = _make_batch_str_output()
+        idle.rids = []
+
+        with (
+            patch.object(
+                multi_tokenizer_mixin,
+                "sock_recv",
+                side_effect=[
+                    output,
+                    output,
+                    idle,
+                    ConfigureLoggingReq(log_level="debug"),
+                    EOFError,
+                ],
+            ),
+            self.assertRaises(EOFError),
+        ):
+            router.event_loop()
+
+        for name, expected in (
+            ("messages_received", 4),
+            ("request_outputs_received", 4),
+            ("messages_sent", 6),
+        ):
+            self.assertEqual(
+                registry.get_sample_value(f"sglang:detokenizer_router_{name}_total"),
+                expected,
+            )
+        self.assertEqual(router.socket_mapping.send_output.call_count, 6)
+
+        router.socket_mapping.send_output.side_effect = RuntimeError("send failed")
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            router._send("detok-a", output)
+        self.assertEqual(
+            registry.get_sample_value("sglang:detokenizer_router_messages_sent_total"),
+            6,
+        )
+
     def test_router_cpu_metric_started_only_when_enabled(self):
         for enabled in (False, True):
             with self.subTest(enable_metrics=enabled):
