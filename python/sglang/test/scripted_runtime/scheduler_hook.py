@@ -25,6 +25,7 @@ from sglang.test.scripted_runtime.io_struct import (
     ScriptSucceeded,
     Shutdown,
 )
+from sglang.test.scripted_runtime.scheduling_trace import SchedulingTraceWriter
 from sglang.test.scripted_runtime.utils import (
     close_zmq_socket,
     ensure_script_importable,
@@ -32,6 +33,7 @@ from sglang.test.scripted_runtime.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
@@ -131,6 +133,7 @@ class ScriptedSchedulerHook:
             and get_parallel().attn_cp_rank == 0
         )
         self._batch_log: List[ScriptedBatchRecord] = []
+        self._trace: Optional[SchedulingTraceWriter] = None
 
         if self._is_driver:
             ensure_script_importable(
@@ -165,6 +168,9 @@ class ScriptedSchedulerHook:
                         ctx = self._context
                         yield from _reset_engine_state(ctx)
                         self._batch_log.clear()
+                        self._trace = SchedulingTraceWriter.maybe_open(
+                            self.scheduler, fn_path, args
+                        )
                         sub_gen = fn(ctx, *args)
                         try:
                             yield from sub_gen
@@ -177,6 +183,10 @@ class ScriptedSchedulerHook:
                             )
                         else:
                             sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
+                        finally:
+                            if self._trace is not None:
+                                self._trace.close()
+                                self._trace = None
                     case _:
                         raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:
@@ -205,12 +215,22 @@ class ScriptedSchedulerHook:
             )
         )
 
+    def on_schedule(self, plan: NextBatchPlan) -> None:
+        if self._trace is not None:
+            self._trace.record_schedule(self.scheduler, plan)
+
+    def on_process_result(self, batch: ScheduleBatch) -> None:
+        if self._trace is not None:
+            self._trace.record_process_result(batch)
+
     def step(self) -> None:
         if not self._is_driver:
             return
 
         done, exc_tb = _advance_generator(self._script_fn_generator)
         if not done:
+            if self._trace is not None:
+                self._trace.observe_readers(self.scheduler)
             return
 
         if exc_tb is not None:

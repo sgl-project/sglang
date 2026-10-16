@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import tempfile
@@ -263,6 +264,8 @@ def _spawn_server_process(
         **CANARY_LAUNCH_DEFAULTS,
     )
     launch_kwargs.update(engine_kwargs)
+    if extra_kwargs := envs.SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS.get():
+        launch_kwargs.update(json.loads(extra_kwargs))
     for key, value in _canary_decode_graph_override(
         kv_canary=launch_kwargs["kv_canary"], device=device.split(":")[0]
     ).items():

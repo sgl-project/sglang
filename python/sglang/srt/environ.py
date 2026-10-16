@@ -438,6 +438,10 @@ class Envs:
     SGLANG_TEST_SCRIPTED_RUNTIME_IPC_ADDR = EnvStr(None)
     SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
     SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
+    # JSONL per-step scheduling traces, one file per executed script.
+    SGLANG_TEST_SCRIPTED_RUNTIME_TRACE_DIR = EnvStr(None)
+    # JSON object of server args applied over every scripted test's own.
+    SGLANG_TEST_SCRIPTED_RUNTIME_EXTRA_ENGINE_KWARGS = EnvStr(None)
 
     # ===================================================================
     # Profiling, tracing, and metrics

@@ -58,6 +58,7 @@ def _make_tree_cache() -> BasePrefixCache:
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.scheduler_stage_metrics = None
+    s.scripted_scheduler_hook = None
     s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
     s.dllm_manager = None

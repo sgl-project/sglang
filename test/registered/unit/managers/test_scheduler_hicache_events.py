@@ -24,6 +24,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
+        s.scripted_scheduler_hook = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
