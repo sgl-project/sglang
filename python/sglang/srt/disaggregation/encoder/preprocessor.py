@@ -729,7 +729,13 @@ class EncoderPreprocessor:
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
-            return model_preprocessor(mm_items, Modality.VIDEO, self.vision_config)
+            return invoke_encoder_preprocessor(
+                model_preprocessor,
+                mm_items,
+                Modality.VIDEO,
+                self.vision_config,
+                image_processor=self.image_processor,
+            )
         if not self.video_processor:
             raise ValueError("No video processor available")
 
@@ -793,7 +799,13 @@ class EncoderPreprocessor:
         audios = await self._flatten_and_load_audios(mm_items)
 
         if model_preprocessor:
-            return model_preprocessor(audios, Modality.AUDIO, self.vision_config)
+            return invoke_encoder_preprocessor(
+                model_preprocessor,
+                audios,
+                Modality.AUDIO,
+                self.vision_config,
+                image_processor=self.image_processor,
+            )
 
         if not self.audio_processor:
             raise ValueError("No audio processor available")

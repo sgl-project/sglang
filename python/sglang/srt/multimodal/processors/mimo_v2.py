@@ -9,7 +9,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -214,16 +214,12 @@ class Content:
                 )
 
 
-# OPENAI_CLIP stats, matching Qwen2VLImageProcessor (preprocessor_config.json
-# image_mean/image_std with do_rescale 1/255). Kept in 0-255 space because
-# standardize_batch sees un-rescaled PIL tensors. ImageNet values were wrong
-# for MiMo-VL and scrambled colors.
-_QWEN2VL_PIXEL_MEAN = (
-    torch.Tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1) * 255.0
-)
-_QWEN2VL_PIXEL_STD = (
-    torch.Tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1) * 255.0
-)
+# Checkpoints set image_mean/image_std in preprocessor_config.json (CLIP for
+# MiMo-V2.5, ImageNet for MiMo-V2.6); these OPENAI_CLIP values are only the
+# fallback, matching Qwen2VLImageProcessor's own default.
+_DEFAULT_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_DEFAULT_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+# (device, image_mean, image_std) -> (mean, std) in 0-255 space.
 _mean_std_cache = {}
 
 
@@ -285,9 +281,17 @@ class MiMoProcessor:
         video_process_num_threads=16,
         video_decode_num_threads=0,
         device=None,
+        image_mean=None,
+        image_std=None,
         **kwargs,
     ):
         self.tokenizer = tokenizer
+        self.image_mean = tuple(
+            _DEFAULT_IMAGE_MEAN if image_mean is None else map(float, image_mean)
+        )
+        self.image_std = tuple(
+            _DEFAULT_IMAGE_STD if image_std is None else map(float, image_std)
+        )
         self.video_process_num_threads = video_process_num_threads
         self.video_decode_num_threads = video_decode_num_threads
 
@@ -385,8 +389,8 @@ class MiMoProcessor:
 
     @classmethod
     def from_hf_config(cls, hf_config, mm_config=None, **overrides):
-        # Params must come from hf_config.processor_config so E and D agree;
-        # any drift shifts input_ids on the D side.
+        # Pixel-bound and token params must come from hf_config.processor_config
+        # so E and D agree; any drift shifts input_ids on the D side.
         def _as_dict(obj):
             if isinstance(obj, dict):
                 return obj
@@ -540,6 +544,8 @@ class MiMoProcessor:
                     factor=factor,
                     min_pixels=min_pixels,
                     max_pixels=max_pixels,
+                    image_mean=self.image_mean,
+                    image_std=self.image_std,
                     device=self.device,
                 )
                 patches, grid = self._flatten_visual_inputs(img_tensor, "image")
@@ -661,6 +667,8 @@ class MiMoProcessor:
             factor=self.patch_size * self.merge_size,
             min_pixels=kwargs["min_pixels"],
             max_pixels=kwargs["max_pixels"],
+            image_mean=self.image_mean,
+            image_std=self.image_std,
             device=self.device,
         )
         return image_transformed_tensor
@@ -803,6 +811,8 @@ class MiMoProcessor:
             factor=self.patch_size * self.merge_size,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
+            image_mean=self.image_mean,
+            image_std=self.image_std,
             device=self.device,
         )
 
@@ -1345,17 +1355,21 @@ class MiMoProcessor:
             return pil_image.convert("RGB")
 
     @staticmethod
-    def standardize_batch(images: torch.Tensor) -> torch.Tensor:
-        device_key = str(images.device)
-        if device_key not in _mean_std_cache:
-            _mean_std_cache[device_key] = (
-                _QWEN2VL_PIXEL_MEAN.detach()
-                .clone()
-                .to(images.device)
-                .view(1, -1, 1, 1),
-                _QWEN2VL_PIXEL_STD.detach().clone().to(images.device).view(1, -1, 1, 1),
+    def standardize_batch(
+        images: torch.Tensor,
+        *,
+        image_mean: Tuple[float, ...],
+        image_std: Tuple[float, ...],
+    ) -> torch.Tensor:
+        # images are un-rescaled 0-255 tensors, so the 0-1 stats are scaled by 255.
+        cache_key = (str(images.device), image_mean, image_std)
+        if cache_key not in _mean_std_cache:
+            _mean_std_cache[cache_key] = (
+                torch.tensor(image_mean, device=images.device).view(1, -1, 1, 1)
+                * 255.0,
+                torch.tensor(image_std, device=images.device).view(1, -1, 1, 1) * 255.0,
             )
-        mean, std = _mean_std_cache[device_key]
+        mean, std = _mean_std_cache[cache_key]
         return (images - mean) / std
 
     @classmethod
@@ -1365,6 +1379,8 @@ class MiMoProcessor:
         factor: int,
         min_pixels: int,
         max_pixels: int,
+        image_mean: Tuple[float, ...],
+        image_std: Tuple[float, ...],
         device: Optional[torch.device] = None,
     ):
         if device is not None:
@@ -1379,7 +1395,9 @@ class MiMoProcessor:
             mode="bilinear",
             align_corners=False,
         )
-        standardized = cls.standardize_batch(resized)
+        standardized = cls.standardize_batch(
+            resized, image_mean=image_mean, image_std=image_std
+        )
 
         return standardized, w_bar, h_bar
 
@@ -1390,6 +1408,8 @@ class MiMoProcessor:
         factor: int,
         min_pixels: int,
         max_pixels: int,
+        image_mean: Tuple[float, ...],
+        image_std: Tuple[float, ...],
         device: Optional[torch.device] = None,
     ):
         if isinstance(img, torch.Tensor):
@@ -1416,7 +1436,9 @@ class MiMoProcessor:
             mode="bilinear",
             align_corners=False,
         )
-        img_standardized = cls.standardize_batch(img_resized).squeeze(0)
+        img_standardized = cls.standardize_batch(
+            img_resized, image_mean=image_mean, image_std=image_std
+        ).squeeze(0)
 
         return img_standardized, w_bar, h_bar
 
@@ -1605,6 +1627,8 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             rope_type=rope_type,
             use_video_timestamps=processor_config.get("use_video_timestamps", False),
             device=device,
+            image_mean=self._processor.image_processor.image_mean,
+            image_std=self._processor.image_processor.image_std,
         )
         self._processor = self.mimo_processor
 
