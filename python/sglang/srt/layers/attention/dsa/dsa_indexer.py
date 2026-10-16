@@ -558,7 +558,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     @torch.compile(dynamic=True)
     def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
         weights = weights_raw * self.n_heads**-0.5
-        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        # bf16_indexer passes q_scale=1 (python scalar), so the result stays
+        # bf16; DeepGEMM mqa_logits requires fp32 weights. The quant paths
+        # already promote to fp32 via the fp32 q_scale tensor.
+        return weights.to(torch.float32)
 
     @torch.compile(dynamic=True)
     def _scale_head_gates_no_q_scale(self, weights_raw: torch.Tensor):
@@ -567,7 +571,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
-        return kw.split([self.head_dim, self.n_heads], dim=-1)
+        key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+        # The split views have row stride head_dim + n_heads; PPU kernels
+        # downstream (e.g. flashinfer layernorm) assume contiguous rows.
+        return key.contiguous(), weights_raw.contiguous()
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
         # Fusion drops the (logit-preserving) Hadamard rotation; without it the
@@ -949,6 +956,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             not self.use_fp4
             and not self.use_int8
+            and not self.bf16_indexer
             and not _is_fp8_fnuz
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
@@ -2054,6 +2062,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             return
 
+        # bf16 path: no quantization, store the key directly (scale unused).
+        if self.bf16_indexer:
+            key_2d = key.view(-1, key.shape[-1]) if key.dim() != 2 else key
+            if not out_cache_loc.is_contiguous():
+                out_cache_loc = out_cache_loc.contiguous()
+            pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=out_cache_loc,
+                index_k=key_2d.contiguous(),
+                index_k_scale=None,
+            )
+            return
+
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
@@ -2205,6 +2226,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if (
             self.use_dsa_indexer_fusion
+            and not self.bf16_indexer
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ):
