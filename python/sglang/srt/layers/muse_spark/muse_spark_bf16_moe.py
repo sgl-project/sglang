@@ -23,6 +23,7 @@ from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm im
     FusedPostExpertNormWeightedSumTRTLLM,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.muse_spark import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     finalize_with_post_expert_norm,
 )
@@ -101,6 +102,7 @@ class MuseSpark1xBf16Experts(nn.Module):
         top_k: int,
     ):
         super().__init__()
+        intermediate_size, self.expert_tp = expert_tp.partition(intermediate_size)
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
@@ -187,6 +189,11 @@ class MuseSpark1xBf16Experts(nn.Module):
         if self.use_trtllm or self.use_triton:
             return
         if not _trtllm_bf16_moe_supported(self.gate_up_proj.device):
+            if self.expert_tp:
+                raise ValueError(
+                    "Muse BF16 expert TP needs FlashInfer's TRT-LLM BF16 MoE "
+                    "(SM10x); use EP equal to TP instead."
+                )
             if _triton_bf16_moe_supported(self.gate_up_proj.device):
                 self._triton_runner_config = self._build_triton_runner_config()
                 self.use_triton = True
@@ -469,6 +476,11 @@ class MuseSpark1xBf16Experts(nn.Module):
                 activation_type=_SWIGLU,
             )[:3]
         )
+        if self.expert_tp:
+            gemm2_out, expanded_idx_to_permuted_idx = expert_tp.reduce_partials(
+                gemm2_out=gemm2_out,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            )
 
         if self._finalize_op is None:
             output = finalize_with_post_expert_norm(
