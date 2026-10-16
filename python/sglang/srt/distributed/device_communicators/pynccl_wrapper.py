@@ -88,6 +88,9 @@ NCCL_API_MAGIC = 0xCAFEBEEF
 # from nccl.h.in.
 NCCL_CONFIG_VERSION = 23000  # NCCL_VERSION(2, 30, 0)
 
+# ncclConfig_t.CTAPolicy: run eligible collectives without SMs (copy engines).
+NCCL_CTA_POLICY_ZERO = 0x02
+
 
 class ncclConfig_t(ctypes.Structure):
     """Mirror of ``ncclConfig_t`` (``ncclConfig_v22800``) from nccl.h.in.
@@ -406,6 +409,24 @@ class NCCLLibrary:
         ),
         # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
+        # ncclResult_t ncclMemAlloc(void** ptr, size_t size);
+        Function(
+            "ncclMemAlloc",
+            ncclResult_t,
+            [ctypes.POINTER(buffer_type), ctypes.c_size_t],
+        ),
+        # ncclResult_t ncclMemFree(void* ptr);
+        Function("ncclMemFree", ncclResult_t, [buffer_type]),
+    ]
+
+    # Device-API host calls, NCCL >= 2.29.2.
+    exported_functions_lsa = [
+        # ncclResult_t ncclGetLsaMultimemDevicePointer(ncclWindow_t window, size_t offset, void** outPtr);
+        Function(
+            "ncclGetLsaMultimemDevicePointer",
+            ncclResult_t,
+            [ncclWindow_t, ctypes.c_size_t, ctypes.POINTER(buffer_type)],
+        ),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -441,9 +462,13 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
+            # Copy: optional symbols of this library must not leak into the
+            # class list that another library path binds from.
+            exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
+            if hasattr(self.lib, "ncclGetLsaMultimemDevicePointer"):
+                exported_functions.extend(NCCLLibrary.exported_functions_lsa)
             for func in exported_functions:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
@@ -451,6 +476,11 @@ class NCCLLibrary:
                 _funcs[func.name] = f
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
+
+    def has_function(self, name: str) -> bool:
+        """Whether ``name`` is bound for this library. Optional symbols are
+        bound only when the library exports them."""
+        return name in self._funcs
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")
@@ -649,6 +679,29 @@ class NCCLLibrary:
 
     def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
+
+    def ncclMemAlloc(self, size: int) -> int:
+        ptr = buffer_type()
+        self.NCCL_CHECK(self._funcs["ncclMemAlloc"](ctypes.byref(ptr), size))
+        return ptr.value
+
+    def ncclMemFree(self, ptr: int) -> None:
+        self.NCCL_CHECK(self._funcs["ncclMemFree"](buffer_type(ptr)))
+
+    def ncclGetLsaMultimemDevicePointer(
+        self, window: ncclWindow_t, offset: int
+    ) -> Optional[int]:
+        """Multicast address of ``window + offset``; None without NVLS.
+
+        Creates the comm's multicast team on first use, which is collective.
+        """
+        ptr = buffer_type()
+        self.NCCL_CHECK(
+            self._funcs["ncclGetLsaMultimemDevicePointer"](
+                window, offset, ctypes.byref(ptr)
+            )
+        )
+        return ptr.value
 
     def ncclGroupStart(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupStart"]())

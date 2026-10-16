@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import ctypes
 import logging
 import os
 import tempfile
 import traceback
+import weakref
 from contextlib import nullcontext
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -16,7 +20,77 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import torch_release
 
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from sglang.srt.distributed.device_communicators.pynccl_wrapper import ncclWindow_t
+
 after_2_8_0 = torch_release >= (2, 8)
+
+
+class _NcclMemOwner:
+    """Exposes one ncclMemAlloc buffer to torch, which keeps this object alive
+    as long as any view of the wrapping tensor exists."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+        }
+
+
+def _release_nccl_window_buffer(
+    comm: PyNcclCommunicator, ptr: int, window: Optional[ncclWindow_t]
+) -> None:
+    # Queued communication or computation may still be touching the buffer.
+    torch.cuda.synchronize(comm.device)
+    if window is not None:
+        comm.deregister_comm_window(window)
+    comm.nccl.ncclMemFree(ptr)
+
+
+def allocate_symmetric_buffer(
+    comm: PyNcclCommunicator, nbytes: int
+) -> Tuple[torch.Tensor, bool]:
+    """Zeroed uint8 tensor over ncclMemAlloc memory registered as a symmetric
+    window on ``comm`` (a collective call), and whether NCCL returned a window.
+
+    Every rank must request the same size and use matching offsets for views.
+    This allocation is independent of the shared symmetric memory pool and
+    --enable-symm-mem. It is deregistered and freed when the last view dies.
+    The returned flag means a symmetric window only on NCCL >= 2.29.2.
+    """
+    with torch.cuda.device(comm.device):
+        ptr = comm.nccl.ncclMemAlloc(nbytes)
+        window = comm.register_comm_window_raw(ptr, nbytes)
+        # NCCL >= 2.29.2 returns NULL when the comm has no symmetric memory
+        # support, usually because NCCL runs without cuMem (ncclMemAlloc is
+        # then a cudaMalloc); 2.28.x returns a local-registration handle.
+        window = window if window.value else None
+        if window is not None and comm.nccl.has_function(
+            "ncclGetLsaMultimemDevicePointer"
+        ):
+            # Workaround for NCCL 2.29.7+ with NVLS on a 2-rank comm (fixed
+            # upstream by NCCL commit 430afbc, after 2.30.7): the multicast
+            # team is built lazily inside the first CE collective's sync
+            # (ncclDevrGetLsaTeamPtrMC) with no barrier after binding, so a
+            # fast rank's ready flag can miss a peer and both hang. Build the
+            # team now (the multicast address is not needed) and barrier.
+            # Larger comms, and older NCCL without this API, build the team
+            # during window registration behind a barrier already.
+            comm.nccl.ncclGetLsaMultimemDevicePointer(window, 0)
+            torch.distributed.barrier(group=comm.group)
+        owner = _NcclMemOwner(ptr, nbytes)
+        release = weakref.finalize(
+            owner, _release_nccl_window_buffer, comm, ptr, window
+        )
+        # The process teardown reclaims the memory; NCCL may already be gone.
+        release.atexit = False
+        buf = torch.as_tensor(owner)
+    buf.zero_()
+    return buf, window is not None
+
 
 # C++ source for the NCCL allocator plugin
 # Key design:
