@@ -75,6 +75,13 @@ class SpeedBenchDataset(BaseDataset):
                     add_generation_prompt=True,
                     tokenize=True,
                 )
+                # Newer transformers return a BatchEncoding here instead of a
+                # plain list. len() of that is the number of keys (2), which
+                # made every prompt count as two input tokens.
+                if hasattr(prompt_ids, "keys") and "input_ids" in prompt_ids:
+                    prompt_ids = prompt_ids["input_ids"]
+                if prompt_ids and isinstance(prompt_ids[0], (list, tuple)):
+                    prompt_ids = prompt_ids[0]
                 prompt = tokenizer.decode(prompt_ids)
             except Exception:
                 prompt_ids = tokenizer.encode(prompt_text)
