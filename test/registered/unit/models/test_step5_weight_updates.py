@@ -1,12 +1,15 @@
 """Step5 load_weights: a strict checkpoint load, then weight updates streamed like any other model's."""
 
+import json
 import sys
+import tempfile
 import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import save_file
 
 from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -53,15 +56,19 @@ class _FakeStep5:
         self.model = SimpleNamespace(layers=[])
         self.checkpoint_path = None
         self._checkpoint_loaded = False
+        self._checkpoint_duplicate_names = frozenset()
         self.duplicate_scans = 0
 
     def named_parameters(self):
         return list(self.params.items())
 
-    def _indexed_duplicate_weights(self, weights, expected, model_path):
+    def _checkpoint_duplicate_owners(self, expected, model_path):
+        return Step5ForCausalLM._checkpoint_duplicate_owners(expected, model_path)
+
+    def _indexed_duplicate_weights(self, weights, duplicates, model_path):
         self.duplicate_scans += 1
         return Step5ForCausalLM._indexed_duplicate_weights(
-            weights, expected, model_path
+            weights, duplicates, model_path
         )
 
     def load_weights(self, weights):
@@ -86,6 +93,20 @@ def _checkpoint() -> list[tuple[str, torch.Tensor]]:
             (f"{_PACKED}{projection}.weight_scale_inv", torch.ones(_NUM_EXPERTS, 1, 1))
         )
     return weights
+
+
+def _save_with_a_duplicated_norm(root: str) -> None:
+    """Save _checkpoint() as two shards that both hold model.norm.weight."""
+    weights = dict(_checkpoint())
+    save_file(weights, f"{root}/model-00001.safetensors")
+    save_file(
+        {"model.norm.weight": weights["model.norm.weight"]},
+        f"{root}/model-00002.safetensors",
+    )
+    owners = {name: "model-00001.safetensors" for name in weights}
+    owners["model.norm.weight"] = "model-00002.safetensors"
+    with open(f"{root}/model.safetensors.index.json", "w") as index:
+        json.dump({"weight_map": owners}, index)
 
 
 def _loaded() -> _FakeStep5:
@@ -177,6 +198,24 @@ class TestStep5WeightUpdates(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "Duplicate Step5 target weight"):
             model.load_weights([(name, weight), (name, weight)])
+
+    def test_a_disk_reload_may_resend_what_the_checkpoint_duplicates(self):
+        """A tensor the checkpoint stores in two shards arrives twice on a disk reload;
+        identical copies load, and differing copies are refused."""
+        norm = torch.ones(8, dtype=torch.bfloat16)
+        with tempfile.TemporaryDirectory() as root:
+            _save_with_a_duplicated_norm(root)
+            model = _FakeStep5()
+            model.checkpoint_path = root
+            model.load_weights(_checkpoint())
+
+            model.load_weights(
+                [("model.norm.weight", norm), ("model.norm.weight", norm)]
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate copies differ"):
+                model.load_weights(
+                    [("model.norm.weight", norm), ("model.norm.weight", 2 * norm)]
+                )
 
 
 class TestStep5Bf16ExpertRunner(CustomTestCase):
