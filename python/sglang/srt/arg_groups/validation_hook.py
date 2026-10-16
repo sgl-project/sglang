@@ -326,6 +326,8 @@ def check_server_args(server_args: Any):
             f"got {cfg.device!r}."
         )
 
+    check_request_data_redaction(cfg)
+
     # Check metrics labels
     if (
         not cfg.tokenizer_metrics_custom_labels_header
@@ -378,6 +380,26 @@ def check_server_args(server_args: Any):
     check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
+
+
+def check_request_data_redaction(cfg: Any):
+    """Raise ValueError when SGLANG_REDACT_REQUEST_DATA is set together with an
+    option that logs or dumps request data. Debug logging includes model output
+    (serving_chat.py), so --log-level debug is refused too."""
+    if not envs.SGLANG_REDACT_REQUEST_DATA.get():
+        return
+    conflicts = []
+    if cfg.log_requests:
+        conflicts.append("--log-requests")
+    if cfg.crash_dump_folder:
+        conflicts.append("--crash-dump-folder")
+    if cfg.log_level.lower() == "debug":
+        conflicts.append("--log-level debug")
+    if conflicts:
+        raise ValueError(
+            f"SGLANG_REDACT_REQUEST_DATA is set, so {', '.join(conflicts)} "
+            "cannot be used."
+        )
 
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
