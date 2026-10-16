@@ -1,7 +1,8 @@
 """DeepSeek-V4.1-Flash accuracy with DSPARK on four GB300 GPUs.
 
-Run GSM8K and MMLU in TP4+EP4 and DP-attention4 + EP4 configurations,
-plus TRT-LLM attention with decoder bounded replay and breakable prefill.
+Run GSM8K and MMMU-Pro in TP4+EP4 and DP-attention4 + EP4 configurations,
+plus decoder SWA bounded replay inside breakable prefill graphs with the
+default and TRT-LLM attention backends.
 The DP+EP recipe is intentionally exercised rather than skipped: startup or
 accuracy failures must be visible in CI while this path is being validated.
 """
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1650, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
@@ -32,11 +33,16 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     gsm8k_num_examples = 200
     gsm8k_num_threads = 64
     gsm8k_max_tokens = 4096
-    mmlu_score_threshold = 0.90
-    mmlu_num_examples = 500
-    mmlu_num_threads = 64
-    mmlu_max_tokens = 4096
+    mmmu_pro_score_threshold = 0.75
+    mmmu_pro_num_examples = 200
+    mmmu_pro_num_threads = 64
+    # Bound long reasoning responses consistently across all three CI recipes.
+    mmmu_pro_max_tokens = 32768
+    mmmu_pro_load_preset_from_model_id = MODEL
 
+    mem_fraction_static = "0.8"
+    max_running_requests = "64"
+    graph_args = []
     parallel_args = []
     server_env = {}
 
@@ -57,16 +63,17 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
                 "--speculative-dspark-block-size",
                 "5",
                 "--mem-fraction-static",
-                "0.8",
+                cls.mem_fraction_static,
                 "--cuda-graph-max-bs-decode",
                 "64",
                 "--max-running-requests",
-                "64",
+                cls.max_running_requests,
                 "--reasoning-parser",
                 "auto",
                 "--tool-call-parser",
                 "auto",
                 *cls.parallel_args,
+                *cls.graph_args,
             ],
             env=cls.server_env,
         )
@@ -88,14 +95,16 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
         super().test_gsm8k()
         self.assert_dspark_accepts_draft_tokens()
 
-    def test_mmlu(self):
+    def test_mmmu_pro(self):
         _run_accuracy_eval(
             self,
-            eval_name="mmlu",
-            score_threshold=self.mmlu_score_threshold,
-            num_examples=self.mmlu_num_examples,
-            num_threads=self.mmlu_num_threads,
-            max_tokens=self.mmlu_max_tokens,
+            eval_name="mmmu_pro",
+            score_threshold=self.mmmu_pro_score_threshold,
+            num_examples=self.mmmu_pro_num_examples,
+            num_threads=self.mmmu_pro_num_threads,
+            model=None,
+            load_preset_from_model_id=self.mmmu_pro_load_preset_from_model_id,
+            max_tokens=self.mmmu_pro_max_tokens,
         )
         self.assert_dspark_accepts_draft_tokens()
 
@@ -120,6 +129,24 @@ class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
         "none",
+    ]
+
+
+class TestDSV41FlashTP4EP4DSparkBoundedReplayBCG(TestDSV41FlashTP4EP4DSpark):
+    """Exercise bounded late-layer replay inside the breakable prefill graph."""
+
+    # Leave memory for the prefill graph pool. With 32 requests, the tail
+    # capacity is 4096 rows, below the largest 8192-token capture shape.
+    mem_fraction_static = "0.7"
+    max_running_requests = "32"
+    graph_args = [
+        "--enable-decoder-swa-bounded-replay",
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--cuda-graph-max-bs-prefill",
+        "8192",
+        "--chunked-prefill-size",
+        "8192",
     ]
 
 
