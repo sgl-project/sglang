@@ -47,6 +47,18 @@ Use the [command builder](#1-quick-start) above.
 
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
+<Warning>
+Do not load the official `black-forest-labs/FLUX.2-klein-4b-fp8` single-file
+checkpoint with `--transformer-weights-path`. Its converted split-QKV layout
+does not match the packed-QKV layout required by SGLang's FLUX.2 FP8 path. Use
+`black-forest-labs/FLUX.2-klein-4B` in BF16 or convert the FP8 file to an
+SGLang-compatible packed ModelOpt transformer override. The published
+`lmsys/flux2-dev-modelopt-fp8-sglang-transformer` override targets
+`black-forest-labs/FLUX.2-dev`, not Klein. See
+[Quantization](/docs/sglang-diffusion/quantization#modelopt-fp8) for the
+supported loading pattern.
+</Warning>
+
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
 - `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
