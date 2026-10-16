@@ -6,9 +6,11 @@ import pytest
 import torch
 
 import sglang.multimodal_gen.runtime.pipelines_core.stages.vla as vla
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
+    slice_prefix_context,
 )
 
 
@@ -82,7 +84,7 @@ def setup(monkeypatch):
 
     args = SimpleNamespace(
         disable_conditioning_cache=True,
-        pipeline_config=SimpleNamespace(
+        pipeline_config=Pi05PipelineConfig(
             enable_segmented_actions=True,
             empty_cache_after_prefix=False,
             output_action_dim=4,
@@ -137,6 +139,59 @@ def test_unmarked_request_uses_existing_whole_trajectory_path(setup):
     assert "pi05_flow" not in vla.vla_state(req)
     assert result.output[0]["parameters"] == {"num_inference_steps": 5}
     assert result.output[0]["actions"] == [[0.0] * 4] * 3
+
+
+def test_parked_request_releases_retired_cohort_storage(setup):
+    """A survivor must not retain the original batched prefix or observations."""
+    _, _, args, prep, _, action, post = setup
+    a, b = request("short", 3, 5), request("long", 5, 5)
+    kv = torch.ones(2, 1, 5, 4)
+    group = PrefixContext(
+        VLADensePrefixCache([(kv, kv.clone(), None)]),
+        torch.ones(2, 5, dtype=torch.bool),
+        5,
+        {"full_attention": True},
+    )
+    for i, req in enumerate((a, b)):
+        prep.forward(req, args)
+        vla.vla_state(req).update(
+            pi05_segment_length=3,
+            prefix_context=slice_prefix_context(group, i),
+            prefix_context_group=group,
+            observation_group=object(),
+        )
+    action.run_grouped_requests([a, b], args)
+    state = vla.vla_state(b)
+    flow = state["pi05_flow"]
+    assert flow.remaining == 2
+    assert (
+        not {"prefix_context_group", "observation_group", "observation_batch"}
+        & state.keys()
+    )
+    compact = state["prefix_context"]
+    assert compact is flow.prefix
+    tensors = [compact.prefix_pad_masks, flow.x_t]
+    tensors.extend(compact.past_key_values[0][:2])
+    for tensor in tensors:
+        assert (
+            tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+        )
+    torch.testing.assert_close(compact.past_key_values[0][0], kv[1:])
+    # Repeated parking is zero-copy for an already compact prefix.
+    latent = flow.x_t
+    flow.compact()
+    assert flow.prefix is compact
+    assert flow.x_t is latent
+    state["pi05_segment_length"] = 2
+    action.forward(b, args)
+    resumed = post.forward(b, args).output[0]["actions"]
+    native = request("reference", 5, 5)
+    prep.forward(native, args)
+    vla.vla_state(native).update(
+        pi05_segment_length=5, prefix_context=slice_prefix_context(group, 1)
+    )
+    action.forward(native, args)
+    assert resumed == post.forward(native, args).output[0]["actions"]
 
 
 def test_marked_request_requires_opt_in(setup):

@@ -60,6 +60,30 @@ class Pi05FlowState:
     def dt(self) -> float:
         return -1.0 / self.num_steps
 
+    def compact(self) -> None:
+        """Do not keep retired batch members' storage alive while parked."""
+        prefix = self.prefix
+        tensors = [prefix.prefix_pad_masks]
+        tensors.extend(t for k, v, _ in prefix.past_key_values for t in (k, v))
+        # Server-cached prefixes already have an independent, bounded lifetime.
+        if prefix.cache_key_digest is None and any(
+            t.untyped_storage().nbytes() > t.numel() * t.element_size() for t in tensors
+        ):
+            self.prefix = PrefixContext(
+                VLADensePrefixCache(
+                    [(k.clone(), v.clone(), w) for k, v, w in prefix.past_key_values],
+                    read_only=True,
+                ),
+                prefix.prefix_pad_masks.clone(),
+                prefix.prefix_len,
+                dict(prefix.layout),
+            )
+        if (
+            self.x_t.untyped_storage().nbytes()
+            > self.x_t.numel() * self.x_t.element_size()
+        ):
+            self.x_t = self.x_t.clone()
+
 
 def prefix_compatibility_key(prefix: PrefixContext) -> tuple:
     """Ignore sequence length, but retain tensor and attention compatibility."""

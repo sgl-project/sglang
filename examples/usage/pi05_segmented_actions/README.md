@@ -57,10 +57,16 @@ and terminal responses on every request, including failures.
   prefix outputs can be overwritten by later replays while a continuation still
   needs them. Fresh prefixes execute before denoising; there is no overlap.
 - Prefix K/V collation uses padded, masked device copies; it is not zero-copy.
-  Only tensor-compatible groups execute together.
+  Only tensor-compatible groups execute together. Before parking, request-local
+  slices are compacted so survivors do not retain retired batch members' storage;
+  grouped observation references are released. Server-cached prefixes retain
+  their existing bounded cache lifetime.
 - Logical requests remain in-flight in server metrics across continuation
   boundaries. Reported per-worker forward timing still describes individual
   dispatches; action payload timings include accumulated action denoising time.
+  Batch metrics count each segment dispatch, not each original client request.
+  Queue wait excludes the time spent executing earlier segments; FCFS ordering
+  still follows original arrival order, including control-request barriers.
 - Defaults and hardware-specific thresholds from the research campaign are not
   installed into the upstream server. No performance claim is made here.
 

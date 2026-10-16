@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 
@@ -24,8 +25,9 @@ def _remaining(req: Req) -> int:
 
 class Pi05SegmentSchedulerMixin:
     def _pi05_segments_enabled(self) -> bool:
-        return bool(
-            getattr(self.server_args.pipeline_config, "enable_segmented_actions", False)
+        config = self.server_args.pipeline_config
+        return (
+            isinstance(config, Pi05PipelineConfig) and config.enable_segmented_actions
         )
 
     def _is_pi05_segment_request(self, req: Any) -> bool:
@@ -33,16 +35,16 @@ class Pi05SegmentSchedulerMixin:
             isinstance(req, Req)
             and not req.is_warmup
             and "vla" in (req.extra or {})
-            and not getattr(req, "realtime_session_id", None)
-            and getattr(req, "session", None) is None
-            and getattr(req, "num_outputs_per_prompt", 1) == 1
+            and not req.realtime_session_id
+            and req.session is None
+            and req.num_outputs_per_prompt == 1
         )
 
     def _pi05_queue_signature(self) -> list[tuple]:
         return [
             (
                 type(req).__name__,
-                getattr(req, "request_id", None),
+                req.request_id if isinstance(req, Req) else None,
                 req.num_inference_steps if self._is_pi05_segment_request(req) else None,
                 _remaining(req) if self._is_pi05_segment_request(req) else None,
             )
@@ -56,20 +58,22 @@ class Pi05SegmentSchedulerMixin:
         # Queue position is a stable tie-breaker for fresh requests received in
         # one poll. Continuations retain their original sequence and timestamp.
         for _, req, arrived in q:
-            if self._is_pi05_segment_request(req) and not hasattr(req, "_pi05_arrival"):
-                if _flow(req) is not None:
+            if id(req) not in self._pi05_arrivals:
+                if self._is_pi05_segment_request(req) and _flow(req) is not None:
                     raise RuntimeError("Continuation lost its original arrival")
-                sequence = getattr(self, "_pi05_sequence", 0)
-                req._pi05_arrival = (arrived, sequence)
-                self._pi05_sequence = sequence + 1
+                self._pi05_arrivals[id(req)] = (arrived, self._pi05_sequence)
+                self._pi05_sequence += 1
         # Keep control requests in arrival order relative to continuations.
         ordered = sorted(
             range(len(q)),
-            key=lambda i: getattr(q[i][1], "_pi05_arrival", (q[i][2], -1)),
+            key=lambda i: self._pi05_arrivals[id(q[i][1])],
         )
         head = q[ordered[0]][1]
         if not self._is_pi05_segment_request(head):
-            return {"indices": ordered[:1], "arrivals": [None]}
+            return {
+                "indices": ordered[:1],
+                "arrivals": [self._pi05_arrivals[id(head)]],
+            }
         selected = [ordered[0]]
         reqs = [head]
         if self._dynamic_batching_enabled() and self._can_dynamic_batch(head, head):
@@ -96,10 +100,14 @@ class Pi05SegmentSchedulerMixin:
                 not continuing
                 and len(reqs) < self._batching_max_size
                 and not self._batch_admission.batch_is_full(reqs)
-                and time.monotonic() - head._pi05_arrival[0] < self._batching_delay_s
+                and time.monotonic() - self._pi05_arrivals[id(head)][0]
+                < self._batching_delay_s
             ):
                 return {"indices": []}
-        return {"indices": selected, "arrivals": [r._pi05_arrival for r in reqs]}
+        return {
+            "indices": selected,
+            "arrivals": [self._pi05_arrivals[id(r)] for r in reqs],
+        }
 
     def _get_next_pi05_segment_batch(self) -> list[tuple[bytes | None, Any]] | None:
         rank = self.worker.tp_group.rank
@@ -124,13 +132,34 @@ class Pi05SegmentSchedulerMixin:
         if not packet["indices"]:
             return None
         selected = []
+        enqueue_times = []
         for i, arrival in zip(packet["indices"], packet["arrivals"], strict=True):
-            identity, req, _ = self.waiting_queue[i]
-            if arrival is not None:
-                req._pi05_arrival = tuple(arrival)
+            identity, req, enqueued = self.waiting_queue[i]
+            if self._is_pi05_segment_request(req):
+                self._pi05_arrivals[id(req)] = tuple(arrival)
+            else:
+                self._pi05_arrivals.pop(id(req), None)
             selected.append((identity, req))
+            enqueue_times.append(enqueued)
         for i in sorted(packet["indices"], reverse=True):
             del self.waiting_queue[i]
+        if isinstance(selected[0][1], Req):
+            reqs = [req for _, req in selected]
+            output_count = sum(
+                max(1, int(req.num_outputs_per_prompt or 1)) for req in reqs
+            )
+            segmented = self._is_pi05_segment_request(reqs[0])
+            self._record_batch_dispatch_metrics(
+                request_count=len(reqs),
+                output_count=output_count,
+                queue_wait_ms=(time.monotonic() - min(enqueue_times)) * 1000.0,
+                effective_max_output_count=(
+                    self._batch_admission.max_admissible_batch_size(reqs[0])
+                    if segmented
+                    else output_count
+                ),
+                stop_reason="completion_boundary" if segmented else "head_ineligible",
+            )
         return selected
 
     def _run_pi05_segment(
@@ -171,9 +200,11 @@ class Pi05SegmentSchedulerMixin:
             ):
                 output = OutputBatch(error="Pi05 segment state/budget invariant failed")
             if not output.error and flow.remaining > 0:
-                # Keep the original queue timestamp, not the continuation time.
-                self.waiting_queue.append((item[0], req, req._pi05_arrival[0]))
+                # Arrival metadata preserves FCFS age; queue time measures only
+                # the wait since this continuation became ready again.
+                self.waiting_queue.append((item[0], req, time.monotonic()))
             else:
+                self._pi05_arrivals.pop(id(req), None)
                 for key in (
                     "pi05_flow",
                     "pi05_segment_length",
@@ -181,6 +212,7 @@ class Pi05SegmentSchedulerMixin:
                     "prefix_context",
                     "prefix_context_group",
                     "observation_group",
+                    "observation_batch",
                 ):
                     state.pop(key, None)
                 completed.append((item, output))

@@ -197,6 +197,8 @@ class Scheduler(
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
+        self._pi05_arrivals: dict[int, tuple[float, int]] = {}
+        self._pi05_sequence = 0
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics

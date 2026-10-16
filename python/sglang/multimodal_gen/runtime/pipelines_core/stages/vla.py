@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -23,6 +24,11 @@ from sglang.multimodal_gen.runtime.vla.parallel import (
     broadcast_prefix_context,
     broadcast_tensor_from_rank,
     get_vla_split_group,
+)
+from sglang.multimodal_gen.runtime.vla.pi05_segment import (
+    Pi05FlowState,
+    advance_pi05_segment,
+    prefix_compatibility_key,
 )
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
@@ -423,13 +429,11 @@ class VLAActionDenoisingStage(PipelineStage):
     def _run_segmented_requests(
         self, batches: list[Req], server_args: ServerArgs
     ) -> list[Req]:
-        from sglang.multimodal_gen.runtime.vla.pi05_segment import (
-            Pi05FlowState,
-            advance_pi05_segment,
-            prefix_compatibility_key,
-        )
-
-        if not getattr(server_args.pipeline_config, "enable_segmented_actions", False):
+        config = server_args.pipeline_config
+        if (
+            not isinstance(config, Pi05PipelineConfig)
+            or not config.enable_segmented_actions
+        ):
             raise RuntimeError("Segmented actions are not enabled")
         model = self.policy_model
         if get_vla_split_group() is not None:
@@ -478,10 +482,20 @@ class VLAActionDenoisingStage(PipelineStage):
             advance_pi05_segment(
                 model, flows, vla_state(group[0])["pi05_segment_length"]
             )
+            for flow in flows:
+                if flow.remaining:
+                    flow.compact()
             synchronize_vla_action_tensor(flows[0].x_t)
             elapsed_ms = (time.perf_counter() - start) * 1000
             for batch, flow in zip(group, flows):
                 state = vla_state(batch)
+                state["prefix_context"] = flow.prefix
+                for key in (
+                    "prefix_context_group",
+                    "observation_group",
+                    "observation_batch",
+                ):
+                    state.pop(key, None)
                 state.pop("actions_output", None)
                 state["actions"] = flow.x_t
                 state["parallel"] = model.action_parallel_info(flow.prefix)

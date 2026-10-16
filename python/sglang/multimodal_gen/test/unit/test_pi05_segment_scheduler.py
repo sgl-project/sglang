@@ -4,10 +4,19 @@ from collections import deque
 from types import SimpleNamespace
 
 import pytest
+from prometheus_client import CollectorRegistry
 
 import sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler as module
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
+)
+from sglang.multimodal_gen.runtime.managers.scheduler import (
+    Scheduler as ProductionScheduler,
+)
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    BatchMetricsWindow,
 )
 
 
@@ -19,13 +28,18 @@ class Request:
         self.is_warmup = False
         self.signature = signature
         self.reject = False
+        self.realtime_session_id = None
+        self.session = None
+        self.num_outputs_per_prompt = 1
 
 
 class Scheduler(Pi05SegmentSchedulerMixin):
     def __init__(self, rows, rank=0):
         self.waiting_queue = deque((b"client", req, ts) for req, ts in rows)
+        self._pi05_arrivals = {}
+        self._pi05_sequence = 0
         self.server_args = SimpleNamespace(
-            pipeline_config=SimpleNamespace(enable_segmented_actions=True), tp_size=1
+            pipeline_config=Pi05PipelineConfig(enable_segmented_actions=True), tp_size=1
         )
         self.worker = SimpleNamespace(
             tp_group=SimpleNamespace(rank=rank, ranks=[0, 1]), tp_cpu_group=None
@@ -35,8 +49,13 @@ class Scheduler(Pi05SegmentSchedulerMixin):
         self._batch_admission = SimpleNamespace(
             batch_is_full=lambda rs: False,
             reject_reason_for_candidate=lambda rs, r: "capacity" if r.reject else None,
+            max_admissible_batch_size=lambda r: self._batching_max_size,
         )
         self.metrics = None
+        self._batch_metrics_enabled = True
+        self._batch_metrics_window = BatchMetricsWindow()
+
+    _record_batch_dispatch_metrics = ProductionScheduler._record_batch_dispatch_metrics
 
     def _dynamic_batching_enabled(self):
         return True
@@ -55,17 +74,18 @@ def test_original_arrival_beats_requeue_position_and_checks_admission():
     old, young, incompatible, rejected = [
         Request(n) for n in ["old", "young", "other", "reject"]
     ]
-    old._pi05_arrival = (1.0, 0)
     old.extra["vla"]["pi05_flow"] = SimpleNamespace(remaining=2)
     incompatible.signature = "b"
     rejected.reject = True
     scheduler = Scheduler(
         [(young, 8.0), (incompatible, 9.0), (rejected, 9.1), (old, 1.0)]
     )
+    scheduler._pi05_arrivals[id(old)] = (1.0, 0)
+    scheduler._pi05_sequence = 1
     items = scheduler._get_next_pi05_segment_batch()
     assert [r.request_id for _, r in items] == ["old", "young"]
     assert [r.request_id for _, r, _ in scheduler.waiting_queue] == ["other", "reject"]
-    assert old._pi05_arrival == (1.0, 0)
+    assert scheduler._pi05_arrivals[id(old)] == (1.0, 0)
 
 
 def test_fresh_wait_but_continuation_bypasses_batch_delay():
@@ -76,13 +96,15 @@ def test_fresh_wait_but_continuation_bypasses_batch_delay():
     assert scheduler._get_next_pi05_segment_batch() == [(b"client", req)]
 
 
-def test_control_is_a_batching_barrier():
+@pytest.mark.parametrize("timestamps", [(1.0, 2.0, 3.0), (1.0, 1.0, 1.0)])
+def test_control_is_a_batching_barrier(timestamps):
     old, new = Request("old"), Request("new")
     control = SimpleNamespace(request_id="update_weights")
-    scheduler = Scheduler([(old, 1.0), (control, 2.0), (new, 3.0)])
+    scheduler = Scheduler(list(zip((old, control, new), timestamps)))
     assert scheduler._get_next_pi05_segment_batch() == [(b"client", old)]
     assert scheduler._get_next_pi05_segment_batch() == [(b"client", control)]
     assert scheduler._get_next_pi05_segment_batch() == [(b"client", new)]
+    assert id(control) not in scheduler._pi05_arrivals
 
 
 def test_tp_uses_rank_zero_packet_and_rejects_queue_mismatch(monkeypatch):
@@ -99,7 +121,9 @@ def test_tp_uses_rank_zero_packet_and_rejects_queue_mismatch(monkeypatch):
     a.server_args.tp_size = b.server_args.tp_size = 2
     ai, bi = a._get_next_pi05_segment_batch(), b._get_next_pi05_segment_batch()
     assert [r.request_id for _, r in ai] == [r.request_id for _, r in bi]
-    assert [r._pi05_arrival for _, r in ai] == [r._pi05_arrival for _, r in bi]
+    assert [a._pi05_arrivals[id(r)] for _, r in ai] == [
+        b._pi05_arrivals[id(r)] for _, r in bi
+    ]
     bad = Scheduler([(Request("changed"), 1.0)], rank=1)
     bad.server_args.tp_size = 2
     with pytest.raises(RuntimeError, match="differs"):
@@ -136,12 +160,46 @@ def test_retire_refill_and_only_return_completed_actions():
     assert completed[0][1].output == ["actions"]
     assert "pi05_flow" not in a.extra["vla"]
     assert b.extra["vla"]["pi05_flow"].remaining == 2
-    assert scheduler.waiting_queue[0][2] == 2.0
+    assert scheduler._pi05_arrivals[id(b)][0] == 2.0
+    assert scheduler.waiting_queue[0][2] == 10.0
     c = Request("c", 4)
     scheduler.waiting_queue.append((b"client", c, 9.0))
     completed = scheduler._run_pi05_segment(scheduler._get_next_pi05_segment_batch())
     assert [r.request_id for (_, r), _ in completed] == ["b"]
     assert c.extra["vla"]["pi05_flow"].remaining == 2
+    assert id(a) not in scheduler._pi05_arrivals
+    assert id(b) not in scheduler._pi05_arrivals
+
+
+def test_segment_batch_metrics_exclude_control_requests():
+    """Opt-in scheduling must not bypass the normal dispatch observability."""
+    a, b = Request("a", 3), Request("b", 5)
+    scheduler = Scheduler([(a, 1.0), (b, 2.0), (object(), 3.0)])
+    registry = CollectorRegistry()
+    scheduler.metrics = DiffusionMetrics(
+        role="monolithic", replica="0", registry=registry
+    )
+    scheduler._get_next_pi05_segment_batch()
+    scheduler._get_next_pi05_segment_batch()
+    window = scheduler._batch_metrics_window
+    assert window.dispatches == window.merged_dispatches == 1
+    assert window.total_requests == window.total_outputs == 2
+    assert window.wait_times_ms == [9000.0]
+    labels = {
+        "role": "monolithic",
+        "replica": "0",
+        "stop_reason": "completion_boundary",
+    }
+    assert (
+        registry.get_sample_value(
+            "sglang:diffusion_generation_batch_size_count", labels
+        )
+        == 1
+    )
+    assert (
+        registry.get_sample_value("sglang:diffusion_generation_batch_size_sum", labels)
+        == 2
+    )
 
 
 @pytest.mark.parametrize(
@@ -169,6 +227,7 @@ def test_error_terminates_request_and_releases_state(failure):
     assert not scheduler.waiting_queue
     assert "pi05_flow" not in req.extra["vla"]
     assert "pi05_segment_length" not in req.extra["vla"]
+    assert not scheduler._pi05_arrivals
 
 
 def test_other_pipeline_is_disabled():
@@ -190,9 +249,7 @@ def test_sampling_signature_changes_only_for_opted_in_pi05_requests():
         action_horizon: int = 50
 
     scheduler = ProductionScheduler.__new__(ProductionScheduler)
-    cfg = SimpleNamespace(
-        enable_segmented_actions=False, supports_sequential_dit_inference=lambda: False
-    )
+    cfg = Pi05PipelineConfig(enable_segmented_actions=False)
     scheduler.server_args = SimpleNamespace(pipeline_config=cfg)
     a, b = Request("a", 3), Request("b", 5)
     a.sampling_params, b.sampling_params = Params(3), Params(5)
