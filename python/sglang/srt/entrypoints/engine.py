@@ -1866,8 +1866,7 @@ class Engine(EngineScoreMixin, EngineBase):
 def _set_envs_and_config(server_args: ServerArgs):
     cfg = resolving_view(server_args)
     if cfg.device == "npu":
-        # Opt-in automatic HCCL sizing must land before scheduler processes
-        # create HCCL process groups, which read the buffer env at creation.
+        # HCCL process groups read buffer settings at creation.
         from sglang.srt.hardware_backend.npu.autotune import initialize
 
         initialize(cfg)

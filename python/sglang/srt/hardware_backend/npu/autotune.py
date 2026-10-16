@@ -1,4 +1,4 @@
-"""Opt-in deterministic NPU HCCL buffer sizing; importing never initializes a device.
+"""Default deterministic NPU HCCL buffer sizing; importing never initializes a device.
 
 References:
 - CANN 9.1 (sglang NPU default) HCCL_BUFFSIZE: default 200 MB when unset, must
@@ -23,9 +23,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass
-
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 MIB = 1 << 20
@@ -36,7 +35,7 @@ DEEPEP_PADDING_MB = 20
 DEEPEP_MIN_BUFFSIZE_MB = 2 * DEEPEP_FIXED_OVERHEAD_MB + DEEPEP_PADDING_MB
 # Default of DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS; valid range [32, 8192].
 DEEPEP_PER_ROUND_TOKENS = 8192
-_TRUTHY = ("1", "true", "yes")
+DEEPEP_MAX_BUFFSIZE_MB = 4096
 
 
 @dataclass(frozen=True)
@@ -93,7 +92,7 @@ def deepep_normal_buffer_mb(
     combine_long_seq=False,
     quantum_mb=32,
     min_mb=DEEPEP_MIN_BUFFSIZE_MB,
-    max_mb=4096,
+    max_mb=DEEPEP_MAX_BUFFSIZE_MB,
 ):
     """Size the DeepEP Ascend normal-mode buffer from the documented formulas.
 
@@ -113,7 +112,22 @@ def deepep_normal_buffer_mb(
     else:
         payload = full_seq
     raw = 2 * (DEEPEP_FIXED_OVERHEAD_MB + payload / MIB) + DEEPEP_PADDING_MB
-    return _quantize_mb(raw, quantum_mb, min_mb, max_mb)
+    if min(quantum_mb, min_mb) <= 0 or max_mb < min_mb:
+        raise ValueError("rounding quantum and bounds must be positive")
+    required = math.ceil(max(raw, min_mb) / quantum_mb) * quantum_mb
+    details = (
+        f"rows={token_rows} hidden={hidden_size} topk={topk} "
+        f"per_round_tokens={per_round_tokens} ant_moving={ant_moving} "
+        f"combine_long_seq={combine_long_seq} raw_MiB={raw:g} "
+        f"required_MiB={required} cap_MiB={max_mb}"
+    )
+    if required > max_mb:
+        raise ValueError(
+            f"Automatic DeepEP HCCL sizing exceeds its limit: {details}. "
+            "Set DEEPEP_HCCL_BUFFSIZE explicitly or reduce the workload."
+        )
+    logger.info("NPU autotune: DeepEP normal-mode requirement %s", details)
+    return required
 
 
 def context_from_server_args(server_args):
@@ -133,86 +147,96 @@ def context_from_server_args(server_args):
 
 
 def _deepep_round_config():
-    """Read the DeepEP ant-moving env pair and the combine-streaming flag."""
-    raw = os.environ.get("DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS")
-    try:
-        prt = min(DEEPEP_PER_ROUND_TOKENS, max(32, int(raw))) if raw else DEEPEP_PER_ROUND_TOKENS
-    except ValueError:
-        prt, raw = DEEPEP_PER_ROUND_TOKENS, None
-    combine = os.environ.get("DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ", "0").lower() in _TRUTHY
-    return prt, raw is not None, combine
-
-
-def _decide(name, automatic, reason, dry):
-    """Apply explicit-wins precedence, log the decision, set unless dry-run."""
-    if name in os.environ:
-        source, value = "explicit", os.environ[name]
+    tokens_name = "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS"
+    rounds_name = "DEEPEP_NORMAL_LONG_SEQ_ROUND"
+    tokens, rounds = os.environ.get(tokens_name), os.environ.get(rounds_name)
+    if (tokens is None) != (rounds is None):
+        raise ValueError(f"{tokens_name} and {rounds_name} must be set together")
+    if tokens is not None:
+        if not all(
+            re.fullmatch(r"[ \t\n\r\v\f]*[+-]?[0-9]+", v) for v in (tokens, rounds)
+        ):
+            raise ValueError(f"{tokens_name} and {rounds_name} must be integers")
+        per_round, round_count = int(tokens), int(rounds)
+        if not (32 <= per_round <= 8192 and 1 <= round_count <= 256):
+            raise ValueError(
+                f"{tokens_name} must be in [32, 8192] and {rounds_name} in [1, 256]"
+            )
+        if per_round * round_count > 131072:
+            raise ValueError(f"{tokens_name} * {rounds_name} must not exceed 131072")
     else:
-        source, value = "deterministic-auto", automatic
-    logger.info(
-        "NPU autotune: %s=%s source=%s dry_run=%s %s",
-        name,
-        value,
-        source,
-        dry,
-        reason,
-    )
-    if not dry and source == "deterministic-auto" and value is not None:
-        os.environ[name] = str(value)
+        per_round = DEEPEP_PER_ROUND_TOKENS
+    combine_name = "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ"
+    combine = os.environ.get(combine_name, "0")
+    if not re.fullmatch(r"[0-9]+", combine) or int(combine) > 2147483647:
+        raise ValueError(f"{combine_name} must be a nonnegative 32-bit integer")
+    return per_round, tokens is not None, bool(int(combine))
 
 
 def initialize(server_args):
     """Resolve automatic HCCL sizing before scheduler/HCCL initialization."""
-    auto_hccl = envs.SGLANG_NPU_AUTO_HCCL_BUFFSIZE.get()
-    auto_deepep = envs.SGLANG_NPU_AUTO_DEEPEP_HCCL_BUFFSIZE.get()
-    if not (auto_hccl or auto_deepep):
+    # Snapshot overrides before the general heuristic fills HCCL_BUFFSIZE.
+    hccl = os.environ.get("HCCL_BUFFSIZE")
+    deepep = os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+    if hccl is not None:
+        logger.info("NPU autotune: HCCL_BUFFSIZE=%s MiB source=explicit", hccl)
+    if deepep is not None:
+        logger.info("NPU autotune: DEEPEP_HCCL_BUFFSIZE=%s MiB source=explicit", deepep)
+    elif hccl is not None:
+        logger.info(
+            "NPU autotune: DEEPEP_HCCL_BUFFSIZE=%s MiB source=inherited HCCL_BUFFSIZE",
+            hccl,
+        )
+    if hccl is not None:
         return
+
     context = context_from_server_args(server_args)
     rows = representative_prefill_rows(context)
-    dry = envs.SGLANG_NPU_AUTOTUNE_DRY_RUN.get()
-    if auto_hccl:
-        element = 4 if context.dtype in ("float32", "torch.float32") else 2
-        _decide(
-            "HCCL_BUFFSIZE",
-            hccl_buffer_mb(
-                rows,
-                context.hidden_size,
-                element,
-                envs.SGLANG_NPU_HCCL_HEADROOM.get(),
-                envs.SGLANG_NPU_HCCL_QUANTUM_MB.get(),
-                envs.SGLANG_NPU_HCCL_MIN_MB.get(),
-                envs.SGLANG_NPU_HCCL_MAX_MB.get(),
-            ),
-            f"collective_bytes={rows * context.hidden_size * element} "
-            f"tp={context.tp_size} dtype={context.dtype}; HCCL default if unset",
-            dry,
-        )
-    if auto_deepep:
-        if context.num_experts_per_tok:
-            prt, ant_moving, combine_long = _deepep_round_config()
-            _decide(
-                "DEEPEP_HCCL_BUFFSIZE",
-                deepep_normal_buffer_mb(
+    element = 4 if context.dtype in ("float32", "torch.float32") else 2
+    proposed = {"HCCL_BUFFSIZE": hccl_buffer_mb(rows, context.hidden_size, element)}
+    if deepep is None:
+        backend, mode = server_args.moe_a2a_backend, server_args.deepep_mode
+        if (
+            context.num_experts_per_tok
+            and backend == "deepep"
+            and context.ep_size > 1
+            and mode in ("normal", "auto")
+        ):
+            prt, ant_moving, combine = _deepep_round_config()
+            try:
+                proposed["DEEPEP_HCCL_BUFFSIZE"] = deepep_normal_buffer_mb(
                     rows,
                     context.hidden_size,
                     context.num_experts_per_tok,
                     prt,
                     ant_moving,
-                    combine_long,
-                    envs.SGLANG_NPU_DEEPEP_HCCL_QUANTUM_MB.get(),
-                    envs.SGLANG_NPU_DEEPEP_HCCL_MIN_MB.get(),
-                    envs.SGLANG_NPU_DEEPEP_HCCL_MAX_MB.get(),
-                ),
-                f"rows={rows} hidden={context.hidden_size} "
-                f"topk={context.num_experts_per_tok} per_round_tokens={prt} "
-                f"combine_long_seq={combine_long} ep={context.ep_size}; "
-                "documented DeepEP normal-mode formulas",
-                dry,
-            )
+                    combine,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"{exc} DEEPEP_NORMAL_LONG_SEQ_ROUND="
+                    f"{os.environ.get('DEEPEP_NORMAL_LONG_SEQ_ROUND', '1')}"
+                ) from exc
         else:
             logger.info(
-                "NPU autotune: DEEPEP_HCCL_BUFFSIZE=None source=default "
-                "dry_run=%s model has no num_experts_per_tok; "
-                "DeepEP sizing not applicable",
-                dry,
+                "NPU autotune: DeepEP sizing skipped; not applicable: "
+                "topk=%s backend=%s ep=%s mode=%s",
+                context.num_experts_per_tok,
+                backend,
+                context.ep_size,
+                mode,
             )
+    # Validation must finish before either value becomes visible to workers.
+    for name, value in proposed.items():
+        logger.info(
+            "NPU autotune: %s=%s MiB source=automatic rows=%s hidden=%s "
+            "dtype=%s tp=%s ep=%s",
+            name,
+            value,
+            rows,
+            context.hidden_size,
+            context.dtype,
+            context.tp_size,
+            context.ep_size,
+        )
+    os.environ.update({name: str(value) for name, value in proposed.items()})

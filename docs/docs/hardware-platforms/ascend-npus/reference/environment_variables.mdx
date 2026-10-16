@@ -6,6 +6,30 @@ metatags:
 SGLang supports various environment variables related to Ascend NPU that can be used to configure its runtime behavior.
 This document provides a list of commonly used environment variables and aims to stay updated over time.
 
+On Ascend NPU startup, unset HCCL buffer sizes are calculated before worker
+processes and communication groups are created. You do not need an enable flag.
+Explicit `DEEPEP_HCCL_BUFFSIZE` values take precedence for the default and
+MoE-named process groups. An explicit `HCCL_BUFFSIZE` remains their fallback and
+prevents automatic DeepEP sizing from replacing it.
+
+General sizing uses the smaller of positive chunked-prefill size and maximum
+prefill tokens, or maximum prefill tokens when chunking is disabled. It estimates
+`rows × hidden size × dtype bytes × 1.25`, rounds up to 32 MiB, and clamps the
+result to 64–1024 MiB. This is a collective-payload heuristic.
+
+DeepEP normal-mode sizing uses the documented dispatch/combine formula, rounds
+up to 32 MiB, and has a 4096 MiB automatic limit. Startup raises an error if the
+rounded requirement exceeds this limit. Set `DEEPEP_HCCL_BUFFSIZE` explicitly or
+reduce the workload to proceed. Existing DeepEP round and streaming settings
+are preserved; round count and per-round tokens must be set together and satisfy
+the transport's bounds. Dense models, EP1, other backends and low-latency-only
+mode skip this normal-mode estimate.
+
+Sizes calculated here use MiB (2²⁰ bytes), although the existing variable names
+and vendor documentation use MB. Each communication domain can allocate send
+and receive buffers, so total HBM use depends on the number of groups and their
+allocation behavior. Validate startup and memory use on your target workload.
+
 ## Directly Used in SGLang
 
 <table>
@@ -35,26 +59,6 @@ This document provides a list of commonly used environment variables and aims to
     <tr>
       <td><code>SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT</code></td>
       <td>Disable casting model weight tensor to a specific NPU <br/> ACL format.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_AUTO_HCCL_BUFFSIZE</code></td>
-      <td>Set <code>HCCL_BUFFSIZE</code> automatically before process-group <br/> creation from the representative prefill shape <br/> (<code>rows × hidden × element × headroom</code>, clamped by the <br/> <code>SGLANG_NPU_HCCL_*</code> knobs). Explicitly set values always win.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_AUTO_DEEPEP_HCCL_BUFFSIZE</code></td>
-      <td>Set <code>DEEPEP_HCCL_BUFFSIZE</code> automatically to the <br/> documented DeepEP normal-mode minimum (per-round payload with <br/> combine streaming on, otherwise the full-sequence term; send + <br/> receive, plus fixed overhead and padding). Respects <br/> <code>DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS</code> and <br/> <code>DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ</code>. Explicitly set <br/> values always win.</td>
-      <td><code>false</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_HCCL_HEADROOM</code>, <code>SGLANG_NPU_HCCL_QUANTUM_MB</code>, <br/> <code>SGLANG_NPU_HCCL_MIN_MB</code>, <code>SGLANG_NPU_HCCL_MAX_MB</code>, <br/> <code>SGLANG_NPU_DEEPEP_HCCL_QUANTUM_MB</code>, <br/> <code>SGLANG_NPU_DEEPEP_HCCL_MIN_MB</code>, <br/> <code>SGLANG_NPU_DEEPEP_HCCL_MAX_MB</code></td>
-      <td>Rounding quantum and clamps for the automatic sizing above. <br/> Defaults: headroom <code>1.25</code>; quanta <code>32</code>; collective range <br/> <code>64</code>–<code>1024</code> MB; DeepEP range <code>232</code>–<code>4096</code> MB.</td>
-      <td>see description</td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_AUTOTUNE_DRY_RUN</code></td>
-      <td>With an <code>SGLANG_NPU_AUTO_*</code> switch on, log the computed <br/> sizing decisions without modifying the environment.</td>
       <td><code>false</code></td>
     </tr>
     <tr>
@@ -110,8 +114,8 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>DEEPEP_HCCL_BUFFSIZE</code></td>
-      <td>Configures the HCCL buffer size (in MB) for the process groups used by <br/> DeepEP MoE All-to-All communication (the default group and <code>moe</code>-named <br/> groups), allowing the MoE communication buffer to be tuned independently from <br/> non-MoE groups. If unset, falls back to <code>HCCL_BUFFSIZE</code>, then to <code>200</code>. <br/> A larger buffer reduces All-to-All latency at the cost of more HBM usage. <br/> See <a href="/advanced_features/expert_parallelism">Expert Parallelism</a> for the <br/> buffer-size formulas; <code>SGLANG_NPU_AUTO_DEEPEP_HCCL_BUFFSIZE=1</code> <br/> applies the normal-mode formula automatically.</td>
-      <td><code>200</code></td>
+      <td>Configures the HCCL buffer size (in MB) for the process groups used by <br/> DeepEP MoE All-to-All communication (the default group and <code>moe</code>-named <br/> groups), allowing the MoE communication buffer to be tuned independently from <br/> non-MoE groups. If unset, falls back to <code>HCCL_BUFFSIZE</code>, then to <code>200</code>. <br/> A larger buffer reduces All-to-All latency at the cost of more HBM usage. <br/> See <a href="/advanced_features/expert_parallelism">Expert Parallelism</a> for the <br/> buffer-size formulas. NPU startup applies the normal-mode formula <br/> automatically for MoE models using DeepEP with EP &gt; 1 and <br/> <code>--deepep-mode normal</code> or <code>auto</code>, unless either buffer <br/> variable is explicitly set.</td>
+      <td>Automatic on NPU startup</td>
     </tr>
   </tbody>
 </table>
@@ -164,8 +168,8 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>HCCL_BUFFSIZE</code></td>
-      <td>Controls the size of the buffer area for shared data between two NPUs. <br/>The unit is MB, and the value must be greater than or equal to 1. <br/>Note every communication domain allocates send + receive buffers <br/>(about 2× this value). <a href="https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0047.html">Detail</a>. <br/><code>SGLANG_NPU_AUTO_HCCL_BUFFSIZE=1</code> sets it from the <br/>representative prefill shape.</td>
-      <td><code>200</code></td>
+      <td>Controls the size of the buffer area for shared data between two NPUs. <br/>The unit is MB, and the value must be greater than or equal to 1. <br/>Note every communication domain allocates send + receive buffers <br/>(about 2× this value). <a href="https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0047.html">Detail</a>. <br/>NPU startup sizes unset values from the representative prefill shape.</td>
+      <td>Automatic on NPU startup</td>
     </tr>
     <tr>
       <td><code>P2P_HCCL_BUFFSIZE</code></td>
