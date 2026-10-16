@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 TORCH_IPC_BACKEND = "torch_ipc"
 VMM_FD_BACKEND = "vmm_fd"
+NPU_IPC_BACKEND = "npu_ipc"
 
 _FD_INDEX_STRUCT = struct.Struct("<Q")
 
@@ -187,9 +188,84 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         self._raise_not_implemented()
 
 
+class NpuIpcTransportBackend(WeightCacheTransportBackend):
+    """NPU (Ascend) transport using native torch_npu multiprocessing reduction.
+
+    Shares the same framing as ``TorchIpcTransportBackend`` (serialize the
+    ``tensor.data`` via ``MultiprocessingSerializer`` -> ForkingPickler, ship the
+    bytes over the existing length-prefixed socket protocol, rebuild on the
+    client with the reconstructed function). On NPU the underlying reduction is
+    resolved by torch_npu's natively registered ``reduce_tensor`` /
+    ``rebuild_npu_tensor``.
+
+    Verified by smoke test ``_verify_npu_native_ipc.py``:
+      * native NPU reduction works WITHOUT ``SGLANG_TP_RANK`` (device index is
+        self-describing), and
+      * it is truly zero-copy (a client-side write of 12345 is observed by the
+        daemon on the same physical HBM).
+
+    This is safe because plain inference startup never calls
+    ``monkey_patch_torch_reductions()`` (only RL / checkpoint / spec paths do),
+    so ``rebuild_npu_tensor`` keeps its native behavior here and is not forced
+    to read ``SGLANG_TP_RANK``.
+    """
+
+    name = NPU_IPC_BACKEND
+
+    def prepare_export(
+        self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
+    ) -> Dict[str, Dict[str, Any]]:
+        entries: Dict[str, Dict[str, Any]] = {}
+        for name, (tensor, is_param) in state_tensors.items():
+            entries[name] = {
+                "handle": MultiprocessingSerializer.serialize(
+                    tensor.data, output_str=True
+                ),
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype).replace("torch.", ""),
+                "is_param": is_param,
+                "device": tensor.device.index,
+            }
+        return entries
+
+    def send_fetch_state_response(
+        self,
+        conn: socket.socket,
+        *,
+        config: Dict[str, Any],
+        entries: Dict[str, Dict[str, Any]],
+        pid: int,
+        preloaded_weights_bytes: int = 0,
+    ) -> None:
+        send_msg(
+            conn,
+            {
+                "status": "ok",
+                "config": config,
+                "entries": entries,
+                "pid": pid,
+                "transport_backend": self.name,
+                "preloaded_weights_bytes": preloaded_weights_bytes,
+            },
+        )
+
+    def recv_fetch_state_response(
+        self, sock: socket.socket, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return result
+
+    def import_tensor(self, entry: Dict[str, Any]) -> torch.Tensor:
+        return MultiprocessingSerializer.deserialize(entry["handle"])
+
+
 def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
 ) -> WeightCacheTransportBackend:
+    from sglang.srt.utils.common import is_npu
+
+    if is_npu():
+        logger.info("[weight_cache] Using transport backend: %s", NPU_IPC_BACKEND)
+        return NpuIpcTransportBackend()
     if VmmFdTransportBackend.can_export_state(state_tensors):
         logger.info("[weight_cache] Using transport backend: %s", VMM_FD_BACKEND)
         return VmmFdTransportBackend()
@@ -198,6 +274,8 @@ def choose_daemon_transport_backend(
 
 
 def get_client_transport_backend(name: Optional[str]) -> WeightCacheTransportBackend:
+    if name == NPU_IPC_BACKEND:
+        return NpuIpcTransportBackend()
     if name in (None, "", TORCH_IPC_BACKEND):
         return TorchIpcTransportBackend()
     if name == VMM_FD_BACKEND:

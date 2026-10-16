@@ -184,10 +184,11 @@ class IpcModelLoader(BaseModelLoader):
         """Fail loud if the serving daemon dies while we hold its weights.
 
         In both client and (engine-spawned) daemon mode, the model's param.data
-        points into the daemon's GPU memory via CUDA IPC, and CUDA graphs may
-        capture those addresses. If the daemon exits, the pointers dangle:
-        forward passes would read freed GPU memory -> illegal-address crashes or
-        silent garbage. There is no safe in-place recovery, so a background
+        points into the daemon's device memory via zero-copy IPC (CUDA IPC on
+        CUDA, native torch_npu reduction on NPU), and CUDA graphs may capture
+        those addresses. If the daemon exits, the pointers dangle:
+        forward passes would read freed device memory -> illegal-address crashes
+        or silent garbage. There is no safe in-place recovery, so a background
         thread polls the daemon PID and, on death, SIGKILLs this process with a
         clear message instead of letting it serve corrupt results.
         """
@@ -213,9 +214,10 @@ class IpcModelLoader(BaseModelLoader):
                 if not _daemon_alive(daemon_pid):
                     logger.critical(
                         f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
-                        f"died while this engine holds its weights via CUDA IPC. "
-                        f"The mapped weight pointers are now dangling; continuing "
-                        f"would read freed GPU memory. Terminating this process."
+                        f"died while this engine holds its weights via zero-copy "
+                        f"IPC. The mapped weight pointers are now dangling; "
+                        f"continuing would read freed device memory. Terminating "
+                        f"this process."
                     )
                     os.kill(os.getpid(), signal.SIGKILL)
                     return
