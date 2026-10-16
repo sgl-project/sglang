@@ -94,6 +94,7 @@ from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     FreezeGCReq,
     GenerateReqInput,
+    GetSchedulerIdleReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -2285,14 +2286,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if obj.mode != "abort":
                 await self._async_dispatch_to_scheduler(obj)
             else:
-                # we are using the model_update_lock to check if there is still on-going requests.
+                self.auto_create_handle_loop()
                 while True:
-                    # TODO: maybe make it async instead of fire-and-forget
                     self.abort_request(abort_all=True)
                     is_locked = await self.model_update_lock.is_locked()
-                    if not is_locked:
+                    # A disconnected HTTP handler releases its reader lock before
+                    # the scheduler has drained its request and overlap results.
+                    # Wait for every scheduler, keeping inference enabled so the
+                    # normal abort cleanup can finish before memory is released.
+                    results = await self.get_scheduler_idle_communicator(
+                        GetSchedulerIdleReqInput()
+                    )
+                    if not is_locked and all(r.is_idle for r in results):
                         break
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.01)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
