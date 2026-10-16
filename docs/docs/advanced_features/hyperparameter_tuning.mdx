@@ -66,34 +66,9 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 
 ### Interleave waiting prefills with a continuing request
 
-Prefill interleaving lets waiting requests finish their uncached prefill alongside
-a continuing request. It requires chunked prefill, radix caching, and an
-autoregressive model. Enable it for `hrrn` with `--prefill-interleaving`;
-it is enabled by default for `shortest-prefill-first`. Use
-`--no-prefill-interleaving` to turn it off.
+With chunked prefill, a long prompt fills every chunk and short requests wait behind it. `--prefill-interleaving` caps the continuing chunk so waiting requests that fit finish their prefill in the same pass. It is on by default for `shortest-prefill-first` and opt-in for `hrrn`; `--no-prefill-interleaving` turns it off, and `--prefill-interleaving-min-continuation-tokens` sets the continuation's minimum share of the chunk. Both policies skip waiters that do not fit and admit the selected ones first; `shortest-prefill-first` also takes only waiters shorter than the continuation.
 
-`--prefill-interleaving-min-continuation-tokens` reserves one KV page by default
-for `shortest-prefill-first`, or half the current chunk budget rounded up to a
-page for `hrrn` (8K of 16K). An explicit minimum must be a positive multiple of
-`--page-size` below `--chunked-prefill-size`. If no waiter fits, the continuation
-uses the normal chunk budget. The reservation covers at most as many waiters as
-the pass can admit (free request slots, `--prefill-max-requests`), and none when
-the running batch is full. Memory admission can still limit either allocation.
-
-| Policy | Waiting-request selection |
-| --- | --- |
-| `shortest-prefill-first` | Select requests shorter than the continuation; stop at the first ineligible request. |
-| `hrrn` | Select fitting requests in queue order, skipping those that do not fit. |
-
-Both policies check at most the first 128 waiting requests per interleaving pass;
-the unscanned tail stays in place. HRRN uses FCFS ordering when the waiting queue
-exceeds its existing 128-request fallback threshold. The interleaving scan cap
-limits eligibility checks, not prefix matching or total scheduler work.
-
-Only one unfinished prefill is supported: waiters must fit after the continuation
-reservation and finish in this pass. Interleaving longer requests needs support
-for multiple partial prefills. Non-fitting waiters can be bypassed, so HRRN aging
-does not guarantee bounded tail TTFT.
+Only one unfinished prefill is supported, so a waiter must finish within the pass, and HRRN aging no longer bounds tail TTFT once non-fitting waiters are bypassed.
 
 ### Tune `--cuda-graph-max-bs-decode`
 By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).

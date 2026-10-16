@@ -106,17 +106,8 @@ def check_watermark_server_args(server_args: Any) -> None:
 
 
 def check_prefill_interleaving(cfg: Any) -> None:
-    enabled = (
-        cfg.schedule_policy == "shortest-prefill-first"
-        if cfg.prefill_interleaving is None
-        else cfg.prefill_interleaving
-    )
     minimum = cfg.prefill_interleaving_min_continuation_tokens
     if minimum is not None:
-        if not enabled:
-            raise ValueError(
-                "--prefill-interleaving-min-continuation-tokens requires prefill interleaving."
-            )
         if minimum <= 0 or minimum % cfg.page_size:
             raise ValueError(
                 "--prefill-interleaving-min-continuation-tokens must be a positive multiple of page_size."

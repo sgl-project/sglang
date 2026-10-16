@@ -15,9 +15,6 @@ from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
 
-# Match the HRRN/LPM fallback threshold; this is a CPU-work cap, not a tuned optimum.
-_PREFILL_INTERLEAVING_SCAN_LIMIT = 128
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -270,7 +267,7 @@ class SchedulePolicy:
                     logger.info(
                         "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
                         len(waiting_queue),
-                        self._shortest_prefill_work(waiting_queue[0]),
+                        self._uncached_prefill_len(waiting_queue[0]),
                     )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
@@ -410,7 +407,7 @@ class SchedulePolicy:
         return temporary_deprioritized
 
     @staticmethod
-    def _shortest_prefill_work(r: Req) -> int:
+    def _uncached_prefill_len(r: Req) -> int:
         return max(
             1,
             len(r.origin_input_ids) + len(r.output_ids) - r.num_matched_prefix_tokens,
@@ -424,12 +421,12 @@ class SchedulePolicy:
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                SchedulePolicy._shortest_prefill_work(r),
+                SchedulePolicy._uncached_prefill_len(r),
                 r.time_stats.wait_queue_entry_time,
             )
         )
 
-    def prefill_interleaving_chunk_limit(
+    def reserve_interleaved_prefills(
         self,
         chunked_req: Req,
         waiting_queue: List[Req],
@@ -438,12 +435,12 @@ class SchedulePolicy:
         *,
         max_reqs: int,
     ) -> Optional[int]:
-        """Reserve whole waiting prefills, at most ``max_reqs``, and put selected
-        HRRN requests first."""
+        """Cap the continuing chunk to reserve whole prefills for at most
+        ``max_reqs`` waiting requests, and move them ahead of the skipped ones."""
         shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-        minimum = self.prefill_interleaving_min_continuation_tokens
-        if minimum is None:
-            minimum = (
+        min_continuation = self.prefill_interleaving_min_continuation_tokens
+        if min_continuation is None:
+            min_continuation = (
                 page_size
                 if shortest_first
                 else max(page_size, _ceil_div(budget, 2 * page_size) * page_size)
@@ -451,32 +448,29 @@ class SchedulePolicy:
         if (
             not self.prefill_interleaving
             or max_reqs <= 0
-            or budget < minimum + page_size
+            or budget < min_continuation + page_size
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
         selected = []
         skipped = []
-        for req in waiting_queue[:_PREFILL_INTERLEAVING_SCAN_LIMIT]:
+        for req in waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]:
             if len(selected) == max_reqs:
                 break
-            work = self._shortest_prefill_work(req)
+            work = self._uncached_prefill_len(req)
             charge = _ceil_div(work, page_size) * page_size
             if (shortest_first and work >= remaining) or (
-                reserved + charge > budget - minimum
+                reserved + charge > budget - min_continuation
             ):
-                if shortest_first:
-                    break
                 skipped.append(req)
                 continue
             selected.append(req)
             reserved += charge
         if not reserved:
             return None
-        if not shortest_first:
-            # Admission stops on failure; try fitting requests before skipped ones.
-            waiting_queue[: len(selected) + len(skipped)] = selected + skipped
+        # Admission stops on failure; try fitting requests before skipped ones.
+        waiting_queue[: len(selected) + len(skipped)] = selected + skipped
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
 
@@ -644,7 +638,6 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        prefill_interleaving: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -655,7 +648,6 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
-        self.prefill_interleaving = prefill_interleaving
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
         self.exact_chunk_fill = (
@@ -1612,9 +1604,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req or self.new_chunked_req is not None
-            ) and self.prefill_interleaving:
+            if has_chunked_req or self.new_chunked_req is not None:
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:

@@ -3969,11 +3969,9 @@ class Scheduler(
         return res
 
     def _max_interleaved_waiting_reqs(self, running_batch: ScheduleBatch) -> int:
-        """Waiting requests the admission loop can add next to the chunked request."""
         if running_batch.batch_is_full:
             return 0
-        # The chunked request takes one of the slots the admission loop counts,
-        # but it keeps its req_to_token row across chunks, so it needs no free row.
+        # The chunked request keeps its row across chunks but takes an admission slot.
         slots = self.get_num_allocatable_reqs(
             len(running_batch.reqs),
             running_batch=running_batch,
@@ -4105,12 +4103,11 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            prefill_interleaving=self.policy.prefill_interleaving,
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.prefill_interleaving_chunk_limit(
+            adder.chunked_req_limit = self.policy.reserve_interleaved_prefills(
                 self.chunked_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,

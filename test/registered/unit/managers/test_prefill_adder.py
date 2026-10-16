@@ -38,7 +38,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-# No request-slot limit on the interleaving selection.
 ADMIT_ALL = 1 << 20
 
 
@@ -208,20 +207,12 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_interleaving_adder(
-        self, *, chunk_tokens=4096, policy="shortest-prefill-first"
-    ):
-        override = get_context().override_server_args(schedule_policy=policy)
-        override.install()
-        self.addCleanup(override.restore)
+    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_token_allocator.available_size.return_value = 32768
         return self.create_adder(
-            self.create_running_batch(),
-            page_size=256,
-            rem_chunk_tokens=chunk_tokens,
-            prefill_interleaving=True,
+            self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
     def test_interleaving_admits_complete_waiters(self):
@@ -230,7 +221,7 @@ class TestPrefillAdder(CustomTestCase):
             ("hrrn", [8192, 257, 2560], 1024),
         ):
             with self.subTest(policy=name):
-                adder = self.create_interleaving_adder(policy=name)
+                adder = self.create_shortest_prefill_adder()
                 policy = SchedulePolicy(
                     policy=name,
                     tree_cache=RadixCache.create_simulated(),
@@ -250,7 +241,7 @@ class TestPrefillAdder(CustomTestCase):
                     req.num_matched_prefix_tokens = 0
                     waiting.append(req)
                 expected = [continuation, *waiting[-2:]]
-                adder.chunked_req_limit = policy.prefill_interleaving_chunk_limit(
+                adder.chunked_req_limit = policy.reserve_interleaved_prefills(
                     continuation,
                     waiting,
                     adder.rem_chunk_tokens,
@@ -271,7 +262,7 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertGreaterEqual(adder.rem_total_tokens, 0)
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
-        adder = self.create_interleaving_adder(chunk_tokens=512)
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("second-chunk")
         req.full_untruncated_fill_ids = list(range(1024))
         self.assertEqual(
@@ -283,32 +274,25 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(req.extend_end)
         self.mock_tree_cache.init_load_back.assert_not_called()
 
-    def test_interleaving_rechecks_chunk_limit_after_host_miss(self):
-        for policy in ("shortest-prefill-first", "hrrn"):
-            with self.subTest(policy=policy):
-                adder = self.create_interleaving_adder(chunk_tokens=512, policy=policy)
-                req = self.create_shared_req("host-miss")
-                req.full_untruncated_fill_ids = list(range(1024))
-                req.prefix_len = 0
-                req.host_hit_length = 768
-                req.best_match_node = req.last_node
-                req.needs_host_load_back.return_value = True
-                self.mock_tree_cache.init_load_back.reset_mock()
-                self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
-                self.assertEqual(
-                    adder.add_one_req(
-                        req, has_chunked_req=True, truncation_align_size=None
-                    ),
-                    AddReqResult.OTHER,
-                )
-                self.mock_tree_cache.init_load_back.assert_called_once()
-                self.mock_tree_cache.init_load_back.reset_mock()
-                self.assertEqual(adder.can_run_list, [])
-                self.assertIsNone(adder.new_chunked_req)
-                self.assertIsNone(req.extend_end)
+    def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        req = self.create_shared_req("host-miss")
+        req.full_untruncated_fill_ids = list(range(1024))
+        req.prefix_len = 0
+        req.host_hit_length = 768
+        req.best_match_node = req.last_node
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.extend_end)
 
     def test_shortest_prefill_preserves_memory_admission(self):
-        adder = self.create_interleaving_adder()
+        adder = self.create_shortest_prefill_adder()
         self.mock_token_allocator.available_size.return_value = 256
         req = self.create_shared_req("no-memory")
         req.full_untruncated_fill_ids = list(range(512))
@@ -369,7 +353,7 @@ class TestPrefillAdder(CustomTestCase):
                     )
 
     def test_continuation_without_limit_keeps_normal_chunk_size(self):
-        adder = self.create_interleaving_adder()
+        adder = self.create_shortest_prefill_adder()
         req = self.create_shared_req("continuation")
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
