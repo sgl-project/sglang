@@ -1613,6 +1613,15 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    # ROCm gfx950, DeepSeek-V4 128x128 block-fp8 dense linears: run the GEMM as
+    # aiter's e8m0 mxscale bpreshuffle (flydsl) instead of the fp32-scale
+    # CK/asm/triton bpreshuffle. The weight bytes are shared; only an e8m0 copy
+    # of the (power-of-two) weight scale is added at load, and activations are
+    # quantized with power-of-two (ue8m0) scales. Restricted to the (N, K)
+    # shapes in SGLANG_DSV4_DENSE_MXSCALE_SHAPES ("N:K,N:K"; empty = built-in
+    # whitelist of shapes that win in the microbench, "all" = every shape).
+    SGLANG_DSV4_DENSE_MXSCALE = EnvBool(False)
+    SGLANG_DSV4_DENSE_MXSCALE_SHAPES = EnvStr("")
     # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
     # installed aiter ships it; 0 keeps the asm kernel.
     SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)
