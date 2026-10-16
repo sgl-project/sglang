@@ -45,7 +45,6 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import log_info_on_rank0
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -442,9 +441,6 @@ class CustomAllReduceV2:
             for i in range(len(ptrs))
         ]
         self.register_peer_mapped_inputs(peer_ptrs)
-        log_info_on_rank0(
-            logger, f"Registered {len(ptrs)} cuda graph addresses via cudaIpc handles"
-        )
 
     def get_graph_capture_bases(self):
         """VMM base allocations of pending graph inputs (VmmGraphInputManager hook)."""
