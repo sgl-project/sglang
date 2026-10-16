@@ -1025,9 +1025,6 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm,
         )
         self._fused_ffn_boundary = None
-        self._next_layer = None
-        # (forward batch, QKV) the previous layer's Helion verify tail computed.
-        self._verify_qkv = None
         # The checkpoint keeps the first and last layers' experts in BF16; those
         # layers stay on the stock path.
         self._megakernel_capable = (
@@ -1050,10 +1047,6 @@ class MuseSpark1xDecoderLayer(nn.Module):
             and envs.SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION.get()
         ):
             self.mlp.set_unpool_gather_boundary(self._fused_ffn_boundary)
-
-    def bind_next_layer(self, next_layer: MuseSpark1xDecoderLayer) -> None:
-        # Not a submodule: the model owns it. The Helion verify tail computes its QKV.
-        object.__setattr__(self, "_next_layer", next_layer)
 
     def forward(
         self,
@@ -1160,7 +1153,6 @@ class MuseSpark1xModel(nn.Module):
             self.layers.append(layer)
         for layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
             layer.bind_next_pre_attn_norm(next_layer.input_layernorm)
-            layer.bind_next_layer(next_layer)
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
