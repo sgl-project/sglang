@@ -164,43 +164,17 @@ class TestAsymmetricMHAPoolSetKVBuffer(unittest.TestCase):
         self._run_roundtrip(128, 128)
 
 
-@unittest.skipUnless(_HAS_CUDA, "prefix-valid write path requires CUDA")
-class TestAsymmetricPrefixValid(unittest.TestCase):
-    """set_kv_buffer_prefix_valid with K/V rows of different widths (an MLA DFlash
-    draft served as expanded MHA) must commit exactly the first commit_lens rows of
-    each request. Regression: an fp8 pool whose fallback converted to fp8 and then
-    handed the uint8 store view to set_kv_buffer, which converted the bytes again
-    as integers; the draft context KV became garbage without any error."""
+@unittest.skipUnless(_HAS_CUDA, "prefix-valid tiled kernel requires CUDA")
+class TestAsymmetricPrefixValidGuard(unittest.TestCase):
+    """set_kv_buffer_prefix_valid's tiled kernel takes one row width for both
+    tensors, so it must refuse asymmetric KV rather than truncate V."""
 
-    def _check(self, head_dim: int, v_head_dim: int, dtype: torch.dtype):
-        pool = MHATokenToKVPool(
-            size=POOL_SIZE,
-            page_size=1,
-            dtype=dtype,
-            head_num=HEAD_NUM,
-            head_dim=head_dim,
-            v_head_dim=v_head_dim,
-            layer_num=1,
-            device="cuda",
-            enable_memory_saver=False,
-            enable_alt_stream=False,
-        )
-        k_buf, v_buf = pool.k_buffer[0], pool.v_buffer[0]
-        for buf in (k_buf, v_buf):
-            buf.copy_(
-                torch.randint_like(buf, 0, 100)
-                if dtype != DTYPE
-                else torch.randn_like(buf)
-            )
-        k_before, v_before = k_buf.clone(), v_buf.clone()
-
-        loc_2d = torch.tensor([[5, 6, 7], [9, 10, 11]], device="cuda")
-        commit_lens = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
-        cache_k = torch.randn((6, HEAD_NUM, head_dim), dtype=DTYPE, device="cuda")
-        cache_v = torch.randn((6, HEAD_NUM, v_head_dim), dtype=DTYPE, device="cuda")
-        expected_k = cache_k.to(dtype).view(pool.store_dtype)
-        expected_v = cache_v.to(dtype).view(pool.store_dtype)
-
+    def _call_prefix_valid(self, pool, head_dim, v_head_dim):
+        rows = 2
+        loc_2d = torch.tensor([[1, 2]], dtype=torch.int64, device="cuda")
+        commit_lens = torch.tensor([rows], dtype=torch.int32, device="cuda")
+        cache_k = torch.randn((rows, HEAD_NUM, head_dim), dtype=DTYPE, device="cuda")
+        cache_v = torch.randn((rows, HEAD_NUM, v_head_dim), dtype=DTYPE, device="cuda")
         pool.set_kv_buffer_prefix_valid(
             SimpleNamespace(layer_id=0, k_scale=None, v_scale=None),
             loc_2d,
@@ -209,24 +183,20 @@ class TestAsymmetricPrefixValid(unittest.TestCase):
             cache_v,
         )
 
-        committed = torch.tensor([5, 6, 9], device="cuda")
-        rows = torch.tensor([0, 1, 3], device="cuda")
-        self.assertTrue(torch.equal(k_buf[committed], expected_k[rows]), "K rows")
-        self.assertTrue(torch.equal(v_buf[committed], expected_v[rows]), "V rows")
-        # Slot 0 is the reserved padding slot; nothing else may change.
-        untouched = torch.ones(k_buf.shape[0], dtype=torch.bool, device="cuda")
-        untouched[committed] = False
-        untouched[0] = False
-        self.assertTrue(torch.equal(k_buf[untouched], k_before[untouched]), "K bled")
-        self.assertTrue(torch.equal(v_buf[untouched], v_before[untouched]), "V bled")
+    def test_rejects_asymmetric(self):
+        for head_dim, v_head_dim in ASYM_DIM_PAIRS:
+            with self.subTest(head_dim=head_dim, v_head_dim=v_head_dim):
+                pool = _build_pool(head_dim, v_head_dim)
+                with self.assertRaises(NotImplementedError):
+                    self._call_prefix_valid(pool, head_dim, v_head_dim)
 
-    def test_commits_prefix_rows(self):
-        for dtype in (DTYPE, torch.float8_e4m3fn):
-            for head_dim, v_head_dim in ASYM_DIM_PAIRS:
-                with self.subTest(
-                    dtype=dtype, head_dim=head_dim, v_head_dim=v_head_dim
-                ):
-                    self._check(head_dim, v_head_dim, dtype)
+    def test_accepts_symmetric(self):
+        # The guard must not tighten the equal-width path it already served.
+        pool = _build_pool(128, 128)
+        self._call_prefix_valid(pool, 128, 128)
+        expected = torch.arange(1, 3, device="cuda")
+        self.assertTrue(torch.any(pool.k_buffer[0][expected] != 0))
+        self.assertTrue(torch.any(pool.v_buffer[0][expected] != 0))
 
 
 if __name__ == "__main__":

@@ -829,7 +829,52 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     cfg = resolving_view(server_args)
 
-    supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    def load_draft_config():
+        kwargs = {}
+        config_file = getattr(cfg, "decrypted_draft_config_file", None)
+        if config_file and config_file.strip():
+            kwargs["_configuration_file"] = config_file.strip()
+        return get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+            **kwargs,
+        )
+
+    # Out-of-tree platforms own their draft backend dispatch, including config
+    # loading. The compressed MLA implementation here is CUDA/HIP-only.
+    draft_hf_config = None if current_platform.is_out_of_tree() else load_draft_config()
+    if draft_hf_config is not None and is_dflash_mla_draft_config(draft_hf_config):
+        from sglang.srt.speculative.dflash_mla_backend import (
+            resolve_dflash_mla_attention_backend,
+        )
+
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_draft_attention_backend",
+            speculative_draft_attention_backend=resolve_dflash_mla_attention_backend(
+                cfg.speculative_draft_attention_backend
+            ),
+        )
+        return
+
+    if (
+        not current_platform.is_out_of_tree()
+        and cfg.speculative_draft_attention_backend == "tokenspeed_mla"
+    ):
+        raise ValueError(
+            "DFLASH tokenspeed_mla requires an MLA draft model; "
+            "it cannot serve GQA/MHA draft attention."
+        )
+    supported_draft_backends = [
+        backend
+        for backend in DRAFT_ATTENTION_BACKEND_CHOICES
+        if backend != "tokenspeed_mla"
+    ]
 
     def is_supported_backend(backend: str) -> bool:
         if current_platform.is_out_of_tree():
@@ -882,14 +927,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
-        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-        )
+        if draft_hf_config is None:
+            draft_hf_config = load_draft_config()
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )

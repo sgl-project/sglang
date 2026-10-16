@@ -44,6 +44,15 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
     )
     draft_backend = get_spec().speculative_draft_attention_backend
+    if (
+        draft_backend is not None
+        and draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES
+        and algo_label == "DFLASH"
+    ):
+        raise ValueError(
+            f"Unsupported DFLASH draft attention backend {draft_backend!r}; "
+            f"expected one of {DRAFT_ATTENTION_BACKEND_CHOICES}."
+        )
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:

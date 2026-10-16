@@ -1918,11 +1918,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
+                    if getattr(attn, "is_mla", False):
+                        latent, k_pe = attn.kv_proj_only(layer_ctx_hidden)
+                        k_pe = attn.apply_k_rope(positions, k_pe)
+                        self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer_prefix_valid(
+                            attn.attn,
+                            cache_loc_2d,
+                            commit_lens,
+                            latent.view(-1, 1, attn.kv_lora_rank),
+                            k_pe.view(-1, 1, attn.qk_rope_head_dim),
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                    v = v.view(-1, attn.num_kv_heads, attn.v_head_dim)
+                    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
@@ -1968,6 +1979,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if getattr(attn, "is_mla", False):
+                latent, k_pe = attn.kv_proj_only(layer_ctx_hidden)
+                k_pe = attn.apply_k_rope(ctx_positions, k_pe)
+                self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer(
+                    attn.attn,
+                    KVWriteLoc(ctx_cache_loc, physical=True),
+                    latent.view(-1, 1, attn.kv_lora_rank),
+                    k_pe.view(-1, 1, attn.qk_rope_head_dim),
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
@@ -1978,7 +1999,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_norm(k)
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-            v = v.view(-1, attn.num_kv_heads, attn.v_head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 KVWriteLoc(ctx_cache_loc, physical=True),

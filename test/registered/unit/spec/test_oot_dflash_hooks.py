@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
@@ -56,6 +57,10 @@ class TestOOTDFlashHooks(CustomTestCase):
         with (
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(f"{HOOK_MODULE}.attention_backends_of", return_value=(None, None)),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                side_effect=AssertionError("OOT dispatch must not load HF config"),
+            ),
         ):
             # Call the resolver directly: the full hook also resolves the
             # algorithm alias, which loads the draft HF config over the network.
@@ -119,6 +124,57 @@ class TestOOTDFlashHooks(CustomTestCase):
                     None, None, None, None, 0, 0, None
                 )
             self.assertIs(result, expected)
+
+
+class TestDFlashDraftBackendResolution(CustomTestCase):
+    def _resolve(self, args, *, mla: bool, target_backend="fa3"):
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = False
+        config = SimpleNamespace(
+            num_hidden_layers=1,
+            dflash_config={"attention_mode": "mla" if mla else "gqa"},
+        )
+        with (
+            patch(f"{HOOK_MODULE}.current_platform", platform),
+            patch(
+                f"{HOOK_MODULE}.get_platform",
+                return_value=SimpleNamespace(is_xpu=False, is_hip=False),
+            ),
+            patch(
+                f"{HOOK_MODULE}.attention_backends_of",
+                return_value=(target_backend, target_backend),
+            ),
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                return_value=config,
+            ) as get_config,
+        ):
+            _resolve_dflash_draft_attention_backend(args)
+        return get_config
+
+    def test_mla_default_uses_decrypted_draft_config(self):
+        args = _make_dflash_args(None)
+        args.decrypted_draft_config_file = " /tmp/decrypted-draft.json "
+        get_config = self._resolve(args, mla=True)
+        self.assertEqual(
+            get_config.call_args.kwargs["_configuration_file"],
+            "/tmp/decrypted-draft.json",
+        )
+        self.assertEqual(
+            resolution_result(args, "speculative_draft_attention_backend"), "triton"
+        )
+
+    def test_gqa_rejects_explicit_tokenspeed(self):
+        with self.assertRaisesRegex(ValueError, "requires an MLA draft model"):
+            self._resolve(_make_dflash_args("tokenspeed_mla"), mla=False)
+
+    def test_gqa_does_not_inherit_target_tokenspeed(self):
+        args = _make_dflash_args(None)
+        self._resolve(args, mla=False, target_backend="tokenspeed_mla")
+        self.assertEqual(
+            resolution_result(args, "speculative_draft_attention_backend"),
+            "flashinfer",
+        )
 
 
 if __name__ == "__main__":

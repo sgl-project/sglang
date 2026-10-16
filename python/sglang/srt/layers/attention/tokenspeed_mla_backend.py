@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import (
@@ -145,6 +146,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 self.kv_lora_rank,
                 max_q_len=(max_speculative_num_draft_tokens() or 1),
             )
+
+            # DFlash runs its block through TARGET_VERIFY with compressed MLA
+            # Q/KV. It never uses the expanded-MHA prefill kernels below.
+            if self.is_dflash_mla_draft:
+                return
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
             # min; without warm-up the first request trips the 300 s scheduler
@@ -343,6 +349,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
+            causal_mask=not (
+                self.is_dflash_mla_draft
+                and layer.attn_type
+                in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+            ),
             enable_pdl=is_arch_support_pdl(),
             return_lse=return_lse,
             causal_seqs=causal_seqs,

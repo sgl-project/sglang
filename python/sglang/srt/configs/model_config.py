@@ -1101,13 +1101,6 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and getattr(self.hf_config, "dflash_config", None):
-            from sglang.srt.speculative.dflash_utils import (
-                expand_dflash_mla_kv_shapes,
-            )
-
-            expand_dflash_mla_kv_shapes(self.hf_config)
-
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -1229,6 +1222,19 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
+        self.is_dflash_mla_draft = False
+        dflash_mla_config = None
+        if self.is_draft_model and getattr(self.hf_config, "dflash_config", None):
+            from sglang.srt.speculative.dflash_utils import (
+                is_dflash_mla_draft_config,
+                parse_dflash_mla_config,
+            )
+
+            self.is_dflash_mla_draft = is_dflash_mla_draft_config(self.hf_config)
+            if self.is_dflash_mla_draft:
+                # Validate before the generic GQA defaults fill missing fields.
+                dflash_mla_config = parse_dflash_mla_config(self.hf_config)
+
         # Pure SSM models have no attention heads; use head_dim == 0 so the
         # KV-cell size is 0 rather than a division on a missing head count.
         is_pure_ssm = any(
@@ -1262,7 +1268,27 @@ class ModelConfig:
             self.swa_v_head_dim = self.swa_head_dim
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
-        if (
+        if self.is_dflash_mla_draft:
+            mla = dflash_mla_config
+            self.attention_arch = AttentionArch.MLA
+            self.head_dim = mla.qk_head_dim
+            self.kv_lora_rank = mla.kv_lora_rank
+            self.qk_nope_head_dim = mla.qk_nope_head_dim
+            self.qk_rope_head_dim = mla.qk_rope_head_dim
+            self.v_head_dim = mla.v_head_dim
+            self.swa_head_dim = mla.qk_head_dim
+            self.swa_v_head_dim = mla.v_head_dim
+            self.swa_kv_lora_rank = mla.kv_lora_rank
+            self.swa_qk_rope_head_dim = mla.qk_rope_head_dim
+            self.index_head_dim = None
+            # The exported GQA template fields do not describe MLA storage.
+            # Each rank caches one shared latent and its shared RoPE key.
+            self.hf_text_config.num_key_value_heads = 1
+            rope_scaling = getattr(
+                self.hf_text_config, "rope_parameters", None
+            ) or getattr(self.hf_text_config, "rope_scaling", None)
+            self._init_mla_scaling(rope_scaling)
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
