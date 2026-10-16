@@ -200,7 +200,7 @@ class ViTCudaGraphRunner:
         else:
             warmup_cu_ws = [cu_full, cu_full_kk, max_full_len]
         warmup_layouts = [warmup_cu_ws]
-        if backend in ("fa3", "fa4"):
+        if backend in ("fa3", "fa4", "aiter_attn"):
             warmup_layouts = [[warmup_cu_ws[0], warmup_cu_ws[2]]]
         if backend == "fa4" and self._fullatt_block_indexes:
             # FA4 JIT-compiles each kernel variant on first use, which must not
@@ -242,7 +242,7 @@ class ViTCudaGraphRunner:
 
                 if backend == "triton_attn":
                     cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif backend in ("fa3", "fa4"):
+                elif backend in ("fa3", "fa4", "aiter_attn"):
                     cu_seq_len_ws = [cu_seqlens_now, max_len]
                 else:
                     raise RuntimeError(
