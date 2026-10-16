@@ -284,6 +284,10 @@ class CustomAllreduce:
 
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
         out = torch.empty_like(inp)
+        # An empty all-reduce exchanges nothing; the CUDA kernel would launch zero blocks,
+        # an unchecked launch error that the next kernel launch on this thread reports.
+        if inp.numel() == 0:
+            return out
         if not _is_hip:  # CUDA-like
             if registered:
                 ops.all_reduce(self._ptr, inp, out, 0, 0)
