@@ -73,18 +73,27 @@ def _reference_chain(layer, out, x, runtime_scale):
     return out + delta.to(dtype=out.dtype)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("request_batch", [_batch("exact"), None])
 @pytest.mark.parametrize("stacked", [False, True])
 @pytest.mark.parametrize(
     "alpha, strength, runtime_scale",
-    [(RANK, 1.0, 1.0), (2 * RANK, 1.0, 1.0), (RANK, 0.7, 1.0), (8, 0.7, 0.5)],
+    [
+        (RANK, 1.0, 1.0),
+        (2 * RANK, 1.0, 1.0),
+        (RANK, 0.7, 1.0),
+        (8, 0.7, 0.5),
+        (8, 0.7, 0.6),
+    ],
 )
 def test_exact_tier_keeps_the_reference_chain_bit_for_bit(
-    stacked, alpha, strength, runtime_scale, request_batch
+    stacked, alpha, strength, runtime_scale, request_batch, device
 ):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
     a, b = _adapter(stacked, torch.bfloat16)
-    layer = _layer(a, b, alpha, strength)
-    x = _activations(TOKENS, IN_DIM, seed=2).to(torch.bfloat16)
+    layer = _layer(a, b, alpha, strength).to(device)
+    x = _activations(TOKENS, IN_DIM, seed=2).to(device=device, dtype=torch.bfloat16)
     with torch.inference_mode(), set_forward_context(0, None, request_batch):
         out = layer.base_layer(x)
         actual = layer._add_lora_delta(out.clone(), x, runtime_scale)
