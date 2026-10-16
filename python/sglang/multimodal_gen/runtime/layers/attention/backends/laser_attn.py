@@ -9,7 +9,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformEnum
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
 _BF16_LASER_SCALE = 256.0
@@ -42,7 +46,7 @@ class LaserAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        if torch.npu.get_soc_version() == 260:
+        if current_platform.return_platform() == NPUPlatformEnum.ASCEND_950:
             raise ValueError(
                 "Laser Attention is unavailable on Ascend 950 (A5). "
                 "Use --attention-backend fa or rain_fusion_attn."

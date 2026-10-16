@@ -132,7 +132,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>block_sparse_attn</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>BLOCK_SPARSE_ATTN</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>sgl_kernel_npu</code> on Ascend910 (A2/A3) and CANN>=9.0.0 on Ascend950 (A5).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Ascend 910 (A2/A3) only. Requires <code>sgl_kernel_npu</code> with <code>sparse_block_estimate</code> and <code>ada_block_sparse_attention</code>.</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>rain_fusion_attn</code></td>
@@ -536,14 +536,14 @@ Hybrid window attention constraints:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`skip_first_steps`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Number of dense steps before switching to sparse attention: Laser on Ascend 910, Ascend FA on Ascend 950.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Number of dense steps before switching to sparse attention.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`10`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparsity`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`float`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}> The sparsity coefficient must be in the range [0, 1).</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`0.2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`0.7`</td>
     </tr>
   </tbody>
 </table>
@@ -809,7 +809,7 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NPU-only. Uses sgl-kernel-npu Ada BSA on Ascend 910 and CANN BSA only on Ascend 950. Configuration via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ascend 910 (A2/A3) only. Uses sgl-kernel-npu. Configuration via <code>--attention-backend-config</code>.</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>rain_fusion_attn</code></td>
