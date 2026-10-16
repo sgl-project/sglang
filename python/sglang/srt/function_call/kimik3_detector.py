@@ -13,6 +13,8 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -28,6 +30,16 @@ from sglang.srt.function_call.kimik3_structural_tag import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_orphan_tool_closers(text: str) -> str:
+    for marker in (CALL_CLOSE, ARGUMENT_CLOSE):
+        text = text.replace(marker, "")
+        for length in range(len(marker) - 1, 0, -1):
+            if text.endswith(marker[:length]):
+                text = text[:-length]
+                break
+    return text
 
 _CALL_RE = re.compile(
     r"<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
@@ -149,11 +161,13 @@ class KimiK3Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         open_idx = text.find(self.bot_token)
         if open_idx == -1:
-            return StreamingParseResult(normal_text=strip_response_wrappers(text))
+            return StreamingParseResult(
+                normal_text=_strip_orphan_tool_closers(strip_response_wrappers(text))
+            )
         # Computed outside the try so the error path can reuse it instead of
         # falling back to raw text, which would ship the XTML tools markup to
         # the client.
-        before = strip_response_wrappers(text[:open_idx])
+        before = _strip_orphan_tool_closers(strip_response_wrappers(text[:open_idx]))
         try:
             section_start = open_idx + len(self.bot_token)
             close_idx = text.find(self.eot_token, section_start)
@@ -230,13 +244,24 @@ class KimiK3Detector(BaseFormatDetector):
                 )
             return StreamingParseResult()
         pending = self._emit_normal_text(limit=len(self._buffer))
-        return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))
+        return StreamingParseResult(
+            normal_text=_strip_orphan_tool_closers(
+                strip_partial_marker_suffix(pending)
+            )
+        )
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
         if limit is None:
             holdback = partial_suffix_len(
                 self._buffer,
-                [self.bot_token, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE],
+                [
+                    self.bot_token,
+                    RESPONSE_OPEN,
+                    RESPONSE_CLOSE,
+                    MESSAGE_CLOSE,
+                    CALL_CLOSE,
+                    ARGUMENT_CLOSE,
+                ],
             )
             limit = len(self._buffer) - holdback
         if limit <= self._sent_normal_idx:
@@ -246,4 +271,4 @@ class KimiK3Detector(BaseFormatDetector):
             if marker in pending:
                 pending = pending.replace(marker, "")
         self._sent_normal_idx = limit
-        return pending
+        return _strip_orphan_tool_closers(pending)
