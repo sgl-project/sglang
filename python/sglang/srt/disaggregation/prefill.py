@@ -927,229 +927,13 @@ class DisaggPrefill:
     def commit_extend(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> List[Req]:
-        """
-        Transfer kv for prefill completed requests and add it into the transfer list
-        Adapted from process_batch_result_prefill
-        Returns the optimistic requests that yield back to the front of the
-        waiting list.
-        """
-        chunked_req = self.core_lists.chunked_req
-        requeued: List[Req] = []
-        logits_output, next_token_ids, auxiliary_output_starts = (
-            self.batch_result_processor.host_prefill_result(batch, result)
+        """The host commit of a prefill step: the requests whose prefill
+        concluded hand their KV over to the transfer list. Returns the
+        optimistic requests that yield back to the front of the waiting
+        list."""
+        return self.batch_result_processor.commit_extend(
+            batch, result, _HandoffOutcome(self, result)
         )
-        auxiliary_output = result.auxiliary_host_output
-        extend_input_len_per_req = batch.extend_lens
-        extend_logprob_start_len_per_req = batch.extend_logprob_start_lens
-
-        logprob_pt = 0
-        aborted_reqs: List[Req] = []
-        # Requests whose last launched chunk this step ran: they leave
-        # prefilling, to the inflight queue, back to waiting, or finished.
-        concluded: List[Req] = []
-        # The draft state the decode node's first verify starts from.
-        draft_input = result.next_draft_input
-        draft_hidden_states_cpu = None
-        draft_dsa_topk_indices_cpu = None
-        if self.spec_algorithm.is_eagle() and draft_input is not None:
-            draft_hidden_states_cpu = draft_input.hidden_states.to(
-                "cpu", non_blocking=False
-            )
-            if draft_input.dsa_topk_indices is not None:
-                draft_dsa_topk_indices_cpu = draft_input.dsa_topk_indices.to(
-                    "cpu", non_blocking=False
-                )
-
-        def advance_logprob_pt(i: int, req: Req) -> None:
-            nonlocal logprob_pt
-            if not req.return_logprob or extend_input_len_per_req is None:
-                return
-            extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-            extend_input_len = extend_input_len_per_req[i]
-            if extend_logprob_start_len < extend_input_len:
-                logprob_pt += extend_input_len - extend_logprob_start_len
-
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
-        ):
-            if req is not batch.chunked_req:
-                concluded.append(req)
-                req.time_stats.set_prefill_finished_time()
-
-                # Its KV never landed: abort instead of sending it to decode.
-                if req.discard_output_reason is not None:
-                    req.to_finish = req.discard_output_reason
-                if is_aborted(req):
-                    if self._retire_aborted_prefill_result(req):
-                        req.time_stats.set_completion_time()
-                        aborted_reqs.append(req)
-                    advance_logprob_pt(i, req)
-                    continue
-
-                # Test hook: exercise the release/requeue retry path.
-                if req.disagg.pending_bootstrap and should_force_retry(req):
-                    requeued = self.optimistic_release_and_requeue(req, requeued)
-                    advance_logprob_pt(i, req)
-                    continue
-
-                sampling_mask_finish_reason = None
-                if req.return_sampling_mask:
-                    assert logits_output is not None
-                    statuses = logits_output.next_token_sampling_mask_status
-                    status = None if statuses is None else statuses[i]
-                    sampling_mask_finish_reason = (
-                        self.batch_result_processor.get_sampling_mask_finish_reason(
-                            status=status
-                        )
-                    )
-                if sampling_mask_finish_reason is not None:
-                    req.to_finish = sampling_mask_finish_reason
-                    req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": sampling_mask_finish_reason.message}
-                    )
-                    if self._retire_aborted_prefill_result(req):
-                        req.time_stats.set_completion_time()
-                        aborted_reqs.append(req)
-                    advance_logprob_pt(i, req)
-                    continue
-
-                req.output_ids.append(next_token_id)
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
-                    if is_aborted(req):
-                        if self._retire_aborted_prefill_result(req):
-                            req.time_stats.set_completion_time()
-                            aborted_reqs.append(req)
-                        advance_logprob_pt(i, req)
-                        continue
-
-                self.checkpoint(req)
-                self.transfer.append(req)
-                if self.spec_algorithm.is_eagle() and draft_input is not None:
-                    req.output_topk_p = draft_input.topk_p[i]
-                    req.output_topk_index = draft_input.topk_index[i]
-                    req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
-                    if draft_dsa_topk_indices_cpu is not None:
-                        req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[
-                            i
-                        ].clone()
-                    else:
-                        req.output_dsa_topk_indices = None
-                else:
-                    req.hidden_states_tensor = None
-                    req.output_dsa_topk_indices = None
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.batch_result_processor.logprob_result_processor.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-                if req.return_sampling_mask:
-                    self.batch_result_processor.add_sampling_mask_return_values(
-                        i, req, logits_output
-                    )
-                if (
-                    get_disagg().disaggregation_decode_allocation_policy
-                    == "prefill_complete"
-                ):
-                    self.kv_senders[req.rid].mark_prefill_complete()
-                if not req.disagg.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
-
-            else:
-                # being chunked reqs' prefill is not finished
-                # Still chunking iff its next chunk was launched: either it is
-                # still the chunked request, or its final chunk (extend_end
-                # reaching the end of the input) is in flight. A yielded req
-                # is neither, so do its deferred release here.
-                still_chunking = chunked_req is req or (
-                    req.extend_end is not None
-                    and req.extend_end >= len(req.origin_input_ids)
-                )
-                if not still_chunking:
-                    concluded.append(req)
-                # Abort is terminal. Do not requeue an aborted optimistic
-                # request merely because bootstrap is still pending.
-                if is_aborted(req):
-                    if not still_chunking and self._retire_aborted_prefill_result(req):
-                        req.time_stats.set_completion_time()
-                        aborted_reqs.append(req)
-                    advance_logprob_pt(i, req)
-                    req.time_stats.set_last_chunked_prefill_finish_time()
-                    continue
-
-                if req.disagg.pending_bootstrap and not still_chunking:
-                    requeued = self.optimistic_release_and_requeue(req, requeued)
-                    advance_logprob_pt(i, req)
-                    req.time_stats.set_last_chunked_prefill_finish_time()
-                    continue
-
-                if req.return_logprob:
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.batch_result_processor.logprob_result_processor.add_input_logprob_return_values(
-                            i,
-                            req,
-                            logits_output,
-                            logprob_pt,
-                            num_input_logprobs,
-                            last_prefill_chunk=False,
-                        )
-                        logprob_pt += num_input_logprobs
-
-                # In non-overlap-mode, KV is sent in process_prefill_chunk
-                # Only send when req's sender is initialized
-                if self.enable_overlap and not req.disagg.pending_bootstrap:
-                    assert req.disagg.metadata_buffer_index >= 0, (
-                        f"Req {req.rid} does not have metadata buffer allocated"
-                    )
-                    chunk_end = batch.prefix_lens[i] + batch.extend_lens[i]
-                    self.send_kv_chunk(
-                        req,
-                        last_chunk=False,
-                        end_idx=min(chunk_end, len(req.origin_input_ids)),
-                    )
-                req.time_stats.set_last_chunked_prefill_finish_time()
-
-        if auxiliary_output is not None:
-            self.batch_result_processor.consume_auxiliary_output(
-                batch,
-                auxiliary_output,
-                auxiliary_output_starts,
-            )
-
-        if concluded:
-            self.prefilling = [r for r in self.prefilling if r not in concluded]
-
-        if aborted_reqs:
-            self.output_streamer.stream_output(
-                aborted_reqs,
-                any(req.return_logprob for req in aborted_reqs),
-            )
-
-        self.output_streamer.maybe_reply_health_check()
-        return requeued
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def poll_transfer_rids(self) -> List[str]:
@@ -1779,3 +1563,181 @@ class DisaggPrefill:
             req.arrival_processed_tokens = self.counters.processed_tokens_counter
             waiting = [req, *waiting]
         return waiting
+
+
+def _abort_before_handoff(req: Req, error: str) -> None:
+    """Abort a concluded PD prefill request now: the commit retires it
+    instead of handing its KV over."""
+    prepare_abort(req, error, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+class _HandoffOutcome:
+    """PD prefill: a concluded row hands its KV over to the transfer list
+    (or aborts, or yields an optimistic request back to waiting); the
+    chunked request's row sends its chunk under overlap. Only aborted
+    requests stream."""
+
+    def __init__(self, owner: DisaggPrefill, result: GenerationBatchResult):
+        self.owner = owner
+        self.processor = owner.batch_result_processor
+        # The chunked request the scheduler still chunks, at this commit.
+        self.chunked_req = owner.core_lists.chunked_req
+        # The draft state the decode node's first verify starts from.
+        self.draft_input = (
+            result.next_draft_input if owner.spec_algorithm.is_eagle() else None
+        )
+        self._draft_cpu = None
+        # Requests whose last launched chunk this step ran: they leave
+        # prefilling, to the inflight queue, back to waiting, or finished.
+        self.concluded: List[Req] = []
+        self.aborted: List[Req] = []
+        self.requeued: List[Req] = []
+
+    def _draft_tensors_cpu(self):
+        if self._draft_cpu is None:
+            draft_input = self.draft_input
+            self._draft_cpu = (
+                draft_input.hidden_states.to("cpu", non_blocking=False),
+                (
+                    draft_input.dsa_topk_indices.to("cpu", non_blocking=False)
+                    if draft_input.dsa_topk_indices is not None
+                    else None
+                ),
+            )
+        return self._draft_cpu
+
+    def _skip_logprobs(self, commit, i: int, req: Req) -> None:
+        if commit.batch.return_logprob:
+            self.processor.apply_prefill_logprobs(commit, i, req, store=False)
+
+    def _drop(self, commit, i: int, req: Req) -> None:
+        if self.owner._retire_aborted_prefill_result(req):
+            req.time_stats.set_completion_time()
+            self.aborted.append(req)
+        self._skip_logprobs(commit, i, req)
+
+    def conclude(self, commit, i: int, req: Req, next_token_id: int) -> None:
+        owner = self.owner
+        processor = self.processor
+        self.concluded.append(req)
+        req.time_stats.set_prefill_finished_time()
+
+        # Its KV never landed: abort instead of sending it to decode.
+        if req.discard_output_reason is not None:
+            req.to_finish = req.discard_output_reason
+        if is_aborted(req):
+            self._drop(commit, i, req)
+            return
+
+        # Test hook: exercise the release/requeue retry path.
+        if req.disagg.pending_bootstrap and should_force_retry(req):
+            self.requeued = owner.optimistic_release_and_requeue(req, self.requeued)
+            self._skip_logprobs(commit, i, req)
+            return
+
+        if req.return_sampling_mask:
+            sampling_mask_finish_reason = processor.sampling_mask_finish_reason(
+                commit, i
+            )
+            if sampling_mask_finish_reason is not None:
+                req.to_finish = sampling_mask_finish_reason
+                req.time_stats.trace_ctx.abort(
+                    abort_info={"reason": sampling_mask_finish_reason.message}
+                )
+                self._drop(commit, i, req)
+                return
+
+        req.output_ids.append(next_token_id)
+        if req.grammar is not None:
+            processor.apply_prefill_grammar(
+                commit, req, next_token_id, abort=_abort_before_handoff
+            )
+            if is_aborted(req):
+                self._drop(commit, i, req)
+                return
+
+        owner.checkpoint(req)
+        owner.transfer.append(req)
+        draft_input = self.draft_input
+        if draft_input is not None:
+            draft_hidden_states_cpu, draft_dsa_topk_indices_cpu = (
+                self._draft_tensors_cpu()
+            )
+            req.output_topk_p = draft_input.topk_p[i]
+            req.output_topk_index = draft_input.topk_index[i]
+            req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
+            if draft_dsa_topk_indices_cpu is not None:
+                req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[i].clone()
+            else:
+                req.output_dsa_topk_indices = None
+        else:
+            req.hidden_states_tensor = None
+            req.output_dsa_topk_indices = None
+        if commit.batch.return_logprob:
+            processor.apply_prefill_logprobs(commit, i, req)
+        if req.return_sampling_mask:
+            processor.add_sampling_mask_return_values(i, req, commit.logits_output)
+        if get_disagg().disaggregation_decode_allocation_policy == "prefill_complete":
+            owner.kv_senders[req.rid].mark_prefill_complete()
+        if not req.disagg.pending_bootstrap:
+            owner.send_kv_chunk(req, last_chunk=True)
+        req.time_stats.set_prefill_transfer_queue_entry_time()
+
+    def continue_chunk(self, commit, i: int, req: Req) -> None:
+        owner = self.owner
+        # Still chunking iff its next chunk was launched: either it is
+        # still the chunked request, or its final chunk (extend_end
+        # reaching the end of the input) is in flight. A yielded req
+        # is neither, so do its deferred release here.
+        still_chunking = self.chunked_req is req or (
+            req.extend_end is not None and req.extend_end >= len(req.origin_input_ids)
+        )
+        if not still_chunking:
+            self.concluded.append(req)
+        # Abort is terminal. Do not requeue an aborted optimistic
+        # request merely because bootstrap is still pending.
+        if is_aborted(req):
+            if not still_chunking and owner._retire_aborted_prefill_result(req):
+                req.time_stats.set_completion_time()
+                self.aborted.append(req)
+            self._skip_chunk_logprobs(commit, i, req)
+            req.time_stats.set_last_chunked_prefill_finish_time()
+            return
+
+        if req.disagg.pending_bootstrap and not still_chunking:
+            self.requeued = owner.optimistic_release_and_requeue(req, self.requeued)
+            self._skip_chunk_logprobs(commit, i, req)
+            req.time_stats.set_last_chunked_prefill_finish_time()
+            return
+
+        if commit.batch.return_logprob:
+            self.processor.apply_chunked_prefill_logprobs(commit, i, req)
+
+        # In non-overlap-mode, KV is sent in process_prefill_chunk
+        # Only send when req's sender is initialized
+        if owner.enable_overlap and not req.disagg.pending_bootstrap:
+            assert req.disagg.metadata_buffer_index >= 0, (
+                f"Req {req.rid} does not have metadata buffer allocated"
+            )
+            chunk_end = commit.batch.prefix_lens[i] + commit.batch.extend_lens[i]
+            owner.send_kv_chunk(
+                req,
+                last_chunk=False,
+                end_idx=min(chunk_end, len(req.origin_input_ids)),
+            )
+        req.time_stats.set_last_chunked_prefill_finish_time()
+
+    def _skip_chunk_logprobs(self, commit, i: int, req: Req) -> None:
+        if commit.batch.return_logprob:
+            self.processor.apply_chunked_prefill_logprobs(commit, i, req, store=False)
+
+    def finish(self, commit) -> List[Req]:
+        owner = self.owner
+        if self.concluded:
+            owner.prefilling = [r for r in owner.prefilling if r not in self.concluded]
+        if self.aborted:
+            owner.output_streamer.stream_output(
+                self.aborted,
+                any(req.return_logprob for req in self.aborted),
+            )
+        return self.requeued

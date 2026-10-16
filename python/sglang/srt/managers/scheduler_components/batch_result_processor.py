@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Iterable,
     List,
     Optional,
@@ -690,13 +691,20 @@ class SchedulerBatchResultProcessor:
             batch.spec_info,
         )
 
-    def _apply_prefill_grammar(
-        self, *, req: Req, next_token_id: int, already_advanced: bool = False
+    def apply_prefill_grammar(
+        self,
+        commit: ExtendCommit,
+        req: Req,
+        next_token_id: int,
+        abort: Callable[[Req, str], None],
     ) -> None:
+        """Advance a concluded row's grammar over its token, then sync
+        grammar.finished. A token the grammar rejects aborts the request with
+        the error (status 500), the way the mode aborts it."""
         # The step's grammar commit may have advanced the FSM over this
         # prefilled token already (inside the next spec step's verify); only
         # advance if not, but always sync grammar.finished.
-        if not already_advanced:
+        if not commit.result.grammar_advanced:
             # FIXME: this try-except block is for handling unexpected xgrammar issue.
             try:
                 req.grammar.accept_token(next_token_id)
@@ -704,17 +712,16 @@ class SchedulerBatchResultProcessor:
                 # Grammar accept_token can raise ValueError if the token is not in the
                 # grammar. This can happen if the grammar is not set correctly or the
                 # token is invalid.
-                logger.error(
-                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                )
-                req.to_finish = FINISH_ABORT()
+                error = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                logger.error(error)
+                abort(req, error)
         req.grammar.finished = req.finished()
 
     def apply_chunked_prefill_logprobs(
-        self, commit: ExtendCommit, i: int, req: Req
+        self, commit: ExtendCommit, i: int, req: Req, *, store: bool = True
     ) -> None:
-        """Advance the logprob cursor past a continuing chunk's row, storing
-        its input logprobs."""
+        """Advance the logprob cursor past a continuing chunk's row,
+        optionally storing its input logprobs."""
         extend_logprob_start_len = commit.batch.extend_logprob_start_lens[i]
         extend_input_len = commit.batch.extend_lens[i]
         if extend_logprob_start_len < extend_input_len:
@@ -726,7 +733,7 @@ class SchedulerBatchResultProcessor:
                     extend_logprob_start_len,
                 )
             )
-            if req.return_logprob:
+            if store and req.return_logprob:
                 self.logprob_result_processor.add_input_logprob_return_values(
                     i,
                     req,
@@ -1429,6 +1436,12 @@ class SchedulerBatchResultProcessor:
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)
 
 
+def _abort_at_next_commit(req: Req, error: str) -> None:
+    """Abort a running request: it finishes at its next commit, as a client
+    abort does, since the next step may already run it."""
+    req.to_finish = FINISH_ABORT(error, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
 class _PrefillOutcome:
     """Normal prefill: a concluded row takes its token, then finishes or
     checkpoints; every row but the chunked request's streams."""
@@ -1543,10 +1556,8 @@ class _PrefillOutcome:
             processor.add_sampling_mask_return_values(i, req, logits_output)
 
         if req.grammar is not None:
-            processor._apply_prefill_grammar(
-                req=req,
-                next_token_id=next_token_id,
-                already_advanced=commit.result.grammar_advanced,
+            processor.apply_prefill_grammar(
+                commit, req, next_token_id, abort=_abort_at_next_commit
             )
 
     def continue_chunk(self, commit: ExtendCommit, i: int, req: Req) -> None:

@@ -540,6 +540,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         dp_cooperation_info=None,
         extend_lens=None,
         extend_logprob_start_lens=None,
+        return_logprob=False,
     )
     snapshot_auxiliary_output_starts = Mock(
         side_effect=SchedulerBatchResultProcessor.snapshot_auxiliary_output_starts
@@ -568,7 +569,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
-    owner.output_streamer.maybe_reply_health_check.assert_called_once_with()
+    # The scheduler's commit tail answers health checks, once per step.
+    owner.output_streamer.maybe_reply_health_check.assert_not_called()
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():

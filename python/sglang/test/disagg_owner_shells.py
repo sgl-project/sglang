@@ -60,18 +60,34 @@ def tree_release(owner):
 
 
 def result_processor_shell(**attrs) -> SimpleNamespace:
-    """A result processor whose host_prefill_result is the real one, over mocked
-    logprob and auxiliary-output steps."""
+    """A result processor whose extend loop, host_prefill_result and row
+    helpers are the real ones, over mocked logprob, auxiliary-output and
+    free-group steps."""
     processor = SimpleNamespace(
+        kv=SimpleNamespace(token_to_kv_pool_allocator=Mock()),
         snapshot_auxiliary_output_starts=Mock(return_value=[]),
         move_logprobs_to_cpu=Mock(),
         materialize_sampling_mask_output=(
             SchedulerBatchResultProcessor.materialize_sampling_mask_output
         ),
+        _validate_pp_skip_output_comm=(
+            SchedulerBatchResultProcessor._validate_pp_skip_output_comm
+        ),
         consume_auxiliary_output=Mock(),
     )
     processor.__dict__.update(attrs)
-    processor.host_prefill_result = MethodType(
-        SchedulerBatchResultProcessor.host_prefill_result, processor
-    )
+    for name in (
+        "commit_extend",
+        "host_prefill_result",
+        "sampling_mask_finish_reason",
+        "apply_prefill_logprobs",
+        "apply_chunked_prefill_logprobs",
+        "apply_prefill_grammar",
+    ):
+        if name not in attrs:
+            setattr(
+                processor,
+                name,
+                MethodType(getattr(SchedulerBatchResultProcessor, name), processor),
+            )
     return processor

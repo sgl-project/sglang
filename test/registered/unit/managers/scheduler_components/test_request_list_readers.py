@@ -54,7 +54,13 @@ _OWNERS = {
     "disagg_prefill": (
         "disaggregation/prefill.py",
         "DisaggPrefill.lists",
-        {"disaggregation/prefill.py": ["DisaggPrefill", "PrefillBootstrapQueue"]},
+        {
+            "disaggregation/prefill.py": [
+                "DisaggPrefill",
+                "PrefillBootstrapQueue",
+                "_HandoffOutcome",
+            ]
+        },
     ),
     "disagg_decode": (
         "disaggregation/decode.py",
@@ -144,7 +150,7 @@ _LOOP_SCHEDULING = {
     ("disaggregation/decode.py", "DisaggDecode.pop_reqs_to_admit"),
     # PD prefill's extend commit tells the request still chunking from a
     # yielded one.
-    ("disaggregation/prefill.py", "DisaggPrefill.commit_extend"),
+    ("disaggregation/prefill.py", "_HandoffOutcome.__init__"),
 }
 
 # L1 allowlist: (module under srt/, scope, field read) -> count.
@@ -189,6 +195,10 @@ _NOT_LISTS = {
     ("DecodePreallocQueue", "pending_reqs"): (
         "the members of `queue` still resolving their prefill DP rank"
     ),
+    # One PD prefill commit's rows, sorted while the commit runs.
+    ("_HandoffOutcome", "concluded"): "the commit's rows that leave prefilling",
+    ("_HandoffOutcome", "aborted"): "the commit's rows it retired, to stream",
+    ("_HandoffOutcome", "requeued"): "the commit's rows that yield to waiting",
 }
 
 # L3: unannotated container fields of the owners that hold no requests; any

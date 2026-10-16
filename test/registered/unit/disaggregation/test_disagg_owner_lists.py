@@ -117,6 +117,7 @@ class TestDisaggPrefillLists(CustomTestCase):
             dp_cooperation_info=None,
             extend_lens=None,
             extend_logprob_start_lens=None,
+            return_logprob=False,
         )
         result = GenerationBatchResult(next_token_ids=torch.tensor([11]))
         self.assertEqual(owner.commit_extend(batch, result), [])

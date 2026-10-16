@@ -93,6 +93,7 @@ def _batch(req, *, middle_chunk=False):
         dp_cooperation_info=None,
         extend_lens=None,
         extend_logprob_start_lens=None,
+        return_logprob=False,
     )
 
 
