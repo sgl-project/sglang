@@ -1828,8 +1828,9 @@ def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: List[int],
 ):
+    """Quantize BF16 or FP32 weights with 128x128 power-of-two block scales."""
     assert weight_block_size == [128, 128]
-    assert weight_dequant.dtype == torch.bfloat16, (
+    assert weight_dequant.dtype in (torch.bfloat16, torch.float32), (
         f"{weight_dequant.dtype=} {weight_dequant.shape=}"
     )
 
@@ -1936,24 +1937,24 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
-    mn_repeat_128, k_div_4 = sf_packed.shape
-    mn = mn_repeat_128 // block_size
+    # one row per weight row, so the last block is partial when the rows are not a multiple of 128
+    num_rows, k_div_4 = sf_packed.shape
+    mn = -(-num_rows // block_size)
     k = k_div_4 * 4
 
     # packed u8 -> fp32
-    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
+    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(num_rows, k)
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
     # remove repeat
-    sf_reshaped = sf_fp32.view(mn, block_size, k)
-    sf_unrepeated = sf_reshaped[:, 0:1, :]
-    if not torch.all(sf_unrepeated == sf_reshaped):
+    sf_unrepeated = sf_fp32[::block_size].contiguous()
+    sf_repeated = sf_unrepeated.repeat_interleave(block_size, dim=0)[:num_rows]
+    if not torch.all(sf_repeated == sf_fp32):
         from sglang.srt.debug_utils.dumper import get_tensor_info
 
         raise AssertionError(
-            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
+            f"sf_repeated != sf_fp32 ({get_tensor_info(sf_repeated)=} {get_tensor_info(sf_fp32)=})"
         )
-    sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
 
     assert sf_unrepeated.shape == (mn, k)
     return sf_unrepeated

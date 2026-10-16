@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -52,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_platform,
     get_server_args,
 )
 from sglang.srt.utils import get_available_gpu_memory
@@ -83,6 +85,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
@@ -221,6 +224,15 @@ def _get_quantization_config(
 
             quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            if (
+                quant_config.is_fp4_experts
+                and not quant_config.dequant_fp4_to_fp8
+                and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                and not get_platform().is_sm100
+            ):
+                raise ValueError(
+                    "flashinfer_trtllm_routed with MXFP4 experts requires SM100."
+                )
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:
@@ -314,6 +326,14 @@ def post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+    refresh_gemma_weights(model)
+
+
+def refresh_gemma_weights(model: nn.Module) -> None:
+    # its weight loader derives the buffer, so writes that bypass the loader leave it stale
+    for module in model.modules():
+        if isinstance(module, GemmaRMSNorm):
+            module.refresh_gemma_weight()
 
 
 def _modules_with_quant_method(model: nn.Module):
@@ -827,6 +847,33 @@ class DefaultModelLoader(BaseModelLoader):
                 )
         return model
 
+    def initialize_model_without_storage(
+        self,
+        *,
+        model_config: ModelConfig,
+        device: torch.device,
+    ) -> Tuple[nn.Module, Dict[str, torch.Size]]:
+        """Build the model of `initialize_model_for_startup` without allocating parameter storage.
+
+        Returns the model, with every parameter 0-size on `device`, and the shape each parameter was built with,
+        by name. Parameters keep their subclass, attributes and ties; other tensors stay on meta, so the model
+        cannot run forward. For a trainer that binds its own buffers before loading weights in this rank's layout
+        (p2p weight updates).
+        """
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device("meta"):
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        built_shapes_by_name = {
+            name: param.shape for name, param in model.named_parameters()
+        }
+        _replace_parameters_with_empty(model, device)
+        return model, built_shapes_by_name
+
     def prepare_model_for_capture(
         self,
         *,
@@ -1084,10 +1131,28 @@ class DefaultModelLoader(BaseModelLoader):
     def restore_weights_before_loading(model, target_device):
         """Undo in-place quant packing so fresh weights can be loaded."""
         for module, quant_method in _modules_with_quant_method(model):
-            # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
+            # Duck-typed methods without the quantization hook contract cannot restore.
             if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
                     quant_method.restore_weights_before_loading(module)
+
+
+def _replace_parameters_with_empty(model: nn.Module, device: torch.device) -> None:
+    # by the original's id, so a parameter shared by several modules stays shared
+    replacements: Dict[int, nn.Parameter] = {}
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is None:
+                continue
+            if id(param) not in replacements:
+                replacement = torch.Tensor._make_subclass(
+                    type(param),
+                    torch.empty(0, dtype=param.dtype, device=device),
+                    param.requires_grad,
+                )
+                replacement.__dict__.update(param.__dict__)
+                replacements[id(param)] = replacement
+            module._parameters[name] = replacements[id(param)]
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -3382,6 +3447,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 load_config.remote_instance_weight_loader_transfer_engine,
                 f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
                 load_config.tp_rank,
+                role="draft" if model_config.is_draft_model else "target",
             )
             if not success:
                 raise RuntimeError(
@@ -3460,11 +3526,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
+        self, model, transfer_engine, seed_url, tp_rank, role
     ) -> bool:
         # get remote weights metadata from source instance
         seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank, role)
         )
         if (
             seed_transfer_engine_session_id is None

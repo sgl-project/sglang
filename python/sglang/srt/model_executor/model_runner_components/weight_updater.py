@@ -12,6 +12,7 @@ from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
     post_load_weights,
+    refresh_gemma_weights,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -301,12 +302,43 @@ class WeightUpdater:
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
+        self._assert_published_storage_unmoved()
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
         if run_post_load:
             post_load_weights(self.get_model())
+        else:
+            refresh_gemma_weights(self.get_model())
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
+        )
+        self._assert_published_storage_unmoved()
+
+    def _assert_published_storage_unmoved(self: WeightUpdater) -> None:
+        """Peers write weight updates straight into the addresses this rank published at startup (p2p), so a
+        weight-update session must leave every published parameter's storage where it was."""
+        published_weight_info = (
+            self.get_model_runner().remote_instance_weight_transporter.weight_info
+        )
+        # nothing published: nobody writes by address
+        if published_weight_info is None:
+            return
+        params = dict(self.get_model().named_parameters())
+        moved = []
+        for name, (address, numel, element_size) in published_weight_info.items():
+            param = params.get(name)
+            now = (
+                None
+                if param is None
+                else (param.data_ptr(), param.numel() * param.element_size())
+            )
+            if now != (address, numel * element_size):
+                moved.append(
+                    f"{name} published at {(address, numel * element_size)}, now {now}"
+                )
+        assert not moved, (
+            "a weight-update session moved published parameters, so peer writes would land in freed memory: "
+            f"{', '.join(moved[:5])} ({len(moved)} in all)"
         )
 
     def load_weights_from_distributed(
@@ -339,21 +371,30 @@ class WeightUpdater:
 
         monkey_patch_torch_reductions()
         self._assert_weight_cache_inactive("update_weights_from_tensor")
-        if load_format == "flattened_bucket":
-            # Handle flattened bucket format
-            return self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
-
         # We need to get device after patch otherwise the device would be wrong
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
+        # Two input shapes reach this point. The per-tensor formats hand over a
+        # list of (name, tensor) pairs, where a tensor may still be a
+        # LocalSerializedTensor carrying one CUDA IPC handle per TP rank: open
+        # this rank's handle and move the result to this device before loading.
+        # A flattened bucket is instead a dict holding one big device tensor and
+        # the metadata that says how to slice it; its loader below does that.
+        if load_format != "flattened_bucket":
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device),
+                )
+                for name, tensor in named_tensors
+            ]
+
+        if load_format == "flattened_bucket":
+            self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors
+            )
+        elif load_format == "direct":
             _model_load_weights_direct(self.get_model(), named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
@@ -362,13 +403,18 @@ class WeightUpdater:
             self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        # Tensors deserialized from CUDA IPC handles alias storage owned by the
+        # sender, who may free or reuse it as soon as this call returns. The
+        # loads above only enqueue device-to-device copies, so wait for them
+        # before handing control back.
+        device_module.synchronize()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
         self: WeightUpdater,
         flattened_tensor_bucket_dict,
-    ):
-        """Handle flattened bucket format for weight updates"""
+    ) -> None:
+        """Load a flattened bucket, raising if reconstruction or loading fails."""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
@@ -393,8 +439,6 @@ class WeightUpdater:
 
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
-
-        return True, "Success"
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""

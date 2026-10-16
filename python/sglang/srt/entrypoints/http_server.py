@@ -188,6 +188,7 @@ from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
+    model_json_response,
     orjson_response,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -1321,18 +1322,20 @@ async def send_weights_to_remote_instance(
 
 @app.get("/get_remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_remote_instance_transfer_engine_info(rank: int = None):
+async def get_remote_instance_transfer_engine_info(
+    rank: int = None, role: str = "target"
+):
     """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
     logger.warning(
         "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed in a future version. "
         "Please use '/remote_instance_transfer_engine_info' instead."
     )
-    return await remote_instance_transfer_engine_info(rank=rank)
+    return await remote_instance_transfer_engine_info(rank=rank, role=role)
 
 
 @app.get("/remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def remote_instance_transfer_engine_info(rank: int = None):
+async def remote_instance_transfer_engine_info(rank: int = None, role: str = "target"):
     if rank is None or rank < 0:
         return ORJSONResponse(
             {"error": {"message": "Missing or invalid rank parameter"}},
@@ -1343,24 +1346,30 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     try:
         resp = requests.get(
             f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
-            params={"rank": rank},
+            params={"rank": rank, "role": role},
             timeout=5,
         )
         if resp.status_code == 200:
             return resp.json()
     except (requests.exceptions.RequestException, ValueError) as e:
-        logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
+        logger.warning(
+            f"Failed to get transfer engine info for role {role} rank {rank}: {e}"
+        )
 
     return ORJSONResponse(
-        {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
+        {
+            "error": {
+                "message": f"Failed to get transfer engine info for role {role} rank {rank}"
+            }
+        },
         status_code=HTTPStatus.BAD_REQUEST,
     )
 
 
 @app.get("/parallelism_config")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def parallelism_config(rank: int = None):
-    """Get per-rank parallelism config from the bootstrap server."""
+async def parallelism_config(rank: int = None, role: str = "target"):
+    """Get per-rank parallelism config of the `role` runner (target or a draft) from the bootstrap server."""
     if rank is None or rank < 0:
         return ORJSONResponse(
             {"error": {"message": "Missing or invalid rank parameter"}},
@@ -1371,7 +1380,7 @@ async def parallelism_config(rank: int = None):
     try:
         resp = requests.get(
             f"{server_args.engine_info_bootstrap_url}/get_parallelism_config",
-            params={"rank": rank},
+            params={"rank": rank, "role": role},
             timeout=5,
         )
         if resp.status_code == 200:
@@ -1807,8 +1816,10 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_completion.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -1817,8 +1828,10 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2141,8 +2154,10 @@ async def sagemaker_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_chat.handle_request(
+            request, raw_request
+        )
     )
 
 

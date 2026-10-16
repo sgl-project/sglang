@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -286,6 +287,7 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_weight_version_record: Optional[KvWeightVersionRecord] = None
 
 
 def resolve_draft_attention_backend(
@@ -666,7 +668,11 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
-        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
+        # drafts publish once the spec worker binds the target's embed and head (Scheduler.init_memory_pools)
+        if not self.is_draft_worker:
+            self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info(
+                role="target"
+            )
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
@@ -1801,6 +1807,10 @@ class ModelRunner:
                 cuda_graph_batch=cuda_graph_num_tokens,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
+
+        output.kv_weight_version_record = KvWeightVersionRecord.maybe_capture(
+            model_runner=self, forward_batch=forward_batch
+        )
 
         # should_advance_eplb_counter is always True on non-hip platform
         if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
