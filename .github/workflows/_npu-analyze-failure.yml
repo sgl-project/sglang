@@ -9,6 +9,11 @@ on:
         type: string
         required: true
         description: 'Glob pattern for test log artifacts (e.g. selected-test-logs-*)'
+      diffusion_artifact_pattern:
+        type: string
+        required: false
+        default: 'diffusion-failures-*'
+        description: 'Glob pattern for diffusion failure artifacts (consistency failures)'
       recommendations_content:
         type: string
         required: false
@@ -33,37 +38,68 @@ jobs:
         id: locate-recs
         run: |
           mkdir -p ./test-logs
+          # Always create the file so the analyzer can run on diffusion-only failures.
+          touch ./test-logs/_recommended.txt
+          echo "RECS_FILE=./test-logs/_recommended.txt" >> $GITHUB_ENV
 
           if [ -n "${{ inputs.recommendations_content }}" ]; then
             echo "has_recommendations=true" >> $GITHUB_OUTPUT
             echo "Using workflow output recommendations"
             echo "${{ inputs.recommendations_content }}" > ./test-logs/_recommended.txt
-            echo "RECS_FILE=./test-logs/_recommended.txt" >> $GITHUB_ENV
             echo "RECS_SOURCE=output" >> $GITHUB_ENV
             COUNT=$(wc -l < ./test-logs/_recommended.txt)
             echo "Recommendations count: ${COUNT}"
           else
             echo "has_recommendations=false" >> $GITHUB_OUTPUT
-            echo "::notice::No recommended test cases detected, skipping subsequent analysis tasks."
+            echo "RECS_SOURCE=none" >> $GITHUB_ENV
+            echo "::notice::No recommended test cases detected; analyzing log and diffusion failures only."
           fi
 
       # ----- Step 2: Download test logs -----
+      # continue-on-error is a step keyword, not a download-artifact input.
       - name: Download test logs
         uses: actions/download-artifact@v7
         with:
           pattern: ${{ inputs.log_artifact_pattern }}
           path: ./test-logs
           merge-multiple: true
-          continue-on-error: true
+        continue-on-error: true
 
-      - name: Show downloaded logs structure
+      # ----- Step 2b: Download diffusion failure artifacts -----
+      # Keep merge-multiple off so each partition's consistency_failures/summary.json
+      # lands in its own <artifact-name>/ directory instead of clobbering the others.
+      - name: Download diffusion failure artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ inputs.diffusion_artifact_pattern }}
+          path: ./diffusion-failures
+        continue-on-error: true
+
+      - name: Check for diffusion failure artifacts
+        id: check-diffusion
+        run: |
+          if compgen -G "./diffusion-failures/*/consistency_failures/summary.json" > /dev/null; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Diffusion consistency failure artifacts found"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No diffusion consistency failure artifacts"
+          fi
+
+      - name: Show downloaded artifacts structure
         run: |
           echo "Downloaded log files:"
           find ./test-logs -type f | head -50 || echo "  (no logs found)"
+          echo "Downloaded diffusion failure artifacts:"
+          if compgen -G "./diffusion-failures/*" > /dev/null; then
+            find ./diffusion-failures -type f | head -50
+          else
+            echo "  (no diffusion failure artifacts found)"
+          fi
 
       # ----- Step 3: Run analysis -----
       - name: Ensure regex is available
-        if: steps.locate-recs.outputs.has_recommendations != 'false'
+        if: ${{ steps.locate-recs.outputs.has_recommendations != 'false' || steps.check-diffusion.outputs.found == 'true' }}
         run: |
           set -euo pipefail
           if ! python3 -c "import regex" >/dev/null 2>&1; then
@@ -75,12 +111,13 @@ jobs:
           python3 -c "import regex; print('regex ok:', regex.__file__)"
 
       - name: Run failure analysis
-        if: steps.locate-recs.outputs.has_recommendations != 'false'
+        if: ${{ steps.locate-recs.outputs.has_recommendations != 'false' || steps.check-diffusion.outputs.found == 'true' }}
         id: analysis
         continue-on-error: true
         run: |
           python3 scripts/ci/npu/precise-test/analyze_failure_report.py \
             --log-dir ./test-logs \
+            --diffusion-dir ./diffusion-failures \
             --recommendations-file "${RECS_FILE}" \
             --recommendations-source "${RECS_SOURCE:-none}" \
             --output ./test-logs/failure_report.md

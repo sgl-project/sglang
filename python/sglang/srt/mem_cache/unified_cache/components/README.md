@@ -99,7 +99,7 @@ Find the longest cached prefix for a token sequence.
 |--------|--------|
 | **Purpose** | Walk the radix tree to find the longest prefix where **all** component validators pass |
 | **Inputs** | `params.key: RadixKey` — token IDs + optional extra key for namespace isolation |
-| **Output** | `MatchResult(device_indices, last_device_node, last_host_node, best_match_node, host_hit_length, mamba_branching_seqlen, ...)` |
+| **Output** | `MatchResult(device_prefix_len, last_device_node, last_host_node, best_match_node, host_hit_length, mamba_branching_seqlen, ...)` |
 | **Mutation** | Updates `last_access_time` on matched path; promotes matched nodes to MRU in all component LRU lists; may trigger `_split_node` if match ends mid-node |
 | **Complexity** | **O(K + D·C)** |
 

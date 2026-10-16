@@ -175,9 +175,6 @@ class VideoSparseAttentionH3MetadataBuilder(AttentionMetadataBuilder):
     def __init__(self) -> None:
         self._workspace_cache: dict = {}
 
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore[override]
         self,
         current_timestep: int,

@@ -59,13 +59,13 @@ def test_registry_resolves_fasth3_configs() -> None:
 
 def test_fasth3_sampling_defaults_and_task_rejection() -> None:
     params = FastH3SamplingParams(prompt="p")
-    assert params.num_inference_steps == 9
+    assert params.num_inference_steps == 8
     assert params.guidance_scale == 1.0
     assert params.quality == "lossless"
     assert FastH3SamplingParams(prompt="p", quality="extra-high").quality == "lossless"
     assert FastH3SamplingParams(prompt="p", quality="exact").quality == "exact"
 
-    with pytest.raises(ValueError, match="exactly nine sigma grid points"):
+    with pytest.raises(ValueError, match="exactly eight inference steps"):
         FastH3SamplingParams(prompt="p", num_inference_steps=50)
 
     with pytest.raises(ValueError, match="distilled for t2va only"):
@@ -109,7 +109,7 @@ def test_fasth3_dmd_schedule_matches_trained_rungs() -> None:
     }
     for shift, expected in served.items():
         sigmas = minimax_h3_time_shift_sigmas(
-            num_steps=9, shift_scale=shift, dmd_steps=DMD_STEPS
+            num_steps=8, shift_scale=shift, dmd_steps=DMD_STEPS
         )
         assert sigmas == pytest.approx(expected, abs=1e-6)
     with pytest.raises(ValueError, match="8 DiT forwards"):

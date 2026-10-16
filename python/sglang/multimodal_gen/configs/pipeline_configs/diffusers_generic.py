@@ -67,12 +67,6 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
         """
         pass
 
-    def adjust_size(self, width, height, image):
-        """
-        Pass through - diffusers handles size adjustments.
-        """
-        return width, height
-
 
 # Static subclasses for each non-default task type.
 # These exist so that _get_diffusers_model_info() can swap the task_type without

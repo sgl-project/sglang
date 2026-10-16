@@ -157,18 +157,9 @@ class PipelineStage(StageDedupMixin, ABC):
         # Default implementation - no verification
         return VerificationResult()
 
-    def maybe_free_model_hooks(self):
-        pass
-
     def load_model(self):
         """
         Load the model for the stage.
-        """
-        pass
-
-    def offload_model(self):
-        """
-        Offload the model for the stage.
         """
         pass
 
@@ -383,15 +374,6 @@ class PipelineStage(StageDedupMixin, ABC):
         return torch.device(
             current_platform.device_type,
         )
-
-    def set_logging(self, enable: bool):
-        """
-        Enable or disable logging for this stage.
-
-        Args:
-            enable: Whether to enable logging.
-        """
-        self._enable_logging = enable
 
     def __call__(
         self,
