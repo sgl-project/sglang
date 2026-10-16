@@ -19,6 +19,7 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
+import math
 import re
 from typing import Dict, List, Optional
 
@@ -68,7 +69,11 @@ class LoRAAdapter(nn.Module):
         self.base_hf_config: AutoConfig = base_hf_config
         self.load_config: LoadConfig = load_config
         self.lora_backend: BaseLoRABackend = lora_backend
-        self.scaling: float = self.config.lora_alpha / self.config.r
+        # PEFT scales an rsLoRA adapter (use_rslora=True) by alpha / sqrt(r).
+        rank_scale = (
+            math.sqrt(self.config.r) if self.config.use_rslora else self.config.r
+        )
+        self.scaling: float = self.config.lora_alpha / rank_scale
 
         # Bypass nn.Module.__setattr__ so the base model is held as a plain
         # reference rather than auto-registered as a submodule (which would
