@@ -12,7 +12,7 @@ from sglang_simulator.hook import (
     is_class_hook_matched,
     validate_required_class_hooks,
 )
-from sglang_simulator.hook.utils import get_obj_from_args
+from sglang_simulator.hook.utils import get_hook_target, get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
@@ -65,7 +65,7 @@ class C_SglangPrefillAdderHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_add_one_req = target.add_one_req
+        original_add_one_req = get_hook_target(target, "add_one_req")
 
         def wrapped_add_one_req(self, *args, **kwargs):
             req = get_obj_from_args(
@@ -259,7 +259,7 @@ class C_SchedulerRequestReceiver(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_recv_requests = target.recv_requests
+        original_recv_requests = get_hook_target(target, "recv_requests")
 
         def wrapped_recv_requests(self, *args, **kwargs):
             recv_reqs = original_recv_requests(self, *args, **kwargs)
@@ -289,9 +289,11 @@ class C_SchedulerHook(BaseHook):
     def hook(cls, target):
         original_init = target.__init__
         original_recv_requests = getattr(target, "recv_requests", None)
-        original_process_batch_result = target.process_batch_result
-        original_event_loop_normal = target.event_loop_normal
-        original_init_request_dispatcher = target.init_request_dispatcher
+        original_process_batch_result = get_hook_target(target, "process_batch_result")
+        original_event_loop_normal = get_hook_target(target, "event_loop_normal")
+        original_init_request_dispatcher = get_hook_target(
+            target, "init_request_dispatcher"
+        )
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -504,12 +506,15 @@ class C_SchedulerHook(BaseHook):
         def wrapped_init_request_dispatcher(self, *args, **kwargs):
             ret = original_init_request_dispatcher(self, *args, **kwargs)
 
-            _request_dispatcher = getattr(self, "_request_dispatcher", None)
-
-            if _request_dispatcher is not None:
-                for ty in _request_dispatcher._mapping.keys():
-                    if ty.__name__ == "ProfileReq":
-                        _request_dispatcher._mapping[ty] = override_profile
+            mapping = self._request_dispatcher._mapping
+            profile_types = [ty for ty in mapping if ty.__name__ == "ProfileReq"]
+            if not profile_types:
+                raise RuntimeError(
+                    "SGLang Simulator could not hook the ProfileReq handler. The "
+                    "simulator must be adapted to this SGLang revision."
+                )
+            for ty in profile_types:
+                mapping[ty] = override_profile
             return ret
 
         target.event_loop_overlap = override_event_loop_overlap
@@ -527,7 +532,9 @@ class C_StepPlannerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_get_new_batch_prefill = target.get_new_batch_prefill
+        original_get_new_batch_prefill = get_hook_target(
+            target, "get_new_batch_prefill"
+        )
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
             start = time.perf_counter()
@@ -586,7 +593,7 @@ class C_RequestIntakeHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_prefetch_kvcache = target._prefetch_kvcache
+        original_prefetch_kvcache = get_hook_target(target, "_prefetch_kvcache")
 
         def wrapped_prefetch_kvcache(self, *args, **kwargs):
             original_prefetch_kvcache(self, *args, **kwargs)
@@ -609,7 +616,7 @@ class C_StepLauncherHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_run_batch = target.run_batch
+        original_run_batch = get_hook_target(target, "run_batch")
 
         def wrapped_run_batch(self, *args, **kwargs):
             ret = original_run_batch(self, *args, **kwargs)
