@@ -1290,13 +1290,14 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
 
         tml = load_tml_renderers().tokenizer
 
-        def served(shift_token=None):
-            return SimpleNamespace(
-                convert_tokens_to_ids=lambda token: (
-                    tml.encode_special(token[2:-2]) + (token == shift_token)
-                ),
-                encode=lambda text, add_special_tokens: list(tml.encode_ordinary(text)),
-            )
+        def served(shift_token=None, ordinary=tml.encode_ordinary):
+            # Only encode(), as on the tiktoken tokenizer wrapper.
+            def encode(text, add_special_tokens):
+                if text.startswith("<|") and text.endswith("|>"):
+                    return [tml.encode_special(text[2:-2]) + (text == shift_token)]
+                return list(ordinary(text))
+
+            return SimpleNamespace(encode=encode)
 
         build = functools.partial(
             InklingSpecAdapter,
@@ -1306,7 +1307,9 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         )
         build(tokenizer=served())
         with self.assertRaisesRegex(ValueError, "<\\|end_message\\|>"):
-            build(tokenizer=served("<|end_message|>"))
+            build(tokenizer=served(shift_token="<|end_message|>"))
+        with self.assertRaisesRegex(ValueError, "ordinary text"):
+            build(tokenizer=served(ordinary=lambda text: tml.encode_ordinary(text)[1:]))
 
     def test_responses_handler_builds_one_adapter_bound_to_itself(self):
         """The Responses handler reuses the adapter from its base init; its

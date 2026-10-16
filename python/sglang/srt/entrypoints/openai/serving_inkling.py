@@ -310,11 +310,12 @@ def _check_served_tokenizer(tokenizer: Any) -> None:
     # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
     # stop strings and detokenizes with the served one; they must agree.
     tml_tokenizer = load_tml_renderers().tokenizer
+    # encode() is the lookup both the HF and the tiktoken tokenizer wrappers share.
     mismatched = [
         token
         for token in INKLING_SPECIAL_TOKEN_IDS
-        if tokenizer.convert_tokens_to_ids(token)
-        != tml_tokenizer.encode_special(token[2:-2])
+        if tokenizer.encode(token, add_special_tokens=False)
+        != [tml_tokenizer.encode_special(token[2:-2])]
     ]
     if tokenizer.encode(_TOKENIZER_PROBE, add_special_tokens=False) != list(
         tml_tokenizer.encode_ordinary(_TOKENIZER_PROBE)
