@@ -580,7 +580,6 @@ class TestFlux3RequestControls(unittest.TestCase):
         )
         params.prepare_synthetic_warmup_request_for_queue(req, server_args)
         self.assertEqual(req.num_inference_steps, 1)
-        self.assertEqual(req.extra["warmup_target_num_inference_steps"], 28)
         self.assertEqual(req.extra["cache_dit_num_inference_steps"], 28)
 
     def test_image_api_accepts_the_request_mode(self):

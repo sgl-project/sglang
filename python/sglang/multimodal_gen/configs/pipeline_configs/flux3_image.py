@@ -94,15 +94,12 @@ class Flux3ImageSamplingParams(SamplingParams):
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any
     ) -> None:
-        # Warmup copies the request's steps as the full-workload target before
-        # any adjustment; ``None`` (server default) has to be resolved here.
-        for key in (
-            "warmup_target_num_inference_steps",
-            "cache_dit_num_inference_steps",
-        ):
-            if key in req.extra and req.extra[key] is None:
-                package = server_args.pipeline_config.flux3_package
-                req.extra[key] = package.config.sampler.steps
+        # Warmup copies the request's steps for Cache-DiT before any
+        # adjustment; ``None`` (server default) has to be resolved here.
+        key = "cache_dit_num_inference_steps"
+        if key in req.extra and req.extra[key] is None:
+            package = server_args.pipeline_config.flux3_package
+            req.extra[key] = package.config.sampler.steps
         if self.flux3_mode != "i2i" or not req.image_path:
             # TI2I permits references for i2i requests on the same server, but
             # this synthetic warmup is unconditioned; with no reference (none
