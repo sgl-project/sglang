@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import is_gfx1250_supported
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -939,7 +940,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def _aiter_ck_moe_supported(self, layer) -> bool:
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        return layer.intermediate_size_per_partition % 128 == 0
+        # Its bf16 2-stage kernels are xdlops (MFMA) only and do not build on gfx1250.
+        # This also gates the CK weight shuffle, which the Triton runner cannot read.
+        return (
+            layer.intermediate_size_per_partition % 128 == 0
+            and not is_gfx1250_supported()
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
