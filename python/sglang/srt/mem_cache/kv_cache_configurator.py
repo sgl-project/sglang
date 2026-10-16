@@ -397,7 +397,8 @@ class KVCacheConfigurator:
                 swa_capacity=swa_max_total_num_tokens,
             )
         # Request tokens, not per-rank rows: DCP widens rows by attn_dcp_size,
-        # KV sharding by kv_shard_size.
+        # KV sharding by kv_shard_size. Approximate: ModelRunner also caps this
+        # via req_to_token_pool.schedulable_token_capacity.
         capacity = (
             self.logical_token_capacity(max_total_num_tokens=max_total_num_tokens)
             * self.kv_shard_size
