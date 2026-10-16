@@ -14,8 +14,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
-    accept_greedy_triton,
-    finalize_accept_lens_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -183,46 +181,24 @@ class TargetVerifyExecutor:
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
         )
-        if simulate:
-            correct_len = self._simulated_correct_len.repeat(bs).to(correct_len.dtype)
-            if simulate_bonus_sampling_info is not None:
-                bonus = sample_simulated_bonus(
-                    target_logits=target_logits,
-                    correct_len=correct_len,
-                    greedy_bonus=bonus,
-                    sampling_info=simulate_bonus_sampling_info,
-                    bs=bs,
-                    verify_num_draft_tokens=self.verify_num_draft_tokens,
-                )
-
-        site = (
+        sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
             if accept_sampling_info is None or accept_sampling_info.is_all_greedy
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
-        self._tp_sync.sync(site, correct_len)
-        self._tp_sync.sync(site, bonus)
-        self._tp_sync.sync(site, cap_trim_lens)
-
-        finalized = FinalizeAcceptLens.execute(
+        return build_accept_outs(
             correct_len=correct_len,
+            bonus=bonus,
             cap_trim_lens=cap_trim_lens,
             prefix_lens=prefix_lens,
-        )
-        out_tokens = BuildOutTokens.execute(
             draft_tokens=draft_tokens,
-            correct_len=correct_len,
-            bonus=bonus,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
             gamma=self.gamma,
-        )
-        return AcceptOuts(
-            correct_len=correct_len,
-            bonus=bonus,
-            cap_trim_lens=finalized.cap_trim_lens,
-            commit_lens=finalized.commit_lens,
-            new_seq_lens=finalized.new_seq_lens,
-            out_tokens=out_tokens,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            tp_sync=self._tp_sync,
+            sync_site=sync_site,
+            simulated_correct_len=self._simulated_correct_len,
+            target_logits=target_logits,
+            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
 
     def begin_simulated_step(self) -> None:
@@ -768,38 +744,27 @@ class DsparkVerifyEpilogue:
         self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
     ) -> torch.Tensor:
         bs = candidates.shape[0]
-        correct_len, bonus, cap_trim_lens = accept_greedy_triton(
+        correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
             candidates=candidates,
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
         )
-        if self.simulated_correct_len is not None:
-            # The accept runs as served; only its length is replaced.
-            correct_len = self.simulated_correct_len.repeat(bs).to(correct_len.dtype)
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
-        finalized = finalize_accept_lens_triton(
-            correct_len=correct_len,
-            cap_trim_lens=cap_trim_lens,
-            prefix_lens=seq_lens[:bs],
-        )
-        out_tokens = BuildOutTokens.execute(
-            draft_tokens=draft_tokens,
+        accept = build_accept_outs(
             correct_len=correct_len,
             bonus=bonus,
-            verify_num_draft_tokens=self.stride,
+            cap_trim_lens=cap_trim_lens,
+            prefix_lens=seq_lens[:bs],
+            draft_tokens=draft_tokens,
             gamma=self.gamma,
+            verify_num_draft_tokens=self.stride,
+            tp_sync=self._tp_sync,
+            sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
+            simulated_correct_len=self.simulated_correct_len,
+            out=self.read_accept(bs),
         )
-        self.correct_len_buf[:bs].copy_(correct_len)
-        self.bonus_buf[:bs].copy_(bonus)
-        self.cap_trim_lens_buf[:bs].copy_(cap_trim_lens.to(torch.int32))
-        self.commit_lens_buf[:bs].copy_(finalized.commit_lens)
-        self.new_seq_lens_buf[:bs].copy_(finalized.new_seq_lens)
-        self.out_tokens_buf[:bs].copy_(out_tokens.view(bs, self.stride))
-        return finalized.commit_lens
+        return accept.commit_lens
 
     def _commit_inject(
         self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int
@@ -836,6 +801,72 @@ class DsparkVerifyEpilogue:
                 positions=inject_layout.positions,
                 pool=pool,
             )
+
+
+def build_accept_outs(
+    *,
+    correct_len: torch.Tensor,
+    bonus: torch.Tensor,
+    cap_trim_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    gamma: int,
+    verify_num_draft_tokens: int,
+    tp_sync: SpecTpSync,
+    sync_site: SpecTpSyncSite,
+    simulated_correct_len: Optional[torch.Tensor] = None,
+    target_logits: Optional[torch.Tensor] = None,
+    simulate_bonus_sampling_info=None,
+    out: Optional[AcceptOuts] = None,
+) -> AcceptOuts:
+    """``out``: static buffers (the in-graph accept's) to copy the results into."""
+    bs = correct_len.shape[0]
+    if simulated_correct_len is not None:
+        # The accept runs as served; only its length is replaced.
+        correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
+        if simulate_bonus_sampling_info is not None:
+            assert target_logits is not None
+            bonus = sample_simulated_bonus(
+                target_logits=target_logits,
+                correct_len=correct_len,
+                greedy_bonus=bonus,
+                sampling_info=simulate_bonus_sampling_info,
+                bs=bs,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+            )
+    tp_sync.sync(sync_site, correct_len)
+    tp_sync.sync(sync_site, bonus)
+    tp_sync.sync(sync_site, cap_trim_lens)
+
+    finalized = FinalizeAcceptLens.execute(
+        correct_len=correct_len,
+        cap_trim_lens=cap_trim_lens,
+        prefix_lens=prefix_lens,
+    )
+    out_tokens = BuildOutTokens.execute(
+        draft_tokens=draft_tokens,
+        correct_len=correct_len,
+        bonus=bonus,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        gamma=gamma,
+    )
+    accept = AcceptOuts(
+        correct_len=correct_len,
+        bonus=bonus,
+        cap_trim_lens=finalized.cap_trim_lens,
+        commit_lens=finalized.commit_lens,
+        new_seq_lens=finalized.new_seq_lens,
+        out_tokens=out_tokens,
+    )
+    if out is not None:
+        out.correct_len.copy_(accept.correct_len)
+        out.bonus.copy_(accept.bonus)
+        out.cap_trim_lens.copy_(accept.cap_trim_lens)
+        out.commit_lens.copy_(accept.commit_lens)
+        out.new_seq_lens.copy_(accept.new_seq_lens)
+        out.out_tokens.copy_(accept.out_tokens)
+        return out
+    return accept
 
 
 def sample_simulated_bonus(

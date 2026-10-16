@@ -203,6 +203,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Any] = None
     beam_width: Optional[int] = None
+    watermark: Optional[WatermarkRequestConfig] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -212,6 +213,23 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_SamplingParams(self)
+
+
+class WatermarkRequestConfig(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WatermarkRequestConfig: JSON object (unknown keys rejected)."""
+
+    enabled: Optional[bool] = None
+    key: Optional[str] = None
+    context_window: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WatermarkRequestConfig":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WatermarkRequestConfig(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WatermarkRequestConfig(self)
 
 
 class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -239,6 +257,8 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     mm_hashes: Optional[StringListOrList] = None
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
+    extra_key: Optional[StringOrList] = None
+    priority: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -282,6 +302,8 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     input_token_ids_logprobs: List[NullableTopLogprobs] = []
     hidden_states: List[HiddenStateRow] = []
     e2e_latency: Optional[float] = None
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -344,6 +366,7 @@ class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
     max_tokens_per_frame: Optional[int] = None
     max_image_tokens: Optional[int] = None
     use_audio: Optional[bool] = None
+    image_grid_thw: Optional[ImageGridThw] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "MediaRef":
@@ -505,6 +528,9 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
+
+# sglang.api.v1.ImageGridThw: JSON bare array.
+ImageGridThw = List[Int64List]
 
 # sglang.api.v1.MediaItem: JSON: the value's shape picks the arm.
 MediaItem = Union[str, MediaRef]
@@ -873,7 +899,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -932,6 +958,8 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["custom_params"] = x
         elif key == "beam_width":
             kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "watermark":
+            kw["watermark"] = None if x is None else decode_WatermarkRequestConfig(x)
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -990,6 +1018,37 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["custom_params"] = v.custom_params
     if v.beam_width is not None:
         d["beam_width"] = v.beam_width
+    if v.watermark is not None:
+        d["watermark"] = encode_WatermarkRequestConfig(v.watermark)
+    return d
+
+
+_FIELDS_WatermarkRequestConfig = ("enabled", "key", "context_window",)
+
+
+def decode_WatermarkRequestConfig(value: Any) -> WatermarkRequestConfig:
+    m = _expect_map(value, expected="struct WatermarkRequestConfig")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "enabled":
+            kw["enabled"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "key":
+            kw["key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context_window":
+            kw["context_window"] = None if x is None else _expect_int(x, expected="i64")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_WatermarkRequestConfig)
+    return WatermarkRequestConfig(**kw)
+
+
+def encode_WatermarkRequestConfig(v: WatermarkRequestConfig) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.enabled is not None:
+        d["enabled"] = v.enabled
+    if v.key is not None:
+        d["key"] = v.key
+    if v.context_window is not None:
+        d["context_window"] = v.context_window
     return d
 
 
@@ -1041,6 +1100,10 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["video_data"] = None if x is None else decode_MediaInput(x)
         elif key == "audio_data":
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else decode_StringOrList(x)
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
     return GenerateRequest(**kw)
 
 
@@ -1090,6 +1153,10 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["video_data"] = encode_MediaInput(v.video_data)
     if v.audio_data is not None:
         d["audio_data"] = encode_MediaInput(v.audio_data)
+    if v.extra_key is not None:
+        d["extra_key"] = encode_StringOrList(v.extra_key)
+    if v.priority is not None:
+        d["priority"] = v.priority
     return d
 
 
@@ -1192,6 +1259,10 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["hidden_states"] = [] if x is None else [decode_HiddenStateRow(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "cached_tokens":
+            kw["cached_tokens"] = _expect_uint(x, expected="u32")
+        elif key == "reasoning_tokens":
+            kw["reasoning_tokens"] = _expect_uint(x, expected="u64")
     return GenerateMetaInfo(**kw)
 
 
@@ -1217,6 +1288,8 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["hidden_states"] = [encode_HiddenStateRow(e) for e in v.hidden_states]
     if v.e2e_latency is not None:
         d["e2e_latency"] = float(v.e2e_latency)
+    d["cached_tokens"] = v.cached_tokens
+    d["reasoning_tokens"] = v.reasoning_tokens
     return d
 
 
@@ -1267,7 +1340,7 @@ def encode_GenerateStreamError(v: GenerateStreamError) -> Dict[str, Any]:
     return d
 
 
-_FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio",)
+_FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio", "image_grid_thw",)
 
 
 def decode_MediaRef(value: Any) -> MediaRef:
@@ -1302,6 +1375,8 @@ def decode_MediaRef(value: Any) -> MediaRef:
             kw["max_image_tokens"] = None if x is None else _expect_int(x, expected="i64")
         elif key == "use_audio":
             kw["use_audio"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "image_grid_thw":
+            kw["image_grid_thw"] = None if x is None else decode_ImageGridThw(x)
         else:
             raise _unknown_field(key, fields=_FIELDS_MediaRef)
     return MediaRef(**kw)
@@ -1336,7 +1411,17 @@ def encode_MediaRef(v: MediaRef) -> Dict[str, Any]:
         d["max_image_tokens"] = v.max_image_tokens
     if v.use_audio is not None:
         d["use_audio"] = v.use_audio
+    if v.image_grid_thw is not None:
+        d["image_grid_thw"] = encode_ImageGridThw(v.image_grid_thw)
     return d
+
+
+def decode_ImageGridThw(value: Any) -> ImageGridThw:
+    return [decode_Int64List(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_ImageGridThw(v: ImageGridThw) -> List[Any]:
+    return [encode_Int64List(e) for e in v]
 
 
 def decode_MediaItem(value: Any) -> MediaItem:

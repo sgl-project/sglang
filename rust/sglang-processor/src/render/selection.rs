@@ -76,15 +76,8 @@ pub fn select_chat_formatter(
                 None,
             );
         }
-        if let Some(formatter) = kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true)
-        {
-            return (
-                Some(ChatFormatter::HuggingFace {
-                    formatter,
-                    thinking: ThinkingTemplates::native(true, true),
-                }),
-                None,
-            );
+        if kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true).is_some() {
+            return (Some(ChatFormatter::KimiK3), None);
         }
         if model_type_lower.as_deref() == Some("inkling_mm_model")
             && let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower)

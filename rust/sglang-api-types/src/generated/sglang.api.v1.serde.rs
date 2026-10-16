@@ -1107,6 +1107,9 @@ impl ::serde::Serialize for SamplingParams {
         if let Some(v) = &self.beam_width {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "beam_width", v)?;
         }
+        if let Some(v) = &self.watermark {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "watermark", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1140,6 +1143,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             "sampling_seed",
             "custom_params",
             "beam_width",
+            "watermark",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -1177,6 +1181,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                 let mut f_sampling_seed = None;
                 let mut f_custom_params = None;
                 let mut f_beam_width = None;
+                let mut f_watermark = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "max_new_tokens" => {
@@ -1383,6 +1388,12 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                             }
                             f_beam_width = Some(map.next_value::<Option<i64>>()?);
                         }
+                        "watermark" => {
+                            if f_watermark.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("watermark"));
+                            }
+                            f_watermark = Some(map.next_value::<Option<WatermarkRequestConfig>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -1416,6 +1427,76 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                     sampling_seed: f_sampling_seed.flatten(),
                     custom_params: f_custom_params.flatten(),
                     beam_width: f_beam_width.flatten(),
+                    watermark: f_watermark.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for WatermarkRequestConfig {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.enabled {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "enabled", v)?;
+        }
+        if let Some(v) = &self.key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "key", v)?;
+        }
+        if let Some(v) = &self.context_window {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "context_window", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for WatermarkRequestConfig {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["enabled", "key", "context_window"];
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = WatermarkRequestConfig;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct WatermarkRequestConfig")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_enabled = None;
+                let mut f_key = None;
+                let mut f_context_window = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "enabled" => {
+                            if f_enabled.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("enabled"));
+                            }
+                            f_enabled = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "key" => {
+                            if f_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("key"));
+                            }
+                            f_key =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "context_window" => {
+                            if f_context_window.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("context_window"));
+                            }
+                            f_context_window = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        other => {
+                            return Err(::serde::de::Error::unknown_field(other, FIELDS));
+                        }
+                    }
+                }
+                Ok(WatermarkRequestConfig {
+                    enabled: f_enabled.flatten(),
+                    key: f_key.flatten(),
+                    context_window: f_context_window.flatten(),
                 })
             }
         }
@@ -1509,6 +1590,12 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.audio_data {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_data", v)?;
         }
+        if let Some(v) = &self.extra_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
+        }
+        if let Some(v) = &self.priority {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1547,6 +1634,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_mm_hashes = None;
                 let mut f_video_data = None;
                 let mut f_audio_data = None;
+                let mut f_extra_key = None;
+                let mut f_priority = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1703,6 +1792,18 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_audio_data = Some(map.next_value::<Option<MediaInput>>()?);
                         }
+                        "extra_key" => {
+                            if f_extra_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("extra_key"));
+                            }
+                            f_extra_key = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "priority" => {
+                            if f_priority.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("priority"));
+                            }
+                            f_priority = Some(map.next_value::<Option<i64>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1731,6 +1832,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     mm_hashes: f_mm_hashes.flatten(),
                     video_data: f_video_data.flatten(),
                     audio_data: f_audio_data.flatten(),
+                    extra_key: f_extra_key.flatten(),
+                    priority: f_priority.flatten(),
                 })
             }
         }
@@ -1981,6 +2084,16 @@ impl ::serde::Serialize for GenerateMetaInfo {
         if let Some(v) = &self.e2e_latency {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "e2e_latency", v)?;
         }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cached_tokens",
+            &self.cached_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "reasoning_tokens",
+            &self.reasoning_tokens,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2009,6 +2122,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_input_token_ids_logprobs = None;
                 let mut f_hidden_states = None;
                 let mut f_e2e_latency = None;
+                let mut f_cached_tokens = None;
+                let mut f_reasoning_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2114,6 +2229,20 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             }
                             f_e2e_latency = Some(map.next_value::<Option<f64>>()?);
                         }
+                        "cached_tokens" => {
+                            if f_cached_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cached_tokens"));
+                            }
+                            f_cached_tokens = Some(map.next_value::<u32>()?);
+                        }
+                        "reasoning_tokens" => {
+                            if f_reasoning_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_tokens",
+                                ));
+                            }
+                            f_reasoning_tokens = Some(map.next_value::<u64>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2132,6 +2261,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     input_token_ids_logprobs: f_input_token_ids_logprobs.unwrap_or_default(),
                     hidden_states: f_hidden_states.unwrap_or_default(),
                     e2e_latency: f_e2e_latency.flatten(),
+                    cached_tokens: f_cached_tokens.unwrap_or_default(),
+                    reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
                 })
             }
         }
@@ -2314,6 +2445,9 @@ impl ::serde::Serialize for MediaRef {
         if let Some(v) = &self.use_audio {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "use_audio", v)?;
         }
+        if let Some(v) = &self.image_grid_thw {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_grid_thw", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2335,6 +2469,7 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
             "max_tokens_per_frame",
             "max_image_tokens",
             "use_audio",
+            "image_grid_thw",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -2360,6 +2495,7 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
                 let mut f_max_tokens_per_frame = None;
                 let mut f_max_image_tokens = None;
                 let mut f_use_audio = None;
+                let mut f_image_grid_thw = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "url" => {
@@ -2456,6 +2592,12 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
                             }
                             f_use_audio = Some(map.next_value::<Option<bool>>()?);
                         }
+                        "image_grid_thw" => {
+                            if f_image_grid_thw.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_grid_thw"));
+                            }
+                            f_image_grid_thw = Some(map.next_value::<Option<ImageGridThw>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -2476,10 +2618,27 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
                     max_tokens_per_frame: f_max_tokens_per_frame.flatten(),
                     max_image_tokens: f_max_image_tokens.flatten(),
                     use_audio: f_use_audio.flatten(),
+                    image_grid_thw: f_image_grid_thw.flatten(),
                 })
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ImageGridThw {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.rows.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ImageGridThw {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(ImageGridThw {
+            rows: <::prost::alloc::vec::Vec<Int64List> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
     }
 }
 
