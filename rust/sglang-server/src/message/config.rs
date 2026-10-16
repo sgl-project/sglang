@@ -178,6 +178,15 @@ pub struct ServerArgs {
     pub max_total_num_tokens: u64,
     /// Resolved deployment metadata used by out-of-process orchestrators.
     pub deployment_info: DeploymentInfo,
+    /// The scheduler's shared-memory load snapshot file, its DP rank count and
+    /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
+    /// go over ZMQ instead), plus the accelerator name and per-rank count that
+    /// endpoint reports.
+    pub load_snapshot_path: Option<String>,
+    pub load_snapshot_dp_size: usize,
+    pub load_snapshot_dp_rank: usize,
+    pub accelerator: Option<String>,
+    pub num_accelerators: u32,
     /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
     pub metrics: Option<MetricsConfig>,
 }
@@ -221,6 +230,11 @@ impl ServerArgs {
         version,
         max_total_num_tokens,
         deployment_info,
+        load_snapshot_path,
+        load_snapshot_dp_size,
+        load_snapshot_dp_rank,
+        accelerator,
+        num_accelerators,
         metrics,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
@@ -261,6 +275,11 @@ impl ServerArgs {
         version: String,
         max_total_num_tokens: u64,
         deployment_info: DeploymentInfo,
+        load_snapshot_path: Option<String>,
+        load_snapshot_dp_size: usize,
+        load_snapshot_dp_rank: usize,
+        accelerator: Option<String>,
+        num_accelerators: u32,
         metrics: Option<MetricsConfig>,
     ) -> Self {
         Self {
@@ -299,6 +318,11 @@ impl ServerArgs {
             version,
             max_total_num_tokens,
             deployment_info,
+            load_snapshot_path,
+            load_snapshot_dp_size,
+            load_snapshot_dp_rank,
+            accelerator,
+            num_accelerators,
             metrics,
         }
     }
@@ -345,6 +369,11 @@ impl Default for ServerArgs {
             version: String::new(),
             max_total_num_tokens: 0,
             deployment_info: DeploymentInfo::default(),
+            load_snapshot_path: None,
+            load_snapshot_dp_size: 0,
+            load_snapshot_dp_rank: 0,
+            accelerator: None,
+            num_accelerators: 0,
             metrics: None,
         }
     }

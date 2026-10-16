@@ -387,16 +387,27 @@ pub struct GenerateRequest {
     /// validates it against its priority-scheduling mode.
     #[prost(int64, optional, tag = "24")]
     pub priority: ::core::option::Option<i64>,
+    /// Prefix-cache salt: a second namespace beside `extra_key`, normalized the
+    /// same way.
+    #[prost(message, optional, tag = "25")]
+    pub cache_salt: ::core::option::Option<StringOrList>,
+    /// Apply grammar constraints only after the reasoning section, for every
+    /// batch item.
+    #[prost(bool, optional, tag = "26")]
+    pub require_reasoning: ::core::option::Option<bool>,
+    /// A field this server cannot honour. Unknown keys are ignored, but dropping
+    /// this one would silently return a stateless answer for a session request,
+    /// so a non-null value is rejected instead.
+    #[prost(string, optional, tag = "28")]
+    pub session_params: ::core::option::Option<::prost::alloc::string::String>,
     /// Orchestrator controls used by native gRPC clients such as Dynamo.
     /// `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
     /// applies to every prompt, a list carries one (nullable) value per prompt.
-    #[prost(message, optional, tag = "30")]
+    #[prost(message, optional, tag = "27")]
     pub lora_path: ::core::option::Option<OptionalStringOrList>,
-    #[prost(string, optional, tag = "26")]
+    #[prost(string, optional, tag = "31")]
     pub routing_key: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bool, optional, tag = "27")]
-    pub require_reasoning: ::core::option::Option<bool>,
-    #[prost(uint64, optional, tag = "28")]
+    #[prost(uint64, optional, tag = "32")]
     pub max_thinking_tokens: ::core::option::Option<u64>,
     #[prost(message, optional, tag = "29")]
     pub kv_hints: ::core::option::Option<KvHintsEnvelopeOrList>,

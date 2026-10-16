@@ -60,15 +60,23 @@ message GenerateRequest {
   // Scheduling priority, one value for every batch item; the scheduler
   // validates it against its priority-scheduling mode.
   optional int64 priority = 24;
+  // Prefix-cache salt: a second namespace beside `extra_key`, normalized the
+  // same way.
+  StringOrList cache_salt = 25;
+  // Apply grammar constraints only after the reasoning section, for every
+  // batch item.
+  optional bool require_reasoning = 26;
+  // A field this server cannot honour. Unknown keys are ignored, but dropping
+  // this one would silently return a stateless answer for a session request,
+  // so a non-null value is rejected instead.
+  optional string session_params = 28 [(sglang.json.v1.field_json).raw_json = true];
 
   // Orchestrator controls used by native gRPC clients such as Dynamo.
   // `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
   // applies to every prompt, a list carries one (nullable) value per prompt.
-  OptionalStringOrList lora_path = 30;
-  optional string routing_key = 26;
-  reserved 25; // Trace-parent extraction is not implemented by the Rust frontend yet.
-  optional bool require_reasoning = 27;
-  optional uint64 max_thinking_tokens = 28;
+  OptionalStringOrList lora_path = 27;
+  optional string routing_key = 31;
+  optional uint64 max_thinking_tokens = 32;
   KvHintsEnvelopeOrList kv_hints = 29;
 }
 

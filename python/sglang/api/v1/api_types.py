@@ -260,11 +260,13 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     audio_data: Optional[MediaInput] = None
     extra_key: Optional[StringOrList] = None
     priority: Optional[int] = None
-    routing_key: Optional[str] = None
+    cache_salt: Optional[StringOrList] = None
     require_reasoning: Optional[bool] = None
-    max_thinking_tokens: Optional[int] = None
-    kv_hints: Optional[KvHintsEnvelopeOrList] = None
     lora_path: Optional[OptionalStringOrList] = None
+    session_params: Optional[Any] = None
+    kv_hints: Optional[KvHintsEnvelopeOrList] = None
+    routing_key: Optional[str] = None
+    max_thinking_tokens: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -1321,16 +1323,20 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["extra_key"] = None if x is None else decode_StringOrList(x)
         elif key == "priority":
             kw["priority"] = None if x is None else _expect_int(x, expected="i64")
-        elif key == "routing_key":
-            kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "cache_salt":
+            kw["cache_salt"] = None if x is None else decode_StringOrList(x)
         elif key == "require_reasoning":
             kw["require_reasoning"] = None if x is None else _expect_bool(x, expected="a boolean")
-        elif key == "max_thinking_tokens":
-            kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
-        elif key == "kv_hints":
-            kw["kv_hints"] = None if x is None else decode_KvHintsEnvelopeOrList(x)
         elif key == "lora_path":
             kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "session_params":
+            kw["session_params"] = x
+        elif key == "kv_hints":
+            kw["kv_hints"] = None if x is None else decode_KvHintsEnvelopeOrList(x)
+        elif key == "routing_key":
+            kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_thinking_tokens":
+            kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
     return GenerateRequest(**kw)
 
 
@@ -1384,16 +1390,20 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["extra_key"] = encode_StringOrList(v.extra_key)
     if v.priority is not None:
         d["priority"] = v.priority
-    if v.routing_key is not None:
-        d["routing_key"] = v.routing_key
+    if v.cache_salt is not None:
+        d["cache_salt"] = encode_StringOrList(v.cache_salt)
     if v.require_reasoning is not None:
         d["require_reasoning"] = v.require_reasoning
-    if v.max_thinking_tokens is not None:
-        d["max_thinking_tokens"] = v.max_thinking_tokens
-    if v.kv_hints is not None:
-        d["kv_hints"] = encode_KvHintsEnvelopeOrList(v.kv_hints)
     if v.lora_path is not None:
         d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
+    if v.session_params is not None:
+        d["session_params"] = v.session_params
+    if v.kv_hints is not None:
+        d["kv_hints"] = encode_KvHintsEnvelopeOrList(v.kv_hints)
+    if v.routing_key is not None:
+        d["routing_key"] = v.routing_key
+    if v.max_thinking_tokens is not None:
+        d["max_thinking_tokens"] = v.max_thinking_tokens
     return d
 
 

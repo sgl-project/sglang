@@ -43,7 +43,8 @@ wire_struct! {
         lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block.
+        /// PD-disaggregation block. Everything after `kv_hints` (the last
+        /// field emitted) has a msgspec default in Python and is omitted.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -64,7 +65,7 @@ wire_struct! {
         multi_item_delimiter_indices: (),
         token_indices_to_pool: (),
         time_stats: (),
-        cache_salt: (),
+        cache_salt: Option<&'a str>,
         kv_hints: Option<&'a super::request::KvHintsEnvelope>,
     }
 }
@@ -149,7 +150,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             multi_item_delimiter_indices: (),
             token_indices_to_pool: (),
             time_stats: (),
-            cache_salt: (),
+            cache_salt: req.cache_salt.as_deref(),
             kv_hints: req.kv_hints.as_ref(),
         }
     }
@@ -339,9 +340,10 @@ mod tests {
 
     /// The PD block must land on Python's wire indices 25–31, with the filler
     /// block (17–24) holding its defaults — a shift here silently routes KV
-    /// transfers to the wrong host/room.
+    /// transfers to the wrong host/room. The cache keys and `require_reasoning`
+    /// follow at 33–45.
     #[test]
-    fn header_bootstrap_block_and_extra_key_are_positionally_aligned() {
+    fn header_bootstrap_block_and_cache_keys_are_positionally_aligned() {
         let req = GenerateRequest {
             rid: "r1".into(),
             text: Some("hi".into()),
@@ -353,7 +355,9 @@ mod tests {
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
             extra_key: Some("salt".into()),
+            cache_salt: Some("pepper".into()),
             priority: Some(-2),
+            require_reasoning: true,
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -373,8 +377,15 @@ mod tests {
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
         assert!(arr[32].is_nil(), "routing_key at 32");
-        assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
+        assert_eq!(arr[33].as_bool(), Some(true), "require_reasoning at 33");
         assert_eq!(arr[34].as_i64(), Some(-2), "priority at 34");
         assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
+        for (i, slot) in arr.iter().enumerate().take(39).skip(36) {
+            assert_eq!(slot.as_bool(), Some(false), "idx {i} must be false");
+        }
+        for (i, slot) in arr.iter().enumerate().take(45).skip(39) {
+            assert!(slot.is_nil(), "idx {i} must be a nil default");
+        }
+        assert_eq!(arr[45].as_str(), Some("pepper"), "cache_salt at 45");
     }
 }

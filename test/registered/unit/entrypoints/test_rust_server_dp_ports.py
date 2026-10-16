@@ -35,6 +35,7 @@ def _scheduler_for_typed_config():
         page_size=16,
         rust_server_tokenizer_path=lambda: "tokenizer",
         max_total_num_tokens=1024,
+        load_snapshot_writer=None,
     )
 
 

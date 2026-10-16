@@ -105,7 +105,14 @@ pub fn into_requests(
         max_thinking_tokens,
         kv_hints,
         extra_key,
+        cache_salt,
+        session_params,
     } = req;
+    if session_params.is_some() {
+        return Err(Error::Validation(
+            "session_params is not supported by the Rust server".into(),
+        ));
+    }
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
     let input_ids = input_ids.and_then(wire::token_ids_or_list);
@@ -130,6 +137,7 @@ pub fn into_requests(
     let audio_data = audio_data.map(wire::media_input).transpose()?;
     let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
     let extra_key = extra_key.and_then(wire::string_or_list);
+    let cache_salt = cache_salt.and_then(wire::string_or_list);
     let lora_path = lora_path.and_then(wire::optional_string_or_list);
 
     if max_thinking_tokens.is_some() && !policy.enable_strict_thinking {
@@ -305,17 +313,24 @@ pub fn into_requests(
     } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
-    // Python `_normalize_extra_key`: one key broadcasts, a list is per item
-    // (batch requests only), and an empty key means none.
-    if !is_batch && matches!(extra_key, Some(OneOrMany::Many(_))) {
-        return Err(Error::Validation(
-            "extra_key should be a string for a single request.".into(),
-        ));
-    }
-    let extra_keys: Vec<Option<String>> = fan_out(extra_key, n, "extra_key")?
-        .into_iter()
-        .map(|key| key.filter(|key| !key.is_empty()))
-        .collect();
+    // Python `_normalize_extra_key` / `_normalize_cache_salt`: one key
+    // broadcasts, a list is per item (batch requests only), and an empty key
+    // means none.
+    let cache_key_column = |value: Option<OneOrMany<String>>, name: &str| {
+        if !is_batch && matches!(value, Some(OneOrMany::Many(_))) {
+            return Err(Error::Validation(format!(
+                "{name} should be a string for a single request."
+            )));
+        }
+        Ok::<Vec<Option<String>>, Error>(
+            fan_out(value, n, name)?
+                .into_iter()
+                .map(|key| key.filter(|key| !key.is_empty()))
+                .collect(),
+        )
+    };
+    let extra_keys = cache_key_column(extra_key, "extra_key")?;
+    let cache_salts = cache_key_column(cache_salt, "cache_salt")?;
     // `mm_hashes` has no batch form: honoring it only here would give the two
     // servers different prefix-cache keys for the same body. Reject instead of
     // dropping it silently as Python does — the field exists to align a
@@ -366,6 +381,7 @@ pub fn into_requests(
         bootstrap_pair_keys,
         decode_tp_sizes,
         extra_keys,
+        cache_salts,
         images,
         videos,
         audios,
@@ -389,6 +405,7 @@ pub fn into_requests(
             bootstrap_pair_key,
             decode_tp_size,
             extra_key,
+            cache_salt,
             image_data,
             video_data,
             audio_data,
@@ -432,6 +449,7 @@ pub fn into_requests(
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
                 extra_key,
+                cache_salt,
                 lora_id,
                 routing_key: routing_key.clone(),
                 priority,
@@ -583,6 +601,8 @@ pub struct GenerateRequest {
     /// Prefix-cache namespace: requests share cached prefixes only under the
     /// same key.
     pub extra_key: Option<String>,
+    /// The prefix cache's second namespace key.
+    pub cache_salt: Option<String>,
     /// Scheduler/orchestrator controls forwarded by the native API. `lora_id`
     /// accepts the preloaded adapter identifier; dynamic LoRA loading remains
     /// owned by the Python registry and is intentionally not implied here.
@@ -1090,13 +1110,17 @@ mod tests {
     /// declared and dropped by hand just to let `bench_serving` through.
     /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
     /// behavior; a typo being silently ignored is the same trade Python makes.
+    /// The exception is `session_params`: dropping it would silently change the
+    /// answer, so a non-null value is a 400 (as Python's is without that
+    /// session), and `null` passes.
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
             r#""session_id": "s""#,
-            r#""session_params": {"a": 1}"#,
+            r#""session_params": null"#,
             r#""return_sampling_mask": true"#,
             r#""custom_logit_processor": "cls""#,
+            r#""lora_path": null"#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
             // Python has no top-level `n` either, and ignores it just the same.
@@ -1109,6 +1133,10 @@ mod tests {
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
         }
+        let field = r#""session_params": {"id": "s"}"#;
+        let body = format!(r#"{{"text": "hi", {field}}}"#);
+        let err = requests(&body).unwrap_err().to_string();
+        assert!(err.contains("not supported"), "{field}: {err}");
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
@@ -1472,11 +1500,12 @@ mod tests {
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
     }
 
-    /// `extra_key` fans out like Python `_normalize_extra_key`: one key
+    /// `extra_key` fans out like Python `_normalize_extra_key` (and
+    /// `cache_salt` like `_normalize_cache_salt`, the same rules): one key
     /// broadcasts, a list is per item and must match the batch (and needs a
     /// batch), and an empty key means none.
     #[test]
-    fn extra_key_fans_out() {
+    fn cache_keys_fan_out() {
         let (ps, _) = requests(r#"{"text": "a", "extra_key": "salt"}"#).unwrap();
         assert_eq!(ps[0].extra_key.as_deref(), Some("salt"));
         let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": "salt"}"#).unwrap();
@@ -1490,6 +1519,16 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "extra_key": ["k"]}"#).unwrap_err();
         assert!(err.to_string().contains("extra_key"), "{err}");
+
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "cache_salt": ["s", ""]}"#).unwrap();
+        assert_eq!(ps[0].cache_salt.as_deref(), Some("s"));
+        assert_eq!(ps[1].cache_salt, None);
+        assert!(requests(r#"{"text": "a", "cache_salt": ["s"]}"#).is_err());
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b"], "cache_salt": "s", "require_reasoning": true}"#)
+                .unwrap();
+        assert!(ps.iter().all(|p| p.cache_salt.as_deref() == Some("s")));
+        assert!(ps.iter().all(|p| p.require_reasoning));
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The

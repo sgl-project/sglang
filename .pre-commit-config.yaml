@@ -56,6 +56,9 @@ repos:
     hooks:
       - id: codespell
         args: ['--config', '.codespellrc']
+        # Vendored ROCm/aiter#5882 kernel, kept byte-for-byte (`padd` is a helper name).
+        # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+        exclude: ^python/sglang/kernels/ops/attention/dsv4/flydsl_v4nm/
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v20.1.7
     hooks:
