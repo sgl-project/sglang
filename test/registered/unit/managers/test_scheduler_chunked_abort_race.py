@@ -20,6 +20,9 @@ from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
     ModeOwners,
 )
+from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
+    ModeStages,
+)
 from sglang.test.scheduler_request_lists import partial_scheduler  # noqa: E402
 from sglang.test.scheduler_request_lists import request_registry_of  # noqa: E402
 
@@ -122,9 +125,15 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched._start_fpm_clock = Mock()
         sched.hub.step_planner = Mock()
         sched.hub.request_intake = Mock()
-        sched.finalize_step = lambda step, slot: step
+        sched.finalize_step = lambda step, slot, need_mlp_sync: step
+        # The PP PD prefill schedule stages.
+        sched.mode.stages = ModeStages(
+            commit_extend=Mock(),
+            advance_chunked=owner.process_prefill_chunk,
+            admit=sched.hub.step_planner.get_new_batch_prefill,
+        )
 
-        sched.get_next_pp_disagg_prefill_batch_to_run(Mock())
+        sched.schedule_step(Mock())
 
         owner.release_aborted_chunked_req.assert_called_once_with(req)
         sched.parts.request_retirer.retire_aborted.assert_called_once_with(req)

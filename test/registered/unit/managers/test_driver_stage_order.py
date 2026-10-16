@@ -6,6 +6,7 @@ The fakes stand at the owners and at the scheduling and commit leaves, so the
 order pinned here is the drivers' and the schedule stages', not the leaves'.
 """
 
+import itertools
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -127,15 +128,12 @@ class _DecodeOwner:
     def intake(self, *, lora_ids_in_use):
         self.shell.log("dd.intake")
 
-    def pop_reqs_to_admit(self, slot):
-        self.shell.log("dd.pop", slot.index)
+    def join_ready(self, slot):
+        self.shell.log("join", slot.index)
         return []
 
-    def commit_prefill_handoff(self, reqs):
-        self.shell.log("dd.handoff")
-
     def check_hicache_events(self):
-        self.shell.log("dd.hicache")
+        self.shell.log("hicache")
 
     def retracted_rids(self, mb_id):
         self.shell.log("dd.retracted")
@@ -181,6 +179,21 @@ class _DllmOwner:
         self.shell.log("dllm.commit_extend", step.name)
 
 
+class _HiSparse:
+    def __init__(self, shell):
+        self.shell = shell
+
+    def on_launch(self, reqs):
+        self.shell.log("hisparse.on_launch", *[r.rid for r in reqs])
+
+    def leave_finished(self):
+        pass
+
+    def join_ready(self, slot, *, future_map, device):
+        self.shell.log("join", slot.index)
+        return []
+
+
 class _Hook:
     def __init__(self, shell):
         self.shell = shell
@@ -201,6 +214,7 @@ class _Shell:
         ready_at=None,
         shutdown_at=None,
         paused=(),
+        hisparse=False,
     ):
         self.events = []
         self.groups = {}
@@ -236,7 +250,9 @@ class _Shell:
         s.enable_unified_memory = False
         s.parts.metrics_sink = SimpleNamespace(enable_fpm=False)
         s.enable_hisparse = False
-        s.parts.mode_owners.hisparse_coordinator = None
+        s.parts.mode_owners.hisparse_coordinator = _HiSparse(self) if hisparse else None
+        s.parts.future_map = None
+        s.parts.streams.device = "cpu"
         s.parts.require_mlp_sync = False
         s.parts.is_generation = True
         s.tp_size = 2
@@ -261,6 +277,8 @@ class _Shell:
         s._record_scheduler_state_for_paused_engine = lambda: self.log("paused")
         s._yield_gil_if_needed = lambda: None
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
+        s._start_fpm_clock = lambda: self.log("fpm")
+        s.stash_chunked_request = lambda: self.log("stash")
         s._process_hicache_events = self.hicache_events
         s.hub.request_intake = SimpleNamespace(
             requeue_ready_grammars=lambda: self.log("grammar")
@@ -374,6 +392,8 @@ def _at(iteration, *events):
     return [(iteration,) + (e if isinstance(e, tuple) else (e,)) for e in events]
 
 
+# The core steps every schedule runs first, in every mode and driver.
+_PROLOGUE = ("chunked_abort", "hicache", "fpm", "stash")
 # The tail every schedule runs, on a step and on no step.
 _HOOK = "hook.on_schedule"
 _FINALIZE_NONE = ("mlp_sync", "extend_view", "arm_interval", "ngram", _HOOK)
@@ -385,7 +405,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
         shell = _Shell(
             "normal", 3, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
         )
-        schedule = ("ingest", "chunked_abort", "hicache", "grammar")
+        schedule = ("ingest", *_PROLOGUE, "grammar")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
@@ -401,7 +421,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
             "normal", 4, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
         )
         shell.s.enable_overlap = True
-        schedule = {"chunked_abort", "hicache", "grammar", "prefill", "decode"}
+        schedule = {*_PROLOGUE, "grammar", "prefill", "decode"}
         schedule.update(_FINALIZE)
         self.assertEqual(
             [e for e in shell.run() if e[1] not in schedule],
@@ -440,7 +460,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
 
     def test_dllm(self):
         shell = _Shell("dllm", 2, prefill={0: _step("b0", ForwardMode.DLLM_EXTEND)})
-        schedule = ("ingest", "chunked_abort", "hicache", "grammar", "dllm.schedule")
+        schedule = ("ingest", *_PROLOGUE, "grammar", "dllm.schedule")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, *_FINALIZE)
@@ -450,7 +470,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
 
     def test_pd_prefill(self):
         shell = _Shell("prefill", 2, prefill={0: _step("p0")})
-        schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
+        schedule = ("ingest", "dp.intake", *_PROLOGUE)
         schedule += ("dp.resolve", "dp.chunk", "grammar")
         self.assertEqual(
             shell.run(),
@@ -464,7 +484,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
     def test_pd_prefill_overlap(self):
         shell = _Shell("prefill", 3, prefill={0: _step("p0"), 1: _step("p1")})
         shell.s.enable_overlap = True
-        schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
+        schedule = ("ingest", "dp.intake", *_PROLOGUE)
         schedule += ("dp.resolve", "dp.chunk", "grammar")
         self.assertEqual(
             shell.run(),
@@ -489,7 +509,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
             ready_at={"p0": 3, "p1": 3, "p2": 5},
         )
         shell.s.enable_overlap = True
-        schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
+        schedule = ("ingest", "dp.intake", *_PROLOGUE)
         schedule += ("dp.resolve", "dp.chunk", "grammar")
         with envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(True):
             events = shell.run()
@@ -517,7 +537,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
     def test_pd_decode(self):
         # The prefetch runs at the top of an iteration, before the ingest that
         # numbers it, so the log stamps it with the iteration before.
-        schedule = ("ingest", "dd.intake", "grammar", ("dd.pop", None))
+        schedule = ("ingest", *_PROLOGUE, "dd.intake", "grammar", ("join", None))
         for overlap in (False, True):
             with self.subTest(overlap=overlap):
                 shell = _Shell("decode", 2, decode={0: _decode_step("d0")})
@@ -612,7 +632,7 @@ class TestRingDriverStageOrder(CustomTestCase):
         shell = _RingShell(
             "normal", 4, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
         )
-        schedule = {"chunked_abort", "hicache", "grammar"}
+        schedule = {*_PROLOGUE, "grammar"}
         schedule.update(_FINALIZE)
         self.assertEqual(
             [e for e in shell.run() if e[1] not in schedule],
@@ -629,8 +649,8 @@ class TestRingDriverStageOrder(CustomTestCase):
 
     def test_pd_prefill(self):
         shell = _RingShell("prefill", 3, prefill={0: _step("p0")})
-        schedule = ("ingest", "dp.intake", "dp.poll_transfer", "chunked_abort")
-        schedule += ("dp.chunk", "hicache", "grammar")
+        schedule = ("ingest", "dp.intake", "dp.poll_transfer", *_PROLOGUE)
+        schedule += ("dp.chunk", "grammar")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
@@ -683,8 +703,8 @@ class TestRingDriverStageOrder(CustomTestCase):
 
     def test_pd_decode(self):
         shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})
-        schedule = ("ingest", "dd.hicache", "dd.retracted", "dd.poll_prealloc")
-        schedule += ("dd.poll_transfer",)
+        schedule = ("ingest", "dd.retracted", "dd.poll_prealloc", "dd.poll_transfer")
+        schedule += (*_PROLOGUE, "grammar")
 
         # Slot 1 applies the consensus of slot 0, the slot scheduled next,
         # and budgets it against that slot.
@@ -700,26 +720,123 @@ class TestRingDriverStageOrder(CustomTestCase):
 
         self.assertEqual(
             shell.run(),
-            _at(0, *schedule, "grammar", ("dd.pop", 0), ("decode", "d0"), *_FINALIZE)
+            _at(0, *schedule, ("join", 0), ("decode", "d0"), *_FINALIZE)
             + _at(0, ("run_batch", "d0"), ("exchange", 1))
             + _at(0, "send", "send", "send", "send", "send_proxy")
-            + _at(
-                1,
-                *schedule,
-                "grammar",
-                ("dd.pop", 1),
-                ("decode", None),
-                *_FINALIZE_NONE,
-            )
+            + _at(1, *schedule, ("join", 1), ("decode", None), *_FINALIZE_NONE)
             + _at(1, ("exchange", 0), *consensus(0))
             + _at(1, ("commit", "d0"), "send", "send", "send", "send"),
         )
 
 
+# Where each schedule event may sit: the core prologue, the mode's steps
+# before admission, the grammar requeue, the join of ready requests,
+# admission, decode selection, then the tail.
+_RANK = {
+    **{name: rank for rank, name in enumerate(_PROLOGUE)},
+    "dd.intake": 4,
+    "dp.resolve": 4,
+    "dp.chunk": 4,
+    "grammar": 5,
+    "join": 6,
+    "prefill": 7,
+    "dllm.schedule": 7,
+    "decode": 8,
+    **{name: 9 for name in _FINALIZE + _FINALIZE_NONE},
+}
+
+
+class TestOnePrologue(CustomTestCase):
+    """Every mode on every driver, with HiSparse on and off, runs one
+    schedule: the core prologue in one order, the mode's own steps only at
+    their places, and the tail."""
+
+    _CASES = (
+        ("flat", "normal", {}),
+        ("flat", "normal", {"overlap": True}),
+        ("flat", "dllm", {}),
+        ("flat", "prefill", {}),
+        ("flat", "prefill", {"overlap": True, "gate": True}),
+        ("flat", "decode", {}),
+        ("ring", "normal", {}),
+        ("ring", "prefill", {}),
+        ("ring", "decode", {}),
+    )
+    # The mode's own steps each schedule runs, per driver.
+    _MODE_STEPS = {
+        ("flat", "normal"): ("join?", "prefill", "decode"),
+        ("flat", "dllm"): ("join?", "dllm.schedule", "decode"),
+        ("flat", "prefill"): ("dp.resolve", "dp.chunk", "prefill"),
+        ("flat", "decode"): ("dd.intake", "join", "decode"),
+        ("ring", "normal"): ("join?", "prefill", "decode"),
+        ("ring", "prefill"): ("dp.chunk", "prefill"),
+        ("ring", "decode"): ("join", "decode"),
+    }
+
+    def _schedules(self, events):
+        """The events of each schedule call, from its first core step to
+        the tail's hook."""
+        schedules, current = [], None
+        for event in events:
+            name = event[1]
+            if name == _PROLOGUE[0]:
+                current = []
+            if current is not None and name in _RANK:
+                current.append(name)
+            if name == _HOOK and current is not None:
+                schedules.append(current)
+                current = None
+        return schedules
+
+    def test_every_mode_and_driver(self):
+        for driver, mode, options in self._CASES:
+            for hisparse in (False, True):
+                with self.subTest(
+                    driver=driver, mode=mode, hisparse=hisparse, **options
+                ):
+                    shell_cls = _RingShell if driver == "ring" else _Shell
+                    shell = shell_cls(
+                        mode,
+                        3,
+                        prefill={0: _step("p0", ForwardMode.DLLM_EXTEND)}
+                        if mode == "dllm"
+                        else {0: _step("p0")},
+                        hisparse=hisparse,
+                        ready_at={"p0": 1},
+                    )
+                    shell.s.enable_overlap = options.get("overlap", False)
+                    with envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(
+                        options.get("gate", False)
+                    ):
+                        schedules = self._schedules(shell.run())
+                    self.assertGreaterEqual(len(schedules), 2)
+                    joins = hisparse and mode in ("normal", "dllm")
+                    expected_steps = tuple(
+                        step.rstrip("?")
+                        for step in self._MODE_STEPS[(driver, mode)]
+                        if not step.endswith("?") or joins
+                    )
+                    for names in schedules:
+                        self.assertEqual(
+                            [n for n in names if n in _PROLOGUE or n == "grammar"],
+                            [*_PROLOGUE, "grammar"],
+                        )
+                        ranks = [_RANK[n] for n in names]
+                        self.assertEqual(ranks, sorted(ranks), names)
+                        steps = tuple(
+                            n for n in names if 4 <= _RANK[n] <= 8 and n != "grammar"
+                        )
+                        # Admission builds the step; decode runs when it built none.
+                        self.assertEqual(
+                            [n for n in steps if n != "decode"],
+                            [n for n in expected_steps if n != "decode"],
+                        )
+
+
 class TestCommitExtendStage(CustomTestCase):
-    """Each mode commits an extend step through its own stage: dLLM and PD
-    prefill through their owner, the rest through the prefill result
-    processor."""
+    """Every mode's stages, flat or PP and with HiSparse on or off, commit an
+    extend step through their own stage: dLLM and PD prefill through their
+    owner, the rest through the prefill result processor."""
 
     def test_binding(self):
         expected = {
@@ -728,10 +845,12 @@ class TestCommitExtendStage(CustomTestCase):
             "dllm": "dllm.commit_extend",
             "prefill": "dp.commit_extend",
         }
-        for mode, event in expected.items():
-            with self.subTest(mode):
-                shell = _Shell(mode, 0)
-                with published_topology():
+        for (mode, event), pp_size, hisparse in itertools.product(
+            expected.items(), (1, 2), (False, True)
+        ):
+            with self.subTest(mode=mode, pp_size=pp_size, hisparse=hisparse):
+                shell = _Shell(mode, 0, hisparse=hisparse)
+                with published_topology(pp_size=pp_size):
                     stages = init_mode_stages(
                         shell.s.parts, shell.s.loop_schedules(), lora_ids_in_use=set
                     )
@@ -758,7 +877,7 @@ class TestScheduleStageLabel(CustomTestCase):
     """Every mode's schedule, flat and ring, runs under the
     get_next_batch_to_run stage; the PD prefill intake runs outside it."""
 
-    _SCHEDULE_EVENTS = ("prefill", "decode", "dllm.schedule", "dd.pop", _HOOK)
+    _SCHEDULE_EVENTS = (*_PROLOGUE, "grammar", "join", "prefill", "decode", _HOOK)
 
     def _stages_by_event(self, shell):
         recorder = shell.s.scheduler_stage_metrics = _StageRecorder()

@@ -11,7 +11,6 @@ from sglang.srt.runtime_context import get_disagg
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DisaggDecode
     from sglang.srt.disaggregation.prefill import DisaggPrefill
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
     from sglang.srt.managers.scheduler_components.pp_channel import PPChannel
 
@@ -86,13 +85,11 @@ class _DisaggPrefillRing:
         pp_loop_size: int,
         *,
         intake: Callable[[], None],
-        schedule: Callable[[ScheduleSlot], Optional[ScheduleBatch]],
         release: Callable[[Optional[List[str]]], None],
     ):
         self.owner = owner
         self.channel = channel
         self.intake = intake
-        self.schedule = schedule
         self.release = release
         # Per slot: the transferred ids it put to the consensus, or None.
         self.tmbs: List[Optional[List[str]]] = [None] * pp_loop_size
@@ -156,12 +153,10 @@ class _DisaggDecodeRing:
         channel: PPChannel,
         pp_loop_size: int,
         *,
-        schedule: Callable[[ScheduleSlot], Optional[ScheduleBatch]],
         lora_ids_in_use: Callable[[], Set[Optional[str]]],
     ):
         self.owner = owner
         self.channel = channel
-        self.schedule = schedule
         self.lora_ids_in_use = lora_ids_in_use
         # Per slot: the ids it put to each consensus, or None.
         self.rmbs: List[Optional[List[str]]] = [None] * pp_loop_size
@@ -232,9 +227,6 @@ class _DisaggDecodeRing:
         return transferred_rids
 
     def take_ids(self, mb_id: int) -> None:
-        # As the flat loop's intake: finished HiCache loads unpin their nodes
-        # before this slot preallocates against the tree.
-        self.owner.check_hicache_events()
         # reaching consensus through PP ranks
         self.retract_rids = self._get_retract_ids(mb_id)
         self.rmbs[mb_id] = self.retract_rids

@@ -203,22 +203,18 @@ class _Scheduler:
 
     event_loop_normal_disagg_prefill = Scheduler.event_loop_normal_disagg_prefill
     event_loop_overlap_disagg_prefill = Scheduler.event_loop_overlap_disagg_prefill
-    get_next_disagg_prefill_batch_to_run = (
-        Scheduler.get_next_disagg_prefill_batch_to_run
-    )
+    schedule_step = Scheduler.schedule_step
+    stash_chunked_request = Scheduler.stash_chunked_request
     finalize_step = Scheduler.finalize_step
     loop_schedules = Scheduler.loop_schedules
-    # The other modes' schedules, which the loop's stage table names.
-    get_next_batch_to_run = Scheduler.get_next_batch_to_run
+    # The stages the loop's stage table names.
+    _admit_prefill = Scheduler._admit_prefill
+    _admit_prefill_after_interval = Scheduler._admit_prefill_after_interval
     _admit_dllm_step = Scheduler._admit_dllm_step
-    get_next_disagg_decode_batch_to_run = Scheduler.get_next_disagg_decode_batch_to_run
+    _select_decode = Scheduler._select_decode
     process_bootstrapped_queue = Scheduler.process_bootstrapped_queue
     process_prefill_transfer_queue = Scheduler.process_prefill_transfer_queue
-    get_next_pp_disagg_prefill_batch_to_run = (
-        Scheduler.get_next_pp_disagg_prefill_batch_to_run
-    )
     _start_fpm_clock = Scheduler._start_fpm_clock
-    _begin_schedule = Scheduler._begin_schedule
     paused_pass = Scheduler.paused_pass
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
     pause_generation = Scheduler.pause_generation

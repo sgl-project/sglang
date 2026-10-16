@@ -329,8 +329,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             observed_iters.append(record.step.forward_iter)
             step_counters.record(record)
 
-        scheduler.get_next_disagg_prefill_batch_to_run = schedule
-        scheduler.get_next_disagg_decode_batch_to_run = schedule
+        scheduler.schedule_step = schedule
         scheduler.mode.step_launcher.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
         scheduler.parts.step_counters = SimpleNamespace(record=record_step_counters)

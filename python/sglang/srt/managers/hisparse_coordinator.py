@@ -41,6 +41,7 @@ else:
 
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -721,6 +722,26 @@ class HiSparseCoordinator:
         for req in ready_reqs:
             self.alloc_device_buffer(req)
         return ready_reqs
+
+    def join_ready(self, slot, *, future_map, device) -> List[Req]:
+        """Core stage at schedule: the staging requests whose host copy
+        landed, which join decoding. Their next decode step gathers its input
+        token from the relay, so it is stashed there."""
+        reqs = self.collect_ready_reqs()
+        if not reqs:
+            return reqs
+        req_pool_indices = torch.tensor(
+            [r.kv.req_pool_idx for r in reqs],
+            dtype=torch.int64,
+            device=device,
+        )
+        last_tokens = torch.tensor(
+            [r.output_ids[-1] for r in reqs],
+            dtype=torch.int64,
+            device=device,
+        )
+        future_map.stash(req_pool_indices, RelayPayload(bonus_tokens=last_tokens))
+        return reqs
 
     def map_last_loc_to_buffer(
         self,

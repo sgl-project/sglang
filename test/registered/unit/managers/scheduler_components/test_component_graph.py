@@ -403,19 +403,19 @@ _SCHEDULER_REFS = {
 _LAMBDA, _BOUND, _SELF = "lambda", "bound method", "self"
 _CALLBACK_SITES = {
     # Stage tables: the loop's own stages.
-    ("loop_schedules", "LoopSchedules", "schedule", _BOUND): 1,
+    ("loop_schedules", "LoopSchedules", "admit_prefill", _BOUND): 1,
+    ("loop_schedules", "LoopSchedules", "admit_prefill_after_interval", _BOUND): 1,
     ("loop_schedules", "LoopSchedules", "admit_dllm", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "schedule_disagg_prefill", _BOUND): 1,
+    ("loop_schedules", "LoopSchedules", "select_decode", _BOUND): 1,
     ("loop_schedules", "LoopSchedules", "ring_intake_disagg_prefill", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "ring_schedule_disagg_prefill", _BOUND): 1,
     ("loop_schedules", "LoopSchedules", "ring_release_disagg_prefill", _BOUND): 1,
-    ("loop_schedules", "LoopSchedules", "schedule_disagg_decode", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "ingest_requests", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "launch_step", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "commit_step", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "on_idle", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "mark_idle", _BOUND): 1,
     ("init_pp_ring", "DriverOps", "paused_pass", _BOUND): 1,
+    ("init_pp_ring", "DriverOps", "schedule_step", _BOUND): 1,
     # RPC dispatch and the PD role switch, which name the scheduler itself.
     ("handle_rpc_request", "getattr", "", _SELF): 1,
     ("handle_pd_role_switch", "role_switch.handle_pd_role_switch", "", _SELF): 1,

@@ -54,6 +54,8 @@ class TestHiSparseStagingList(unittest.TestCase):
         )
         scheduler.hisparse_coordinator.staging = []
         scheduler.parts.batch_result_processor = Mock()
+        scheduler.parts.future_map = Mock()
+        scheduler.parts.streams.device = "cpu"
         scheduler.mode.stages = init_mode_stages(
             scheduler.parts, scheduler.loop_schedules(), lora_ids_in_use=set
         )

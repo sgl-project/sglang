@@ -3534,15 +3534,14 @@ class DisaggDecode:
 
     def check_hicache_events(self) -> None:
         """Poll the decode HiCache's async events: a finished load-back unpins
-        the nodes it locked. Every decode iteration runs it before intake."""
+        the nodes it locked. Every schedule runs it before admission and
+        before the preallocation it releases room for."""
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def intake(self, *, lora_ids_in_use: Callable[[], Set[Optional[str]]]) -> None:
         """`lora_ids_in_use` gives the adapters the live requests keep."""
-        self.check_hicache_events()
-
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.check_offload_progress()
 
@@ -3746,6 +3745,15 @@ class DisaggDecode:
 
         set_time_batch(reqs, "set_forward_entry_time")
         return reqs
+
+    def join_ready(self, slot: ScheduleSlot) -> List[Req]:
+        """The ready requests that fit slot, with their prefill handoff
+        committed; those it did not finish join decoding."""
+        reqs = self.pop_reqs_to_admit(slot)
+        if not reqs:
+            return []
+        self.commit_prefill_handoff(reqs)
+        return [req for req in reqs if not req.finished()]
 
     def commit_prefill_handoff(self, reqs: List[Req]) -> None:
         """Commit the prefill node's step for the admitted requests: account

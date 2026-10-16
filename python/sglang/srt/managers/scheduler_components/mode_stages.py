@@ -1,19 +1,24 @@
 """What the drivers run per mode, and what they hand to it.
 
 The scheduler chooses a mode's stages once (again on a PD role switch); the
-flat and the ring driver read the same set. Only `schedule` and
-`commit_extend` are required; an optional stage left None runs the core
-default inline, so a mode pays no call for a stage it does not have.
+flat and the ring driver read the same set and run one core schedule,
+`Scheduler.schedule_step`, which calls a mode's schedule stages in a fixed
+order. Only `commit_extend` is required; an optional stage left None runs the
+core default inline, or nothing, so a mode pays no call for a stage it does
+not have.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.managers.scheduler_components.pending_steps import PendingStep
+    from sglang.srt.managers.scheduler_components.pending_steps import (
+        PendingStep,
+        PendingSteps,
+    )
     from sglang.srt.managers.utils import GenerationBatchResult
 
 
@@ -37,8 +42,6 @@ class ScheduleSlot:
 class ModeStages:
     """One mode's stages, in driver order."""
 
-    # Build the step of a slot (flat PD prefill also takes its polling args).
-    schedule: Callable[..., Optional[ScheduleBatch]]
     # Commit, the host commit of an extend step; returns the requests that go
     # back to the front of the waiting list (PD prefill: the optimistic
     # requests that yield), or None.
@@ -46,17 +49,39 @@ class ModeStages:
     # Flat driver, before intake while the engine runs: PD decode starts the
     # prefill DP-rank lookups of its pending rooms.
     prefetch: Optional[Callable[[], None]] = None
-    # Flat driver, after intake: the owner advances its own lists and returns
-    # the requests that join the core waiting list (PD prefill: bootstrapped;
-    # PD decode: None, its admitted requests wait in its ready list).
-    intake: Optional[Callable[[], Optional[List[Req]]]] = None
-    # Normal schedule, before admission: HiSparse requests whose host copy
-    # landed; they join decoding.
-    collect_ready: Optional[Callable[[], List[Req]]] = None
-    # Normal schedule, admission: dLLM takes its requests from waiting and
-    # builds its step (None: prefill admission, after the prefill/decode
-    # interval).
+    # Flat driver, after intake: PD prefill's bootstrapped requests, which
+    # join the core waiting list.
+    intake: Optional[Callable[[], List[Req]]] = None
+    # Schedule, the HiCache drain at its head (a TP collective): PD decode
+    # drains its decode HiCache (None: the core drain, with the storage
+    # prefetch retries).
+    drain_hicache: Optional[Callable[[], None]] = None
+    # Schedule, before admission: flat PD decode advances its own lists
+    # (resume retracted, preallocate, poll transfers); its ready requests
+    # wait for join_ready.
+    before_admission: Optional[Callable[[], None]] = None
+    # Schedule, before admission: flat PD prefill resolves the waiting
+    # requests' bootstrap; it takes and returns the core waiting list.
+    resolve_waiting: Optional[Callable[[List[Req]], List[Req]]] = None
+    # Schedule, before admission, once per launched step: PD prefill advances
+    # the chunked request's bootstrap and KV send; it takes and returns the
+    # chunked request and the waiting list, and reads the pending steps.
+    advance_chunked: Optional[
+        Callable[
+            [Optional[Req], List[Req], PendingSteps],
+            Tuple[Optional[Req], List[Req]],
+        ]
+    ] = None
+    # Schedule, after the grammar requeue: the requests ready to decode,
+    # which join decoding (HiSparse: their host copy landed; PD decode: their
+    # KV arrived and their prefill handoff is committed).
+    join_ready: Optional[Callable[[ScheduleSlot], List[Req]]] = None
+    # Schedule, admission: the step of newly admitted requests (normal:
+    # prefill after the prefill/decode interval; PD prefill: prefill; dLLM:
+    # its own step).
     admit: Optional[Callable[[ScheduleSlot], Optional[ScheduleBatch]]] = None
+    # Schedule, when admission built no step: the decode step.
+    select_decode: Optional[Callable[[ScheduleSlot], Optional[ScheduleBatch]]] = None
     # Launch, before the forward: PD prefill sends cached prefix KV early.
     before_forward: Optional[Callable[[ScheduleBatch], None]] = None
     # Launch: dLLM moves its whole step into its staging list.
@@ -87,19 +112,19 @@ class ModeStages:
 @dataclass(frozen=True, slots=True)
 class LoopSchedules:
     """The scheduler's own schedule stages, filled once by the scheduler; each
-    mode's stages take theirs from here."""
+    mode's stages take theirs from here. Admission and decode selection come
+    through the scheduler because the step planner is built after the mode."""
 
-    # The normal schedule; dLLM's too, which admits through admit_dllm.
-    schedule: Callable[..., Optional[ScheduleBatch]]
+    # Admission: prefill (PD prefill), prefill after the prefill/decode
+    # interval (normal), and dLLM's step.
+    admit_prefill: Callable[[ScheduleSlot], Optional[ScheduleBatch]]
+    admit_prefill_after_interval: Callable[[ScheduleSlot], Optional[ScheduleBatch]]
     admit_dllm: Callable[[ScheduleSlot], Optional[ScheduleBatch]]
-    # PD prefill: the flat schedule, and the ring's intake, schedule and
-    # release around each slot.
-    schedule_disagg_prefill: Callable[..., Optional[ScheduleBatch]]
+    # The decode step of the decoding requests.
+    select_decode: Callable[[ScheduleSlot], Optional[ScheduleBatch]]
+    # PD prefill under PP: the ring's intake and release around each slot.
     ring_intake_disagg_prefill: Callable[[], None]
-    ring_schedule_disagg_prefill: Callable[..., Optional[ScheduleBatch]]
     ring_release_disagg_prefill: Callable[..., None]
-    # PD decode, flat and ring.
-    schedule_disagg_decode: Callable[..., Optional[ScheduleBatch]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,5 +144,7 @@ class DriverOps:
     on_idle: Callable[[], None]
     # Note a ring round that launched nothing.
     mark_idle: Callable[[], None]
-    # Whether the engine is paused; a paused pass runs nothing after intake.
+    # Whether the engine is paused; a paused pass launches nothing.
     paused_pass: Callable[[], bool]
+    # Schedule a slot's step.
+    schedule_step: Callable[[ScheduleSlot], Optional[ScheduleBatch]]

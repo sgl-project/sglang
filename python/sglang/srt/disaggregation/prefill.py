@@ -1431,11 +1431,6 @@ class DisaggPrefill:
         request and the waiting requests."""
         if (req := chunked_req) is None:
             return chunked_req, waiting
-        # Publish the chunk it launched last; a later schedule call before its
-        # next chunk finds nothing new.
-        if req.extend_end > req.prefix_len:
-            self.checkpoint(req)
-
         if not self.check_bootstrap(req):
             if is_aborted(req):
                 # bootstrap failed

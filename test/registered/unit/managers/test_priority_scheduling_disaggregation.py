@@ -32,6 +32,7 @@ from sglang.srt.managers.scheduler_components.mode_owners import (  # noqa: E402
     ModeOwners,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import (  # noqa: E402
+    ModeStages,
     ScheduleSlot,
 )
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
@@ -1037,11 +1038,18 @@ class TestDecodeAdmission(unittest.TestCase):
             lambda step, chunked_req: step
         )
         scheduler.scheduler_stage_metrics = None
+        # The PD decode schedule stages of a flat driver, without its intake.
+        scheduler.mode.stages = ModeStages(
+            commit_extend=MagicMock(),
+            drain_hicache=owner.check_hicache_events,
+            join_ready=owner.join_ready,
+            select_decode=scheduler._select_decode,
+        )
 
         with get_context().override_server_args(
             disaggregation_decode_enable_radix_cache=False
         ):
-            step = scheduler.get_next_disagg_decode_batch_to_run(ScheduleSlot())
+            step = scheduler.schedule_step(ScheduleSlot())
 
         self.assertIsNone(step)
         owner.commit_prefill_handoff.assert_called_once_with([kept, finished])

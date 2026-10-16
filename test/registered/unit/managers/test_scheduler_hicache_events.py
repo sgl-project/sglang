@@ -119,13 +119,17 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.hub.step_planner.get_new_batch_prefill.return_value = None
         s.parts.ngram_embedding_manager = Mock()
         s.parts.ngram_embedding_manager.prepare_for_forward.return_value = None
+        s.parts.batch_result_processor = Mock()
+        s.mode.stages = init_mode_stages(
+            s.parts, s.loop_schedules(), lora_ids_in_use=set
+        )
         slot = ScheduleSlot()
         for waiting_queue in ([], [SimpleNamespace(rid="pending_l3")]):
             with self.subTest(waiting=bool(waiting_queue)):
                 s.parts.lists.waiting_queue = waiting_queue
                 self.calls.reset_mock()
                 for _ in range(2):
-                    self.assertIsNone(s.get_next_disagg_prefill_batch_to_run(slot))
+                    self.assertIsNone(s.schedule_step(slot))
                 self.assertEqual(
                     self.calls.mock_calls,
                     [call.drain(), call.retry(), call.admit(slot)] * 2,
@@ -152,7 +156,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.mode.stages = init_mode_stages(
             s.parts, s.loop_schedules(), lora_ids_in_use=set
         )
-        step = s.get_next_batch_to_run(ScheduleSlot())
+        step = s.schedule_step(ScheduleSlot())
 
         self.assertIsNone(step)
         s.hub.step_planner.get_new_batch_prefill.assert_not_called()

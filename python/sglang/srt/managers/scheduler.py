@@ -137,9 +137,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
     sock_send,
 )
-from sglang.srt.managers.overlap_utils import (
-    RelayPayload,
-)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
@@ -228,13 +225,12 @@ class Scheduler:
     def loop_schedules(self) -> LoopSchedules:
         """The loop's own schedule stages, which each mode's stages take."""
         return LoopSchedules(
-            schedule=self.get_next_batch_to_run,
+            admit_prefill=self._admit_prefill,
+            admit_prefill_after_interval=self._admit_prefill_after_interval,
             admit_dllm=self._admit_dllm_step,
-            schedule_disagg_prefill=self.get_next_disagg_prefill_batch_to_run,
+            select_decode=self._select_decode,
             ring_intake_disagg_prefill=self.process_bootstrapped_queue,
-            ring_schedule_disagg_prefill=self.get_next_pp_disagg_prefill_batch_to_run,
             ring_release_disagg_prefill=self.process_prefill_transfer_queue,
-            schedule_disagg_decode=self.get_next_disagg_decode_batch_to_run,
         )
 
     def init_loop_state(self) -> None:
@@ -528,6 +524,7 @@ class Scheduler:
                 on_idle=self.on_idle,
                 mark_idle=self.mark_sched_idled,
                 paused_pass=self.paused_pass,
+                schedule_step=self.schedule_step,
             ),
         )
 
@@ -541,7 +538,7 @@ class Scheduler:
         readiness gate (PD prefill continuous polling), a pass whose oldest
         result is not ready on every rank returns to intake instead."""
         stages = self.mode.stages
-        prefetch, intake, schedule = stages.prefetch, stages.intake, stages.schedule
+        prefetch, intake = stages.prefetch, stages.intake
         after_commit = stages.after_commit
         is_result_ready = stages.is_result_ready if overlap else None
         slot = self.flat_slot
@@ -579,7 +576,7 @@ class Scheduler:
             scheduled = False
             if is_result_ready is None:
                 if not self.parts.flags.gracefully_exit:
-                    step = schedule(slot)
+                    step = self.schedule_step(slot)
                     scheduled = True
             else:
                 if not waiting_for_result or received or joined:
@@ -590,7 +587,7 @@ class Scheduler:
                     and not self._deferred_input_requests
                     and not skip_schedule
                 ):
-                    step = schedule(
+                    step = self.schedule_step(
                         slot,
                         # Storage retry deadlines count schedules, not polls.
                         should_retry_storage_prefetch=not waiting_for_result,
@@ -910,7 +907,14 @@ class Scheduler:
     def handle_batch_embedding_request(self, recv_req: BatchTokenizedEmbeddingReqInput):
         self.hub.request_intake.handle_batch_embedding_request(recv_req)
 
-    def stash_chunked_request(self, req: Req):
+    def stash_chunked_request(self) -> None:
+        """Publish the KV the chunked request's last launched chunk computed;
+        a later schedule before its next chunk finds nothing new."""
+        req = self.parts.lists.chunked_req
+        # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
+        # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+        if req is None or req.extend_end <= req.prefix_len:
+            return
         if self.disagg_prefill is not None:
             self.disagg_prefill.checkpoint(req)
         else:
@@ -962,24 +966,6 @@ class Scheduler:
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
-    def _admit_hisparse_ready_reqs(self, reqs: List[Req], slot: ScheduleSlot) -> None:
-        """Move requests whose HiSparse staging is done into decoding."""
-        req_pool_indices = torch.tensor(
-            [r.kv.req_pool_idx for r in reqs],
-            dtype=torch.int64,
-            device=self.parts.streams.device,
-        )
-        # The next decode step gathers its input token from the relay.
-        last_tokens = torch.tensor(
-            [r.output_ids[-1] for r in reqs],
-            dtype=torch.int64,
-            device=self.parts.streams.device,
-        )
-        self.parts.future_map.stash(
-            req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
-        self.parts.lists.join_decoding(reqs, slot)
-
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
     ) -> None:
@@ -995,50 +981,52 @@ class Scheduler:
             if hicache_storage_enabled() and should_retry_storage_prefetch:
                 self.hub.request_intake.process_storage_prefetch_retries()
 
-    def _begin_schedule(self, should_retry_storage_prefetch: bool = True) -> None:
-        """The head of a schedule: the deferred chunked abort, the HiCache
-        drain (a TP collective), then the forward pass metrics clock."""
-        self.process_pending_chunked_abort()
-        self._process_hicache_events(
-            should_retry_storage_prefetch=should_retry_storage_prefetch
-        )
-        self._start_fpm_clock()
-
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
-    def get_next_batch_to_run(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
+    def schedule_step(
+        self,
+        slot: ScheduleSlot,
+        should_retry_storage_prefetch: bool = True,
+        process_chunk: bool = True,
+    ) -> Optional[ScheduleBatch]:
         """Schedule this iteration and build its step for slot from the
-        request lists.
+        request lists: every mode runs these steps in this order, and its
+        stages supply only what differs. The flat PD prefill driver repeats a
+        schedule while it waits for a result: those repeats retry no storage
+        prefetch and do not advance the chunked request again.
 
         The step is built fresh from the lists and the requests admitted now;
         launching it moves them (see ``join_launched_step``)."""
-        self._begin_schedule()
-
-        if self.parts.lists.chunked_req is not None:
-            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
-            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
-            if (
-                self.parts.lists.chunked_req.extend_end
-                > self.parts.lists.chunked_req.prefix_len
-            ):
-                self.stash_chunked_request(self.parts.lists.chunked_req)
-        self.hub.request_intake.requeue_ready_grammars()
-
         stages = self.mode.stages
-        if stages.collect_ready is not None:
-            ready_reqs = stages.collect_ready()
-            if len(ready_reqs) > 0:
-                self._admit_hisparse_ready_reqs(ready_reqs, slot)
-
-        if stages.admit is not None:
-            new_batch = stages.admit(slot)
-        elif self.hub.step_planner.should_defer_prefill():
-            new_batch = None
+        lists = self.parts.lists
+        self.process_pending_chunked_abort()
+        # The HiCache drain is TP-wide consensus; run it before rank-local
+        # decisions (should_defer_prefill) or ranks enter different collectives.
+        if stages.drain_hicache is not None:
+            stages.drain_hicache()
         else:
-            new_batch = self.hub.step_planner.get_new_batch_prefill(slot)
+            self._process_hicache_events(should_retry_storage_prefetch)
+        self._start_fpm_clock()
+        self.stash_chunked_request()
 
-        need_mlp_sync = self.parts.require_mlp_sync
+        if stages.before_admission is not None:
+            stages.before_admission()
+        if stages.resolve_waiting is not None:
+            lists.waiting_queue = stages.resolve_waiting(lists.waiting_queue)
+        if stages.advance_chunked is not None and process_chunk:
+            lists.chunked_req, lists.waiting_queue = stages.advance_chunked(
+                lists.chunked_req, lists.waiting_queue, self.parts.pending
+            )
+        self.hub.request_intake.requeue_ready_grammars()
+        if stages.join_ready is not None:
+            if ready := stages.join_ready(slot):
+                lists.join_decoding(ready, slot)
+
+        new_batch = stages.admit(slot) if stages.admit is not None else None
+        need_mlp_sync = None
         if (
-            need_mlp_sync
+            stages.admit is not None
+            and stages.select_decode is not None
+            and self.parts.require_mlp_sync
             and not self.parts.spec_algorithm.is_none()
             and not get_spec().speculative_skip_dp_mlp_sync
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
@@ -1053,12 +1041,21 @@ class Scheduler:
             need_mlp_sync = new_batch is None
 
         # Run prefill first if possible
-        ret = (
-            new_batch
-            if new_batch is not None
-            else self.hub.step_planner.get_decode_step(slot)
-        )
-        return self.finalize_step(ret, slot, need_mlp_sync)
+        step = new_batch
+        if step is None and stages.select_decode is not None:
+            step = stages.select_decode(slot)
+        return self.finalize_step(step, slot, need_mlp_sync)
+
+    def _admit_prefill(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
+        return self.hub.step_planner.get_new_batch_prefill(slot)
+
+    def _admit_prefill_after_interval(
+        self, slot: ScheduleSlot
+    ) -> Optional[ScheduleBatch]:
+        """Prefill admission, unless the prefill/decode interval defers it."""
+        if self.hub.step_planner.should_defer_prefill():
+            return None
+        return self.hub.step_planner.get_new_batch_prefill(slot)
 
     def _admit_dllm_step(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
         """The dLLM owner takes the requests it runs; the rest stay waiting."""
@@ -1067,71 +1064,16 @@ class Scheduler:
         )
         return step
 
-    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
-    def get_next_disagg_prefill_batch_to_run(
-        self,
-        slot: ScheduleSlot,
-        should_retry_storage_prefetch: bool = True,
-        process_chunk: bool = True,
-    ) -> Optional[ScheduleBatch]:
-        self._begin_schedule(should_retry_storage_prefetch)
-        self.parts.lists.waiting_queue = self.disagg_prefill.resolve_waiting_bootstrap(
-            self.parts.lists.waiting_queue
-        )
-        if process_chunk:
-            self.parts.lists.chunked_req, self.parts.lists.waiting_queue = (
-                self.disagg_prefill.process_prefill_chunk(
-                    self.parts.lists.chunked_req,
-                    self.parts.lists.waiting_queue,
-                    self.parts.pending,
-                )
-            )
-        self.hub.request_intake.requeue_ready_grammars()
-
-        return self.finalize_step(
-            self.hub.step_planner.get_new_batch_prefill(slot), slot
-        )
+    def _select_decode(self, slot: ScheduleSlot) -> Optional[ScheduleBatch]:
+        return self.hub.step_planner.get_decode_step(slot)
 
     def process_bootstrapped_queue(self):
         self.parts.lists.waiting_queue.extend(self.disagg_prefill.intake())
-
-    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
-    def get_next_pp_disagg_prefill_batch_to_run(
-        self, slot: ScheduleSlot
-    ) -> Optional[ScheduleBatch]:
-        self.process_pending_chunked_abort()
-        self.parts.lists.chunked_req, self.parts.lists.waiting_queue = (
-            self.disagg_prefill.process_prefill_chunk(
-                self.parts.lists.chunked_req,
-                self.parts.lists.waiting_queue,
-                self.parts.pending,
-            )
-        )
-        self._process_hicache_events()
-        self._start_fpm_clock()
-        self.hub.request_intake.requeue_ready_grammars()
-        return self.finalize_step(
-            self.hub.step_planner.get_new_batch_prefill(slot), slot
-        )
 
     def process_prefill_transfer_queue(self, release_rids: Optional[List[str]]) -> None:
         self.parts.lists.waiting_queue = self.disagg_prefill.after_commit(
             self.parts.lists.waiting_queue, release_rids
         )
-
-    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
-    def get_next_disagg_decode_batch_to_run(
-        self, slot: ScheduleSlot
-    ) -> Optional[ScheduleBatch]:
-        """Admit transferred requests into decoding, then build the decode step."""
-        self._start_fpm_clock()
-        self.hub.request_intake.requeue_ready_grammars()
-        reqs = self.disagg_decode.pop_reqs_to_admit(slot)
-        if reqs:
-            self.disagg_decode.commit_prefill_handoff(reqs)
-            self.parts.lists.join_decoding([r for r in reqs if not r.finished()], slot)
-
-        return self.finalize_step(self.hub.step_planner.get_decode_step(slot), slot)
 
     def finalize_step(
         self,

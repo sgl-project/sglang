@@ -232,11 +232,7 @@ class PPRing:
                 step = None
                 if not held:
                     with torch.profiler.record_function("get_next_batch_to_run"):
-                        step = (
-                            pd.schedule(slot)
-                            if pd is not None
-                            else stages.schedule(slot)
-                        )
+                        step = self.ops.schedule_step(slot)
                 self.counters.cur_batch_for_debug = step
                 if step:
                     self.slots[mb_id].last_step = step

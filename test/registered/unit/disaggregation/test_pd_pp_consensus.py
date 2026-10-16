@@ -45,7 +45,7 @@ class _Channel:
 
 
 def _decode_ring(owner, channel):
-    return _DisaggDecodeRing(owner, channel, 2, schedule=Mock(), lora_ids_in_use=set)
+    return _DisaggDecodeRing(owner, channel, 2, lora_ids_in_use=set)
 
 
 class TestDisaggDecodeRing(CustomTestCase):
@@ -69,29 +69,6 @@ class TestDisaggDecodeRing(CustomTestCase):
         self.assertEqual(ring.transferred_rids, ["t2"])
         self.assertEqual(ring.rmbs[0], ["b"])
         self.assertIsNone(ring.rmbs[1])
-
-    def test_take_ids_drains_decode_hicache_events_first(self):
-        # As the flat loop's intake: finished load-backs unpin their nodes
-        # before the slot polls the requests waiting for room.
-        calls = []
-        owner = decode_owner_shell(
-            enable_decode_hicache=True,
-            tree_cache=SimpleNamespace(
-                check_hicache_events=lambda: calls.append("hicache")
-            ),
-            retracted_rids=lambda mb_id: calls.append("retract") or [],
-            poll_prealloc_rids=lambda: ([], []),
-            aborted_prealloc_rids=set,
-            poll_transfer_rids=lambda: [],
-        )
-        channel = _Channel()
-        channel.is_first_rank = True
-        ring = _decode_ring(owner, channel)
-
-        ring.take_ids(0)
-        ring.take_ids(1)
-
-        self.assertEqual(calls, ["hicache", "retract"] * 2)
 
     @patch(f"{PP_MODULE}.get_disagg")
     def test_exchange_ids_applies_the_consensus_of_the_next_slot(self, get_disagg):
@@ -248,13 +225,15 @@ class TestDecodeHiCacheAcrossPPRanks(CustomTestCase):
         slot = ScheduleSlot(index=0)
         released = []
         for step in range(1, 7):
-            # take_ids: every rank drains its HiCache events, then polls.
+            # take_ids: every rank polls; then the slot's schedule drains
+            # every rank's HiCache events.
             for rank in ranks:
                 rank.tree_cache.now = step
-                rank.check_hicache_events()
             consensus = sorted(
                 set(pp0.poll_transfer_rids()) & set(pp1.poll_transfer_rids())
             )
+            for rank in ranks:
+                rank.check_hicache_events()
             # exchange_ids, half a slot later: PP0 applies the consensus, and
             # the next rank applies the ids PP0 released.
             for rank in ranks:
@@ -280,9 +259,7 @@ class TestDisaggPrefillRing(CustomTestCase):
         owner = prefill_owner_shell(poll_transfer_rids=lambda: ["a", "b"])
         intake, release = Mock(), Mock()
         channel = _Channel(["b", "c"], ["b"])
-        ring = _DisaggPrefillRing(
-            owner, channel, 2, intake=intake, schedule=Mock(), release=release
-        )
+        ring = _DisaggPrefillRing(owner, channel, 2, intake=intake, release=release)
 
         ring.take_ids(0)
         intake.assert_called_once_with()

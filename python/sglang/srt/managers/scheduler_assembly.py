@@ -1285,22 +1285,28 @@ def init_mode_stages(
     schedules: LoopSchedules,
     lora_ids_in_use: Callable[[], Set[Optional[str]]],
 ) -> ModeStages:
-    """Choose the mode's stages, once; a PD role switch rebuilds them. PD
+    """Choose the mode's stages, once; a PD role switch rebuilds them. The PP
+    ring and the flat driver differ only where pp_size decides here. PD
     decode admission takes the adapters the scheduler's requests pin."""
     owners = parts.mode_owners
     hisparse = owners.hisparse_coordinator
     if owners.dllm is not None:
         stages = dict(
-            schedule=schedules.schedule,
             commit_extend=owners.dllm.commit_extend,
             admit=schedules.admit_dllm,
+            select_decode=schedules.select_decode,
             on_launch=owners.dllm.on_launch,
         )
     elif (owner := owners.disagg_prefill) is not None:
+        under_pp = get_parallel().pp_size > 1
         stages = dict(
-            schedule=schedules.schedule_disagg_prefill,
             commit_extend=owner.commit_extend,
             intake=owner.intake,
+            # The resolve poll reduces over TP only, so under PP it could
+            # split the stages; optimistic prefill is off under PP anyway.
+            resolve_waiting=None if under_pp else owner.resolve_waiting_bootstrap,
+            advance_chunked=owner.process_prefill_chunk,
+            admit=schedules.admit_prefill,
             before_forward=owner.before_forward,
             on_prefilled=owner.on_launch,
             after_commit=owner.after_commit,
@@ -1308,7 +1314,7 @@ def init_mode_stages(
             is_result_ready=(
                 owner.is_result_ready
                 if (not get_schedule().disable_overlap_schedule)
-                and get_parallel().pp_size == 1
+                and not under_pp
                 and continuous_input_polling_enabled(
                     spec_algorithm=parts.spec_algorithm,
                     is_generation=parts.is_generation,
@@ -1319,16 +1325,23 @@ def init_mode_stages(
                 _DisaggPrefillRing,
                 owner,
                 intake=schedules.ring_intake_disagg_prefill,
-                schedule=schedules.ring_schedule_disagg_prefill,
                 release=schedules.ring_release_disagg_prefill,
             ),
         )
     elif (owner := owners.disagg_decode) is not None:
+        under_pp = get_parallel().pp_size > 1
         stages = dict(
-            schedule=schedules.schedule_disagg_decode,
             commit_extend=parts.batch_result_processor.process_batch_result_prefill,
             prefetch=owner.prefetch_prefill_dp_rank_queries,
-            intake=functools.partial(owner.intake, lora_ids_in_use=lora_ids_in_use),
+            drain_hicache=owner.check_hicache_events,
+            # Under PP the ring's consensus messages advance the lists instead.
+            before_admission=(
+                None
+                if under_pp
+                else functools.partial(owner.intake, lora_ids_in_use=lora_ids_in_use)
+            ),
+            join_ready=owner.join_ready,
+            select_decode=schedules.select_decode,
             hold_finished=(
                 owner.hold_finished
                 if parts.decode_offload_manager is not None
@@ -1337,22 +1350,26 @@ def init_mode_stages(
             ring_consensus=functools.partial(
                 _DisaggDecodeRing,
                 owner,
-                schedule=schedules.schedule_disagg_decode,
                 lora_ids_in_use=lora_ids_in_use,
             ),
         )
     else:
         stages = dict(
-            schedule=schedules.schedule,
             commit_extend=parts.batch_result_processor.process_batch_result_prefill,
+            admit=schedules.admit_prefill_after_interval,
+            select_decode=schedules.select_decode,
         )
     if hisparse is not None:
         # Launched prefills stage until their host copy lands (PD prefill
-        # hands them over instead); the normal schedule then admits them.
+        # hands them over instead); the normal schedule then joins them.
         stages.setdefault("on_prefilled", hisparse.on_launch)
         stages["leave_finished"] = hisparse.leave_finished
         if owners.disagg_prefill is None and owners.disagg_decode is None:
-            stages["collect_ready"] = hisparse.collect_ready_reqs
+            stages["join_ready"] = functools.partial(
+                hisparse.join_ready,
+                future_map=parts.future_map,
+                device=parts.streams.device,
+            )
     return ModeStages(**stages)
 
 

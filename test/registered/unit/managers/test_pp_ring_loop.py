@@ -124,7 +124,8 @@ class TestPPRingCommit(CustomTestCase):
             trace[-1]["committed"] = record.step.name
             assert record.result is trace[-1]["relayed"]
 
-        s.mode.stages = ModeStages(schedule=schedule_slot, commit_extend=Mock())
+        s.mode.stages = ModeStages(commit_extend=Mock())
+        s.schedule_step = schedule_slot
         s.commit_step = commit_step
         s.init_pp_ring()
         ring = s.pp_ring

@@ -178,7 +178,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
         )
         steps = []
 
-        def get_next_batch_to_run(slot):
+        def schedule_step(slot):
             # Two decode steps of req: seq lens 4 (a boundary) and 5.
             if len(steps) == 2:
                 return None
@@ -193,7 +193,7 @@ class TestMambaBoundaryCommit(unittest.TestCase):
             req.kv.kv_allocated_len += token_per_req
             return torch.tensor([3], dtype=torch.int64)
 
-        scheduler.get_next_batch_to_run = get_next_batch_to_run
+        scheduler.schedule_step = schedule_step
         state_at_commit = []
 
         def process_batch_result(result_batch, batch_result):

@@ -639,7 +639,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         owner.request_retirer = MagicMock()
         scheduler.parts.decode_offload_manager = manager
         scheduler.mode.stages = ModeStages(
-            schedule=MagicMock(),
             commit_extend=MagicMock(),
             hold_finished=owner.hold_finished,
         )

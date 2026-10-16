@@ -110,7 +110,7 @@ class TestGrammarCommitOverlap(CustomTestCase):
         s.parts.recv_skipper = None
         s.parts.is_generation = False
         s.parts.batch_result_processor = processor
-        s.get_next_batch_to_run = MagicMock(side_effect=steps)
+        s.schedule_step = MagicMock(side_effect=steps)
         s._apply_war_barrier = MagicMock()
         s.parts.step_counters = MagicMock()
 

@@ -112,10 +112,9 @@ _LOOP_SCHEDULING = {
     ("managers/scheduler.py", "Scheduler.join_launched_step"),
     ("managers/scheduler.py", "Scheduler.leave_finished_reqs"),
     ("managers/scheduler.py", "Scheduler.process_pending_chunked_abort"),
-    ("managers/scheduler.py", "Scheduler.get_next_batch_to_run"),
+    ("managers/scheduler.py", "Scheduler.stash_chunked_request"),
+    ("managers/scheduler.py", "Scheduler.schedule_step"),
     ("managers/scheduler.py", "Scheduler._admit_dllm_step"),
-    ("managers/scheduler.py", "Scheduler.get_next_disagg_prefill_batch_to_run"),
-    ("managers/scheduler.py", "Scheduler.get_next_pp_disagg_prefill_batch_to_run"),
     ("managers/scheduler.py", "Scheduler.process_prefill_transfer_queue"),
     ("managers/scheduler.py", "Scheduler.process_batch_result"),
     # Prefill admission, decode selection and retraction.
