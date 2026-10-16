@@ -4645,22 +4645,7 @@ class Scheduler(
                                     return_hidden_states=batch.return_hidden_states,
                                 )
                             else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
-                                    copy_fn = partial(
-                                        batch_result.copy_to_cpu,
-                                        return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
-                                    )
-                                    if self.enable_async_d2h_copy:
-                                        batch_result.copy_done = (
-                                            self.async_d2h_worker.submit(copy_fn)
-                                        )
-                                    else:
-                                        copy_fn()
+                                self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
 
@@ -4934,6 +4919,32 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
 
+    def _copy_result_to_cpu(
+        self, batch_result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        """Issue the result readback on copy_stream so it overlaps the next forward.
+
+        copy_stream is a leaf gated by copy_done that forward_stream never waits
+        for. Under Confidential Computing the copy would block this thread until
+        the forward is done, so the worker issues it from its own thread instead.
+        """
+        copy_fn = partial(
+            batch_result.copy_to_cpu,
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
+            if not self.enable_async_d2h_copy:
+                copy_fn()
+            elif batch.return_hidden_states or batch.spec_algorithm.is_dspark():
+                # Hidden states and the DSpark accept lengths are views of CUDA
+                # graph buffers that the next replay rewrites; only a copy queued
+                # right behind this forward reads them in time.
+                copy_fn()
+            else:
+                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
@@ -4951,20 +4962,7 @@ class Scheduler(
                 cur_batch, batch_result.future_indices, batch_result
             )
 
-        # Run device-to-host copy on a separate stream to avoid blocking the
-        # forward stream. The copy waits for the sampled result and can overlap
-        # with subsequent forward computation.
-        self.copy_stream.wait_stream(self.forward_stream)
-        with self.copy_stream_ctx:
-            copy_fn = partial(
-                batch_result.copy_to_cpu,
-                return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
-            )
-            if self.enable_async_d2h_copy:
-                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
-            else:
-                copy_fn()
+        self._copy_result_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
