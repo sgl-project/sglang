@@ -78,7 +78,8 @@ def _joy_image_qk_rope(
         )
 
     # Read the packed projection directly, using the same CUDA arithmetic as
-    # the original contiguous in-place operation. Keep unmeasured paths native.
+    # the original contiguous in-place operation; apply_qk_norm_rope only fuses
+    # in place, so it needs the contiguous copies. Keep unmeasured paths native.
     if (
         not q.is_cuda
         or torch.version.hip

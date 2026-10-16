@@ -173,6 +173,8 @@ def _swiglu(packed: torch.Tensor) -> torch.Tensor:
     )
 
 
+# Not apply_qk_norm_rope: Flux3RMSNorm has neither RMSNorm's weight nor its eps,
+# and the eager fallback is Flux3's own fp32 pair rotation.
 def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
     return (
         _fast_path_allowed(q)
