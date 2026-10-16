@@ -1410,42 +1410,37 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
-        def append_unified_compress(buf: torch.Tensor, ratio: int) -> None:
-            # Compressed pages sit after the SWA ring; PD indices are page ids
+        def append_unified_compress(
+            buf: torch.Tensor, ratio: int, row_base: int
+        ) -> None:
+            # Compressed pages sit after the SWA ring(s); PD indices are page ids
             # into this region. SWA itself ships as StateType.SWA_RING.
             assert buf is not None, "unified kv buffer not allocated"
             assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
-            swa_pages = self.unified_kv_pool.swa_pages
             row_bytes = buf[0].nbytes
             rows_per_page = self.page_size // ratio
-            compress_rows = buf.shape[0] - swa_pages
-            data_ptrs.append(buf.data_ptr() + swa_pages * row_bytes)
+            compress_rows = buf.shape[0] - row_base
+            data_ptrs.append(buf.data_ptr() + row_base * row_bytes)
             data_lens.append(compress_rows * row_bytes)
             item_lens.append(rows_per_page * row_bytes)
 
-        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-        # [C4 KV, C4 indexer, C128 KV], and under fp8 a rope group (128 B/row)
-        # after each KV group. Rope keeps the KV page indices -- shift them and
-        # decode reads a page whose rope half came from some other page.
+        # [C4 KV, C4 indexer, C128 KV, then the ratio-1/2 kv_source KV and
+        # indexers], and under fp8 a rope group (128 B/row) after each KV group.
+        # Rope keeps the KV page indices -- shift them and decode reads a page
+        # whose rope half came from some other page.
         for ratio, kv_pool in self.kv_pools.items():
             if self._unified_kv:
-                if ratio in (1, 2):
-                    raise NotImplementedError(
-                        "PD transfer of the unified kv_source-shared (ratio 1 / 2) "
-                        "regions is not wired yet"
-                    )
-                for local_layer_id, layer_ratio in enumerate(stage_ratios):
-                    if layer_ratio != ratio:
-                        continue
+                owners = self._unified_compress_owners(ratio)
+                for local_layer_id, row_base in owners:
                     append_unified_compress(
-                        self.unified_kv_pool.kv_buffer[local_layer_id], ratio
+                        self.unified_kv_pool.kv_buffer[local_layer_id], ratio, row_base
                     )
                 if self._unified_kv_fp8:
-                    for local_layer_id, layer_ratio in enumerate(stage_ratios):
-                        if layer_ratio != ratio:
-                            continue
+                    for local_layer_id, row_base in owners:
                         append_unified_compress(
-                            self.unified_kv_pool.kv_buffer_rope[local_layer_id], ratio
+                            self.unified_kv_pool.kv_buffer_rope[local_layer_id],
+                            ratio,
+                            row_base,
                         )
             elif kv_pool is not None:
                 for buf in kv_pool.kv_buffer:
@@ -1506,6 +1501,25 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             append_ring(self.unified_kv_pool.kv_buffer_rope)
         return data_ptrs, data_lens, item_lens
 
+    def _unified_compress_owners(self, ratio: int) -> List[Tuple[int, int]]:
+        """``(local_layer_id, row_base)`` of each layer owning a compressed region
+        of ``ratio`` in its unified view: every ratio-4/128 layer, or the kv_source
+        of every ratio-1/2 group (its members read that one region, so it is
+        transferred / mirrored once). ``row_base`` is where the region starts."""
+        pool = self.unified_kv_pool
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        if ratio in (1, 2):
+            return [
+                (src, pool.compress_row_base[src])
+                for src in sorted(pool.groups)
+                if stage_ratios[src] == ratio
+            ]
+        return [
+            (i, pool.compress_row_base[i])
+            for i, r in enumerate(stage_ratios)
+            if r == ratio
+        ]
+
     def _unified_page_views(
         self, buffers: List[torch.Tensor], ratio: int
     ) -> Tuple[List[torch.Tensor], int]:
@@ -1513,22 +1527,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # the unified pool stores individual token rows after its SWA region.
         # Bf16 kv layout: [rows, 1024B]
         # Fp8 kv layout:  [rows, 512B] fp8 nope, [rows, 128B] bf16 rope
-        swa_pages = self.unified_kv_pool.swa_pages
         rows_per_page = self.page_size // ratio
-        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
-        local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
 
         views: List[torch.Tensor] = []
-        for local_layer_id in local_layer_ids:
+        for local_layer_id, row_base in self._unified_compress_owners(ratio):
             buf = buffers[local_layer_id]
-            compress_rows = buf.shape[0] - swa_pages
+            compress_rows = buf.shape[0] - row_base
             assert compress_rows % rows_per_page == 0, (
                 f"compressed rows {compress_rows} not a multiple of "
                 f"rows_per_page {rows_per_page} for ratio {ratio}"
             )
             num_pages = compress_rows // rows_per_page
             page_view = (
-                buf.narrow(0, swa_pages, compress_rows)
+                buf.narrow(0, row_base, compress_rows)
                 .reshape(num_pages, rows_per_page * buf.shape[1])
                 .view(torch.uint8)
             )
@@ -1540,7 +1551,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
         """Main compressed region of one stage: bf16 latents, or fp8 nope."""
         assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
-        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+        assert ratio in (1, 2, 4, 128), f"unsupported compression ratio: {ratio}"
         return self._unified_page_views(self.unified_kv_pool.kv_buffer, ratio)
 
     def unified_rope_region_buffers(
@@ -1551,7 +1562,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if not self._unified_kv_fp8:
             return None
         assert self._unified_kv, "unified_rope_region_buffers requires unified_kv"
-        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+        assert ratio in (1, 2, 4, 128), f"unsupported compression ratio: {ratio}"
         return self._unified_page_views(self.unified_kv_pool.kv_buffer_rope, ratio)
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
