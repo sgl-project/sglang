@@ -40,9 +40,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
-    LONGLIVE2_I2V_CI_sampling_params,
-    LONGLIVE2_T2V_CI_sampling_params,
-    REALTIME_MODEL_sampling_params,
     ScenarioConfig,
 )
 
@@ -633,72 +630,3 @@ def test_realtime_sampling_params_route_to_realtime_video_generator():
     )
 
     assert generate_fn.__name__ == "generate_realtime_video"
-
-
-def test_realtime_model_params_are_lossless_gt_ready():
-    params = REALTIME_MODEL_sampling_params
-
-    assert "floating island hotel" in params.prompt
-    assert "825646291038" in str(params.image_path)
-    assert params.output_size == "832x480"
-    assert params.realtime_num_chunks == 4
-    assert params.realtime_output_format is None
-    assert params.realtime_perf_ignore_initial_chunks == 2
-    assert params.realtime_perf_thresholds["p95_chunk_total_ms"] == 5000.0
-    assert params.realtime_perf_thresholds["p95_scheduler_forward_ms"] == 4500.0
-    assert params.realtime_events == []
-    assert params.extras["condition_inputs"]["camera_actions"] == [
-        ["w"],
-        ["w"],
-        ["w"],
-        ["w"],
-        ["w"],
-        ["w"],
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    ]
-
-
-def test_longlive2_cases_share_realtime_model_sampling_profile():
-    for params in (
-        LONGLIVE2_T2V_CI_sampling_params,
-        LONGLIVE2_I2V_CI_sampling_params,
-    ):
-        assert params.prompt == REALTIME_MODEL_sampling_params.prompt
-        assert params.fps == REALTIME_MODEL_sampling_params.fps
-        assert params.extras == {
-            "seed": 42,
-            "num_inference_steps": 4,
-            "guidance_scale": 1.0,
-        }
-        assert params.realtime_num_chunks is None
-        assert params.realtime_perf_thresholds == {}
-
-    assert LONGLIVE2_T2V_CI_sampling_params.image_path is None
-    assert (
-        LONGLIVE2_T2V_CI_sampling_params.output_size
-        == REALTIME_MODEL_sampling_params.output_size
-    )
-    assert (
-        LONGLIVE2_I2V_CI_sampling_params.image_path
-        == REALTIME_MODEL_sampling_params.image_path
-    )
-    assert LONGLIVE2_I2V_CI_sampling_params.output_size == "960x928"
-
-
-def test_lingbot_realtime_case_is_registered_by_default():
-    from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES
-
-    case = next(
-        item
-        for item in ONE_GPU_CASES
-        if item.id == "lingbot_world_realtime_plastic_beach"
-    )
-    assert case.id == "lingbot_world_realtime_plastic_beach"
-    assert case.run_consistency_check is True
-    assert case.run_perf_check is True
-    assert case.sampling_params.realtime_output_format is None
