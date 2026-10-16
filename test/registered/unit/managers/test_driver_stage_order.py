@@ -189,6 +189,12 @@ class _HiSparse:
     def leave_finished(self):
         pass
 
+    def admit_request_into_staging(self, req):
+        self.shell.log("hisparse.stage", req.rid)
+
+    def free_remapped_decode_slots(self):
+        self.shell.log("hisparse.free_remapped")
+
     def join_ready(self, slot, *, future_map, device):
         self.shell.log("join", slot.index)
         return []
@@ -303,9 +309,7 @@ class _Shell:
         s.process_batch_result = self.process_batch_result
         s.parts.step_counters = SimpleNamespace(record=lambda record: None)
         s.parts.batch_result_processor = SimpleNamespace(
-            process_batch_result_prefill=lambda step, result: self.log(
-                "commit_prefill", step.name
-            )
+            process_batch_result_prefill=self.commit_prefill
         )
         s.on_idle = lambda: self.log("idle")
 
@@ -359,6 +363,11 @@ class _Shell:
 
     def process_batch_result(self, step, result):
         self.log("commit", step.name)
+
+    def commit_prefill(self, step, result, on_checkpoint=None):
+        self.log("commit_prefill", step.name)
+        if on_checkpoint is not None:
+            on_checkpoint(step.reqs[0])
 
     def run(self, **topology):
         with (
@@ -855,7 +864,13 @@ class TestCommitExtendStage(CustomTestCase):
                         shell.s.parts, shell.s.loop_schedules(), lora_ids_in_use=set
                     )
                 stages.commit_extend(_step("p0"), None)
-                self.assertEqual(shell.events, [(-1, event, "p0")])
+                staged = hisparse and event == "commit_prefill"
+                self.assertEqual(
+                    shell.events,
+                    [(-1, event, "p0")] + [(-1, "hisparse.stage", "p0")] * staged,
+                )
+                # HiSparse frees a decode step's remapped slots in every mode.
+                self.assertEqual(stages.after_decode_commit is not None, hisparse)
 
 
 class _StageRecorder:

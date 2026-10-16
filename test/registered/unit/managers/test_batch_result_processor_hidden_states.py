@@ -50,7 +50,6 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
             metrics_sink=metrics_sink,
             output_streamer=Mock(),
         ),
-        hisparse_coordinator=None,
         decode_offload_manager=None,
         metrics_collector=None,
         workers=SimpleNamespace(draft_worker=None, model_worker=Mock()),
@@ -251,16 +250,9 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 )
                 processor = _make_processor(self, server_mode)
 
-                with (
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.checkpoint_kv_cache"
-                    ),
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.get_memory",
-                        return_value=SimpleNamespace(enable_hisparse=False),
-                    ),
+                with patch(
+                    "sglang.srt.managers.scheduler_components."
+                    "batch_result_processor.checkpoint_kv_cache"
                 ):
                     processor.process_batch_result_prefill(batch, result)
 

@@ -82,7 +82,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
             metrics_sink=SimpleNamespace(),
             output_streamer=SimpleNamespace(),
         ),
-        hisparse_coordinator=None,
         decode_offload_manager=None,
         metrics_collector=None,
         workers=SimpleNamespace(

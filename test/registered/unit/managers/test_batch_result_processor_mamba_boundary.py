@@ -107,7 +107,6 @@ def _make_processor(tree_cache=None) -> SchedulerBatchResultProcessor:
             metrics_sink=metrics_sink,
             output_streamer=MagicMock(),
         ),
-        hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
         decode_offload_manager=None,
         metrics_collector=None,

@@ -36,11 +36,12 @@ def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     order.dllm.commit_extend.return_value = None
     order.processor.process_batch_result_prefill.return_value = None
     s.mode.stages = SimpleNamespace(
+        after_decode_commit=None,
         commit_extend={
             "normal": order.processor.process_batch_result_prefill,
             "pd_prefill": order.disagg_prefill.commit_extend,
             "dllm": order.dllm.commit_extend,
-        }[mode]
+        }[mode],
     )
     s.parts.batch_result_processor = order.processor
     s.parts.batch_result_processor.process_batch_result_decode.return_value = 7

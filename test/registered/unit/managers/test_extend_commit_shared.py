@@ -93,7 +93,6 @@ def _processor():
         model_config=SimpleNamespace(think_end_ids=None),
         kv=kv,
         services=SimpleNamespace(output_streamer=Mock()),
-        hisparse_coordinator=None,
         decode_offload_manager=None,
         metrics_collector=None,
         workers=SimpleNamespace(),

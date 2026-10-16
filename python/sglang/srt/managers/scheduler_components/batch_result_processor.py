@@ -38,7 +38,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
-    get_memory,
     get_observability,
     get_schedule,
     mamba_track_grid,
@@ -57,7 +56,6 @@ if TYPE_CHECKING:
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.bundles import (
         KvResources,
         SchedulerServices,
@@ -249,7 +247,6 @@ class SchedulerBatchResultProcessor:
     model_config: ModelConfig
     kv: KvResources
     services: SchedulerServices
-    hisparse_coordinator: Optional[HiSparseCoordinator]
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
     workers: Workers
@@ -448,9 +445,14 @@ class SchedulerBatchResultProcessor:
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        on_checkpoint: Optional[Callable[[Req], None]] = None,
     ):
+        """on_checkpoint takes each concluded request whose KV the commit
+        checkpointed (HiSparse stages it until its host copy lands)."""
         if self.is_generation:
-            return self.commit_extend(batch, result, _PrefillOutcome(self, batch))
+            return self.commit_extend(
+                batch, result, _PrefillOutcome(self, batch, on_checkpoint)
+            )
 
         # An embedding or reward model.
         self.kv.token_to_kv_pool_allocator.free_group_begin()
@@ -1446,8 +1448,14 @@ class _PrefillOutcome:
     """Normal prefill: a concluded row takes its token, then finishes or
     checkpoints; every row but the chunked request's streams."""
 
-    def __init__(self, processor: SchedulerBatchResultProcessor, batch: ScheduleBatch):
+    def __init__(
+        self,
+        processor: SchedulerBatchResultProcessor,
+        batch: ScheduleBatch,
+        on_checkpoint: Optional[Callable[[Req], None]],
+    ):
         self.processor = processor
+        self.on_checkpoint = on_checkpoint
         self.first_decode_row = len(batch.reqs) - batch.num_decode_rows
         self.capture_hidden_mode = processor._get_prefill_hidden_capture_mode(batch)
         self.hidden_state_offset = 0
@@ -1538,8 +1546,8 @@ class _PrefillOutcome:
                 processor.kv.tree_cache,
                 publish=not processor._mamba_lazy_keep_pending_write(req),
             )
-            if get_memory().enable_hisparse:
-                processor.hisparse_coordinator.admit_request_into_staging(req)
+            if self.on_checkpoint is not None:
+                self.on_checkpoint(req)
 
         if discard_finish_reason is None:
             processor._maybe_collect_customized_info(i, req, logits_output)

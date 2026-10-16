@@ -1140,8 +1140,10 @@ class Scheduler:
                 batch=batch,
                 num_generated_tokens=num_generated_tokens,
             )
-            if self.hisparse_coordinator is not None:
-                self.hisparse_coordinator.free_remapped_decode_slots()
+            if (
+                after_decode_commit := self.mode.stages.after_decode_commit
+            ) is not None:
+                after_decode_commit()
         elif batch.forward_mode.is_extend():
             if requeued := self.mode.stages.commit_extend(batch, result):
                 self.parts.lists.waiting_queue = [

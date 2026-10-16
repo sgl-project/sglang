@@ -93,6 +93,9 @@ class ModeStages:
     # continuous input polling): whether a pending step's result is ready on
     # every rank; until it is, the driver returns to intake.
     is_result_ready: Optional[Callable[[Any], bool]] = None
+    # Commit of a decode step, after its rows: HiSparse frees the decode
+    # slots the step remapped.
+    after_decode_commit: Optional[Callable[[], None]] = None
     # Commit, as the finished requests leave decoding (it takes them): PD
     # decode with KV offload moves those whose release waits on a copy into
     # its releasing list.

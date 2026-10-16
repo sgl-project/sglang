@@ -201,6 +201,7 @@ except ImportError:
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -773,7 +774,6 @@ def assemble_scheduler(
         model_config=model_config,
         kv=kv,
         services=services,
-        hisparse_coordinator=mode_owners.hisparse_coordinator,
         decode_offload_manager=decode_offload_manager,
         metrics_collector=metrics_collector,
         workers=workers,
@@ -1331,7 +1331,7 @@ def init_mode_stages(
     elif (owner := owners.disagg_decode) is not None:
         under_pp = get_parallel().pp_size > 1
         stages = dict(
-            commit_extend=parts.batch_result_processor.process_batch_result_prefill,
+            commit_extend=_commit_prefill(parts, hisparse),
             prefetch=owner.prefetch_prefill_dp_rank_queries,
             drain_hicache=owner.check_hicache_events,
             # Under PP the ring's consensus messages advance the lists instead.
@@ -1355,7 +1355,7 @@ def init_mode_stages(
         )
     else:
         stages = dict(
-            commit_extend=parts.batch_result_processor.process_batch_result_prefill,
+            commit_extend=_commit_prefill(parts, hisparse),
             admit=schedules.admit_prefill_after_interval,
             select_decode=schedules.select_decode,
         )
@@ -1364,6 +1364,7 @@ def init_mode_stages(
         # hands them over instead); the normal schedule then joins them.
         stages.setdefault("on_prefilled", hisparse.on_launch)
         stages["leave_finished"] = hisparse.leave_finished
+        stages["after_decode_commit"] = hisparse.free_remapped_decode_slots
         if owners.disagg_prefill is None and owners.disagg_decode is None:
             stages["join_ready"] = functools.partial(
                 hisparse.join_ready,
@@ -1371,6 +1372,17 @@ def init_mode_stages(
                 device=parts.streams.device,
             )
     return ModeStages(**stages)
+
+
+def _commit_prefill(
+    parts: SchedulerParts, hisparse: Optional[HiSparseCoordinator]
+) -> Callable:
+    """The prefill result processor's extend commit; with HiSparse a concluded
+    request stages until its host copy lands."""
+    commit = parts.batch_result_processor.process_batch_result_prefill
+    if hisparse is None:
+        return commit
+    return functools.partial(commit, on_checkpoint=hisparse.admit_request_into_staging)
 
 
 def continuous_input_polling_enabled(

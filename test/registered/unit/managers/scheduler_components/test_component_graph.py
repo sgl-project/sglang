@@ -94,7 +94,6 @@ _DECLARED = {
         "OutputStreamer",
         "MetricsSink",
         "BeamCoordinator",
-        "HiSparse",
         "DecodeOffloadManager",
         "PendingSteps",
         "Workers",
