@@ -166,3 +166,16 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_clear_mm_embedding_cache_drops_every_embedding():
+    """Flushing after a weight update must not serve embeddings of the old encoder."""
+    from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+
+    mm_utils.init_mm_embedding_cache(1 << 20)
+    mm_utils.embedding_cache.set(7, EmbeddingResult(embedding=torch.ones(4, 8)))
+
+    mm_utils.clear_mm_embedding_cache()
+
+    assert mm_utils.embedding_cache.get_single(7) is None
+    assert mm_utils.embedding_cache.current_size == 0
