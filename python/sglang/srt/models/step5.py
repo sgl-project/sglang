@@ -277,6 +277,15 @@ def _step5_keep_bf16_experts(quant_config, prefix: str) -> bool:
     return w13_skipped and not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get()
 
 
+def _step5_bf16_trtllm_supported() -> bool:
+    if not get_platform().is_sm100:
+        return False
+    from flashinfer.fused_moe import core as fi_moe
+
+    # Only FlashInfer builds with the SwigluStep patch apply the post-SiLU clamp.
+    return getattr(fi_moe, "TRTLLM_BF16_SWIGLU_STEP_SUPPORTED", False)
+
+
 _STEP5_EXPERT_LAYER = re.compile(r"layers\.(\d+)\.moe\.experts")
 _STEP5_EXPERT_TENSOR = re.compile(r"(?:^|\.)layers\.(\d+)\.moe\.experts\.\d+\.")
 _STEP5_PACKED_NVFP4_TENSOR = re.compile(
@@ -489,14 +498,7 @@ class Step5MoE(nn.Module):
             not self.use_nvfp4_experts
             and _step5_keep_bf16_experts(quant_config, f"{self.prefix}.experts")
         )
-        self.bf16_trtllm = self.keep_bf16_experts and get_platform().is_sm100
-        if self.bf16_trtllm:
-            from flashinfer.fused_moe import core as fi_moe
-
-            if not getattr(fi_moe, "TRTLLM_BF16_SWIGLU_STEP_SUPPORTED", False):
-                raise RuntimeError(
-                    "Step5 BF16 TRTLLM requires the FlashInfer SwigluStep patch"
-                )
+        self.bf16_trtllm = self.keep_bf16_experts and _step5_bf16_trtllm_supported()
         self.use_mega_moe = (
             get_moe_a2a_backend().is_megamoe() and not self.keep_bf16_experts
         )
@@ -533,8 +535,8 @@ class Step5MoE(nn.Module):
         if self.use_nvfp4_experts:
             quant_method = ModelOptNvFp4FusedMoEMethod(quant_config)
         elif self.keep_bf16_experts:
-            # Checkpoint BF16 experts use the TRTLLM post-SiLU clamp on Blackwell
-            # and the global runner elsewhere; they never route to CUTLASS.
+            # Checkpoint BF16 experts apply the post-SiLU clamp in TRTLLM when FlashInfer
+            # has SwigluStep, else in the CUDA Triton runner; never in CUTLASS.
             quant_method = UnquantizedFusedMoEMethod(
                 use_flashinfer_trtllm_moe=self.bf16_trtllm,
                 use_flashinfer_cutlass=False,

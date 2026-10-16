@@ -1,11 +1,14 @@
 """Step5 load_weights: a strict checkpoint load, then weight updates streamed like any other model's."""
 
+import sys
+import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.models.step5 import Step5ForCausalLM
+from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -174,6 +177,33 @@ class TestStep5WeightUpdates(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "Duplicate Step5 target weight"):
             model.load_weights([(name, weight), (name, weight)])
+
+
+class TestStep5Bf16ExpertRunner(CustomTestCase):
+    def test_blackwell_uses_trtllm_only_with_the_swiglu_step_patch(self):
+        """Blackwell without FlashInfer's SwigluStep patch serves checkpoint-BF16
+        experts on the Triton runner instead of refusing to start."""
+        for patched in (False, True):
+            core = types.ModuleType("flashinfer.fused_moe.core")
+            if patched:
+                core.TRTLLM_BF16_SWIGLU_STEP_SUPPORTED = True
+            fused_moe = types.ModuleType("flashinfer.fused_moe")
+            fused_moe.core = core
+            with (
+                self.subTest(patched=patched),
+                patch(
+                    "sglang.srt.models.step5.get_platform",
+                    return_value=SimpleNamespace(is_sm100=True),
+                ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "flashinfer.fused_moe": fused_moe,
+                        "flashinfer.fused_moe.core": core,
+                    },
+                ),
+            ):
+                self.assertEqual(_step5_bf16_trtllm_supported(), patched)
 
 
 if __name__ == "__main__":
