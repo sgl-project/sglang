@@ -496,20 +496,29 @@ def gguf_sidecar_dir(
 # ---------------------------------------------------------------------------
 
 
-def get_rope_config(config):
+def get_rope_config(config, layer_type: Optional[str] = None):
     """Get (rope_theta, rope_params) from config, supporting both v4 and v5.
 
     Trust-remote-code configs or parent configs passed to sub-models may not
     have the v5 ``rope_parameters`` property, so we fall back to the v4-style
     ``config.rope_theta`` / ``config.rope_scaling`` attributes.
 
+    For per-layer-type v5 configs, select ``layer_type``. When omitted,
+    select ``full_attention`` or ``main``. Flat configs ignore this argument.
+
     Returns:
-        (rope_theta, rope_params): In v5, rope_params is the full
+        (rope_theta, rope_params): In v5, rope_params is the selected
         rope_parameters dict (which subsumes rope_scaling and includes
         rope_theta). In v4, rope_params is the rope_scaling dict or None.
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
+        if rope_params and all(isinstance(v, dict) for v in rope_params.values()):
+            if layer_type is None:
+                layer_type = (
+                    "full_attention" if "full_attention" in rope_params else "main"
+                )
+            rope_params = rope_params[layer_type]
         rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
         return rope_theta, rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
