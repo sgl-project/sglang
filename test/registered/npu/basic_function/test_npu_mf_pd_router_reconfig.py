@@ -90,6 +90,12 @@ class MFPDRouterReconfigTest(CustomTestCase):
     --health-failure-threshold; --health-success-threshold
     """
 
+    def _callTestMethod(self, method):
+        # 覆盖 CustomTestCase 的 retry 机制：本用例有 kill 进程等副作用且用例间存在
+        # 顺序依赖（test_02 杀 prefill_2、test_03 杀 decode_2），失败后整体重跑会破坏
+        # worker 池状态导致级联 503，因此禁止 CI retry，失败一次即报错。
+        method()
+
     @classmethod
     def setUpClass(cls):
         cls._init_ports()
@@ -253,7 +259,10 @@ class MFPDRouterReconfigTest(CustomTestCase):
         cls.processes["lb"] = popen_with_error_check(
             cmd, return_stdout_stderr=(out, err)
         )
+        # router 自身 /health 200 不代表 worker 健康检查已收敛（threshold=2 × interval=15s），
+        # 等待所有已注册 worker 通过 LB 的健康检查后再返回，避免请求撞上 503 窗口
         cls._wait_ready(f"{cls.lb_url}/health")
+        cls._wait_pd_ready(prefill_names, decode_names)
 
     @classmethod
     def _wait_ready(cls, url, timeout=120):
@@ -270,6 +279,38 @@ class MFPDRouterReconfigTest(CustomTestCase):
                 raise RuntimeError(f"Server {url} failed to start in {timeout}s")
 
             time.sleep(1)
+
+    @classmethod
+    def _wait_pd_ready(cls, prefill_names, decode_names, timeout=60):
+        """等待 router 完成 worker 健康检查收敛（PD 通道可用）。
+
+        通过 LB 发送试探请求：返回 200 说明健康检查已收敛、PD 通道可用；
+        返回 503 说明 router 尚认为部分 worker 不健康，退避后重试。
+        超时则抛错（真实的 worker 故障不应被掩盖）。
+        """
+        start = time.perf_counter()
+        while True:
+            try:
+                resp = send_request(cls.lb_url)
+                if resp.status_code == 200:
+                    logger.info(
+                        f"PD channel ready in {time.perf_counter() - start:.0f}s "
+                        f"(prefills={prefill_names}, decodes={decode_names})"
+                    )
+                    return
+                logger.info(
+                    f"PD channel not ready yet (status={resp.status_code}), retrying..."
+                )
+            except Exception as e:
+                logger.info(f"PD probe failed ({e}), retrying...")
+
+            if time.perf_counter() - start > timeout:
+                raise RuntimeError(
+                    f"PD channel failed to become ready in {timeout}s "
+                    f"(prefills={prefill_names}, decodes={decode_names})"
+                )
+
+            time.sleep(5)
 
     @classmethod
     def tearDownClass(cls):
@@ -319,9 +360,11 @@ class MFPDRouterReconfigTest(CustomTestCase):
         logger.info(f"Workers {names} are healthy")
 
     def _kill_worker(self, name):
-        """kill 指定 worker 并确认进程已终止。"""
+        """kill 指定 worker 并确认进程已终止（幂等：已 kill 时直接返回，不报错）。"""
         proc = self.processes.get(name)
-        self.assertIsNotNone(proc, f"Worker {name} already killed")
+        if proc is None:
+            logger.warning(f"Worker {name} already killed, skip")
+            return
         kill_process_tree(proc.pid)
         time.sleep(5)
         self.assertIsNotNone(proc.poll(), f"Worker {name} not terminated yet")
