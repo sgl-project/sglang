@@ -1,7 +1,7 @@
 """Hybrid near-bit-exact KL guards: MTP.
 
-Keep scenarios in separate files so CI can partition them independently under
-its 1800-second per-file limit. Runtime estimates need GPU calibration.
+Group related scenarios so CI can partition device, HiCache, and MTP coverage
+under its 1800-second per-file limit. Runtime estimates need GPU calibration.
 """
 
 import unittest
