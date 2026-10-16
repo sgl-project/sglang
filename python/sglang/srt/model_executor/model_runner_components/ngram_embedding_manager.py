@@ -185,12 +185,15 @@ class NgramEmbeddingManager:
                 end = len(fill_ids) - 1
                 ids = fill_ids[max(0, end - n1) : end]
                 rows.append([0] * (n1 - len(ids)) + list(ids))
-            slots = torch.tensor(
+            # PD admission fences the schedule stream behind the in-flight
+            # forward. Keep these history seeds asynchronous so that fence
+            # does not also block the CPU from preparing the next step.
+            slots = async_h2d(
                 [req.kv.req_pool_idx for req in batch.reqs],
                 dtype=torch.int64,
                 device=history.device,
             )
-            history[slots] = torch.tensor(
+            history[slots] = async_h2d(
                 rows, dtype=history.dtype, device=history.device
             ).view(len(rows), n1)
             return
