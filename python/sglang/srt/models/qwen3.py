@@ -100,45 +100,42 @@ def aiter_fused_qk_norm_rope_set_kv(
     q_out = torch.empty(
         num_tokens, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device
     )
-    common_args = (
-        qkv.view(num_tokens, -1, head_dim),
-        q_norm.weight,
-        k_norm.weight,
-        rotary_emb.cos_sin_cache_as(qkv.dtype),
-        positions,
-        num_tokens,
-        num_heads,
-        num_kv_heads,
-        num_kv_heads,
-        head_dim,
-        rotary_emb.is_neox_style,
-    )
-    # The kernel reads cache strides as (block, token, head); an NHD buffer is
-    # one-slot blocks addressed with block_size=0.
-    cache_args = (
-        q_norm.variance_epsilon,
-        q_out,
-        k_cache.unsqueeze(1),
-        v_cache.unsqueeze(1),
-        out_cache_loc,
-        k_scale,
-        v_scale,
-        None,
-        None,
-        False,
-        False,
-        0,
-        0,
+    kernel_kwargs = dict(
+        qkv=qkv.view(num_tokens, -1, head_dim),
+        qw=q_norm.weight,
+        kw=k_norm.weight,
+        cos_sin=rotary_emb.cos_sin_cache_as(qkv.dtype),
+        positions=positions,
+        num_tokens=num_tokens,
+        num_heads_q=num_heads,
+        num_heads_k=num_kv_heads,
+        num_heads_v=num_kv_heads,
+        head_size=head_dim,
+        is_neox_style=rotary_emb.is_neox_style,
+        eps=q_norm.variance_epsilon,
+        q_out=q_out,
+        # The kernel reads cache strides as (block, token, head); an NHD buffer
+        # is one-slot blocks addressed with block_size=0.
+        k_cache=k_cache.unsqueeze(1),
+        v_cache=v_cache.unsqueeze(1),
+        slot_mapping=out_cache_loc,
+        per_tensor_k_scale=k_scale,
+        per_tensor_v_scale=v_scale,
+        k_out=None,
+        v_out=None,
+        return_kv=False,
+        use_shuffle_layout=False,
+        block_size=0,
+        x=0,
     )
     if isinstance(rotary_emb, MRotaryEmbedding):
         fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-            *common_args,
-            rotary_emb.mrope_section,
-            rotary_emb.mrope_interleaved,
-            *cache_args,
+            **kernel_kwargs,
+            mrope_section_=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
         )
     else:
-        fused_qk_norm_rope_cache_pts_quant_shuffle(*common_args, *cache_args)
+        fused_qk_norm_rope_cache_pts_quant_shuffle(**kernel_kwargs)
     return q_out.view(num_tokens, -1)
 
 
