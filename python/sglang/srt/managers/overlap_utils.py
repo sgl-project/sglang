@@ -641,7 +641,7 @@ class FutureMap:
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
+            self.output_tokens_buf
         )
 
         # Staging transitions refresh only the bonus token. Preserve top-k and
