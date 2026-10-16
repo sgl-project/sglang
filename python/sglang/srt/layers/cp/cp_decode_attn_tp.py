@@ -156,9 +156,23 @@ class CpDecodeAttnTpContext:
         else:
             return []
 
+        # gfx950 block-fp8-as-MXFP8 linears run from scale copies derived at load time
+        # (fp8_hip.process_dense_weights), laid out over (N, K) like the weight.
+        if getattr(linear_instance, "mxfp8_native_ready", False):
+            raise NotImplementedError(
+                "CP decode attn TP: the gfx950 MXFP8 native route stores the weight in "
+                "scaled-MFMA lane order, which cannot be sliced by row/column narrowing; "
+                "use --fp8-gemm-backend aiter or triton."
+            )
         attrs = [(linear_instance, "weight", dim)]
-        for scale_name in ("weight_scale_inv", "weight_scale"):
-            if getattr(linear_instance, scale_name, None) is not None:
+        for scale_name in (
+            "weight_scale_inv",
+            "weight_scale",
+            "weight_scale_inv_mx",
+            "weight_scale_mx_e8m0",
+            "weight_bf16",
+        ):
+            if isinstance(getattr(linear_instance, scale_name, None), torch.Tensor):
                 attrs.append((linear_instance, scale_name, dim))
         return attrs
 
