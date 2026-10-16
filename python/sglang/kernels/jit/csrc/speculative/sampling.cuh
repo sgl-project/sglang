@@ -18,6 +18,7 @@
 
 #include <sgl_kernel/tensor.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/speculative/sampling.cuh>
@@ -78,7 +79,7 @@ void tree_speculative_sampling_target_only(
 
   constexpr uint32_t block_threads = 1024;
   constexpr size_t smem_size = sizeof(SamplingTempStorage<block_threads, SCAN_ALGO, REDUCE_ALGO>);
-  auto kernel = speculative_sampling::TreeSpeculativeSamplingTargetOnly<
+  constexpr auto kernel = speculative_sampling::TreeSpeculativeSamplingTargetOnly<
       block_threads,
       SCAN_ALGO,
       REDUCE_ALGO,
@@ -87,7 +88,7 @@ void tree_speculative_sampling_target_only(
       float,
       int32_t,
       int64_t>;
-  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  runtime::set_max_dynamic_smem_per_device<kernel>(device.unwrap().device_id, smem_size);
   LaunchKernel(static_cast<uint32_t>(batch_size.unwrap()), block_threads, device.unwrap(), smem_size)(
       kernel,
       static_cast<int32_t*>(predicts.data_ptr()),

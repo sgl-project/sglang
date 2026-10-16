@@ -40,6 +40,7 @@ from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
@@ -61,7 +62,6 @@ from sglang.srt.utils import ceil_align, is_hip
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.tp_worker import BaseTpWorker
-    from sglang.srt.mem_cache.events import LoRANameTable
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -257,7 +257,7 @@ def build_kv_cache(
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     dynamo_kv_event_format: bool = False,
-    kv_event_lora_names: Optional[LoRANameTable] = None,
+    kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -354,6 +354,7 @@ def build_kv_cache(
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+        decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
         pp_rank=parallel.pp_rank,
         pp_size=parallel.pp_size,
         attn_cp_rank=parallel.attn_cp_rank,
@@ -361,6 +362,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
     )
 
     tree_context = TreeCacheBuildContext(
