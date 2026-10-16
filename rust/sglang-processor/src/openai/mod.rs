@@ -8,21 +8,22 @@
 
 mod chat;
 mod completions;
+mod kimi_k3_tag;
 mod pieces;
 mod request;
 mod wire;
 
 use serde::Deserialize;
 
-pub use chat::{ChatModel, ChatResponder, lower_chat};
+pub use chat::{ChatModel, ChatResponder, ReasoningToggle, lower_chat};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
 pub use wire::Reply;
 
 /// Builds the OpenAI response of a lowered request from the engine's `/generate` output.
 pub enum Responder {
-    Completion(CompletionResponder),
-    Chat(ChatResponder),
+    Completion(Box<CompletionResponder>),
+    Chat(Box<ChatResponder>),
 }
 
 impl Responder {

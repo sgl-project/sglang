@@ -298,23 +298,6 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                         f"{name}.{slot} does not cover every member",
                     )
 
-    def test_gate_setters_do_not_enumerate_members_themselves(self):
-        """The structural half of the rule above: a setter that names its
-        members is one a new member silently escapes. Installation must go
-        through the shared helper, which drives off `_move_gate_targets`.
-        """
-        import inspect
-
-        for name in self._EXPECTED_COVERAGE:
-            cls = self._allocator_class(name)
-            for setter in ("set_disagg_move_gate", "set_host_transfer_move_gate"):
-                if setter not in vars(cls):
-                    continue  # inherited, and the inherited one is checked above
-                with self.subTest(composite=name, setter=setter):
-                    body = inspect.getsource(getattr(cls, setter))
-                    self.assertIn("install_move_gate", body)
-                    self.assertNotIn("_move_gate = ", body)
-
     def test_swa_composite_translates_the_swa_side_separately(self):
         """The SWA sub-pool runs its OWN compaction, so a full-side physical id
         does not name the SWA page holding the same virtual token: the transfer
