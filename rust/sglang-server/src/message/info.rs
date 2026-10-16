@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::{DisaggregationMode, PreferredSamplingParams};
+use super::config::{DeploymentInfo, DisaggregationMode, PreferredSamplingParams};
 
 /// Static model metadata shared by every public transport.
 #[derive(Clone, Debug, Serialize)]
@@ -33,6 +33,11 @@ pub(crate) struct ServerInfo {
     pub(crate) version: String,
     pub(crate) frontend: &'static str,
     pub(crate) internal_states: Vec<InternalState>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) incremental_streaming_output: bool,
+    pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) deployment_info: DeploymentInfo,
 }
 
 /// Scheduler-owned runtime metrics used by the public server-info operation.

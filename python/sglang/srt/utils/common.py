@@ -3680,6 +3680,8 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
     serving = get_serving()
     if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
         return None
+    if envs.SGLANG_RUST_SERVER.get():
+        return None
 
     from sglang.srt.rust_extensions import load_rust_extension
     from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
