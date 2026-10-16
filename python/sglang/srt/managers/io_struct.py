@@ -1173,6 +1173,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1537,6 +1539,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2300,10 +2304,12 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report asynchronous Elastic EP scale completion or failure."""
+    """Report scale completion in physical EP and logical DP-slot units."""
 
     success: bool
+    # Public Elastic EP state remains physical.
     effective_ep_size: int
+    # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
