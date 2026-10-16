@@ -47,6 +47,22 @@ def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
     return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
+def suffix_page_indices(
+    req_to_token: torch.Tensor,
+    req_pool_idx: int,
+    prefix_len: int,
+    seq_len: int,
+    page_size: int,
+) -> np.ndarray:
+    """Pages of a request's tokens [prefix_len, seq_len).
+
+    PD prefill and decode both call this with the same page-aligned prefix
+    (decode_prefix_len), so their lists pair up page by page even though their
+    rows point at different physical pages.
+    """
+    return kv_to_page_indices(req_to_token[req_pool_idx, prefix_len:seq_len], page_size)
+
+
 def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
@@ -172,6 +188,34 @@ def free_kv_row_segments(
         allocator.free_segments(swa_alive)
 
 
+def _req_radix_key(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: array[int],
+    max_prefix_len: Optional[int] = None,
+) -> RadixKey:
+    # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
+    # bounded replay); cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
+    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    if max_prefix_len is not None:
+        key_limit = (
+            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
+        )
+    return RadixKey(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        limit=key_limit,
+        cache_salt=req.cache_salt,
+    )
+
+
+def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
+    tree_cache.touch_prefix(
+        _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
+    )
+
+
 def match_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -184,23 +228,9 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
-    # prefix carries stale SWA; cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
-    if max_prefix_len is not None:
-        key_limit = (
-            max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
-        )
-
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(
-                token_ids=token_ids,
-                extra_key=req.extra_key,
-                limit=key_limit,
-                cache_salt=req.cache_salt,
-            ),
+            key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
             req=req,
         )
@@ -209,7 +239,7 @@ def match_kv_cache(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
-    req.prefix_len = len(match_result.device_indices)
+    req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,
         req.last_host_node,
@@ -282,17 +312,14 @@ def _evict_until_allocatable(
             return
 
 
-def dsv41_dspark_needs_rebootstrap(
+def dsv4_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
-    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
-    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
-        return False
-
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     pool = token_to_kv_pool_allocator.get_kvcache()
-    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+    # No DeepSeek-V4 pool keeps a host copy of a request's KV; the prefill recomputes it.
+    return isinstance(pool, DeepSeekV4TokenToKVPool)
 
 
 def backup_kv_cache(
@@ -302,15 +329,18 @@ def backup_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> bool:
-    """Returns False when no backup can be taken ('none' backend, or the host
-    pool cannot hold it); the caller aborts the request."""
-    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
-        # Drain the in-flight verify before its slots can receive recomputed KV.
+    """Returns False when the request can be neither backed up nor recomputed;
+    the caller aborts it."""
+    if backend == "none":
+        return False
+    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+        if req.multimodal_inputs is not None:
+            # The recompute payload carries token ids only; images would be lost.
+            return False
+        # Drain the in-flight forward before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
-    if backend == "none":
-        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True

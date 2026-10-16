@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
@@ -202,20 +203,17 @@ class ConvRotInt8JitLinearMethod(LinearMethodBase):
                 f"convrot_int8 backend jit needs the output size per "
                 f"partition ({sum(output_partition_sizes)}) to be a multiple of 8"
             )
-        # The online path initially matches UnquantizedLinearMethod so the
-        # source weights load in BF16 before quantization. Serialized weights
-        # allocate their final INT8 storage immediately.
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=(torch.int8 if self.is_checkpoint_serialized else params_dtype),
-            ),
-            requires_grad=False,
+        # Online checkpoints load their original dtype; serialized ones use INT8.
+        UnquantizedLinearMethod.create_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            torch.int8 if self.is_checkpoint_serialized else params_dtype,
+            **extra_weight_attrs,
         )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
         if self.is_checkpoint_serialized:
             # Comfy stores the per-row scale as [N, 1]; the ops read N contiguous
             # floats and accept that shape unchanged.

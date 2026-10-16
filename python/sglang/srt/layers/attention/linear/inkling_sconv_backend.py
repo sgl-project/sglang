@@ -43,6 +43,7 @@ import torch
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
 )
+from sglang.kernels.ops.mamba.sconv_tracking import fill_track_conv_indices
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
@@ -68,6 +69,7 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -481,19 +483,14 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # batch always has them, and must still fail rather than track against
         # an invented prefix.
         prefix_lens = forward_batch.extend_prefix_lens
-        if prefix_lens is None and on_graph_path:
-            prefix_lens = torch.zeros_like(forward_batch.mamba_track_seqlens)
+        track_seqlens = forward_batch.mamba_track_seqlens
+        assert query_start_loc is not None and track_seqlens is not None
+        assert prefix_lens is not None or on_graph_path
         live = min(
             rows,
-            forward_batch.mamba_track_seqlens.shape[0],
-            prefix_lens.shape[0],
+            track_seqlens.shape[0],
+            prefix_lens.shape[0] if prefix_lens is not None else rows,
         )
-
-        lens_to_track = forward_batch.mamba_track_seqlens[:live] - prefix_lens[:live]
-        chunk_aligned = (
-            lens_to_track // self.mamba_cache_chunk_size
-        ) * self.mamba_cache_chunk_size
-        start_indices = query_start_loc[:live] + chunk_aligned - self.conv_state_len
 
         if on_graph_path:
             assert rows <= self._graph_track_conv_indices.shape[0], (
@@ -505,8 +502,30 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             out = torch.empty(
                 (rows, self.conv_state_len),
                 dtype=torch.int64,
-                device=start_indices.device,
+                device=query_start_loc.device,
             )
+
+        if is_cuda() and query_start_loc.is_cuda:
+            fill_track_conv_indices(
+                query_start_loc=query_start_loc,
+                track_seqlens=track_seqlens,
+                prefix_lens=prefix_lens,
+                output=out,
+                live=live,
+                chunk_size=self.mamba_cache_chunk_size,
+            )
+            self.sconv_metadata.track_conv_indices = out
+            return
+
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(track_seqlens)
+
+        lens_to_track = forward_batch.mamba_track_seqlens[:live] - prefix_lens[:live]
+        chunk_aligned = (
+            lens_to_track // self.mamba_cache_chunk_size
+        ) * self.mamba_cache_chunk_size
+        start_indices = query_start_loc[:live] + chunk_aligned - self.conv_state_len
+
         torch.add(
             start_indices.unsqueeze(-1).to(torch.int64),
             self._track_window_offsets,

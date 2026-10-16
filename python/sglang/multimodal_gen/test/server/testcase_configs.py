@@ -36,6 +36,11 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.test_utils import (
+    SGL_TEST_FILES_CI_DATA_REPO,
+    SGL_TEST_FILES_CI_DATA_REVISION,
+)
+from sglang.srt.environ import envs
 
 
 @dataclass
@@ -344,6 +349,8 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    # Cached MiniMax goldens require its implicit-quality cache mode.
+    pin_consistency_quality: bool = True
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -373,7 +380,19 @@ class DiffusionTestCase:
         # removes the pin.
         # Replaces rather than mutates: several cases share one module-level
         # sampling-params instance.
-        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+        cache_dit_requested = self.sampling_params.extras.get("enable_cache_dit")
+        if cache_dit_requested is None:
+            cache_dit_requested = self.server_args.enable_cache_dit or (
+                self.server_args.env_vars.get("SGLANG_CACHE_DIT_ENABLED", "").lower()
+                == "true"
+            )
+        # Cached goldens require the cached path; an explicit exact tier disables
+        # MiniMax-H3's environment-selected Cache-DiT configuration.
+        if (
+            self.run_consistency_check
+            and "quality" not in self.sampling_params.extras
+            and (self.pin_consistency_quality or not cache_dit_requested)
+        ):
             object.__setattr__(
                 self,
                 "sampling_params",
@@ -710,16 +729,22 @@ MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
     extras={"num_inference_steps": 50, "seed": 0},
 )
 
+# CI prefetches the input; standalone runs retain the release URL fallback.
+TI2I_QWEN_IMAGE_EDIT_INPUT = (
+    envs.SGLANG_TEST_TI2I_INPUT_IMAGE.get()
+    or "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg"
+)
+
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
     output_size="512x512",
     extras={"num_inference_steps": 8, "seed": 0},
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
 )
 
 MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
@@ -883,6 +908,35 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     output_size="960x960",
     num_frames=4,
     fps=4,
+)
+
+# Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,
+# so the pinned revision must point at a commit that carries them.
+_WAN_2_2_ANIMATE_2_CI_INPUT_BASE = (
+    "https://raw.githubusercontent.com/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/inputs/wan_animate_2"
+)
+WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "Character appearance description: a smiling young woman with shoulder-length "
+        "dark hair, a mustard-yellow knit sweater, blue jeans and white sneakers. "
+        "Background description: a plain light-gray studio backdrop."
+    ),
+    image_path=f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/reference_short.jpg",
+    # The model reads `size` as an area budget and emits the 16-aligned canvas fitted to
+    # the reference aspect; 576x1024 (9:16, like the image) maps onto itself.
+    output_size="576x1024",
+    fps=16,
+    output_format="mp4",
+    # 24 driving frames at 16 fps pad to one 29-frame clip (get_padding_len),
+    # so the request denoises a single clip; output length follows the driving video.
+    extras={
+        "video_url": f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/driving_video_short.mp4",
+        "clip_len": 37,
+        "num_inference_steps": 8,
+        "seed": 42,
+    },
 )
 
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(

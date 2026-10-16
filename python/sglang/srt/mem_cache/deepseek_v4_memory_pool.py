@@ -168,6 +168,8 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+        mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
             "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
@@ -1080,6 +1082,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
+        self.full_to_swa_index_mapping = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # DSpark's draft shares the target's full-to-SWA mapping, so the target
         # keeps its paged SWA allocator even under encoder replay.

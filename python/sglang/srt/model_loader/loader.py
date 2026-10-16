@@ -47,6 +47,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
+from sglang.srt.monokernels.runtime import monokernel_weights_iterator
 from sglang.srt.runtime_context import (
     get_exec,
     get_model,
@@ -119,6 +120,7 @@ from sglang.srt.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     initialize_capture_safe_weights,
     initialize_dummy_weights,
+    instanttensor_weights_iterator,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
@@ -359,6 +361,11 @@ class BaseModelLoader(ABC):
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
+    if load_format == LoadFormat.INSTANTTENSOR:
+        # Pass extra config directly to InstantTensor and let it report invalid
+        # options, so newer versions can add parameters without a SGLang update.
+        return
+
     allowed_keys = {"enable_multithread_load", "num_threads"}
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
@@ -490,9 +497,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif (
-            load_format == LoadFormat.SAFETENSORS
-            or load_format == LoadFormat.FASTSAFETENSORS
+        elif load_format in (
+            LoadFormat.SAFETENSORS,
+            LoadFormat.FASTSAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
         ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
@@ -630,6 +638,12 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.download_dir,
                 hf_folder,
                 hf_weights_files,
+            )
+        elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+            weights_iterator = instanttensor_weights_iterator(
+                hf_weights_files,
+                extra_config=extra_config,
+                load_group=self.load_config.load_group,
             )
         elif use_safetensors:
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
@@ -1044,6 +1058,7 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
+        weights = monokernel_weights_iterator(model=model, weights=weights)
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.

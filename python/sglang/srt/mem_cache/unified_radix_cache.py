@@ -4,7 +4,9 @@ import atexit
 import logging
 import threading
 import time
+from array import array
 from dataclasses import replace
+from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -213,12 +215,25 @@ class UnifiedRadixCache(BasePrefixCache):
         self._sliding_window_size = (
             params.sliding_window_size if self.is_swa_enabled else None
         )
+        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
+        # A disabled tree holds nothing, so it reports no KV events and never
+        # evicts; its eviction policy config is not built or validated.
+        tree_params = (
+            replace(
+                params,
+                enable_kv_cache_events=False,
+                eviction_policy="lru",
+                eviction_policy_config=None,
+            )
+            if self.disable
+            else params
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
-            params=params,
+            params=tree_params,
             components=self.components,
         )
         # Components execute boundary actions through the tree core.
@@ -296,6 +311,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_anchor_lost": 0,
             "declined_device_covered": 0,
             "declined_host_oversize": 0,
+            "declined_unservable_prefix": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
             "l3_demand_requests": 0,
@@ -412,18 +428,16 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
-            # follow-up to #34798 and #35769.
-            # FULL and FULL+SWA only: Mamba has no state-handoff channel on
-            # the admission-time load-back read path and is not layer-gated.
-            # Lifting the fence also needs the admission charge: a staged
-            # state slot is request-pinned at consumption and must ride
-            # req.mamba_host_hit_length the way the SWA window does.
-            supported = {ComponentType.FULL, ComponentType.SWA}
+            supported = {
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.AUXILIARY_SWA,
+                ComponentType.MAMBA,
+            }
             if not set(self.tree_components) <= supported:
                 raise ValueError(
                     "--hicache-host-memory-mode buffer_only supports only "
-                    "FULL/SWA unified trees; got components "
+                    "FULL/SWA/AUXILIARY_SWA/MAMBA unified trees; got components "
                     f"{sorted(ct.name for ct in self.tree_components)}."
                 )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -482,20 +496,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
             swa = self.components.get(ComponentType.SWA)
+            auxiliary_swa = self.components.get(ComponentType.AUXILIARY_SWA)
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,
                 host_pool_group=self.host_pool_group,
                 swa_component=swa,
+                auxiliary_swa_component=auxiliary_swa,
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
-            self.buffer_pipeline = BufferModePipeline(
-                cache=self,
+            self.buffer_pipeline = self.components[
+                ComponentType.FULL
+            ].create_buffer_pipeline(
                 max_context_len=get_model().context_length or 0,
-                swa_window_pages=(
-                    swa.full_window_pages
-                    if swa is not None and self.tree_core.has_swa_host_pool
-                    else 0
-                ),
+                swa_component=swa,
+                auxiliary_swa_component=auxiliary_swa,
                 # Leak backstop only: the queue is charged once per unique node
                 # span across pools; a cap binding on live content would
                 # drop-newest and punch storage holes.
@@ -520,13 +534,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
-        # Preserve the SWA host window before device eviction makes it unrecoverable.
-        if (
-            get_memory().enable_unified_memory
-            and self.host_memory_mode == "cache"
-            and self.tree_core.has_swa_host_pool
-        ):
-            self.tree_core.enable_swa_write_back_eviction_barrier()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -598,6 +605,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
+        if self.disable:
+            return
+        result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
+        self._apply_cache_actions(result.cache_actions)
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
@@ -786,74 +800,45 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> tuple[Optional[NodeId], bool]:
-        """Advance the walk, completing pending host-backup barriers."""
-        while True:
-            result = self.tree_core.evict_device_next_node(component_type, tracker)
-            if result.mamba_backup_node_id is not None:
-                assert component_type == ComponentType.MAMBA and result.node_id is None
-                assert (
-                    not result.device_frees
-                    and not result.host_frees
-                    and not result.tracker
-                )
-                # Reserve a host state slot and wait for the backup acknowledgment
-                # before freeing device state. If allocation fails, eviction still
-                # proceeds to make room on the device.
-                node_id = result.mamba_backup_node_id
-                mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
-                if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
-                    self.evict_host(1, ComponentType.MAMBA)
-                self.backup_node_for_write_back(node_id)
-                result = self.tree_core.finish_mamba_state_eviction(node_id)
-            elif result.swa_backup_node_id is not None:
-                assert component_type == ComponentType.SWA and result.node_id is None
-                assert (
-                    not result.device_frees
-                    and not result.host_frees
-                    and not result.tracker
-                )
-                # The backup can cover several unbacked SWA segments. Reserve host
-                # space for the whole window before copying it, then resume eviction
-                # even if host allocation fails.
-                node_id = result.swa_backup_node_id
-                needed = result.swa_backup_num_tokens
-                swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
-                if (
-                    swa_host_pool is not None
-                    and swa_host_pool.available_size() < needed
-                ):
-                    self.evict_host(needed, ComponentType.SWA)
-                self.backup_node_for_write_back(node_id)
-                result = self.tree_core.finish_swa_state_eviction(node_id)
-            self._free_values(result.device_frees, result.host_frees)
-            if self._tracks_write_through_unbacked_evictions():
-                self._record_dropped_tokens(
-                    result.unbacked_tokens,
-                    reason="write_through_unbacked_eviction",
-                )
-            self._accumulate_tracker(tracker, result.tracker)
-            if result.backup_kv is None:
-                return result.node_id, result.made_progress
-
-            assert result.node_id is None
-            assert self.buffer_pipeline is None, (
-                "SWA write-back eviction barriers are cache-mode only"
+        """Advance the eviction walk one node, consuming its step result."""
+        result = self.tree_core.evict_device_next_node(component_type, tracker)
+        if result.mamba_backup_node_id is not None:
+            assert component_type == ComponentType.MAMBA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
             )
-            written = self._execute_and_commit_kv_backup(
-                result.backup_kv, write_back=True
+            # Reserve a host state slot and wait for the backup acknowledgment
+            # before freeing device state. If allocation fails, eviction still
+            # proceeds to make room on the device.
+            node_id = result.mamba_backup_node_id
+            mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+            if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+                self.evict_host(1, ComponentType.MAMBA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
             )
-            if written <= 0:
-                node_id = result.backup_kv.node_ids[0]
-                logger.warning(
-                    "write_back: auxiliary backup failed under host pressure "
-                    "(component=%s, node=%d); dropping only the component",
-                    component_type.name,
-                    node_id,
-                )
-                # Match the Python SWA demotion: preserve FULL and descendants;
-                # the resumed native walk tombstones this component after one try.
-                continue
-            self.writing_check(write_back=True)
+            # The backup can cover several unbacked SWA segments. Reserve host
+            # space for the whole window before copying it, then resume eviction
+            # even if host allocation fails.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
+        self._free_values(result.device_frees, result.host_frees)
+        if self._tracks_write_through_unbacked_evictions():
+            self._record_dropped_tokens(
+                result.unbacked_tokens,
+                reason="write_through_unbacked_eviction",
+            )
+        self._accumulate_tracker(tracker, result.tracker)
+        return result.node_id, result.made_progress
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -935,11 +920,29 @@ class UnifiedRadixCache(BasePrefixCache):
 
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
+            # An allocation-driven FULL request names the allocator's
+            # shortfall, not what the walk must free: an allocator can hide
+            # headroom behind a clamp (a reserve it refills before raw
+            # allocation sees a page again) or page rounding, so freeing
+            # exactly the shortfall can leave its target unmet. Such a walk
+            # runs to the target; the check after every victim still stops it
+            # at the first sufficient one.
+            to_target = (
+                ct == ComponentType.FULL
+                and request_cnt > 0
+                and available_size_targets is not None
+                and ct in available_size_targets
+            )
             # A preceding component may have cascade-evicted this component or,
             # on a shared pool, released enough bytes to satisfy its allocation.
-            if tracker[ct] >= request_cnt or target_reached(ct):
+            if target_reached(ct) or (not to_target and tracker[ct] >= request_cnt):
                 continue
-            self.tree_core.evict_device_start(ct, request_cnt)
+            walk_quota = request_cnt
+            if to_target:
+                walk_quota = max(
+                    request_cnt, tracker[ct] + self.tree_core.full_evictable_size()
+                )
+            self.tree_core.evict_device_start(ct, walk_quota)
             try:
                 while True:
                     node_id, made_progress = self._evict_device_next_node(ct, tracker)
@@ -1193,23 +1196,23 @@ class UnifiedRadixCache(BasePrefixCache):
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
-                    priority=insert_params.priority + 1,
+                    priority=min(
+                        insert_params.priority + 1, torch.iinfo(torch.int64).max
+                    ),
                 )
             )
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        # The tree's own walk: a session slot must not answer for the insert.
-        match_result = self._match_tree(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        # With PD decode radix caching, SWA matching can stop short of the inserted path.
+        # Repoint from that path to protect all tree-owned KV.
+        new_last_node = result.last_device_node
+        new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
+        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -2097,6 +2100,19 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if transfers:
                 comp_xfers[ct] = transfers
+        if buffer_mode and ComponentType.FULL in self.tree_components:
+            transfers = self.components[ComponentType.FULL].build_hicache_transfers(
+                None,
+                CacheTransferPhase.PREFETCH,
+                prefix_key=RadixKey(
+                    array("q", matched_prefix_tokens or ()),
+                    extra_key=extra_key,
+                    is_bigram=self.tree_core.is_eagle,
+                    cache_salt=cache_salt,
+                ),
+            )
+            if transfers:
+                comp_xfers[ComponentType.FULL] = transfers
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=None)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
@@ -2693,6 +2709,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         beliefs = self.storage_existence_cache
         verdicts = operation.query_pool_hit_pages
+        # No rank-agreed KV query evidence; leave beliefs unchanged.
+        if PoolName.KV not in verdicts:
+            return
         folded_pages = operation.storage_hit_count // self.page_size
 
         def verdict(pool: PoolName) -> tuple[int, bool]:
@@ -2837,7 +2856,6 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
-        self._invalidate_absent_from_hit_query(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -2911,6 +2929,22 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Other prefetches hold the budget; ours fits once they
                     # drain, so park rather than launch this one unprotected.
                     return False
+                if anchor == "unservable":
+                    # The device prefix is resident but unreadable; the
+                    # request recomputes and heals it instead of splicing.
+                    self._prefetch_outcome_stats["declined_unservable_prefix"] += 1
+                    logger.info(
+                        "HiCache prefetch declined req=%s reason=unservable_prefix "
+                        "device_prefix=%d hit=%d",
+                        request.rid,
+                        full_match_len,
+                        hit_tokens,
+                    )
+                    self._finish_storage_prefetch(
+                        request, fulfilled_tokens=0, reason="unservable_prefix"
+                    )
+                    self.revoke_pending_prefetch(request)
+                    return True
                 if self.buffer_pipeline.staged_span_covered(
                     request, operation.storage_hit_count
                 ):
@@ -2925,36 +2959,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 info, hit_tokens, aux_hit_tokens = self._trim_buffer_prefetch_full_head(
                     request, info, operation, full_match_len, hit_tokens
                 )
-            else:
-                aux_hit_tokens = hit_tokens
-            alloc_len = hit_tokens
-            if buffer_mode and not cc.can_fit_prefetch_host_buffers(
-                operation, alloc_len
-            ):
-                self._prefetch_outcome_stats["declined_host_oversize"] += 1
-                logger.warning(
-                    "HiCache buffer prefetch declined req=%s: the Full/sidecar "
-                    "bounce cannot fit in an empty host arena",
-                    request,
+                return self.buffer_pipeline.allocate_and_queue_prefetch(
+                    operation, info, hit_tokens, aux_hit_tokens
                 )
-                self.revoke_pending_prefetch(request)
-                return True
+            aux_hit_tokens = hit_tokens
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=not buffer_mode,
+                allow_partial=True,
                 min_tokens=self.prefetch_threshold,
                 evict_host=self.evict_host,
             )
             if host_indices is None:
-                if buffer_mode:
-                    # Parked ops hold no pin: release and re-take at the next
-                    # attempt, which is also how a moved anchor gets noticed.
-                    self.buffer_pipeline.release_anchor_lock(request)
-                    self._log_storage_prefetch_deferred(
-                        max(alloc_len, aux_hit_tokens), "host_capacity"
-                    )
-                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -2969,12 +2985,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
                 # Same outcome as a KV shortfall: nothing stays staged.
                 cc.append_host_mem_release(host_indices=host_indices)
-                if buffer_mode:
-                    self.buffer_pipeline.release_anchor_lock(request)
-                    self._log_storage_prefetch_deferred(
-                        max(alloc_len, aux_hit_tokens), "host_capacity"
-                    )
-                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -2994,13 +3004,6 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
-            if buffer_mode:
-                operation.buffer_host_occupied_units = (
-                    self.buffer_pipeline.host_allocation_units(
-                        host_indices, operation.pool_transfers
-                    )
-                )
-                cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
             cc.prefetch_buffer.put(operation)
             return True
 
@@ -3013,13 +3016,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
-                    # Request already aborted/cleaned up; still flush the
-                    # query's absent-hash feedback.
-                    self._invalidate_absent_from_hit_query(operation)
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
@@ -3053,7 +3054,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=False)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
@@ -3444,10 +3444,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Optional[tuple[torch.Tensor, NodeId]]:
-        """Prepare KV cache loading from host to device.
-        Returns (device_indices, last_node), or None when buffer-mode
-        admission must retry without committing a load."""
+    ) -> Optional[tuple[int, NodeId]]:
+        """Only buffer mode returns None: its admission retries without
+        committing a load."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3471,37 +3470,52 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id, last_best_match_device_node_id
                 )
                 if new_indices.numel() == 0:
-                    return (
-                        self.tree_core.empty_match_result.device_indices,
-                        last_best_match_device_node_id,
-                    )
+                    return 0, last_best_match_device_node_id
 
                 logger.debug(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(new_indices),
                     best_match_node_id,
                 )
-                return new_indices, best_match_node_id
+                return len(new_indices), best_match_node_id
 
-        return (
-            self.tree_core.empty_match_result.device_indices,
-            last_best_match_device_node_id,
-        )
+        return 0, last_best_match_device_node_id
+
+    def load_back_is_cache_owned(self) -> bool:
+        # Linker-loaded slots stay request-owned until the load succeeds.
+        # Keep cache_protected_len unchanged so failed loads can be freed.
+        return self.linker is None
+
+    def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
+        """Wait for the external-linker loads of the batch that just ran and
+        return the requests whose KV did not land, marked so their output is
+        dropped and their KV never reaches the tree. Their slots are private
+        (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
+        them."""
+        if self.linker is None:
+            return []
+        failed_rids = set(self.linker.finish_loads())
+        failed = [req for req in reqs if req.rid in failed_rids]
+        if failed:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            for req in failed:
+                req.skip_radix_cache_insert = True
+                req.discard_output_reason = FINISH_ABORT(
+                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+        return failed
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
             finish_counts = torch.tensor(
-                [
-                    self.linker.num_completed_loads(),
-                    self.linker.num_completed_offloads(),
-                ],
+                [self.linker.num_completed_offloads()],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
-            self.linker.drain_loads(load_count)
+            offload_count = int(finish_counts.item())
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
@@ -3587,17 +3601,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def sliding_window_size(self):
         return self._sliding_window_size
 
-    def swa_reprefill_tail_tokens(self) -> int:
-        """
-        Only unified_kv needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never stored in the tree, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring.
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
+        """Tokens at the end of a matched prefix to re-prefill because their SWA
+        cannot be reused as is.
 
-        Applies to plain radix reuse as well as HiCache -- the ring is stale
-        either way. Returns 0 once SWA has a host pool to restore exact contents
-        from, and for every non-unified_kv layout, whose SWA slots are
-        content-stable.
+        unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
+        stores, so a reused window would read another request's stale slots; a
+        host pool restores exact contents instead. Decoder SWA bounded replay
+        writes late-layer window KV only for an extend's tail rows, so a matched
+        prefix may lack it; a streaming turn borrowing its own record has it.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -3606,6 +3618,8 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
+        if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
+            return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:
@@ -3665,11 +3679,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()
-
-    def swa_transient_size(self) -> int:
-        if self.buffer_pipeline is None:
-            return 0
-        return self.buffer_pipeline.swa_transient_size()
 
     def mamba_protected_size(self) -> int:
         return self.tree_core.mamba_protected_size()
@@ -3804,8 +3813,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
         root = self.root_node_handle(req.extra_key)
         path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        if self.linker is not None:
+            tail = self.linker.private_load_indices.get(req.rid)
+            if tail is not None:
+                path = torch.cat([path, tail])
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
         return path[: req.prefix_len]
+
+    def path_device_indices(self, node: NodeId) -> torch.Tensor:
+        return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""

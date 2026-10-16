@@ -40,6 +40,7 @@ from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
@@ -231,7 +232,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 req_pool, allocator = tp_worker.get_memory_pool()
                 kv_pool = allocator.get_kvcache()
                 min_tokens = decode_retraction_max_tokens(req_pool, kv_pool)
-                if disagg.disaggregation_decode_host_receive_threshold > 0:
+                if disagg.disaggregation_decode_host_receive_threshold < 1:
                     # One request can receive while another is retracted.
                     min_tokens *= 2
                 ratio = max(ratio, min_tokens / kv_pool.size)
@@ -255,6 +256,8 @@ def build_kv_cache(
     enable_kv_cache_events: bool,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
+    dynamo_kv_event_format: bool = False,
+    kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -346,9 +349,12 @@ def build_kv_cache(
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        dynamo_kv_event_format=dynamo_kv_event_format,
+        kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+        decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
         pp_rank=parallel.pp_rank,
         pp_size=parallel.pp_size,
         attn_cp_rank=parallel.attn_cp_rank,
@@ -356,6 +362,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
     )
 
     tree_context = TreeCacheBuildContext(
@@ -367,7 +374,6 @@ def build_kv_cache(
         is_dsa=is_dsa,
         enable_hierarchical_cache=enable_hierarchical_cache,
         disable_radix_cache=disable_radix_cache,
-        effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=tp_worker,
         model_config=model_config,
         tp_size=parallel.tp_size,

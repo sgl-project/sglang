@@ -107,12 +107,8 @@ jobs:
     # caller that declares its runners as a matrix cannot, since job-level `if`
     # sees github/needs/vars/inputs but not `matrix`. Callers that never declare
     # the input read back null and match every runner_config.
-    # Temporarily skip the unavailable B300/GB300 runners before GitHub tries to
-    # allocate them. Covers every caller: pr-test, pr-test-extra and nightly.
     if: |
       always() &&
-      inputs.runner_config != '4-gpu-gb300' &&
-      inputs.runner_config != '8-gpu-b300' &&
       (fromJson(inputs.caller_inputs).runner_filter == null ||
        fromJson(inputs.caller_inputs).runner_filter == '' ||
        fromJson(inputs.caller_inputs).runner_filter == 'all' ||

@@ -9,7 +9,10 @@ the consumer ``_gqa_share_sparse_decode_kernel`` contract.
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.minimax_decode_topk import minimax_decode_topk
+from sglang.kernels.ops.attention.minimax_decode_topk import (
+    _jit_module,
+    minimax_decode_topk,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -64,9 +67,7 @@ def _check_contract(out, seq_lens, block_size, topk, S):
 @pytest.mark.parametrize("H", [1, 2])
 @pytest.mark.parametrize("B", [1, 5, 32])
 @pytest.mark.parametrize("topk", [16, 32, 64])
-@pytest.mark.parametrize(
-    "max_ctx", [4096, 131072, 524288] + ([2097152] if torch.version.hip else [])
-)
+@pytest.mark.parametrize("max_ctx", [4096, 131072, 524288, 2097152])
 def test_decode_topk_distinct(dtype_sl, H, B, topk, max_ctx):
     torch.manual_seed(1234)
     block_size = 128
@@ -129,6 +130,53 @@ def test_decode_topk_small_num_blocks(seq_len):
     nb = min((seq_len + block_size - 1) // block_size, S)
     if nb <= topk:
         assert out[0, 0, :nb].tolist() == list(range(nb))
+
+
+@pytest.mark.parametrize("S", [4096, 4097, 8192, 8193, 16384])
+def test_decode_topk_register_buckets(S):
+    """Cover both sides of every register-bucket boundary.
+
+    On CUDA the radix path is instantiated per bucket (4096 / 8192 / 16384 rows),
+    so a row one past a bucket selects the next instantiation. The other cases only
+    reach the 4096 and 16384 buckets, and only at their exact capacities.
+    """
+    block_size, topk = 128, 16
+    H, B = 1, 1
+    torch.manual_seed(S)
+    score = torch.randn(H, B, S, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([S * block_size], device="cuda", dtype=torch.int32)
+
+    out = minimax_decode_topk(score, seq_lens, block_size, topk)
+    _check_contract(out, seq_lens, block_size, topk, S)
+    # Tie-robust: compare the selected scores, not the indices.
+    for got, want in zip(
+        _selected_scores_sorted(score, out),
+        _selected_scores_sorted(score, _ref(score, seq_lens, block_size, topk)),
+    ):
+        torch.testing.assert_close(got, want)
+    sel = out[0, 0]
+    sel = sel[sel >= 0]
+    assert torch.equal(sel, torch.sort(sel).values), f"not ascending: {sel}"
+
+
+def test_decode_topk_rejects_over_cap():
+    """Above the largest bucket both the wrapper and the kernel must raise.
+
+    The CUDA launcher sends every row past 8192 blocks to the 16384 bucket, so the
+    kernel's own cap check is what keeps a direct caller from silently selecting
+    from the first 16384 blocks; the wrapper asserts the same bound first.
+    """
+    block_size, topk = 128, 16
+    S = 16385
+    score = torch.randn(1, 1, S, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([S * block_size], device="cuda", dtype=torch.int32)
+    with pytest.raises(AssertionError, match="exceeds kMaxNumBlocks"):
+        minimax_decode_topk(score, seq_lens, block_size, topk)
+    out = torch.empty(1, 1, topk, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="exceeds kMaxNumBlocks"):
+        _jit_module(seq_lens.dtype).minimax_decode_topk(
+            score, seq_lens, out, block_size, topk
+        )
 
 
 def test_decode_topk_out_param():

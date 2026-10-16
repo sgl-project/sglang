@@ -14,7 +14,10 @@ from sglang.srt.model_loader.loader import (
     post_load_weights,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_pp_stage_load_group,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import (
@@ -188,7 +191,10 @@ class WeightUpdater:
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        # PP stages handle disk updates sequentially, unlike cold startup.
+        load_config = LoadConfig(
+            load_format=load_format, load_group=get_pp_stage_load_group()
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
@@ -241,7 +247,7 @@ class WeightUpdater:
             or self.device == "musa"
             or (
                 current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
+                and current_platform.capabilities.graph_capture
             )
         ):
             self.recapture_cuda_graph()
