@@ -50,10 +50,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(super) struct ChatRequest {
     #[serde(flatten)]
-    request: CreateChatCompletionRequest,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    pub(super) request: CreateChatCompletionRequest,
+    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }

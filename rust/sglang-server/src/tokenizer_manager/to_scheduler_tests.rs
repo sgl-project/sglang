@@ -107,11 +107,16 @@ fn ids_len(req: &SchedulerRequest) -> usize {
 /// the same rid could `Register` ahead of the stale abort and be torn down by
 /// it. `Rid::from_client` removes the premise: a retry carries a different
 /// `Rid`, so no abort in flight can name it.
+///
+/// A dropped tokenize or detokenize call (`Local`) never reached the
+/// scheduler, so it only deregisters: thousands of cancelled items must not
+/// queue scheduler aborts ahead of generation requests.
 #[test]
 fn every_abort_source_deregisters_and_stops_the_scheduler() {
-    for source in [
-        AbortSource::Guard("x".into()),
-        AbortSource::Detok("x".into()),
+    for (source, scheduler_aborts) in [
+        (AbortSource::Guard("x".into()), 1),
+        (AbortSource::Detok("x".into()), 1),
+        (AbortSource::Local("x".into()), 0),
     ] {
         let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
         let (to_scheduler_tx, consumer) = to_scheduler(16);
@@ -140,8 +145,8 @@ fn every_abort_source_deregisters_and_stops_the_scheduler() {
         );
         assert_eq!(
             consumer.drain(8).len(),
-            1,
-            "{source:?} must push an AbortReq so the scheduler stops",
+            scheduler_aborts,
+            "{source:?}: AbortReqs pushed to the scheduler",
         );
     }
 }
@@ -446,6 +451,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_channel() {
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Detokenize {
             token_ids: vec![7, 8, 9],
+            skip_special_tokens: false,
         },
     });
     assert!(
@@ -455,10 +461,10 @@ fn detokenize_flows_register_then_decode_and_skips_the_channel() {
     assert!(
         matches!(
             detok_rx.try_recv(),
-            Ok(DetokMsg::Decode { rid, token_ids })
+            Ok(DetokMsg::Decode { rid, token_ids, skip_special_tokens: false })
                 if rid.as_str() == "41" && token_ids == [7, 8, 9]
         ),
-        "the decode job follows, ids intact",
+        "the decode job follows, ids and flag intact",
     );
     assert!(
         consumer.drain(16).is_empty(),
@@ -484,6 +490,7 @@ fn detokenize_negative_ids_reject_before_registration() {
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Detokenize {
             token_ids: vec![1, -1],
+            skip_special_tokens: true,
         },
     });
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
@@ -493,6 +500,71 @@ fn detokenize_negative_ids_reject_before_registration() {
     assert!(err.to_string().contains("out of range"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
     assert!(consumer.drain(16).is_empty());
+}
+
+/// A `Tokenize` request goes to the tokenizer pool, which answers it through
+/// its own sink: no detok shard hears of it and nothing reaches the
+/// scheduler channel. Without a tokenizer (`skip_tokenizer_init`) it is a
+/// validation error instead.
+#[test]
+fn tokenize_goes_to_the_pool_without_detok_registration() {
+    for skip_tokenizer_init in [false, true] {
+        let (tok_tx, tok_rx) = flume::unbounded();
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (to_scheduler_tx, consumer) = to_scheduler(16);
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let mut intake = Intake::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: tok_tx,
+                detokenizer_tx: vec![detok_tx],
+            },
+            to_scheduler_tx,
+            Limits {
+                skip_tokenizer_init,
+                ..test_limits()
+            },
+            test_mm(flume::unbounded().0, true),
+            sd_rx,
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        intake.drive(Request {
+            rid: "45".into(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Tokenize {
+                text: "hi".into(),
+                add_special_tokens: false,
+            },
+        });
+        if skip_tokenizer_init {
+            let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+                panic!("sink must receive the validation error");
+            };
+            assert!(matches!(err, Error::Validation(_)));
+            assert!(tok_rx.try_recv().is_err(), "the pool never sees it");
+        } else {
+            let pooled = tok_rx.try_recv().expect("handed to the tokenizer pool");
+            assert_eq!(pooled.rid.as_str(), "45");
+            assert!(matches!(
+                pooled.kind,
+                RequestKind::Tokenize {
+                    add_special_tokens: false,
+                    ..
+                }
+            ));
+            assert!(rx.try_recv().is_err(), "no response until the pool answers");
+        }
+        assert!(detok_rx.try_recv().is_err(), "no detok registration");
+        assert!(
+            consumer.drain(16).is_empty(),
+            "must never reach the scheduler"
+        );
+    }
 }
 
 /// A dropped channel push is survivable, and this pins WHY. The channel is bounded,
