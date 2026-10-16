@@ -396,11 +396,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
     )
     if cfg.enable_decoder_swa_bounded_replay:
-        if cfg.disable_decoder_bounded_replay:
-            raise ValueError(
-                "--enable-decoder-swa-bounded-replay cannot be combined with "
-                "--disable-decoder-bounded-replay"
-            )
         for feature, unsupported in incompatible:
             if unsupported:
                 raise ValueError(
@@ -409,9 +404,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 )
         return
 
+    if cfg.enable_decoder_swa_bounded_replay is False:
+        return
+
     enabled = (
-        not cfg.disable_decoder_bounded_replay
-        and (get_platform().is_cuda or get_platform().is_hip)
+        (get_platform().is_cuda or get_platform().is_hip)
         and cfg.disaggregation_mode == "null"
         and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
         and not any(enabled for _, enabled in incompatible)

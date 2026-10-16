@@ -24,7 +24,7 @@
 --elastic-ep-join-rank-offset
 --elastic-ep-scale-timeout
 --enable-cp-decode-attn-tp
---disable-decoder-bounded-replay
+--no-enable-decoder-swa-bounded-replay
 --enable-decoder-swa-bounded-replay
 --enable-dense-mlp-attn-tp
 --enable-dsa-cache-layer-split

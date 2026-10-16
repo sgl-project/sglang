@@ -168,7 +168,7 @@ export const config = {
         options: [
           { id: "on", label: "Automatic (default)" },
           { id: "off", label: "Off (full prefill)",
-            flags: ["--disable-decoder-bounded-replay"] },
+            flags: ["--no-enable-decoder-swa-bounded-replay"] },
         ],
       },
     ],

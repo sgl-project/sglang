@@ -134,19 +134,16 @@ class ExecFeatures(msgspec.Struct):
         "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Explicitly enable DeepSeek-V4.1 decoder SWA bounded replay. "
-            "Enabled automatically for supported configurations when neither "
-            "replay flag is set. Not numerically equivalent to full prefill.",
+            help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
+            "for supported configurations. Use --no-enable-decoder-swa-bounded-replay "
+            "to retain full prefill or request prompt logprobs. "
+            "Not numerically equivalent to full prefill.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),
-    ] = False
-    disable_decoder_bounded_replay: A[
-        bool,
-        "Disable automatic DeepSeek-V4.1 decoder bounded replay; use full "
-        "prefill, including support for prompt logprobs.",
-    ] = False
+    ] = None
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "

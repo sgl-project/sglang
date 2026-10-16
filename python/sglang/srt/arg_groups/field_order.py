@@ -519,7 +519,6 @@ POSITIONAL_FIELD_ORDER = (
     "swa_prefix_tails",
     "enable_encoder_swa_bounded_replay",
     "enable_decoder_swa_bounded_replay",
-    "disable_decoder_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
 )
