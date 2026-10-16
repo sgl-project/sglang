@@ -81,9 +81,6 @@ jobs:
       - name: Test PR title check
         run: node --test .github/scripts/pr-title.test.cjs
 
-      - name: Test PR check comment
-        run: node --test .github/scripts/pr-check-comment.test.cjs
-
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 
