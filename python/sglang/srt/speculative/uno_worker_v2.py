@@ -32,7 +32,6 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
-from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
@@ -443,6 +442,9 @@ class UnoWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         """Run UNO's F-wide proposal pass, then native EAGLE Q-node verify."""
 
+        # Linear UNO also runs on NPU without the CUDA-only FlashInfer dependency.
+        from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
+
         draft_state = batch.spec_info
 
         if batch.seq_lens.device.type != "cpu":
@@ -828,27 +830,29 @@ class UnoWorkerV2(BaseSpecWorker):
                     need_top1=need_top1,
                 )
 
-            graph_runner = getattr(
-                self.model_runner,
-                "decode_cuda_graph_runner",
-                None,
-            )
-            # If cuda-graph is on, reuse its captured LoRA routing
-            # and replay it in _run_target_block.
-            # Else, prepare routing for eager.
-            if not (
-                forward_batch.forward_mode.is_cuda_graph()
-                and graph_runner is not None
-                and graph_runner.can_run_graph(forward_batch)
-            ):
-                self.lora_manager.prepare_lora_token_segments(
-                    lora_ids=[None, self.uno_lora_id] * batch_size,
-                    segment_lens=[1, self.num_speculative_proposals] * batch_size,
+            try:
+                graph_runner = getattr(
+                    self.model_runner,
+                    "decode_cuda_graph_runner",
+                    None,
                 )
-            result = self._run_target_block(
-                forward_batch,
-                need_top1=need_top1,
-            )
-            # Clear LoRA routing before verification
-            self.lora_manager.reset_lora_batch()
-            return result
+                # If cuda-graph is on, reuse its captured LoRA routing
+                # and replay it in _run_target_block.
+                # Else, prepare routing for eager.
+                if not (
+                    forward_batch.forward_mode.is_cuda_graph()
+                    and graph_runner is not None
+                    and graph_runner.can_run_graph(forward_batch)
+                ):
+                    self.lora_manager.prepare_lora_token_segments(
+                        lora_ids=[None, self.uno_lora_id] * batch_size,
+                        segment_lens=[1, self.num_speculative_proposals] * batch_size,
+                    )
+                return self._run_target_block(
+                    forward_batch,
+                    need_top1=need_top1,
+                )
+            finally:
+                # The target and subsequent prefills must always use base weights,
+                # including when routing setup or the draft forward raises.
+                self.lora_manager.reset_lora_batch()
