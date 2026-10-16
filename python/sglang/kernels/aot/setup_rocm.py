@@ -91,6 +91,8 @@ fp8_macro = (
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
 topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
 
+warp_size = 32 if amdgpu_target == "gfx1250" else 64
+
 hipcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -103,6 +105,7 @@ hipcc_flags = [
     "-DENABLE_FP8",
     fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
+    f"-DSGL_ROCM_WARP_SIZE={warp_size}",
 ]
 
 ext_modules = [
