@@ -128,9 +128,11 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         handlers = (
             (
                 "lossless",
-                "test fusion",
-                lambda t: mounted.append(t) or True,
-                lambda _: None,
+                SimpleNamespace(
+                    name="test fusion",
+                    mount=lambda t: mounted.append(t) or True,
+                    unmount=lambda _: None,
+                ),
             ),
         )
 
@@ -141,7 +143,14 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         self.assertEqual(self.stage._mounted_quality, "lossless")
 
     def test_allows_high_when_model_has_no_dit_quality_fusions(self):
-        handlers = (("lossless", "test fusion", lambda _: False, lambda _: None),)
+        handlers = (
+            (
+                "lossless",
+                SimpleNamespace(
+                    name="test fusion", mount=lambda _: False, unmount=lambda _: None
+                ),
+            ),
+        )
 
         with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
             self.stage._maybe_toggle_quality_fusions(self._batch("high"))
@@ -154,9 +163,11 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         handlers = (
             (
                 "lossless",
-                "test fusion",
-                lambda t: mounted.append(t) or True,
-                lambda t: unmounted.append(t),
+                SimpleNamespace(
+                    name="test fusion",
+                    mount=lambda t: mounted.append(t) or True,
+                    unmount=lambda t: unmounted.append(t),
+                ),
             ),
         )
 
@@ -177,15 +188,19 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         handlers = (
             (
                 "lossless",
-                "equivalent fusion",
-                lambda _: mounted.append("equivalent") or True,
-                lambda _: None,
+                SimpleNamespace(
+                    name="equivalent fusion",
+                    mount=lambda _: mounted.append("equivalent") or True,
+                    unmount=lambda _: None,
+                ),
             ),
             (
                 "high",
-                "approximate fusion",
-                lambda _: mounted.append("approximate") or True,
-                lambda _: None,
+                SimpleNamespace(
+                    name="approximate fusion",
+                    mount=lambda _: mounted.append("approximate") or True,
+                    unmount=lambda _: None,
+                ),
             ),
         )
 

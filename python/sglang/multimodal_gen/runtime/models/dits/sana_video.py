@@ -10,9 +10,9 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 
 from sglang.kernels.ops.diffusion import (
+    SANA_VIDEO_LINEAR_ATTENTION,
     BitExactFusionGate,
     fused_interleaved_rope_fp64,
-    mark_sana_video_linear_attention_site,
     tensors_equal,
     try_sana_video_linear_attention,
 )
@@ -252,7 +252,7 @@ class SanaVideoLinearAttention(nn.Module):
         self.to_out = nn.ModuleList(
             [nn.Linear(self.inner_dim, query_dim, bias=True), nn.Identity()]
         )
-        mark_sana_video_linear_attention_site(self)
+        SANA_VIDEO_LINEAR_ATTENTION.mark(self)
 
     def forward(
         self,

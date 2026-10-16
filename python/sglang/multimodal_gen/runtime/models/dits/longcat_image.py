@@ -34,12 +34,11 @@ from diffusers.models.normalization import (
 
 from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
     BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
     residual_gate_add,
     tensors_equal,
 )
@@ -327,11 +326,13 @@ class _LongCatFFN(nn.Module):
         # lossless/high site: up-proj GEMM + tanh-GELU epilogue. Off by
         # default; the denoising stage mounts it per batch. The ModuleDict holds
         # `proj` in _modules, so getattr resolves it for the fusion helper.
-        mark_fused_gelu_site(self.net[0], "proj")
+        FUSED_LINEAR_GELU.mark(self.net[0], "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         proj = self.net[0]["proj"]
-        if fused_gelu_active(self.net[0]) and can_use_linear_gelu(proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self.net[0]) and can_use_linear_gelu(
+            proj, hidden_states
+        ):
             hidden_states = fused_linear_gelu_tanh(
                 hidden_states, proj.weight, proj.bias
             )
@@ -615,7 +616,7 @@ class _SingleTransformerBlock(nn.Module):
         self.act_mlp = nn.GELU(approximate="tanh")
         # lossless/high site: proj_mlp GEMM + tanh-GELU epilogue,
         # mounted per batch by the denoising stage; off (bit-exact) by default.
-        mark_fused_gelu_site(self, "proj_mlp")
+        FUSED_LINEAR_GELU.mark(self, "proj_mlp")
         # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via
         # all-reduce, matching Flux2SingleTransformerBlockAttention.to_out.
         self.proj_out = RowParallelLinear(
@@ -680,7 +681,7 @@ class _SingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        gelu_in_projection = fused_gelu_active(self) and can_use_linear_gelu(
+        gelu_in_projection = FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
             self.proj_mlp, norm_hidden_states
         )
         if gelu_in_projection:

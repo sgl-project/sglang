@@ -19,16 +19,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_layernorm_modulate,
     fused_linear_gelu_tanh,
     fused_qk_head_layernorm,
     is_plain_layer_norm,
-    mark_fused_gelu_site,
     residual_gate_add,
     tensors_equal,
 )
@@ -450,10 +449,12 @@ class GlmImageGELU(nn.Module):
         )
         # lossless/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )

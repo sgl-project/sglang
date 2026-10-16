@@ -8,13 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_GATE_RMSNORM,
     BitExactFusionGate,
-    fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
     fused_rope_rotate_half_bitexact,
     fused_silu_mul_bitexact,
-    mark_fused_gate_rmsnorm_site,
     modulate_scale_shift,
     residual_gate_add,
     tensors_equal,
@@ -493,7 +492,7 @@ class Ideogram4TransformerBlock(nn.Module):
         # collapses into one Triton kernel (Z-Image bf16-native suite). Off by
         # default (bit-exact reference path); mounted per batch by the
         # denoising stage.
-        mark_fused_gate_rmsnorm_site(
+        FUSED_GATE_RMSNORM.mark(
             self, ("attention_norm1", "attention_norm2", "ffn_norm1", "ffn_norm2")
         )
         self.adaln_modulation = _linear(
@@ -510,7 +509,7 @@ class Ideogram4TransformerBlock(nn.Module):
             adaln_input
         ).chunk(4, dim=-1)
         enable_fused = (
-            fused_gate_rmsnorm_active(self) and not torch.compiler.is_compiling()
+            FUSED_GATE_RMSNORM.is_enabled(self) and not torch.compiler.is_compiling()
         )
         attn_out = self.attention(
             _norm_scale(x, scale_msa, self.attention_norm1, enable_fused),
