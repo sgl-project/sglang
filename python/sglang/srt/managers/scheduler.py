@@ -1081,10 +1081,10 @@ class Scheduler:
             self.hub.step_planner.get_new_batch_prefill(slot), slot
         )
 
-    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def process_bootstrapped_queue(self):
         self.parts.lists.waiting_queue.extend(self.disagg_prefill.intake())
 
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_pp_disagg_prefill_batch_to_run(
         self, slot: ScheduleSlot
     ) -> Optional[ScheduleBatch]:
@@ -1107,6 +1107,7 @@ class Scheduler:
             self.parts.lists.waiting_queue, release_rids
         )
 
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
         self, slot: ScheduleSlot
     ) -> Optional[ScheduleBatch]:

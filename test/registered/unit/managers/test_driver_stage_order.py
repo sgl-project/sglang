@@ -644,5 +644,60 @@ class TestRingDriverStageOrder(CustomTestCase):
         )
 
 
+class _StageRecorder:
+    """Stands for the scheduler's stage recorder: the stage it is in."""
+
+    def __init__(self):
+        self.stage = None
+        self._trace_stage = None
+
+    def enter(self, stage):
+        previous, self.stage = self.stage, stage
+        return previous
+
+    def exit(self, previous):
+        self.stage = previous
+
+
+class TestScheduleStageLabel(CustomTestCase):
+    """Every mode's schedule, flat and ring, runs under the
+    get_next_batch_to_run stage; the PD prefill intake runs outside it."""
+
+    _SCHEDULE_EVENTS = ("prefill", "decode", "dllm.schedule", "dd.pop", _HOOK)
+
+    def _stages_by_event(self, shell):
+        recorder = shell.s.scheduler_stage_metrics = _StageRecorder()
+        stages = {}
+        log = shell.log
+
+        def log_with_stage(*event):
+            stages.setdefault(event[0], set()).add(recorder.stage)
+            log(*event)
+
+        shell.log = log_with_stage
+        shell.run()
+        return stages
+
+    def test_flat_and_ring(self):
+        shells = {
+            "flat normal": _Shell("normal", 2, decode={1: _decode_step("d1")}),
+            "flat dllm": _Shell("dllm", 1),
+            "flat pd prefill": _Shell("prefill", 1),
+            "flat pd decode": _Shell("decode", 1),
+            "ring normal": _RingShell("normal", 2),
+            "ring pd prefill": _RingShell("prefill", 2),
+            "ring pd decode": _RingShell("decode", 2),
+        }
+        for name, shell in shells.items():
+            with self.subTest(name):
+                stages = self._stages_by_event(shell)
+                for event in self._SCHEDULE_EVENTS:
+                    if event in stages:
+                        self.assertEqual(
+                            stages[event], {"get_next_batch_to_run"}, event
+                        )
+                self.assertLessEqual(stages.get("dp.intake", set()), {None})
+
+
 if __name__ == "__main__":
     unittest.main()
