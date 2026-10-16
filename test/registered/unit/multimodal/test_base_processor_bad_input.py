@@ -77,6 +77,15 @@ class TestBadInputIsClientError(CustomTestCase):
                     _StubProcessor._load_single_item(media, Modality.IMAGE)
                 self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
 
+    def test_decompression_bomb_image(self):
+        # 15000 x 15000 is above twice Image.MAX_IMAGE_PIXELS, so Pillow refuses it
+        # in Image.open, before decoding; a 1-bit PNG of that size is about 27 KB.
+        buf = io.BytesIO()
+        Image.new("1", (15000, 15000)).save(buf, format="PNG")
+        with self.assertRaisesRegex(ValueError, "decompression bomb") as ctx:
+            _StubProcessor._load_single_item(buf.getvalue(), Modality.IMAGE)
+        self.assertIsInstance(ctx.exception.__cause__, Image.DecompressionBombError)
+
     def test_undecodable_audio_bytes(self):
         # soundfile raises LibsndfileError, a RuntimeError -- not a ValueError.
         self._assert_client_error(b"definitely not audio", Modality.AUDIO)
@@ -122,6 +131,7 @@ class TestClientMediaExceptions(CustomTestCase):
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
             binascii.Error,  # invalid base64
+            Image.DecompressionBombError,
         ):
             with self.subTest(exc_type=exc_type.__name__):
                 self.assertTrue(issubclass(exc_type, CLIENT_MEDIA_EXCEPTIONS))
