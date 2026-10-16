@@ -2706,6 +2706,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
                 and get_moe_a2a_backend().supports_aiter()
+                # On gfx1250 aiter's fused_moe forces fp4x2 activations, which picks
+                # a CK module that does not build for per-tensor fp8 weights.
+                and not (
+                    _is_gfx1250_supported
+                    and not self.block_quant
+                    and not self.is_fp4_expert
+                    and not _use_hip_int4
+                )
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
