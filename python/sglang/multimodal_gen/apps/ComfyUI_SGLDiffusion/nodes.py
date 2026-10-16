@@ -946,7 +946,9 @@ class SGLDCacheOptions:
     FUNCTION = "apply"
     CATEGORY = "SGLDiffusion"
 
-    def apply(self, model, enable_cache_dit="default", preset="server default", **knobs):
+    def apply(
+        self, model, enable_cache_dit="default", preset="server default", **knobs
+    ):
         # -1 means "keep the preset / server value" for every knob.
         params = dict(CONSERVATIVE_PRESET) if preset == "conservative" else {}
         params.update({k: v for k, v in knobs.items() if v is not None and v >= 0})
