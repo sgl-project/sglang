@@ -277,6 +277,10 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"16",
                 item,
                 dim,
+                b"1",
+                b"0",
+                state_layer,
+                layer,
             ],
         }
         for backend in self.backends:

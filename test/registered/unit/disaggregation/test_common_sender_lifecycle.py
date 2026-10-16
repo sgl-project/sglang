@@ -39,6 +39,17 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     return sender, manager, manager.transfer_queues[0]
 
 
+class FakePPStatus(dict):
+    """PP rank 0's request_status: local statuses plus one peer stage."""
+
+    def __init__(self, local, peer):
+        super().__init__(local)
+        self.peer = peer
+
+    def collect(self, room):
+        return [self.get(room), self.peer.get(room)]
+
+
 class TestCommonSenderLifecycle(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -122,6 +133,22 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertEqual(sender.poll(), KVPoll.Transferring)
         manager._staging_outstanding[42] = 0
         self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_pp_consensus_poll_concludes_on_the_slowest_stage(self):
+        sender, manager, _ = make_sender(MooncakeKVManager)
+        manager.bootstrap_timeout = 300
+        peer = {}
+        manager.request_status = FakePPStatus(manager.request_status, peer)
+        manager.request_status[42] = KVPoll.Success
+        self.assertEqual(sender.poll_pp_consensus(), KVPoll.Bootstrapping)
+        peer[42] = KVPoll.Transferring
+        self.assertEqual(sender.poll_pp_consensus(), KVPoll.Transferring)
+        peer[42] = KVPoll.Success
+        manager._staging_outstanding[42] = 1
+        self.assertEqual(sender.poll_pp_consensus(), KVPoll.Transferring)
+        manager._staging_outstanding[42] = 0
+        self.assertEqual(sender.poll_pp_consensus(), KVPoll.Success)
+        self.assertEqual(sender.conclude_state, KVPoll.Success)
 
     def test_mooncake_trace_context_reaches_worker_and_finishes(self):
         trace = Mock(tracing_enable=True)
