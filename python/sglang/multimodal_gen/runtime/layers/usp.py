@@ -54,7 +54,7 @@ def uncached_a2a_staging():
 
 # Accelerators whose device module exposes is_current_stream_capturing() and can
 # run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
-_A2A_DEVICE_TYPES = ("cuda", "xpu")
+_A2A_DEVICE_TYPES = ("cuda", "xpu", "cpu")
 
 
 def drop_a2a_staging_buffers() -> None:
