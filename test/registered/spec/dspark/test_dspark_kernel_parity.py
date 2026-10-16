@@ -411,13 +411,15 @@ def _case_scatter_compact_to_strided(tc):
         compact = torch.randn(
             graph_num_tokens, dim, dtype=torch.bfloat16, device=DEVICE
         )
-        tc._parity(
-            dspark_verify_window.ScatterCompactToStrided,
-            compact=compact,
-            layout=_layout(verify_lens, graph_num_tokens),
-            fill_value=0.0,
-            verify_num_draft_tokens=t,
-        )
+        for fill_value, point_mass_fill in ((0.0, False), (-1.0e9, True)):
+            tc._parity(
+                dspark_verify_window.ScatterCompactToStrided,
+                compact=compact,
+                layout=_layout(verify_lens, graph_num_tokens),
+                fill_value=fill_value,
+                verify_num_draft_tokens=t,
+                point_mass_fill=point_mass_fill,
+            )
 
 
 def _case_schedule_verify_lens_topk(tc):

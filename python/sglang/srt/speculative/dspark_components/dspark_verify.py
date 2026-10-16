@@ -56,6 +56,11 @@ _is_npu = is_npu()
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
+# Off-token logit of a compact padding row. Padding rows are never accepted
+# from, but the sampling accept still renormalizes them, and a uniform row is
+# top-p's slowest input; a point mass is its fastest. Finite in bf16 and fp32.
+_PADDING_LOGIT = -1.0e9
+
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
@@ -476,7 +481,8 @@ class TargetVerifyExecutor:
             strided_logits = ScatterCompactToStrided.execute(
                 compact=compact_logits,
                 layout=layout,
-                fill_value=0.0,
+                fill_value=_PADDING_LOGIT,
+                point_mass_fill=True,
                 verify_num_draft_tokens=stride,
             )
             compact_hidden = logits_output.hidden_states
@@ -750,7 +756,8 @@ class DsparkVerifyEpilogue:
             verify_lens=verify_lens,
             out=self.strided_logits[: bs * self.stride],
             stride=self.stride,
-            fill_value=0.0,
+            fill_value=_PADDING_LOGIT,
+            point_mass_fill=True,
         )
         scatter_compact_to_strided_into(
             compact=compact_hidden,
