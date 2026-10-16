@@ -3839,6 +3839,22 @@ class UnifiedRadixCache(BasePrefixCache):
             elif ct.is_mamba:
                 available_size = self.req_to_token_pool.mamba_allocator.available_size()
             else:
+                # DSV4 NPU compressed sidecar pools (e.g. C128): a separate
+                # alloc gate invisible in the full/swa numbers above. getattr
+                # keeps every non-DSV4 cache (and the draft worker, whose
+                # sidecar pools are zeroed out) on the plain continue path.
+                sub = getattr(
+                    self.token_to_kv_pool_allocator,
+                    f"{ct.name.lower()}_attn_allocator",
+                    None,
+                )
+                if sub is None:
+                    continue
+                lines.append(
+                    f"Available {ct}: {sub.available_size() // sub.page_size} pages "
+                    f"(available_compressed={sub.available_size()}, "
+                    f"evictable={self.tree_core.component_evictable_size(ct)})"
+                )
                 continue
 
             lines.append(

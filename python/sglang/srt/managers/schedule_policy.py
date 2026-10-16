@@ -659,6 +659,10 @@ class PrefillAdder:
 
         self.req_states = None
         self.can_run_list = []
+        # DSV4 NPU: running sum of the C128 page demand admitted so far this
+        # round (mirrors PrefillBudget.reserve's offset mechanism), so the
+        # batch SUM is judged against the pool, not each request in isolation.
+        self._c128_pending_pages = 0
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
@@ -1238,6 +1242,53 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
+    def _c128_gate(self, prefix_len: int, seq_len: int) -> bool:
+        """DSV4 NPU: admit one request against the C128 sidecar pool.
+
+        Demand uses the same formula as the batch-level `c128_num_pages_needed`
+        that alloc_extend checks (single source of truth) and accumulates
+        across the batch via `_c128_pending_pages`, so the batch SUM is judged
+        against the pool rather than each request in isolation.
+
+        The available side is `free + reclaimable`, where reclaimable is an
+        optimistic upper bound of the C128 pages that evicting unlocked
+        device-resident FULL leaves would release (alloc's
+        ensure_c128_capacity performs that eviction for real). Without this
+        term the gate can livelock: tree eviction only runs inside alloc, so
+        a gate that rejects every request would keep alloc from ever running
+        and the reclaimable pages would never be freed. If the estimate
+        proves too optimistic, alloc fails, the scheduler safety net
+        requeues, and that same failed alloc has already evicted everything
+        it could — so the next round's estimate drops to the truth. No
+        livelock either way.
+
+        Read-only vs the pool: no eviction here; eviction happens at alloc.
+        Known imprecision: a request that passes here but is rejected later
+        leaves its demand counted — conservative (under-admission) by design.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(allocator, "c128_attn_allocator", None) is None:
+            return True
+        need = allocator.c128_prefill_need_pages(prefix_len, seq_len)
+        if need == 0:
+            return True
+        budget = allocator.c128_available_pages()
+        tree_cache = self.tree_cache
+        if tree_cache is not None and not tree_cache.is_chunk_cache():
+            # Same evictable source PrefillBudget._available_and_evictable
+            # uses; one C128 page spans 128 * page_size full tokens.
+            evictable_tokens = (
+                tree_cache.full_evictable_size()
+                if tree_cache.supports_mamba()
+                else tree_cache.evictable_size()
+            )
+            group_tokens = 128 * allocator.c128_attn_allocator.page_size
+            budget += evictable_tokens // group_tokens
+        if need + self._c128_pending_pages > budget:
+            return False
+        self._c128_pending_pages += need
+        return True
+
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         paged_input = (
@@ -1255,6 +1306,13 @@ class PrefillAdder:
         )
         if not fits:
             return AddReqResult.NO_TOKEN
+
+        # DSV4 NPU C128 gate (see _c128_gate). seq here is prefix + extend by
+        # construction: len(prefix_indices) + (len(fill_ids) - len(prefix_indices)).
+        if not self._c128_gate(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        ):
+            return AddReqResult.OTHER
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1441,6 +1499,16 @@ class PrefillAdder:
                 if admission is AddReqResult.NO_TOKEN:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
+
+            # DSV4 NPU C128 gate (see _c128_gate): defer an unfundable request
+            # on the normal "not added this round" path instead of crashing in
+            # prepare_for_extend. OTHER (not NO_TOKEN) on purpose:
+            # batch_is_full must stay False so the queue keeps being retried
+            # while C128 holders finish or get retracted.
+            if not self._c128_gate(
+                admission.prefix_len, admission.prefix_len + admission.extend_len
+            ):
+                return AddReqResult.OTHER
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (
