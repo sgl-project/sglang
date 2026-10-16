@@ -38,7 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ _ABSMAX_EPS = 1e-10
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 # The mxscale flatmm BMM is gfx950-only, so resolve availability once at import
 # rather than per decode step.
@@ -85,6 +86,23 @@ if _batched_gemm_a8w8_mxscale is not None:
         )
 
 
+# gfx1250 (RDNA4 / MI455): FlyDSL WMMA a8w8 mxfp8 strided-batched GEMM with a
+# 16×16-preshuffled weight layout.  No scaled-MFMA on RDNA4, so the gfx950 path
+# above is unavailable; this path uses wave32 WMMA instead.
+_batched_gemm_a8w8_mxscale_bpreshuffle = None
+if _is_hip and _is_gfx1250_supported:
+    try:
+        from aiter.ops.batched_gemm_op_a8w8 import (
+            batched_gemm_a8w8_mxscale_bpreshuffle as _batched_gemm_a8w8_mxscale_bpreshuffle,
+        )
+    except Exception as err:  # pragma: no cover - env-dependent
+        logger.warning(
+            "aiter batched_gemm_a8w8_mxscale_bpreshuffle import failed; the "
+            "DSV4 wo_a fp8 bpreshuffle path is unavailable on this build: %s",
+            err,
+        )
+
+
 def is_wo_a_fp8_mxscale_supported() -> bool:
     """True when the ROCm fp8 ``wo_a`` path can run on this build/arch."""
     return _batched_gemm_a8w8_mxscale is not None
@@ -94,6 +112,52 @@ def is_wo_a_fp8_fused_invrope_supported() -> bool:
     """True when the fused inverse-RoPE + quant ``wo_a`` path can run."""
     return (
         _batched_gemm_a8w8_mxscale is not None and _inverse_rope_group_quant is not None
+    )
+
+
+def is_wo_a_fp8_bpreshuffle_supported() -> bool:
+    """True when the gfx1250 FlyDSL a8w8 bpreshuffle ``wo_a`` path can run."""
+    return _batched_gemm_a8w8_mxscale_bpreshuffle is not None
+
+
+def wo_a_weight_to_bpreshuffle(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    num_groups: int,
+    o_lora_rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert and preshuffle ``wo_a`` weight for the gfx1250 bpreshuffle GEMM.
+
+    Reuses ``wo_a_weight_scale_to_e8m0`` (same e8m0 conversion as the gfx950
+    path) then applies the WMMA 16×16 tile shuffle offline.
+
+    Returns ``(weight_preshuffled [G, R, D] fp8, scale [G, R/128, D/128] uint8)``.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    weight_fp8, scale_e8m0 = wo_a_weight_scale_to_e8m0(
+        weight, weight_scale_inv, num_groups, o_lora_rank
+    )
+    # weight_fp8: [G, R, D]; shuffle_weight applies the 16×16 WMMA tile layout
+    # in-place (same shape, rearranged bytes) for the FlyDSL kernel.
+    weight_shuf = shuffle_weight(weight_fp8)
+    return weight_shuf, scale_e8m0
+
+
+def apply_wo_a_fp8_bpreshuffle(
+    o: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """fp8 ``wo_a`` for gfx1250: quantize [T, G, D] then bpreshuffle batched-GEMM.
+
+    ``weight`` must already be preshuffled (``wo_a_weight_to_bpreshuffle`` at
+    load time).  ``weight_scale`` is the uint8 e8m0 [G, R/128, D/128] tensor.
+    Returns bf16 [T, G, R].
+    """
+    o_fp8, o_scale = quant_wo_a_act_mxfp8(o)
+    return _batched_gemm_a8w8_mxscale_bpreshuffle(
+        o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
     )
 
 
@@ -286,8 +350,11 @@ def wo_a_weight_scale_to_e8m0(
 
 __all__ = [
     "WO_A_MXFP8_GROUP_SIZE",
+    "apply_wo_a_fp8_bpreshuffle",
     "apply_wo_a_fp8_mxscale",
+    "is_wo_a_fp8_bpreshuffle_supported",
     "is_wo_a_fp8_mxscale_supported",
     "quant_wo_a_act_mxfp8",
     "wo_a_weight_scale_to_e8m0",
+    "wo_a_weight_to_bpreshuffle",
 ]
