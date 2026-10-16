@@ -328,10 +328,9 @@ class LRUFileEvictor:
 
         - ``("evicted", n)``: oldest entry dropped from the index; ``n`` disk
           bytes reclaimed (0 if the file was already gone).
-        - ``("skipped", 0)``: oldest entry is an in-flight write; re-pinned at MRU
-          so the writer is not evicted out from under itself.
-        - ``("stop", 0)``: nothing evictable (empty index) or the unlink failed
-          (entry re-pinned at LRU); the caller should stop its eviction loop.
+        - ``("skipped", 0)``: oldest entry is an in-flight write or its unlink
+          failed; retain its accounting at MRU and try other victims.
+        - ``("stop", 0)``: empty index; stop the eviction loop.
         """
         if not self._lru:
             return "stop", 0
@@ -352,9 +351,9 @@ class LRUFileEvictor:
                 self._on_evict(evict_stem)
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
+            # Keep the bytes charged, but let the bounded loop try other files.
             self._lru[evict_stem] = evict_size
-            self._lru.move_to_end(evict_stem, last=False)
-            return "stop", 0
+            return "skipped", 0
         self._total_bytes -= evict_size
         return "evicted", freed
 
@@ -362,8 +361,9 @@ class LRUFileEvictor:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
 
         ``should_continue`` is passed the disk bytes reclaimed so far and returns
-        whether to keep evicting. In-flight writes are skipped; the loop is bounded
-        so it can't spin once every remaining entry is pending. Caller holds _lock.
+        whether to keep evicting. In-flight writes and failed unlinks are skipped;
+        the loop is bounded so it cannot spin when no remaining entry is evictable.
+        Caller holds _lock.
         Returns the total disk bytes reclaimed.
         """
         reclaimed = 0
