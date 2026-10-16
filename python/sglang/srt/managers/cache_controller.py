@@ -609,6 +609,7 @@ class HiCacheController:
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+            and storage_backend != "radixshmem"
         )
 
         # Use storage backend factory for dynamic backend creation

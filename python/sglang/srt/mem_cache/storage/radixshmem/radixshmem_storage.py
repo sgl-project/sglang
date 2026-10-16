@@ -8,7 +8,8 @@ temporal plus conv over all heads, whatever the host layout and TP size:
 each rank copies its own heads into place, so instances with different TP
 sizes share slots. Pools whose shape is not known are stored as the ranks'
 parts side by side, keyed by the TP size; rank-replicated pools (MLA) store
-one copy. Keys are sglang's chained page hashes folded to uint64 and salted
+one copy. Under DSA layer split each CP rank holds only its own layers, so
+those pools store the CP ranks' pages side by side, keyed by the CP size. Keys are sglang's chained page hashes folded to uint64 and salted
 per model, PP stage, pool and slot shape.
 
 The anchor pool (kv) owns the radix path of a prefix. The swa and mamba
@@ -158,11 +159,13 @@ class _Pool:
         kind,
         mask: int,
         layout: Optional[_Layout] = None,
+        writes: bool = True,
     ):
         self.name = name
         self.host_pool = host_pool
         self.page_bytes = page_bytes
-        self.sharded = parts > 1
+        self.sharded = parts > 1 or layout is not None
+        self.writes = writes
         self.layout = layout
         self.slot_bytes = layout.slot_bytes if layout else page_bytes * parts
         self.offset = 0 if layout else part * page_bytes
@@ -227,6 +230,7 @@ class RadixShmemStorage(HiCacheStorage):
                 f"radixshmem: shard group of {self.read_comm.size} ranks is not "
                 f"a multiple of attn_cp_size={cp_size}"
             )
+        self.cp_parts = cp_size
         self.tp_parts = self.read_comm.size // cp_size
         self.tp_part = self.read_comm.rank % self.tp_parts
         self.cp_rank = self.read_comm.rank // self.tp_parts
@@ -371,6 +375,11 @@ class RadixShmemStorage(HiCacheStorage):
             parts.append(_Part(view, shape, buf.dtype, dim, spans, True))
         return _Layout(parts, local_bytes) if parts else None
 
+    @staticmethod
+    def _layer_split(host_pool: Any) -> bool:
+        device = getattr(host_pool, "device_pool", None)
+        return bool(getattr(device, "layer_shard_enabled", False))
+
     def _make_pool(self, name, host_pool: Any, anchor: Optional[_Pool]) -> _Pool:
         sharded = self._sharded(name) and self.tp_parts > 1
         layout = None
@@ -380,6 +389,16 @@ class RadixShmemStorage(HiCacheStorage):
             )
         parts = self.tp_parts if sharded else 1
         part = self.tp_part if sharded else 0
+        writes = self.cp_rank == 0 if sharded or layout else self.leader
+        tag = layout.tag if layout else f"tp{parts}"
+        if layout is None and self._layer_split(host_pool) and self.cp_parts > 1:
+            if sharded:
+                raise ValueError(
+                    f"radixshmem: pool {name} is split by layer and by TP heads"
+                )
+            parts, part = self.cp_parts, self.cp_rank
+            writes = self.tp_part == 0
+            tag = f"cp{parts}"
         if layout is None and getattr(host_pool, "slot_state_device_tensors", None):
             raise ValueError(
                 f"radixshmem: pool {name} carries Mamba side state in a layout "
@@ -390,7 +409,7 @@ class RadixShmemStorage(HiCacheStorage):
         salt = _salt(
             self.config.model_name,
             f"pp{self.config.pp_rank}/{self.config.pp_size}",
-            layout.tag if layout else f"tp{parts}",
+            tag,
             str(name),
         )
         component = self.components.get(name)
@@ -403,7 +422,9 @@ class RadixShmemStorage(HiCacheStorage):
         ):
             kind, mask = component
             salt = anchor.salt
-        return _Pool(name, host_pool, page_bytes, parts, part, salt, kind, mask, layout)
+        return _Pool(
+            name, host_pool, page_bytes, parts, part, salt, kind, mask, layout, writes
+        )
 
     def _attach(self) -> None:
         if self.index is not None:
@@ -646,7 +667,7 @@ class RadixShmemStorage(HiCacheStorage):
             return [False] * n
         slots = buf[1:].numpy().astype(np.int32)
         ok = torch.ones(1, dtype=torch.int64)
-        if self.cp_rank == 0:
+        if pool.writes:
             try:
                 copy(slots)
             except Exception:

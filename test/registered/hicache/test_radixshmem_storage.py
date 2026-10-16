@@ -520,6 +520,37 @@ class TestRadixShmemStorage(CustomTestCase):
         self.assertEqual(index.paths, {})
         self.assertEqual(len(index.free), NUM_SLOTS)
 
+    def test_layer_split_cp_ranks_share_one_slot(self):
+        keys = _keys(2)
+        size, tp, cp = 4, 2, 2
+        write, read = _Group(size), _Group(size)
+        ranks = []
+        for r in range(size):
+            pool = _FakeHostPool(8)
+            pool.device_pool = SimpleNamespace(layer_shard_enabled=True)
+            pool.buf.fill_(10 * (r // tp) + 1)
+            storage = self.cls(_config(tp_rank=r % tp, is_mla=True, cp_size=cp), pool)
+            storage.set_shard_groups(write.member(r), read.member(r))
+            storage.register_mem_pool_host(pool)
+            ranks.append((storage, pool))
+        got = _run(
+            [lambda s=s: s.batch_set_v1(keys, _indices(2), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 2] * size)
+        self.assertEqual(
+            _FakeClient.servers["test"].geometry, (PAGE_SIZE, cp * PAGE_BYTES)
+        )
+        dsts = [_FakeHostPool(8) for _ in ranks]
+        for (s, _), dst in zip(ranks, dsts):
+            dst.device_pool = SimpleNamespace(layer_shard_enabled=True)
+            s.register_mem_pool_host(dst)
+        got = _run(
+            [lambda s=s: s.batch_get_v1(keys, _indices(2), _info([])) for s, _ in ranks]
+        )
+        self.assertEqual(got, [[True] * 2] * size)
+        for r, dst in enumerate(dsts):
+            self.assertTrue(torch.all(dst.buf[: 2 * PAGE_BYTES] == 10 * (r // tp) + 1))
+
     def test_read_barrier(self):
         ranks = self._group(tp=2)
         got = _run(
@@ -677,9 +708,7 @@ class TestRadixShmemConfig(CustomTestCase):
 
         check()
         check(nnodes=2, attn_dp_size=2)
-        check(hicache_storage_backend="mooncake", enable_dsa_cache_layer_split=True)
-        with self.assertRaises(ValueError):
-            check(enable_dsa_cache_layer_split=True)
+        check(enable_dsa_cache_layer_split=True)
         with self.assertRaises(ValueError):
             check(nnodes=2)
 
