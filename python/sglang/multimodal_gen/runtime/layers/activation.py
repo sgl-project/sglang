@@ -108,8 +108,16 @@ class GeluAndMul(CustomOp):
 
 @CustomOp.register("gelu_new")
 class NewGELU(CustomOp):
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.activation.gelu import new_gelu
+
+        return new_gelu(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
     def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
@@ -123,8 +131,16 @@ class NewGELU(CustomOp):
 @CustomOp.register("quick_gelu")
 class QuickGELU(CustomOp):
     # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.activation.gelu import quick_gelu
+
+        return quick_gelu(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
     def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)

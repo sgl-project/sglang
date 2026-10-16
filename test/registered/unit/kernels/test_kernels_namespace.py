@@ -63,6 +63,27 @@ def test_qwen_qkv_registry_accepts_hopper(platform, eligible):
     assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
 
 
+@pytest.mark.parametrize(
+    "device,expect", [("cuda", "jit"), ("hip", "aot"), ("cpu", None)]
+)
+def test_quick_gelu_default_backend(monkeypatch, device, expect):
+    from sglang.kernels.ops.activation import _GELU_QUICK
+
+    monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
+    backend = _GELU_QUICK.auto_selected_backend()
+    assert (backend.value if backend is not None else None) == expect
+
+
+@pytest.mark.parametrize(
+    "platform,eligible", [(_SM90, True), (_SM100, True), (_CPU, False), (_HIP, False)]
+)
+def test_new_gelu_registry_cuda_only(platform, eligible):
+    spec = K.select_kernel("activation.new_gelu", backend=KernelBackend.JIT)
+    assert spec.target == "sglang.kernels.ops.activation.gelu:new_gelu"
+    assert spec.format_signature.supported_dtypes == ("float16", "bfloat16", "float32")
+    assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
+
+
 def test_multi_backend_requires_explicit_backend(monkeypatch):
     # Device is a hard eligibility filter, not a ranking: >1 usable backend on
     # the current device means selection must name one.
