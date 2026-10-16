@@ -8,15 +8,36 @@ ids, so the pieces go through the backend's ``encode_batch``, which runs on the
 tokenizers (rayon) thread pool.
 
 A single message is often most of the prompt, so long gaps between added
-tokens are also cut at pre-token boundaries, but only for the exact
-Split-regex + ByteLevel + BPE pipeline of GLM / Llama-3 style tokenizers
-(``_INTRA_SPLIT_REGEX``). For that regex, a match containing a letter ends at
-the last letter of a run (only the ``'s``-style and ``?\p{L}+`` alternatives
-contain letters) and a match containing ``\n`` never continues into a letter,
-so "letter|space letter" and "\n|letter" are always pre-token boundaries.
-Truncating a chunk after a letter cannot change any match; after ``\n`` the
-only lookahead that could flip (``\s+(?!\S)``) is shadowed by the earlier
-``\s*[\r\n]+`` alternative. BPE never merges across pre-tokens.
+tokens are also cut at two kinds of pre-token boundary, "letter|space letter"
+and "\n|letter, digit or CJK ideograph" (``_INTRA_CUT``), but only for the
+Split-regex + ByteLevel + BPE pipelines in ``_INTRA_SPLIT_REGEXES``:
+GLM / Llama-3, Qwen2 / Qwen3 (NFC normalizer), o200k as used by gpt-oss, and
+DeepSeek-V3, whose digit and CJK splits run ahead of the main regex.
+
+In each of these regexes no match continues from a letter into a space (only
+the ``'s``-style and ``?\p{L}+``-style alternatives contain letters, and the
+contraction suffix o200k keeps inside a word needs an apostrophe), and no
+match continues from ``\n`` into a character other than whitespace, ``\r``,
+``\n`` or, in o200k, ``/`` (the alternatives that can contain ``\n`` end in
+``[\r\n]*``, ``[\r\n]+`` or ``\s+``). So both kinds of cut are pre-token
+boundaries. Truncating a chunk after a letter cannot change any match; after
+``\n`` the only lookahead that could flip (``\s+(?!\S)``) is shadowed by the
+earlier ``\s*[\r\n]+`` alternative. DeepSeek's leading ``\p{N}{1,3}`` and
+CJK splits cannot straddle a cut, since the character before one, a letter
+or ``\n``, is neither a digit nor in their ranges. BPE never merges across
+pre-tokens.
+
+Under NFC the pre-tokenizer sees the normalized text, and a cut is a boundary
+there too. The characters on both sides of a cut are ASCII or CJK ideographs:
+NFC leaves each unchanged, none has a combining class that reorders, and none
+is the second half of a canonical composition, so NFC of the text is NFC of
+the chunks concatenated, and the character after the cut, whether or not a
+following mark composes with it, is still not whitespace, a line break or
+``/``. Added tokens matched after normalization, on the other hand, would be
+invisible to the raw-text cut search. So the normalizer must be the identity
+(none, or an empty ``Sequence``) or NFC with every added token matched on the
+raw text; under any other normalizer, or with a pre-tokenizer outside the
+table, only the added-token cuts are taken.
 
 Any configuration where that argument does not hold falls back to the original
 encode: slow or wrapped tokenizers, specials added by the post-processor,
@@ -65,13 +86,53 @@ _ID_PRESERVING_POST_PROCESSORS = {
     "RobertaProcessing",
 }
 
-# Pre-token regex for which the intra-gap cut points below were verified.
-_INTRA_SPLIT_REGEX = (
+# Pre-token regexes for which the intra-gap cut points below were verified:
+# each pipeline's Split patterns, in order, ahead of ByteLevel.
+# GLM / Llama-3: digit groups of up to three.
+_LLAMA3_SPLIT_REGEX = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
     r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
-# ASCII letters only: Python and Oniguruma agree on them for \p{L}.
-_INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
+# Qwen2 / Qwen3: single digits. Qwen3.5 keeps marks inside the letter run.
+_QWEN2_SPLIT_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_QWEN35_SPLIT_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+# o200k (gpt-oss): a word may split at a case change and keeps its
+# contraction; a punctuation run also takes a trailing "/".
+_O200K_SPLIT_REGEX = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+# DeepSeek-V3: digit groups and CJK runs are split off first. The main regex
+# is not a raw string: its classes contain real CR / LF characters, as the
+# tokenizer file's do.
+_DEEPSEEK3_SPLIT_REGEXES = (
+    r"\p{N}{1,3}",
+    "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|"
+    "[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|"
+    "\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+)
+_INTRA_SPLIT_REGEXES = {
+    (_LLAMA3_SPLIT_REGEX,),
+    (_QWEN2_SPLIT_REGEX,),
+    (_QWEN35_SPLIT_REGEX,),
+    (_O200K_SPLIT_REGEX,),
+    _DEEPSEEK3_SPLIT_REGEXES,
+}
+# ASCII letters and digits, and CJK ideographs after a newline: Python and
+# Oniguruma agree on their classes, and NFC leaves them unchanged.
+_INTRA_CUT = re.compile(
+    r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z0-9\u4e00-\u9fff])"
+)
 
 _plans = weakref.WeakKeyDictionary()
 # None: not yet checked; False: encode_batch consumed only one CPU (rayon
@@ -113,20 +174,42 @@ def _post_processor_safe(cfg):
     return processor_type in _ID_PRESERVING_POST_PROCESSORS
 
 
+def _identity_normalizer(cfg):
+    """None, or an empty Sequence as in DeepSeek-V3: normalized text is the input."""
+    if cfg is None:
+        return True
+    return cfg.get("type") == "Sequence" and not cfg.get("normalizers")
+
+
 def _intra_cut_safe(cfg):
     pre = cfg.get("pre_tokenizer") or {}
     subs = pre.get("pretokenizers") if pre.get("type") == "Sequence" else None
-    if not subs or len(subs) != 2:
+    if not subs or len(subs) < 2:
         return False
-    split, bl = subs
+    *splits, bl = subs
+    regexes = []
+    for split in splits:
+        if split.get("type") != "Split":
+            return False
+        if split.get("behavior") != "Isolated" or split.get("invert"):
+            return False
+        pattern = split.get("pattern")
+        if not isinstance(pattern, dict):
+            return False
+        regexes.append(pattern.get("Regex"))
+    if tuple(regexes) not in _INTRA_SPLIT_REGEXES:
+        return False
+    normalizer = cfg.get("normalizer")
+    if not _identity_normalizer(normalizer):
+        # NFC only, and only when the raw-text cut search sees every added
+        # token: one matched after normalization could be split by a cut.
+        if normalizer.get("type") != "NFC":
+            return False
+        if any(t.get("normalized") for t in cfg.get("added_tokens") or []):
+            return False
     model = cfg.get("model") or {}
     return (
-        cfg.get("normalizer") is None
-        and split.get("type") == "Split"
-        and split.get("pattern") == {"Regex": _INTRA_SPLIT_REGEX}
-        and split.get("behavior") == "Isolated"
-        and not split.get("invert")
-        and bl.get("type") == "ByteLevel"
+        bl.get("type") == "ByteLevel"
         and not bl.get("add_prefix_space")
         and not bl.get("use_regex")
         and model.get("type") == "BPE"
@@ -180,9 +263,12 @@ def _build_plan(tokenizer):
     normed = [t.content for t in added if t.normalized and t.content]
     pattern = _alternation(raw)
     # Normalized added tokens are matched on normalized text in a second pass.
-    # Without a normalizer that text is the original, so their ends are cut
-    # points too; with one, only the first-pass (raw) tokens are used.
-    npattern = _alternation(normed) if backend.normalizer is None else None
+    # Under the identity normalizer that text is the original, so their ends
+    # are cut points too; under any other, only the first-pass (raw) tokens
+    # are used.
+    npattern = None
+    if _identity_normalizer(cfg.get("normalizer")):
+        npattern = _alternation(normed)
     intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
     if pattern is None and npattern is None and intra is None:
         return None

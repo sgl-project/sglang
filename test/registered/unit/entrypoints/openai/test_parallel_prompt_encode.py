@@ -4,10 +4,12 @@
 `backend.encode_batch`, so its whole contract is that the concatenated ids are
 identical to `tokenizer.encode(text, **encode_kwargs)` — an off-by-one cut
 point is not a crash, it is a silently different prompt. These cases pin the
-identity on a ByteLevel-BPE tokenizer built in memory with the exact
-Split-regex + ByteLevel + BPE pipeline the intra-gap cuts were verified for,
-and pin the refusals: every tokenizer configuration outside that pipeline, and
-every gate, must reach the original encode instead.
+identity on ByteLevel-BPE tokenizers built in memory with each exact
+Split-regex + ByteLevel + BPE pipeline the intra-gap cuts were verified for
+(GLM / Llama-3, Qwen2 / Qwen3 and Qwen3.5 under NFC, o200k, DeepSeek-V3), on
+the real tokenizer files of those pipelines when they are on this machine,
+and pin the refusals: every tokenizer configuration outside those pipelines,
+and every gate, must reach the original encode instead.
 
 The tests never assert that the rayon pool actually ran the chunks in
 parallel. The helper probes for a serial `encode_batch` once and then disables
@@ -16,6 +18,7 @@ runner is free to make; `_parallel_ok` is pinned per test so the id
 comparisons do not depend on it.
 """
 
+import os
 import random
 import sys
 import unittest
@@ -42,7 +45,7 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 _TRAIN_CORPUS = [
     "the quick brown fox jumps over the lazy dog",
@@ -63,25 +66,55 @@ _SPECIALS = [
     "<sop>",
     "/nothink",
 ]
+# Matched on normalized text in the backend's second pass, as DeepSeek-V3's
+# role markers are: a cut point only under the identity normalizer, where that
+# text is the input. Added to the deepseek3 backend below.
+_NORMALIZED_SPECIAL = "<|norm|>"
+
+# The verified pipelines: Split regexes ahead of ByteLevel, and the normalizer.
+_PIPELINES = {
+    "llama3": ((ppe._LLAMA3_SPLIT_REGEX,), None),
+    "qwen2": ((ppe._QWEN2_SPLIT_REGEX,), normalizers.NFC()),
+    "qwen35": ((ppe._QWEN35_SPLIT_REGEX,), normalizers.NFC()),
+    "o200k": ((ppe._O200K_SPLIT_REGEX,), None),
+    "deepseek3": (ppe._DEEPSEEK3_SPLIT_REGEXES, normalizers.Sequence([])),
+}
+# The pipelines verified after #41259; llama3 has its own cases below.
+_OTHER_PIPELINES = ("qwen2", "qwen35", "o200k", "deepseek3")
+
+# Real tokenizer files for the verified pipelines, used when present:
+# SGLANG_TEST_TOKENIZER_JSONS="qwen2=/path/tokenizer.json,o200k=..." or the
+# checkpoint's tokenizer.json in the Hugging Face cache (downloaded when the
+# hub is reachable). A file that cannot be found skips, it never fails.
+_REAL_CHECKPOINTS = {
+    "llama3": "meta-llama/Llama-3.1-8B-Instruct",
+    "qwen2": "Qwen/Qwen3-0.6B",
+    "qwen35": "Qwen/Qwen3.5-0.8B",
+    "o200k": "openai/gpt-oss-20b",
+    "deepseek3": "deepseek-ai/DeepSeek-V3",
+}
 
 
-@lru_cache(maxsize=1)
-def _safe_backend_json():
-    """A GLM / Llama-3 shaped backend: the pipeline `_intra_cut_safe` accepts.
+@lru_cache(maxsize=None)
+def _backend_json(pipeline="llama3"):
+    """A backend with the pre-tokenizer pipeline `_intra_cut_safe` accepts.
 
-    Only the pre-tokenizer pipeline and the model type decide which cut points
-    the helper takes, so a 900-token vocabulary exercises the same code path a
-    real checkpoint does. The ByteLevel alphabet is seeded explicitly so every
-    byte of the test corpus has a token and nothing is silently dropped.
+    Only the pre-tokenizer pipeline, the normalizer and the model type decide
+    which cut points the helper takes, so a 900-token vocabulary exercises
+    the same code path a real checkpoint does. The ByteLevel alphabet is
+    seeded explicitly so every byte of the test corpus has a token and
+    nothing is silently dropped.
     """
+    splits, normalizer = _PIPELINES[pipeline]
     backend = Tokenizer(models.BPE())
+    if normalizer is not None:
+        backend.normalizer = normalizer
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
-            pre_tokenizers.Split(
-                Regex(ppe._INTRA_SPLIT_REGEX), behavior="isolated", invert=False
-            ),
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            pre_tokenizers.Split(Regex(split), behavior="isolated", invert=False)
+            for split in splits
         ]
+        + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
     )
     backend.decoder = decoders.ByteLevel()
     backend.train_from_iterator(
@@ -96,14 +129,40 @@ def _safe_backend_json():
     backend.add_tokens(
         [AddedToken(t, normalized=False, special=True) for t in _SPECIALS]
     )
+    if pipeline == "deepseek3":
+        backend.add_tokens(
+            [AddedToken(_NORMALIZED_SPECIAL, normalized=True, special=True)]
+        )
     return backend.to_str()
 
 
-def _tokenizer(mutate=None, **kwargs):
-    backend = Tokenizer.from_str(_safe_backend_json())
+def _tokenizer(mutate=None, pipeline="llama3", **kwargs):
+    backend = Tokenizer.from_str(_backend_json(pipeline))
     if mutate is not None:
         mutate(backend)
     return PreTrainedTokenizerFast(tokenizer_object=backend, **kwargs)
+
+
+def _real_tokenizer_file(pipeline):
+    for item in os.environ.get("SGLANG_TEST_TOKENIZER_JSONS", "").split(","):
+        name, _, path = item.partition("=")
+        if name.strip() == pipeline and os.path.isfile(path.strip()):
+            return path.strip()
+    try:
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+        from huggingface_hub.constants import HF_HUB_OFFLINE
+    except ImportError:
+        return None
+    repo = _REAL_CHECKPOINTS[pipeline]
+    cached = try_to_load_from_cache(repo, "tokenizer.json")
+    if isinstance(cached, str):
+        return cached
+    if HF_HUB_OFFLINE:
+        return None
+    try:
+        return hf_hub_download(repo, "tokenizer.json")
+    except Exception:
+        return None
 
 
 def _chunk_ids(tokenizer, text, all_cuts=False):
@@ -156,12 +215,46 @@ _EDGE_TEXTS = [
     "Ωmega ΣΙΓΜΑ ßtraße İi",
     "a" * 5000 + " b",
     "x y\n" * 3000,
+    # Digits, CJK and punctuation after a newline; "/" after a newline is a
+    # cut only for a letter, since o200k keeps "\n/" in a punctuation run.
+    "line\n123 456\n中文。\n文本\n/path x\n'q'\n#c\n鿿\n一",
+    "1\n2\n3\n4 5\n中\n文\n\n中\r\n文\n \n中",
+    "abcDEF ghi\nJKL mno\nPQRstu\n123abc\nabc123\nHTTPServer",
+    # Marks and NFC: composable pairs, a letter that decomposes (U+0958),
+    # Hangul jamo and syllables, and marks right after a cut.
+    "é é\nf́ g\nåb\nक़/ क़\nक़ क़",
+    "ab\ncd́ ef\nx́y\nz̵ w\n1́\n中́ x",
+    "한글\n한글 abc\n가 x\n각 b\ncᄀ",
+    # Emoji with variation selectors, skin tones and ZWJ sequences.
+    "❤️ x\n❤️\n👍🏽 y\n👍\n🇨🇳\n中\n👩‍👩‍👧 a\n❤️ b",
+    # Added tokens next to every kind of cut.
+    "a <|user|>b\nc<|user|>\nd\n<|user|>e <|user|> f\n<|user|>\n中<|user|>1",
+    "x\n<|user|>\n<|norm|>\n1<|norm|>a <|norm|> b\n<|norm|><|user|>",
 ]
 
 
-def _fuzz_texts():
+# Chunks the all-cuts split must produce: one case per kind of cut point.
+_CUT_CASES = (
+    ("<think>abcd", ["<think>", "abcd"]),
+    ("abcd efgh", ["abcd", " efgh"]),
+    ("abcd\nefgh", ["abcd\n", "efgh"]),
+    ("abcd\n1234", ["abcd\n", "1234"]),
+    ("abcd\n中文", ["abcd\n", "中文"]),
+    ("abcd\n/efgh ijkl", ["abcd\n/efgh", " ijkl"]),
+)
+
+
+def _edge_texts(opening="<think>", closing="</think>"):
+    """The edge texts, bare and wrapped in a pair of special tokens."""
+    texts = list(_EDGE_TEXTS)
+    for text in _EDGE_TEXTS:
+        texts += [opening + text, text + closing, opening + text + closing]
+    return texts
+
+
+def _fuzz_texts(specials=_SPECIALS, seed=0, short=4000, long=30):
     """Random texts over the atoms that sit on either side of a cut point."""
-    rng = random.Random(0)
+    rng = random.Random(seed)
     atoms = list("aZ é中🙂'1 \n\r\t.,;:{}()<>/_-\"\\") + [
         "\u0301",
         " ",
@@ -170,17 +263,73 @@ def _fuzz_texts():
         "\r\n",
         " \n",
         "\n ",
+        # Words, contractions, digit groups, a newline before "/" or "#".
+        "the",
+        "Hello",
+        "WORLD",
+        "it's",
+        "123",
+        "4567",
+        "\n/",
+        ".\n/",
+        "\n#",
+        # CJK ideographs (U+9FA5 ends DeepSeek's split range, U+9FFF the cut
+        # range), fullwidth punctuation, kana with a combining dakuten,
+        # Hangul jamo and syllables.
+        "文",
+        "龥",
+        "鿿",
+        "。",
+        "，",
+        "中文文本",
+        "の",
+        "ガ",
+        "한",
+        "가",
+        "ᆨ",
+        "가",
+        # NFC: a composable pair, a mark that reorders, U+0958 both ways.
+        "é",
+        "\u0335",
+        "क़",
+        "क़",
+        # No-break, ideographic and zero width spaces.
+        "\u00a0",
+        "\u3000",
+        "\u200b",
+        # Emoji with a skin tone, a variation selector (also bare) and ZWJ.
+        "👍🏽",
+        "❤️",
+        "\ufe0f",
+        "👩‍👩‍👧",
+        # Non-ASCII lower and upper case letters.
+        "ß",
+        "İ",
     ]
-    atoms += _SPECIALS
+    atoms += list(specials)
     texts = [
         "".join(rng.choice(atoms) for _ in range(rng.randint(0, 400)))
-        for _ in range(4000)
+        for _ in range(short)
     ]
     texts += [
         "".join(rng.choice(atoms) for _ in range(rng.randint(5000, 60000)))
-        for _ in range(30)
+        for _ in range(long)
     ]
     return texts
+
+
+def _long_prompt(specials):
+    """A chat-shaped prompt: role markers around prose, code, Chinese and a
+    numbered log, long enough for the default chunking."""
+    user, assistant = specials[:2]
+    body = (
+        "The quick brown fox jumps over the lazy dog. It's a test, isn't it?\n"
+        "def main(argv):\n    return 0  # trailing\n\n"
+        "中文文本，没有空格。日本語のテキスト 한국어\n"
+        "2024-01-02 12:34:56 INFO request 1234 took 56ms /api/v1\n"
+        "é ❤️ 👍🏽 क़/ HTTPServer abc123def\n"
+    )
+    return (user + "\n" + body * 30 + assistant + "\n") * 20
 
 
 class _EncodeCase(CustomTestCase):
@@ -210,6 +359,21 @@ class _EncodeCase(CustomTestCase):
                 f"{encode_kwargs} on {text[:60]!r}",
             )
 
+    def _assert_every_cut_point_is_exact(self, tokenizer, texts, label=""):
+        for text in texts:
+            reference = tokenizer.encode(text, add_special_tokens=False)
+            self.assertEqual(
+                _chunk_ids(tokenizer, text, all_cuts=True)[0],
+                reference,
+                f"{label} {text[:80]!r}",
+            )
+
+    def _assert_cuts(self, tokenizer, cases):
+        for text, expected in cases:
+            self.assertEqual(
+                _chunk_ids(tokenizer, text, all_cuts=True)[1], expected, repr(text)
+            )
+
 
 class TestSafePipelineIdsAreIdentical(_EncodeCase):
     def setUp(self):
@@ -223,24 +387,10 @@ class TestSafePipelineIdsAreIdentical(_EncodeCase):
         self.assertIsNotNone(plan)
         self.assertIsNotNone(plan[2], "added tokens must be matched")
         self.assertIs(plan[4], ppe._INTRA_CUT, "intra-gap cuts must be enabled")
-        for text, expected in (
-            ("<think>abcd", ["<think>", "abcd"]),
-            ("abcd efgh", ["abcd", " efgh"]),
-            ("abcd\nefgh", ["abcd\n", "efgh"]),
-        ):
-            self.assertEqual(
-                _chunk_ids(self.tokenizer, text, all_cuts=True)[1], expected
-            )
+        self._assert_cuts(self.tokenizer, _CUT_CASES)
 
     def test_edge_cases_encode_the_same_at_every_cut_point(self):
-        texts = list(_EDGE_TEXTS)
-        for text in _EDGE_TEXTS:
-            texts += [
-                "<think>" + text,
-                text + "</think>",
-                "<think>" + text + "</think>",
-            ]
-        for text in texts:
+        for text in _edge_texts():
             reference = self.tokenizer.encode(text)
             self.assertEqual(
                 _chunk_ids(self.tokenizer, text, all_cuts=True)[0], reference
@@ -326,6 +476,114 @@ class TestSafePipelineIdsAreIdentical(_EncodeCase):
         self.assertTrue(ppe._parallel_ok)
 
 
+class TestVerifiedPipelinesIdsAreIdentical(_EncodeCase):
+    """The other verified pipelines, built in memory: the same cut points,
+    under NFC (Qwen) and under the empty normalizer Sequence (DeepSeek)."""
+
+    def setUp(self):
+        super().setUp()
+        self._no_min_chars()
+
+    def test_each_pipeline_takes_every_kind_of_cut_point(self):
+        for pipeline in _OTHER_PIPELINES:
+            with self.subTest(pipeline):
+                tokenizer = _tokenizer(pipeline=pipeline)
+                plan = ppe._plan_for(tokenizer)
+                self.assertIsNotNone(plan)
+                self.assertIs(plan[4], ppe._INTRA_CUT, "intra-gap cuts expected")
+                self._assert_cuts(tokenizer, _CUT_CASES)
+                if pipeline == "deepseek3":
+                    # The identity normalizer makes the normalized added token
+                    # a cut point as well, and keeps cuts out of it.
+                    self.assertIsNotNone(plan[3])
+                    self._assert_cuts(
+                        tokenizer,
+                        (
+                            ("ab<|norm|>cd", ["ab<|norm|>", "cd"]),
+                            ("ab\n<|norm|>\ncd", ["ab\n<|norm|>", "\n", "cd"]),
+                        ),
+                    )
+                else:
+                    self.assertIsNone(plan[3])
+
+    def test_edge_cases_encode_the_same_at_every_cut_point(self):
+        for pipeline in _OTHER_PIPELINES:
+            with self.subTest(pipeline):
+                tokenizer = _tokenizer(pipeline=pipeline)
+                texts = _edge_texts()
+                self._assert_every_cut_point_is_exact(tokenizer, texts, pipeline)
+                for text in texts:
+                    self._assert_matches_encode(tokenizer, text)
+
+    def test_fuzzed_texts_encode_the_same_at_every_cut_point(self):
+        for pipeline in _OTHER_PIPELINES:
+            with self.subTest(pipeline):
+                tokenizer = _tokenizer(pipeline=pipeline)
+                specials = list(_SPECIALS)
+                if pipeline == "deepseek3":
+                    specials.append(_NORMALIZED_SPECIAL)
+                texts = _fuzz_texts(specials, seed=pipeline, short=2000, long=10)
+                self._assert_every_cut_point_is_exact(tokenizer, texts, pipeline)
+                # A sample through the entry point, whose chunking is coarser.
+                for text in texts[::10]:
+                    self.assertEqual(
+                        ppe.parallel_prompt_encode(tokenizer, text, {}),
+                        tokenizer.encode(text),
+                        f"{pipeline} {text[:80]!r}",
+                    )
+
+    def test_a_long_prompt_uses_the_default_chunking(self):
+        for pipeline in _OTHER_PIPELINES:
+            with self.subTest(pipeline):
+                tokenizer = _tokenizer(pipeline=pipeline)
+                text = _long_prompt(_SPECIALS)
+                ids, chunks = _chunk_ids(tokenizer, text)
+                self.assertGreater(len(chunks), 1)
+                self.assertLessEqual(len(chunks), ppe._MAX_CHUNKS + 1)
+                self.assertEqual(ids, tokenizer.encode(text))
+                self._assert_matches_encode(tokenizer, text)
+
+
+class TestRealTokenizerFiles(_EncodeCase):
+    """The verified pipelines on real tokenizer files: the full vocabulary,
+    the real added tokens, every cut point. Skipped where no file is found."""
+
+    def setUp(self):
+        super().setUp()
+        self._no_min_chars()
+
+    def test_real_tokenizers_encode_the_same_at_every_cut_point(self):
+        found = False
+        for pipeline in _PIPELINES:
+            path = _real_tokenizer_file(pipeline)
+            if path is None:
+                continue
+            found = True
+            with self.subTest(pipeline):
+                tokenizer = PreTrainedTokenizerFast(tokenizer_file=path)
+                plan = ppe._plan_for(tokenizer)
+                self.assertIsNotNone(plan, f"{pipeline}: {path}")
+                self.assertIs(plan[4], ppe._INTRA_CUT, f"{pipeline}: {path}")
+                # The file's own markers, as wrappers and as fuzz atoms.
+                specials = [
+                    t.content
+                    for t in tokenizer._tokenizer.get_added_tokens_decoder().values()
+                    if t.content and not t.content.isalnum()
+                ][:8]
+                texts = _edge_texts(specials[0], specials[1])
+                texts += _fuzz_texts(specials, seed=pipeline, short=2000, long=10)
+                self._assert_every_cut_point_is_exact(tokenizer, texts, pipeline)
+                text = _long_prompt(specials)
+                ids, chunks = _chunk_ids(tokenizer, text)
+                self.assertGreater(len(chunks), 1)
+                self.assertEqual(ids, tokenizer.encode(text, add_special_tokens=False))
+                self._assert_matches_encode(tokenizer, text)
+        if not found:
+            self.skipTest(
+                "no tokenizer.json in SGLANG_TEST_TOKENIZER_JSONS or the HF cache"
+            )
+
+
 def _metaspace(backend):
     backend.pre_tokenizer = pre_tokenizers.Metaspace()
 
@@ -339,10 +597,31 @@ def _other_split_regex(backend):
     )
 
 
+def _removed_split(backend):
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(
+                Regex(ppe._LLAMA3_SPLIT_REGEX), behavior="removed", invert=True
+            ),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+
+
+def _reordered_splits(backend):
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(Regex(split), behavior="isolated")
+            for split in reversed(ppe._DEEPSEEK3_SPLIT_REGEXES)
+        ]
+        + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
+    )
+
+
 def _prefix_space(backend):
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
-            pre_tokenizers.Split(Regex(ppe._INTRA_SPLIT_REGEX), behavior="isolated"),
+            pre_tokenizers.Split(Regex(ppe._LLAMA3_SPLIT_REGEX), behavior="isolated"),
             pre_tokenizers.ByteLevel(add_prefix_space=True, use_regex=False),
         ]
     )
@@ -351,6 +630,14 @@ def _prefix_space(backend):
 def _lowercase_normalizer(backend):
     backend.add_tokens([AddedToken("NORM", normalized=True)])
     backend.normalizer = normalizers.Lowercase()
+
+
+def _nfd_normalizer(backend):
+    backend.normalizer = normalizers.NFD()
+
+
+def _normalized_added_token(backend):
+    backend.add_tokens([AddedToken("NORM", normalized=True)])
 
 
 def _post_processor_adds_bos(backend):
@@ -444,7 +731,7 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
             ),
             "split_special_tokens": _tokenizer(split_special_tokens=True),
             "wrapped encode": _WrappedTokenizer(
-                tokenizer_object=Tokenizer.from_str(_safe_backend_json())
+                tokenizer_object=Tokenizer.from_str(_backend_json())
             ),
             "slow tokenizer": _SlowWordTokenizer(),
         }
@@ -458,8 +745,16 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
         backend restarts the pipeline there whatever the pre-tokenizer is."""
         cases = {
             "different Split regex": _tokenizer(_other_split_regex),
+            "Split with Removed behavior": _tokenizer(_removed_split),
+            "Split sequence in another order": _tokenizer(
+                _reordered_splits, pipeline="deepseek3"
+            ),
             "ByteLevel add_prefix_space": _tokenizer(_prefix_space),
             "normalizer present": _tokenizer(_lowercase_normalizer),
+            "NFD normalizer": _tokenizer(_nfd_normalizer, pipeline="qwen2"),
+            "NFC with a normalized added token": _tokenizer(
+                _normalized_added_token, pipeline="qwen2"
+            ),
         }
         for name, tokenizer in cases.items():
             with self.subTest(name):
