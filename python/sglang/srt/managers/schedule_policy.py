@@ -143,7 +143,6 @@ def _ceil_div(value: int, divisor: int) -> int:
 def combine_truncation_align(
     truncation_align_size: Optional[int], *, grid: int
 ) -> Optional[int]:
-    """Add `grid` to the chunked-prefill alignment, keeping any existing one."""
     if grid <= 1:
         return truncation_align_size
     if truncation_align_size is None:
