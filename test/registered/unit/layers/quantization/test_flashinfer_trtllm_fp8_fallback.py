@@ -150,3 +150,78 @@ class TestBlockSizeDispatch(CustomTestCase):
             self.assertTrue(method.convert_mxfp8_to_block)
             self.assertIs(method.w8a8_block_fp8_linear, triton_w8a8_block_fp8_linear)
             self.assertFalse(method.block_fp8_as_mxfp8)
+
+
+class TestFlashinferPrequantizedInput(CustomTestCase):
+    """A pre-quantized ``(fp8 q, (m, k // 128) scales)`` input goes to the GEMM
+    as is, in the scale layout each FlashInfer backend reads, and never through
+    the quantizer again."""
+
+    def _invoke(self, backend, k, input_scale):
+        q = torch.zeros((M, k), dtype=torch.float8_e4m3fn)
+        weight = torch.zeros((N, k), dtype=torch.float32)
+        weight_scale = torch.zeros((N // 128, k // 128), dtype=torch.float32)
+
+        triton_spy = MagicMock(return_value=torch.zeros((M, N), dtype=torch.bfloat16))
+        gemm_spy = MagicMock(return_value=torch.zeros((M, N), dtype=torch.bfloat16))
+        quant_spy = MagicMock()
+
+        with (
+            patch.object(
+                fp8_utils,
+                "_get_flashinfer_groupwise_backend",
+                return_value=backend,
+                create=True,
+            ),
+            patch.object(fp8_utils, "gemm_fp8_nt_groupwise", gemm_spy, create=True),
+            patch.object(fp8_utils, "triton_w8a8_block_fp8_linear", triton_spy),
+            patch.object(fp8_utils, "sglang_per_token_group_quant_fp8", quant_spy),
+        ):
+            out = fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
+                q, weight, BLOCK_SIZE, weight_scale, input_scale=input_scale
+            )
+        quant_spy.assert_not_called()
+        self.assertEqual(out.dtype, torch.bfloat16)
+        return q, triton_spy, gemm_spy
+
+    @staticmethod
+    def _scales(k, *, column_major):
+        scales = torch.arange(M * (k // 128), dtype=torch.float32).view(M, k // 128)
+        return scales.t().contiguous().t() if column_major else scales
+
+    def test_cutlass_takes_mn_major_scales(self):
+        for column_major in (False, True):
+            with self.subTest(column_major=column_major):
+                scales = self._scales(512, column_major=column_major)
+                q, triton_spy, gemm_spy = self._invoke("cutlass", 512, scales)
+                triton_spy.assert_not_called()
+                (a, _, x_scale, _), kwargs = gemm_spy.call_args
+                self.assertEqual(a.data_ptr(), q.data_ptr())
+                self.assertTrue(x_scale.is_contiguous())
+                self.assertTrue(torch.equal(x_scale, scales.t()))
+                self.assertEqual(kwargs["out_dtype"], torch.bfloat16)
+
+    def test_trtllm_takes_column_major_scales(self):
+        for column_major in (False, True):
+            with self.subTest(column_major=column_major):
+                scales = self._scales(512, column_major=column_major)
+                q, triton_spy, gemm_spy = self._invoke("trtllm", 512, scales)
+                triton_spy.assert_not_called()
+                (a, _, x_scale, _), kwargs = gemm_spy.call_args
+                self.assertEqual(a.data_ptr(), q.data_ptr())
+                self.assertEqual(x_scale.stride(), (1, M))
+                self.assertTrue(torch.equal(x_scale, scales))
+                self.assertEqual(kwargs["out_dtype"], torch.bfloat16)
+
+    def test_trtllm_small_k_falls_back_with_row_major_scales(self):
+        scales = self._scales(128, column_major=True)
+        q, triton_spy, gemm_spy = self._invoke("trtllm", 128, scales)
+        gemm_spy.assert_not_called()
+        (a, _, _, _, x_scale, _), _ = triton_spy.call_args
+        self.assertEqual(a.data_ptr(), q.data_ptr())
+        self.assertTrue(x_scale.is_contiguous())
+        self.assertTrue(torch.equal(x_scale, scales))
+
+    def test_rejects_scales_of_the_wrong_shape(self):
+        with self.assertRaises(AssertionError):
+            self._invoke("cutlass", 512, torch.zeros((M, 3), dtype=torch.float32))
