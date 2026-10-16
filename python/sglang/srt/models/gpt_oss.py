@@ -137,8 +137,11 @@ class TinyGemmLinear(ReplicatedLinear):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # tinygemm serves only up to 128 tokens, so with it a token's router
+        # logits would depend on how many tokens share its batch.
         self._use_tinygemm = (
             _is_tinygemm_supported
+            and not get_exec().deterministic.enable_deterministic_inference
             and not self.skip_bias_add
             and self.weight.is_contiguous()
             and self.weight.shape[0] % 16 == 0

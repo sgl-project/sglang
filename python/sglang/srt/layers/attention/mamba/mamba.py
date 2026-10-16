@@ -642,9 +642,7 @@ class MambaMixer2(torch.nn.Module):
                     1, num_prefill_tokens, -1, self.head_dim
                 ),
                 state_dtype=ssm_state.dtype,
-                batch_invariant=(
-                    num_prefills > 1 and is_batch_invariant_mode_enabled()
-                ),
+                batch_invariant=is_batch_invariant_mode_enabled(),
                 batch_invariant_boundaries=mixed_metadata.prefill_boundaries,
             )
 

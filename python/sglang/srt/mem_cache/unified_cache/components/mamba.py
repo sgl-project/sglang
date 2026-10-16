@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
+    BufferLoadBackContext,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -42,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
+    process_model_config,
 )
 
 if TYPE_CHECKING:
@@ -567,6 +570,17 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if (
+            not self.cache.enable_mamba_extra_buffer
+            and get_exec().deterministic.enable_deterministic_inference
+        ):
+            scan_config = mamba2_scan_config(process_model_config())
+            # A live no-buffer slot has no saved prefill state after decoding.
+            # Only an unfinished prefill on the scan grid can be donated.
+            if scan_config is not None and (
+                is_finished or token_ids_len % scan_config.mamba_chunk_size != 0
+            ):
+                return 0
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
@@ -711,13 +725,18 @@ class MambaComponent(TreeComponent):
             )
         ):
             return PrepareLoadBackResult()
+        dst = self._alloc_request_state_slot(req)
+        assert dst is not None, "Cannot alloc mamba for load_back"
+        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert dst is not None, "Cannot alloc mamba for load_back"
-        req.kv.mamba_pool_idx = dst[0]
-        return PrepareLoadBackResult(allocated_mamba_slot=dst)
+        if dst is not None:
+            req.kv.mamba_pool_idx = dst[0]
+        return dst
 
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
@@ -726,6 +745,23 @@ class MambaComponent(TreeComponent):
         if not success and prep.allocated_mamba_slot is not None:
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
+
+    def prepare_buffer_load_back(
+        self, req: Req, staged: list[PoolTransfer]
+    ) -> Optional[BufferLoadBackContext]:
+        node_copy = next((t for t in staged if t.name == PoolName.MAMBA), None)
+        assert (
+            node_copy is not None
+            and node_copy.host_indices is not None
+            and node_copy.host_indices.numel() == 1
+        ), "Mamba buffer load-back requires one staged checkpoint"
+        prep = PrepareLoadBackResult()
+        if not req.kv.holds_mamba:
+            dst = self._alloc_request_state_slot(req)
+            if dst is None:
+                return None
+            prep = PrepareLoadBackResult(allocated_mamba_slot=dst)
+        return _MambaBufferLoadBackContext(self, req, node_copy, prep)
 
     def prepare_prefetch(
         self,
@@ -982,3 +1018,52 @@ class MambaComponent(TreeComponent):
         raise AssertionError(
             f"MambaComponent: unhandled ComponentAction {type(action).__name__}"
         )
+
+
+class _MambaBufferLoadBackContext(BufferLoadBackContext):
+    """Loads the staged state into the published node's slot and, layer-gated,
+    into the request's own: a device CoW would run before the layer gate."""
+
+    def __init__(
+        self,
+        component: MambaComponent,
+        req: Req,
+        node_copy: PoolTransfer,
+        prep: PrepareLoadBackResult,
+    ):
+        self.component = component
+        self.req = req
+        self.node_copy = node_copy
+        self.prep = prep
+        self.load_xfers = (
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=node_copy.host_indices,
+                device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
+            ),
+        )
+
+    def finalize_allocation(self, success: bool) -> None:
+        req = self.req
+        if not success:
+            self.component.finalize_load_back(req, self.prep, success=False)
+            return
+        # The H2D supersedes the replay cursor and the deferred CoW/clear.
+        req_to_token_pool = self.component.cache.req_to_token_pool
+        write_pos = req_to_token_pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None:
+            slot = req.kv.mamba_pool_idx.unsqueeze(0)
+            write_pos[req_to_token_pool.translate_mamba_indices(slot)] = 0
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+
+    def get_insert_fields(self) -> dict[str, torch.Tensor]:
+        return {"mamba_value": self.node_copy.device_indices}
+
+    def get_redundant_device_slots(
+        self, insert_result: InsertResult
+    ) -> list[tuple[PoolName, torch.Tensor]]:
+        # A SWA-only repair can keep the tail's existing checkpoint.
+        if not insert_result.mamba_exist:
+            return []
+        return [(PoolName.MAMBA, self.node_copy.device_indices)]

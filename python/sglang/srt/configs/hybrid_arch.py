@@ -108,6 +108,18 @@ def mamba2_config(model_config: ModelConfig):
     return None
 
 
+def mamba2_scan_config(model_config: ModelConfig):
+    """Return the config for models that use the Mamba2 chunked scan."""
+    config = model_config.hf_config
+    if isinstance(config, NemotronH_Nano_VL_V2_Config):
+        config = config.llm_config
+    if isinstance(
+        config, FalconH1Config | NemotronHConfig | Mamba2Config | GraniteMoeHybridConfig
+    ):
+        return mamba2_config(model_config)
+    return None
+
+
 def kimi_linear_config(model_config: ModelConfig):
     config = model_config.hf_config
     if isinstance(config, KimiLinearConfig):

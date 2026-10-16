@@ -35,6 +35,7 @@ def _track_states_at(
     initial_states,
     track_seq_idx,
     track_end_locs,
+    final_states=None,
 ):
     starts = cu_seqlens[track_seq_idx]
     ends = track_end_locs.to(device=starts.device, dtype=starts.dtype)
@@ -49,6 +50,7 @@ def _track_states_at(
         bounds,
         states.squeeze(0),
         initial_states=initial_states,
+        final_states=final_states,
     )[::2].unsqueeze(0)
 
 
@@ -74,6 +76,7 @@ def _mamba_chunk_scan_combined_fwd(
     track_seq_idx=None,
     track_end_locs=None,
     varlen_end_locs=None,
+    use_scan_boundary_states=False,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     batch, seqlen, nheads, headdim = x.shape
@@ -157,6 +160,7 @@ def _mamba_chunk_scan_combined_fwd(
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
         is_cont_batched=cu_seqlens is not None,
         chunk_offsets=chunk_offsets,
+        round_boundary_states=use_scan_boundary_states,
     )
     states, final_states = (
         rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
@@ -205,6 +209,7 @@ def _mamba_chunk_scan_combined_fwd(
                 cu_seqlens,
                 states.squeeze(0),
                 initial_states=initial_states,
+                final_states=final_states if use_scan_boundary_states else None,
             )
         else:
             # Aligned packing may add inert tokens after each real sequence.
@@ -219,6 +224,7 @@ def _mamba_chunk_scan_combined_fwd(
                 initial_states,
                 torch.arange(len(cu_seqlens) - 1, device=x.device),
                 varlen_end_locs,
+                final_states=final_states if use_scan_boundary_states else None,
             ).squeeze(0)
         track_states = None
         if (
@@ -236,6 +242,7 @@ def _mamba_chunk_scan_combined_fwd(
                 initial_states,
                 track_seq_idx,
                 track_end_locs,
+                final_states=final_states if use_scan_boundary_states else None,
             )
         return out_x, dt, dA_cumsum, states, final_states, varlen_states, track_states
 
@@ -294,6 +301,7 @@ def mamba_chunk_scan_combined(
         assert return_varlen_states and not return_final_states
         assert not return_intermediate_states
         assert cu_seqlens is not None and out is not None
+    if batch_invariant and cu_seqlens.numel() > 2:
         return _mamba_chunk_scan_combined_batch_invariant(
             x,
             dt,
@@ -344,6 +352,7 @@ def mamba_chunk_scan_combined(
             state_dtype=state_dtype,
             track_seq_idx=track_seq_idx,
             track_end_locs=track_end_locs,
+            use_scan_boundary_states=batch_invariant,
         )
     )
     if return_track_states:
@@ -504,6 +513,7 @@ def _mamba_chunk_scan_combined_batch_invariant(
         track_seq_idx=track_seq_idx,
         track_end_locs=padded_track_end_locs,
         varlen_end_locs=padded_end_locs,
+        use_scan_boundary_states=True,
     )
 
     for start, end, padded_start in zip(boundaries, boundaries[1:], padded_boundaries):

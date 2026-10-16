@@ -462,6 +462,7 @@ def _chunk_state_varlen_kernel(
     cu_seqlens_ptr,
     states_ptr,
     initstates_ptr,
+    final_states_ptr,
     # Matrix dimensions
     hdim,
     dstate,
@@ -493,8 +494,12 @@ def _chunk_state_varlen_kernel(
     stride_init_states_head,
     stride_init_states_hdim,
     stride_init_states_dstate,
+    stride_final_states_head,
+    stride_final_states_hdim,
+    stride_final_states_dstate,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    USE_SCAN_BOUNDARIES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -539,6 +544,8 @@ def _chunk_state_varlen_kernel(
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
 
     chunk_size_limit = end_idx - pid_c * chunk_size
+    reuse_scan_state = USE_SCAN_BOUNDARIES and end_idx % chunk_size == 0
+    chunk_size_limit = tl.where(reuse_scan_state, 0, chunk_size_limit)
     start_idx = tl.load(cu_seqlens_ptr + pid_b)
     start_idx_cur = tl.maximum(start_idx - pid_c * chunk_size, 0)
 
@@ -581,7 +588,7 @@ def _chunk_state_varlen_kernel(
     # If HAS_INITSTATES==True need to consider two possibilities
     # - if start_idx < pid_c * chunk_size, then we need to take the past_states_ptrs
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
-    if (start_idx < pid_c * chunk_size) or (HAS_INITSTATES):  # first chunk
+    if ((start_idx < pid_c * chunk_size) or HAS_INITSTATES) and not reuse_scan_state:
         dA_cs_boundary = 0.0  # default
 
         if not HAS_INITSTATES:
@@ -620,6 +627,32 @@ def _chunk_state_varlen_kernel(
         acc += past_states * scale
 
     states = acc.to(states_ptr.dtype.element_ty)
+
+    if USE_SCAN_BOUNDARIES:
+        if reuse_scan_state:
+            # A continuation must start with the exact state an unsplit scan uses.
+            # Recomputing it with a separately tuned reduction can change its bits.
+            boundary_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
+            if end_idx == seqlen:
+                final_boundary_ptrs = (
+                    final_states_ptr
+                    + pid_h * stride_final_states_head
+                    + offs_m[:, None] * stride_final_states_hdim
+                    + offs_n[None, :] * stride_final_states_dstate
+                )
+                states = tl.load(final_boundary_ptrs, mask=boundary_mask, other=0.0).to(
+                    states_ptr.dtype.element_ty
+                )
+            else:
+                chunk_boundary_ptrs = (
+                    chunk_states_ptr
+                    + stride_chunk_states_chunk
+                    + offs_m[:, None] * stride_chunk_states_hdim
+                    + offs_n[None, :] * stride_chunk_states_dstate
+                )
+                states = tl.load(chunk_boundary_ptrs, mask=boundary_mask, other=0.0).to(
+                    states_ptr.dtype.element_ty
+                )
 
     states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -756,7 +789,14 @@ def _chunk_state_fwd(
 
 
 def chunk_state_varlen(
-    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_seqlens,
+    chunk_states,
+    initial_states=None,
+    final_states=None,
 ):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -771,6 +811,8 @@ def chunk_state_varlen(
 
     if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
+    if final_states is not None:
+        assert final_states.shape == (1, nheads, headdim, dstate)
 
     states = torch.empty(
         batch,
@@ -796,6 +838,7 @@ def chunk_state_varlen(
             cu_seqlens,
             states,
             initial_states,
+            final_states,
             headdim,
             dstate,
             chunk_size,
@@ -832,5 +875,15 @@ def chunk_state_varlen(
                 else (0, 0, 0, 0)
             ),
             HAS_INITSTATES=initial_states is not None,
+            stride_final_states_head=(
+                final_states.stride(1) if final_states is not None else 0
+            ),
+            stride_final_states_hdim=(
+                final_states.stride(2) if final_states is not None else 0
+            ),
+            stride_final_states_dstate=(
+                final_states.stride(3) if final_states is not None else 0
+            ),
+            USE_SCAN_BOUNDARIES=final_states is not None,
         )
     return states

@@ -34,7 +34,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config, mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     get_self_pp_group,
@@ -210,6 +210,18 @@ def sample_draft_proposal(
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+
+
+def check_simulate_acc_token_mode() -> None:
+    if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_TOKEN_MODE not in (
+        "fixed",
+        "real-draft-token",
+    ):
+        raise ValueError(
+            "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+            f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or 'real-draft-token'."
+        )
+
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -838,6 +850,14 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+def _can_track_mamba_verify(batch: ScheduleBatch) -> bool:
+    # Recurrent verify states cannot restart a bit-exact Mamba2 chunked scan.
+    return not (
+        get_exec().deterministic.enable_deterministic_inference
+        and mamba2_scan_config(batch.model_config) is not None
+    )
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
@@ -852,16 +872,20 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
-    track_positions = None
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
-        track_positions = batch.mamba_lazy_spec_track_positions_cpu
-        assert track_positions is not None and len(track_positions) == len(
-            batch.reqs
-        ), (
-            "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
-            "must run in prepare_for_decode for every spec decode iteration"
-        )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
+    if not _can_track_mamba_verify(batch):
+        batch.mamba_track_indices = None
+        batch.mamba_track_buffer_indices = []
+    else:
+        track_positions = None
+        if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+            track_positions = batch.mamba_lazy_spec_track_positions_cpu
+            assert track_positions is not None and len(track_positions) == len(
+                batch.reqs
+            ), (
+                "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
+                "must run in prepare_for_decode for every spec decode iteration"
+            )
+        set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None
@@ -1178,7 +1202,9 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    if get_exec().mamba.enable_mamba_extra_buffer_lazy and _can_track_mamba_verify(
+        batch
+    ):
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),

@@ -96,6 +96,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
 )
@@ -361,7 +362,7 @@ class _DominoDraftSampler:
             lm_head_org_vocab_start=self.lm_head_org_vocab_start,
             lm_head_num_org=self.lm_head_num_org,
             lm_head_num_org_padded=self.lm_head_num_org_padded,
-            prefer_tp_candidate_pool=bs > 1,
+            in_cuda_graph=True,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
@@ -405,6 +406,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
+        check_simulate_acc_token_mode()
 
         # Under dp attention, the draft worker runs on the per-DP attn-TP
         # group, independent of idle peer DP ranks; it is built and run under
@@ -2214,7 +2216,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, target_predict
+        if SIMULATE_ACC_LEN > 0:
+            apply_dflash_simulated_acceptance(
+                candidates=candidates,
+                target_predict=target_predict,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_method=SIMULATE_ACC_METHOD,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                next_token_logits=next_token_logits,
+            )
+            # The Triton path may have written new_seq_lens from the real
+            # accept_len; recompute it from the forced commit_lens.
+            new_seq_lens = None
+
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2655,6 +2674,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head_num_org_padded=(
                     int(shard.num_org_elements_padded) if shard is not None else None
                 ),
+                in_cuda_graph=False,
             )
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
@@ -2834,7 +2854,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus,
             out_tokens,
             new_seq_lens,
-            target_predict,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2843,34 +2862,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             bs=bs,
         )
-
-        if SIMULATE_ACC_LEN > 0:
-            if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
-                raise ValueError(
-                    "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
-                    f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
-                    "'real-draft-token'."
-                )
-
-            if SIMULATE_ACC_TOKEN_MODE == "real-draft-token" and target_predict is None:
-                # The sampling-verify branch does not materialize the target argmax.
-                target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
-                ).view(bs, int(self.block_size))
-            apply_dflash_simulated_acceptance(
-                candidates=candidates,
-                target_predict=target_predict,
-                accept_len=accept_len,
-                commit_lens=commit_lens,
-                bonus=bonus,
-                out_tokens=out_tokens,
-                simulate_acc_len=SIMULATE_ACC_LEN,
-                simulate_acc_method=SIMULATE_ACC_METHOD,
-                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            )
-            # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
-            new_seq_lens = None
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,

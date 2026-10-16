@@ -16,9 +16,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
+SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -105,11 +107,12 @@ def _a2a_staging_buffer(
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
+    sp_group = get_sp_group()
+    ulysses_pg = sp_group.ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
-    if x.is_cuda and not _UNCACHED_STAGING:
+    if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
             IPC_A2A_MULTI,
             ipc_a2a_multi_ready,
@@ -124,9 +127,21 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
         output = torch.empty_like(x)
     else:
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
+
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    handle = sp_group.ulysses_shm_handle
+    input_bytes = x.numel() * x.element_size()
+    if (
+        current_platform.is_cpu()
+        and handle is not None
+        and handle >= 0
+        and input_bytes <= SHM_ALLTOALL_MAX_BYTES
+    ):
+        torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
+    else:
+        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+
     return output.reshape(x_shape)
 
 
@@ -169,7 +184,9 @@ def _ipc_ready_group():
         ipc_a2a_ready,
     )
 
-    if _UNCACHED_STAGING:
+    # The transport's custom-class handles cannot be traced; a compiled graph
+    # keeps the NCCL all-to-all (traceable) instead of breaking here.
+    if _UNCACHED_STAGING or torch.compiler.is_compiling():
         return None
     group = get_sp_group().ulysses_group
     return group if ipc_a2a_ready(group) else None

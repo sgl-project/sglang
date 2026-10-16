@@ -87,6 +87,7 @@ from sglang.srt.beam_search.batch_tail import (
     strip_beam_tail,
 )
 from sglang.srt.beam_search.fork import free_member_rows
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -904,7 +905,7 @@ class ReqLogprob:
     input_top_logprobs_val: Optional[List[List[float]]] = None
     input_top_logprobs_idx: Optional[List[List[int]]] = None
     # Flat replacements for the rows above (see
-    # build_flat_input_top_logprobs_arrays); when set, the nested rows are
+    # build_flat_top_logprobs_arrays); when set, the nested rows are
     # emptied and the arrays ship instead.
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
@@ -1077,6 +1078,8 @@ class Req(ReqDllmMixin):
         self.dllm_initialized: bool = False
 
         self.session = session
+        # media added by this turn, excluding the session's borrowed history
+        self._session_mm_items: List[MultimodalDataItem] = []
         self.session_id = session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
@@ -1178,6 +1181,7 @@ class Req(ReqDllmMixin):
         self.mm_image_tokens: int = 0
         self.mm_audio_tokens: int = 0
         self.mm_video_tokens: int = 0
+        self.mm_token_counts_ready: bool = False
 
         # Prefix info
         # Tokens [0, prefix_len) are already in the row, or, before allocation,
@@ -1365,7 +1369,14 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Override embeds give KV that the token ids alone do not determine.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
+        # Set when the request's in-flight forward ran on KV that never landed:
+        # that forward's output is dropped and the request finishes with it.
+        self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1418,6 +1429,26 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+    def get_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Return per-modality prompt counts, scanning media at most once."""
+        if not self.mm_token_counts_ready and self.multimodal_inputs is not None:
+            (
+                self.mm_image_tokens,
+                self.mm_audio_tokens,
+                self.mm_video_tokens,
+            ) = self.multimodal_inputs.compute_mm_token_counts()
+            self.mm_token_counts_ready = True
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
+    def inherit_mm_token_counts(self, other: Req) -> None:
+        """Reuse counts from the request whose media history is shared."""
+        (
+            self.mm_image_tokens,
+            self.mm_audio_tokens,
+            self.mm_video_tokens,
+        ) = other.get_mm_token_counts()
+        self.mm_token_counts_ready = True
+
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,
@@ -1450,12 +1481,20 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    @property
+    def auxiliary_swa_host_hit_length(self) -> int:
+        plan = self.staged_prefetch_plan
+        return (
+            plan.window_tokens(ComponentType.AUXILIARY_SWA) if plan is not None else 0
+        )
+
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
         return (
             self.host_hit_length > 0
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
+            or self.auxiliary_swa_host_hit_length > 0
         )
 
     def materialized_host_hit_len(self) -> int:
@@ -1510,6 +1549,13 @@ class Req(ReqDllmMixin):
         self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
+        if self.mm_token_counts_ready:
+            image_tokens, audio_tokens, video_tokens = (
+                image_inputs.compute_mm_token_counts()
+            )
+            self.mm_image_tokens += image_tokens
+            self.mm_audio_tokens += audio_tokens
+            self.mm_video_tokens += video_tokens
         if self.session is not None:
             self._extend_session_image_inputs(image_inputs)
         elif self.multimodal_inputs is None:
@@ -1519,6 +1565,7 @@ class Req(ReqDllmMixin):
 
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""
+        self._session_mm_items.extend(image_inputs.mm_items)
         # Padding can change token values without changing their count.
         self.full_untruncated_fill_ids = array("q")
         if self.multimodal_inputs is not None:
@@ -1563,6 +1610,18 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.mrope_position_delta = (
                 positions.max() + 1 - positions.shape[1]
             ).reshape(1, 1)
+
+    def release_mm_inputs_on_abort(self) -> None:
+        """Release this turn's media without invalidating session history."""
+        if self.session is None:
+            if self.multimodal_inputs is not None:
+                self.multimodal_inputs.release_features()
+        else:
+            for item in self._session_mm_items:
+                item.release_transport_proxies()
+                item.feature = None
+            self._session_mm_items.clear()
+        self.multimodal_inputs = None
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -2110,9 +2169,7 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         # Session requests share historical multimodal inputs with their prior
         # request. The session owns and releases those features when it closes.
-        if self.multimodal_inputs is not None and self.session is None:
-            self.multimodal_inputs.release_features()
-        self.multimodal_inputs = None
+        self.release_mm_inputs_on_abort()
         self.grammar = None
         self.origin_input_ids = array(
             "q", [0]
@@ -2900,8 +2957,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         if self.return_logprob:
+            # Pin so the non_blocking H2D copy in ForwardBatch.init_new is stream-ordered
             extend_input_logprob_token_ids = torch.tensor(
-                extend_input_logprob_token_ids
+                extend_input_logprob_token_ids,
+                pin_memory=is_pin_memory_available(self.device),
             )
             # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
             # so they stay within the vocab boundary before being sent to GPU.
@@ -3317,15 +3376,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # No backup exists and the device KV is already freed, so the
                 # request cannot resume.
-                if get_disagg().disaggregation_decode_retraction_backup == "none":
+                if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                else:
                     message = (
                         "Retracted under decode memory pressure without a KV "
                         "backup. Retry later."
                     )
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                else:
-                    message = "Retraction host KV pool exhausted. Aborting the request."
-                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 req.to_finish = FINISH_ABORT(message, status_code=status_code)
                 reqs_to_abort.append(req)
                 logger.warning(
@@ -3472,6 +3531,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.kv.mamba_next_track_idx = other_idx
+            else:
+                # The in-flight write invalidates the keep slot's old checkpoint.
+                req.kv.mamba_last_track_seqlen = None
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3508,6 +3570,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if new_slot is not None:
                     pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                     has_pending = True
+                else:
+                    req.kv.mamba_last_track_seqlen = None
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(
                 other_idx if has_pending else req.kv.mamba_next_track_idx
@@ -3601,6 +3665,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+            # Token-wise decode and chunked scans use different reductions.
+            # Deterministic requests may only reuse prefill checkpoints.
+            track_decode = not (
+                get_exec().deterministic.enable_deterministic_inference
+                and mamba2_scan_config(self.model_config) is not None
+            )
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
@@ -3608,15 +3678,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 self.mamba_track_buffer_indices = []
             else:
-                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy and track_decode:
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
-            track_mask_cpu = track_remainders_cpu == 0
+            track_mask_cpu = (track_remainders_cpu == 0) & track_decode
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                (
+                    (track_remainders_cpu == mamba_track_interval - 1) & track_decode
+                ).tolist()
                 if self.enable_overlap
                 else None
             )
