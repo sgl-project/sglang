@@ -10,6 +10,7 @@ export const Qwen36Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
         { id: 'xeon', label: 'XEON', default: false },
+        { id: 'arc_b', label: 'BMG', default: false },
       ],
     },
     modelSize: {
@@ -24,10 +25,13 @@ export const Qwen36Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
+      // BMG currently supports BF16 only for Qwen3.6.
       getDynamicItems: (values) => {
+        const isArcB = values.hardware === 'arc_b';
         const items = [
-          { id: 'fp8', label: 'FP8', default: true },
-          { id: 'bf16', label: 'BF16', default: false },
+          { id: 'fp8', label: 'FP8', default: !isArcB, disabled: isArcB,
+            disabledReason: isArcB ? 'FP8 is not supported on BMG for Qwen3.6' : '' },
+          { id: 'bf16', label: 'BF16', default: isArcB },
         ];
         const nvfp4Supported = values.hardware === 'b200' || values.hardware === 'b300';
         if (nvfp4Supported) {
@@ -59,10 +63,17 @@ export const Qwen36Deployment = () => {
       title: 'Speculative Decoding (MTP)',
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
+        const isArcB = values.hardware === 'arc_b';
+        const unsupported = isXeon || isArcB;
+        const disabledReason = isXeon
+          ? 'Speculative decoding is not supported on Xeon'
+          : isArcB
+            ? 'Speculative decoding is not supported on BMG'
+            : '';
         return [
-          { id: 'disabled', label: 'Disabled', default: isXeon },
-          { id: 'enabled', label: 'Enabled', default: !isXeon, disabled: isXeon,
-            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' },
+          { id: 'disabled', label: 'Disabled', default: unsupported },
+          { id: 'enabled', label: 'Enabled', default: !unsupported, disabled: unsupported,
+            disabledReason },
         ];
       },
       commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
@@ -70,7 +81,7 @@ export const Qwen36Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'arc_b',
       getDynamicItems: (values) => {
         const mtpEnabled = values.speculative === 'enabled';
         if (mtpEnabled) {
@@ -96,6 +107,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
+      arc_b: { bf16: { tp: 4, mem: 0.8 } },
     },
     '27b': {
       baseName: '27B',
@@ -104,6 +116,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 6 },           fp8: { tp: 6 } },
+      arc_b: { bf16: { tp: 4, mem: 0.8 } },
     },
   };
 
@@ -201,6 +214,9 @@ export const Qwen36Deployment = () => {
     let cmd = `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (hardware === 'arc_b') {
+      cmd += ` \\\n  --device xpu`;
+      cmd += ` \\\n  --linear-attn-backend intel_xpu`;
     }
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
