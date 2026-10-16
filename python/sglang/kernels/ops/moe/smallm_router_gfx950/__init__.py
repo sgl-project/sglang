@@ -89,8 +89,8 @@ def qwen_moe_topk_output(block, hidden_states):
     from sglang.srt.layers.moe import get_moe_runner_backend
     from sglang.srt.layers.moe.topk import (
         StandardTopKOutput,
-        _eplb_remap_enabled,
         capture_routed_experts_if_allowed,
+        is_expert_remapping_enabled,
     )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
         is_in_tc_piecewise_cuda_graph,
@@ -115,7 +115,7 @@ def qwen_moe_topk_output(block, hidden_states):
             and sw.is_contiguous()
             and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
             and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-            and not _eplb_remap_enabled()
+            and not is_expert_remapping_enabled()
         )
     if (
         not ok

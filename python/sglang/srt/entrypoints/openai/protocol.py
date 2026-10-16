@@ -407,6 +407,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
@@ -911,6 +914,11 @@ class ChatCompletionRequest(PDRoutingFields):
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
+    # Flat output top logprobs in choices[].meta_info (requires return_meta_info);
+    # choices[].logprobs top_logprobs are then empty.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
+    return_flat_raw_top_logprobs_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -961,6 +969,9 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

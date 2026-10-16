@@ -65,10 +65,55 @@ class LoRANameTable:
     def register(self, *, lora_id: str, lora_name: str) -> None:
         self._names[lora_id] = lora_name
 
+    def get(self, extra_key: Optional[str]) -> Optional[str]:
+        return self.resolve(extra_key)
+
     def resolve(self, extra_key: Optional[str]) -> Optional[str]:
         if not extra_key:
             return None
         return self._names.get(extra_key[-_LORA_ID_LEN:])
+
+
+class KvEventLoraNames(LoRANameTable):
+    """Public names of selected LoRA namespaces, kept for the publisher lifetime.
+
+    Write-back can publish a host store after the last GPU removal and after
+    its request dies, so request or published-block counts cannot bound this.
+    """
+
+    def __init__(self):
+        # Adapter-id registrations keep the existing Dynamo load-time lookup.
+        self._adapter_names: dict[str, str] = {}
+        self._names: dict[str, str] = {}
+
+    def register(
+        self,
+        req: Any = None,
+        lora_name: Optional[str] = None,
+        *,
+        lora_id: Optional[str] = None,
+    ) -> None:
+        """Name ``req``'s namespace; ``req`` needs ``extra_key`` and ``lora_id``."""
+        if lora_id is not None:
+            self._adapter_names[lora_id] = lora_name
+            return
+        if req.lora_id is None:
+            return
+        # Older IPC senders omit the optional name; admission still resolves an ID.
+        lora_name = lora_name or self._adapter_names.get(req.lora_id)
+        if not lora_name:
+            return
+        self._names[req.extra_key] = lora_name
+
+    def get(self, extra_key: Optional[str]) -> Optional[str]:
+        return self._names.get(extra_key)
+
+    def resolve(self, extra_key: Optional[str]) -> Optional[str]:
+        if not extra_key:
+            return None
+        return self._names.get(extra_key) or self._adapter_names.get(
+            extra_key[-_LORA_ID_LEN:]
+        )
 
 
 class KVCacheEventRecorder:
@@ -84,12 +129,12 @@ class KVCacheEventRecorder:
         enabled: bool,
         page_size: int,
         dynamo_format: bool = False,
-        lora_names: Optional[LoRANameTable] = None,
+        lora_names: Optional[KvEventLoraNames] = None,
     ):
         self.enabled = enabled
         self.page_size = page_size
         self.dynamo_format = dynamo_format
-        self.lora_names = lora_names if lora_names is not None else LoRANameTable()
+        self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -114,6 +159,7 @@ class KVCacheEventRecorder:
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt
                     and tail.session_id == event.session_id
+                    and tail.lora_name == event.lora_name
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -151,9 +197,15 @@ class KVCacheEventRecorder:
         return hash_str_to_int64(parent_hash_values[-1])
 
     def _namespace_seed(self, node: Any) -> Optional[bytes]:
-        # The default format publishes the hashes unchanged.
         if not self.dynamo_format:
-            return None
+            return kv_event_namespace_seed(
+                extra_key=(
+                    node.key.extra_key
+                    if self.lora_names.get(node.key.extra_key) is not None
+                    else None
+                ),
+                cache_salt=None,
+            )
         return kv_event_namespace_seed(
             extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
         )
@@ -177,7 +229,9 @@ class KVCacheEventRecorder:
                 parent_block_hash, namespace_seed=namespace_seed
             )
         lora_name = (
-            self.lora_names.resolve(node.key.extra_key) if self.dynamo_format else None
+            self.lora_names.resolve(node.key.extra_key)
+            if self.dynamo_format
+            else self.lora_names.get(node.key.extra_key)
         )
 
         page_index = 0
