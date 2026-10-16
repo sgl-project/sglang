@@ -4,8 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
-import msgspec
-
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -747,20 +745,14 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
     ]
 
 
-class _LowRatioRegion(msgspec.Struct, frozen=True):
-    """One shared-source KV or indexer buffer group, in FULL-page rows."""
-
-    name: PoolName
-    device_pool: Any
-    buffers: list
-    layer_mapping: dict[int, int]
-
-
-def _dsv4_low_ratio_regions(kvcache: Any, page_size: int) -> list[_LowRatioRegion]:
-    """Expose shared source KV and indexer buffers in FULL-page units."""
+def _dsv4_low_ratio_regions(
+    kvcache: Any, page_size: int
+) -> list[tuple[PoolName, Any, list, dict[int, int]]]:
+    """(name, device_pool, buffers, layer_mapping) per shared source KV and
+    indexer buffer group, in FULL-page units."""
     import torch
 
-    regions: list[_LowRatioRegion] = []
+    regions = []
     for ratio, names in (
         (
             1,
@@ -791,9 +783,7 @@ def _dsv4_low_ratio_regions(kvcache: Any, page_size: int) -> list[_LowRatioRegio
         layer_mapping = {
             source - kvcache.start_layer: index for index, source in enumerate(sources)
         }
-        regions.append(
-            _LowRatioRegion(names[0], kv_pool, kv_pool.kv_buffer, layer_mapping)
-        )
+        regions.append((names[0], kv_pool, kv_pool.kv_buffer, layer_mapping))
         if index_pool.index_k_with_scale_buffer is not None:
             index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
         else:
@@ -811,7 +801,7 @@ def _dsv4_low_ratio_regions(kvcache: Any, page_size: int) -> list[_LowRatioRegio
                     .view(torch.uint8)
                     .reshape(full_pages, -1)
                 )
-            regions.append(_LowRatioRegion(name, index_pool, rows, layer_mapping))
+            regions.append((name, index_pool, rows, layer_mapping))
     return regions
 
 
@@ -820,13 +810,14 @@ def _dsv4_low_ratio_entries(
 ):
     """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
     entries = []
-    for region in _dsv4_low_ratio_regions(kvcache, page_size):
-        buffers = region.buffers
+    for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+        kvcache, page_size
+    ):
         entries.append(
             build_pool_entry(
-                name=region.name,
+                name=name,
                 host_pool=DeepSeekV4PagedHostPool(
-                    pool_name=str(region.name),
+                    pool_name=str(name),
                     device_buffers=buffers,
                     item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
                     num_host_pages=num_host_pages,
@@ -835,8 +826,8 @@ def _dsv4_low_ratio_entries(
                     allocator_type=_get_allocator_type(),
                     page_aligned_only=True,
                 ),
-                device_pool=region.device_pool,
-                layer_mapping=region.layer_mapping,
+                device_pool=device_pool,
+                layer_mapping=layer_mapping,
                 transfer_layer_id_max=transfer_layer_id_max,
             )
         )
