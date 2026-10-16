@@ -15,13 +15,28 @@
 
 import json
 import logging
+from collections import OrderedDict
+from concurrent.futures import Future
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.inkling_tokenizer import (
+    CONTENT_MODEL_END_SAMPLING,
+    CONTENT_TEXT,
+    CONTENT_THINKING,
+    END_MESSAGE,
+    INKLING_SPECIAL_TOKEN_IDS,
+    MESSAGE_MODEL,
+)
+from sglang.srt.parser.reasoning_parser import (
+    InklingDetector as InklingReasoningDetector,
+)
+from sglang.srt.parser.reasoning_parser import (
+    ReasoningParser,
+)
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 from .base_grammar_backend import (
@@ -31,6 +46,79 @@ from .base_grammar_backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+_canonical_inkling_auto_tool_schema: Optional[dict] = None
+_INKLING_FRAMED_KEY_TYPES = ("json", "regex", "ebnf")
+_INKLING_OPEN_TEXT_VARIANT = "inkling_open_text"
+_INKLING_THINK_BUDGET_VARIANT = "inkling_think_budget="
+# Arbitrary bound; budgets are a per-request knob, so only recent variants stay cached.
+_INKLING_BUDGET_VARIANT_CACHE_SIZE = 32
+
+
+def _get_canonical_inkling_auto_tool_schema() -> dict:
+    global _canonical_inkling_auto_tool_schema
+    if _canonical_inkling_auto_tool_schema is None:
+        # Lazy: inkling_detector imports xgrammar unconditionally, and XPU
+        # installs may not ship it.
+        from sglang.srt.function_call.inkling_detector import InklingDetector
+
+        _canonical_inkling_auto_tool_schema = (
+            InklingDetector()
+            .get_auto_tool_call_structural_tag()
+            .model_dump(by_alias=True)
+        )
+    return _canonical_inkling_auto_tool_schema
+
+
+def _inkling_answer_structural_tag(
+    content: dict, *, in_text_block: bool, max_think_tokens: int
+) -> dict:
+    def token(name: str) -> dict:
+        return {"type": "token", "token": INKLING_SPECIAL_TOKEN_IDS[name]}
+
+    elements = [content, token(END_MESSAGE)]
+    if in_text_block:
+        return {
+            "type": "structural_tag",
+            "format": {"type": "sequence", "elements": elements},
+        }
+    thinking = {
+        "type": "any_tokens",
+        "exclude_tokens": [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
+    }
+    if max_think_tokens >= 0:
+        thinking["max_tokens"] = max_think_tokens
+    thinking_message = {
+        "type": "sequence",
+        "elements": [
+            token(MESSAGE_MODEL),
+            token(CONTENT_THINKING),
+            thinking,
+            token(END_MESSAGE),
+        ],
+    }
+    elements = [
+        {"type": "optional", "content": thinking_message},
+        token(MESSAGE_MODEL),
+        token(CONTENT_TEXT),
+        *elements,
+    ]
+    return {
+        "type": "structural_tag",
+        "format": {"type": "sequence", "elements": elements},
+    }
+
+
+def _ends_in_open_inkling_text_block(input_ids: Sequence[int]) -> bool:
+    end_message = INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]
+    last_end = next(
+        (i for i in range(len(input_ids) - 1, -1, -1) if input_ids[i] == end_message),
+        -1,
+    )
+    return list(input_ids[last_end + 1 : last_end + 3]) == [
+        INKLING_SPECIAL_TOKEN_IDS[MESSAGE_MODEL],
+        INKLING_SPECIAL_TOKEN_IDS[CONTENT_TEXT],
+    ]
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -271,9 +359,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        think_end_ids = tokenizer.encode(
-            reasoning_parser.detector.think_end_token, add_special_tokens=False
-        )
+        self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
         if not think_end_ids:
             raise ValueError(
                 f"think_end_token '{reasoning_parser.detector.think_end_token}' "
@@ -281,6 +368,19 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
+        self._is_inkling_detector = isinstance(
+            reasoning_parser.detector, InklingReasoningDetector
+        )
+        if self._is_inkling_detector:
+            # Inkling's control tokens decode to their literal spellings, so text
+            # positions such as JSON strings would otherwise admit <|end_message|>.
+            self.grammar_backend.reserve_framing_tokens(
+                [
+                    token_id
+                    for token, token_id in INKLING_SPECIAL_TOKEN_IDS.items()
+                    if token != CONTENT_MODEL_END_SAMPLING
+                ]
+            )
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
@@ -347,22 +447,88 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return None
         return self._make_grammar_object(None, reasoning)
 
+    def get_request_grammar_key(
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
+    ) -> Tuple[str, str]:
+        key_type, key_string = key
+        if not (self._is_inkling_detector and key_type in _INKLING_FRAMED_KEY_TYPES):
+            return key
+        if _ends_in_open_inkling_text_block(input_ids):
+            return (f"{key_type}:{_INKLING_OPEN_TEXT_VARIANT}", key_string)
+        # Mirrors the strict wrapper, which applies a request budget only while filtering.
+        if not self.enable_token_filter or thinking_budget is None:
+            return key
+        budget = max(thinking_budget, -1)
+        if budget == max(self.max_think_tokens, -1):
+            return key
+        return (f"{key_type}:{_INKLING_THINK_BUDGET_VARIANT}{budget}", key_string)
+
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
+        if key in self._budget_variant_keys:
+            self._budget_variant_keys.move_to_end(key)
+        return super().get_cached_or_future_value(key, require_reasoning)
+
+    def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        super().set_cache(key, value)
+        if _INKLING_THINK_BUDGET_VARIANT not in key[0]:
+            return
+        self._budget_variant_keys[key] = None
+        self._budget_variant_keys.move_to_end(key)
+        while len(self._budget_variant_keys) > _INKLING_BUDGET_VARIANT_CACHE_SIZE:
+            evicted, _ = self._budget_variant_keys.popitem(last=False)
+            self.cache.pop(evicted, None)
+
+    def reset(self):
+        super().reset()
+        self._budget_variant_keys.clear()
+
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
+        key_type, _, variant = key[0].partition(":")
+        key = (key_type, key[1])
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
             return ret
-        if not self.enable_strict_thinking and key[0] == "structural_tag":
-            from sglang.srt.function_call.inkling_detector import InklingDetector
-
+        if self._is_inkling_detector and key[0] in _INKLING_FRAMED_KEY_TYPES:
+            # The frame delimits thinking by message kind, so it owns the whole
+            # turn; strict thinking only caps the thinking message.
+            framed = self._frame_inkling_answer(ret, variant)
+            if framed is not None:
+                return framed
+        if (
+            not self.enable_strict_thinking
+            and key[0] == "structural_tag"
+            and self._is_inkling_detector
+        ):
             # Only this canonical schema owns the full turn; user restrictions may not.
-            if json.loads(key[1]) == (
-                InklingDetector()
-                .get_auto_tool_call_structural_tag()
-                .model_dump(by_alias=True)
-            ):
+            if json.loads(key[1]) == _get_canonical_inkling_auto_tool_schema():
                 return ret
         return self._make_grammar_object(ret, reasoning)
+
+    def _frame_inkling_answer(
+        self, grammar: BaseGrammarObject, variant: str
+    ) -> Optional[BaseGrammarObject]:
+        in_text_block = variant == _INKLING_OPEN_TEXT_VARIANT
+        if variant.startswith(_INKLING_THINK_BUDGET_VARIANT):
+            max_think_tokens = int(variant.removeprefix(_INKLING_THINK_BUDGET_VARIANT))
+        elif self.enable_strict_thinking:
+            max_think_tokens = self.max_think_tokens
+        else:
+            max_think_tokens = -1
+        return self.grammar_backend.compile_framed_grammar(
+            grammar,
+            lambda content: _inkling_answer_structural_tag(
+                content,
+                in_text_block=in_text_block,
+                max_think_tokens=max_think_tokens,
+            ),
+        )
