@@ -10,7 +10,7 @@ set -euo pipefail
 
 readonly DEEP_GEMM_VERSION="0.2.1.post1+muse.cbe1727"
 readonly SOURCE_REVISION="cbe1727eacd9ad704795584ce1421dd1f5a8d67e"
-readonly PATCH_SHA256="40fe1894eaae94324ad3051bbb7a414e4f2b1b8d03e81986df434e368fca8bb9"
+readonly PATCH_SHA256="2add36aa8264c338afc2a9013dd4b3a2dbf73a5b9746dc1ce82915a2fa1fadc1"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly PATCH_FILE="${SCRIPT_DIR}/deep_gemm.patch"
 
