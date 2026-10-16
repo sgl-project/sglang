@@ -1435,6 +1435,22 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+    # NIXL KV packing gathers [tokens, heads, head_dim] pages; validated only on
+    # SWA hybrids whose full and SWA pools are plain NHD MHA pools. Each pool is
+    # gathered with one page size for K and V, and both are sliced with the
+    # full-attention head count, so K/V head dims and the head counts must match.
+    kv_args.kv_packable = (
+        draft_token_to_kv_pool is None
+        and isinstance(token_to_kv_pool, SWAKVPool)
+        and all(
+            type(pool) is MHATokenToKVPool
+            and pool.kv_cache_layout == "nhd"
+            and pool.head_dim == pool.v_head_dim
+            for pool in (token_to_kv_pool.full_kv_pool, token_to_kv_pool.swa_kv_pool)
+        )
+        and token_to_kv_pool.full_kv_pool.head_num
+        == token_to_kv_pool.swa_kv_pool.head_num
+    )
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
