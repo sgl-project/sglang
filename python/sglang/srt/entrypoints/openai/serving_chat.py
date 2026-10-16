@@ -498,19 +498,6 @@ class OpenAIServingChat(OpenAIServingBase):
             ),
         )
 
-    def normalize_history_messages(self, messages: List[Any]) -> List[Any]:
-        """Adapt Anthropic or Responses history to the form this spec's encoder reads."""
-        if self._spec_adapter is None:
-            return messages
-        return [
-            (
-                self._spec_adapter.normalize_history_message(message)
-                if isinstance(message, dict)
-                else message
-            )
-            for message in messages
-        ]
-
     def _spec_output(self) -> Optional[spec_adapters.SpecOutputAdapter]:
         if self._spec_adapter is None:
             return None

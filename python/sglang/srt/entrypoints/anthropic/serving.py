@@ -549,10 +549,6 @@ class AnthropicServing:
                 openai_msg["content"] = ""
                 openai_messages.append(openai_msg)
 
-        openai_messages = self.openai_serving_chat.normalize_history_messages(
-            openai_messages
-        )
-
         # Build ChatCompletionRequest
         request_data = {
             "messages": openai_messages,

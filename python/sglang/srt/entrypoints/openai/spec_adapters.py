@@ -85,11 +85,6 @@ class SpecAdapter(Protocol):
         """None when the configured parsers leave output to the text parsers."""
         ...
 
-    def normalize_history_message(self, message: dict[str, Any]) -> dict[str, Any]:
-        """Rewrite one Anthropic or Responses history message into the form this
-        spec's encoder reads; Chat Completions history is passed as sent."""
-        ...
-
     def encode_messages(
         self,
         *,

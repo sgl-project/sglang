@@ -3,7 +3,6 @@ import json
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -22,12 +21,6 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from sglang.srt.entrypoints.openai.serving_chat import (  # noqa: E402
-    OpenAIServingChat,
-)
-from sglang.srt.entrypoints.openai.serving_inkling import (  # noqa: E402
-    InklingSpecAdapter,
-)
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -38,8 +31,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
-    _spec_adapter = None
-    normalize_history_messages = OpenAIServingChat.normalize_history_messages
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
@@ -70,10 +61,6 @@ class _FakeNonStreamingErrorOpenAI:
     """Returns an error response or raises an exception from the OpenAI handler."""
 
     supports_inline_system = False
-
-    @staticmethod
-    def normalize_history_messages(messages):
-        return messages
 
     def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
@@ -1124,56 +1111,6 @@ class TestAnthropicServing(unittest.TestCase):
         assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
         self.assertEqual(assistant_msg.reasoning_content, "ponder")
         self.assertEqual(assistant_msg.content, "")
-
-    def test_inkling_thinking_history_becomes_thinking_part(self):
-        """Bug regression: the Inkling encoder renders prior thinking only from
-        thinking content parts, so reasoning_content history was dropped."""
-
-        class _InklingOpenAI(_FakeOpenAIServingChat):
-            native_reasoning_history = True
-            _spec_adapter = InklingSpecAdapter(
-                reasoning_parser="inkling",
-                tool_call_parser="inkling",
-                chat_hooks=Mock(),
-            )
-
-        serving = AnthropicServing(_InklingOpenAI())
-        request = self._anthropic_request(
-            stream=False,
-            messages=[
-                {"role": "user", "content": "hi"},
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "ponder"},
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_1",
-                            "name": "lookup",
-                            "input": {},
-                        },
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_1",
-                            "content": "ok",
-                        }
-                    ],
-                },
-            ],
-        )
-        chat_request = serving._convert_to_chat_completion_request(request)
-        assistant = next(m for m in chat_request.messages if m.role == "assistant")
-        self.assertIsNone(assistant.reasoning_content)
-        self.assertEqual(
-            [(part.type, part.thinking) for part in assistant.content],
-            [("thinking", "ponder")],
-        )
-        self.assertEqual(assistant.tool_calls[0].function.name, "lookup")
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""

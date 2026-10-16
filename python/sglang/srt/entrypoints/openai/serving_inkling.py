@@ -68,21 +68,6 @@ class InklingSpecAdapter:
     def output(self) -> Optional[InklingSpecAdapter]:
         return self if self._token_output else None
 
-    def normalize_history_message(self, message: dict[str, Any]) -> dict[str, Any]:
-        # tml-renderers reads prior reasoning only from thinking content parts.
-        reasoning = message.get("reasoning_content")
-        if message.get("role") != "assistant" or not reasoning:
-            return message
-        parts: list[Any] = [{"type": "thinking", "thinking": reasoning}]
-        content = message.get("content")
-        if isinstance(content, str) and content:
-            parts.append({"type": "text", "text": content})
-        elif isinstance(content, list):
-            parts.extend(content)
-        converted = {k: v for k, v in message.items() if k != "reasoning_content"}
-        converted["content"] = parts
-        return converted
-
     def encode_messages(
         self,
         *,
@@ -95,7 +80,9 @@ class InklingSpecAdapter:
             reasoning_effort = self._default_reasoning_effort
         assistant_prefix = _pop_assistant_prefix(messages, request)
         prompt_ids = render_inkling_messages(
-            messages, tools=tools, reasoning_effort=reasoning_effort
+            [_reasoning_as_thinking_part(message) for message in messages],
+            tools=tools,
+            reasoning_effort=reasoning_effort,
         )
         if assistant_prefix is not None:
             prompt_ids += render_inkling_assistant_prefix(assistant_prefix)
@@ -315,6 +302,22 @@ def select_new_output_ids(
         # The abort chunk re-sends already-streamed tokens.
         return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
     return output_ids
+
+
+def _reasoning_as_thinking_part(message: dict[str, Any]) -> dict[str, Any]:
+    # tml-renderers reads prior reasoning only from thinking content parts.
+    reasoning = message.get("reasoning_content")
+    if message.get("role") != "assistant" or not reasoning:
+        return message
+    parts: list[Any] = [{"type": "thinking", "thinking": reasoning}]
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        parts.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        parts.extend(content)
+    converted = {k: v for k, v in message.items() if k != "reasoning_content"}
+    converted["content"] = parts
+    return converted
 
 
 def _pop_assistant_prefix(

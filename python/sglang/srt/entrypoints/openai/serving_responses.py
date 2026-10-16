@@ -1549,7 +1549,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
-        messages = self.normalize_history_messages(messages)
 
         # Preserve the history prefix when a later instruction is appended.
         if self.supports_inline_system:

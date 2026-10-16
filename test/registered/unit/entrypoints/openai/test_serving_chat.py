@@ -5155,6 +5155,42 @@ class InklingReasoningEffortTest(unittest.TestCase):
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
 
+    def test_reasoning_content_history_renders_as_thinking(self):
+        """Prior thinking sent as reasoning_content (Chat Completions, and the
+        Anthropic and Responses converters) must render like a thinking part."""
+        serving = _inkling_serving()
+
+        def encode(assistant):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    assistant,
+                    {"role": "user", "content": "again"},
+                ],
+                reasoning_effort=0.5,
+            )
+            return serving._encode_messages(
+                [message.model_dump() for message in request.messages],
+                request,
+                thinking_mode=None,
+            )
+
+        self.assertEqual(
+            encode(
+                {"role": "assistant", "reasoning_content": "ponder", "content": "ok"}
+            ),
+            encode(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "ok"},
+                    ],
+                }
+            ),
+        )
+
 
 class InklingTokenOutputTest(CustomTestCase):
     """Inkling chat responses are parsed from output token IDs, not text."""
