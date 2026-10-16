@@ -157,7 +157,15 @@ class CpDecodeAttnTpContext:
             return []
 
         attrs = [(linear_instance, "weight", dim)]
-        for scale_name in ("weight_scale_inv", "weight_scale"):
+        # The gfx950 MXFP8 routes (fp8_hip) read derived copies, not the block scales;
+        # all keep (N, K) order with whole tiles, so a chunk is the rank's slice.
+        for scale_name in (
+            "weight_scale_inv",
+            "weight_scale",
+            "weight_scale_mx_e8m0",
+            "weight_scale_inv_mx",
+            "weight_bf16",
+        ):
             if getattr(linear_instance, scale_name, None) is not None:
                 attrs.append((linear_instance, scale_name, dim))
         return attrs

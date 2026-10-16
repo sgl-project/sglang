@@ -31,15 +31,23 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
 )
-from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.interleave import (
+    _HIP_MIN_TOKENS_PER_RANK,
+    InterleaveCPStrategy,
+)
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_interleave_input_ids,
+    cp_shard_hidden_states,
     cp_split_before_forward,
+    drop_unconsumed_states_before_norm,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -54,6 +62,12 @@ PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
 ] = {
     (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
 }
+if is_hip():
+    # The capture path shards input_ids with the hidden states for DSV4 hash
+    # routing; enabled on ROCm only until the CUDA path is validated as well.
+    PREFILL_CP_BCG_SUPPORTED_COMBINATIONS.add(
+        (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSV4)
+    )
 
 
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
@@ -89,8 +103,13 @@ def filter_prefill_cp_bcg_capture_num_tokens(
 ) -> list[int]:
     """Keep only token buckets where the selected CP strategy can run."""
     min_num_tokens = resolved_view(server_args).attn_cp_size
-    if resolving_view(server_args).cp_strategy == "zigzag":
+    cp_strategy = resolving_view(server_args).cp_strategy
+    if cp_strategy == "zigzag":
         min_num_tokens *= 2
+    elif cp_strategy == "interleave" and is_hip():
+        # InterleaveCPStrategy.can_apply leaves smaller HIP batches unsharded,
+        # so a smaller bucket could never be captured or replayed with CP.
+        min_num_tokens *= _HIP_MIN_TOKENS_PER_RANK
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(
@@ -120,9 +139,24 @@ class PrefillCPBCGInput:
     positions: torch.Tensor
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
+    input_ids: Optional[torch.Tensor] = None
+    # Rank-major token ids for TP MoE, which routes the CP all-gathered rows.
+    global_input_ids: Optional[torch.Tensor] = None
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
+        strategy = get_cp_strategy()
+        global_id_capacity = 0
+        if (
+            isinstance(strategy, InterleaveCPStrategy)
+            and get_moe_a2a_backend().is_none()
+        ):
+            align = get_cp_padding_align_size()
+            local_capacity = (
+                runner.max_num_tokens + strategy.cp_size - 1
+            ) // strategy.cp_size
+            local_capacity = (local_capacity + align - 1) // align * align
+            global_id_capacity = strategy.cp_size * local_capacity
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -135,6 +169,12 @@ class PrefillCPBCGInput:
                 positions=torch.zeros(
                     (runner.max_num_tokens,),
                     dtype=torch.int64,
+                ),
+                input_ids=torch.zeros((runner.max_num_tokens,), dtype=torch.int64),
+                global_input_ids=(
+                    torch.zeros((global_id_capacity,), dtype=torch.int64)
+                    if global_id_capacity
+                    else None
                 ),
             )
 
@@ -248,6 +288,7 @@ class PrefillCPBCGInput:
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
+        local_input_ids = cp_shard_hidden_states(global_input_ids, forward_batch)
         global_input_embeds = runner.model_runner.model.get_input_embeddings()(
             global_input_ids
         )
@@ -278,12 +319,31 @@ class PrefillCPBCGInput:
 
         input_embeds = self.input_embeds[:captured_local_tokens]
         positions = self.positions[:captured_local_tokens]
+        assert self.input_ids is not None
+        input_ids = self.input_ids[:captured_local_tokens]
         input_embeds.zero_()
         positions.zero_()
+        input_ids.zero_()
         input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
+        input_ids[:live_local_tokens].copy_(local_input_ids)
         forward_batch.input_embeds = input_embeds
-        forward_batch.positions = positions
+        # The captured body takes CP-local positions and ids, while attention
+        # backends keep reading forward_batch.positions in global token order
+        # (e.g. the SWA ring store after the CP KV all-gather).
+        forward_batch._cp_positions = positions
+        forward_batch._cp_input_ids = input_ids
+        if self.global_input_ids is not None:
+            global_ids = cp_interleave_input_ids(global_input_ids, forward_batch)
+            if global_ids.numel() > self.global_input_ids.numel():
+                raise RuntimeError(
+                    f"CP global token ids need {global_ids.numel()} rows, but the "
+                    f"fixed buffer has capacity {self.global_input_ids.numel()}"
+                )
+            forward_batch.input_ids_global = self.global_input_ids[: global_ids.numel()]
+            forward_batch.input_ids_global.copy_(global_ids)
+        else:
+            forward_batch.input_ids_global = input_ids
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
@@ -341,6 +401,11 @@ def execute_prefill_cp_bcg(
                 else hidden_states
             )
 
+        hidden_states = drop_unconsumed_states_before_norm(
+            hidden_states,
+            forward_batch=forward_batch,
+            has_aux_hidden_states=aux_hidden_states is not None,
+        )
         hidden_states = cp_gather_after_forward(
             hidden_states,
             static_forward_batch,

@@ -788,6 +788,10 @@ class TestCPZigzagStrategy(CustomTestCase):
 
 class TestCPInterleaveStrategy(CustomTestCase):
     def setUp(self):
+        # These layouts are below the HIP minimum CP tokens per rank.
+        patcher = patch("sglang.srt.layers.cp.interleave._is_hip", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,

@@ -252,10 +252,14 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_cp_prefill_attaches_before_reindex(self):
         for need_compress in (False, True):
-            with self.subTest(need_compress=need_compress):
-                self._check_cp_prefill_order(need_compress)
+            for use_prefill_cuda_graph in (False, True):
+                with self.subTest(
+                    need_compress=need_compress,
+                    use_prefill_cuda_graph=use_prefill_cuda_graph,
+                ):
+                    self._check_cp_prefill_order(need_compress, use_prefill_cuda_graph)
 
-    def _check_cp_prefill_order(self, need_compress):
+    def _check_cp_prefill_order(self, need_compress, use_prefill_cuda_graph):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.has_c4 = False
@@ -274,8 +278,13 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             side_effect=lambda *_args, **_kwargs: events.append("attach")
         )
         forward_batch = SimpleNamespace(
-            attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[2, 2])
+            attn_cp_metadata=SimpleNamespace(
+                per_rank_actual_token=[2, 2], local_index=None
+            )
         )
+        # CP breakable prefill graphs pass the bucket-sized out_cache_loc while
+        # the live batch has 3 tokens; the global write fields follow the bucket.
+        num_write_tokens = 4 if use_prefill_cuda_graph else 3
 
         with (
             mock.patch(
@@ -295,19 +304,24 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 req_pool_indices=torch.tensor([7, 9], dtype=torch.int32),
                 seq_lens=torch.tensor([1, 3], dtype=torch.int32),
                 seq_lens_cpu=[1, 3],
-                out_cache_loc=torch.zeros(3, dtype=torch.int64),
+                out_cache_loc=torch.zeros(num_write_tokens, dtype=torch.int64),
                 num_tokens=3,
                 extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
                 extend_seq_lens_cpu=[1, 2],
                 need_compress=need_compress,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
             )
 
         self.assertEqual(expand_prefill.call_args.kwargs["padded_num_tokens"], 4)
+        self.assertEqual(expand_prefill.call_args.kwargs["num_tokens"], 3)
         self.assertEqual(
-            backend.make_core_attn_metadata.call_args.kwargs["num_tokens"], 3
+            backend.make_core_attn_metadata.call_args.kwargs["num_tokens"],
+            num_write_tokens,
         )
-        core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
+        core.apply_cp_reindex.assert_called_once_with(
+            num_tokens=num_write_tokens, local_index=None
+        )
         # Target prefill rebuilds FlashMLA on the local rows; the draft skips it.
         self.assertEqual(
             events, ["attach", "reindex"] + (["flashmla"] if need_compress else [])

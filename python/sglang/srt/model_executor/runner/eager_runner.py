@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
+    drop_unconsumed_states_before_norm,
     get_cp_strategy,
     is_cp_active,
     prepare_cp_forward,
@@ -402,6 +403,11 @@ class EagerRunner(BaseRunner):
             )
 
         stream = torch.cuda.current_stream()
+        hidden_states = drop_unconsumed_states_before_norm(
+            hidden_states,
+            forward_batch=forward_batch,
+            has_aux_hidden_states=aux_hidden_states is not None,
+        )
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:
