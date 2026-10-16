@@ -133,6 +133,16 @@ def normalize_json_schema_types(schema: Any) -> None:
     if not isinstance(schema, dict):
         return
 
+    # ``required`` (array) and ``properties`` (object) are sometimes emitted as
+    # ``null`` by SDKs that initialize optional fields to None. That is
+    # semantically equivalent to omitting the keyword, but JSON Schema
+    # validation rejects the null value ("None is not of type 'array'"/
+    # "'object'") and the whole tool definition is turned into a 400. Drop the
+    # null so an otherwise-usable schema keeps validating.
+    for key in ("required", "properties"):
+        if key in schema and schema[key] is None:
+            del schema[key]
+
     if "type" in schema:
         t = schema["type"]
         if isinstance(t, str):
