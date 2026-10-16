@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::Router;
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
@@ -56,7 +56,7 @@ fn normalize_method(method: &axum::http::Method) -> &'static str {
 /// `"unknown"` (running outside a container with neither set).
 static POD_ID: OnceLock<String> = OnceLock::new();
 
-fn pod_id() -> &'static str {
+pub(crate) fn pod_id() -> &'static str {
     POD_ID.get_or_init(|| {
         std::env::var("POD_NAME")
             .or_else(|_| std::env::var("HOSTNAME"))
@@ -150,6 +150,9 @@ async fn access_log_and_record(
                 .unwrap_or_else(|| outcome_from_status(status.as_u16()))
                 .as_str(),
             worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
+            engine_rid = log_ctx
+                .and_then(|c| c.engine_rid.as_deref())
+                .unwrap_or(""),
             model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
             stream = log_ctx.is_some_and(|c| c.streaming),
             latency_ms,
@@ -179,6 +182,16 @@ async fn log_413(req: Request, next: Next) -> Response {
     resp
 }
 
+/// A Messages route: body limit, 413 logging and the Anthropic 413 envelope.
+fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppContext>> {
+    route
+        .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+        .layer(middleware::from_fn(log_413))
+        .layer(middleware::from_fn(
+            crate::server::routes::messages::envelope_413,
+        ))
+}
+
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
@@ -203,8 +216,52 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/v1/messages",
+            messages_route(post(crate::server::routes::messages::messages)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            messages_route(post(crate::server::routes::messages::count_tokens)),
+        )
+        .route(
+            "/v1/completions",
+            post(crate::server::routes::chat::completions)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/generate",
+            post(crate::server::routes::chat::generate)
+                .put(crate::server::routes::chat::generate)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/embeddings",
+            post(crate::server::routes::chat::embeddings)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/classify",
+            post(crate::server::routes::chat::classify)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/rerank",
+            post(crate::server::routes::chat::rerank)
+                .put(crate::server::routes::chat::rerank)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
+        )
+        .route(
+            crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
+            get(crate::server::routes::cache::kv_snapshot),
         );
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers
@@ -446,6 +503,7 @@ mod tests {
                         model_id: "tiny".into(),
                         streaming: false,
                         outcome: RequestOutcome::Cancelled,
+                        engine_rid: Some("1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3".into()),
                     });
                     resp
                 }),
@@ -467,6 +525,11 @@ mod tests {
         assert!(
             logs.contains("worker=\"http://worker-a:30000\"") && logs.contains("model=\"tiny\""),
             "a routed request must be logged with its worker and model; captured:\n{logs}",
+        );
+        assert!(
+            logs.contains("engine_rid=\"1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3\"")
+                && logs.contains("request_id="),
+            "the minted rid must be logged beside the caller's request id; captured:\n{logs}",
         );
         // The handler's outcome must win over the status-derived fallback —
         // otherwise the log and `worker_requests_total` can disagree about a

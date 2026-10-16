@@ -1,3 +1,4 @@
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -154,7 +155,7 @@ class InternS1ForConditionalGeneration(nn.Module):
 
         return hs
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id

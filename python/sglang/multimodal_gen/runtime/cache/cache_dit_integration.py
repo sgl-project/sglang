@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
     get_ring_parallel_world_size,
     get_tp_world_size,
     get_ulysses_parallel_world_size,
@@ -105,15 +106,14 @@ def _patch_cache_dit_similarity():
         tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
         target_group = tp_sp_group or sp_group or tp_group
 
-        # Averaging over a one-rank group returns the input, so skip the
-        # collective rather than pay for a round trip that cannot change it.
+        # CFG/DP peers are independent; never fall back to the global group
         if target_group is None or dist.get_world_size(target_group) == 1:
             return _original_similarity(
                 self,
                 t1,
                 t2,
                 threshold=threshold,
-                parallelized=parallelized,
+                parallelized=False,
                 prefix=prefix,
             )
 
@@ -403,6 +403,18 @@ class CustomBlockAdapterSpec:
 
 # Custom BlockAdapter metadata for models absent from cache-dit's registry.
 _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
+    "AnimaTransformer3DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "MingImageTransformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="layers",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
+    "QwenImage21Transformer2DModel": CustomBlockAdapterSpec(
+        blocks_attr="transformer_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
     "ErnieImageTransformer2DModel": CustomBlockAdapterSpec(
         blocks_attr="layers",
         forward_pattern=ForwardPattern.Pattern_3,
@@ -415,6 +427,12 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    # The joint single-stream trunk; the per-modality mode blocks before it run
+    # depth-major over a ModuleDict, which a BlockAdapter cannot express.
+    "Flux3ImageDiT": CustomBlockAdapterSpec(
+        blocks_attr="single_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
@@ -424,7 +442,29 @@ def _build_custom_block_adapter(
 ) -> Optional[BlockAdapter]:
     """Build a manual BlockAdapter for a model absent from cache-dit's registry,
     or None if the class is unknown."""
-    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
+    # FSDP adds a runtime subclass; retain the native model's adapter contract.
+    model_name = next(
+        (
+            cls.__name__
+            for cls in type(transformer).__mro__
+            if cls.__name__ == "Kandinsky6Transformer3DModel"
+            or cls.__name__ in _CUSTOM_BLOCK_ADAPTER_SPECS
+        ),
+        None,
+    )
+    if model_name == "Kandinsky6Transformer3DModel":
+        # the second stream is evolving audio, not static text conditioning
+        return BlockAdapter(
+            transformer=transformer,
+            blocks=transformer.visual_transformer_blocks,
+            forward_pattern=(
+                ForwardPattern.Pattern_0
+                if transformer.config.is_multimodal
+                else ForwardPattern.Pattern_2
+            ),
+            has_separate_cfg=has_separate_cfg,
+        )
+    spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(model_name)
     if spec is None:
         return None
     blocks = getattr(transformer, spec.blocks_attr, None)
@@ -496,6 +536,7 @@ def enable_cache_on_transformer(
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     has_separate_cfg: bool = False,
+    joint_cfg_decision: bool = False,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -509,6 +550,9 @@ def enable_cache_on_transformer(
         has_separate_cfg: Whether the run issues separate conditional/unconditional
             passes per step (CFG). Used by custom adapters (ERNIE, Krea-2); a
             mismatch only disables caching, never corrupts output.
+        joint_cfg_decision: The model batches its CFG pair into one forward, so
+            one cache decision covers both; CFG-parallel ranks then decide
+            together instead of independently.
 
     """
     if not config.enabled:
@@ -523,23 +567,19 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
-    # Prefer the standard path (transformer pre-registered in cache-dit). For
-    # models absent from the registry, fall back to a manual BlockAdapter (see
-    # _build_custom_block_adapter).
-    custom_adapter = None
-    if not BlockAdapterRegister.is_supported(transformer):
-        custom_adapter = _build_custom_block_adapter(
-            transformer, has_separate_cfg=has_separate_cfg
+    # Native forward contracts take precedence over cache-dit's family-name matching.
+    custom_adapter = _build_custom_block_adapter(
+        transformer, has_separate_cfg=has_separate_cfg
+    )
+    if custom_adapter is None and not BlockAdapterRegister.is_supported(transformer):
+        transformer_cls_name = transformer.__class__.__name__
+        raise ValueError(
+            f"{transformer_cls_name} is not officially supported by cache-dit. "
+            "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
+            "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
+            "Please ensure your transformer belongs to one of these families or "
+            "define a custom BlockAdapter."
         )
-        if custom_adapter is None:
-            transformer_cls_name = transformer.__class__.__name__
-            raise ValueError(
-                f"{transformer_cls_name} is not officially supported by cache-dit. "
-                "Supported cache-dit DiT families include Flux, QwenImage, HunyuanDiT, "
-                "HunyuanVideo, Wan, CogVideoX, Mochi, and others. "
-                "Please ensure your transformer belongs to one of these families or "
-                "define a custom BlockAdapter."
-            )
 
     # Build cache config (including SCM fields if provided)
     cache_config = DBCacheConfig(
@@ -600,7 +640,9 @@ def enable_cache_on_transformer(
         )
 
     parallelism_config = _build_parallelism_config(sp_group, tp_group)
-    if parallelism_config is not None:
+    if parallelism_config is not None or (
+        dist.is_initialized() and dist.get_world_size() > 1
+    ):
         _patch_cache_dit_similarity()
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
@@ -638,6 +680,12 @@ def enable_cache_on_transformer(
 
             context_manager._sglang_tp_sp_group = tp_sp_group
 
+    if joint_cfg_decision and get_classifier_free_guidance_world_size() > 1:
+        context_manager = getattr(transformer, "_context_manager", None)
+        if context_manager is not None:
+            # The DiT group spans the CFG ranks (and any TP ranks within them).
+            context_manager._sglang_tp_sp_group = get_dit_group()
+
     return transformer
 
 
@@ -649,6 +697,7 @@ def enable_cache_on_dual_transformer(
     model_name: str = "wan2.2",
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    has_separate_cfg: bool = True,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
@@ -830,7 +879,7 @@ def enable_cache_on_dual_transformer(
             params_modifiers=[primary_modifier, secondary_modifier],
             check_forward_pattern=adapter_spec.check_forward_pattern,
             check_num_outputs=adapter_spec.check_num_outputs,
-            has_separate_cfg=adapter_spec.has_separate_cfg,
+            has_separate_cfg=adapter_spec.has_separate_cfg and has_separate_cfg,
         ),
         parallelism_config=None,
     )
@@ -857,19 +906,23 @@ def refresh_context_on_transformer(
     num_inference_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
+    steps_computation_mask: Optional[List[int]] = None,
+    steps_computation_policy: str | None = None,
 ) -> None:
     """Refresh cache-dit context for transformer."""
-    steps_computation_mask = None
-    if scm_preset is not None:
+    if steps_computation_mask is None and scm_preset is not None:
         steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_inference_steps
         )
+    policy = (
+        steps_computation_policy if steps_computation_policy is not None else scm_preset
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_inference_steps,
             steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )

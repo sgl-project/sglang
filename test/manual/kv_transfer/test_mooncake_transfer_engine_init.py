@@ -45,7 +45,6 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
     """
     Test the condition logic for using MooncakeTransferEngine.
     """
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
     dummy_runner = SimpleNamespace(server_args=server_args, gpu_id=0)
     init_called = False
@@ -69,7 +68,11 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
             return_value="127.0.0.1",
         ),
     ):
-        ModelRunner.init_shared_mooncake_transfer_engine(dummy_runner)
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            maybe_init_shared_mooncake_transfer_engine,
+        )
+
+        maybe_init_shared_mooncake_transfer_engine(gpu_id=dummy_runner.gpu_id)
 
     return init_called
 

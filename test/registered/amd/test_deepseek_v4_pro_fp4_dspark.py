@@ -121,7 +121,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
                     self.assertIs(result, eager_metadata)
                     backend.init_forward_metadata_target_verify_old.assert_called_once()
 
-    def test_build_unified_commit_inject_layout(self):
+    def test_build_ring_commit_inject_layout(self):
         stride, ring_stride = 7, 128
         req_pool_indices = torch.tensor([3, 0, 5, 1], device=DEVICE, dtype=torch.int32)
         prefix_lens = torch.tensor(
@@ -130,7 +130,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         block_pos_offsets = torch.arange(stride, device=DEVICE, dtype=torch.int64)
         commit_lens = torch.tensor([0, 3, stride, 5], device=DEVICE, dtype=torch.int32)
 
-        got = dspark_verify_window.build_unified_commit_inject_layout(
+        got = dspark_verify_window.build_ring_commit_inject_layout(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             block_pos_offsets=block_pos_offsets,
@@ -183,9 +183,8 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-dp-lm-head",
             "--enable-prefill-delayer",
             "--disable-radix-cache",
@@ -236,7 +235,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             num_questions=1319,
             parallel=512,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
