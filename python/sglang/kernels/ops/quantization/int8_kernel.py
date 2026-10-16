@@ -99,7 +99,7 @@ def _per_token_group_quant_int8(
     y_stride,
     # Columns of input
     N,
-    # Avoid to divide zero
+    # Avoid division by zero
     eps,
     # Information for int8
     int8_min,
