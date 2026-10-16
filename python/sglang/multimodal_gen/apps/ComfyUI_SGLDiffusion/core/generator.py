@@ -9,9 +9,9 @@ import logging
 import os
 import sys
 
-from ..executors.base import NATIVE_BATCHING_MODES
 import torch
 
+from ..executors.base import NATIVE_BATCHING_MODES
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import (
     FastH3Executor,
