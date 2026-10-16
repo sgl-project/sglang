@@ -267,6 +267,8 @@ Designed to test system prompt caching/prefix sharing performance.
 - `--gsp-num-groups`: Number of unique system prompts.
 - `--gsp-prompts-per-group`: How many user questions share the same system prompt.
 - `--gsp-system-prompt-len`: Length of the shared prefix.
+- `--gsp-num-turns`: Turns per conversation (requires a chat backend).
+- `--multi-turn-echo-reasoning`: Send `reasoning_content` back on multi-turn rounds (default: `content` only).
 - `--gsp-fast-prepare`: Skips some statistics calculation for faster startup.
 
 #### 2.7.2 Mooncake
