@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.uno_npu_graph_runner import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.speculative.uno_utils import (
     _dense_rejection_torch,
+    _sparse_rejection_from_support,
     _top_k,
     run_uno_sampling,
     sample_uno_candidates,
@@ -149,6 +150,43 @@ class TestUnoDeviceSampling(CustomTestCase):
                     torch.testing.assert_close(
                         result.new_seq_lens, frontiers + width + 1
                     )
+
+    def test_dense_rejection_recovers_target_distribution(self):
+        # q=(3/4,1/4), p=(1/4,3/4). Each of these four equally weighted
+        # rows represents 1/4 of proposal/acceptance probability mass.
+        candidates = torch.tensor([[0, 0], [0, 0], [0, 0], [0, 1]])
+        target = torch.tensor([[[0.25, 0.75], [0.25, 0.75]]]).expand(4, -1, -1)
+        draft = torch.tensor([[[0.75, 0.25]]]).expand(4, -1, -1)
+        accepted, bonus = _dense_rejection_torch(
+            candidates=candidates,
+            target_probs=target,
+            draft_probs=draft,
+            accept_uniforms=torch.tensor([[1 / 6, 0], [0.5, 0], [5 / 6, 0], [0.5, 0]]),
+            final_uniforms=torch.full((4,), 0.5),
+        )
+        emitted = torch.where(accepted > 0, candidates[:, 1], bonus)
+        self.assertEqual(accepted.tolist(), [1, 0, 0, 1])
+        self.assertEqual(torch.bincount(emitted, minlength=2).tolist(), [1, 3])
+
+    def test_sparse_rejection_handles_partially_disjoint_supports(self):
+        # q puts 3/4 mass on token 1 (absent from p); p=(1/2,0,1/2).
+        # Three rejected token-1 proposals and one accepted token-2 proposal
+        # each represent 1/4 probability mass. Correction must recover p.
+        candidates = torch.tensor([[0, 1], [0, 1], [0, 1], [0, 2]])
+        target_ids = torch.tensor([[[0, 2], [0, 2]]]).expand(4, -1, -1)
+        draft_ids = torch.tensor([[[1, 2]]]).expand(4, -1, -1)
+        accepted, bonus = _sparse_rejection_from_support(
+            candidates=candidates,
+            target_ids=target_ids,
+            target_probs=torch.full((4, 2, 2), 0.5),
+            draft_ids=draft_ids,
+            draft_probs=torch.tensor([[[0.75, 0.25]]]).expand(4, -1, -1),
+            accept_uniforms=torch.full((4, 2), 0.5),
+            final_uniforms=torch.tensor([1 / 6, 0.5, 5 / 6, 0.5]),
+        )
+        emitted = torch.where(accepted > 0, candidates[:, 1], bonus)
+        self.assertEqual(accepted.tolist(), [0, 0, 0, 1])
+        self.assertEqual(torch.bincount(emitted, minlength=3).tolist(), [2, 0, 2])
 
     def test_dense_rejection_all_accepted_and_single_token_width(self):
         for width in (1, 4):

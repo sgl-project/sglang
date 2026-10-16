@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.runtime_context import get_spec
@@ -29,6 +30,16 @@ def init_uno_lora_manager(
     model_runner: ModelRunner,
 ) -> tuple[LoRAManager, str]:
     """Load and pin the single UNO draft adapter."""
+
+    if mambaish_config(model_runner.model_config) is not None:
+        # UNO writes a LoRA draft followed by a base-only verify into the same
+        # model. Recurrent states need separate draft state and accepted-prefix
+        # commit/rollback, which the UNO worker does not implement.
+        raise ValueError(
+            "UNO does not support recurrent or hybrid linear-attention models "
+            "(Mamba/GDN/KDA); draft-state isolation and accepted-state commit "
+            "are not implemented."
+        )
 
     lora_path = get_spec().uno_lora_path
 
