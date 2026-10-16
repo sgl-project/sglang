@@ -169,7 +169,8 @@ class LRUFileEvictor:
         concurrent ``reserve`` won't evict it before the file is committed; the
         caller must then call ``commit`` (write landed) or ``abort`` (write
         failed). Returns ``False`` -- reserving nothing -- when the write is
-        refused: this rank is not the storage owner, the value is larger than
+        refused: the key already has a pending write, this rank is not the
+        storage owner, the value is larger than
         the cap, there is no evictable space, or the free-space watermark cannot
         be met. When eviction is not configured the write is always admitted.
         """
@@ -189,6 +190,9 @@ class LRUFileEvictor:
             return False
 
         with self._lock:
+            # A duplicate must not replace or settle another writer's reservation.
+            if suffixed_key in self._pending_writes:
+                return False
             # Cap-based eviction: evict, then bail if still over cap.
             if (
                 self.max_size_bytes > 0
