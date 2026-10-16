@@ -14,7 +14,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra", "PR Test ROCm 7.2 (AMD)"]
+    workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -128,9 +128,10 @@ jobs:
                 // this SHA: all three workflows also accept workflow_dispatch,
                 // and for AMD that is a single stage rather than the full gate.
                 event: 'pull_request',
-                per_page: 1,
+                per_page: 10,
               });
-              return data.workflow_runs[0] || null;
+              return data.workflow_runs.find((run) => run.conclusion !== 'skipped')
+                || data.workflow_runs[0] || null;
             }
             async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
               if (preSleepMs > 0) await sleep(preSleepMs);
@@ -158,12 +159,12 @@ jobs:
             // subscription above, so a real dispatch refreshes this block.
             const [ptRun, peRun, amdRun] = await Promise.all([
               findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
-              // pr-test-extra gates on BOTH labels (see check-changes there).
+              // pr-test-extra gates on BOTH labels (see call-gate there).
               findRun(
                 'pr-test-extra.yml',
                 (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
               ),
-              findRun('pr-test-amd-rocm720.yml', labelOffOpts),
+              findRun('pr-test-amd.yml', labelOffOpts),
             ]);
 
             // Skipped run = "no real run" -- happens when a label is added
@@ -214,8 +215,8 @@ jobs:
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
-            const amdStart   = '<!-- slot:pr-test-amd-rocm720:start -->';
-            const amdEnd     = '<!-- slot:pr-test-amd-rocm720:end -->';
+            const amdStart   = '<!-- slot:pr-test-amd:start -->';
+            const amdEnd     = '<!-- slot:pr-test-amd:end -->';
 
             const newBlock = [
               outerStart,

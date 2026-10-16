@@ -42,9 +42,10 @@ const SKIP_SPECIAL_TOKENS: bool = true;
 
 /// Per-request incremental decoder. `step` feeds the new token ids for one chunk
 /// and returns the newly decoded text delta (empty if the ids only produced a
-/// partial/incomplete multi-byte sequence that needs more tokens).
+/// partial/incomplete multi-byte sequence that needs more tokens). `finish` marks
+/// the request's last chunk, which also flushes any text held back.
 pub trait StreamDecoder: Send {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error>;
+    fn step(&mut self, token_ids: &[i64], finish: bool) -> Result<String, Error>;
 }
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
@@ -53,7 +54,7 @@ struct DynamoDecoder {
 }
 
 impl StreamDecoder for DynamoDecoder {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error> {
+    fn step(&mut self, token_ids: &[i64], finish: bool) -> Result<String, Error> {
         let mut out = String::new();
         for &id in token_ids {
             if let Some(chunk) = self
@@ -63,6 +64,14 @@ impl StreamDecoder for DynamoDecoder {
             {
                 out.push_str(&chunk);
             }
+        }
+        if finish
+            && let Some(chunk) = self
+                .stream
+                .finish()
+                .map_err(|e| Error::Detokenize(e.to_string()))?
+        {
+            out.push_str(&chunk);
         }
         Ok(out)
     }
@@ -183,9 +192,8 @@ impl Runnable for DetokenizerWorker {
         tracing::debug!(shard = self.shard, "detokenizer worker started");
 
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
-        // clone gone). On shutdown that happens once the API runtime drop cancels
-        // in-flight handlers (their `AbortGuard`s release the last clones) and
-        // to-scheduler/from-scheduler exit — no shutdown signal needed here.
+        // clone gone). On shutdown that happens once to-scheduler/from-scheduler
+        // exit — core calls own only their abort sender, not detok channels.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
@@ -314,8 +322,10 @@ fn handle_chunk(
         .cloned();
     // Count generated tokens (incl. a matched stop token) *before* trimming.
     let n_tok = ev.token_ids.len() as u64;
-    // Stop TOKEN: drop it before decode, so it reaches neither `text` nor `output_ids`.
-    trim_stop_token(&mut ev.token_ids, &matched, no_stop_trim);
+    // Stop TOKEN: omit it from decoded text while preserving the scheduler's
+    // exact output IDs for downstream protocol consumers.
+    let decode_ids = trim_matched_stop_token(&ev.token_ids, &matched, no_stop_trim);
+    let stop_token_trimmed = decode_ids.len() != ev.token_ids.len();
 
     // Fully incremental: decode just this chunk's delta. `token_ids` stays in the
     // event — it's ALSO surfaced as the `/generate` response's `output_ids` (the
@@ -323,7 +333,7 @@ fn handle_chunk(
     // `skip_tokenizer_init` mode. Nothing cumulative is kept here — the api-server's
     // drain loop reassembles it where needed.
     let mut delta_text = match &mut st.decoder {
-        Some(decoder) => match decoder.step(&ev.token_ids) {
+        Some(decoder) => match decoder.step(decode_ids, finished) {
             Ok(delta) => delta,
             Err(e) => {
                 // Abort too: this is terminal for the request, and without it the
@@ -365,6 +375,7 @@ fn handle_chunk(
     // formats this delta (and accumulates for the cumulative view).
     ev.text = delta_text;
     ev.completion_tokens = n_tok;
+    ev.stop_token_trimmed = stop_token_trimmed;
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
@@ -396,12 +407,9 @@ fn handle_chunk(
             }
             let _ = st.fsm.apply(Event::Disconnect);
             // Abort ONLY when the sink is full. `Closed` means the handler future is
-            // already gone, so its `AbortGuard` has run: it aborted and released the
-            // rid. A second abort from here is unordered with respect to that
-            // release, so it lands after a resubmit of the same rid has registered
-            // and deregisters the NEW request — the cross-wiring the rid registry
-            // exists to prevent, reached through the one abort producer that
-            // bypasses the guard's ordering.
+            // already gone, so its `CoreCall` has queued the abort; do not emit
+            // the same lifecycle event a second time. A full sink still has a live
+            // handler, so the detokenizer must initiate cleanup itself.
             if matches!(e, SinkError::Full) {
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
             }
@@ -410,15 +418,15 @@ fn handle_chunk(
     }
 }
 
-/// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
-/// token branch); `no_stop_trim` / non-token match keeps it.
-fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
-    // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
-    // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
-    // for any model whose stop id happens to be 0.
-    if !no_stop_trim && matches!(matched, Some(Matched::Token(t)) if *t != 0) {
-        token_ids.pop();
-    }
+/// Exclude a matched stop TOKEN while decoding text (Python
+/// `trim_matched_stop`, token branch) without changing surfaced `output_ids`.
+fn trim_matched_stop_token<'a>(
+    token_ids: &'a TokenIds,
+    matched: &Option<Matched>,
+    no_stop_trim: bool,
+) -> &'a [i64] {
+    let trim = !no_stop_trim && matches!(matched, Some(Matched::Token(_)));
+    &token_ids[..token_ids.len().saturating_sub(usize::from(trim))]
 }
 
 /// Remove the matched stop string from the decoded final chunk (Python
@@ -575,7 +583,7 @@ mod tests {
         table.insert(Rid::from("bob"), state(tx_b));
         let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
 
-        let chunk = |rid: &str, id: i32| ChunkEvent {
+        let chunk = |rid: &str, id: i64| ChunkEvent {
             rid: Rid::from(rid.to_string()),
             token_ids: vec![id],
             ..Default::default()
@@ -615,7 +623,7 @@ mod tests {
     fn final_chunk(
         no_stop_trim: bool,
         finish_reason: serde_json::Value,
-        ids: Vec<i32>,
+        ids: TokenIds,
     ) -> ChunkEvent {
         let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
@@ -647,34 +655,20 @@ mod tests {
         }
     }
 
-    /// Token id 0 is not a match: Python's `trim_matched_stop` guards with
-    /// `if not matched`, and 0 is falsy there. Trimming on it drops a real
-    /// generated token for any model whose stop id is 0.
+    /// A matched stop token remains in `output_ids`; it is only omitted from
+    /// decoded text above, and the event says so. Token id 0 is a stop token
+    /// like any other, as in Python's `trim_matched_stop`.
     #[test]
-    fn matched_token_zero_does_not_trim() {
-        let mut ids = vec![1, 2, 0];
-        trim_stop_token(&mut ids, &Some(Matched::Token(0)), false);
-        assert_eq!(ids, vec![1, 2, 0], "id 0 is not a matched stop");
-        // A real stop id still trims.
-        let mut ids = vec![1, 2, 3];
-        trim_stop_token(&mut ids, &Some(Matched::Token(3)), false);
-        assert_eq!(ids, vec![1, 2]);
-    }
-
-    /// A matched stop TOKEN is dropped from the surfaced `output_ids` by default
-    /// (but still counted in `completion_tokens`); `no_stop_trim` keeps it.
-    #[test]
-    fn stop_token_trimmed_from_output_ids() {
-        let fr = serde_json::json!({ "type": "stop", "matched": 3 });
-        let out = final_chunk(false, fr.clone(), vec![1, 2, 3]);
-        assert_eq!(out.token_ids, vec![1, 2], "matched stop token dropped");
-        assert_eq!(
-            out.completion_tokens, 3,
-            "generated count still includes it"
-        );
-
-        let out = final_chunk(true, fr, vec![1, 2, 3]);
-        assert_eq!(out.token_ids, vec![1, 2, 3], "no_stop_trim keeps it");
+    fn stop_token_is_preserved_in_output_ids() {
+        for stop in [3, 0] {
+            let reason = serde_json::json!({ "type": "stop", "matched": stop });
+            for no_stop_trim in [false, true] {
+                let output = final_chunk(no_stop_trim, reason.clone(), vec![1, 2, stop]);
+                assert_eq!(output.token_ids, vec![1, 2, stop]);
+                assert_eq!(output.completion_tokens, 3);
+                assert_eq!(output.stop_token_trimmed, !no_stop_trim);
+            }
+        }
     }
 
     /// A non-stop finish (`length`, no `matched`) never trims.
@@ -683,5 +677,6 @@ mod tests {
         let fr = serde_json::json!({ "type": "length", "length": 3 });
         let out = final_chunk(false, fr, vec![1, 2, 3]);
         assert_eq!(out.token_ids, vec![1, 2, 3]);
+        assert!(!out.stop_token_trimmed);
     }
 }

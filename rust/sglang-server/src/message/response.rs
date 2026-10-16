@@ -1,19 +1,18 @@
-//! The response direction: the per-request back-channel the API handler
-//! drains ([`ResponseSink`] / [`ResponseItem`]), the response frame encodings
-//! (batch / control result / error), and the columnar batch decode into
-//! per-request [`ChunkEvent`]s.
+//! The runtime response direction: per-request channels into the core
+//! boundary ([`ResponseSink`] / [`ResponseItem`]), response frame encodings,
+//! and columnar batch decoding into per-request [`ChunkEvent`]s.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::finish_reason::FinishReason;
-use super::types::TokenIds;
 use crate::message::ids::Rid;
+use crate::message::types::TokenIds;
 use crate::utils::error::Error;
 
-/// Per-request back-channel the detok shard writes decode frames to and the API
-/// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
+/// Per-request back-channel the detok shard writes runtime outputs to and the
+/// core boundary drains; bounded, and receiver-drop cancels the producer.
 #[derive(Clone, Debug)]
 pub enum ResponseSink {
     Local(mpsc::Sender<ResponseItem>),
@@ -39,26 +38,26 @@ impl ResponseSink {
     }
 }
 
-#[allow(dead_code)] // the receiver half is created inline in api_server::submit.
+#[allow(dead_code)] // the receiver half is owned inside the core boundary.
 pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
-/// What the connection handler receives on the decode stream: a detok-decoded
-/// [`ChunkEvent`] (handler formats it), a verbatim control payload, or an error.
+/// Runtime-facing output delivered to the core boundary: a detok-decoded
+/// [`ChunkEvent`], a serialized internal-operation result, or a stage error.
+/// [`crate::api_server::core::CoreHandle`] translates these variants before a
+/// transport adapter sees them.
 #[derive(Debug)]
 pub enum ResponseItem {
     /// An intermediate streamed generation step (only sent for streaming reqs).
     Frame(ChunkEvent),
     /// The final generation step.
     Done(ChunkEvent),
-    /// A control-request result: one verbatim payload (e.g. `/server_info`),
-    /// delivered as-is with no per-protocol formatting.
+    /// A control-request result encoded by the Python scheduler.
     Control(Bytes),
     /// Reply to an internal service request (`RequestKind::Detokenize`): raw
-    /// bytes for the SUBMITTER to consume (e.g. the decoded prompt text), not
-    /// client-bound JSON like `Control` and not a generation frame. Generation
-    /// and control drains never see it.
+    /// bytes for the core to decode (e.g. detokenized text), not a
+    /// client-facing wire payload and not a generation frame.
     Data(Bytes),
-    /// Terminal failure: handler emits an error frame (stream) or status (unary).
+    /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
 
@@ -84,6 +83,22 @@ fn take_f32(data: &[u8], off: &mut usize, n: usize) -> Option<Vec<f32>> {
         .get(start..end)?
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    *off = end;
+    Some(out)
+}
+
+/// Read `n` little-endian i64 token ids from `data` at `*off`, advancing `*off`.
+/// The scheduler stores output ids as `array("q")` and emits their bytes as-is,
+/// so this is the crate's [`TokenIds`] width with no conversion. `None` past
+/// the buffer end.
+fn take_i64(data: &[u8], off: &mut usize, n: usize) -> Option<TokenIds> {
+    let start = *off;
+    let end = start.checked_add(n.checked_mul(8)?)?;
+    let out = data
+        .get(start..end)?
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().expect("8-byte chunk")))
         .collect();
     *off = end;
     Some(out)
@@ -118,9 +133,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
+/// Columnar scalar header for a whole decode batch. The first six fields are
+/// required; every field after `reasoning_tokens` defaults empty, so the hot
+/// path emits a six-element header. Field order is the wire ABI and must match
 /// `RustTokenizerManager.push_generation`'s `header_cols` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
@@ -140,6 +155,9 @@ pub struct BatchHeader {
     pub finish_reasons: Vec<Option<FinishReason>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
+    /// Python's `cached_tokens` / `reasoning_tokens`: running totals, not deltas.
+    pub cached_tokens: Vec<u32>,
+    pub reasoning_tokens: Vec<u64>,
     #[serde(default)]
     pub out_lp_lens: Vec<u32>,
     #[serde(default)]
@@ -261,8 +279,13 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // `tok_lens` delivered a 200 with an empty completion, and a short
     // `finish_reasons` dropped the terminal marker so the request never completed
     // and its unary drain pended forever. The producer already asserts this for the
-    // extras columns; the four core ones were unchecked.
-    if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+    // extras columns; the core ones were unchecked.
+    if h.finish_reasons.len() != n
+        || h.prompt_tokens.len() != n
+        || h.tok_lens.len() != n
+        || h.cached_tokens.len() != n
+        || h.reasoning_tokens.len() != n
+    {
         reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
@@ -294,9 +317,11 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // Per-column byte cursors, advanced per request — no whole-column read. Columns
     // are concatenated in exactly this order, every element 4 bytes.
     let mut base = 0usize;
-    let mut col = |count: usize| -> usize {
+    // Token ids are 8-byte (`array("q")` bytes as the scheduler holds them);
+    // every logprob / hidden column is 4-byte (f32 values, i32 indices).
+    let mut col = |count: usize, width: usize| -> usize {
         let start = base;
-        base += count * 4;
+        base += count * width;
         start
     };
     // Each val/idx column pair shares one element count — sum it once.
@@ -308,20 +333,20 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let n_od = sum(&h.out_tokids_lp_poslens);
     let n_id = sum(&h.in_tokids_lp_poslens);
     let n_h = sum(&h.hidden_poslens);
-    let mut c_ids = col(n_ids);
-    let mut c_olp_v = col(n_olp);
-    let mut c_olp_i = col(n_olp);
-    let mut c_ilp_v = col(n_ilp);
-    let mut c_ilp_i = col(n_ilp);
-    let mut c_ot_v = col(n_ot);
-    let mut c_ot_i = col(n_ot);
-    let mut c_it_v = col(n_it);
-    let mut c_it_i = col(n_it);
-    let mut c_od_v = col(n_od);
-    let mut c_od_i = col(n_od);
-    let mut c_id_v = col(n_id);
-    let mut c_id_i = col(n_id);
-    let mut c_h_v = col(n_h);
+    let mut c_ids = col(n_ids, 8);
+    let mut c_olp_v = col(n_olp, 4);
+    let mut c_olp_i = col(n_olp, 4);
+    let mut c_ilp_v = col(n_ilp, 4);
+    let mut c_ilp_i = col(n_ilp, 4);
+    let mut c_ot_v = col(n_ot, 4);
+    let mut c_ot_i = col(n_ot, 4);
+    let mut c_it_v = col(n_it, 4);
+    let mut c_it_i = col(n_it, 4);
+    let mut c_od_v = col(n_od, 4);
+    let mut c_od_i = col(n_od, 4);
+    let mut c_id_v = col(n_id, 4);
+    let mut c_id_i = col(n_id, 4);
+    let mut c_h_v = col(n_h, 4);
 
     // `col` summed every column's span into `base`, so a truncated frame is caught
     // here — the one rejection that is genuinely whole-frame, since it precedes the
@@ -357,7 +382,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // already routed; making that abort atomic would mean buffering the whole frame,
     // which is exactly what the streaming decode avoids.
     let mut decode_one = |i: usize| -> Option<ChunkEvent> {
-        let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
+        let token_ids = take_i64(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely.
@@ -448,6 +473,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            cached_tokens: h.cached_tokens.get(i).copied().unwrap_or(0),
+            reasoning_tokens: h.reasoning_tokens.get(i).copied().unwrap_or(0),
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -455,6 +482,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // compiled clean and silently shipped zeros.
             text: String::new(),
             completion_tokens: 0,
+            stop_token_trimmed: false,
         })
     };
 
@@ -518,8 +546,8 @@ pub fn frame_control_result(rid: &str, payload: &[u8]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Frame a per-request failure `[rid, message]` for the response — routes a
-/// terminal error back to the owning request (→ HTTP 400) instead of crashing.
+/// Frame a per-request validation failure `[rid, message]` for the response —
+/// routes a terminal error back to the owning request instead of crashing.
 pub fn frame_error(rid: &str, message: &str) -> Bytes {
     use rmpv::Value;
     let arr = Value::Array(vec![Value::from(rid), Value::from(message)]);
@@ -540,22 +568,29 @@ pub fn frame_error(rid: &str, message: &str) -> Bytes {
 /// frame and moved between stages in-process (never serialized), so no serde.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkEvent {
-    /// Client-visible rid — the request's IDENTITY. Moved out of the frame header
-    /// (which owns it and drops it), so carrying it costs no allocation. The shard
-    /// is still chosen by `Rid::shard`, but a hash collision there now only
-    /// co-locates two requests instead of merging them.
+    /// Runtime correlation ID. Moved out of the frame header (which owns it and
+    /// drops it), so carrying it costs no allocation. The core strips this
+    /// field before exposing semantic output; the shard routes it via `Rid::shard`.
     pub rid: Rid,
-    /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
+    /// New token ids for this step, widened from the scheduler's int32 wire
+    /// width at parse time. Empty allowed (e.g. metadata-only frames).
     pub token_ids: TokenIds,
     /// `None` while streaming, the [`FinishReason`] on the final chunk.
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
+    /// Prefix-cache hits and reasoning tokens so far: running totals, so the
+    /// latest chunk's value is the request's.
+    pub cached_tokens: u32,
+    pub reasoning_tokens: u64,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
     /// filled by the detok shard. `token_ids` doubles as `output_ids`;
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Set by the detok shard when the last of `token_ids` is a matched stop
+    /// token kept in `output_ids` but left out of `text`.
+    pub stop_token_trimmed: bool,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
@@ -648,7 +683,8 @@ mod tests {
     fn decodes_batch_frame() {
         use rmpv::Value;
         // 3 requests: rids "1","2","3"; finish [nil, {type:stop,matched:5}, nil];
-        // prompt_tokens [4,5,6]; tok_lens [2,0,1] -> ids [10,11 | (none) | 12].
+        // prompt_tokens [4,5,6]; tok_lens [2,0,1] -> ids [10,11 | (none) | 12];
+        // cached_tokens [3,0,1]; reasoning_tokens [0,0,7].
         let stop = Value::Map(vec![
             (Value::from("type"), Value::from("stop")),
             (Value::from("matched"), Value::from(5)),
@@ -666,10 +702,20 @@ mod tests {
                 Value::from(0u32),
                 Value::from(1u32),
             ]),
+            Value::Array(vec![
+                Value::from(3u32),
+                Value::from(0u32),
+                Value::from(1u32),
+            ]),
+            Value::Array(vec![
+                Value::from(0u64),
+                Value::from(0u64),
+                Value::from(7u64),
+            ]),
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
-        let data: Vec<u8> = [10i32, 11, 12]
+        let data: Vec<u8> = [10i64, 11, 12]
             .iter()
             .flat_map(|x| x.to_le_bytes())
             .collect();
@@ -682,6 +728,8 @@ mod tests {
         assert_eq!(events[0].rid, Rid::from("1"));
         assert_eq!(events[0].token_ids, vec![10, 11]);
         assert_eq!(events[0].prompt_tokens, 4);
+        assert_eq!(events[0].cached_tokens, 3);
+        assert_eq!(events[2].reasoning_tokens, 7);
         assert!(events[0].finish_reason.is_none());
         assert_eq!(events[1].rid, Rid::from("2"));
         assert!(events[1].token_ids.is_empty());
@@ -712,7 +760,7 @@ mod tests {
     #[test]
     fn rejects_frame_with_lengths_past_data() {
         use rmpv::Value;
-        // 1 request: tok_lens[0]=10 claims 40 bytes and out_lp_lens[0]=1 puts the
+        // 1 request: tok_lens[0]=10 claims 80 bytes and out_lp_lens[0]=1 puts the
         // logprob column's base past the 4-byte data buffer. The old clamp-only-`end`
         // code advanced the cursor past `len`, then sliced `data[40..4]` (start > end)
         // and panicked.
@@ -720,7 +768,9 @@ mod tests {
             Value::Array(vec![Value::from("1")]),   // rids
             Value::Array(vec![Value::Nil]),         // finish_reasons
             Value::Array(vec![Value::from(0u32)]),  // prompt_tokens
-            Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 40 bytes)
+            Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 80 bytes)
+            Value::Array(vec![Value::from(0u32)]),  // cached_tokens
+            Value::Array(vec![Value::from(0u32)]),  // reasoning_tokens
             Value::Array(vec![Value::from(1u32)]),  // out_lp_lens (base now past data)
         ]);
         let mut header = Vec::new();
@@ -748,6 +798,7 @@ mod tests {
         use rmpv::Value;
         let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
         let rids = Value::Array(vec![Value::from("1"), Value::from("2")]);
         let finish = Value::Array(vec![Value::Nil, Value::Nil]);
@@ -758,6 +809,8 @@ mod tests {
             finish.clone(),
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // cached_tokens
+            arr_u(&[0, 0]), // reasoning_tokens
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[2, 1]), // out_top_reqlens — 3 positions claimed
@@ -766,7 +819,7 @@ mod tests {
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let mut data = Vec::new();
-        data.extend(i(&[10, 20])); // token_ids
+        data.extend(q(&[10, 20])); // token_ids
         data.extend(f(&[-0.1, -0.2, -0.3, -0.4])); // out_top_val (sum of poslens = 4)
         data.extend(i(&[1, 2, 3, 4])); // out_top_idx
         let framed = frame_decode_batch_cols(&header, &[&data]);
@@ -782,6 +835,8 @@ mod tests {
             finish,
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // cached_tokens
+            arr_u(&[0, 0]), // reasoning_tokens
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[0, 0]), // out_top_reqlens
@@ -798,7 +853,7 @@ mod tests {
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let mut data = Vec::new();
-        data.extend(i(&[10, 20])); // token_ids
+        data.extend(q(&[10, 20])); // token_ids
         data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (sum of poslens = 3)
         let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
@@ -819,6 +874,8 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),
             Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
             Value::Array(vec![Value::from(9u32), Value::from(9u32)]), // tok_lens past data
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]), // cached_tokens
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]), // reasoning_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -844,11 +901,13 @@ mod tests {
             Value::Array(vec![Value::from("1")]),
             Value::Array(vec![Value::Nil]),
             Value::Array(vec![Value::from(0u32)]),
-            Value::Array(vec![Value::from(1u32)]), // tok_lens: 1 id = 4 bytes
+            Value::Array(vec![Value::from(1u32)]), // tok_lens: 1 id = 8 bytes
+            Value::Array(vec![Value::from(0u32)]), // cached_tokens
+            Value::Array(vec![Value::from(0u32)]), // reasoning_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
-        let data: Vec<u8> = vec![0u8; 8]; // 4 bytes too many
+        let data: Vec<u8> = vec![0u8; 16]; // 8 bytes too many
         let framed = frame_decode_batch_cols(&header, &[&data]);
         let decoded = for_each_chunk(&framed[1..], |_| {});
         assert!(!decoded.ok, "header and data must agree exactly");
@@ -867,10 +926,12 @@ mod tests {
             Value::Array(vec![Value::Nil]),                   // finish_reasons
             Value::Array(vec![Value::from(1u32)]),            // prompt_tokens
             Value::Array(vec![Value::from(1u32)]),            // tok_lens
+            Value::Array(vec![Value::from(0u32)]),            // cached_tokens
+            Value::Array(vec![Value::from(0u32)]),            // reasoning_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
-        let data: Vec<u8> = [0i32].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let data: Vec<u8> = [0i64].iter().flat_map(|x| x.to_le_bytes()).collect();
 
         let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
@@ -909,8 +970,10 @@ mod tests {
         use rmpv::Value;
         let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
-        // header: rids, finish, prompt, tok_lens, out_lp_lens, in_lp_lens,
+        // header: rids, finish, prompt, tok_lens, cached_tokens, reasoning_tokens,
+        //   out_lp_lens, in_lp_lens,
         //   out_top_reqlens, out_top_poslens, in_top_*, out_tokids_lp_*,
         //   in_tokids_lp_*,
         //   hidden_reqlens, hidden_poslens
@@ -919,6 +982,8 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),             // finish
             arr_u(&[3, 4]),                                         // prompt
             arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[0, 0]),                                         // cached_tokens
+            arr_u(&[0, 0]),                                         // reasoning_tokens
             arr_u(&[2, 0]),                                         // out_lp_lens
             arr_u(&[0, 0]),                                         // in_lp_lens
             arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
@@ -935,7 +1000,7 @@ mod tests {
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let mut data = Vec::new();
-        data.extend(i(&[10, 20])); // token_ids: req0=[10], req1=[20]
+        data.extend(q(&[10, 20])); // token_ids: req0=[10], req1=[20]
         data.extend(f(&[-0.5, -0.6])); // out_lp_val (req0, 2)
         data.extend(i(&[10, 99])); // out_lp_idx
         data.extend(f(&[-0.1, -0.2])); // out_top_val (1 pos, k=2)
@@ -977,6 +1042,7 @@ mod tests {
         use rmpv::Value;
         let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
 
         // Only `out_lp` is active; the other six families are inactive. `zeros`
@@ -991,6 +1057,8 @@ mod tests {
                 Value::Array(vec![Value::Nil, Value::Nil]),             // finish
                 arr_u(&[3, 4]),                                         // prompt
                 arr_u(&[1, 1]),                                         // tok_lens
+                arr_u(&[0, 0]),                                         // cached_tokens
+                arr_u(&[0, 0]),                                         // reasoning_tokens
                 arr_u(&[2, 0]),                                         // out_lp_lens (ACTIVE)
                 reqlens.clone(),                                        // in_lp_lens
                 reqlens.clone(),                                        // out_top_reqlens
@@ -1007,7 +1075,7 @@ mod tests {
             let mut header = Vec::new();
             rmpv::encode::write_value(&mut header, &header_arr).unwrap();
             let mut data = Vec::new();
-            data.extend(i(&[10, 20])); // token_ids
+            data.extend(q(&[10, 20])); // token_ids
             data.extend(f(&[-0.5, -0.6])); // out_lp_val (req0)
             data.extend(i(&[10, 99])); // out_lp_idx
             let framed = frame_decode_batch_cols(&header, &[&data]);
@@ -1064,6 +1132,7 @@ mod tests {
         use rmpv::Value;
         let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
 
         let header_arr = Value::Array(vec![
@@ -1071,6 +1140,8 @@ mod tests {
             Value::Array(vec![Value::Nil]),       // finish
             arr_u(&[9]),                          // prompt
             arr_u(&[1]),                          // tok_lens
+            arr_u(&[0]),                          // cached_tokens
+            arr_u(&[0]),                          // reasoning_tokens
             arr_u(&[2]),                          // out_lp_lens      (2 flat)
             arr_u(&[1]),                          // in_lp_lens       (1 flat)
             arr_u(&[1]),                          // out_top_reqlens  (1 position…
@@ -1089,7 +1160,7 @@ mod tests {
 
         // Concatenated in `for_each_chunk`'s column order.
         let mut data = Vec::new();
-        data.extend(i(&[100])); // token_ids
+        data.extend(q(&[100])); // token_ids
         data.extend(f(&[-1.1, -1.2])); // out_lp_val
         data.extend(i(&[11, 12])); // out_lp_idx
         data.extend(f(&[-2.1])); // in_lp_val
@@ -1144,10 +1215,12 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),
             Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
             Value::Array(vec![Value::from(1u32), Value::from(1u32)]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
-        let data: Vec<u8> = [7i32, 8].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let data: Vec<u8> = [7i64, 8].iter().flat_map(|x| x.to_le_bytes()).collect();
         let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);

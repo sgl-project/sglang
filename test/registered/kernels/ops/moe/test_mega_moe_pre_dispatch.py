@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -64,6 +64,31 @@ def test_mxfp8_scale_output_uses_padded_row_stride() -> None:
     torch.testing.assert_close(buf_topk_weights[:num_tokens], topk_weights)
     assert torch.all(buf_topk_idx[num_tokens:] == -1)
     assert torch.all(buf_topk_weights[num_tokens:] == 0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+def test_empty_mhc_view_clears_idle_dispatch() -> None:
+    hidden, padded_max, top_k = 2304, 8, 8
+    x = torch.empty(1, 4, hidden, device="cuda", dtype=torch.bfloat16)[:0, 0]
+    assert x.stride(0) == 4 * hidden
+    buf_x = torch.zeros(padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn)
+    buf_x_sf = torch.zeros(padded_max, 20, device="cuda", dtype=torch.int32)[:, :18]
+    buf_idx = torch.full((padded_max, top_k), 42, device="cuda", dtype=torch.int64)
+    buf_weights = torch.ones(padded_max, top_k, device="cuda", dtype=torch.float32)
+    mega_moe_pre_dispatch(
+        x,
+        torch.empty(0, top_k, device="cuda", dtype=torch.int32),
+        torch.empty(0, top_k, device="cuda", dtype=torch.float32),
+        buf_x,
+        buf_x_sf,
+        buf_idx,
+        buf_weights,
+    )
+    torch.testing.assert_close(buf_idx, torch.full_like(buf_idx, -1))
+    torch.testing.assert_close(buf_weights, torch.zeros_like(buf_weights))
 
 
 if __name__ == "__main__":

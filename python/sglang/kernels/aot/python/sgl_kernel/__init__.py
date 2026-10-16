@@ -106,17 +106,23 @@ else:
         assign_extend_cache_locs_cpu,
         assign_req_to_token_pool_cpu,
         build_draft_decode_metadata_cpu,
-        build_tree_kernel_efficient,
         build_tree_kernel_efficient_cpu,
         fill_accept_out_cache_loc_cpu,
         fill_bonus_tokens_cpu,
-        reconstruct_indices_from_tree_mask,
         rotate_input_ids_cpu,
-        segment_packbits,
-        tree_speculative_sampling_target_only,
-        verify_tree_greedy,
         verify_tree_greedy_cpu,
     )
+
+    # CUDA and ROCm route these through sglang.kernels.ops.speculative (JIT).
+    if torch.version.cuda is None:
+        from sgl_kernel.speculative import (
+            build_tree_kernel_efficient,
+            reconstruct_indices_from_tree_mask,
+            segment_packbits,
+            tree_speculative_sampling_target_only,
+            verify_tree_greedy,
+        )
+
     from sgl_kernel.top_k import (
         fast_topk,
         fast_topk_transform_fused,

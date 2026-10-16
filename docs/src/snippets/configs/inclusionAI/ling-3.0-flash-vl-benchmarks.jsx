@@ -81,6 +81,12 @@ export const benchmarks = [
   { match: { hw: "b300", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
   { match: { hw: "b200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" } },
   {
+    match: { hw: "h200", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "dev @ bf254483a1",
+    accuracy: { mmmu_pro_pct: 76.24, gsm8k_pct: 96.66 },
+    notes: "1×H200 (141 GB), TP=1, flashinfer_mxfp4 MoE backend (SM90 CUTLASS W4A16), auto-selected — verified without an explicit --moe-runner-backend flag (healthy in 330 s). Serving smoke verified: text request completes with finish_reason=stop and reasoning split. Accuracy measured on 2×B300, TP=2 (sgl-eval, single-shot, thinking on): MMMU-Pro 76.24% (1,730 examples, stop 98.96%, truncated 1.04%), GSM8K 96.66% (stop 100%).",
+  },
+  {
     match: { hw: "dgx-spark", variant: "default", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "dev @ bf254483a1",
     speed: [

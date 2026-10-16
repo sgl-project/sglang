@@ -45,6 +45,18 @@ def cuda_home() -> str:
 
 
 @cache_once
+def cuda_stubs_dir() -> str:
+    """Directory holding the driver stub libraries (`libcuda.so`).
+
+    A module that calls the driver API links `-lcuda` against this stub; the
+    real `libcuda.so.1` is supplied by the installed driver at load time. Only
+    the stub ships with the toolkit, so this path -- not a plain `-lcuda` -- is
+    what makes the link resolve.
+    """
+    return os.path.join(cuda_home(), "lib64", "stubs")
+
+
+@cache_once
 def rocm_home() -> str:
     """ROCm install root, resolved the way tvm-ffi resolves it."""
     return os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"

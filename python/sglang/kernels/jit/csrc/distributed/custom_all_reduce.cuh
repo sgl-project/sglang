@@ -142,7 +142,16 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   const auto r = params.rank;
   const auto num_vecs = params.num_vecs;
   const auto num_threads = blockDim.x * gridDim.x;
-  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  // Round-robin warps to blocks rather than giving each block a contiguous run.
+  // The grid is pinned to the counter array, so once `num_vecs` stops filling
+  // `gridDim * blockDim` a block-major index leaves the tail CTAs with nothing
+  // to do; that happens over a whole 2x band of sizes, between the point where
+  // `choose_block_size` gives up on 512 and the point where 1024 threads fill
+  // the grid again.
+  const auto warp_in_block = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
+  const auto global_tid = global_warp_id * kWarpThreads + lane_id;
   PDLWaitPrimary<kUsePDL>();
   const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
 

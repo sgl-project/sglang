@@ -36,19 +36,14 @@ def test_flux2_token_cat_fp8_is_bit_exact(tokens: int) -> None:
     assert torch.equal(actual, expected)
 
 
-def test_flux2_token_cat_fp8_rejects_compile() -> None:
+@pytest.mark.parametrize(
+    "guard", ["torch.compiler.is_compiling", "torch.cuda.is_current_stream_capturing"]
+)
+def test_flux2_token_cat_fp8_rejects_capture(guard) -> None:
     attention = torch.empty((1, 1, 16), device="cuda", dtype=torch.bfloat16)
     mlp = torch.empty((1, 1, 48), device="cuda", dtype=torch.bfloat16)
     scale = torch.ones((1,), device="cuda", dtype=torch.float32)
-    with patch("torch.compiler.is_compiling", return_value=True):
-        assert try_flux2_token_cat_fp8(attention, mlp, scale) is None
-
-
-def test_flux2_token_cat_fp8_rejects_cuda_graph_capture() -> None:
-    attention = torch.empty((1, 1, 16), device="cuda", dtype=torch.bfloat16)
-    mlp = torch.empty((1, 1, 48), device="cuda", dtype=torch.bfloat16)
-    scale = torch.ones((1,), device="cuda", dtype=torch.float32)
-    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+    with patch(guard, return_value=True):
         assert try_flux2_token_cat_fp8(attention, mlp, scale) is None
 
 

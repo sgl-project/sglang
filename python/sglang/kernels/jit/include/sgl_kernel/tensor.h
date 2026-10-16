@@ -10,6 +10,7 @@
 /// usage examples.
 
 #pragma once
+#include <sgl_kernel/bits.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -527,6 +529,14 @@ struct TensorMatcher {
     return std::move(*this);
   }
 
+  /// Ensure alignment on all dimensions except for the last dimension.
+  auto ensure_alignment(int64_t alignment) && -> TensorMatcher&& {
+    RuntimeCheck(!m_alignment.has_value(), "Alignment already specified");
+    RuntimeCheck(is_pow2<uint64_t>(alignment), "Alignment must be a power of 2");
+    m_alignment = alignment;
+    return std::move(*this);
+  }
+
   // once we start verification, we cannot modify anymore
   auto verify(tvm::ffi::TensorView view, DebugInfo info = {}) const&& -> const TensorMatcher&& {
     try {
@@ -580,6 +590,18 @@ struct TensorMatcher {
     // since we may double verify, we will force to check
     m_dtype->verify(view.dtype());
     m_device->verify(view.device());
+    if (m_alignment.has_value()) {
+      const auto alignment = *m_alignment;
+      CHECK_HOST(std::bit_cast<uintptr_t>(view.data_ptr()) % alignment == 0)
+          << "Tensor data pointer is not aligned to " << alignment << " bytes";
+      if (dim > 0) [[likely]] {
+        const auto bytes = static_cast<int64_t>(dtype_bytes(view.dtype()));
+        for (const auto i : irange(dim - 1)) {
+          CHECK_HOST(view.size(i) == 1 || (view.stride(i) * bytes) % alignment == 0)
+              << "Tensor stride for dimension " << i << " is not aligned to " << alignment << " bytes";
+        }
+      }
+    }
   }
 
   auto m_init_dtype() -> void {
@@ -602,6 +624,7 @@ struct TensorMatcher {
   DeviceRef m_device;
   bool m_has_dtype = false;
   bool m_has_device = false;
+  std::optional<int64_t> m_alignment;
 };
 
 }  // namespace host

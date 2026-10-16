@@ -62,9 +62,9 @@ _OWNER_SITES = {
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_committed_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "kv_committed_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode_default", "evict"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_allocated_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_committed_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
@@ -92,8 +92,8 @@ _OWNER_SITES = {
         "kv_committed_len",
     ): 1,
     # disaggregation decode prealloc: both lengths are settled on the host in
-    # _plan_prealloc before the batched device allocation; the NPU DSV4
-    # per-request path (alloc_for_decode_prealloc) restates kv_allocated_len.
+    # _plan_prealloc before the batched device allocation; the per-request
+    # paths (alloc_for_decode_prealloc(_hisparse)) restate kv_allocated_len.
     (
         "disaggregation/decode.py",
         "DecodePreallocQueue._plan_prealloc",
@@ -105,6 +105,11 @@ _OWNER_SITES = {
         "kv_allocated_len",
     ): 1,
     ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
+    (
+        "disaggregation/decode.py",
+        "alloc_for_decode_prealloc_hisparse",
+        "kv_allocated_len",
+    ): 1,
     # Beam member rows alias the leader's decode region, so releasing them
     # rewinds the leader's watermarks to keep its own per-Req release from
     # freeing that region twice.
@@ -116,6 +121,17 @@ _OWNER_SITES = {
     (
         "beam_search/fork.py",
         "free_member_rows",
+        "kv_allocated_len",
+    ): 1,
+    # A completed dLLM canvas is discarded while the context and slot stay owned.
+    (
+        "dllm/mixin/scheduler.py",
+        "SchedulerDllmMixin._stash_dllm_context",
+        "kv_committed_len",
+    ): 1,
+    (
+        "dllm/mixin/scheduler.py",
+        "SchedulerDllmMixin._stash_dllm_context",
         "kv_allocated_len",
     ): 1,
     # streaming session tail trimming

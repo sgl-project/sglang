@@ -20,6 +20,7 @@
 
 import copy
 import logging
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -33,6 +34,15 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    layer_stack,
+)
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import UNFUSED_NORM_READOUT
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -646,6 +656,7 @@ class GlmImageTextAttention(nn.Module):
             output_size=hidden_size,
             bias=None,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -887,6 +898,7 @@ class GlmImageTextDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -896,23 +908,34 @@ class GlmImageTextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                declare_attn(
+                    read=UNFUSED_NORM_READOUT,
+                    output_transform=OutputTransform(self.post_self_attn_layernorm),
+                ),
+                self.input_layernorm,
+            ),
+            (
+                declare_ffn(
+                    sparse=False,
+                    next_layer_sparse=False,
+                    read=UNFUSED_NORM_READOUT,
+                    output_transform=OutputTransform(self.post_mlp_layernorm),
+                ),
+                self.post_attention_layernorm,
+            ),
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         **kwargs,
-    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
-
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
+    ) -> torch.Tensor:
         # Self Attention
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states, _ = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -920,17 +943,11 @@ class GlmImageTextDecoderLayer(nn.Module):
             **kwargs,
         )
 
-        hidden_states = self.post_self_attn_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states, None
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class GlmImageTextModel(nn.Module):
@@ -953,17 +970,18 @@ class GlmImageTextModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.layers = nn.ModuleList(
-            [
-                GlmImageTextDecoderLayer(
-                    layer_id=i,
-                    config=config,
-                    quant_config=self.quant_config,
-                    prefix=add_prefix(f"layers.{i}", getattr(config, "prefix", "")),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    GlmImageTextDecoderLayer(
+                        layer_id=i,
+                        config=config,
+                        quant_config=self.quant_config,
+                        prefix=add_prefix(f"layers.{i}", getattr(config, "prefix", "")),
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -984,18 +1002,12 @@ class GlmImageTextModel(nn.Module):
 
         hidden_states = input_embeds
 
-        residual = None
+        residual_batch.start(forward_batch)
         for layer in self.layers:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+            hidden_states = layer(positions, hidden_states, forward_batch)
 
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        return self.norm(residual_batch.take_output(hidden_states, forward_batch))
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1068,7 +1080,7 @@ class GlmImageForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(logits_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

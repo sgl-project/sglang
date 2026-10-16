@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
@@ -19,7 +19,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
@@ -465,11 +465,16 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             delattr(layer, stale)
 
 
-def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
-    if layer.quant_config.group_size != 16:
-        raise ValueError(
-            f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
-        )
+def prepare_moe_nvfp4_layer_for_marlin(
+    layer: torch.nn.Module, group_size: Optional[int] = None
+) -> None:
+    # compressed-tensors carries the group size on the per-layer scheme rather
+    # than on layer.quant_config (which the MoE weight loader owns), so callers
+    # outside ModelOpt pass it in.
+    if group_size is None:
+        group_size = layer.quant_config.group_size
+    if group_size != 16:
+        raise ValueError(f"NVFP4 Marlin MoE requires group_size=16, got {group_size}.")
 
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data

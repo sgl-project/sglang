@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.rotary_triton import (
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.rotary_embedding.yarn import (
+    _extend_yarn_cache,
     yarn_find_correction_range,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
@@ -22,12 +23,14 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
+    is_hip,
     is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -169,11 +172,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if _is_hip:
+            # On HIP, keep fp32 for the fused QSA indexer JIT kernel.
+            if self.cos_sin_cache.device != query.device:
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        else:
+            if (
+                self.cos_sin_cache.device != query.device
+                or self.cos_sin_cache.dtype != query.dtype
+            ):
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
 
     def forward_native(
         self,
@@ -250,6 +260,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if query.shape[0] == 0:
+            return query, key
         self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
@@ -485,6 +497,14 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
             + inv_freq_extrapolation * inv_freq_mask
         )
         return inv_freq
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        self.cos_sin_cache, _ = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
+        )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)

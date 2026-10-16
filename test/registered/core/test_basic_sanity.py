@@ -1,7 +1,7 @@
 """Stage-a basic sanity: small-but-broad server coverage that downstream
 stages depend on. Multiple sanity-kit mixins driving one shared server,
 covering protocol, decode correctness, scheduler stress, occupancy, and
-hellaswag accuracy."""
+MMLU accuracy."""
 
 import unittest
 
@@ -10,8 +10,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
+from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
-from sglang.test.kits.hellaswag_kit import HellaswagMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -29,7 +29,7 @@ class TestBasicSanity(
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
-    HellaswagMixin,
+    MMLUSanityMixin,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_MODEL_NAME_FOR_TEST

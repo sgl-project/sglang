@@ -22,7 +22,6 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.diffusion.norm.rmsnorm_scale_shift_bitexact import (
-    can_use_fused_rmsnorm_scale_shift,
     fused_rmsnorm_scale_shift_bitexact,
 )
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
@@ -63,14 +62,6 @@ def _ones_weight(x: torch.Tensor) -> torch.Tensor:
         w = torch.ones(x.shape[-1], device=x.device, dtype=torch.bfloat16)
         _ONES_WEIGHT_CACHE[key] = w
     return w
-
-
-def can_use_ltx2_rms_norm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> bool:
-    if x.dtype is not torch.bfloat16 or not x.is_cuda:
-        return False
-    return can_use_fused_rmsnorm_scale_shift(x, _ones_weight(x), scale, shift)
 
 
 def fused_ltx2_rms_norm_modulate(

@@ -15,9 +15,7 @@ on:
         default: 'all'
         options:
           - 'all'
-          - 'cu129'
           - 'cu130'
-          - 'rocm700'
           - 'rocm720'
           - 'rocm1000'
           - 'musa43'
@@ -35,110 +33,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # cu130 is the PyPI-released variant; cu129 wheels are published only to the
-  # sgl-project/whl index (consumed via `pip install ...+cu129` for the legacy
-  # cuda 12.9 path), not to PyPI.
-  build-cu129-matrix:
-    if: |
-      github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'cu129')
-    strategy:
-      matrix:
-        python-version: ["3.10"]
-        cuda-version: ["12.9"]
-        arch: [x86_64, aarch64]
-        include:
-          - arch: x86_64
-            runner: x64-kernel-build-node
-          - arch: aarch64
-            runner: arm-kernel-build-node
-    runs-on: ${{ matrix.runner }}
-    steps:
-      # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
-      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
-      # container before checkout recreates the workspace.
-      - name: Clean workspace (remove root-owned files from prior runs)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
-            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build wheels
-        run: |
-          cd python/sglang/kernels/aot
-          chmod +x ./build.sh
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
-        env:
-          BUILD_JOBS: 64
-          NVCC_THREADS: 8
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
-          path: python/sglang/kernels/aot/dist/*
-
-  release-cu129:
-    needs: build-cu129-matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: python/sglang/kernels/aot/dist/
-          merge-multiple: true
-          pattern: wheel-*
-
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            python/sglang/kernels/aot/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 129
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
-
   build-cu130-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
@@ -274,7 +168,7 @@ jobs:
   build-rocm-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700' || github.event.inputs.target == 'rocm720' || github.event.inputs.target == 'rocm1000')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm720' || github.event.inputs.target == 'rocm1000')
     runs-on: amd-docker-scale
     strategy:
       matrix:
@@ -287,7 +181,7 @@ jobs:
         # leg is another image build on the shared AMD node, and its release job
         # appends the same wheel to the index a second time. `inputs` is empty
         # on push, which falls through to the full set.
-        rocm-version: ${{ fromJson(inputs.target == 'rocm700' && '["700"]' || inputs.target == 'rocm720' && '["720"]' || inputs.target == 'rocm1000' && '["1000"]' || '["700", "720", "1000"]') }}
+        rocm-version: ${{ fromJson(inputs.target == 'rocm720' && '["720"]' || inputs.target == 'rocm1000' && '["1000"]' || '["720", "1000"]') }}
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
       # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
@@ -320,59 +214,6 @@ jobs:
         with:
           name: wheel-python${{ matrix.python-version }}-rocm${{ matrix.rocm-version }}
           path: python/sglang/kernels/aot/dist/*
-
-  release-rocm700:
-    needs: build-rocm-matrix
-    # Only publish the flavors this run built; see build-rocm-matrix.
-    if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'rocm700' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: python/sglang/kernels/aot/dist/
-          merge-multiple: true
-          pattern: wheel-*-rocm700
-
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            python/sglang/kernels/aot/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --rocm 700
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
 
   release-rocm720:
     needs: build-rocm-matrix
