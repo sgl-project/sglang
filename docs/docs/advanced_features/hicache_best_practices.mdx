@@ -32,6 +32,27 @@ Notes:
 
 ## Key Configurations with Storage Backends Enabled
 
+### Host Pool Size With a Storage Backend
+
+A storage (L3) hit is loaded into the host pool first, then to the GPU. So the host pool needs free room at the moment of the hit.
+
+With `write_through`, the default policy, every token cached on the GPU also keeps a copy in the host pool. Host eviction can only free entries that are no longer on the GPU. Once the GPU pool is full, the room left for storage hits is at most the host pool size minus the GPU pool size, in tokens.
+
+If the host pool is not larger than the GPU pool, a warmed-up server drops every storage hit:
+
+- `cached_tokens` stays 0 for prompts that are in storage.
+- `sglang:storage_prefetch_unfulfilled_tokens_total{reason="host_capacity"}` grows.
+- The same prompt loads from storage after `/flush_cache`, because the flush empties the host pool.
+
+To avoid this, make the host pool larger than the GPU pool by at least the prompts you expect to load from storage. The default `--hicache-ratio 2` does this. `--hicache-size` is in gigabytes and overrides the ratio, so check it against the GPU pool in tokens. Both sizes appear in the startup log:
+
+```text
+KV Cache is allocated. dtype: torch.bfloat16, #tokens: 20000, K size: 1.07 GB, V size: 1.07 GB
+Allocating kv hierarchical KV host pool: 17439 tokens, 2.00 GB host memory.
+```
+
+In this example, `--hicache-size 2` gives a 17,439-token host pool for a 20,000-token GPU pool, so no storage hit can be served once the GPU pool fills. The server also warns at startup when the host pool is not larger than the GPU pool, with a message that starts with `HiCache kv host pool (17439 tokens) is smaller than the device pool (20000 tokens)`. Treat that warning as a sign that storage hits will be dropped, not only that the L2 hit rate is lower.
+
 ### Memory Layout Optimization
 
 ```bash Command
