@@ -284,10 +284,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            (
-                "DP attention on hardware other than CUDA",
-                attn_dp_enabled_of(cfg) and not get_platform().is_cuda,
-            ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
