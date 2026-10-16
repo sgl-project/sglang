@@ -203,22 +203,25 @@ class PPRing:
                                 async_send=True,
                             )
 
-                # A shutdown or a pause ends the pass after intake, on every
-                # rank at the same slot: the requests that carry it are
-                # relayed on first, so the next rank sees it there too.
+                # A shutdown or a pause launches nothing more, from the same
+                # slot on every rank: the requests that carry it are relayed
+                # on first. The slot still exchanges and commits what is in
+                # flight, which the ranks pipeline across slots; once nothing
+                # is, a shutdown ends the ring.
                 exiting = self.flags.gracefully_exit
-                if exiting or self.ops.paused_pass():
+                if exiting and not self.pending:
                     if pd is not None and not self.pp_group.is_last_rank:
                         self.send_req_work = self.channel.send_pyobj(
                             recv_reqs, async_send=True
                         )
-                    if exiting:
-                        self.channel.commit(self.send_req_work)
-                        return
-                    # A paused round is not idle: the idle checks wait for
-                    # the resume, as in the flat loop.
+                    self.channel.commit(self.send_req_work)
+                    self.channel.commit(self.send_output_work)
+                    return
+                held = exiting or self.ops.paused_pass()
+                if held:
+                    # Not idle: the idle checks wait for the resume, as in
+                    # the flat loop.
                     server_is_idle = False
-                    continue
 
                 if pd is not None:
                     pd.take_ids(mb_id)
@@ -226,10 +229,14 @@ class PPRing:
                 # Schedule the slot's step from the requests tagged with it;
                 # each slot admits up to its own batch size.
                 slot = self.slots[mb_id].schedule_slot
-                with torch.profiler.record_function("get_next_batch_to_run"):
-                    step = (
-                        pd.schedule(slot) if pd is not None else stages.schedule(slot)
-                    )
+                step = None
+                if not held:
+                    with torch.profiler.record_function("get_next_batch_to_run"):
+                        step = (
+                            pd.schedule(slot)
+                            if pd is not None
+                            else stages.schedule(slot)
+                        )
                 self.counters.cur_batch_for_debug = step
                 if step:
                     self.slots[mb_id].last_step = step

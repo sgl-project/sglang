@@ -638,32 +638,36 @@ class TestRingDriverStageOrder(CustomTestCase):
         shell.s.parts.mode_owners.disagg_prefill.transfer.append(object())
         self.assertEqual(shell.run()[-1], (1, "idle"))
 
-    def test_pause_runs_only_intake(self):
-        """A paused pass receives and relays requests and nothing else, and a
-        paused round runs no idle checks; the pass that resumes schedules."""
+    def test_pause_launches_nothing(self):
+        """A paused slot launches nothing but still exchanges and commits the
+        step in flight, and a paused round runs no idle checks; the first
+        pass after the resume schedules again."""
         for mode in ("normal", "prefill"):
             with self.subTest(mode):
-                shell = _RingShell(mode, 4, prefill={2: _step("p2")}, paused=(0, 1))
-                events = [e for e in shell.run() if e[1] != "dp.intake"]
-                self.assertEqual(
-                    events[:6],
-                    _at(0, "ingest", "paused", "send")
-                    + _at(1, "ingest", "paused", "send")
-                    if mode == "prefill"
-                    else _at(0, "ingest", "send", "paused")
-                    + _at(1, "ingest", "send", "paused"),
+                shell = _RingShell(
+                    mode, 4, prefill={0: _step("p0"), 3: _step("p3")}, paused=(1, 2)
                 )
-                self.assertIn((2, "run_batch", "p2"), events)
+                events = shell.run()
+                paused = [e[0] for e in events if e[1] == "paused"]
+                self.assertEqual(paused, [1, 2])
+                launched = [e for e in events if e[1] == "run_batch"]
+                self.assertEqual(
+                    launched, [(0, "run_batch", "p0"), (3, "run_batch", "p3")]
+                )
+                self.assertIn((1, "commit", "p0"), events)
                 self.assertNotIn("idle", [e[1] for e in events])
 
-    def test_shutdown_ends_the_ring(self):
-        """The pass that receives the shutdown relays it and ends the loop."""
+    def test_shutdown_ends_the_ring_once_nothing_is_in_flight(self):
+        """The pass that receives the shutdown launches nothing; the ring
+        ends at the first pass with nothing in flight."""
         for mode in ("normal", "prefill"):
             with self.subTest(mode):
-                shell = _RingShell(mode, 4, prefill={0: _step("p0")}, shutdown_at=1)
+                shell = _RingShell(mode, 6, prefill={0: _step("p0")}, shutdown_at=1)
                 events = shell.run()
-                self.assertEqual(events[-2:], _at(1, "ingest", "send"))
-                self.assertEqual(shell.iteration, 1)
+                self.assertIn((1, "commit", "p0"), events)
+                self.assertNotIn((1, "run_batch"), [e[:2] for e in events])
+                self.assertEqual(shell.iteration, 2)
+                self.assertEqual(events[-2:], _at(2, "ingest", "send"))
 
     def test_pd_decode(self):
         shell = _RingShell("decode", 2, decode={0: _decode_step("d0")})
