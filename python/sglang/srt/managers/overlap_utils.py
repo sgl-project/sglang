@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -82,6 +83,94 @@ def _assert_nonneg_and_invalidate(
     Compiled so the reduction + assert + scatter run as one kernel launch."""
     torch._assert_async((values >= 0).all())
     buf[indices] = -1
+
+
+@dataclass
+class StagedDeviceTensor:
+    """One-shot device copy of a host value, uploaded on the schedule stream
+    ahead of the HiCache load burst hand-over (see pre_upload_forward_inputs).
+
+    ``take(source)`` hands the tensor out exactly once, and only while
+    ``source`` is still the host object the copy was made from. A later
+    re-assignment of the host value (draft-extend rewrites extend_lens, a DP
+    step re-gathers global_num_tokens) therefore falls back to a fresh upload
+    instead of reading a stale copy. Consuming mutates this object rather than
+    the ScheduleBatch, so it also survives the spec forward-isolation snapshot
+    and restore.
+    """
+
+    source: Any
+    tensor: Optional[torch.Tensor]
+
+    def take(self, source: Any) -> Optional[torch.Tensor]:
+        if self.tensor is None or source is not self.source:
+            return None
+        tensor, self.tensor = self.tensor, None
+        return tensor
+
+
+def _stage(values: Any, dtype: torch.dtype, device) -> StagedDeviceTensor:
+    tensor = torch.tensor(
+        values, dtype=dtype, pin_memory=is_pin_memory_available(device)
+    ).to(device, non_blocking=True)
+    return StagedDeviceTensor(source=values, tensor=tensor)
+
+
+def pre_upload_forward_inputs(batch: ScheduleBatch) -> None:
+    """Issue the round-head H2D uploads on the current (schedule) stream,
+    BEFORE the HiCache load burst is handed over.
+
+    The first ops a prefill forward enqueues are small H2D copies: the deferred
+    input_ids upload in resolve_forward_inputs and the extend / DP-sync
+    metadata tensors built by ForwardBatch.init_new. When an asynchronous
+    HiCache load burst is already queued on the load stream, the copy engine
+    can serve those head copies only after the whole burst, and the entire
+    forward waits behind them. HiCacheController.start_loading records its
+    start_event on the schedule stream and makes the load stream wait on it,
+    so every copy issued here before that record is ordered ahead of the
+    burst by stream contract.
+
+    Only prefill batches reach this point (see Scheduler._handover_hicache_load)
+    and the batch is final: mixing with running decodes and the DP mlp-sync
+    gather have already happened.
+
+    * Pure prefill: input_ids goes straight to the device; the pinned staging
+      is released and resolve_forward_inputs becomes a no-op for it (the same
+      pattern the dynamic chunk sizer uses). A mixed prefill+decode batch keeps
+      the deferred path because its input_ids needs the forward-time FutureMap
+      gather.
+    * extend_lens / prefix_lens (host lists on the main path) and the
+      mlp-sync global token counts are staged as StagedDeviceTensor and
+      consumed once by ForwardBatch.init_new. Speculative batches skip the
+      global counts: init_new rescales them, so the staged values would be
+      wrong.
+    """
+    if batch.prefill_input_ids_cpu is not None and batch.mix_running_indices is None:
+        batch.input_ids = batch.prefill_input_ids_cpu.to(
+            batch.device, non_blocking=True
+        )
+        batch.prefill_input_ids_cpu = None
+
+    device = batch.device
+    if isinstance(batch.extend_lens, list) and batch.extend_lens:
+        batch.head_staged_extend_seq_lens = _stage(
+            batch.extend_lens, torch.int32, device
+        )
+    if isinstance(batch.prefix_lens, list) and batch.prefix_lens:
+        batch.head_staged_extend_prefix_lens = _stage(
+            batch.prefix_lens, torch.int32, device
+        )
+
+    if batch.spec_info is not None:
+        return
+    if batch.global_num_tokens is not None:
+        batch.head_staged_global_num_tokens = _stage(
+            batch.global_num_tokens, torch.int64, device
+        )
+    if batch.global_num_tokens_for_logprob is not None:
+        batch.head_staged_global_num_tokens_for_logprob = _stage(
+            batch.global_num_tokens_for_logprob, torch.int64, device
+        )
 
 
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
