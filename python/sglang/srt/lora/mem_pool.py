@@ -149,7 +149,9 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        enable_routed_expert_lora: bool = True,
     ):
+        self.enable_routed_expert_lora = enable_routed_expert_lora
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.lora_layer_ids: frozenset[int] = frozenset(lora_layer_ids)
@@ -651,14 +653,15 @@ class LoRAMemoryPool:
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
                     # Allocate shared expert version (3D) only when model has shared experts
-                    if has_shared_experts:
+                    if has_shared_experts or not self.enable_routed_expert_lora:
                         buffer[module_name] = alloc_per_layer(
                             module_name, get_lora_shape_fn
                         )
 
                     # MoE expert version (4D)
-                    moe_key = f"{module_name}_moe"
-                    buffer[moe_key] = alloc_per_layer(moe_key, get_lora_shape_fn)
+                    if self.enable_routed_expert_lora:
+                        moe_key = f"{module_name}_moe"
+                        buffer[moe_key] = alloc_per_layer(moe_key, get_lora_shape_fn)
 
                     # Shared-expert MoE version (4D, separate sink namespace).
                     if self._has_shared_fused_moe(base_model):

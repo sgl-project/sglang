@@ -741,6 +741,15 @@ class LoRAManager:
                 "down lora_B will be shared across experts (expert_dim=1)."
             )
 
+        # A dense shared-expert adapter must not wrap the routed expert bank
+        # merely because both paths use gate/up/down projection names.
+        # With no initial adapters, retain the pool for dynamic MoE loading.
+        self.routed_expert_lora_enabled = not self.loras or any(
+            ".experts." in name
+            for adapter in self.loras.values()
+            for layer in adapter.layers
+            for name in layer.weights
+        )
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -921,6 +930,17 @@ class LoRAManager:
                 )
             self.lora_added_tokens_size = inferred_extra_vocab_size
 
+    def _check_routed_expert_pool(self, lora_adapter: LoRAAdapter) -> None:
+        if not getattr(self, "routed_expert_lora_enabled", True) and any(
+            ".experts." in name
+            for layer in lora_adapter.layers
+            for name in layer.weights
+        ):
+            raise ValueError(
+                "Routed-expert LoRA was not initialized. Start the server with "
+                "a routed-expert adapter in --lora-paths to enable its pool."
+            )
+
     def load_lora_weights(self, lora_ref: LoRARef):
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
@@ -941,6 +961,7 @@ class LoRAManager:
             speculative_algorithm=self.speculative_algorithm,
         )
 
+        self._check_routed_expert_pool(lora_adapter)
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_weights_from_tensors(
@@ -964,6 +985,7 @@ class LoRAManager:
             embedding_layer_names=lora_adapter.embedding_layers.keys(),
             speculative_algorithm=self.speculative_algorithm,
         )
+        self._check_routed_expert_pool(lora_adapter)
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_adapter_from_tensors(
@@ -1039,6 +1061,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            enable_routed_expert_lora=self.routed_expert_lora_enabled,
         )
 
         # Initializing memory pool with base model
@@ -1177,6 +1200,12 @@ class LoRAManager:
                     # (e.g. nested helpers under non-".layers." prefixes) have
                     # no resolvable layer id; skip them so we don't index
                     # `self.lora_modules` with `None`.
+                    continue
+                if (
+                    isinstance(module, FusedMoE)
+                    and not getattr(module, "is_shared_fused_moe", False)
+                    and not getattr(self, "routed_expert_lora_enabled", True)
+                ):
                     continue
                 if isinstance(module, InklingBatchDenseMLP):
                     module.initialize_lora(self.lora_backend)
