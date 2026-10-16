@@ -388,6 +388,26 @@ output(
 )
 
 version = importlib.metadata.version("tml-renderers")
+
+
+def _dump_golden(golden: dict) -> str:
+    # One token-ID array per line keeps the fixture reviewable.
+    arrays = []
+
+    def stash(value):
+        if isinstance(value, dict):
+            return {key: stash(item) for key, item in value.items()}
+        if isinstance(value, list):
+            if value and all(type(item) is int for item in value):
+                arrays.append(json.dumps(value, separators=(",", ":")))
+                return f"\0{len(arrays) - 1}\0"
+            return [stash(item) for item in value]
+        return value
+
+    text = json.dumps(stash(golden), ensure_ascii=False, indent=1)
+    return re.sub(r'"\\u0000(\d+)\\u0000"', lambda m: arrays[int(m.group(1))], text)
+
+
 golden = {
     "source": f"tml-renderers=={version} v0.Renderer/v0.Parser via OpenAIMessage "
     "bridge; tool_declare inserted after leading system messages; image spans "
@@ -402,5 +422,5 @@ target = (
     else Path(__file__).resolve().parents[2]
     / "registered/unit/parser/inkling_tmlv0_golden.json"
 )
-target.write_text(json.dumps(golden, ensure_ascii=False, indent=1) + "\n")
+target.write_text(_dump_golden(golden) + "\n")
 print(f"wrote {len(prompts)} prompts and {len(outputs)} outputs to {target}")
