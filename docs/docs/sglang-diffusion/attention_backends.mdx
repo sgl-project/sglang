@@ -1009,4 +1009,5 @@ sglang generate \
 ### Notes for ROCm / MPS
 
 - ROCm: use `--attention-backend torch_sdpa` or `fa` depending on what is available in your environment. On gfx1151 / Strix Halo (wave32), do **not** use `aiter` — prefer `torch_sdpa` (image sets `SGLANG_USE_AITER=0`).
+- ROCm gfx1201 (Radeon AI PRO R9700 / R9600D, Radeon RX 9070): `aiter_sage` runs aiter's `gfx1201_sage_attention` kernel (INT8 QK^T, FP8 PV) for non-causal BF16 attention with head dim 128; other calls, and aiter builds without that op, keep the Triton `fav3_sage` kernel.
 - MPS: the platform implementation always uses `torch_sdpa`.
