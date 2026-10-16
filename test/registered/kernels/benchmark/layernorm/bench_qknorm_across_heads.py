@@ -10,6 +10,7 @@ from sglang.kernels.jit.benchmark.utils import run_benchmark
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm_across_heads
 from sglang.srt.utils import get_current_device_stream_fast
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.qknorm import torch_impl_qknorm
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
@@ -58,22 +59,6 @@ def flashinfer_qknorm_across_heads(
     rmsnorm(k, k_weight, out=k)
 
 
-@torch.compile()
-def torch_impl_qknorm_across_heads(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> None:
-    q_mean = q.float().pow(2).mean(dim=-1, keepdim=True)
-    k_mean = k.float().pow(2).mean(dim=-1, keepdim=True)
-    q_norm = (q_mean + eps).rsqrt()
-    k_norm = (k_mean + eps).rsqrt()
-    q.copy_(q.float() * q_norm * q_weight.float())
-    k.copy_(k.float() * k_norm * k_weight.float())
-
-
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
@@ -115,7 +100,7 @@ def benchmark(
         "jit": sglang_jit_qknorm_across_heads,
         "aot": sglang_aot_qknorm_across_heads,
         "flashinfer": flashinfer_qknorm_across_heads,
-        "torch": torch_impl_qknorm_across_heads,
+        "torch": torch_impl_qknorm,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
     return run_benchmark(fn)

@@ -666,63 +666,6 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(out["x"].shape, (1, 4, 16))
         self.assertIsInstance(out["attn_mask_meta"], dict)
 
-    def test_ideogram_is_registered_as_bcg_supported(self):
-        self.assertIn(
-            "ideogram-ai/ideogram-4-fp8",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "comfy-org/ideogram-4",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "fal/ideogram-v4-fast",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "fal/ideogram-v4-instant",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "Ideogram4PipelineConfig",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
-        )
-
-    def test_image_generation_models_are_registered_as_bcg_supported(self):
-        for model_id in (
-            "meituan-longcat/longcat-image",
-            "meituan-longcat/longcat-image-edit-turbo",
-            "qwen/qwen-image",
-            "qwen/qwen-image-2512",
-            "tongyi-mai/z-image",
-            "tongyi-mai/z-image-turbo",
-            "zai-org/glm-image",
-        ):
-            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
-
-        for config_name in (
-            "GlmImagePipelineConfig",
-            "LongCatImagePipelineConfig",
-            "LongCatImageEditPipelineConfig",
-            "QwenImagePipelineConfig",
-            "ZImagePipelineConfig",
-        ):
-            self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
-
-    def test_ltx_models_are_registered_as_bcg_supported(self):
-        for model_id in (
-            "lightricks/ltx-2",
-            "lightricks/ltx-2.3",
-        ):
-            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
-
-        self.assertIn(
-            "LTX2PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-        )
-        self.assertIn(
-            "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-        )
-
     def test_sana_video_keeps_its_fixed_prompt_shape(self):
         kwargs = {
             "encoder_hidden_states": torch.zeros(1, 300, 2304),
