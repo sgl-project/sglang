@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=180, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 N, K = 5120, 4096
 PORT = 29731
@@ -28,6 +28,11 @@ M = 8192
 #: Long enough for a cold FlyDSL compile (~10s measured) with room to spare, and
 #: short enough that a rank stranded in a collective fails instead of hanging CI.
 SPAWN_TIMEOUT = 300
+#: Relative L2 each all-gather wire may reach, keyed by whether it is fp8.
+#: The bf16 leg is exact up to summation order (2.4e-3 measured); the fp8 leg
+#: carries e4m3's mantissa width, which is a fixed cost rather than a margin --
+#: 2.3e-2 on an MI355X TP4 microbench, 2.4e-2 end to end in review.
+WIRE_REL_L2_BOUND = {False: 2e-2, True: 3e-2}
 
 
 class _Group:
@@ -134,12 +139,13 @@ def _unique_id_worker(rank, world):
     dist.destroy_process_group()
 
 
-def _numerics_worker(rank, world):
+def _numerics_worker(rank, world, fp8_gather):
     _setup(rank, world)
     from mori.ops.gemm_ar import preshuffle_b
 
     import sglang.srt.layers.mori_gemm_ar as mg
     from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import mxfp8_e4m3_quantize
+    from sglang.srt.environ import envs
 
     torch.manual_seed(rank)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / 8
@@ -149,14 +155,16 @@ def _numerics_worker(rank, world):
     )
     b_scale = w_exps.t().contiguous().to(torch.int32).reshape(-1)
 
-    state = mg._FusedWoB(m_max=M, n=N, k=K)
-    try:
-        state.warmup()
-        state.self_test()
-        q, x_scale = mg.quantize_packed(x)
-        out = state.run(q, x_scale, preshuffle_b(w), b_scale).clone()
-    finally:
-        state.close()
+    # Read once, in _FusedWoB.__init__, so the override has to wrap the build.
+    with envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.override(fp8_gather):
+        state = mg._FusedWoB(m_max=M, n=N, k=K)
+        try:
+            state.warmup()
+            state.self_test()
+            q, x_scale = mg.quantize_packed(x)
+            out = state.run(q, x_scale, preshuffle_b(w), b_scale).clone()
+        finally:
+            state.close()
 
     # Same operands the op was given, dequantised exactly -- ue8m0 scales are
     # powers of two -- so the only difference left is summation order and the
@@ -170,7 +178,10 @@ def _numerics_worker(rank, world):
     dist.all_reduce(ref)
 
     rel = ((out.float() - ref).norm() / ref.norm()).item()
-    assert rel < 2e-2, f"rank {rank}: relative L2 {rel:.3e} against the split path"
+    bound = WIRE_REL_L2_BOUND[fp8_gather]
+    assert rel < bound, (
+        f"rank {rank}: relative L2 {rel:.3e} against the split path, bound {bound:g}"
+    )
     dist.destroy_process_group()
 
 
@@ -242,8 +253,14 @@ class TestFusedWoBCollective(CustomTestCase):
 
         A mori built with ``BUILD_CCO_SDMA=OFF`` runs every kernel, returns
         mostly the local slice, and measures faster for it.
+
+        Both wires, because they fail differently: the bf16 leg loses bytes
+        silently, while the fp8 leg is lossy by construction and so needs a
+        bound of its own before a regression can be told from e4m3.
         """
-        self._spawn(_numerics_worker)
+        for fp8_gather in (False, True):
+            with self.subTest(wire="fp8" if fp8_gather else "bf16"):
+                self._spawn(_numerics_worker, fp8_gather)
 
 
 if __name__ == "__main__":
