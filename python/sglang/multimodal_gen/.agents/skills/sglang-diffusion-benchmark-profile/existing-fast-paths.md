@@ -403,7 +403,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py` and `test/registered/kernels/ops/layernorm/test_qknorm_across_heads.py`.
+- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py`.
 
 **QK Norm + RoPE Optimization**
 
