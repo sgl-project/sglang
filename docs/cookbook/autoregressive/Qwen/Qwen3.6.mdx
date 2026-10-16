@@ -103,7 +103,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### RTX Spark: 35B-A3B NVFP4
 
-Use the following single-node, single-GPU recipe for
+Select **RTX Spark** in the generator above to use the single-node, single-GPU recipe for
 [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
 on [NVIDIA RTX Spark](https://www.nvidia.com/en-us/products/rtx-spark/), which
 pairs a Blackwell RTX GPU with a Grace CPU and offers up to 128GB of unified
@@ -111,8 +111,6 @@ memory. The contributor tested this command on SGLang `main`. The recipe uses
 the FlashInfer CUTLASS MoE runner,
 `extra_buffer` Mamba radix caching, and a static memory fraction of `0.8`.
 Speculative decoding is not enabled.
-
-Select **RTX Spark** in the generator above to get this command.
 
 The contributor reported **75 output tokens/s for a single request** on SGLang
 `main`. The exact commit, OS/runtime, memory configuration, input/output lengths,
