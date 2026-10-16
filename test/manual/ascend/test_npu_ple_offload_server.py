@@ -364,7 +364,10 @@ class TestNpuPleOffloadServer(CustomTestCase):
                     record["embedding_class"], "Qwen4ExpPinnedHostEmbedding"
                 )
                 self.assertEqual(record["device"], "cpu")
-                self.assertIs(record["pinned"], backend == "pinned")
+                # A registered file mapping can also report is_pinned=True.
+                # Validate file storage through its real /proc/self/maps path.
+                if backend == "pinned":
+                    self.assertTrue(record["pinned"])
                 self.assertTrue(record["npu_uva_enabled"])
                 self.assertEqual(record["dtype"], "bfloat16")
                 if backend == "file":

@@ -114,7 +114,16 @@ class TestNpuPleOffload(unittest.TestCase):
         self.assertEqual(embedding.weight.data_ptr(), ptr)
         self.assertEqual(embedding.weight.device.type, "cpu")
         self.assertEqual(embedding.weight.dtype, dtype)
-        self.assertEqual(embedding.weight.is_pinned(), backend == "pinned")
+        if backend == "pinned":
+            self.assertTrue(embedding.weight.is_pinned())
+        else:
+            # is_pinned() may report registered UVA host memory as pinned.
+            # File identity and shared writes establish the backend instead.
+            filename = embedding.weight.untyped_storage().filename
+            self.assertIsNotNone(filename)
+            files = list(table_dir.iterdir())
+            self.assertEqual(len(files), 1)
+            self.assertTrue(os.path.samefile(filename, files[0]))
         self.assertIs(embedding.weight_scale, source.weight_scale)
         self.assertTrue(embedding.npu_uva_enabled)
         self.assertEqual(dtype, torch.bfloat16)
