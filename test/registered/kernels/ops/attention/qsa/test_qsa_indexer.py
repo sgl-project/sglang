@@ -319,6 +319,90 @@ def test_tilelang_mqa_rejects_mixed_operand_dtypes():
         tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, 64)
 
 
+def _decode_operands(rows, max_pages, page_size, context_lens, device):
+    q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
+    cache = torch.randn(1024, page_size, 1, HEAD_DIM, device=device).to(torch.bfloat16)
+    page_table = torch.randint(
+        0, 1024, (rows, max_pages), device=device, dtype=torch.int32
+    )
+    return q, cache, page_table, context_lens.to(device=device, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("rows", [6, 100, 700])
+def test_tilelang_mqa_decode_grid_covers_every_group(rows):
+    """The decode kernel strides 256, 16 or 1 CTAs per row (by row count) over the
+    row's 64-token groups. Every group of every row must be scored, and nothing
+    is written past a row's context length."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        torch_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(rows)
+    max_pages, page_size = 128, 16
+    max_model_len = max_pages * page_size
+    lens = torch.randint(1, max_model_len + 1, (rows,))
+    lens[0] = max_model_len
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    out = tilelang_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    finite = torch.isfinite(ref)
+    assert torch.equal(finite, torch.isfinite(out))
+    torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
+
+
+def test_tilelang_mqa_decode_skips_rows_that_fit_topk():
+    """With min_scored_len = k the kernel leaves rows that fit k unscored and
+    nothing past a row's length is set; fast_topk(k) must still select exactly
+    what it selects on fully scored logits (every block of a row that fits k)."""
+    from sglang.kernels.ops.attention.fast_topk import fast_topk
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        torch_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    max_pages, page_size, block_topk = 128, 16, 512
+    max_model_len = max_pages * page_size
+    lens = torch.tensor([1, 300, 511, 512, 513, 1000, 2047, 2048] * 4)
+    rows = lens.numel()
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    # The caching allocator hands the NaN block to the unset logits, so a top-k
+    # that read an unscored row or a column past a length would show it.
+    poison = torch.full((rows, max_model_len), float("nan"), device=device)
+    del poison
+    out = tilelang_qsa_mqa_decode(
+        q, cache, page_table, lens, max_model_len, min_scored_len=block_topk
+    )
+    sel_ref = fast_topk(ref, lens, topk=block_topk)
+    sel_out = fast_topk(out, lens, topk=block_topk)
+    for row in range(rows):
+        length = int(lens[row])
+        if length <= block_topk:
+            assert torch.equal(sel_out[row], sel_ref[row])
+            continue
+        torch.testing.assert_close(
+            out[row, :length], ref[row, :length], rtol=2e-3, atol=2e-3
+        )
+    for a, b in zip(
+        _selected_score_multisets(ref, sel_ref), _selected_score_multisets(ref, sel_out)
+    ):
+        torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)
+
+
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_expand_block_indices_int_inputs(dtype):
     device = torch.device("cuda")

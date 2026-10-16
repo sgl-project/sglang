@@ -60,6 +60,10 @@ def _residual_gate_add_cuda_impl(
     )
     module = _jit_residual_gate_add_module(residual.dtype)
     gate_mode = _gate_mode(residual, gate)
+    if gate_mode == 3:
+        # AdaLN unbind views have gaps between batch rows. Only copy the small
+        # [B, 1, D] gate, never expand it across the token dimension.
+        gate = gate.contiguous()
     module.residual_gate_add(
         out.view(-1),
         residual.view(-1),
@@ -188,11 +192,13 @@ def _residual_gate_add_custom_op(
 
 
 def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
-    """0 = full, 1 = broadcast row (hidden_size), 2 = per-token (rows)."""
+    """0 = full, 1 = shared row, 2 = per-token, 3 = one row per batch."""
     if gate.shape == residual.shape:
         return 0
     if _is_row_broadcast_gate(residual, gate):
         return 1
+    if _is_batched_row_gate(residual, gate):
+        return 3
     return 2
 
 
@@ -208,6 +214,14 @@ def _is_per_token_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
         gate.dim() == residual.dim()
         and gate.shape[-1] == 1
         and gate.shape[:-1] == residual.shape[:-1]
+    )
+
+
+def _is_batched_row_gate(residual: torch.Tensor, gate: torch.Tensor) -> bool:
+    return (
+        residual.dim() == 3
+        and 1 < residual.shape[0] <= _MAX_GRID_DIM
+        and gate.shape == (residual.shape[0], 1, residual.shape[-1])
     )
 
 
@@ -246,12 +260,13 @@ def can_use_residual_gate_add_cuda(
             gate.shape == residual.shape
             or _is_row_broadcast_gate(residual, gate)
             or _is_per_token_gate(residual, gate)
+            or _is_batched_row_gate(residual, gate)
         )
         and (
             (residual.is_contiguous() and update.is_contiguous())
             or _is_transposed_dense_residual(residual, update, gate)
         )
-        and gate.is_contiguous()
+        and (gate.is_contiguous() or _is_batched_row_gate(residual, gate))
     )
 
 
