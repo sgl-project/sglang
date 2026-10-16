@@ -1,22 +1,30 @@
 export const config = (() => {
   const modelOf = (s) => "OpenMOSS-Team/MOVA-" + s.resolution;
-  const plan = (s) => ({
-    flags: [
-      "--model-path " + modelOf(s),
-      "--host 0.0.0.0",
-      "--port {{PORT}}",
-      "--adjust-frames false",
-      "--num-gpus 8",
-      "--ring-degree 2",
-      "--ulysses-degree 4",
-      "--tp 1",
-      "--enable-torch-compile",
-      "--save-output",
-      '--output-dir "$SG_OUTPUT_DIR"',
-    ],
-    gpus: 8,
-    topology: { tp_size: 1, ulysses_degree: 4, ring_degree: 2 },
-  });
+  const plan = (s) =>
+    s.hw === "xeon"
+      ? {
+          flags: ["--model-path " + modelOf(s)],
+          gpus: 0,
+          topology: { tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
+          env: ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"],
+        }
+      : {
+          flags: [
+            "--model-path " + modelOf(s),
+            "--host 0.0.0.0",
+            "--port {{PORT}}",
+            "--adjust-frames false",
+            "--num-gpus 8",
+            "--ring-degree 2",
+            "--ulysses-degree 4",
+            "--tp 1",
+            "--enable-torch-compile",
+            "--save-output",
+            '--output-dir "$SG_OUTPUT_DIR"',
+          ],
+          gpus: 8,
+          topology: { tp_size: 1, ulysses_degree: 4, ring_degree: 2 },
+        };
   const defaults = {
     hw: "b200",
     nodes: 1,
@@ -29,8 +37,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "MOVA",
-    supportedHardware: ["b200", "h200", "h100", "a100"],
-    hardware: [{ id: "a100", label: "A100", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["b200", "h200", "h100", "a100", "xeon"],
+    hardware: [
+      { id: "a100", label: "A100", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -41,15 +52,23 @@ export const config = (() => {
         default: "360p",
         options: [
           { id: "360p", label: "360p" },
-          { id: "720p", label: "720p" },
+          {
+            id: "720p",
+            label: "720p",
+            disabled: (s) => s.hw === "xeon",
+            disableReason: "MOVA-720p is not yet supported on Intel Xeon CPUs.",
+          },
         ],
       },
     ],
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
-        verifiedRecipes: ["b200", "h200", "h100", "a100"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon" },
+        },
+        verifiedRecipes: ["b200", "h200", "h100", "a100", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
@@ -68,7 +87,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (!Number.isInteger(count) || count < 1 || count > 8)
+          if (s.hw !== "xeon" && (!Number.isInteger(count) || count < 1 || count > 8))
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))

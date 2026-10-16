@@ -1,7 +1,7 @@
 export const config = (() => {
   const modelOf = () => "Lightricks/LTX-2.5-Diffusers";
   const plan = (s) => {
-    const gpus = Number(s.gpus_per_node);
+    const gpus = s.hw === "xeon" ? 0 : Number(s.gpus_per_node);
     const flags = [
       "--model-path " + modelOf(s),
       "--pipeline-class-name " + (s.pipeline === "two-stage" ? "LTX2TwoStagePipeline" : "LTX2Pipeline"),
@@ -24,6 +24,7 @@ export const config = (() => {
         ulysses_degree: gpus === 2 && s.parallel === "sp" ? 2 : 1,
         ring_degree: 1,
       },
+      env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
       warnings: [
         ...(s.parallel === "cfg" && gpus === 2 && s.weights !== "dev"
           ? ["Distilled weights run unguided; CFG parallelism does not accelerate them."]
@@ -55,8 +56,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "LTX-2.5",
-    supportedHardware: ["h200", "cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["h200", "cuda", "xeon"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -145,8 +149,11 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
-        verifiedRecipes: ["h200", "cuda"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 2, disabledWhen: (s) => s.hw === "xeon" },
+        },
+        verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
@@ -165,7 +172,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (!Number.isInteger(count) || count < 1 || count > 2)
+          if (s.hw !== "xeon" && (!Number.isInteger(count) || count < 1 || count > 2))
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))
