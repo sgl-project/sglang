@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from types import SimpleNamespace
 
 from sglang.multimodal_gen.configs.models.dits.llada_image import (
     LLaDAImageArchConfig,
@@ -55,14 +56,21 @@ class TestLLaDAImageConfig(unittest.TestCase):
         self.assertGreater(rows(1920), limit)
 
     def test_unservable_editing_sizes_are_rejected_at_validation(self):
-        """Edits off the SigVQ grid or past the RoPE table fail before any GPU work."""
+        """Edits the DiT would refuse for every prompt fail before any GPU work."""
         config = LLaDAImagePipelineConfig()
         config.validate_output_size(1008, 1008, editing=False)
-        config.validate_output_size(1024, 1024, editing=True)
+        config.validate_output_size(1888, 1888, editing=True)
         with self.assertRaisesRegex(ValueError, "divisible by 32"):
             config.validate_output_size(1008, 1008, editing=True)
+        # Every caption carries the 256 query tokens, so 1920 never fits.
         with self.assertRaisesRegex(ValueError, "sequence positions"):
-            config.validate_output_size(2048, 2048, editing=True)
+            config.validate_output_size(1920, 1920, editing=True)
+        two_sources = LLaDAImageSamplingParams(prompt="a", image_path=["a", "b"])
+        server_args = SimpleNamespace(
+            pipeline_config=config, output_path=None, comfyui_mode=False
+        )
+        with self.assertRaisesRegex(ValueError, "one source image"):
+            two_sources._adjust(server_args)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,22 @@ class LLaDAImageSamplingParams(SamplingParams):
     guidance_scale: float = 5.0
     max_sequence_length: int = 2048
 
+    def _adjust(self, server_args):
+        super()._adjust(server_args)
+        # The offline generator pairs prompts from a list or a file with one
+        # image each, so only a single string prompt is checked here.
+        if (
+            isinstance(self.prompt, str)
+            and self.prompt_path is None
+            and getattr(server_args, "prompt_file_path", None) is None
+            and isinstance(self.image_path, list)
+            and len(self.image_path) > 1
+        ):
+            raise ValueError(
+                "LLaDA-Image editing takes exactly one source image, "
+                f"got {len(self.image_path)}"
+            )
+
     def _validate_with_pipeline_config(self, pipeline_config):
         super()._validate_with_pipeline_config(pipeline_config)
         if self.enable_cache_dit or self.cache_dit_params is not None:
