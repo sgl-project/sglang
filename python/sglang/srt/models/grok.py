@@ -160,6 +160,7 @@ class Grok1MoE(nn.Module):
             use_presharded_weights=use_presharded_weights,
             inplace=inplace,
             no_combine=no_combine,
+            prefix=add_prefix("experts", prefix),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -490,7 +491,7 @@ class Grok1DecoderLayer(nn.Module):
             reduce_results=False,
             alt_stream=self.alt_stream,
             load_presharded_attn=load_presharded_attn,
-            prefix=add_prefix("attn", prefix),
+            prefix=add_prefix("self_attn", prefix),
         )
 
         split_gate_up = not getattr(config, "merge_gate_up", True)
@@ -522,6 +523,7 @@ class Grok1DecoderLayer(nn.Module):
                     use_presharded_weights=load_presharded_mlp,
                     layer_id=layer_id,
                     split_gate_up=split_gate_up,
+                    prefix=add_prefix("mlp", prefix),
                 )
         else:
             raise NotImplementedError()
@@ -554,7 +556,6 @@ class Grok1DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor] = None,
         deferred_norm: Optional[RMSNorm] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, RMSNorm]:
-
         hidden_states_original = hidden_states
         residual_original = residual
 
@@ -651,6 +652,7 @@ class Grok1Model(nn.Module):
                     load_presharded_attn=load_presharded_attn,
                     load_presharded_mlp=load_presharded_mlp,
                     alt_stream=self.alt_stream,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
