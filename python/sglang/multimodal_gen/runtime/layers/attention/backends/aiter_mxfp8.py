@@ -202,6 +202,9 @@ def can_use_mxfp8_attention(
     )
 
 
+# Dynamo cannot functionalize fmha_fwd_mxfp8_asm; Inductor fails with
+# "auto_functionalized_v2 was not removed".
+@torch.compiler.disable
 def mxfp8_attention(
     query: torch.Tensor,
     key: torch.Tensor,
