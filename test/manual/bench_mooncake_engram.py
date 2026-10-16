@@ -7,8 +7,10 @@ IPC/scheduling/detokenization), without HTTP or input tokenization time.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import random
 import statistics
 import subprocess
 import time
@@ -77,6 +79,7 @@ async def wave(engine, prompts, output_length):
     requests = await asyncio.gather(*(request(ids) for ids in prompts))
     duration = time.perf_counter() - start
     return {
+        "input_sha256": hashlib.sha256(json.dumps(prompts).encode()).hexdigest(),
         "seconds": duration,
         "output_tokens_per_second": sum(r["output_tokens"] for r in requests)
         / duration,
@@ -109,28 +112,28 @@ def main():
     assert kwargs["disable_radix_cache"], "Prefix reuse invalidates cold-prefill timing"
     assert kwargs["stream_interval"] == 1
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    sentence = tokenizer.encode(
-        "A memory table maps each integer index to a stored embedding row. "
-        "The model reads these values and combines them with the current context. ",
-        add_special_tokens=False,
-    )
-    cases = []
-    for length in args.input_lengths:
-        for concurrency in args.concurrencies:
-            prompts = []
-            for request_id in range(concurrency):
-                prefix = tokenizer.encode(
-                    f"Request {request_id}: ", add_special_tokens=False
-                )
-                ids = (prefix + sentence * (length // len(sentence) + 2))[:length]
-                assert len(ids) == length
-                prompts.append(ids)
-            cases.append((length, concurrency, prompts))
+    special = set(tokenizer.all_special_ids)
+    token_pool = [
+        i for i in range(256, min(32000, tokenizer.vocab_size)) if i not in special
+    ]
+    assert token_pool
+
+    def prompts_for(length, concurrency, iteration):
+        # Different rows each wave; identical inputs for the two backends.
+        rng = random.Random(42 + length * 100000 + concurrency * 1000 + iteration)
+        return [rng.choices(token_pool, k=length) for _ in range(concurrency)]
+
+    cases = [
+        (length, concurrency)
+        for length in args.input_lengths
+        for concurrency in args.concurrencies
+    ]
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "engine_args": kwargs,
+        "input_distribution": "uniform text token IDs in [256, min(32000, vocab_size)), excluding special IDs; different deterministic seed per wave",
         "benchmark_args": vars(args),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "host_table": os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"),
@@ -142,17 +145,22 @@ def main():
     engine = sgl.Engine(**kwargs)
     result["load_seconds"] = time.perf_counter() - started
     try:
-        for length, concurrency, prompts in cases:
-            for _ in range(args.warmups):
+        for length, concurrency in cases:
+            for iteration in range(args.warmups):
+                prompts = prompts_for(length, concurrency, iteration)
                 engine.loop.run_until_complete(
                     wave(engine, prompts, args.output_length)
                 )
             before = memory_snapshot()
             samples = [
                 engine.loop.run_until_complete(
-                    wave(engine, prompts, args.output_length)
+                    wave(
+                        engine,
+                        prompts_for(length, concurrency, args.warmups + iteration),
+                        args.output_length,
+                    )
                 )
-                for _ in range(args.repeats)
+                for iteration in range(args.repeats)
             ]
             summary = {
                 "input_length": length,
