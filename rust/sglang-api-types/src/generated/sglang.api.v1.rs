@@ -374,6 +374,15 @@ pub struct GenerateRequest {
     pub video_data: ::core::option::Option<MediaInput>,
     #[prost(message, optional, tag = "22")]
     pub audio_data: ::core::option::Option<MediaInput>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the same
+    /// key. One key for every batch item, or one per item; an empty key means
+    /// none.
+    #[prost(message, optional, tag = "23")]
+    pub extra_key: ::core::option::Option<StringOrList>,
+    /// Scheduling priority, one value for every batch item; the scheduler
+    /// validates it against its priority-scheduling mode.
+    #[prost(int64, optional, tag = "24")]
+    pub priority: ::core::option::Option<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {

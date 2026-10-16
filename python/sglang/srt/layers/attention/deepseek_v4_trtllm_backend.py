@@ -591,7 +591,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA prefill, one query token per entry with per-token causal seq_lens."""
+        """Per-token sparse MLA prefill; eager, including at BCG breaks."""
 
         assert q.ndim == 3, f"{q.shape=}"
         num_qo_padded, num_heads, head_dim = q.shape
@@ -600,12 +600,28 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # Dense per-token query layout from the host-side extend lens.
         core = self.forward_metadata.core_attn_metadata
         if core.trtllm_prefill_qmeta is None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            tail = self.forward_metadata.late_layer_tail
+            extend_seq_lens_cpu = (
+                tail.extend_seq_lens_cpu
+                if tail is not None
+                else forward_batch.extend_seq_lens_cpu
+            )
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
             sum_q = sum(int(x) for x in extend_seq_lens_cpu)
             # q may be padded past the real extend tokens; pad rows sit at the end.
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            seq_lens_i32 = core.seq_lens_casual[:sum_q].to(torch.int32)
+            if tail is not None:
+                # SWA columns are bounded by causal lengths, not -1 sentinels: tail
+                # rows count from the tail start, whose earlier window KV is unwritten.
+                lens = tail.extend_seq_lens.to(torch.int64)
+                starts = torch.repeat_interleave(
+                    torch.cumsum(lens, 0) - lens, lens, output_size=sum_q
+                )
+                seq_lens_i32 = (
+                    torch.arange(sum_q, device=lens.device) - starts + 1
+                ).to(torch.int32)
+            else:
+                seq_lens_i32 = core.seq_lens_casual[:sum_q].to(torch.int32)
             assert seq_lens_i32.shape == (sum_q,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (sum_q, seq_lens_i32)
         sum_q, seq_lens = core.trtllm_prefill_qmeta
