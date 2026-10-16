@@ -12,6 +12,9 @@ switches listed for it below. With no switch set, the tree runs the base code pa
 
 ## Common setup (all points)
 
+The launch files were rendered by NVIDIA srt-slurm (`srtctl`, Apache-2.0); `client.env` is the InferenceX `9330deaf` runner
+environment and `infra.sh` follows srtctl's head-node setup.
+
 | Item | Value |
 |---|---|
 | Container image | `lmsysorg/sglang:nightly-dev-cu13-20261015-a6a8c560`; this tree's `python/sglang` is mounted over the image's editable install (`/sgl-workspace/sglang/python/sglang`, read-only). Keep the image's compiled artifacts (`_version.py`, Rust `*.so`) in the mounted tree. |
@@ -23,7 +26,8 @@ switches listed for it below. With no switch set, the tree runs the base code pa
 
 Placeholders in the scripts: `<P{i}_HOST>` / `<P{i}_IP>` = prefill worker i (worker 0 also runs infra, nginx and the client),
 `<D0_N{k}_HOST>` / `<D0_N{k}_IP>` = node k of the decode worker, `<NODE{k}_HOST>` / `<NODE{k}_IP>` = node k of an aggregated server.
-The worker scripts are the exact rendered launch commands of the reference runs; only hosts and IPs were replaced.
+The worker scripts are the exact rendered launch commands of the reference runs, with hosts and IPs replaced by placeholders.
+Each `nginx.conf` is a render of NVIDIA srt-slurm's `nginx.conf.j2` template (Apache-2.0) with its comments removed; it keeps the template's license header.
 
 ## The five points
 

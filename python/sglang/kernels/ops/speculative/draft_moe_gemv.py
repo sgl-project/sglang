@@ -14,7 +14,7 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Tunable launch shapes (bench_draft_moe.py sweeps them).
+# Tunable launch shapes.
 _UP_PAIRS_PER_CTA = 4
 _DOWN_WARPS_PER_CTA = 8
 _UP_STAGES = 8

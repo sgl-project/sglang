@@ -25,7 +25,8 @@ keeps the stock path.
 # Modified by NVIDIA: _run_experts_from_tables is the post-moe_sort part of
 # flashinfer.fused_moe.cute_dsl.fused_moe._moe_core_impl (FlashInfer 0.7.1),
 # restricted to W4A4 with a scalar input scale and fed externally built routing
-# tables.
+# tables; _choose_tactic and the runner inputs in forward_routed follow
+# CuteDslMoEWrapper.run so the autotuner cache is shared.
 
 from __future__ import annotations
 

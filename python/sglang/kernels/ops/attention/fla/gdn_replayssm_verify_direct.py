@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# _gdn_replayssm_verify_body is derived from gdn_replayssm_spec_circular_kernel in
+# gdn_replayssm_spec_decode.py, ported from github.com/Johnny-Liou/ReplaySSM (commit 3c85112).
 # Modified by NVIDIA: forward substitution and fused output accumulation.
 
 import triton
