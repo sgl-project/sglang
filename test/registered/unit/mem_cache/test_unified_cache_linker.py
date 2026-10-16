@@ -1023,14 +1023,10 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
     )
     wrapper.inflight_load_rids = ["rid"]
     wrapper.private_load_indices["rid"] = torch.arange(4)
-    pages = _LoadedPages(4, frozenset({"h0", "h1"}))
-    wrapper.private_load_pages["rid"] = pages
     wrapper.start_layer_wise_loading()
 
     assert wrapper.finish_loads() == ([] if landed else ["rid"])
     assert wrapper.private_load_indices == {}
-    assert wrapper.private_load_pages == {}
-    assert wrapper.loaded_pages == ({"rid": pages} if landed else {})
     assert ("External linker load failed" in caplog.text) is (not landed)
 
 
@@ -1038,13 +1034,11 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
 def test_linker_lifecycle_releases_private_index_references(operation):
     wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
     wrapper.private_load_indices["rid"] = torch.arange(4)
-    wrapper.private_load_pages["rid"] = _LoadedPages(4, frozenset({"h0"}))
-    wrapper.loaded_pages["landed"] = _LoadedPages(4, frozenset({"h1"}))
+    wrapper.loaded_pages["landed"] = _LoadedPages(4, frozenset({"h0"}))
 
     getattr(wrapper, operation)()
 
     assert wrapper.private_load_indices == {}
-    assert wrapper.private_load_pages == {}
     assert wrapper.loaded_pages == {}
 
 
