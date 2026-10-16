@@ -7,6 +7,8 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
+_PACKED_DECODE_WARMED: set[tuple[int, int, float | None]] = set()
+
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_kda_packed_decode,
@@ -20,6 +22,58 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
+def warmup_packed_decode(
+    *,
+    num_v_heads: int = 12,
+    head_dim: int = 128,
+    lower_bound: Optional[float] = None,
+    batches: tuple[int, ...] = (1, 2, 8),
+    state_dtypes: tuple[torch.dtype, ...] = (torch.float32, torch.bfloat16),
+    device: Optional[torch.device] = None,
+) -> None:
+    """Compile packed KDA decode for both SSM dtypes before HIP graph capture."""
+    if is_cpu() or is_npu() or is_xpu():
+        return
+    if device is None:
+        if not torch.cuda.is_available():
+            return
+        device = torch.device("cuda")
+    key = (num_v_heads, head_dim, lower_bound)
+    if key in _PACKED_DECODE_WARMED:
+        return
+    HV = num_v_heads
+    K = V = head_dim
+    kernel = TritonKDAKernel()
+    for state_dtype in state_dtypes:
+        for batch in batches:
+            mixed_qkv = torch.zeros(
+                batch, 3 * HV * V, dtype=torch.bfloat16, device=device
+            )
+            a = torch.zeros(batch, HV * K, dtype=torch.bfloat16, device=device)
+            b = torch.zeros(1, batch, HV, dtype=torch.bfloat16, device=device)
+            A_log = torch.zeros(HV, dtype=torch.float32, device=device)
+            dt_bias = torch.zeros(HV * K, dtype=torch.float32, device=device)
+            ssm_states = torch.zeros(
+                batch + 1, HV, V, K, dtype=state_dtype, device=device
+            )
+            cache_indices = torch.arange(batch, dtype=torch.int32, device=device)
+            kernel.packed_decode(
+                mixed_qkv,
+                a,
+                b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=head_dim**-0.5,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=HV,
+                head_v_dim=V,
+                lower_bound=lower_bound,
+            )
+    torch.cuda.synchronize(device)
+    _PACKED_DECODE_WARMED.add(key)
+
+
 class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
@@ -27,6 +81,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    # fused_recurrent_kda_packed_decode implements lower_bound. Kimi-K3 always
+    # sets it, so without this flag decode falls through to the varlen kernel.
+    supports_packed_decode_safe_gate: bool = True
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
 
