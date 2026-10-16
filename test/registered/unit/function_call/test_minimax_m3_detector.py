@@ -526,6 +526,26 @@ class TestMinimaxM3Malformed(CustomTestCase):
         for seg in _segments(*segments):
             detector.parse_streaming_increment(seg, self.tools)
 
+    def test_overflow_number_literal_does_not_crash_streaming(self):
+        # A non-finite number literal ("1e999" -> inf) made int() raise
+        # OverflowError in the scalar path; streaming crashed while
+        # detect_and_parse degraded to content. Both must now agree.
+        segments = (
+            "<tool_call>",
+            '<invoke name="search">',
+            "<query>hi",
+            "</query>",
+            "<ratio>1e999",
+            "</ratio>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        detector = MinimaxM3Detector()
+        for seg in _segments(*segments):
+            detector.parse_streaming_increment(seg, self.tools)
+        # non-streaming path already tolerated it
+        MinimaxM3Detector().detect_and_parse(_wire(*segments), self.tools)
+
 
 def _parse_segments_text(text, tools):
     detector = MinimaxM3Detector()
