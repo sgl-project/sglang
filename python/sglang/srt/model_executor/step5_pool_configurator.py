@@ -519,6 +519,8 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             or kvc.device not in ("cpu", "cuda")
         ):
             raise ValueError("unsupported Step5 target BF16 NHD sizing mode")
+        _step5_integer("model target depth", hf.num_hidden_layers, 1)
+        _step5_integer("model MTP depth", hf.num_nextn_predict_layers)
         disagg = get_disagg()
         pd_mtp_mode = (
             spec.speculative_algorithm in ("EAGLE", "EAGLE3")
@@ -556,13 +558,15 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
             )
             or kvc.sliding_window_size != 512
             or hf.sliding_window != kvc.sliding_window_size
-            or (kvc.layer_info.start_layer, kvc.layer_info.end_layer) != (0, 92)
-            or kvc.layer_info.num_effective_layers != 92
-            or hf.num_hidden_layers != 92
-            or hf.num_nextn_predict_layers != 3
+            or (kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+            != (0, hf.num_hidden_layers)
+            or kvc.layer_info.num_effective_layers != hf.num_hidden_layers
+            # The MTP draft is the fixed three-step chain; MTP-off may run a
+            # checkpoint without MTP layers (e.g. a layer slice).
+            or (not kvc.spec_algorithm.is_none() and hf.num_nextn_predict_layers != 3)
         ):
             raise ValueError(
-                "Step5 sizing requires explicit B, P64, W512 and all 92 layers"
+                "Step5 sizing requires explicit B, P64, W512 and all target layers"
             )
 
     @staticmethod
@@ -577,27 +581,24 @@ class Step5PoolConfigurator(MemoryPoolConfigurator):
         )
         for layer_id in full + swa:
             _step5_integer("resolved layer ID", layer_id)
+        target, mtp = hf.num_hidden_layers, hf.num_nextn_predict_layers
+        _step5_integer("model target depth", target, 1)
+        _step5_integer("model MTP depth", mtp)
         if (
-            len(full) != 23
-            or len(swa) != 69
-            or len(set(full + swa)) != 92
-            or set(full + swa) != set(range(92))
+            len(full) + len(swa) != target
+            or set(full + swa) != set(range(target))
             or hf.layer_types_with_mtp is None
-            or len(hf.layer_types_with_mtp) != 95
+            or len(hf.layer_types_with_mtp) != target + mtp
             or any(hf.layer_types_with_mtp[i] != "full_attention" for i in full)
             or any(hf.layer_types_with_mtp[i] != "sliding_attention" for i in swa)
-            or hf.layer_types_with_mtp[92:] != ["sliding_attention"] * 3
+            or hf.layer_types_with_mtp[target:] != ["sliding_attention"] * mtp
         ):
-            raise ValueError(
-                "invalid resolved target partition or three draft SWA layers"
-            )
+            raise ValueError("invalid resolved target partition or draft SWA layers")
         heads = mc.get_num_kv_heads(ps.attn_tp_size, ps.attn_dcp_size)
         for name, value in (
             ("page size", kvc.page_size),
             ("window", kvc.sliding_window_size),
             ("model window", hf.sliding_window),
-            ("model target depth", hf.num_hidden_layers),
-            ("model MTP depth", hf.num_nextn_predict_layers),
             ("model hidden size", hf.hidden_size),
             ("local FULL KV heads", heads),
             ("FULL K width", mc.head_dim),
