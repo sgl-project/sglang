@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
+    CUDA_ONLY,
     CapabilityRequirement,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
 )
@@ -26,11 +26,6 @@ register_kernel(
                 CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3)),
             }
         ),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="FP32 [batch, vocab] softmax probabilities",
-        ),
-        description="Cake Blackwell softmax distributed by FlashInfer.",
     )
 )
 
@@ -80,10 +75,6 @@ register_kernel(
         op="sampling.denoiser_statistics",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.denoiser_statistics:denoiser_statistics",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="FP32 probabilities, entropy and raw-logit argmax for contiguous [B,M,V] logits; optional BF16 probabilities.",
-        ),
+        capabilities=CUDA_ONLY,
     )
 )

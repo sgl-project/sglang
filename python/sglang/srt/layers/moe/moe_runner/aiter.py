@@ -3,14 +3,11 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
-
-_SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -24,6 +21,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
+
+_SMALLM_MOE_ON = envs.SGLANG_ROCM_SMALLM_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
