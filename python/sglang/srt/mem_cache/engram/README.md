@@ -58,3 +58,38 @@ Run `pytest -q test/manual/test_mooncake_engram.py` on a CUDA host with the
 matching Mooncake build. It compares raw lookup, table scaling, block scaling,
 shard masking and CUDA graph replay against native kernels and tensor references. End-to-end
 tests additionally need the original model checkpoints.
+
+## Performance comparison
+
+`test/manual/bench_mooncake_engram.py` compares warm streaming inference through
+the Engine API, including scheduling, IPC and detokenization. It excludes model
+loading, warmup, input tokenization and HTTP. Run the two backends sequentially
+on the same idle GPUs with identical Engine arguments:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_mooncake_engram.py \
+  --model-path /models/gemma-3n-E2B-it --backend native \
+  --engine-args engine-args.json --output native.json
+CUDA_VISIBLE_DEVICES=0 python test/manual/bench_mooncake_engram.py \
+  --model-path /models/gemma-3n-E2B-it --backend mooncake \
+  --engine-args engine-args.json --output mooncake.json
+```
+
+The JSON argument file must set `disable_radix_cache=true` and
+`stream_interval=1`. Fix `max_total_tokens`, `max_running_requests`, TP/EP,
+graph batch sizes and sampling settings across backends. For example, use
+`max_total_tokens=32768`, `max_running_requests=16`, `context_length=2048`,
+`chunked_prefill_size=1024` and `cuda_graph_bs_decode=[1,4,16]`.
+
+Defaults cover 128/1024 input tokens, 128 output tokens and concurrency 1/4/16,
+with two warmup waves and five measured waves per case. Each wave uses different
+deterministic synthetic text-token IDs; paired backends receive identical
+inputs, recorded with hashes. Output includes each request's TTFT, TPOT, latency
+and generated IDs, wave throughput, GPU memory and process-tree host PSS.
+Use wave-level statistics and inspect variability before claiming equivalence.
+
+Native placement is model-dependent: Qwen can use pinned host tables, DeepSeek
+can use shared or TP-sharded host tables, while Gemma and LongCat use GPU tables.
+Record these choices and memory changes alongside latency. In particular,
+DeepSeek's native shared-host layout avoids the TP reduction used by this
+adapter, so that comparison includes a layout/communication difference.
