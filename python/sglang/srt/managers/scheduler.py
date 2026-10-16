@@ -5543,9 +5543,13 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
-            for req in self.dllm_manager.pop_aborted_reqs(
+            aborted_dllm_reqs = self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
-            ):
+            )
+            if aborted_dllm_reqs:
+                # An aborted context may leave kept encoder rows that nobody reads.
+                mm_schedule.release_prefill_rows()
+            for req in aborted_dllm_reqs:
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req

@@ -568,5 +568,21 @@ def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progr
     assert manager.any_context_in_progress() is in_progress
 
 
+def test_dllm_abort_drops_kept_rows(published_server_args, kept_rows):
+    # Another dLLM context can stay part-way for many steps, so the table is not
+    # cleared by the scheduling check; the aborted context's rows have no reader.
+    req = Req("dllm-video", "", [1], SamplingParams())
+    scheduler = _queued_scheduler(req)
+    scheduler.waiting_queue = []
+    scheduler.dllm_config = object()
+    scheduler.dllm_manager = DllmManager(dllm_config=None)
+    scheduler.dllm_manager.staging_queue.append(req)
+
+    scheduler.abort_request(AbortReq(rid=req.rid))
+
+    assert not scheduler.dllm_manager.staging_queue
+    assert not kept_rows
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
