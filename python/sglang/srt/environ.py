@@ -891,6 +891,14 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
+    # pinned aiter still ships the pre-PR config (see
+    # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
+    # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+    # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+    SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
+    # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+    SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
