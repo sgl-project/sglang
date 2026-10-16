@@ -230,6 +230,8 @@ class NixlEPBuffer:
         state.connected_ep_size = 0
         state.scale_to = 0
         state.dispatch_ep_size = 0
+        state.recovery_operation_id = None
+        state.recovery_disconnected_rank = None
         state.recovery_connections_ready = False
 
     @classmethod
