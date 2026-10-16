@@ -8,7 +8,6 @@ names follow the released K2 checkpoint, so weights load without remapping.
 """
 
 import math
-import os
 from typing import Any, Optional
 
 import torch
@@ -17,6 +16,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
@@ -64,12 +64,7 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def _fused_qknorm_rope_enabled() -> bool:
-    return os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower() not in (
-        "0",
-        "false",
-        "off",
-        "no",
-    )
+    return envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
 
 
 def _can_use_fused_qknorm_rope(head_dim: int, dtype: torch.dtype) -> bool:

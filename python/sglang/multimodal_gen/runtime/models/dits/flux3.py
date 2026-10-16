@@ -36,7 +36,6 @@ request.
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import msgspec
@@ -54,6 +53,7 @@ from sglang.kernels.ops.diffusion import (
     residual_gate_add,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -178,8 +178,7 @@ def _swiglu(packed: torch.Tensor) -> torch.Tensor:
 def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
     return (
         _fast_path_allowed(q)
-        and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        not in ("0", "false", "off", "no")
+        and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and can_use_fused_inplace_qknorm_rope(
             head_dim=head_dim,
             rope_dim=head_dim,

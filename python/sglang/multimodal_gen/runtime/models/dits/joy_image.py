@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -11,6 +10,7 @@ from einops import rearrange
 
 from sglang.kernels.ops import diffusion as diffusion_kernels
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
@@ -113,8 +113,7 @@ def _joy_image_qk_rope(
                 x.requires_grad for x in (q, k, q_norm.weight, k_norm.weight, cache)
             )
         )
-        or os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        in {"0", "false", "off", "no"}
+        or not envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
     ):
         return reference()
     if not diffusion_kernels.can_use_fused_inplace_qknorm_rope(
