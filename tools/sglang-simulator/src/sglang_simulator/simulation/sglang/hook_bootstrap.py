@@ -43,6 +43,7 @@ def install_simulator_hooks() -> None:
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
             hicache_storage.C_StorageBackendFactory,
+            cache_controller.C_PrefetchOperationHook,
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,
             unified_radix_cache.C_UnifiedRadixCacheHook,
