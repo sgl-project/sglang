@@ -203,6 +203,9 @@ class GpuDeltaBackend:
 
         self._canonical_plan_digest = None
         self.batch_plan = None
+        self.layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
+        if self.layers_per_batch < 1:
+            raise ValueError("GPU_DELTA_LAYERS_PER_BATCH must be positive")
         inventory = read_canonical_checkpoint_inventory(model_runner)
         self.layout = GpuDeltaLayout(model_runner.model, inventory)
         self.device = next(model_runner.model.parameters()).device
@@ -406,9 +409,7 @@ class PreparedDelta:
         self.apply_host_view = None
         self.backend, self.device = backend, backend.device
         preparation_started = time.perf_counter()
-        layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
-        if layers_per_batch < 1:
-            raise ValueError("GPU_DELTA_LAYERS_PER_BATCH must be positive")
+        layers_per_batch = backend.layers_per_batch
         manifest_started = time.perf_counter()
         path = Path(manifest_path).resolve(strict=True)
         content = path.read_bytes()
@@ -425,7 +426,6 @@ class PreparedDelta:
         entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
-        local_names = [binding.name for binding in backend.layout.bindings]
         payload_started = time.perf_counter()
         index, files = backend.host_arena.prepare_encoded(
             path,
@@ -437,7 +437,9 @@ class PreparedDelta:
         )
         release_started = time.perf_counter()
         # READY admission drained file reads/hashes; keep only this rank's entries.
-        entries = {name: entries[name] for name in local_names}
+        entries = {
+            binding.name: entries[binding.name] for binding in backend.layout.bindings
+        }
         del manifest, content
         self.timings["host_rank_metadata_release_s"] = (
             time.perf_counter() - release_started
@@ -445,7 +447,7 @@ class PreparedDelta:
         self.host_snapshot = backend.host_arena.prepare_local(
             index,
             files,
-            [entries[name] for name in local_names],
+            list(entries.values()),
             backend.payload_pool,
             self.timings,
         )
@@ -605,15 +607,14 @@ class PreparedDelta:
             if inner_codec not in backend.decoders:
                 backend.decoders[inner_codec] = NvcompDecoder(self.device, inner_codec)
             decoder = backend.decoders[inner_codec]
-            with torch.cuda.stream(self.de_stream):
-                self.decode_plan = decoder.prepare_batches(
-                    frame_table,
-                    frame_counts,
-                    backend.host_arena.tensor,
-                    self.de_stream,
-                )
-                self.decode_plan.record_stream(self.stream)
-                self.workspace = self.decode_plan.workspace
+            self.decode_plan = decoder.prepare_batches(
+                frame_table,
+                frame_counts,
+                backend.host_arena.tensor,
+                self.de_stream,
+            )
+            self.decode_plan.record_stream(self.stream)
+            self.workspace = self.decode_plan.workspace
             from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 
             with torch.cuda.stream(self.stream):

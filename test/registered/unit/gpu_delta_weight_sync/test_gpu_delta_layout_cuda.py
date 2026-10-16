@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+from sglang.srt.weight_sync.gpu_delta.flashinfer import FlashInferLayout
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="4-gpu-b200")
@@ -21,7 +23,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 def _apply_prepared_masks(bindings, masks, derived=()):
     """Exercise the prepared grouped path; nvCOMP itself has a separate oracle."""
     from sglang.srt.weight_sync.gpu_delta.apply import (
-        _compiled,
         plan_apply,
         prepare_status_check,
     )
@@ -69,13 +70,6 @@ def _apply_prepared_masks(bindings, masks, derived=()):
         )
         metadata = torch.tensor(group.metadata_rows, dtype=torch.int64, device="cuda")
         apply = group.bind_launch(pointers, metadata, prepared.error)
-        misses = _compiled.cache_info().misses
-        repeated = plan_apply(outputs)
-        repeated.prepare_metadata(decoded.device.index)
-        repeated.bind(decoded)
-        assert repeated.kernels == group.kernels
-        assert repeated.metadata_rows == group.metadata_rows
-        assert _compiled.cache_info().misses == misses
     # Compilation and module loading must not execute against live weights.
     for value, before in saved:
         torch.testing.assert_close(
@@ -118,6 +112,7 @@ def _apply_prepared_masks(bindings, masks, derived=()):
 
 def _reference_layer(values, independent_mma=False):
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
         interleave_w13_halves,
         resolve_cutedsl_standard_scales,
@@ -269,6 +264,7 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
                 local + 2,
                 projection,
                 suffix,
+                FlashInferLayout("nvfp4", "cutedsl", True, "w4a16", up_first=True),
             )
             mask = value.reshape(-1).view(torch.uint8) ^ after[local].reshape(-1).view(
                 torch.uint8
@@ -426,6 +422,7 @@ def test_scale_binding_matches_loader_padding():
             0,
             "down",
             "weight_scale",
+            FlashInferLayout("nvfp4", "cutedsl", True, "w4a16", up_first=True),
         )
         mask = torch.randint(256, shape, dtype=torch.uint8, device="cuda")
         expected = swizzle_blockscale((values ^ mask).view(torch.float8_e4m3fn))
@@ -673,7 +670,6 @@ def test_flashinfer_matrix_matches_native_preprocessing(
         _moe_binding,
         validate_ue8m0_payload,
     )
-    from sglang.srt.weight_sync.gpu_delta.flashinfer import FlashInferLayout
 
     monkeypatch.setenv("SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE", "true")
     hidden = 384

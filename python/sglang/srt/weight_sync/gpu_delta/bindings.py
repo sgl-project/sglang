@@ -17,9 +17,9 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 
 import torch
+
 from sglang.srt.weight_sync.gpu_delta.flashinfer import (
     DestinationSegment,
-    FlashInferLayout,
     expert_destinations,
     expert_scale_target,
     identify_layout,
@@ -211,10 +211,7 @@ def _normalize_expert_meta(meta, layout, suffix):
     meta["format"] = layout.format
 
 
-def _moe_binding(name, meta, layer, expert, projection, suffix, layout=None):
-    # Keep the direct CuTe binding helper usable independently of serving setup.
-    if layout is None:
-        layout = FlashInferLayout("nvfp4", "cutedsl", True, "w4a16", up_first=True)
+def _moe_binding(name, meta, layer, expert, projection, suffix, layout):
     _normalize_expert_meta(meta, layout, suffix)
     if not layout.gated and projection == "gate":
         raise ValueError("non-gated experts have no gate projection")
@@ -380,9 +377,8 @@ class ConsumerSnapshot:
 
     def check_objects(self):
         current = self.read()
-        if (
-            len(current) != len(self.objects)
-            or any(a is not b for a, b in zip(current, self.objects))
+        if len(current) != len(self.objects) or any(
+            a is not b for a, b in zip(current, self.objects)
         ):
             raise RuntimeError(
                 "GPU delta consumer storage changed; readmission required"

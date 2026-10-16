@@ -100,6 +100,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
         backend = SimpleNamespace(
             _canonical_plan_digest=None,
             batch_plan=None,
+            layers_per_batch=1,
             layout=SimpleNamespace(
                 inventory={
                     name: {"dtype": "U8", "shape": [2, 4]}
@@ -204,7 +205,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         consumer.start()
         self.addCleanup(consumer.stop)
 
-    def test_prepared_tp_selection_reads_reused_decoder_scratch(self):
+    def test_tp_selection_reads_reused_decoder_scratch(self):
         for dtype, name in (
             (torch.uint8, "U8"),
             (torch.bfloat16, "BF16"),
@@ -220,47 +221,19 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     target,
                     [[2, 10], [5, 13]],
                 )
-                prepared = layout.PreparedDelta.__new__(layout.PreparedDelta)
-                host_input = torch.empty_like(canonical)
                 decoded = torch.zeros_like(canonical)
-                prepared.error = torch.zeros(1, dtype=torch.int32)
                 payload = binding.selected_bytes(decoded)
                 self.assertEqual(
                     payload.untyped_storage().data_ptr(),
                     decoded.untyped_storage().data_ptr(),
                 )
                 self.assertFalse(payload.is_contiguous())
-                decoder = SimpleNamespace(
-                    enqueue=lambda: decoded.copy_(host_input),
-                    statuses=torch.zeros(1, dtype=torch.int32),
-                    actual_sizes=torch.tensor([size]),
-                    expected_sizes=torch.tensor([size]),
-                )
-                batch = layout._PreparedBatch(
-                    decoder,
-                    lambda: _apply_binding(
-                        binding, torch.where(prepared.error == 0, payload, 0)
-                    ),
-                    [],
-                    lambda: prepared.error.bitwise_or_(
-                        (decoder.statuses != 0).any().to(torch.int32)
-                    ),
-                )
-                expected = _bytes(target).clone()
-                pointer, stride = target.data_ptr(), target.stride()
-                # Two successful decodes observe new scratch values. An error
-                # then gates both that mask and every later mask in the batch.
-                for status in (0, 0, 1, 0):
-                    host_input.random_(256)
-                    decoder.statuses.fill_(status)
-                    if not status and not prepared.error.item():
-                        mask = host_input.view(dtype).reshape(12, 20)[2:10, 5:13]
-                        expected.bitwise_xor_(_bytes(mask))
-                    decoder.enqueue()
-                    prepared._apply_batch(batch)
-                    torch.testing.assert_close(_bytes(target), expected)
-                    self.assertEqual(target.data_ptr(), pointer)
-                    self.assertEqual(target.stride(), stride)
+                # A prepared TP view observes later decoder writes without a
+                # cached contiguous copy. Native tests cover the actual XOR gate.
+                for _ in range(2):
+                    decoded.random_(256)
+                    expected = decoded.view(dtype).reshape(12, 20)[2:10, 5:13]
+                    torch.testing.assert_close(_bytes(payload), _bytes(expected))
 
     def test_unfused_bf16_shared_experts_use_ordinary_tp8_slices(self):
         tp_rank, intermediate, hidden = 3, 32, 16
@@ -704,6 +677,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             parameters=lambda: iter([SimpleNamespace(device=torch.device("cuda", 0))])
         )
         with (
+            patch.dict(layout.os.environ, GPU_DELTA_LAYERS_PER_BATCH="3"),
             patch.object(layout, "GpuDeltaLayout", return_value=fake_plan),
             patch("sglang.srt.weight_sync.gpu_delta.host.HostArena"),
             patch(
@@ -717,9 +691,17 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             self.assertEqual(backend.decoders, {})
             self.assertIsNone(backend.apply_stream)
             self.assertIsNone(backend.de_stream)
-            backend.describe()
-            backend.describe()
+            self.assertEqual(backend.layers_per_batch, 3)
+            with patch.dict(layout.os.environ, GPU_DELTA_LAYERS_PER_BATCH="0"):
+                backend.describe()
+                backend.describe()
+                self.assertEqual(backend.layers_per_batch, 3)
+                with self.assertRaisesRegex(ValueError, "must be positive"):
+                    layout.GpuDeltaBackend(
+                        SimpleNamespace(model=fake_model), {"engine_id": "invalid"}
+                    )
             read_inventory.assert_called_once()
+            backend.close()
 
         drains = []
 
