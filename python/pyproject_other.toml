@@ -118,7 +118,7 @@ srt_hip = [
   "torch",
   "petit_kernel==0.0.2",
   # Monokernels for gfx950 (--monokernel-backend amd); bump with sgl-amd-mono.
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@8f1bff3c06f8467cda1512122844d58d389ad7ca",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e07665c8b36f7d42a48f6615bacf911d0656f5c5",
   "wave-lang==3.8.2",
 ]
 
@@ -129,7 +129,7 @@ srt_hip_rocm724 = [
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
   # Monokernels for gfx950 (--monokernel-backend amd); bump with sgl-amd-mono.
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@8f1bff3c06f8467cda1512122844d58d389ad7ca",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e07665c8b36f7d42a48f6615bacf911d0656f5c5",
   "sglang[runtime_common]",
   "torch==2.11.0",
   "wave-lang==3.8.2",
