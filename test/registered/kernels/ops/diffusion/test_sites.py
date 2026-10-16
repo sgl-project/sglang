@@ -172,6 +172,45 @@ def test_bitexact_gate_skips_first_sight_during_graph_capture(monkeypatch):
     assert gate.can_attempt_once()
 
 
+def test_bitexact_gate_run_verifies_each_signature_outside_capture(monkeypatch):
+    # A new signature must not verify (eager reference + host sync) inside
+    # capture, while a verified one replays the fused kernel alone there.
+    gate = BitExactFusionGate("run", per_signature=True)
+    calls = []
+
+    def fused():
+        calls.append("fused")
+        return torch.tensor([1.0])
+
+    def ref():
+        calls.append("ref")
+        return torch.tensor([1.0])
+
+    def capturing(active):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: active)
+        calls.clear()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    capturing(True)
+    gate.run(fused, ref, sig="a")
+    assert calls == ["ref"] and not gate.is_verified("a")
+    capturing(False)
+    gate.run(fused, ref, sig="a")
+    assert calls == ["fused", "ref"] and gate.is_verified("a")
+    capturing(True)
+    gate.run(fused, ref, sig="a")
+    assert calls == ["fused"]
+    gate.run(fused, ref, sig="b")
+    assert calls == ["fused", "ref"] and not gate.is_verified("b")
+
+    def invalid():
+        raise ValueError("bad operands")
+
+    with pytest.raises(ValueError):
+        gate.run(invalid, ref, sig="a", reraise=(ValueError,))
+    assert not gate.disabled
+
+
 def test_tensors_equal_supports_sequences():
     assert tensors_equal(
         (torch.tensor([1.0]), torch.tensor([2.0])),
