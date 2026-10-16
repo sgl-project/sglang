@@ -34,6 +34,9 @@ _PROFILE_REPLAYS = 5
 _RESIDUAL_SYNC_INTERVAL = 64
 _MIN_RESIDUAL_SAMPLES = 8
 _EMA_WEIGHT = 0.1
+# Arbitrary: a ragged tier must beat the uniform graph by this much, since smaller
+# savings sit inside the cost model's and the estimator's noise (bs=1 lost ~5%).
+_MIN_TIER_SAVING = 0.05
 
 
 class _ResidualCost:
@@ -309,6 +312,13 @@ class AdaptiveVerifyScheduler:
         slots = self._slots(num_reqs)
         full_tokens = num_reqs * self.num_draft_tokens
         tiers = [t for t in self._tiers_by_slots[slots] if num_reqs < t < full_tokens]
+        if self._forced_tier <= 0:
+            tiers = [
+                t
+                for t in tiers
+                if self._tier_costs[(slots, t)]
+                <= (1.0 - _MIN_TIER_SAVING) * self._uniform_costs[slots]
+            ]
         rows = req_pool_indices_cpu.to(torch.int64)
         cost_table = self._cost_table(num_reqs=num_reqs, slots=slots, tiers=tiers)
         budget = self._budget_planner.compute_budget(
