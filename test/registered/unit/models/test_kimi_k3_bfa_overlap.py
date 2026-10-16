@@ -8,10 +8,16 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+from sglang.srt.layers.quantization.w8a8_fp8 import (
+    W8A8Fp8Config,
+    W8A8Fp8LinearMethod,
+)
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _get_k3_dense_weight,
 )
+from sglang.srt.utils import is_ppu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,6 +49,7 @@ def _make_owner(with_stream: bool):
         use_full_rank_gate=True,
         use_fused_input_projection=False,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
+        _bfa_scale=None,
         _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,
         _bfa_b_size=_N_B,
@@ -57,6 +64,86 @@ def _make_owner(with_stream: bool):
 def _run(owner, x):
     out = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
     return [t.clone() for t in out]
+
+
+class _FP8Projection(torch.nn.Module):
+    def __init__(self, in_features, out_features, generator):
+        super().__init__()
+        weight = torch.randn(
+            out_features, in_features, device="cuda", generator=generator
+        ).mul_(0.05)
+        scale = weight.abs().amax(dim=1).clamp_min(1e-6).div(448)
+        self.weight = torch.nn.Parameter(
+            (weight / scale[:, None]).to(torch.float8_e4m3fn).t(),
+            requires_grad=False,
+        )
+        self.weight_scale = torch.nn.Parameter(scale[:, None], requires_grad=False)
+        self.quant_method = W8A8Fp8LinearMethod(W8A8Fp8Config(True))
+
+    def forward(self, x):
+        return apply_fp8_linear(x, self.weight, self.weight_scale), None
+
+
+class TestKimiK3ScaledBfaWeights(CustomTestCase):
+    def test_channelwise_merge_preserves_square_weight_orientation(self):
+        def projection(rows, cols):
+            weight = torch.arange(rows * cols).reshape(rows, cols).remainder(31)
+            return SimpleNamespace(
+                weight=torch.nn.Parameter(weight.to(torch.float8_e4m3fn).t(), False),
+                weight_scale=torch.nn.Parameter(torch.ones(rows, 1), False),
+                quant_method=W8A8Fp8LinearMethod(W8A8Fp8Config(True)),
+            )
+
+        modules = [projection(128, 128), projection(64, 128), projection(12, 128)]
+        weights = [layer.weight.t().float().clone() for layer in modules]
+        owner = SimpleNamespace(
+            fused_qkvg_proj=modules[0], f_a_proj=modules[1], b_proj=modules[2]
+        )
+
+        self.assertTrue(KimiK3DeltaAttention._merge_scaled_bfa_weights(owner))
+        offset = 0
+        for layer, expected in zip(modules, weights):
+            size = expected.shape[0]
+            torch.testing.assert_close(
+                owner._bfa_w[offset : offset + size].float(), expected
+            )
+            torch.testing.assert_close(layer.weight.t().float(), expected)
+            self.assertEqual(layer.weight_scale.shape, (size, 1))
+            offset += size
+        self.assertEqual((owner._bfa_fa_size, owner._bfa_b_size), (64, 12))
+        self.assertEqual(owner._bfa_w.shape, (256, 128))
+
+    def test_fp16_input_uses_original_projections_after_fp8_merge(self):
+        generator = torch.Generator().manual_seed(42)
+
+        def projection(rows, cols):
+            weight = torch.randn(rows, cols, generator=generator, dtype=torch.float16)
+            return lambda x: (torch.nn.functional.linear(x, weight), None)
+
+        owner = SimpleNamespace(
+            use_full_rank_gate=True,
+            _bfa_w=torch.empty(128, 8, dtype=torch.float8_e4m3fn),
+            _bfa_scale=torch.ones(128, 1),
+            fused_qkvg_proj=projection(4, 8),
+            f_a_proj=projection(2, 8),
+            b_proj=projection(1, 8),
+            f_b_proj=projection(3, 2),
+            split_sizes=[3, 1],
+        )
+        x = torch.randn(2, 8, generator=generator, dtype=torch.float16)
+        qkvg = owner.fused_qkvg_proj(x)[0]
+        expected = (
+            qkvg[:, :3],
+            owner.b_proj(x)[0],
+            owner.f_b_proj(owner.f_a_proj(x)[0])[0],
+            qkvg[:, 3:],
+        )
+        with patch("sglang.kernels.ops.kimi_k3.kimi_k3_tiny_gemm") as tiny_gemm:
+            actual = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
+            tiny_gemm.assert_not_called()
+        for got, ref in zip(actual, expected):
+            self.assertEqual(got.dtype, torch.float16)
+            self.assertTrue(torch.equal(got, ref))
 
 
 class TestKimiK3BfaOverlap(CustomTestCase):
@@ -149,6 +236,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             f_b_proj=linear(3, 2),
             split_sizes=[9, 3],
             _bfa_w=None,
+            _bfa_scale=None,
+            _merge_scaled_bfa_weights=lambda: False,
         )
         KimiK3DeltaAttention._merge_bfa_weights(owner)
         x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
@@ -165,6 +254,51 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             (expected_qkv, expected_beta, expected_forget_gate, expected_gate),
         ):
             self.assertTrue(torch.equal(got, ref))
+
+    def test_fp8_channelwise_merge_matches_unmerged_projections(self):
+        if not is_ppu():
+            self.skipTest("KDA FP8 fused input projection requires PPU")
+
+        generator = torch.Generator(device="cuda").manual_seed(42)
+        qkvg = _FP8Projection(256, 128, generator)
+        f_a = _FP8Projection(256, 128, generator)
+        beta = _FP8Projection(256, 16, generator)
+        f_b = _FP8Projection(128, 128, generator)
+        owner = SimpleNamespace(
+            use_full_rank_gate=True,
+            use_fused_input_projection=True,
+            _bfa_uses_block_fp8=False,
+            fused_qkvg_proj=qkvg,
+            f_a_proj=f_a,
+            b_proj=beta,
+            f_b_proj=f_b,
+            split_sizes=[96, 32],
+            _bfa_w=None,
+            _bfa_scale=None,
+        )
+        owner._merge_scaled_bfa_weights = lambda: (
+            KimiK3DeltaAttention._merge_scaled_bfa_weights(owner)
+        )
+
+        inputs = [
+            torch.randn(t, 256, generator=generator, device="cuda").to(torch.bfloat16)
+            for t in (8, 16, 32, 128)
+        ]
+        references = []
+        for x in inputs:
+            qkvg_out = qkvg(x)[0]
+            references.append(
+                (qkvg_out[:, :96], beta(x)[0], f_b(f_a(x)[0])[0], qkvg_out[:, 96:])
+            )
+
+        KimiK3DeltaAttention._merge_bfa_weights(owner)
+        self.assertEqual(owner._bfa_w.shape, (384, 256))
+        self.assertEqual(owner._bfa_scale.shape, (384, 1))
+        self.assertEqual(qkvg.weight.data_ptr(), owner._bfa_w.data_ptr())
+        for x, expected in zip(inputs, references):
+            actual = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
+            for got, ref in zip(actual, expected):
+                torch.testing.assert_close(got, ref, atol=0.03, rtol=0.03)
 
 
 if __name__ == "__main__":
