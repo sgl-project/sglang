@@ -356,6 +356,9 @@ class _Scheduler:
         # Over the collaborators as the tests last replaced them.
         return request_registry_of(self)
 
+    # Grammar readiness is the admission double's own (get_new_batch_prefill).
+    request_intake = SimpleNamespace(requeue_ready_grammars=lambda: None)
+
     @property
     def step_planner(self):
         # The real pause retraction over the same collaborators; admission is

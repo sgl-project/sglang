@@ -262,6 +262,9 @@ class _Shell:
         s._yield_gil_if_needed = lambda: None
         s.process_pending_chunked_abort = lambda: self.log("chunked_abort")
         s._process_hicache_events = self.hicache_events
+        s.hub.request_intake = SimpleNamespace(
+            requeue_ready_grammars=lambda: self.log("grammar")
+        )
         s.hub.step_planner = SimpleNamespace(
             should_defer_prefill=lambda: False,
             get_new_batch_prefill=lambda *slot: self.schedule_leaf("prefill"),
@@ -382,7 +385,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
         shell = _Shell(
             "normal", 3, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
         )
-        schedule = ("ingest", "chunked_abort", "hicache")
+        schedule = ("ingest", "chunked_abort", "hicache", "grammar")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
@@ -398,7 +401,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
             "normal", 4, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
         )
         shell.s.enable_overlap = True
-        schedule = {"chunked_abort", "hicache", "prefill", "decode"}
+        schedule = {"chunked_abort", "hicache", "grammar", "prefill", "decode"}
         schedule.update(_FINALIZE)
         self.assertEqual(
             [e for e in shell.run() if e[1] not in schedule],
@@ -426,9 +429,18 @@ class TestFlatDriverStageOrder(CustomTestCase):
             _at(0, "ingest", ("run_batch", "p0")) + _at(1, "ingest", ("commit", "p0")),
         )
 
+    def test_deferred_prefill_requeues_ready_grammars(self):
+        """A pass whose prefill the prefill/decode interval defers still
+        queues the requests whose grammar is ready."""
+        shell = _Shell("normal", 1)
+        shell.s.hub.step_planner.should_defer_prefill = lambda: True
+        events = [e[1] for e in shell.run()]
+        self.assertIn("grammar", events)
+        self.assertNotIn("prefill", events)
+
     def test_dllm(self):
         shell = _Shell("dllm", 2, prefill={0: _step("b0", ForwardMode.DLLM_EXTEND)})
-        schedule = ("ingest", "chunked_abort", "hicache", "dllm.schedule")
+        schedule = ("ingest", "chunked_abort", "hicache", "grammar", "dllm.schedule")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, *_FINALIZE)
@@ -439,7 +451,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
     def test_pd_prefill(self):
         shell = _Shell("prefill", 2, prefill={0: _step("p0")})
         schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
-        schedule += ("dp.resolve", "dp.chunk")
+        schedule += ("dp.resolve", "dp.chunk", "grammar")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
@@ -453,7 +465,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
         shell = _Shell("prefill", 3, prefill={0: _step("p0"), 1: _step("p1")})
         shell.s.enable_overlap = True
         schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
-        schedule += ("dp.resolve", "dp.chunk")
+        schedule += ("dp.resolve", "dp.chunk", "grammar")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
@@ -478,7 +490,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
         )
         shell.s.enable_overlap = True
         schedule = ("ingest", "dp.intake", "chunked_abort", "hicache")
-        schedule += ("dp.resolve", "dp.chunk")
+        schedule += ("dp.resolve", "dp.chunk", "grammar")
         with envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(True):
             events = shell.run()
         self.assertEqual(
@@ -505,7 +517,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
     def test_pd_decode(self):
         # The prefetch runs at the top of an iteration, before the ingest that
         # numbers it, so the log stamps it with the iteration before.
-        schedule = ("ingest", "dd.intake", ("dd.pop", None))
+        schedule = ("ingest", "dd.intake", "grammar", ("dd.pop", None))
         for overlap in (False, True):
             with self.subTest(overlap=overlap):
                 shell = _Shell("decode", 2, decode={0: _decode_step("d0")})
@@ -600,7 +612,7 @@ class TestRingDriverStageOrder(CustomTestCase):
         shell = _RingShell(
             "normal", 4, prefill={0: _step("p0")}, decode={1: _decode_step("d1")}
         )
-        schedule = {"chunked_abort", "hicache"}
+        schedule = {"chunked_abort", "hicache", "grammar"}
         schedule.update(_FINALIZE)
         self.assertEqual(
             [e for e in shell.run() if e[1] not in schedule],
@@ -618,7 +630,7 @@ class TestRingDriverStageOrder(CustomTestCase):
     def test_pd_prefill(self):
         shell = _RingShell("prefill", 3, prefill={0: _step("p0")})
         schedule = ("ingest", "dp.intake", "dp.poll_transfer", "chunked_abort")
-        schedule += ("dp.chunk", "hicache")
+        schedule += ("dp.chunk", "hicache", "grammar")
         self.assertEqual(
             shell.run(),
             _at(0, *schedule, ("prefill", "p0"), *_FINALIZE)
@@ -688,10 +700,17 @@ class TestRingDriverStageOrder(CustomTestCase):
 
         self.assertEqual(
             shell.run(),
-            _at(0, *schedule, ("dd.pop", 0), ("decode", "d0"), *_FINALIZE)
+            _at(0, *schedule, "grammar", ("dd.pop", 0), ("decode", "d0"), *_FINALIZE)
             + _at(0, ("run_batch", "d0"), ("exchange", 1))
             + _at(0, "send", "send", "send", "send", "send_proxy")
-            + _at(1, *schedule, ("dd.pop", 1), ("decode", None), *_FINALIZE_NONE)
+            + _at(
+                1,
+                *schedule,
+                "grammar",
+                ("dd.pop", 1),
+                ("decode", None),
+                *_FINALIZE_NONE,
+            )
             + _at(1, ("exchange", 0), *consensus(0))
             + _at(1, ("commit", "d0"), "send", "send", "send", "send"),
         )

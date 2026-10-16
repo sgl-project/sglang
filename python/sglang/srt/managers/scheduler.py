@@ -1021,6 +1021,7 @@ class Scheduler:
                 > self.parts.lists.chunked_req.prefix_len
             ):
                 self.stash_chunked_request(self.parts.lists.chunked_req)
+        self.hub.request_intake.requeue_ready_grammars()
 
         stages = self.mode.stages
         if stages.collect_ready is not None:
@@ -1085,6 +1086,7 @@ class Scheduler:
                     self.parts.pending,
                 )
             )
+        self.hub.request_intake.requeue_ready_grammars()
 
         return self.finalize_step(
             self.hub.step_planner.get_new_batch_prefill(slot), slot
@@ -1107,6 +1109,7 @@ class Scheduler:
         )
         self._process_hicache_events()
         self._start_fpm_clock()
+        self.hub.request_intake.requeue_ready_grammars()
         return self.finalize_step(
             self.hub.step_planner.get_new_batch_prefill(slot), slot
         )
@@ -1122,12 +1125,7 @@ class Scheduler:
     ) -> Optional[ScheduleBatch]:
         """Admit transferred requests into decoding, then build the decode step."""
         self._start_fpm_clock()
-        if self.parts.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = (
-                self.parts.grammar_manager.get_ready_grammar_requests()
-            )
-            for req in ready_grammar_requests:
-                self.hub.request_intake.add_request_to_queue(req)
+        self.hub.request_intake.requeue_ready_grammars()
         reqs = self.disagg_decode.pop_reqs_to_admit(slot)
         if reqs:
             self.disagg_decode.commit_prefill_handoff(reqs)

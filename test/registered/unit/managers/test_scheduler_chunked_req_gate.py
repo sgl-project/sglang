@@ -84,6 +84,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.parts.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
     s.parts.lists.decoding = []
     s.hub.step_planner = MagicMock(spec=StepPlanner)
+    s.hub.request_intake = MagicMock()
     s.hub.step_planner.should_defer_prefill.return_value = False
     s.hub.step_planner.get_new_batch_prefill.return_value = None
     s.hub.step_planner.get_decode_step.return_value = None

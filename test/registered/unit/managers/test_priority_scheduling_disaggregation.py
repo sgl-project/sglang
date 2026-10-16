@@ -1025,6 +1025,7 @@ class TestDecodeAdmission(unittest.TestCase):
         finished.finished.return_value = True
         scheduler.hub.step_planner = MagicMock(spec=StepPlanner)
         scheduler.hub.step_planner.get_decode_step.return_value = None
+        scheduler.hub.request_intake = MagicMock(spec=RequestIntake)
         scheduler.parts.dp_attn_adapter = MagicMock()
         scheduler.parts.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
             lambda step, need_sync=None: step

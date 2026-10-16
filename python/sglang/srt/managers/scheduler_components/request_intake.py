@@ -971,6 +971,14 @@ class RequestIntake:
             self.init_req_max_new_tokens(req)
         self.add_request_to_queue(req)
 
+    def requeue_ready_grammars(self) -> None:
+        """Queue the requests whose grammar finished compiling. Under PP the
+        ranks agree on them over the pipeline, so every rank calls it at the
+        same point of a schedule, before any rank-local skip."""
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self.add_request_to_queue(req)
+
     def add_request_to_queue(
         self,
         req: Req,

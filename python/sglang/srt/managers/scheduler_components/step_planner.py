@@ -373,12 +373,6 @@ class StepPlanner:
         slot: ScheduleSlot,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
     ) -> Optional[ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self.request_intake.add_request_to_queue(req)
-
         # Under PP only the scheduled slot's requests: a slot's batch size
         # is capped, and preemption must not pick a request in flight.
         running_reqs = slot.filter_decoding(self.core_lists.decoding)

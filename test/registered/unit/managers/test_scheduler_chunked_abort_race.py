@@ -121,6 +121,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched._process_hicache_events = Mock()
         sched._start_fpm_clock = Mock()
         sched.hub.step_planner = Mock()
+        sched.hub.request_intake = Mock()
         sched.finalize_step = lambda step, slot: step
 
         sched.get_next_pp_disagg_prefill_batch_to_run(Mock())
