@@ -42,8 +42,10 @@ FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
 # AOT custom_all_reduce (v1) only supports these world sizes.
 AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 # jit-eager times the naive-loop dispatch (eager heuristics); jit-graph
-# captures the calls in a CUDA graph (graph heuristics + pointer table).
-PROVIDERS = ["nccl", "aot", "jit-eager", "jit-graph", "fi"]
+# captures the calls in a CUDA graph (graph heuristics + pointer table);
+# jit-eager-symm is jit-eager over an input from the NCCL symmetric pool
+# (graph heuristics, zero-copy pull).
+PROVIDERS = ["nccl", "aot", "jit-eager", "jit-eager-symm", "jit-graph", "fi"]
 WORLD_SIZES = get_benchmark_range(WORLD_SIZES, [2, 4, 8])
 
 # ---------------------------------------------------------------------------
@@ -199,9 +201,24 @@ def _init_fi_backend() -> FlashInferAllReduceBackend:
     return FlashInferAllReduceBackend()
 
 
+@cache_once
+def _init_symm_buffer() -> torch.Tensor:
+    """One registered NCCL symmetric-pool buffer that every size views."""
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        get_nccl_mem_pool,
+    )
+
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    with torch.cuda.use_mem_pool(get_nccl_mem_pool()):
+        buf = torch.empty(MAX_BYTES // DTYPE_ITEMSIZE, dtype=DTYPE, device=device)
+    _init_jit_backend().comm.register_symmetric_segments()
+    return buf
+
+
 BACKEND_FACTORY = {
     "nccl": _init_nccl_backend,
     "jit-eager": _init_jit_backend,
+    "jit-eager-symm": _init_jit_backend,
     "jit-graph": _init_jit_backend,
     "aot": _init_aot_backend,
     "fi": _init_fi_backend,
@@ -256,8 +273,11 @@ def benchmark(message_KB: int, provider: str):
     numel = message_bytes // DTYPE_ITEMSIZE
     device_id = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{device_id}")
-    x = torch.randn(numel, dtype=DTYPE, device=device)
-    ctx_fn = backend.graph_context if not provider.endswith("eager") else None
+    if provider == "jit-eager-symm":
+        x = _init_symm_buffer()[:numel].normal_()
+    else:
+        x = torch.randn(numel, dtype=DTYPE, device=device)
+    ctx_fn = None if "eager" in provider else backend.graph_context
     # Bandwidth-equivalent bytes moved by a ring all-reduce per rank.
     effective_bytes = int(x.nbytes * 2 * (world_size - 1) / world_size)
     return marker.do_bench(

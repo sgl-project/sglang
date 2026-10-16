@@ -67,10 +67,19 @@ struct alignas(128) Semaphore {
   SGL_DEVICE void put_release_multicast() {
     ptx::multimem_red_add_release(&m_flag, 1);
   }
+  /// Where this rank's block reads its input this round, published before
+  /// it arrives so peers can read it after the barrier (see custom all-reduce).
+  SGL_DEVICE void set_location(int64_t location) {
+    *reinterpret_cast<volatile int64_t*>(&m_location) = location;
+  }
+  SGL_DEVICE int64_t get_location() const {
+    return *reinterpret_cast<const volatile int64_t*>(&m_location);
+  }
 
  private:
   uint32_t m_flag;
   Counter m_counter;
+  int64_t m_location;
 };
 static_assert(sizeof(Semaphore) == 128, "must match _SEMAPHORE_BYTES in custom_all_reduce_v2.py");
 

@@ -12,9 +12,10 @@ The CUDA side is split into independent pieces:
 - ``Communicator``: the two planes above (either may be absent), the handle
   every kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
-  graph_params, use_multicast)`` with three algorithms (1shot_push /
-  1shot_pull / 2shot_pull) and three pull data sources (eager pull buffer /
-  CUDA-graph pointer table / multicast address).
+  graph_params, use_multicast, symm_table, location)`` with three
+  algorithms (1shot_push / 1shot_pull / 2shot_pull) and four pull data
+  sources (eager pull buffer / CUDA-graph pointer table / symmetric-pool
+  input / multicast address).
 
 All storage is allocated and owned here, in Python.
 
@@ -22,11 +23,20 @@ CUDA-graph inputs are exchanged from Python after capture (cudaIpc handles
 for cudaMalloc-backed pointers, fabric/posix-fd VMM mapping for expandable
 segments) and written into a device-side pointer table (``graph_params``);
 the kernel captured in the graph dereferences its row at replay time.
+
+Eager inputs allocated from the NCCL symmetric pool (``--enable-symm-mem``)
+are zero-copy too. ``register_symmetric_segments`` peer-maps new pool
+segments (collectively, like NCCL's window registration) into a device table.
+Each rank then publishes where its input sits (segment row and offset, or
+staged) at the first barrier and reads the peers' locations, so ranks need not
+agree on offsets, nor all be in the pool.
 """
 
+import bisect
 import logging
+import math
 from contextlib import contextmanager
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -40,6 +50,9 @@ from sglang.kernels.ops.communication.all_reduce import (
     PushPlane,
     custom_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    get_symmetric_segments,
+)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -52,6 +65,9 @@ from sglang.srt.utils.cuda_vmm_utils import (
 )
 
 from .configs.custom_all_reduce_v2 import (
+    MC,
+    PULL2,
+    PUSH1,
     get_all_reduce_config,
     get_supported_world_sizes,
 )
@@ -68,6 +84,8 @@ MB = 1024 * 1024
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
+_MAX_SYMM_SEGMENTS = 4096
+_LOCATION_SHIFT = 40  # kLocationShift in custom_all_reduce.cuh
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
 # forced per-direction workspace sizes; highest priority, override both the
@@ -96,12 +114,6 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
     return tensor, symm_mem
-
-
-class AllReduceConfig(NamedTuple):
-    algo: AllReduceAlgo
-    use_graph: bool = False
-    use_multicast: bool = False
 
 
 class CustomAllReduceV2:
@@ -143,31 +155,16 @@ class CustomAllReduceV2:
         self.world_size = dist.get_world_size(group=self.group)
         base_config = get_all_reduce_config(self.world_size)
         if max_pull_size is None:
-            max_pull_size = min(base_config.max_pull_bytes, max_size)
+            max_pull_size = min(base_config.max_bytes(push=False), max_size)
         if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
+            max_push_size = min(base_config.max_bytes(push=True), max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
             max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
-
-        def force_thresholds(heuristic):
-            # forced sizes bypass the tuned NCCL-crossover heuristics: lift
-            # each direction's ceiling to the forced workspace capacity (the
-            # clip() below only ever lowers thresholds)
-            if _FORCE_PULL_SIZE_KB is not None:
-                heuristic = heuristic._replace(two_shot_pull_threshold=max_pull_size)
-            if _FORCE_PUSH_SIZE_KB is not None:
-                heuristic = heuristic._replace(one_shot_push_threshold=max_push_size)
-            return heuristic
-
-        base_config = base_config._replace(
-            graph=force_thresholds(base_config.graph),
-            eager=force_thresholds(base_config.eager),
-        )
         # Zero on either pull knob opts out of the pull half entirely: no
-        # pull plane at all, and every pull algo disabled below by clipping
-        # its threshold to 0. Push-only callers (the fused qk-norm instances)
+        # pull plane at all, and every pull algo disabled by its zero
+        # capacity in _pick_config. Push-only callers (the fused qk-norm instances)
         # take this path rather than allocating a placeholder buffer just to
         # satisfy a constructor.
         self.pull_enabled = max_pull_blocks != 0 and max_pull_size > 0
@@ -184,9 +181,15 @@ class CustomAllReduceV2:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
-        self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
-        )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
+        self.config = base_config._replace(
+            num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks
+        )
+        # forced sizes bypass the tuned NCCL crossover: fill each forced
+        # workspace up to its capacity
+        if _FORCE_PUSH_SIZE_KB is not None:
+            self._add_rows(head=((math.inf, PUSH1),))
+        if _FORCE_PULL_SIZE_KB is not None:
+            self.uncap_pull_thresholds()
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
@@ -194,6 +197,7 @@ class CustomAllReduceV2:
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        self._symm_supported = not is_multinode
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -212,6 +216,21 @@ class CustomAllReduceV2:
         self._graph_inputs: List[Tuple[int, int]] = []  # (data_ptr, nbytes)
         self._graph_counter = 0
         self._graph_mode_allowed = False
+        self._in_capture = False
+        # peer-mapped symmetric-pool segments: a device table of every rank's
+        # segment base (one row per segment), and this rank's bases sorted for
+        # lookup with their (end, row)
+        self._symm_table: Optional[torch.Tensor] = None
+        self._symm_count = 0
+        self._symm_bases: List[int] = []
+        self._symm_rows: List[Tuple[int, int]] = []
+        self._symm_sink = _SegmentSink()
+        self._symm_vmm = VmmGraphInputManager(
+            obj=self._symm_sink,
+            group=self.group,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
         self.disabled = False
 
     def _init_workspace(self) -> None:
@@ -282,7 +301,11 @@ class CustomAllReduceV2:
                 mc_semaphore=mc_at(sem_offset),
             )
         if not self.has_multicast or not self.pull_enabled:
-            self.config = self.config._replace(num_mc_blocks=None)
+            self.config = self.config._replace(
+                graph=tuple(r for r in self.config.graph if r[1] != MC),
+                eager=tuple(r for r in self.config.eager if r[1] != MC),
+                num_mc_blocks=None,
+            )
 
         self.obj = Communicator(push=push_plane, pull=pull_plane)
         if self.config.num_mc_blocks is not None:
@@ -305,20 +328,16 @@ class CustomAllReduceV2:
     def uncap_pull_thresholds(self) -> None:
         """Raise the 2-shot ceiling to the workspace capacity.
 
-        The tuned config caps ``2shot_pull`` at the size where NCCL takes
-        over; benchmarks and tests that must keep every sweep size on the
-        custom-AR path can lift that cap up to ``max_pull_size``.
+        The tuned tables end at the size where NCCL takes over; benchmarks
+        and tests that must keep every sweep size on the custom-AR path can
+        extend them with ``2shot_pull`` up to ``max_pull_size``.
         """
+        self._add_rows(tail=((math.inf, PULL2),))
 
-        if not self.pull_enabled:
-            return
-
-        def uncap(heuristic):
-            return heuristic._replace(two_shot_pull_threshold=self.max_pull_size)
-
+    def _add_rows(self, head: tuple = (), tail: tuple = ()) -> None:
         self.config = self.config._replace(
-            graph=uncap(self.config.graph),
-            eager=uncap(self.config.eager),
+            graph=head + self.config.graph + tail,
+            eager=head + self.config.eager + tail,
         )
 
     def _can_use_graph(self) -> bool:
@@ -332,18 +351,14 @@ class CustomAllReduceV2:
             and torch.cuda.is_current_stream_capturing()
         )
 
-    def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
-        # TODO: refactor this along with the config file
-        heuristic = self.config.graph if can_use_graph else self.config.eager
-        can_use_multicast = self.config.num_mc_blocks is not None
-        if nbytes <= heuristic.one_shot_push_threshold:
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
-        if nbytes <= heuristic.one_shot_pull_threshold:
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
-        if can_use_multicast and heuristic.mc.contains(nbytes):
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
-        if nbytes <= heuristic.two_shot_pull_threshold:
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
+    def _pick_config(
+        self, nbytes: int, can_use_graph: bool
+    ) -> Optional[Tuple[AllReduceAlgo, bool]]:
+        table = self.config.graph if can_use_graph else self.config.eager
+        for max_bytes, (algo, use_multicast) in table:
+            cap = self.max_push_size if algo.is_push() else self.max_pull_size
+            if nbytes <= min(max_bytes, cap):
+                return algo, use_multicast
         return None
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
@@ -366,23 +381,88 @@ class CustomAllReduceV2:
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
+        can_use_graph = self._can_use_graph()
         if self.override_algo is not None:
             # TODO: enhance this override pattern
-            algo = self.override_algo
-            use_graph = self._can_use_graph() and not algo.is_push()
-            use_multicast = False
+            algo, use_multicast = self.override_algo, False
         else:
-            config = self._pick_config(nbytes, self._can_use_graph())
+            config = self._pick_config(nbytes, can_use_graph)
             assert config is not None, f"No config for {nbytes = }"
-            algo, use_graph, use_multicast = config
+            algo, use_multicast = config
+        staged = algo.is_push() or use_multicast
+        use_graph = can_use_graph and not staged
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
+        # every input of this call takes the same branch on every rank: it
+        # depends on collective state only, never on where this input sits
+        use_symm = (
+            self._symm_count > 0
+            and not staged
+            and not can_use_graph
+            and not self._in_capture
+            and not is_in_tc_piecewise_cuda_graph()
+        )
         return custom_all_reduce(
             self.obj,
             input,
             algo=algo,
             graph_params=graph_params,
             use_multicast=use_multicast,
+            symm_table=self._symm_table if use_symm else None,
+            location=self._symm_location(input) if use_symm else -1,
         )
+
+    # ------------------------------------------------------------------
+    # Symmetric-pool inputs
+    # ------------------------------------------------------------------
+
+    def _symm_location(self, input: torch.Tensor) -> int:
+        """``row << 40 | offset`` of ``input`` in a registered symmetric-pool
+        segment, or -1 when it must be staged."""
+        ptr = input.data_ptr()
+        i = bisect.bisect_right(self._symm_bases, ptr) - 1
+        if i < 0:
+            return -1
+        end, row = self._symm_rows[i]
+        if ptr + input.numel() * input.element_size() > end:
+            return -1
+        return (row << _LOCATION_SHIFT) | (ptr - self._symm_bases[i])
+
+    def register_symmetric_segments(self) -> None:
+        """Peer-map the NCCL symmetric pool's new segments.
+
+        Collective over the group: every rank must call it at the same point
+        with the same number of new segments, as NCCL's own window
+        registration already requires. Offsets inside the segments may differ
+        across ranks; the kernels exchange them.
+        """
+        if self.disabled or not self._symm_supported:
+            return
+        new = get_symmetric_segments(self._symm_count)
+        if not new:
+            return
+        if not is_vmm_pointer(new[0][0]):
+            logger.warning("Symmetric pool is not VMM-backed; staging its inputs")
+            self._symm_supported = False
+            return
+        count = self._symm_count + len(new)
+        assert count <= _MAX_SYMM_SEGMENTS, "Symmetric segment table overflow"
+        self._symm_sink.segments = new
+        self._symm_vmm.register_graph_inputs()
+        if self._symm_table is None:
+            self._symm_table = torch.zeros(
+                (_MAX_SYMM_SEGMENTS, self.world_size),
+                dtype=torch.uint64,
+                device=self.device,
+            )
+        rows = torch.tensor(self._symm_sink.peer_ptrs, dtype=torch.uint64)
+        self._symm_table[self._symm_count : count].copy_(rows)
+        # the rows must be visible before any (PDL-chained) launch reads them
+        torch.cuda.synchronize()
+        for row, (base, size) in enumerate(new, start=self._symm_count):
+            k = bisect.bisect_left(self._symm_bases, base)
+            self._symm_bases.insert(k, base)
+            self._symm_rows.insert(k, (base + size, row))
+        self._symm_count = count
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
@@ -401,9 +481,11 @@ class CustomAllReduceV2:
             return
         try:
             self._graph_mode_allowed = self._is_graph_mode_supported
+            self._in_capture = True
             yield
         finally:
             self._graph_mode_allowed = False
+            self._in_capture = False
         assert not torch.cuda.is_current_stream_capturing(), (
             "Cannot register graph inputs while capturing CUDA graph"
         )
@@ -468,9 +550,26 @@ class CustomAllReduceV2:
             del self.obj  # drop the pointer holder before the workspace tensors
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
+        if hasattr(self, "_symm_vmm"):
+            self._symm_vmm.close()
 
     def __del__(self):
         self.close()
+
+
+class _SegmentSink:
+    """Feeds pool segments through ``VmmGraphInputManager`` (which maps
+    graph inputs) and keeps each segment's per-rank bases."""
+
+    def __init__(self) -> None:
+        self.segments: List[Tuple[int, int]] = []
+        self.peer_ptrs: List[List[int]] = []
+
+    def get_graph_capture_bases(self):
+        return compute_graph_capture_bases(self.segments)
+
+    def register_peer_mapped_inputs(self, peer_ptrs: List[List[int]]) -> None:
+        self.peer_ptrs = peer_ptrs
 
 
 def _is_vmm_backed_allocator(device: torch.device) -> bool:

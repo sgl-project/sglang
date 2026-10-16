@@ -4,6 +4,7 @@ import os
 import tempfile
 import traceback
 from contextlib import nullcontext
+from typing import List, Tuple
 
 import torch
 
@@ -114,6 +115,22 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
     g_comm_registration_index = std::unordered_map<uintptr_t, size_t>();
 }
 
+// Copy up to `cap` tracked segments, starting at index `start`; returns the count.
+size_t nccl_allocator_copy_segments(size_t start, uintptr_t* ptrs, size_t* sizes, size_t cap) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    size_t n = 0;
+    for (size_t i = start; i < g_segments.size() && n < cap; ++i, ++n) {
+        ptrs[n] = reinterpret_cast<uintptr_t>(g_segments[i].ptr);
+        sizes[n] = g_segments[i].size;
+    }
+    return n;
+}
+
+size_t nccl_allocator_num_segments() {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    return g_segments.size();
+}
+
 // Register all tracked segments with a communicator.
 // Uses an index-based approach to avoid re-registering already-registered segments.
 // Returns 0 on success, non-zero on failure.
@@ -153,6 +170,8 @@ _active_symmetric_memory_context = None
 
 # Reference to the C registration function (with arg types set)
 _register_func = None
+_num_segments_func = None
+_copy_segments_func = None
 
 
 def is_symmetric_memory_enabled():
@@ -193,6 +212,7 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     )
 
     global _allocator, _mem_pool, _cur_device, _register_func
+    global _num_segments_func, _copy_segments_func
     if _allocator is None:
         import torch.utils.cpp_extension
 
@@ -230,8 +250,33 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
         _register_func = nccl_allocator_lib.nccl_allocator_register_segments_with_comm
         _register_func.restype = ctypes.c_int
         _register_func.argtypes = [ctypes.c_uint64]
+        _num_segments_func = nccl_allocator_lib.nccl_allocator_num_segments
+        _num_segments_func.restype = ctypes.c_size_t
+        _num_segments_func.argtypes = []
+        _copy_segments_func = nccl_allocator_lib.nccl_allocator_copy_segments
+        _copy_segments_func.restype = ctypes.c_size_t
+        _copy_segments_func.argtypes = [
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+        ]
 
     return _mem_pool
+
+
+def get_symmetric_segments(start: int = 0) -> List[Tuple[int, int]]:
+    """``(ptr, size)`` of the pool's segments from index ``start`` on, in
+    allocation order; empty until the pool exists."""
+    if _num_segments_func is None:
+        return []
+    count = _num_segments_func() - start
+    if count <= 0:
+        return []
+    ptrs = (ctypes.c_uint64 * count)()
+    sizes = (ctypes.c_size_t * count)()
+    count = _copy_segments_func(start, ptrs, sizes, count)
+    return list(zip(ptrs[:count], sizes[:count]))
 
 
 class SymmetricMemoryContext:
@@ -297,6 +342,11 @@ class SymmetricMemoryContext:
         # Register all unregistered segments
         # with the current comm
         self._register_segments_for_comm()
+        ca_comm = self.group_coordinator.ca_comm
+        if not self.is_graph_capture and hasattr(
+            ca_comm, "register_symmetric_segments"
+        ):
+            ca_comm.register_symmetric_segments()
 
         if self.is_graph_capture:
             if after_2_8_0:

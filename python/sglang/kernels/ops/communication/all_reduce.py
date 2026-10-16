@@ -223,9 +223,24 @@ def custom_all_reduce(
     *,
     graph_params: torch.Tensor | None = None,
     use_multicast: bool = False,
+    symm_table: torch.Tensor | None = None,
+    location: int = -1,
 ) -> torch.Tensor:
+    """With ``symm_table`` (every rank's peer-mapped symmetric-pool segment
+    bases), the pull algos run in symmetric-pool mode: ``location`` (segment
+    row << 40 | byte offset, or -1 to stage) is published to the peers, so
+    each rank's input is read where it is. Every rank must pass a table or
+    none on the same call."""
     module = get_all_reduce_module(input.dtype, comm.world_size)
-    result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    result = module.all_reduce(
+        comm,
+        input,
+        algo.algo_name,
+        graph_params,
+        use_multicast,
+        symm_table,
+        location,
+    )
     return torch.from_dlpack(result)
 
 
