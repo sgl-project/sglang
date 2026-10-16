@@ -960,7 +960,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield chunk
 
             # Send any remaining tool call arguments when generation finishes
-            if finish_reason_type is not None and index in parser_dict:
+            if (
+                finish_reason_type is not None
+                and index in parser_dict
+                and not self._drop_tool_calls(request)
+            ):
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index, created=created
@@ -1022,12 +1026,19 @@ class OpenAIServingChat(OpenAIServingBase):
 
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
+
+        This includes ``tool_choice="none"``: nothing stops the model from
+        writing a call anyway, and with the parser off that call reaches the
+        client as raw template syntax in ``content`` (e.g. Kimi K3's
+        ``<|open|>tools<|sep|>...``). The parser still consumes it; the calls
+        are then dropped (see ``_drop_tool_calls``).
         """
-        return bool(
-            request.tool_choice != "none"
-            and self._effective_tools(request)
-            and self.tool_call_parser
-        )
+        return bool(self._effective_tools(request) and self.tool_call_parser)
+
+    @staticmethod
+    def _drop_tool_calls(request: ChatCompletionRequest) -> bool:
+        """``tool_choice="none"``: parse tool calls but never return them."""
+        return request.tool_choice == "none"
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
         """Validate that the input is valid."""
@@ -1458,6 +1469,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+
+        if (
+            effective_tools
+            and request.tool_choice == "none"
+            and self.tool_call_parser
+            and not glm_constraint
+        ):
+            # The parser still runs under "none" (_tool_call_parsing_active),
+            # so the markers it matches must survive detokenization.
+            request.skip_special_tokens = False
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
@@ -2448,6 +2469,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     history_tool_calls_cnt,
                 )
+                if self._drop_tool_calls(request):
+                    if tool_calls:
+                        logger.debug(
+                            "tool_choice=none: dropped %d tool call(s)",
+                            len(tool_calls),
+                        )
+                    tool_calls = None
+                    if finish_reason and finish_reason.get("type") == "tool_calls":
+                        finish_reason["type"] = "stop"
 
             # Extract prompt_token_ids if requested
             choice_prompt_token_ids = (
@@ -3154,7 +3184,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-        # Yield tool calls
+        # Yield tool calls (none under tool_choice="none": the parser consumed
+        # their text above, and the calls themselves are dropped).
+        if self._drop_tool_calls(request):
+            calls = []
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
             # Mark that this choice has tool calls

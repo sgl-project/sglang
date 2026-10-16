@@ -1474,6 +1474,129 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(result.stop)
 
+    _K3_WEATHER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+    _K3_CALL = (
+        TOOLS_OPEN
+        + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        + '<|open|>argument key="city" type="string"<|sep|>'
+        + "Beijing<|close|>argument<|sep|>"
+        + "<|close|>call<|sep|>"
+        + TOOLS_CLOSE
+    )
+
+    def _k3_ret(self, text):
+        return [
+            {
+                "text": text,
+                "meta_info": {
+                    "id": "chatcmpl-k3-none",
+                    "prompt_tokens": 12,
+                    "completion_tokens": 30,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+    def test_tool_choice_none_keeps_tool_call_parser_active(self):
+        """A call the model writes anyway under tool_choice="none" must still be
+        consumed by the parser, or its template syntax reaches content."""
+        self.chat.tool_call_parser = "kimi_k3"
+        for tool_choice in ("none", "auto"):
+            with self.subTest(tool_choice=tool_choice):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather in Beijing?"}],
+                    tools=[self._K3_WEATHER_TOOL],
+                    tool_choice=tool_choice,
+                )
+                self.assertTrue(self.chat._tool_call_parsing_active(request))
+        no_tools = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertFalse(self.chat._tool_call_parsing_active(no_tools))
+
+    def test_kimi_k3_tool_choice_none_drops_call_non_stream(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        text = "I'll check the weather." + self._K3_CALL
+        for tool_choice, expect_calls in (("none", False), ("auto", True)):
+            with self.subTest(tool_choice=tool_choice):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather in Beijing?"}],
+                    tools=[self._K3_WEATHER_TOOL],
+                    tool_choice=tool_choice,
+                )
+                response = self.chat._build_chat_response(
+                    request, self._k3_ret(text), created=123
+                )
+                choice = response.choices[0]
+                content = choice.message.content or ""
+                self.assertNotIn("<|open|>", content)
+                self.assertNotIn("<|close|>", content)
+                if expect_calls:
+                    self.assertEqual(len(choice.message.tool_calls), 1)
+                    self.assertEqual(choice.finish_reason, "tool_calls")
+                else:
+                    self.assertFalse(choice.message.tool_calls)
+                    self.assertEqual(choice.finish_reason, "stop")
+                    self.assertEqual(content, "I'll check the weather.")
+
+    def test_kimi_k3_tool_choice_none_drops_call_stream(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+        text = "I'll check." + self._K3_CALL
+        pieces = [text[i : i + 7] for i in range(0, len(text), 7)]
+
+        async def run(tool_choice):
+            request = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Weather in Beijing?"}],
+                tools=[self._K3_WEATHER_TOOL],
+                tool_choice=tool_choice,
+                stream=True,
+            )
+            parser_dict, has_tool_calls, lines = {}, {}, []
+            for piece in pieces:
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=piece,
+                    parser_dict=parser_dict,
+                    content={"meta_info": {"id": "chatcmpl-k3-none"}},
+                    request=request,
+                    has_tool_calls=has_tool_calls,
+                    created=123,
+                ):
+                    if line:
+                        lines.append(line)
+            return lines, has_tool_calls
+
+        loop = get_or_create_event_loop()
+        for tool_choice, expect_calls in (("none", False), ("auto", True)):
+            with self.subTest(tool_choice=tool_choice):
+                lines, has_tool_calls = loop.run_until_complete(run(tool_choice))
+                deltas = [
+                    json.loads(line[len("data: ") :])["choices"][0]["delta"]
+                    for line in lines
+                ]
+                streamed = "".join(d.get("content") or "" for d in deltas)
+                self.assertNotIn("<|open|>", streamed)
+                self.assertEqual(streamed, "I'll check.")
+                self.assertEqual(any(d.get("tool_calls") for d in deltas), expect_calls)
+                self.assertEqual(bool(has_tool_calls.get(0)), expect_calls)
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
