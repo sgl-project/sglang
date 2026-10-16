@@ -1,0 +1,1669 @@
+openapi: 3.1.0
+info:
+  title: SGLang High-Performance LLM Inference API
+  version: 0.4.5
+  description: |
+    Comprehensive OpenAPI 3.1.0 specification for SGLang SRT (SGLang Runtime Engine).
+    SGLang supports multi-protocol inference interfaces including:
+    - **OpenAI-Compatible APIs** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/rerank`, etc.)
+    - **Anthropic-Compatible APIs** (`/v1/messages`, `/v1/messages/count_tokens`)
+    - **Ollama-Compatible APIs** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`)
+    - **Native High-Performance APIs** (`/generate`, `/encode`, `/classify`, `/open_session`, `/separate_reasoning`, `/parse_function_call`)
+    - **Management, Weights, & Cluster Control APIs** (`/health`, `/v1/loads`, `/update_weights_*`, `/load_lora_adapter`, `/hicache/storage-backend`, `/scale_elastic_ep`)
+
+servers:
+  - url: http://localhost:30000
+    description: Default SGLang SRT Engine endpoint
+
+tags:
+  - name: OpenAI Compatible
+    description: Standards-compliant OpenAI endpoints for Chat, Completions, Embeddings, Responses, and Model Metadata.
+  - name: Anthropic Compatible
+    description: Anthropic Messages API compatible endpoints.
+  - name: Ollama Compatible
+    description: Ollama API compatible endpoints.
+  - name: SGLang Native
+    description: Native SGLang engine entrypoints optimized for low-latency, session management, and structured generation.
+  - name: Management & Diagnostics
+    description: Engine control, memory allocation, profiling, LoRA hot-swapping, and weight synchronization.
+
+paths:
+  # =========================================================================
+  # OPENAI COMPATIBLE ENDPOINTS
+  # =========================================================================
+  /v1/chat/completions:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Create a chat completion
+      description: |
+        Generates a model response for a given chat conversation. Supports multi-turn chat, multimodal inputs (images, videos, audio),
+        streaming SSE, function calling / tool usage, JSON schema enforcement, regex constraints, and reasoning effort controls.
+      operationId: createChatCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: Chat completion response or SSE stream chunks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream of ChatCompletionStreamResponse chunks.
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '422':
+          $ref: '#/components/responses/422ValidationError'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /v1/completions:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Create a text completion
+      description: Generates completion text for a raw prompt.
+      operationId: createCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompletionRequest'
+      responses:
+        '200':
+          description: Completion response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompletionResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+
+  /v1/embeddings:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Create embeddings
+      description: Generates feature embeddings for input prompt text.
+      operationId: createEmbeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmbeddingRequest'
+      responses:
+        '200':
+          description: Vector embeddings result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmbeddingResponse'
+
+  /v1/classify:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Classify text input
+      description: Computes classification logits/probabilities across target categories for input text.
+      operationId: createClassify
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - input
+              properties:
+                model:
+                  type: string
+                input:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items:
+                        type: string
+      responses:
+        '200':
+          description: Classification scores response.
+
+  /v1/tokenize:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Tokenize input text
+      description: Converts raw text strings into model-specific integer token IDs.
+      operationId: tokenizeText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - prompt
+              properties:
+                model:
+                  type: string
+                prompt:
+                  type: string
+      responses:
+        '200':
+          description: Token IDs array.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      type: integer
+                  count:
+                    type: integer
+
+  /v1/detokenize:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Detokenize token IDs
+      description: Converts an array of token IDs back into decoded text.
+      operationId: detokenizeTokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - tokens
+              properties:
+                model:
+                  type: string
+                tokens:
+                  type: array
+                  items:
+                    type: integer
+      responses:
+        '200':
+          description: Decoded text result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  text:
+                    type: string
+
+  /v1/audio/transcriptions:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Transcribe audio
+      description: Transcribes audio file inputs into text using Whisper/ASR models.
+      operationId: transcribeAudio
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                model:
+                  type: string
+                language:
+                  type: string
+                temperature:
+                  type: number
+      responses:
+        '200':
+          description: Transcription text result.
+
+  /v1/rerank:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Rerank documents
+      description: Reranks candidate document strings or multimodal parts relative to a reference query.
+      operationId: rerankDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RerankRequest'
+      responses:
+        '200':
+          description: List of rerank scoring objects containing score, index, document, and meta_info.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RerankResponseItem'
+
+  /v1/responses:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: OpenAI Responses API
+      description: Creates a multi-turn response object with state management and tool execution capability.
+      operationId: createResponse
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResponsesRequest'
+      responses:
+        '200':
+          description: Created response object.
+
+  /v1/responses/{response_id}:
+    get:
+      tags:
+        - OpenAI Compatible
+      summary: Retrieve response
+      description: Fetches a stored response object by its unique ID.
+      parameters:
+        - name: response_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Retrieved response object.
+
+  /v1/responses/{response_id}/cancel:
+    post:
+      tags:
+        - OpenAI Compatible
+      summary: Cancel response
+      description: Cancels an active in-progress response task.
+      parameters:
+        - name: response_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancelled status confirmation.
+
+  /v1/models:
+    get:
+      tags:
+        - OpenAI Compatible
+      summary: List available models
+      description: Returns a list of available active models and LoRA adapters.
+      operationId: listModels
+      responses:
+        '200':
+          description: Model list object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+
+  /v1/models/{model}:
+    get:
+      tags:
+        - OpenAI Compatible
+      summary: Retrieve model info
+      description: Returns model card metadata for a specified model ID.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Model card object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelCard'
+
+  # =========================================================================
+  # ANTHROPIC COMPATIBLE ENDPOINTS
+  # =========================================================================
+  /v1/messages:
+    post:
+      tags:
+        - Anthropic Compatible
+      summary: Create an Anthropic message
+      description: Generates a response using the Anthropic Messages API format (supporting text, image, tool_use, tool_result, and thinking blocks).
+      operationId: createAnthropicMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnthropicMessagesRequest'
+      responses:
+        '200':
+          description: Anthropic message response object or SSE stream events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnthropicMessagesResponse'
+
+  /v1/messages/count_tokens:
+    post:
+      tags:
+        - Anthropic Compatible
+      summary: Count message tokens
+      description: Calculates the total input token count for an Anthropic message request payload.
+      operationId: countAnthropicTokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnthropicCountTokensRequest'
+      responses:
+        '200':
+          description: Token count object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnthropicCountTokensResponse'
+
+  # =========================================================================
+  # OLLAMA COMPATIBLE ENDPOINTS
+  # =========================================================================
+  /api/chat:
+    post:
+      tags:
+        - Ollama Compatible
+      summary: Ollama Chat Completion
+      description: Handles chat completions formatted for Ollama client integration.
+      operationId: ollamaChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaChatRequest'
+      responses:
+        '200':
+          description: Ollama chat response object or stream.
+
+  /api/generate:
+    post:
+      tags:
+        - Ollama Compatible
+      summary: Ollama Text Generation
+      description: Handles raw text generation formatted for Ollama clients.
+      operationId: ollamaGenerate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OllamaGenerateRequest'
+      responses:
+        '200':
+          description: Ollama generate response object or stream.
+
+  /api/tags:
+    get:
+      tags:
+        - Ollama Compatible
+      summary: List Ollama tags
+      description: Lists active models in Ollama's tags catalog structure.
+      responses:
+        '200':
+          description: List of models in Ollama tags format.
+
+  /api/show:
+    post:
+      tags:
+        - Ollama Compatible
+      summary: Show Ollama model details
+      description: Returns configuration details for a specific model in Ollama format.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - model
+              properties:
+                model:
+                  type: string
+      responses:
+        '200':
+          description: Ollama model details response.
+
+  # =========================================================================
+  # SGLANG NATIVE ENDPOINTS
+  # =========================================================================
+  /generate:
+    post:
+      tags:
+        - SGLang Native
+      summary: Native High-Performance Text Generation
+      description: |
+        Primary native SGLang generation endpoint. Offers direct access to internal sampling params,
+        prefix cache controls, logprob start lengths, multimodal data vectors, custom logit processors, and session parameters.
+      operationId: nativeGenerate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateReqInput'
+      responses:
+        '200':
+          description: Native generation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateReqOutput'
+
+  /encode:
+    post:
+      tags:
+        - SGLang Native
+      summary: Native Prompt Encoding
+      description: Encodes prompt text into normalized feature representations or embeddings.
+      operationId: nativeEncode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateReqInput'
+      responses:
+        '200':
+          description: Encoded representation output.
+
+  /classify:
+    post:
+      tags:
+        - SGLang Native
+      summary: Native Prompt Classification
+      description: Executes native sequence classification across target labels.
+      operationId: nativeClassify
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateReqInput'
+      responses:
+        '200':
+          description: Classification logit output.
+
+  /parse_function_call:
+    post:
+      tags:
+        - SGLang Native
+      summary: Parse tool calls from generated text
+      description: Utility endpoint that parses structured function/tool call invocations from raw generated model output text.
+      operationId: parseFunctionCall
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParseFunctionCallReq'
+      responses:
+        '200':
+          description: Parsed function calls object.
+
+  /separate_reasoning:
+    post:
+      tags:
+        - SGLang Native
+      summary: Separate thinking/reasoning blocks
+      description: Utility endpoint to split thinking/reasoning XML blocks (`<think>...</think>`) from output content.
+      operationId: separateReasoning
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SeparateReasoningReq'
+      responses:
+        '200':
+          description: Separated text and reasoning blocks output.
+
+  /open_session:
+    post:
+      tags:
+        - SGLang Native
+      summary: Open stateful KV cache session
+      description: Opens a persistent session ID for continual multi-turn prompting and KV cache tree management.
+      operationId: openSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenSessionReqInput'
+      responses:
+        '200':
+          description: Created session ID and success status.
+
+  /close_session:
+    post:
+      tags:
+        - SGLang Native
+      summary: Close KV cache session
+      description: Closes an active session and frees associated KV cache tree memory.
+      operationId: closeSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseSessionReqInput'
+      responses:
+        '200':
+          description: Session closed status.
+
+  /pause_generation:
+    post:
+      tags:
+        - SGLang Native
+      summary: Pause generation
+      description: Pauses active request generation tasks in the scheduler.
+      operationId: pauseGeneration
+      responses:
+        '200':
+          description: Generation paused message.
+
+  /continue_generation:
+    post:
+      tags:
+        - SGLang Native
+      summary: Continue generation
+      description: Resumes paused request generation tasks in the scheduler.
+      operationId: continueGeneration
+      responses:
+        '200':
+          description: Generation resumed message.
+
+  /abort_request:
+    post:
+      tags:
+        - SGLang Native
+      summary: Abort request
+      description: Aborts an active request by request ID (rid) or all active requests.
+      operationId: abortRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AbortReq'
+      responses:
+        '200':
+          description: Abort status message.
+
+  # =========================================================================
+  # MANAGEMENT & DIAGNOSTICS ENDPOINTS
+  # =========================================================================
+  /health:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: Health check probe
+      description: Returns HTTP 200 OK when the server process is healthy.
+      responses:
+        '200':
+          description: Server healthy status.
+
+  /health_generate:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: End-to-end health probe with generation
+      description: Executes a dummy token generation request to verify end-to-end engine responsiveness.
+      responses:
+        '200':
+          description: Generation probe successful.
+
+  /get_model_info:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: Get model info
+      description: Retrieves engine model metadata, vocabulary size, and architecture configuration.
+      responses:
+        '200':
+          description: Model information dictionary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInfoResponse'
+
+  /get_server_info:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: Get server runtime info
+      description: Returns runtime server information, hardware details, parallelism config, and versioning.
+      responses:
+        '200':
+          description: Server runtime info object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerInfoResponse'
+
+  /get_weight_version:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: Get active weight version
+      description: Returns current loaded model weight version hash/identifier.
+      responses:
+        '200':
+          description: Weight version object.
+
+  /v1/loads:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: Get server load metrics
+      description: Returns queue lengths, active request counts, KV cache usage percentages, and processing throughput.
+      parameters:
+        - name: dp_rank
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filter metrics to a specific Data Parallelism (DP) rank.
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated sections to include (core, memory, spec, lora, disagg, queues, all).
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json, prometheus]
+          description: Response exposition format ('json' or 'prometheus').
+      responses:
+        '200':
+          description: Server loads snapshot object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoadsResponse'
+            text/plain:
+              schema:
+                type: string
+                description: Prometheus exposition format.
+
+  /flush_cache:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Flush KV cache
+      description: Flushes prefix KV cache allocations and memory pools.
+      responses:
+        '200':
+          description: Cache flushed status.
+
+  /start_profile:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Start profiling
+      description: Starts PyTorch autograd profiler or NVTX trace recording.
+      responses:
+        '200':
+          description: Profiling started.
+
+  /stop_profile:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Stop profiling
+      description: Stops active profiler and writes trace outputs to disk.
+      responses:
+        '200':
+          description: Profiling stopped.
+
+  /update_weights_from_disk:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Update weights from disk path
+      description: Hot-reloads model weights from specified local disk paths without restarting the server.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WeightUpdateDiskReq'
+      responses:
+        '200':
+          description: Weights updated status.
+
+  /load_lora_adapter:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Load LoRA adapter
+      description: Dynamically loads and attaches a LoRA adapter from disk or HuggingFace path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoRALoadReq'
+      responses:
+        '200':
+          description: LoRA loaded status.
+
+  /unload_lora_adapter:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Unload LoRA adapter
+      description: Detaches and unloads a active LoRA adapter by name.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoRAUnloadReq'
+      responses:
+        '200':
+          description: LoRA unloaded status.
+
+  /hicache/storage-backend:
+    get:
+      tags:
+        - Management & Diagnostics
+      summary: Query HiCache storage backend
+      description: Queries active state and stats of HiCache L3 storage backend.
+      responses:
+        '200':
+          description: HiCache storage backend stats.
+    put:
+      tags:
+        - Management & Diagnostics
+      summary: Update HiCache storage backend
+      description: Attaches and configures HiCache L3 storage backend settings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttachHiCacheStorageReqInput'
+      responses:
+        '200':
+          description: Backend attached status.
+    delete:
+      tags:
+        - Management & Diagnostics
+      summary: Remove HiCache storage backend
+      description: Disables or clears HiCache L3 storage backend allocations.
+      responses:
+        '200':
+          description: Backend removed status.
+
+  /scale_elastic_ep:
+    post:
+      tags:
+        - Management & Diagnostics
+      summary: Scale Elastic Expert Parallelism
+      description: Dynamically scales Expert Parallelism world size and worker instances.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScaleElasticEPReqInput'
+      responses:
+        '200':
+          description: EP scaling initiated status.
+
+components:
+  responses:
+    '400BadRequest':
+      description: Bad Request / Invalid Parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    '422ValidationError':
+      description: Request Validation Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    '500InternalError':
+      description: Internal Server Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - object
+        - message
+        - type
+        - code
+      properties:
+        object:
+          type: string
+          default: error
+        message:
+          type: string
+          description: Human-readable error message.
+        type:
+          type: string
+          description: Error type classification.
+        param:
+          type: string
+          nullable: true
+          description: Specific request parameter causing the failure.
+        code:
+          type: integer
+          description: HTTP status or internal error code.
+
+    ModelCard:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - owned_by
+      properties:
+        id:
+          type: string
+          description: Unique model identifier or LoRA adapter name.
+        object:
+          type: string
+          default: model
+        created:
+          type: integer
+          description: Unix timestamp of registration.
+        owned_by:
+          type: string
+          default: sglang
+        root:
+          type: string
+          nullable: true
+        parent:
+          type: string
+          nullable: true
+        max_model_len:
+          type: integer
+          nullable: true
+          description: Maximum total context length (tokens) supported by the model.
+
+    ModelList:
+      type: object
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          default: list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelCard'
+
+    # -------------------------------------------------------------------------
+    # OpenAI Chat & Responses Schemas
+    # -------------------------------------------------------------------------
+    ResponsesRequest:
+      type: object
+      required:
+        - input
+      properties:
+        input:
+          oneOf:
+            - type: string
+              description: Single prompt input string.
+            - type: array
+              items:
+                type: object
+              description: Array of input item objects or dicts.
+        model:
+          type: string
+          nullable: true
+        instructions:
+          type: string
+          nullable: true
+        background:
+          type: boolean
+          default: false
+        max_output_tokens:
+          type: integer
+          nullable: true
+        max_tool_calls:
+          type: integer
+          nullable: true
+        parallel_tool_calls:
+          type: boolean
+          default: true
+        metadata:
+          type: object
+          nullable: true
+
+    ChatCompletionRequest:
+      type: object
+      required:
+        - messages
+      properties:
+        messages:
+          type: array
+          description: List of message objects in the conversation history.
+          items:
+            type: object
+            required:
+              - role
+            properties:
+              role:
+                type: string
+                enum: [system, user, assistant, tool, function, developer]
+              content:
+                oneOf:
+                  - type: string
+                  - type: array
+                    items:
+                      type: object
+              name:
+                type: string
+              tool_call_id:
+                type: string
+              reasoning_content:
+                type: string
+        model:
+          type: string
+          default: default
+          description: Target model name or LoRA adapter (base-model:adapter-name).
+        temperature:
+          type: number
+          nullable: true
+          default: 0.7
+          description: Sampling temperature between 0.0 and 2.0.
+        top_p:
+          type: number
+          nullable: true
+          default: 1.0
+          description: Nucleus sampling threshold.
+        max_completion_tokens:
+          type: integer
+          nullable: true
+          description: Maximum tokens to generate for the completion (including reasoning tokens).
+        max_tokens:
+          type: integer
+          nullable: true
+          deprecated: true
+          description: Deprecated in favor of max_completion_tokens.
+        n:
+          type: integer
+          default: 1
+          description: Number of completion choices to generate.
+        stream:
+          type: boolean
+          default: false
+          description: If true, streams partial completion chunks via SSE.
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+          description: Up to 4 stop sequences where generation halts.
+        presence_penalty:
+          type: number
+          default: 0.0
+          description: Penalty for new tokens based on presence in text so far.
+        frequency_penalty:
+          type: number
+          default: 0.0
+          description: Penalty for new tokens based on existing frequency in text.
+        reasoning_effort:
+          oneOf:
+            - type: string
+              enum: [none, minimal, low, medium, high, xhigh, max]
+            - type: number
+              minimum: 0.0
+              maximum: 0.99
+          description: Constrains reasoning effort for thinking models.
+        tools:
+          type: array
+          description: List of tools/functions available to the model.
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                default: function
+              function:
+                type: object
+                required: [name]
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  parameters:
+                    type: object
+        tool_choice:
+          oneOf:
+            - type: string
+              enum: [auto, required, none]
+            - type: object
+        regex:
+          type: string
+          nullable: true
+          description: SGLang extension — Regular expression pattern to constrain output.
+        json_schema:
+          type: string
+          nullable: true
+          description: SGLang extension — JSON schema string to constrain output structure.
+        top_k:
+          type: integer
+          nullable: true
+          description: SGLang extension — Top-k sampling limit.
+        min_p:
+          type: number
+          nullable: true
+          description: SGLang extension — Minimum probability threshold relative to top token.
+
+    ChatCompletionResponse:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          default: chat.completion
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - index
+              - message
+              - finish_reason
+            properties:
+              index:
+                type: integer
+              message:
+                type: object
+                required:
+                  - role
+                  - content
+                properties:
+                  role:
+                    type: string
+                  content:
+                    type: string
+                    nullable: true
+                  reasoning_content:
+                    type: string
+                    nullable: true
+                  tool_calls:
+                    type: array
+                    items:
+                      type: object
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter, abort]
+
+    # -------------------------------------------------------------------------
+    # Completion, Embedding & Rerank Schemas
+    # -------------------------------------------------------------------------
+    CompletionRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+            - type: array
+              items:
+                type: integer
+        model:
+          type: string
+          default: default
+        max_tokens:
+          type: integer
+          default: 16
+        temperature:
+          type: number
+          default: 1.0
+        top_p:
+          type: number
+          default: 1.0
+        stream:
+          type: boolean
+          default: false
+
+    CompletionResponse:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          default: text_completion
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - index
+              - text
+            properties:
+              index:
+                type: integer
+              text:
+                type: string
+              finish_reason:
+                type: string
+
+    EmbeddingRequest:
+      type: object
+      required:
+        - input
+      properties:
+        input:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        model:
+          type: string
+          default: default
+
+    EmbeddingResponse:
+      type: object
+      required:
+        - object
+        - data
+        - model
+      properties:
+        object:
+          type: string
+          default: list
+        data:
+          type: array
+          items:
+            type: object
+            required:
+              - object
+              - embedding
+              - index
+            properties:
+              object:
+                type: string
+                default: embedding
+              embedding:
+                type: array
+                items:
+                  type: number
+              index:
+                type: integer
+        model:
+          type: string
+
+    RerankRequest:
+      type: object
+      required:
+        - query
+        - documents
+      properties:
+        model:
+          type: string
+        query:
+          type: string
+        documents:
+          type: array
+          items:
+            type: string
+        top_n:
+          type: integer
+          nullable: true
+
+    RerankResponseItem:
+      type: object
+      required:
+        - score
+        - index
+      properties:
+        score:
+          type: number
+          description: Rerank relevance score.
+        index:
+          type: integer
+          description: Index of candidate document.
+        document:
+          type: string
+          nullable: true
+          description: Candidate document text if requested.
+        meta_info:
+          type: object
+          nullable: true
+
+    # -------------------------------------------------------------------------
+    # Anthropic Messages Schemas
+    # -------------------------------------------------------------------------
+    AnthropicMessagesRequest:
+      type: object
+      required:
+        - model
+        - messages
+        - max_tokens
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            type: object
+            required:
+              - role
+              - content
+            properties:
+              role:
+                type: string
+                enum: [user, assistant, system]
+              content:
+                oneOf:
+                  - type: string
+                  - type: array
+                    items:
+                      type: object
+        max_tokens:
+          type: integer
+        stream:
+          type: boolean
+          default: false
+        temperature:
+          type: number
+          nullable: true
+
+    AnthropicMessagesResponse:
+      type: object
+      required:
+        - id
+        - type
+        - role
+        - content
+        - model
+        - stop_reason
+        - usage
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          default: message
+        role:
+          type: string
+          default: assistant
+        content:
+          type: array
+          items:
+            type: object
+        model:
+          type: string
+        stop_reason:
+          type: string
+          nullable: true
+        usage:
+          type: object
+
+    AnthropicCountTokensRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            type: object
+
+    AnthropicCountTokensResponse:
+      type: object
+      required:
+        - input_tokens
+      properties:
+        input_tokens:
+          type: integer
+
+    # -------------------------------------------------------------------------
+    # Ollama Schemas
+    # -------------------------------------------------------------------------
+    OllamaChatRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role:
+                type: string
+              content:
+                type: string
+        stream:
+          type: boolean
+          default: true
+
+    OllamaGenerateRequest:
+      type: object
+      required:
+        - model
+        - prompt
+      properties:
+        model:
+          type: string
+        prompt:
+          type: string
+        stream:
+          type: boolean
+          default: true
+
+    # -------------------------------------------------------------------------
+    # SGLang Native Input / Output Schemas
+    # -------------------------------------------------------------------------
+    GenerateReqInput:
+      type: object
+      properties:
+        text:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+          description: Input prompt text or batch of prompt texts.
+        input_ids:
+          oneOf:
+            - type: array
+              items:
+                type: integer
+            - type: array
+              items:
+                type: array
+                items:
+                  type: integer
+          description: Explicit pre-tokenized token IDs bypassing tokenization.
+        sampling_params:
+          type: object
+          description: Dict of sampling parameters (temperature, top_p, top_k, max_new_tokens, etc.).
+        stream:
+          type: boolean
+          default: false
+          description: If true, streams token chunks.
+        return_logprob:
+          type: boolean
+          default: false
+          description: If true, returns logprobs for prompt and generated tokens.
+        logprob_start_len:
+          type: integer
+          default: -1
+          description: Token index where logprob computation begins (-1 for output tokens only).
+        top_logprobs_num:
+          type: integer
+          default: 0
+          description: Number of top logprobs to return per position.
+        lora_path:
+          type: string
+          nullable: true
+          description: LoRA adapter path or name.
+        session_id:
+          type: string
+          nullable: true
+          description: Persistent session identity for multi-turn conversations.
+
+    GenerateReqOutput:
+      type: object
+      required:
+        - text
+        - meta_info
+      properties:
+        text:
+          type: string
+          description: Generated output string.
+        meta_info:
+          type: object
+          description: Generation statistics, token counts, and latency metadata.
+
+    ParseFunctionCallReq:
+      type: object
+      required:
+        - text
+        - tools
+      properties:
+        text:
+          type: string
+          description: Generated text containing tool/function call snippets.
+        tools:
+          type: array
+          items:
+            type: object
+
+    SeparateReasoningReq:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: Raw generated model text containing reasoning markers.
+        reasoning_parser:
+          type: string
+          default: deepseek_r1
+        return_blocks:
+          type: boolean
+          default: false
+
+    OpenSessionReqInput:
+      type: object
+      required:
+        - capacity_of_str_len
+      properties:
+        capacity_of_str_len:
+          type: integer
+          description: Maximum capacity of string length reserved for session context tree.
+        session_id:
+          type: string
+          nullable: true
+          description: Optional custom session identifier string.
+        streaming:
+          type: boolean
+          nullable: true
+          description: Optional streaming flag for session multi-turn responses.
+        timeout:
+          type: number
+          nullable: true
+          description: Session idle timeout in seconds.
+
+    CloseSessionReqInput:
+      type: object
+      required:
+        - session_id
+      properties:
+        session_id:
+          type: string
+
+    AbortReq:
+      type: object
+      properties:
+        rid:
+          type: string
+          nullable: true
+        abort_all:
+          type: boolean
+          default: false
+
+    WeightUpdateDiskReq:
+      type: object
+      required:
+        - model_path
+      properties:
+        model_path:
+          type: string
+          description: Local filesystem directory path containing new model weights.
+
+    LoRALoadReq:
+      type: object
+      required:
+        - lora_name
+        - lora_path
+      properties:
+        lora_name:
+          type: string
+        lora_path:
+          type: string
+
+    LoRAUnloadReq:
+      type: object
+      required:
+        - lora_name
+      properties:
+        lora_name:
+          type: string
+
+    AttachHiCacheStorageReqInput:
+      type: object
+      required:
+        - hicache_storage_backend
+      properties:
+        hicache_storage_backend:
+          type: string
+          description: Type of storage backend to attach (e.g., 'filesystem', 'nvme').
+        hicache_storage_backend_extra_config_json:
+          type: string
+          nullable: true
+          description: Additional backend configuration in JSON string format.
+        hicache_storage_prefetch_policy:
+          type: string
+          nullable: true
+          description: Prefetch policy configuration.
+        hicache_write_policy:
+          type: string
+          nullable: true
+          description: Write policy ('write_through' or 'write_back').
+
+    ScaleElasticEPReqInput:
+      type: object
+      required:
+        - new_ep_size
+      properties:
+        new_ep_size:
+          type: integer
+          minimum: 1
+          description: Target positive integer world size for Expert Parallelism scaling.
+
+    LoadsResponse:
+      type: object
+      required:
+        - timestamp
+        - version
+        - loads
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO timestamp of metric collection.
+        version:
+          type: string
+          description: Active SGLang version string.
+        loads:
+          type: array
+          description: Array of per-DP-rank load metric dictionaries.
+          items:
+            type: object
+            required:
+              - dp_rank
+            properties:
+              dp_rank:
+                type: integer
+                description: Data Parallelism rank index.
+
+    ServerInfoResponse:
+      type: object
+      properties:
+        sglang_version:
+          type: string
+        device:
+          type: string
+        tp_size:
+          type: integer
+        dp_size:
+          type: integer
+
+    ModelInfoResponse:
+      type: object
+      properties:
+        model_path:
+          type: string
+        tokenizer_path:
+          type: string
+        is_generation:
+          type: boolean
