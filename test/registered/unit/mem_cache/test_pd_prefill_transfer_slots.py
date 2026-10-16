@@ -18,13 +18,16 @@ def make_configurator(
     configurator = SimpleNamespace(
         ps=SimpleNamespace(attn_dp_size=attn_dp_size),
         attn_dp_size=attn_dp_size,
+        pp_size=1,
         mambaish_config=SimpleNamespace(
             mamba2_cache_params=SimpleNamespace(
-                layers=[], mamba_cache_per_req=STATE_BYTES
+                layers=[0], mamba_cache_per_req=STATE_BYTES
             )
         ),
         spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
         hybrid_gdn_config=None,
+        hybrid_kda_config=None,
+        extra_mamba_cache_bytes_per_req=0,
         model_config=SimpleNamespace(),
     )
     configurator._prefill_transfer_slots = lambda count: (
@@ -62,11 +65,10 @@ class TestPrefillTransferSlots(unittest.TestCase):
         self.assertEqual(pool_size, 32)
         self.assertAlmostEqual(remaining, 100.0 - 33 * STATE_BYTES / GB)
 
-    def test_draft_memory_is_reserved_only_for_running_requests(self):
+    def test_pd_prefill_does_not_reserve_draft_memory(self):
         pool_size, remaining = handle_max_mamba_cache("prefill", draft_tokens=3)
         self.assertEqual(pool_size, 32)
-        expected = (33 + 17 * 3) * STATE_BYTES / GB
-        self.assertAlmostEqual(remaining, 100.0 - expected)
+        self.assertAlmostEqual(remaining, 100.0 - 33 * STATE_BYTES / GB)
 
     def test_headroom_is_per_attention_worker(self):
         pool_size, _ = handle_max_mamba_cache("prefill", attn_dp_size=2)
