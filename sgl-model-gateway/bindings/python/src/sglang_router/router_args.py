@@ -128,6 +128,11 @@ class RouterArgs:
     tokenizer_cache_l0_max_entries: int = 10000
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
+    # Exact response cache for deterministic, non-streaming generation
+    response_cache_max_entries: int = 0
+    response_cache_namespace: str = ""
+    response_cache_ttl_secs: int = 300
+    response_cache_max_response_bytes: int = 4 * 1024 * 1024  # 4MB
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     # MCP server configuration
@@ -723,6 +728,32 @@ class RouterArgs:
             help="Maximum memory for L1 tokenizer cache in bytes (default: 50MB)",
         )
 
+        response_cache_group = parser.add_argument_group("Response Cache")
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-max-entries",
+            type=int,
+            default=RouterArgs.response_cache_max_entries,
+            help="Maximum deterministic responses to cache; zero disables the cache",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-namespace",
+            type=str,
+            default=RouterArgs.response_cache_namespace,
+            help="Immutable model/deployment revision included in response cache keys",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-ttl-secs",
+            type=int,
+            default=RouterArgs.response_cache_ttl_secs,
+            help="Response cache TTL in seconds",
+        )
+        response_cache_group.add_argument(
+            f"--{prefix}response-cache-max-response-bytes",
+            type=int,
+            default=RouterArgs.response_cache_max_response_bytes,
+            help="Maximum cacheable response body size in bytes",
+        )
+
         # Parser configuration
         parser_group.add_argument(
             f"--{prefix}reasoning-parser",
@@ -1019,6 +1050,20 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.response_cache_max_entries > 0:
+            if not self.response_cache_namespace:
+                raise ValueError(
+                    "--response-cache-namespace is required when the response cache is enabled"
+                )
+            if not self.api_key:
+                raise ValueError(
+                    "--api-key is required when the response cache is enabled"
+                )
+            if self.enable_igw or self.pd_disaggregation:
+                raise ValueError(
+                    "The response cache is only supported in regular routing mode"
+                )
+
         # Validate configuration based on mode
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode

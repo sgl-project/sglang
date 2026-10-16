@@ -13,7 +13,10 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{
+        response_cache::ResponseCache, steps::WorkflowEngines, JobQueue, LoadMonitor,
+        WorkerRegistry, WorkerService,
+    },
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -41,6 +44,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub response_cache: Option<Arc<ResponseCache>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -230,6 +234,13 @@ impl AppContextBuilder {
             .ok_or(AppContextBuildError("router_config"))?;
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
+        let response_cache = router_config.response_cache.is_enabled().then(|| {
+            Arc::new(ResponseCache::new(
+                router_config.response_cache.max_entries,
+                Duration::from_secs(router_config.response_cache.ttl_secs),
+                router_config.response_cache.max_response_bytes,
+            ))
+        });
 
         let worker_registry = self
             .worker_registry
@@ -249,6 +260,7 @@ impl AppContextBuilder {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
+            response_cache,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,

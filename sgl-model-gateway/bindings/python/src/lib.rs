@@ -420,6 +420,10 @@ struct Router {
     tokenizer_cache_l0_max_entries: usize,
     tokenizer_cache_enable_l1: bool,
     tokenizer_cache_l1_max_memory: usize,
+    response_cache_max_entries: usize,
+    response_cache_namespace: String,
+    response_cache_ttl_secs: u64,
+    response_cache_max_response_bytes: usize,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
     mcp_config_path: Option<String>,
@@ -628,6 +632,12 @@ impl Router {
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
+            .response_cache(config::ResponseCacheConfig {
+                max_entries: self.response_cache_max_entries,
+                namespace: self.response_cache_namespace.clone(),
+                ttl_secs: self.response_cache_ttl_secs,
+                max_response_bytes: self.response_cache_max_response_bytes,
+            })
             .history_backend(history_backend)
             .maybe_api_key(self.api_key.as_ref())
             .maybe_discovery(discovery)
@@ -740,6 +750,10 @@ impl Router {
         tokenizer_cache_l0_max_entries = 10000,
         tokenizer_cache_enable_l1 = false,
         tokenizer_cache_l1_max_memory = 52428800,
+        response_cache_max_entries = 0,
+        response_cache_namespace = String::new(),
+        response_cache_ttl_secs = 300,
+        response_cache_max_response_bytes = 4194304,
         reasoning_parser = None,
         tool_call_parser = None,
         mcp_config_path = None,
@@ -832,6 +846,10 @@ impl Router {
         tokenizer_cache_l0_max_entries: usize,
         tokenizer_cache_enable_l1: bool,
         tokenizer_cache_l1_max_memory: usize,
+        response_cache_max_entries: usize,
+        response_cache_namespace: String,
+        response_cache_ttl_secs: u64,
+        response_cache_max_response_bytes: usize,
         reasoning_parser: Option<String>,
         tool_call_parser: Option<String>,
         mcp_config_path: Option<String>,
@@ -938,6 +956,10 @@ impl Router {
             tokenizer_cache_l0_max_entries,
             tokenizer_cache_enable_l1,
             tokenizer_cache_l1_max_memory,
+            response_cache_max_entries,
+            response_cache_namespace,
+            response_cache_ttl_secs,
+            response_cache_max_response_bytes,
             reasoning_parser,
             tool_call_parser,
             mcp_config_path,
