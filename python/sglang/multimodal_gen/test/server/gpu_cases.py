@@ -562,6 +562,50 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     ),
 ]
 
+_LLADA_IMAGE_SERVER_ARGS = DiffusionServerArgs(
+    model_path="inclusionAI/LLaDA-Image",
+    modality="image",
+    num_gpus=1,
+    tp_size=1,
+    ulysses_degree=1,
+    ring_degree=1,
+    cfg_parallel=False,
+    extras=[
+        "--trust-remote-code",
+        "--revision",
+        "e4e2703f410f7ddb6ee8d6b09dac6a8ec5093039",
+    ],
+)
+_LLADA_IMAGE_SAMPLING = {"num_inference_steps": 50, "guidance_scale": 5.0, "seed": 42}
+if not current_platform.is_hip() and not current_platform.is_xpu():
+    ONE_GPU_CASES += [
+        DiffusionTestCase(
+            "llada_image_bf16_t2i",
+            _LLADA_IMAGE_SERVER_ARGS,
+            DiffusionSamplingParams(
+                prompt="A red fox sitting on a snowy hill",
+                output_size="512x512",
+                extras=_LLADA_IMAGE_SAMPLING,
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        ),
+        DiffusionTestCase(
+            "llada_image_bf16_edit",
+            _LLADA_IMAGE_SERVER_ARGS,
+            DiffusionSamplingParams(
+                prompt="Convert 2D style to 3D style",
+                image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+                output_size="512x512",
+                extras=_LLADA_IMAGE_SAMPLING,
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        ),
+    ]
+
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
     ONE_GPU_CASES.append(
@@ -1562,6 +1606,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
         "../single_test_file/test_ipc_a2a_multi_gpu.py",
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py",
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
         "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
@@ -1605,6 +1650,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
         "../single_test_file/test_ipc_a2a_multi_gpu.py": 180.0,
+        # 2 ranks here (4 ranks skip below four GPUs); ~45 s on B300 with warm JIT
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 120.0,
         "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
         "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
         # ~60 s locally with a warm HF cache (load + one capture + 4 steps);

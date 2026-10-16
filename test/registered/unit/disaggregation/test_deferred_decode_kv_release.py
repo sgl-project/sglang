@@ -414,6 +414,25 @@ class TestDeferredAckTargets(CustomTestCase):
         self.assertEqual(mgr._sent, [(8, target)])
         self.assertNotIn(8, mgr._deferred_ack_targets)
 
+    def test_target_registered_during_poison_never_acks(self):
+        """A target that races past the poisoned check must not ack later."""
+        mgr = _make_prefill_manager()
+        mgr._staging_outstanding[7] = 1
+
+        class _PoisonOnRead(dict):
+            def get(self, *args):
+                # The worker poisons between the check and the store.
+                mgr.poison_deferred_ack_room(7)
+                return dict.get(self, *args)
+
+        mgr._deferred_ack_targets = _PoisonOnRead()
+        mgr.register_deferred_ack_target(7, AckTarget("10.0.0.1", 5000, 9))
+        mgr._staging_outstanding[7] = 0
+        mgr._maybe_ack_drained_abort(7)
+
+        self.assertEqual(mgr._sent, [])
+        self.assertNotIn(7, mgr._deferred_ack_targets)
+
     def test_unregistered_room_is_noop(self):
         mgr = _make_prefill_manager()
 

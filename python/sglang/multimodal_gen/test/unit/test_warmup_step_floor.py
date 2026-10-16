@@ -1,12 +1,16 @@
-"""Warmup requests must stay valid for models with a step floor, and a failed
-request-based warmup must not be reported as a warmed-up timing."""
+"""Warmup requests must stay valid for models with a step floor, a failed
+request-based warmup must not be reported as a warmed-up timing, and a BCG
+server whose warmup captured nothing must say it runs eager."""
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    BaseBreakableCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
     DiffGenerator,
 )
@@ -49,6 +53,8 @@ def _scheduler() -> Scheduler:
     scheduler._warmup_progress_bar = None
     scheduler._show_warmup_progress = False
     scheduler._logged_server_ready_after_warmup = False
+    scheduler._checked_bcg_capture = False
+    scheduler.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
     return scheduler
 
 
@@ -82,6 +88,53 @@ def test_successful_request_warmup_leaves_the_request_warm():
     real = _output()
     scheduler._return_item_result((None, _req(SamplingParams(prompt="a"), 50)), real)
     assert real.metrics.warmup_failed is False
+
+
+def _bcg_scheduler() -> Scheduler:
+    scheduler = _scheduler()
+    scheduler.server_args = SimpleNamespace(
+        enable_breakable_cuda_graph=True, model_path="nvidia/Cosmos3-Nano"
+    )
+    return scheduler
+
+
+def _bcg_warnings(warning: Mock) -> list:
+    return [
+        call
+        for call in warning.call_args_list
+        if "captured no breakable CUDA graphs" in call.args[0]
+    ]
+
+
+def test_bcg_warmup_that_captured_nothing_warns_once():
+    scheduler = _bcg_scheduler()
+    with (
+        patch.object(BaseBreakableCudaGraphRunner, "num_captures", 0),
+        patch("sglang.multimodal_gen.runtime.server_warmup.logger.warning") as warning,
+    ):
+        scheduler._return_item_result((None, _request_warmup_req()), _output())
+        scheduler._return_item_result((None, _request_warmup_req()), _output())
+    assert len(_bcg_warnings(warning)) == 1
+
+
+def test_bcg_warmup_that_captured_graphs_stays_quiet():
+    scheduler = _bcg_scheduler()
+    with (
+        patch.object(BaseBreakableCudaGraphRunner, "num_captures", 3),
+        patch("sglang.multimodal_gen.runtime.server_warmup.logger.warning") as warning,
+    ):
+        scheduler._return_item_result((None, _request_warmup_req()), _output())
+    assert _bcg_warnings(warning) == []
+
+
+def test_no_bcg_capture_check_without_the_flag():
+    scheduler = _scheduler()
+    with (
+        patch.object(BaseBreakableCudaGraphRunner, "num_captures", 0),
+        patch("sglang.multimodal_gen.runtime.server_warmup.logger.warning") as warning,
+    ):
+        scheduler._return_item_result((None, _request_warmup_req()), _output())
+    assert _bcg_warnings(warning) == []
 
 
 def _summary_log(caplog, warmup_failed: bool) -> list[logging.LogRecord]:

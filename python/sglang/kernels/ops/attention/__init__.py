@@ -181,6 +181,7 @@ for _mod, _fn in [
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
+    ("dsa.transform_index", "transform_index_page_table_dcp"),
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
@@ -273,6 +274,19 @@ for _mod, _fn, _backend, _device in [
     (
         "kda_flydsl.kimi_k3_kda_decode",
         "flydsl_kimi_k3_kda_decode_with_f_b",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
+    (
+        "dsv4.flydsl_v4nm.mla_v4_decode",
+        "flydsl_mla_decode_fwd_v4_nm",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "dsv4.flydsl_v4nm.mla_v4_decode",
+        "flydsl_mla_v4_decode_fused",
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),

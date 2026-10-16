@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_v4_dspark import DSparkAttention
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
@@ -20,6 +21,23 @@ MODULE = "sglang.srt.speculative.dspark_components.dspark_worker_v2"
 
 
 class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
+    def test_v4_idle_draft_attention_returns_empty_rows_without_kv_work(self):
+        """A peer prefill has no local draft KV rows or attention metadata.
+
+        Its empty HC output can have arbitrary strides; sending it through
+        MXFP8 projection fails before the rank can join the peer's MoE pass.
+        """
+        attention = object.__new__(DSparkAttention)
+        hidden = torch.empty_strided((0, 5120), (1, 1), dtype=torch.bfloat16)
+        output = attention.forward(
+            torch.empty(0, dtype=torch.int64),
+            hidden,
+            SimpleNamespace(forward_mode=ForwardMode.IDLE),
+        )
+        self.assertEqual(output.shape, hidden.shape)
+        self.assertEqual(output.dtype, hidden.dtype)
+        self.assertEqual(output.device, hidden.device)
+
     def test_draft_counts_are_not_scaled_twice(self):
         for width in (6, 7):
             for rank, local_tokens in ((0, 0), (1, 3 * width), (2, 0)):

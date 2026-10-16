@@ -68,10 +68,11 @@ if TYPE_CHECKING:
     # copy-engine all-to-all for Ulysses groups of any size on one host; off by
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
-    # head groups for pipelining MiniMax-H3's Ulysses exchange against dense
-    # attention over the copy-engine transport: -1 picks a count that divides
-    # the heads per rank and steps aside when its buffers do not fit, 0 or 1
-    # keeps the sequential exchange, N >= 2 forces N groups
+    # head groups for pipelining the Ulysses exchange against dense attention
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # -1 picks the most groups that divide the heads per rank while each group's
+    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
+    # 1 keeps the sequential exchange; N >= 2 forces N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
@@ -134,6 +135,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
+    SGLANG_USE_ROCM_AITER_TGEMM: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -535,6 +537,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_ROCM_VAE_CONV2D": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D"),
     # ROCm: use BF16 compute for the Conv2D replacement (implies CONV2D=true)
     "SGLANG_USE_ROCM_VAE_CONV2D_BF16": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D_BF16"),
+    # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
+    # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
+    "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
