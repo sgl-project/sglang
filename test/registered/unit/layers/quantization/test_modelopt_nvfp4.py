@@ -167,8 +167,11 @@ class TestModelOptNvfp4(CustomTestCase):
 
     def test_checkpoint_metadata_rejects_incompatible_quantization(self):
         for algo in ("FP8", "W4A16_NVFP4"):
-            with self.subTest(algo=algo), self.assertRaisesRegex(
-                ValueError, "Per-token activation metadata requires serialized W4A4"
+            with (
+                self.subTest(algo=algo),
+                self.assertRaisesRegex(
+                    ValueError, "Per-token activation metadata requires serialized W4A4"
+                ),
             ):
                 ModelOptFp4Config.from_config(
                     {
