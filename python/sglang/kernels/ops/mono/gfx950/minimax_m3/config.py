@@ -115,6 +115,32 @@ MAX_WIDTH = min(
     _LDS_MAX_WIDTH,
 )
 assert MAX_WIDTH >= 1, "SGLANG_TEST_MONO_MAX_WIDTH must leave at least one width"
+
+# The bottom of the range, for the same reason MAX_WIDTH caps the top: a step
+# outside it routes to the modules, which is the supported fallback.
+#
+# TP8's NARROW MoE path is broken. Measured 2026-10-16 on an 8-rank decode
+# graph capture: widths 16, 12 and 8 captured on mono cleanly, then width 4
+# took `Memory access fault ... on address (nil) / 0x1000 / 0x2000` on all
+# eight ranks at once. Those are unpopulated pointers, not an LDS overflow, so
+# the compile gate cannot see it -- every TP8 width builds clean.
+#
+# 4 is the first width below ``layout.WIDE_FROM`` (5 at TP8, 3 at TP2), i.e.
+# the first step that takes the narrow path, and the narrow path is the one
+# whose sizing has already needed TP-specific repair once (it was sized by
+# HIDDEN rather than INTER, which broke TP2 at widths 3-4). Treat this as the
+# same class, unfixed at TP8.
+#
+# TP2 and TP4 are NOT capped: both have run every width from 1 in anger.
+_NARROW_BROKEN_AT_TP = {8: 5}
+_MIN_WIDTH = _NARROW_BROKEN_AT_TP.get(TP, 1)
+# Unlike MAX_WIDTH's hook this one may also LOWER the floor, so the fix can be
+# exercised without a rebuild. Lowering it at TP8 re-enables a fault that takes
+# down every rank on the node -- do it only on a node you have to yourself.
+MIN_WIDTH = int(os.environ.get("SGLANG_TEST_MONO_MIN_WIDTH", _MIN_WIDTH))
+assert 1 <= MIN_WIDTH <= MAX_WIDTH, (
+    f"MIN_WIDTH {MIN_WIDTH} must be in [1, MAX_WIDTH={MAX_WIDTH}]"
+)
 # The widest fused projection any build asks for. ``IndexHeads.__post_init__``
 # pins count to TOTAL_INDEX_HEADS under CP and LOCAL_INDEX_HEADS otherwise, and
 # LOCAL is never the larger, so CP's every-index-head rows are the bound.
