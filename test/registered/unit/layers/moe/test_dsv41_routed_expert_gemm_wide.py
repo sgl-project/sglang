@@ -145,7 +145,11 @@ class TestBuild(CustomTestCase):
         )
         self.assertEqual(
             pair.call_args.kwargs,
-            {"top_k": TARGET_TOP_K, "max_rows": ROUTED_EXPERT_MAX_ROWS},
+            {
+                "top_k": TARGET_TOP_K,
+                "max_rows": ROUTED_EXPERT_MAX_ROWS,
+                "finalize": False,
+            },
         )
 
     def test_keeps_flashinfer_when_the_kernels_cannot_serve(self):

@@ -40,6 +40,34 @@ tokens of one forward: a DSpark verify step at batch `b` has `6 b` rows.
 | LM head (shared with the DSpark draft) on FlashInfer's CuTe DSL low-M BF16 GEMM | cuBLAS split-K + reduce | 1-16 | `lm_head.py` |
 | Gluon swap-AB sparse decode attention up to 24 rows, launched with PDL, one-warp combine | FlashMLA sparse decode on 64 zero-padded heads past 8 rows | 6-24 | `switch.SWAPAB_MAX_ROWS` |
 
+## DSpark draft and verify
+
+The same switch moves the DSpark draft and the verify accept onto low-latency
+paths (`dspark/`). They take effect only when the target resolved the switch;
+there is no second flag.
+
+| Path | Replaces | Rows | Module |
+| --- | --- | --- | --- |
+| Draft attention `wq_b`, `wo_b` on the low-latency MXFP8 GEMM (same shapes and pinned tactics as the target) | the persistent CuTe DSL MXFP8 GEMM | 1-8 | `dspark/install.py`, `mxfp8_linear.py` |
+| Draft MoE on the routed-expert GEMM pair plus a local finalize (`finalize.cu`, FlashInfer's small-batch finalize arithmetic), since draft stages do not defer the finalize | FlashInfer TRT-LLM-gen routed MoE with `do_finalize=True` | 1-48 | `dspark/install.py`, `routed_expert_gemm.py` |
+| Whole Markov chain of the folded draft proposal in one vocab-sharded cooperative kernel per rank; ranks exchange one key per row and step through symmetric memory | one Markov step kernel + vocab gather per draft step | 1-8 requests | `dspark/sharded_markov.py`, `.cu` |
+| Draft context-KV projection on a side stream beside the accept, inside the verify CUDA graph | the same projection after the accept | static verify graphs | `dspark/static_epilogue.py` |
+| Engram history commit recorded in the verify CUDA graph, gated per row | the eager commit after the replay | static verify graphs | `dspark/static_epilogue.py` |
+| Temperature-sampling accept (rejection, bonus, accept-site sync, Engram and KV commits) in one CUDA graph per verify batch size, compiled at startup | the eager accept after the replay | all-sampled static steps | `dspark/sampling_accept_graph.py` |
+| Block-wise rejection sampler: per-vocab-block stats, a one-warp accept, a block-parallel Gumbel-max resample, counter-based draws | draft and target softmax + single-CTA rejection kernel | no top-k / top-p, no block verification | `dspark/blockwise_rejection.py` |
+
+The block-wise sampler's draws are functions of (server seed, a device step
+counter, row, token), so every rank computes the same accept from the same
+logits. Its accept syncs at the `dspark-accept-greedy` site instead of
+`dspark-accept-sample`: with `SGLANG_SPEC_TP_SYNC=rng` it broadcasts nothing,
+with the default `all` it still broadcasts. The sampling-accept graph serves
+all-sampled steps only; mixed greedy / sampled, top-k, top-p, grammar and
+logit-adjusted steps take the eager accept. A cross-rank wait
+in the sharded Markov kernel traps after 20 s (`sharded_markov.TIMEOUT_MS`)
+instead of hanging. Every per-step DSpark gate reads batch flags, shapes and
+which graphs were captured, all shared by the TP ranks; the sharded chain is
+built on every rank or on none (CPU all-reduce at startup).
+
 ## Rank lockstep
 
 The fused all-reduce and the mailbox are collectives, so every rank must take the

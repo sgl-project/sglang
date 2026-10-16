@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -73,6 +74,9 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        # A one-launch Markov chain a model's install may set (dsv41_low_latency);
+        # it declines the batches it does not take.
+        self.markov_chain = None
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -91,6 +95,10 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
+        noise = None if self.greedy_draft else self._noise
+        forked = self.markov_chain is not None and self.markov_chain.fork_noise(
+            rows=bs, noise=noise
+        )
         if self.sample_from_anchor:
             model_hidden = hidden_states
             sample_hidden = hidden_states.view(bs, self.gamma, -1)
@@ -104,20 +112,34 @@ class DsparkDraftSampler:
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
-        draft_tokens, _ = draft_markov_block(
-            markov_head=self.markov_head,
-            base_logits=base_logits,
-            anchor_tokens=anchor,
-            draft_hidden=sample_hidden,
-            step_temperatures=self.params.step_temperatures[:bs],
-            noise=self._noise,
-            tp_sync=self._tp_sync,
-            logits_out=None
-            if self.greedy_draft
-            else self._step_logits(base_logits)[:bs],
-            greedy_draft=self.greedy_draft,
-        )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
+        draft_tokens = None
+        if self.markov_chain is not None:
+            draft_tokens = self.markov_chain.sample(
+                base_logits=base_logits,
+                anchor_tokens=anchor,
+                temperatures=self.params.step_temperatures,
+                logits_cache=None
+                if self.greedy_draft
+                else self._step_logits(base_logits),
+                noise=noise,
+                forked=forked,
+                out=self.out[: bs * self.gamma].view(bs, self.gamma),
+            )
+        if draft_tokens is None:
+            draft_tokens, _ = draft_markov_block(
+                markov_head=self.markov_head,
+                base_logits=base_logits,
+                anchor_tokens=anchor,
+                draft_hidden=sample_hidden,
+                step_temperatures=self.params.step_temperatures[:bs],
+                noise=self._noise,
+                tp_sync=self._tp_sync,
+                logits_out=None
+                if self.greedy_draft
+                else self._step_logits(base_logits)[:bs],
+                greedy_draft=self.greedy_draft,
+            )
+            self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence, confidence_raw = self.model.compute_confidence(
                 anchor_tokens=anchor,
@@ -162,7 +184,7 @@ def maybe_build_draft_sampler(
             "DSpark draft proposal (%s) folded into the draft cuda graph.",
             "greedy draft" if greedy_draft else "sampling",
         )
-    return DsparkDraftSampler(
+    sampler = DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
         max_bs=max_bs,
@@ -172,3 +194,10 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         out=out,
     )
+    if get_exec().features.enable_dsv41_low_latency_decode:
+        from sglang.srt.models.dsv41_low_latency.dspark.sharded_markov import (
+            install_draft_sampler,
+        )
+
+        install_draft_sampler(sampler)
+    return sampler

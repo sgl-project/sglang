@@ -8,7 +8,8 @@ kernel and a GEMM pair of 8-row tcgen05 block-scaled tiles (persistent schedule,
 compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
 consecutive tiles (route_wide.cu). The kernels read the same shuffled MXFP4 weights and
 MXFP8 activations as FlashInfer and return its deferred-finalize triple, so the fused
-finalize + all-reduce + mHC consumer is unchanged.
+finalize + all-reduce + mHC consumer is unchanged; layers that finalize locally (the
+DSpark draft) add finalize.cu, FlashInfer's small-batch finalize arithmetic.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ GEMM1_UNITS = 9  # 128-row tiles of w13 holding the 576-wide slice (10th is padd
 GEMM2_UNITS = HIDDEN // 128
 ROUTE_THREADS = 64
 ROUTE_WIDE_THREADS = 512
+FINALIZE_THREADS = 256  # one thread per output value, HIDDEN / 256 CTAs per row
 NVRTC_OPTIONS = ("-std=c++17", "-default-device", "--use_fast_math")
 HEADERS = ("route.cuh",)
 GEMM1_PARAMETERS = ("A", "SFA", "X", "XS", "route", "clamp", "H", "HS", "cta_words")
@@ -243,6 +245,17 @@ def load_route_wide(device_index: int) -> _Kernel:
         )
 
 
+@cache
+def load_finalize(device_index: int) -> _Kernel:
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / "finalize.cu").read_text()
+        cubin = compile_source(source, "finalize", f"sm_{major}{minor}a")
+        return _load(cubin, "dsv41_routed_expert_finalize", (FINALIZE_THREADS, 1, 1), 0)
+
+
 def _pointer(tensor: torch.Tensor) -> ctypes.c_void_p:
     return ctypes.c_void_p(tensor.data_ptr())
 
@@ -372,7 +385,17 @@ def check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> None:
 class RoutedExpertGemm:
     """The route kernel and GEMM pair bound to one MoE layer's weights."""
 
-    def __init__(self, w13, w13_scale, w2, w2_scale, clamp, top_k: int, max_rows: int):
+    def __init__(
+        self,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        clamp,
+        top_k: int,
+        max_rows: int,
+        finalize: bool = False,
+    ):
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
         w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
         check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
@@ -387,6 +410,8 @@ class RoutedExpertGemm:
         self.route_wide = (
             load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
         )
+        # Calls that finalize locally (not deferred) take the pair only with this set.
+        self.finalize_kernel = load_finalize(w13.device.index) if finalize else None
         # route.cu flips bit 31 of this word on every launch.
         self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
         self._tensors = (
@@ -403,9 +428,13 @@ class RoutedExpertGemm:
         )
         self.gemm2_maps = (_weight_map(w2, HIDDEN, PADDED, 2), _scale_map(w2_scale, 1))
 
-    def supports(self, x_quant, x_scale, topk_output) -> bool:
+    def supports(
+        self, x_quant, x_scale, topk_output, *, finalize: bool = False
+    ) -> bool:
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        if finalize and self.finalize_kernel is None:
+            return False
         if not TopKOutputChecker.format_is_standard(topk_output):
             return False
         topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
@@ -424,8 +453,11 @@ class RoutedExpertGemm:
             and topk_weights.dtype == torch.float32
         )
 
-    def apply(self, x_quant, x_scale, topk_output):
-        """The MoE output as FlashInfer's deferred finalize returns it."""
+    def apply(
+        self, x_quant, x_scale, topk_output, output: Optional[torch.Tensor] = None
+    ):
+        """The MoE output as FlashInfer's deferred finalize returns it, or finalized
+        into ``output`` (BF16 [rows, 5120]) when given."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -434,6 +466,9 @@ class RoutedExpertGemm:
         gemm2_out, expert_weights, permuted = self(
             x_quant, x_scale, topk_output.topk_ids, topk_output.topk_weights
         )
+        if output is not None:
+            self.finalize(gemm2_out, expert_weights, permuted, output)
+            return StandardCombineInput(hidden_states=output)
         return StandardCombineInput(
             hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
                 gemm2_out=gemm2_out,
@@ -524,10 +559,28 @@ class RoutedExpertGemm:
         )
         return gemm2_rows, topk_weights.contiguous().view(rows, top_k), permuted
 
+    def finalize(self, gemm2_rows, expert_weights, permuted, output) -> None:
+        """output[t] = BF16(sum_k w[t, k] * gemm2_rows[permuted[t, k]]), FlashInfer's
+        small-batch finalize arithmetic; output is BF16 [rows, 5120], contiguous."""
+        rows, top_k = expert_weights.shape
+        _launch(
+            self.finalize_kernel,
+            (HIDDEN // FINALIZE_THREADS, rows, 1),
+            [
+                _pointer(gemm2_rows),
+                _pointer(permuted),
+                _pointer(expert_weights),
+                _pointer(output),
+                ctypes.c_int32(top_k),
+            ],
+            torch.cuda.current_stream(output.device).cuda_stream,
+        )
 
-def build(layer, clamp) -> Optional[RoutedExpertGemm]:
+
+def build(layer, clamp, *, finalize: bool = False) -> Optional[RoutedExpertGemm]:
     """The pair for a TP MoE layer's processed weights; None (logged) when the
-    kernels cannot take them, and FlashInfer serves every batch."""
+    kernels cannot take them, and FlashInfer serves every batch. ``finalize``:
+    the layer's calls also finalize locally (the DSpark draft)."""
     from sglang.srt.models.dsv41_low_latency.switch import ROUTED_EXPERT_MAX_ROWS
 
     try:
@@ -541,6 +594,7 @@ def build(layer, clamp) -> Optional[RoutedExpertGemm]:
             clamp,
             top_k=layer.top_k,
             max_rows=ROUTED_EXPERT_MAX_ROWS,
+            finalize=finalize,
         )
     except (ValueError, ImportError, OSError, RuntimeError) as error:
         logger.warning(

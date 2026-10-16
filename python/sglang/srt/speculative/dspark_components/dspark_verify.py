@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -31,6 +31,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+if TYPE_CHECKING:
+    from sglang.srt.models.dsv41_low_latency.dspark.blockwise_rejection import (
+        RejectionNoise,
+    )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
@@ -139,6 +144,9 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
         self._simulated_correct_len = simulated_correct_len
+        # Counter-based draws of the block-wise rejection sampler, set by a model's
+        # install (dsv41_low_latency); None keeps the classic sampling accept.
+        self.rejection_noise: Optional[RejectionNoise] = None
 
     def accept_and_finalize(
         self,
@@ -180,10 +188,16 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
+            rejection_noise=self.rejection_noise,
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if accept_sampling_info is None or accept_sampling_info.is_all_greedy
+            if accept_sampling_info is None
+            or accept_sampling_info.is_all_greedy
+            # Counter-based draws: like a greedy accept, a function of the shared logits.
+            or _blockwise_rejection_applies(
+                self.rejection_noise, accept_sampling_info, self._block_verification
+            )
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         return build_accept_outs(
@@ -572,6 +586,9 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        # A model's replacement of the static (non-ragged) epilogue, set by its
+        # install (dsv41_low_latency): (out, forward_batch) -> None.
+        self.static_epilogue_override = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -586,6 +603,9 @@ class DsparkVerifyEpilogue:
         ):
             return
         if not runner.ragged_verify_mode:
+            if self.static_epilogue_override is not None:
+                self.static_epilogue_override(out, forward_batch)
+                return
             self._static_epilogue(out, forward_batch)
             return
         self(
@@ -890,6 +910,16 @@ def sample_simulated_bonus(
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
+def _blockwise_rejection_applies(noise, sampling_info, block_verification) -> bool:
+    if noise is None:
+        return False
+    from sglang.srt.models.dsv41_low_latency.dspark import blockwise_rejection
+
+    return blockwise_rejection.applies(
+        noise=noise, sampling_info=sampling_info, block_verification=block_verification
+    )
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -902,6 +932,7 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -910,6 +941,19 @@ def accept_draft_tokens(
         return AcceptGreedy.execute(
             candidates=candidates,
             target_logits=target_logits,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
+        )
+    if _blockwise_rejection_applies(rejection_noise, sampling_info, block_verification):
+        from sglang.srt.models.dsv41_low_latency.dspark import blockwise_rejection
+
+        return blockwise_rejection.accept(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_block=draft_block,
+            sampling_info=sampling_info,
+            noise=rejection_noise,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
