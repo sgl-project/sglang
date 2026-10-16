@@ -40,16 +40,33 @@ def memory_snapshot():
     }
 
 
-async def wave(engine, prompts, output_length):
+async def wave(engine, prompts, output_length, batch_submit=False):
+    sampling = {
+        "temperature": 0,
+        "max_new_tokens": output_length,
+        "ignore_eos": True,
+    }
+
+    def summarize(started, first, first_count, finished, last):
+        assert first is not None and last is not None
+        count = last["meta_info"]["completion_tokens"]
+        assert count == output_length, last["meta_info"]
+        assert last["meta_info"].get("cached_tokens", 0) == 0, last["meta_info"]
+        assert count > first_count, "Need multiple streamed chunks to measure TPOT"
+        return {
+            "ttft_ms": (first - started) * 1000,
+            "latency_ms": (finished - started) * 1000,
+            "tpot_ms": (finished - first) * 1000 / (count - first_count),
+            "first_chunk_tokens": first_count,
+            "output_tokens": count,
+            "output_ids": last.get("output_ids"),
+        }
+
     async def request(ids):
         started = time.perf_counter()
         stream = await engine.async_generate(
             input_ids=ids,
-            sampling_params={
-                "temperature": 0,
-                "max_new_tokens": output_length,
-                "ignore_eos": True,
-            },
+            sampling_params=sampling,
             stream=True,
         )
         first = None
@@ -62,21 +79,24 @@ async def wave(engine, prompts, output_length):
                 first, first_count = now, count
             last = chunk
         finished = time.perf_counter()
-        assert first is not None and last is not None
-        count = last["meta_info"]["completion_tokens"]
-        assert count == output_length, last["meta_info"]
-        assert last["meta_info"].get("cached_tokens", 0) == 0, last["meta_info"]
-        return {
-            "ttft_ms": (first - started) * 1000,
-            "latency_ms": (finished - started) * 1000,
-            "tpot_ms": (finished - first) * 1000 / (count - first_count),
-            "first_chunk_tokens": first_count,
-            "output_tokens": count,
-            "output_ids": last.get("output_ids"),
-        }
+        return summarize(started, first, first_count, finished, last)
 
     start = time.perf_counter()
-    requests = await asyncio.gather(*(request(ids) for ids in prompts))
+    if batch_submit:
+        states = [[None, None, None, None] for _ in prompts]
+        stream = await engine.async_generate(
+            input_ids=prompts, sampling_params=sampling, stream=True
+        )
+        async for chunk in stream:
+            now = time.perf_counter()
+            state = states[chunk["index"]]
+            count = chunk["meta_info"]["completion_tokens"]
+            if count and state[0] is None:
+                state[0], state[1] = now, count
+            state[2], state[3] = now, chunk
+        requests = [summarize(start, *state) for state in states]
+    else:
+        requests = await asyncio.gather(*(request(ids) for ids in prompts))
     duration = time.perf_counter() - start
     return {
         "input_sha256": hashlib.sha256(json.dumps(prompts).encode()).hexdigest(),
@@ -100,8 +120,15 @@ def main():
     parser.add_argument("--output-length", type=int, default=128)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--batch-submit",
+        action="store_true",
+        help="Submit each wave together using SGLang's colocated batch guard",
+    )
     args = parser.parse_args()
     assert args.output_length > 1 and args.warmups >= 1 and args.repeats >= 3
+    if args.batch_submit:
+        os.environ["SGLANG_ENABLE_COLOCATED_BATCH_GEN"] = "1"
 
     from transformers import AutoTokenizer
 
@@ -149,7 +176,7 @@ def main():
             for iteration in range(args.warmups):
                 prompts = prompts_for(length, concurrency, iteration)
                 engine.loop.run_until_complete(
-                    wave(engine, prompts, args.output_length)
+                    wave(engine, prompts, args.output_length, args.batch_submit)
                 )
             before = memory_snapshot()
             samples = [
@@ -158,6 +185,7 @@ def main():
                         engine,
                         prompts_for(length, concurrency, args.warmups + iteration),
                         args.output_length,
+                        args.batch_submit,
                     )
                 )
                 for iteration in range(args.repeats)

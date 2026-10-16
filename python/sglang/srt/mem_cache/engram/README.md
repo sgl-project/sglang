@@ -87,6 +87,10 @@ deterministic synthetic text-token IDs; paired backends receive identical
 inputs, recorded with hashes. Output includes each request's TTFT, TPOT, latency
 and generated IDs, wave throughput, GPU memory and process-tree host PSS.
 Use wave-level statistics and inspect variability before claiming equivalence.
+Independent concurrent calls can reach the scheduler in different prefill
+batches. To control this arrival effect, repeat both backends with
+`--batch-submit`: it uses the batch Engine API and SGLang's existing colocated
+batch guard. Keep this diagnostic separate from independent-request results.
 
 Native placement is model-dependent: Qwen can use pinned host tables, DeepSeek
 can use shared or TP-sharded host tables, while Gemma and LongCat use GPU tables.
