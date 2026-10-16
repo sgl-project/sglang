@@ -427,6 +427,12 @@ class HiCacheController:
             )
         return groups
 
+    def _storage_read_barrier(self, go: bool) -> bool:
+        backend = self.storage_backend
+        if not getattr(backend, "shard_collective", False):
+            return go
+        return backend.read_barrier(go)
+
     def _destroy_sync_groups(
         self, groups: List[torch.distributed.ProcessGroup]
     ) -> None:
@@ -567,6 +573,7 @@ class HiCacheController:
             self.storage_config.is_mla_model
             # todo: load balancing
             and self.storage_config.tp_rank != 0
+            and storage_backend != "radixshmem"
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -615,6 +622,7 @@ class HiCacheController:
                     "mori",
                     "tensorcast",
                     "seaweedfs",
+                    "radixshmem",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -1108,6 +1116,7 @@ class HiCacheController:
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
+            all_success = self._storage_read_barrier(all_success)
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
