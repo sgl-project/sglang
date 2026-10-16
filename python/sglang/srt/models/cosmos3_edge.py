@@ -407,6 +407,17 @@ class Cosmos3EdgeForConditionalGeneration(ArceeForCausalLM):
                     for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                     if forward_batch.mm_inputs[i] is not None
                 ]
+                rids = (
+                    None
+                    if forward_batch.rids is None
+                    else [
+                        rid
+                        for rid, mm_input in zip(
+                            forward_batch.rids, forward_batch.mm_inputs
+                        )
+                        if mm_input is not None
+                    ]
+                )
                 input_embeds, _ = embed_mm_inputs(
                     mm_inputs_list=mm_inputs_list,
                     extend_prefix_lens=extend_prefix_lens,
@@ -414,6 +425,7 @@ class Cosmos3EdgeForConditionalGeneration(ArceeForCausalLM):
                     input_ids=input_ids,
                     input_embedding=self.get_input_embeddings(),
                     multimodal_model=self,
+                    rids=rids,
                 )
 
                 for mm_input in mm_inputs_list:

@@ -5597,9 +5597,10 @@ class Scheduler(
             aborted_dllm_reqs = self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             )
-            if aborted_dllm_reqs:
-                # An aborted context may leave kept encoder rows that nobody reads.
-                mm_schedule.release_prefill_rows()
+            # Other dLLM contexts stay part-way prefilled, so keep their rows.
+            mm_schedule.release_prefill_rows(
+                rids=[req.rid for req in aborted_dllm_reqs]
+            )
             for req in aborted_dllm_reqs:
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(

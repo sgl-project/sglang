@@ -149,6 +149,7 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
                     1,
                     torch.tensor([1]),
                     torch.device("cpu"),
+                    owner="req",
                 )
             elif path == "per_image":
                 [embedding] = mm_schedule._get_chunked_embedding_by_item(
@@ -157,9 +158,17 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
                     0,
                     1,
                     torch.device("cpu"),
+                    owner="req",
                 )
             else:
-                request = mm_schedule.PerImageRequestInfo(0, [item], [(0, 0)], 0, 1)
+                request = mm_schedule.PerImageRequestInfo(
+                    0,
+                    [item],
+                    [(0, 0)],
+                    0,
+                    1,
+                    owner="req",
+                )
                 embeddings = mm_schedule._batch_encode_per_image_misses(
                     encode,
                     [request],
@@ -398,7 +407,9 @@ def test_session_abort_preserves_shared_multimodal_features():
 def kept_rows():
     """One kept entry of mm_schedule, as left by the chunk before."""
     mm_schedule.release_prefill_rows()
-    mm_schedule._prefill_rows[("item", ((0, 9),))] = object()
+    mm_schedule._prefill_rows[("req", "item", Modality.VIDEO, (7,), ((0, 9),))] = (
+        object()
+    )
     yield mm_schedule._prefill_rows
     mm_schedule.release_prefill_rows()
 
@@ -568,20 +579,24 @@ def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progr
     assert manager.any_context_in_progress() is in_progress
 
 
-def test_dllm_abort_drops_kept_rows(published_server_args, kept_rows):
+def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows):
     # Another dLLM context can stay part-way for many steps, so the table is not
     # cleared by the scheduling check; the aborted context's rows have no reader.
     req = Req("dllm-video", "", [1], SamplingParams())
+    survivor = Req("dllm-other", "", [1], SamplingParams())
     scheduler = _queued_scheduler(req)
     scheduler.waiting_queue = []
     scheduler.dllm_config = object()
     scheduler.dllm_manager = DllmManager(dllm_config=None)
-    scheduler.dllm_manager.staging_queue.append(req)
+    scheduler.dllm_manager.staging_queue.extend([req, survivor])
+    kept_rows.clear()
+    kept_rows[(req.rid, "item")] = object()
+    kept_rows[(survivor.rid, "item")] = object()
 
     scheduler.abort_request(AbortReq(rid=req.rid))
 
-    assert not scheduler.dllm_manager.staging_queue
-    assert not kept_rows
+    assert scheduler.dllm_manager.staging_queue == [survivor]
+    assert list(kept_rows) == [(survivor.rid, "item")]
 
 
 if __name__ == "__main__":

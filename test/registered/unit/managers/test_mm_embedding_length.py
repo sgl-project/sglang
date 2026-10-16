@@ -74,6 +74,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
             prefix_length=[0],
             extend_length=[8],
             items_offset_list=[[(2, 4)]],
+            rids=None,
         )
 
     mask.sum.assert_not_called()
@@ -101,6 +102,7 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
             prefix_length=[0],
             extend_length=[8],
             items_offset_list=[[(2, 4)]],
+            rids=None,
         )
 
     assert_async.assert_called_once()
@@ -153,6 +155,7 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
             prefix_length=[0],
             extend_length=[8],
             items_offset_list=[[(2, 4)]],
+            rids=None,
         )
 
     mask.sum.assert_called_once_with()

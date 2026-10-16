@@ -109,7 +109,12 @@ def _run_by_item_chunks(encoder):
     return [
         torch.cat(
             mm_schedule._get_chunked_embedding_by_item(
-                encoder, items, prefix_len, extend_len, _CPU
+                encoder,
+                items,
+                prefix_len,
+                extend_len,
+                _CPU,
+                owner="req",
             ),
             dim=0,
         )
@@ -124,7 +129,14 @@ def _run_full_chunks(encoder):
     outs = []
     for prefix_len, extend_len in CHUNKS:
         chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder, items, ITEM_OFFSETS, prefix_len, extend_len, input_ids, _CPU
+            encoder,
+            items,
+            ITEM_OFFSETS,
+            prefix_len,
+            extend_len,
+            input_ids,
+            _CPU,
+            owner="req",
         )
         outs.append(chunk)
     return outs
@@ -162,7 +174,14 @@ def test_full_matches_by_item():
 def test_list_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
-    mm_schedule._get_chunked_embedding_by_item(_encoder_list, items, 0, TOTAL_LEN, _CPU)
+    mm_schedule._get_chunked_embedding_by_item(
+        _encoder_list,
+        items,
+        0,
+        TOTAL_LEN,
+        _CPU,
+        owner="req",
+    )
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
         own_bytes = emb.numel() * emb.element_size()
@@ -175,7 +194,12 @@ def test_tensor_cache_entries_own_storage(per_request):
     items = _make_items()
     if per_request:
         chunks = mm_schedule._get_chunked_embedding_by_item(
-            _encoder_tensor, items, 0, TOTAL_LEN, _CPU
+            _encoder_tensor,
+            items,
+            0,
+            TOTAL_LEN,
+            _CPU,
+            owner="req",
         )
     else:
         request = mm_schedule.PerImageRequestInfo(
@@ -184,12 +208,13 @@ def test_tensor_cache_entries_own_storage(per_request):
             items_offset=ITEM_OFFSETS,
             extend_prefix_len=0,
             extend_seq_len=TOTAL_LEN,
+            owner="req",
         )
         embeddings = mm_schedule._batch_encode_per_image_misses(
             _encoder_tensor, [request], _CPU
         )
         chunks = mm_schedule._assemble_per_image_chunk(
-            request.overlapping, embeddings, 0, TOTAL_LEN
+            req_info=request, hash_to_embedding=embeddings
         )
     for item, chunk in zip(items, chunks):
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
@@ -213,6 +238,7 @@ def test_tensor_encoder_chunks_survive_cache_pressure(
         [TOTAL_LEN],
         [ITEM_OFFSETS],
         torch.zeros(TOTAL_LEN, dtype=torch.long),
+        rids=["req"],
     )
     assert torch.equal(chunk, _encoder_tensor(items))
     assert mm_schedule.embedding_cache.current_size <= cache_bytes
@@ -252,7 +278,12 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
     encoder = Mock(side_effect=_encoder_list)
 
     chunks = mm_schedule._get_chunked_embedding_by_item(
-        encoder, items, 0, TOTAL_LEN, _CPU
+        encoder,
+        items,
+        0,
+        TOTAL_LEN,
+        _CPU,
+        owner="req",
     )
 
     assert sum(chunk.shape[0] for chunk in chunks) == sum(
@@ -278,6 +309,7 @@ def test_batched_mismatched_cache_entry_is_reencoded():
         items_offset=ITEM_OFFSETS,
         extend_prefix_len=0,
         extend_seq_len=TOTAL_LEN,
+        owner="req",
     )
     encoder = Mock(side_effect=_encoder_list)
 
@@ -307,6 +339,7 @@ def test_full_deferred_ipc_item_is_marked_for_borrow():
         items_offset=[ITEM_OFFSETS[0]],
         extend_prefix_len=0,
         extend_seq_len=TOTAL_LEN,
+        owner="req",
     )
 
     mm_schedule._batch_encode_per_image_misses(_encoder_list, [request], _CPU)
@@ -326,6 +359,7 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
             items_offset=ITEM_OFFSETS[:2],
             extend_prefix_len=0,
             extend_seq_len=TOTAL_LEN,
+            owner="req",
         )
     ]
     encoder = Mock(side_effect=_encoder_list)
@@ -354,7 +388,14 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
 
     with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
         chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+            encoder,
+            items,
+            ITEM_OFFSETS,
+            0,
+            TOTAL_LEN,
+            input_ids,
+            _CPU,
+            owner="req",
         )
 
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
@@ -394,6 +435,7 @@ def test_multi_offset_audio_item_is_chunked_and_cached_per_item(
             [extend_len],
             [[offset for item in items for offset in item.offsets]],
             input_ids,
+            rids=["req"],
         )
         return chunk
 
@@ -457,6 +499,7 @@ def test_cached_audio_items_concatenate_once_in_request_order(
         [[offset for item_offsets in offsets_per_item for offset in item_offsets]]
         * num_requests,
         input_ids,
+        rids=[f"req{i}" for i in range(num_requests)],
     )
 
     assert torch.equal(chunk, expected)
@@ -537,7 +580,7 @@ def _video_encoder():
     )
 
 
-def _prefill_chunk(encoder, item, prefix_len, extend_len):
+def _prefill_chunk(encoder, item, prefix_len, extend_len, rid="req"):
     chunk, _ = mm_schedule._get_chunked_prefill_embedding(
         encoder,
         [item],
@@ -546,6 +589,7 @@ def _prefill_chunk(encoder, item, prefix_len, extend_len):
         [extend_len],
         [item.offsets],
         torch.zeros(VIDEO_LEN, dtype=torch.long),
+        rids=[rid],
     )
     return chunk
 
@@ -595,6 +639,7 @@ def _prefill_pruned(encoder, item, prefix_len, extend_len):
         extend_len,
         torch.tensor(PRUNED_PROMPT[prefix_len : prefix_len + extend_len]),
         _CPU,
+        owner="req",
     )
 
 
@@ -735,7 +780,8 @@ def test_request_that_starts_over_is_encoded_again():
 
 
 def test_item_shared_by_two_requests_in_one_batch():
-    # Session requests share item objects and may read the same kept rows.
+    # Session requests share item objects, but only the request that kept the
+    # rows reads them; the other encodes the item for itself.
     mm_schedule.init_mm_embedding_cache(0)
     item = _run_item()
     encoder = _video_encoder()
@@ -749,11 +795,12 @@ def test_item_shared_by_two_requests_in_one_batch():
         [VIDEO_LEN - 9, VIDEO_LEN - 9],
         [item.offsets, item.offsets],
         torch.zeros(1, dtype=torch.long),
+        rids=["req", "other"],
     )
 
     unread = _video_embedding(item)[6:]
     assert torch.equal(chunk, torch.cat([unread, unread]))
-    encoder.assert_called_once()
+    assert encoder.call_count == 2
     assert not mm_schedule._prefill_rows
 
 
@@ -780,6 +827,7 @@ def test_finished_request_keeps_the_continuing_rows(monkeypatch, path):
         [VIDEO_CHUNKS[1][1], VIDEO_LEN],
         [continuing.offsets, finished.offsets],
         torch.zeros(1, dtype=torch.long),
+        rids=["req", "other"],
     )
     last = _prefill_chunk(encode, continuing, *VIDEO_CHUNKS[2])
 
@@ -808,6 +856,7 @@ def test_same_image_twice_in_a_request_reads_its_own_rows(monkeypatch, per_reque
             [extend_len],
             [first.offsets + second.offsets],
             torch.zeros(1, dtype=torch.long),
+            rids=["req"],
         )
         chunks.append(chunk)
         if prefix_len == 0:
@@ -821,32 +870,30 @@ def test_same_image_twice_in_a_request_reads_its_own_rows(monkeypatch, per_reque
     assert not mm_schedule._prefill_rows
 
 
-def test_kept_rows_are_not_served_to_a_request_with_another_layout():
-    # The same clip at other positions must not read the first request's rows.
+@pytest.mark.parametrize("path", PATHS)
+def test_kept_rows_are_not_served_to_another_request(monkeypatch, path):
+    # B has A's item at A's positions but is further along, e.g. after a longer
+    # prefix hit: it must neither read A's rows nor drop them when it finishes.
     mm_schedule.init_mm_embedding_cache(0)
-    item = _video_item()
-    shifted = [(start + 3, end + 3) for start, end in VIDEO_RUNS]
-    encoder = _video_encoder()
-    expected = _video_embedding(item)
+    continuing, other = _path_item(monkeypatch, path), _path_item(monkeypatch, path)
+    passes = []
 
-    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
-    other, _ = mm_schedule._get_chunked_prefill_embedding(
-        encoder,
-        [item],
-        [0, 1],
-        [9],
-        [VIDEO_LEN + 3 - 9],
-        [shifted],
-        torch.zeros(1, dtype=torch.long),
-    )
+    def encode(items):
+        # Each encoder call adds its own offset, so rows show which call made them.
+        rows = torch.cat([_video_embedding(item) for item in items])
+        passes.append(rows + len(passes))
+        return passes[-1]
+
+    chunks = [_prefill_chunk(encode, continuing, *VIDEO_CHUNKS[0])]
+    _prefill_chunk(encode, other, 12, VIDEO_LEN - 12, rid="other")
     chunks += [
-        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        _prefill_chunk(encode, continuing, prefix_len, extend_len)
         for prefix_len, extend_len in VIDEO_CHUNKS[1:]
     ]
 
-    assert encoder.call_count == 2
-    assert torch.equal(other, expected[4:])
-    assert torch.equal(torch.cat(chunks), expected)
+    assert len(passes) == 2
+    assert torch.equal(torch.cat(chunks), passes[0])
+    assert not mm_schedule._prefill_rows
 
 
 def test_several_multi_run_items_are_encoded_once_per_request():
@@ -874,6 +921,7 @@ def test_several_multi_run_items_are_encoded_once_per_request():
             [11],
             [offsets],
             torch.zeros(1, dtype=torch.long),
+            rids=["req"],
         )
         chunks.append(chunk)
         assert len(mm_schedule._prefill_rows) == (prefix_len < 33)
@@ -932,6 +980,7 @@ def test_keeping_rows_leaves_the_cache_order_alone():
         [9],
         [[(2, 3), (6, 7), (10, 11)]],
         torch.zeros(1, dtype=torch.long),
+        rids=["req"],
     )
 
     cache = mm_schedule.embedding_cache

@@ -416,6 +416,8 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    *,
+    rids: Optional[List[str]],
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -497,6 +499,7 @@ def embed_mm_inputs(
                 prefix_length=extend_prefix_lens,
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
+                rids=rids,
             )
 
             if use_deepstack.get(modality, None) and embedding is not None:
@@ -561,6 +564,8 @@ def _embed_mm_inputs_with_split(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    *,
+    rids: Optional[List[str]],
 ):
     """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
     precomputed_req_indices = []
@@ -588,6 +593,7 @@ def _embed_mm_inputs_with_split(
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
+            rids=rids,
             **embed_kwargs,
         )
 
@@ -632,6 +638,7 @@ def _embed_mm_inputs_with_split(
             extend_prefix_lens=sub_prefix_lens,
             extend_seq_lens=sub_seq_lens,
             input_ids=sub_input_ids,
+            rids=None if rids is None else [rids[i] for i in group_req_indices],
             **embed_kwargs,
         )
 
@@ -709,6 +716,17 @@ def prepare_mm_inputs(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
+            rids = (
+                None
+                if forward_batch.rids is None
+                else [
+                    rid
+                    for rid, mm_input in zip(
+                        forward_batch.rids, forward_batch.mm_inputs
+                    )
+                    if mm_input is not None
+                ]
+            )
             server_args = get_server_args()
             # Makes VLM profiles directly attributable: this range includes
             # encoder/ViT execution and multimodal feature placement, while
@@ -727,6 +745,7 @@ def prepare_mm_inputs(
                         data_embedding_func_mapping=data_embedding_funcs,
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
+                        rids=rids,
                     )
                 else:
                     input_embeds, other_info = embed_mm_inputs(
@@ -739,6 +758,7 @@ def prepare_mm_inputs(
                         data_embedding_func_mapping=data_embedding_funcs,
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
+                        rids=rids,
                     )
 
             # add for qwen3_vl deepstack

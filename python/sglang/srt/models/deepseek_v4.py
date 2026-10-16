@@ -4474,6 +4474,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             input_ids=input_ids.clone(),
             input_embedding=self.get_input_embeddings(),
             multimodal_model=self,
+            rids=forward_batch.rids,
         )
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
