@@ -1,0 +1,134 @@
+// Shared carriers for the native SGLang API. The ground truth for the JSON
+// shapes is the sglang.json.v1 options on each field; the protobuf shapes are
+// the explicit oneofs/messages themselves.
+
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/json/v1/options.proto";
+
+// A token-id sequence. int64 matches the servers' token id width (Rust
+// `TokenIds = Vec<i64>`, Python `array("q")`).
+message TokenIds {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated int64 ids = 1;
+}
+
+// Scalar-or-list carriers: `/generate` accepts every per-request field as one
+// value (single request) or a list (batch). JSON flattens via the one_or_many
+// option; gRPC clients pick the variant explicitly.
+message StringOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    string one = 1;
+    StringList many = 2;
+  }
+}
+
+message StringList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated string items = 1;
+}
+
+// A flat string list for one request, or one list per batch entry. JSON:
+// `["a", "b"]` is `one`; `[["a"], ["b", "c"]]` is `many` (first element
+// decides, `[]` is an empty `one`).
+message StringListOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    StringList one = 1;
+    StringListList many = 2;
+  }
+}
+
+message StringListList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated StringList items = 1;
+}
+
+message BoolOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    bool one = 1;
+    BoolList many = 2;
+  }
+}
+
+message BoolList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated bool items = 1;
+}
+
+message Int64OrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    int64 one = 1;
+    Int64List many = 2;
+  }
+}
+
+message Int64List {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated int64 items = 1;
+}
+
+message TokenIdsOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    TokenIds one = 1;
+    TokenIdsList many = 2;
+  }
+}
+
+message TokenIdsList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated TokenIds items = 1;
+}
+
+// List variants whose ELEMENTS may be JSON null (PD bootstrap columns: a
+// batch mixes bootstrapped and plain requests). Proto carries element
+// presence as a per-element oneof-free wrapper.
+message OptionalString {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional string value = 1;
+}
+
+message OptionalStringOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    OptionalString one = 1;
+    OptionalStringList many = 2;
+  }
+}
+
+message OptionalStringList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OptionalString items = 1;
+}
+
+message OptionalInt64 {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional int64 value = 1;
+}
+
+message OptionalInt64OrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    OptionalInt64 one = 1;
+    OptionalInt64List many = 2;
+  }
+}
+
+message OptionalInt64List {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OptionalInt64 items = 1;
+}
+
+// The native error body: `{"error": {"message", "code"}}` (Python
+// `http_server.generate_request` parity). Transports frame it themselves
+// (unary status + body, SSE error frame, gRPC status detail).
+message ErrorBody {
+  string message = 1;
+  uint32 code = 2;
+}

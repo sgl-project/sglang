@@ -1,21 +1,36 @@
 """Unit tests for host-pool allocation and free-list bookkeeping."""
 
+import contextlib
 import threading
 import unittest
 import unittest.mock
 from functools import partial
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MambaPool,
+    MHATokenToKOnlyPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,6 +62,122 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             allocator_type="default",
         )
+
+    def test_packed_transfers_use_captured_target_and_draft_buffers(self):
+        """Target and draft rows retain their bound destinations during transfer."""
+
+        def copy_rows(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+            for src, dst in zip(src_layers, dst_layers, strict=True):
+                dst[dst_indices] = src[src_indices]
+
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                pool_type = MLATokenToKVPool if mla else MHATokenToKVPool
+                host_type = MLATokenToKVPoolHost if mla else MHATokenToKVPoolHost
+                geometry = (
+                    dict(kv_lora_rank=2, qk_rope_head_dim=2)
+                    if mla
+                    else dict(head_num=1, head_dim=4)
+                )
+                pools = tuple(
+                    pool_type(
+                        size=4,
+                        page_size=2,
+                        dtype=torch.float16,
+                        layer_num=layers,
+                        device="cpu",
+                        enable_memory_saver=False,
+                        **geometry,
+                    )
+                    for layers in (2, 1, 1)
+                )
+                host = host_type(
+                    pools[0],
+                    host_to_device_ratio=2,
+                    host_size=0,
+                    page_size=2,
+                    layout="layer_first",
+                    pin_memory=False,
+                    mtp_draft_device_pools=pools[1:],
+                )
+                self.addCleanup(host.destroy)
+                names = ("kv_buffer",) if mla else ("k_buffer", "v_buffer")
+                buffers = [
+                    buffer
+                    for name in names
+                    for pool in pools
+                    for buffer in getattr(pool, name)
+                ]
+                for value, buffer in enumerate(buffers, 1):
+                    buffer.fill_(value)
+                source = torch.tensor([2, 3])
+                saved = [buffer[source].clone() for buffer in buffers]
+                destination = torch.tensor([4, 5])
+                host_indices = torch.tensor([0, 1])
+                module = "mla" if mla else "mha"
+                with unittest.mock.patch(
+                    f"sglang.srt.mem_cache.pool_host.{module}.transfer_kv_direct",
+                    side_effect=copy_rows,
+                    create=True,
+                ):
+                    with contextlib.ExitStack() as patches:
+                        for pool in pools:
+                            for name in names:
+                                patches.enter_context(
+                                    unittest.mock.patch.object(pool, name, None)
+                                )
+                        host.backup_from_device_all_layer(
+                            pools[0], host_indices, source, "direct"
+                        )
+                        for buffer in buffers:
+                            buffer.zero_()
+                        for layer in range(4):
+                            pool = pools[0] if layer < 2 else pools[layer - 1]
+                            host.load_to_device_per_layer(
+                                pool,
+                                host_indices,
+                                destination,
+                                layer,
+                                "direct",
+                                is_draft=layer >= 2,
+                            )
+                for buffer, expected in zip(buffers, saved, strict=True):
+                    torch.testing.assert_close(buffer[destination], expected)
+                    self.assertEqual(torch.count_nonzero(buffer[:4]).item(), 0)
+
+    def test_index_k_host_pool_joins_a_host_pool_group(self):
+        """Grouping a main KV pool with a K-only index pool raised AttributeError."""
+        index_pool = MHATokenToKOnlyPool(
+            size=self.page_size * 2,
+            page_size=self.page_size,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        index_host = MHATokenToKOnlyPoolHost(
+            index_pool, self.host_pool, "layer_first", pin_memory=False
+        )
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=self.host_pool,
+                    device_pool=self.device_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.INDEXER,
+                    host_pool=index_host,
+                    device_pool=index_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                ),
+            ]
+        )
+        self.assertFalse(group.can_use_write_back_jit)
 
     def test_multiple_attention_rows_per_token(self):
         for rows_per_token in (1, 3):
@@ -235,6 +366,33 @@ class TestLazyHostPoolRelease(CustomTestCase):
     def test_mamba_pool_lazy_release(self):
         self._assert_lazy_release(self._make_mamba_pool())
 
+    def test_mamba_host_preserves_empty_pp_stage(self):
+        pool = MambaPool.__new__(MambaPool)
+        pool.mamba_layer_ids = []
+        pool.mamba_cache = SimpleNamespace(
+            temporal=torch.empty((0, 5, 2, 2)),
+            conv=[torch.empty((0, 5, 3, 2))],
+        )
+        pool._slot_siblings = []
+        (info,) = pool.get_device_pool_infos()
+        info.buffer_info.validate(layer_ids=info.layer_ids)
+        host = MambaPoolHost(
+            info.buffer_info,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=4,
+            layout="page_first",
+            pin_memory=False,
+        )
+        try:
+            self.assertEqual(info.layer_ids, ())
+            self.assertEqual(host.num_mamba_layers, 0)
+            self.assertEqual(host.size_per_token, 0)
+            self.assertEqual(host.size, 9)
+            self.assertEqual(host.kv_buffer, [])
+        finally:
+            host.destroy()
+
     def test_deepseek_v4_pool_lazy_release(self):
         pool = self._make_deepseek_v4_pool()
         self._assert_lazy_release(pool)
@@ -422,6 +580,104 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertIsNone(transfers[1].host_indices)
         self.assertEqual(group.available_size(PoolName.SWA), 1)
         self.assertEqual(group.available_size(PoolName.MAMBA), 2)
+
+
+class TestDSAIndexerPoolDecl(CustomTestCase):
+    """The declaration is the single source of indexer host bytes. The mirror
+    must not re-derive them."""
+
+    def _stub(self):
+        return SimpleNamespace(
+            layer_num=5,
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            size=64 * 8,
+            start_layer=0,
+            end_layer=5,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False] * 5,
+        )
+
+    def test_host_bytes_match_observed_allocation(self):
+        # GLM-5.2 DSA, page 64, 5 layers, host 18192320 tokens: the server
+        # allocated 12006973440 bytes (12.01 GB) for the indexer mirror.
+        storage_info = make_dsa_indexer_pool_decl(self._stub()).storage_info
+        self.assertEqual(storage_info.bytes_per_token_per_layer, 132)
+        self.assertEqual(storage_info.page_bytes(64), 8448)
+        self.assertEqual(
+            storage_info.host_bytes(page_num=284256, layer_num=5, page_size=64),
+            12006973440,
+        )
+
+    def test_mirror_consumes_decl(self):
+        stub = self._stub()
+        decl = make_dsa_indexer_pool_decl(stub)
+        storage_info = decl.storage_info
+        anchor = MLATokenToKVPoolHost(
+            stub,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+        mirror = DSAIndexerPoolHost(
+            decl=decl,
+            anchor_host=anchor,
+            pin_memory=False,
+            is_dummy=True,
+        )
+        self.assertEqual(mirror.layout, anchor.layout)
+        self.assertEqual(mirror.indexer_page_stride_size, storage_info.page_bytes(64))
+        self.assertEqual(
+            mirror.get_size_per_token(), storage_info.bytes_per_token_per_layer * 5
+        )
+        self.assertEqual(
+            storage_info.host_bytes(
+                page_num=anchor.page_num, layer_num=5, page_size=64
+            ),
+            anchor.page_num * mirror.indexer_layout_dim,
+        )
+
+    def test_mirror_is_compact_over_layers_that_own_index_buffers(self):
+        """Shared-topk layers have 0-row device buffers. Mirroring or
+        transferring them dereferences a null pointer. The mirror must cover
+        only the declared layers and translate packed-draft layer ids
+        relative to that compact count."""
+        stub = self._stub()
+        stub.skip_topk_layers = [False, True, True, False, True]
+        decl = make_dsa_indexer_pool_decl(stub)
+        self.assertEqual(decl.owned_device_layers, (0, 3))
+        anchor = MLATokenToKVPoolHost(
+            stub,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+        mirror = DSAIndexerPoolHost(
+            decl=decl,
+            anchor_host=anchor,
+            pin_memory=False,
+            is_dummy=True,
+        )
+        self.assertEqual(mirror.layer_num, 2)
+        self.assertEqual(
+            mirror.get_size_per_token(), decl.storage_info.bytes_per_token_per_layer * 2
+        )
+        self.assertEqual(mirror._owned_device_layer_ids(stub), [0, 3])
+        self.assertEqual(mirror._host_layer_index(3), 1)
+        self.assertFalse(mirror._is_device_layer_owned(stub, 1))
+        # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
+        self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ class EngineScoreMixin:
         score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -56,8 +57,10 @@ class EngineScoreMixin:
 
         Setwise scoring is expressed via ``score_extraction_token_id``: pass a single
         item containing the whole candidate block with one extraction token per
-        candidate, and the head is pooled AT those positions, so ``scores`` becomes
-        the ``[N x num_labels]`` per-candidate matrix.
+        candidate, and the readout is taken AT those positions, so ``scores``
+        becomes the ``[N x num_labels]`` per-candidate matrix. SequenceClassification
+        pools the head there; CausalLM reads label-token logprobs there (batched
+        path only).
 
         Args:
             query: The query text or pre-tokenized token IDs.
@@ -69,10 +72,11 @@ class EngineScoreMixin:
             embed_override_token_id: Placeholder token ID used to locate override positions.
             query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
             item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
-            score_extraction_token_id: SequenceClassification-only. When set, pool the
-                head at every occurrence of this token per sequence instead of the last
-                token; ``scores`` becomes nested — one ``[Ni x num_labels]`` matrix per
-                item (``len(scores) == len(items)``), where ``Ni`` is the number of
+            score_extraction_token_id: When set, read the score head (SeqCls) or
+                label-token logprobs (CausalLM) at every occurrence of
+                this token per sequence instead of the last token; ``scores`` becomes
+                nested — one ``[Ni x num_labels]`` matrix per item
+                (``len(scores) == len(items)``), where ``Ni`` is the number of
                 extraction tokens (candidates) in item ``i``.
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported
@@ -81,6 +85,9 @@ class EngineScoreMixin:
                 softmax. Requires apply_softmax=True when different from 1.
             return_token_logprobs: Include uncalibrated full-vocabulary logprobs for
                 each item's candidates. Only supported for CausalLM, not raw logits.
+            stacked_query_item_embed_overrides: Alternative to query_/item_embed_overrides:
+                one already-stacked [N, hidden] tensor per output sequence, used without
+                a restack. See score_request.
 
         Returns:
             ScoreResult with scores (flat ``[num_items x num_labels]`` for pointwise
@@ -99,6 +106,7 @@ class EngineScoreMixin:
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
                 score_extraction_token_id=score_extraction_token_id,
+                stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
                 request=None,
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 temperature=temperature,
@@ -120,6 +128,7 @@ class EngineScoreMixin:
         score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
@@ -132,6 +141,7 @@ class EngineScoreMixin:
             query_embed_overrides=query_embed_overrides,
             item_embed_overrides=item_embed_overrides,
             score_extraction_token_id=score_extraction_token_id,
+            stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
             request=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
             temperature=temperature,

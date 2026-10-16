@@ -1,6 +1,7 @@
-"""Candidate block selection of the two-level indexer: the per-row block counts
-and sparse-row lengths, the block keys and the JIT block top-k, and the torch
-block ids and masks."""
+"""Candidate blocks of the two-level indexer: a source keeps whole blocks of
+``block_size`` compressed positions, its newest block always, and a consumer
+selects among them. Block counts, block keys, the block top-k (JIT / torch), and
+the torch top-k among chosen blocks."""
 
 from typing import Optional, Union
 
@@ -79,8 +80,8 @@ def candidate_row_lens(
 
 
 @cache_once
-def _jit_block_amax_module():
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_block_amax_module(in_dtype: torch.dtype, out_dtype: torch.dtype):
+    args = make_cpp_args(is_arch_support_pdl(), in_dtype, out_dtype)
     return load_jit(
         make_name("block_amax"),
         *args,
@@ -104,15 +105,17 @@ def amax8_varlen(
     selected anyway); ``topk=0`` never skips. ``out`` is allocated as
     ``[rows, ceil(max_seqlen / 8)]`` when not given, ``max_seqlen`` defaulting to
     the width of ``scores``; every ``seq_lens[b]`` must fit in ``8 * out.shape[1]``.
-    fp32 only for now; ``scores`` rows must be 32-byte aligned (stride a multiple
-    of 8). Returns ``out``.
+    ``scores`` and ``out`` are each fp32 or bf16 (``out`` defaults to fp32), the
+    rows of ``scores`` aligned to a block of 8 (stride a multiple of 8). Returns
+    ``out``.
     """
     if out is None:
         num_tokens, max_len = scores.shape
         if max_seqlen == 0:
             max_seqlen = max_len
-        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
-    _jit_block_amax_module().amax8_varlen(scores, seq_lens, out, topk)
+        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8, dtype=torch.float32)
+    module = _jit_block_amax_module(scores.dtype, out.dtype)
+    module.amax8_varlen(scores, seq_lens, out, topk)
     return out
 
 
@@ -135,67 +138,19 @@ def amax_topk_blocks(
     plan = plan_topk_v2(nblocks)
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
     # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
-    keys = logits.new_empty(rows, -(-max_seq_len // (4 * block)) * 4)
+    keys = logits.new_empty(
+        rows, -(-max_seq_len // (4 * block)) * 4, dtype=torch.float32
+    )
     amax8_varlen(logits, seq_lens, out=keys)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
     topk_transform_paged_v2(keys, nblocks, None, blocks, 1, plan)
     return blocks
 
 
-def mask_topk_scores(
-    scores: torch.Tensor,
-    indices: torch.Tensor,
-    offsets: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Keep masked indexer scores out of attention even when top-k underfills."""
-    columns = indices.to(torch.int64)
-    if offsets is not None:
-        columns = columns - offsets[:, None]
-    selected_scores = scores.gather(1, columns.clamp(0, scores.shape[1] - 1))
-    valid = (
-        (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
-    )
-    return indices.masked_fill(~valid, -1)
-
-
-def _candidate_block_topk(
-    logits: torch.Tensor,
-    compress_lens: Union[torch.Tensor, int],
-    topk_blocks: int,
-    block_size: int,
-) -> torch.return_types.topk:
-    width = logits.size(-1)
-    padding = -width % block_size
-    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
-    num_blocks = scores.size(-1)
-
-    last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
-    )
-
-    return scores.topk(min(topk_blocks, num_blocks), dim=-1)
-
-
-def select_candidate_block_ids(
-    logits: torch.Tensor,
-    compress_lens: Union[torch.Tensor, int],
-    topk_blocks: int,
-    block_size: int,
-) -> torch.Tensor:
-    top = _candidate_block_topk(
-        logits=logits,
-        compress_lens=compress_lens,
-        topk_blocks=topk_blocks,
-        block_size=block_size,
-    )
-    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
-
-
 def candidate_block_mask(
     blocks: torch.Tensor, width: int, block_size: int
 ) -> torch.Tensor:
+    """Materialize a source's block IDs once for Hopper paged-score consumers."""
     num_blocks = (width + block_size - 1) // block_size
     keep = torch.zeros(
         (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
@@ -204,21 +159,64 @@ def candidate_block_mask(
     return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
-def select_candidate_blocks(
+def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    top = _candidate_block_topk(
-        logits=logits,
-        compress_lens=compress_lens,
-        topk_blocks=topk_blocks,
-        block_size=block_size,
+    """Per row the ids of the ``topk_blocks`` blocks with the largest score, the
+    block of position ``compress_lens - 1`` always kept: int32
+    ``[rows, min(topk_blocks, blocks)]``, unordered, ``-1`` past the finite blocks.
+    ``logits`` must be ``-inf`` past each row's causal length."""
+    width = logits.size(-1)
+    padding = -width % block_size
+    scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
     )
-    width = logits.shape[-1]
-    num_blocks = (width + block_size - 1) // block_size
-    keep = torch.zeros(
-        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
-    ).scatter_(-1, top.indices, top.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+def topk_among_blocks(
+    scores: torch.Tensor,
+    lens: torch.Tensor,
+    blocks: torch.Tensor,
+    k: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Top-``k`` of each row of ``scores`` ``[rows, width]`` within its ``blocks``
+    ``[rows, n]`` (``-1`` padded) and its causal ``lens``: int64 ``[rows, k]``
+    positions, unordered, ``-1`` where fewer than ``k`` candidates are finite."""
+    rows, width = scores.shape
+    n = blocks.shape[1]
+    if width == 0 or n == 0:
+        return torch.full((rows, k), -1, dtype=torch.int64, device=scores.device)
+    if width % block_size:
+        # the DeepGEMM callers slice their tile block-aligned, so this is a no-op there
+        scores = F.pad(scores, (0, -width % block_size), value=-torch.inf)
+    num_blocks = scores.shape[1] // block_size
+    by_block = scores.unflatten(1, (num_blocks, block_size))
+    blocks64 = blocks.to(torch.int64)
+    ids = blocks64.clamp(0, num_blocks - 1)
+    # [rows, n, block_size], the only scratch of the row count's size
+    candidates = by_block.gather(1, ids[:, :, None].expand(rows, n, block_size))
+    # column j of block b is position b * block_size + j, kept if j < lens - b * block_size
+    offsets = torch.arange(block_size, device=scores.device, dtype=lens.dtype)
+    room = lens[:, None] - blocks64 * block_size
+    drop = (offsets[None, None, :] >= room[:, :, None]) | (blocks64 < 0)[:, :, None]
+    candidates.masked_fill_(drop, -torch.inf)
+    flat = candidates.flatten(1)
+    top = flat.topk(min(k, flat.shape[1]), dim=-1, sorted=False)
+    block_of_pick = top.indices // block_size
+    picked = blocks64.gather(1, block_of_pick) * block_size + (
+        top.indices - block_of_pick * block_size
+    )
+    picked = picked.masked_fill(top.values == -torch.inf, -1)
+    if picked.shape[1] < k:
+        picked = F.pad(picked, (0, k - picked.shape[1]), value=-1)
+    return picked

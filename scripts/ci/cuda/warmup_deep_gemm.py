@@ -43,21 +43,19 @@ FALLBACK_TIMEOUT_SEC = 600
 # cache key includes per-rank N/K (depends on tp/dp/ep) — must match each
 # model's `other_args` in test/registered/ or warmed shapes won't be hit.
 FALLBACK_ARGS: Dict[str, List[str]] = {
-    "deepseek-ai/DeepSeek-V3.2": ["--dp", "8", "--enable-dp-attention"],
-    "zai-org/GLM-5-FP8": ["--dp", "8", "--enable-dp-attention"],
+    "deepseek-ai/DeepSeek-V3.2": ["--attn-dp-size", "8"],
+    "zai-org/GLM-5-FP8": ["--attn-dp-size", "8"],
     "XiaomiMiMo/MiMo-V2-Flash": [
-        "--dp",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--attention-backend",
         "fa3",
     ],
     # --mm-enable-dp-encoder is required: without it DP0 runs the vision
     # encoder alone and DP1 deadlocks at the next collective.
     "XiaomiMiMo/MiMo-V2.5": [
-        "--dp",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--mm-enable-dp-encoder",
         "--attention-backend",
         "fa3",

@@ -27,7 +27,6 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
             "--json-model-override-args",

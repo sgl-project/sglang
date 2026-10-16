@@ -12,6 +12,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import 
     make_dsa_dense_fallback_cases,
     make_dsa_sparse_cases,
     run_dsa_attention_case,
+    run_dsa_mtp_seed_handoff_case,
     run_dsa_sparse_attention_case,
     run_dsa_sparse_cuda_graph_decode_impl_variant_case,
     run_dsa_sparse_decode_impl_variant_case,
@@ -394,6 +395,44 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 run_dsa_sparse_cuda_graph_decode_impl_variant_case(
                     self, self.CUDA_GRAPH_DECODE_CASES[0], impl
                 )
+
+    # MTP seed handoff with fused top-k + fp8 KV + `flashmla_sparse_q8`: the
+    # draft prefill's RAGGED top-k must reach the first draft decode as
+    # physical slots. Short prefills export through dense MHA, longer ones
+    # through the sparse-MLA `publish()` path; both must convert.
+    MTP_SEED_HANDOFF_CASES = (
+        (
+            DSAAttentionCase(
+                name="dsa_mtp_seed_handoff_mha",
+                backend="dsa",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=1,
+                page_size=DSA_PAGE_SIZE,
+                prefix_lens=(512, 256),
+                extend_lens=(3, 2),
+            ),
+            "mha",
+        ),
+        (
+            DSAAttentionCase(
+                name="dsa_mtp_seed_handoff_sparse_mla",
+                backend="dsa",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=1,
+                page_size=DSA_PAGE_SIZE,
+                prefix_lens=(2048, 1024),
+                extend_lens=(3, 2),
+            ),
+            "sparse_mla",
+        ),
+    )
+
+    def test_mtp_seed_handoff_cases(self):
+        for case, seed_path in self.MTP_SEED_HANDOFF_CASES:
+            with self.subTest(case=case.name, seed_path=seed_path):
+                run_dsa_mtp_seed_handoff_case(self, case, seed_path=seed_path)
 
 
 if __name__ == "__main__":

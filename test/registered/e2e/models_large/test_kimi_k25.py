@@ -31,8 +31,7 @@ class TestKimiK25(unittest.TestCase):
         ]
 
         dp_attn_args = [
-            "--dp=8",
-            "--enable-dp-attention",
+            "--attn-dp-size=8",
         ]
 
         variants = [
