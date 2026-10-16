@@ -135,6 +135,15 @@ pub struct ServerArgs {
     /// Start accepting health checks immediately instead of waiting for the
     /// main process's startup warmup request to finish.
     pub skip_server_warmup: bool,
+    /// Extra headers on a successful `/health_generate` response, for a router
+    /// that reads deployment metadata off the deep health probe.
+    pub health_generate_headers: BTreeMap<String, String>,
+    /// Priority given to a generation request that sets none; `None` unless
+    /// priority scheduling is on (Python `_set_default_priority`).
+    pub default_priority_value: Option<i64>,
+    /// Apply the router's `x-override-*` headers to `/generate` bodies
+    /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
+    pub enable_request_header_overrides: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -191,6 +200,9 @@ impl ServerArgs {
         detokenizer_worker_num,
         skip_tokenizer_init,
         skip_server_warmup,
+        health_generate_headers,
+        default_priority_value,
+        enable_request_header_overrides,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -225,6 +237,9 @@ impl ServerArgs {
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
+        health_generate_headers: BTreeMap<String, String>,
+        default_priority_value: Option<i64>,
+        enable_request_header_overrides: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -257,6 +272,9 @@ impl ServerArgs {
             detokenizer_worker_num,
             skip_tokenizer_init,
             skip_server_warmup,
+            health_generate_headers,
+            default_priority_value,
+            enable_request_header_overrides,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -297,6 +315,9 @@ impl Default for ServerArgs {
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
             skip_server_warmup: false,
+            health_generate_headers: BTreeMap::new(),
+            default_priority_value: None,
+            enable_request_header_overrides: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
@@ -591,6 +612,15 @@ impl ServerArgs {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
         }
+        for (name, value) in &self.health_generate_headers {
+            if http::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || http::HeaderValue::from_str(value).is_err()
+            {
+                return Err(format!(
+                    "invalid 'health_generate_headers' entry {name:?}: {value:?}"
+                ));
+            }
+        }
         if let Some(grpc_port) = self.grpc_port {
             if grpc_port == 0 {
                 return Err("'grpc_port' must be between 1 and 65535".into());
@@ -704,13 +734,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_requires_served_model_name() {
+    fn validate_requires_served_model_name_and_valid_health_headers() {
         assert!(ServerArgs::default().validate().is_err());
         let sa = ServerArgs {
             served_model_name: "m".into(),
             ..Default::default()
         };
         assert!(sa.validate().is_ok());
+        let bad = ServerArgs {
+            health_generate_headers: [("bad header".into(), "v".into())].into(),
+            ..sa
+        };
+        assert!(
+            bad.validate()
+                .unwrap_err()
+                .contains("health_generate_headers")
+        );
     }
 
     #[test]

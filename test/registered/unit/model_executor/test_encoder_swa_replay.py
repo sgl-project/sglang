@@ -173,7 +173,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
 
     def test_tail_keeps_its_own_floor_under_fold(self):
         """A prefix hit with both flags on builds the tail metadata; each tail row
-        is floored at its tail start or its request's replay start, whichever is
+        is floored one window back or at its request's replay start, whichever is
         later. It used to take the fold's per-row floor of all folded rows and
         fail a row-count assert."""
         fx = _Fixture()
@@ -210,6 +210,25 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         layout = metadata.core_attn_metadata.request_window_layout
         torch.testing.assert_close(layout.lengths, expected.lengths)
         torch.testing.assert_close(layout.indices, expected.indices)
+
+    def test_short_tail_floors_one_window_back(self):
+        """A final chunk shorter than a window reads the rows the previous chunk's
+        tail wrote, so its tail is floored at seq_len - SWA_WINDOW."""
+        cpu = torch.device("cpu")
+        _, _, floor = late_layer_tail_layout(
+            extend_lens_cpu=[40], seq_lens_cpu=[300], tail_len=SWA_WINDOW, device=cpu
+        )
+        torch.testing.assert_close(floor, torch.full((40,), 172, dtype=torch.int32))
+
+        # A short chunk, a full-window tail, and a short fresh request.
+        _, _, floor = late_layer_tail_layout(
+            extend_lens_cpu=[40, 200, 50],
+            seq_lens_cpu=[300, 200, 50],
+            tail_len=SWA_WINDOW,
+            device=cpu,
+        )
+        expected = torch.tensor([172] * 40 + [72] * 128 + [0] * 50, dtype=torch.int32)
+        torch.testing.assert_close(floor, expected)
 
     def test_tail_hidden_rows_map_to_scheduled_rows(self):
         """With DSpark the model returns the tail's hidden rows and their indices
