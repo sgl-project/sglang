@@ -3,3 +3,4 @@ mod info;
 mod metrics;
 mod native_api;
 mod openai;
+mod request_headers;
