@@ -16,7 +16,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 class TestKPoolMetadataFusion(CustomTestCase):
     def test_verify_replay_boundaries_and_request_remapping(self):
         device = "cuda"
-        bs, next_n, width, topk, pool_size = 4, 6, 16384, 2048, 4
+        bs, next_n, width, topk, kpool = 4, 6, 16384, 2048, 4
         seq = torch.tensor([1, 61, 2047, 8191], device=device, dtype=torch.int64)
         req = torch.tensor([3, 1, 6, 0], device=device, dtype=torch.int64)
         table = torch.arange(8 * width, device=device, dtype=torch.int32).view(8, width)
@@ -44,9 +44,9 @@ class TestKPoolMetadataFusion(CustomTestCase):
                 bs=bs,
                 max_seqlen_k=width,
                 dsa_index_topk=topk,
-                real_page_size=64,
+                physical_page_size=64,
                 next_n=next_n,
-                index_kpool=pool_size,
+                index_kpool=kpool,
                 **buffers,
             )
 
@@ -65,7 +65,7 @@ class TestKPoolMetadataFusion(CustomTestCase):
             expanded = (
                 seq[:, None] + torch.arange(1, next_n + 1, device=device)
             ).flatten()
-            expected = torch.minimum(expanded, topk + expanded % pool_size).int()
+            expected = torch.minimum(expanded, topk + expanded % kpool).int()
             torch.testing.assert_close(buffers["seqlens_expanded"], expanded.int())
             torch.testing.assert_close(buffers["dsa_cache_seqlens"], expected)
             torch.testing.assert_close(

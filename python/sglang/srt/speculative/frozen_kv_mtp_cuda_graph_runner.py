@@ -302,7 +302,6 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
-            out_cache_loc_is_physical=True,
             batch_size=expanded_bs,
             input_ids=None,
             req_pool_indices=req_pool_indices,
@@ -321,6 +320,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         def run_once():
             # Record the metadata rebuild against the committed target-prefix

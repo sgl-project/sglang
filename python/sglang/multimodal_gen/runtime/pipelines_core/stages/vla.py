@@ -138,10 +138,6 @@ class VLAObservationPreprocessStage(PipelineStage):
         super().__init__()
         self.preprocessor = preprocessor
 
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.ENCODER
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         start = time.perf_counter()
         state = vla_state(batch)
@@ -162,10 +158,6 @@ class VLAPrefixEncodingStage(PipelineStage):
         super().__init__()
         self.policy_model = policy_model
         self.prefix_cache = prefix_cache
-
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.ENCODER
 
     def run_grouped_requests(
         self,
