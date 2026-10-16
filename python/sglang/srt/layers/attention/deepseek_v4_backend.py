@@ -15,6 +15,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -484,8 +485,7 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
-@dataclass(frozen=True)
-class DecodeGraphWidths:
+class DecodeGraphWidths(msgspec.Struct, frozen=True):
     """Capture widths an attention backend offers the decode graph runner.
 
     ``widths`` is ascending and its last entry is always the full configured
