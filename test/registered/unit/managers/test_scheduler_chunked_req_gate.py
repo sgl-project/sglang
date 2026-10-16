@@ -101,6 +101,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.parts.lists._pending_chunked_abort_req = None
     s.parts.mode_owners.disagg_decode = None
     s.parts.mode_owners.hisparse_coordinator = None
+    s.parts.batch_result_processor = MagicMock()
     s.mode.stages = init_mode_stages(s.parts, s.loop_schedules(), lora_ids_in_use=set)
     return s
 

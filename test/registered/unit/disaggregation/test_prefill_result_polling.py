@@ -174,6 +174,7 @@ for _name, _source in (
     ("batch_result_processor", "batch_result_processor"),
     ("send_kv_chunk", "send_kv_chunk"),
     ("request_retirer", "request_retirer"),
+    ("core_lists", "lists"),
 ):
     setattr(_Owner, _name, property(lambda self, n=_source: getattr(self.scheduler, n)))
 
@@ -217,6 +218,7 @@ class _Scheduler:
         Scheduler.get_next_pp_disagg_prefill_batch_to_run
     )
     _start_fpm_clock = Scheduler._start_fpm_clock
+    _begin_schedule = Scheduler._begin_schedule
     _yield_gil_if_needed = Scheduler._yield_gil_if_needed
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation

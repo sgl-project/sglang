@@ -334,6 +334,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.mode.step_launcher.run_batch = run_batch
         scheduler.process_batch_result = process_batch_result
         scheduler.parts.step_counters = SimpleNamespace(record=record_step_counters)
+        scheduler.parts.batch_result_processor = Mock()
         scheduler.mode.stages = init_mode_stages(
             scheduler.parts,
             scheduler.loop_schedules(),

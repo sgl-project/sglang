@@ -99,6 +99,7 @@ from sglang.srt.utils import is_npu
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import AbortReq
+    from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
@@ -610,6 +611,7 @@ class DisaggPrefill:
         batch_result_processor: SchedulerBatchResultProcessor,
         counters: LaunchCounters,
         request_retirer: RequestRetirer,
+        core_lists: CoreLists,
     ):
         spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -652,6 +654,8 @@ class DisaggPrefill:
         self.batch_result_processor = batch_result_processor
         self.counters = counters
         self.request_retirer = request_retirer
+        # Read at the commit: the chunked request the scheduler still chunks.
+        self.core_lists = core_lists
 
         # *2 for the headroom.
         buffer_size = max_running_requests * 2
@@ -921,17 +925,16 @@ class DisaggPrefill:
         return state == 2
 
     def commit_extend(
-        self,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-        waiting: List[Req],
-        chunked_req: Optional[Req],
+        self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> List[Req]:
         """
         Transfer kv for prefill completed requests and add it into the transfer list
         Adapted from process_batch_result_prefill
-        Returns the waiting requests: an optimistic request may yield to their front.
+        Returns the optimistic requests that yield back to the front of the
+        waiting list.
         """
+        chunked_req = self.core_lists.chunked_req
+        requeued: List[Req] = []
         logits_output, next_token_ids, auxiliary_output_starts = (
             self.batch_result_processor.host_prefill_result(batch, result)
         )
@@ -985,7 +988,7 @@ class DisaggPrefill:
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.disagg.pending_bootstrap and should_force_retry(req):
-                    waiting = self.optimistic_release_and_requeue(req, waiting)
+                    requeued = self.optimistic_release_and_requeue(req, requeued)
                     advance_logprob_pt(i, req)
                     continue
 
@@ -1095,7 +1098,7 @@ class DisaggPrefill:
                     continue
 
                 if req.disagg.pending_bootstrap and not still_chunking:
-                    waiting = self.optimistic_release_and_requeue(req, waiting)
+                    requeued = self.optimistic_release_and_requeue(req, requeued)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -1146,7 +1149,7 @@ class DisaggPrefill:
             )
 
         self.output_streamer.maybe_reply_health_check()
-        return waiting
+        return requeued
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def poll_transfer_rids(self) -> List[str]:

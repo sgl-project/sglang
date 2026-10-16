@@ -31,11 +31,17 @@ def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     s.parts.load_publisher = Mock()
     s.hub.load_inquirer = Mock()
     s.parts.mode_owners.hisparse_coordinator = None
-    s.parts.mode_owners.dllm = order.dllm if mode == "dllm" else None
-    s.parts.mode_owners.disagg_prefill = (
-        order.disagg_prefill if mode == "pd_prefill" else None
+    s.parts.lists.waiting_queue = ["waiting"]
+    order.disagg_prefill.commit_extend.return_value = ["requeued"]
+    order.dllm.commit_extend.return_value = None
+    order.processor.process_batch_result_prefill.return_value = None
+    s.mode.stages = SimpleNamespace(
+        commit_extend={
+            "normal": order.processor.process_batch_result_prefill,
+            "pd_prefill": order.disagg_prefill.commit_extend,
+            "dllm": order.dllm.commit_extend,
+        }[mode]
     )
-    order.disagg_prefill.commit_extend.return_value = ["waiting"]
     s.parts.batch_result_processor = order.processor
     s.parts.batch_result_processor.process_batch_result_decode.return_value = 7
     s.hub.metrics_reporter = order.reporter
@@ -109,8 +115,10 @@ class TestCommitReports(CustomTestCase):
                     can_run_cuda_graph=True,
                     dp_cooperation_info="dp",
                 )
-                if mode == "pd_prefill":
-                    self.assertEqual(s.parts.lists.waiting_queue, ["waiting"])
+                self.assertEqual(
+                    s.parts.lists.waiting_queue,
+                    ["requeued", "waiting"] if mode == "pd_prefill" else ["waiting"],
+                )
 
     def test_a_step_without_prefill_stats_reports_nothing(self):
         _, _, order, names = self._commit(

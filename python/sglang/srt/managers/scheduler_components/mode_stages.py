@@ -1,9 +1,9 @@
 """What the drivers run per mode, and what they hand to it.
 
 The scheduler chooses a mode's stages once (again on a PD role switch); the
-flat and the ring driver read the same set. Only `schedule` is required; an
-optional stage left None runs the core default inline, so a mode pays no call
-for a stage it does not have.
+flat and the ring driver read the same set. Only `schedule` and
+`commit_extend` are required; an optional stage left None runs the core
+default inline, so a mode pays no call for a stage it does not have.
 """
 
 from __future__ import annotations
@@ -39,6 +39,10 @@ class ModeStages:
 
     # Build the step of a slot (flat PD prefill also takes its polling args).
     schedule: Callable[..., Optional[ScheduleBatch]]
+    # Commit, the host commit of an extend step; returns the requests that go
+    # back to the front of the waiting list (PD prefill: the optimistic
+    # requests that yield), or None.
+    commit_extend: Callable[[ScheduleBatch, GenerationBatchResult], Optional[List[Req]]]
     # Flat driver, before intake while the engine runs: PD decode starts the
     # prefill DP-rank lookups of its pending rooms.
     prefetch: Optional[Callable[[], None]] = None

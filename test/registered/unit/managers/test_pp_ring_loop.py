@@ -124,7 +124,7 @@ class TestPPRingCommit(CustomTestCase):
             trace[-1]["committed"] = record.step.name
             assert record.result is trace[-1]["relayed"]
 
-        s.mode.stages = ModeStages(schedule=schedule_slot)
+        s.mode.stages = ModeStages(schedule=schedule_slot, commit_extend=Mock())
         s.commit_step = commit_step
         s.init_pp_ring()
         ring = s.pp_ring
@@ -193,6 +193,7 @@ class TestPPSlotTag(CustomTestCase):
         s.parts.lists.waiting_queue = []
         s.parts.pending = PendingSteps()
         s.parts.flags.enable_skip_finishing_decode = False
+        s.parts.batch_result_processor = Mock()
         s.mode.stages = init_mode_stages(
             s.parts, s.loop_schedules(), lora_ids_in_use=set
         )

@@ -1238,6 +1238,7 @@ def maybe_init_disagg_prefill(
         batch_result_processor=parts.batch_result_processor,
         counters=parts.counters,
         request_retirer=parts.request_retirer,
+        core_lists=parts.lists,
     )
 
 
@@ -1290,12 +1291,14 @@ def init_mode_stages(
     if owners.dllm is not None:
         stages = dict(
             schedule=schedules.schedule,
+            commit_extend=owners.dllm.commit_extend,
             admit=schedules.admit_dllm,
             on_launch=owners.dllm.on_launch,
         )
     elif (owner := owners.disagg_prefill) is not None:
         stages = dict(
             schedule=schedules.schedule_disagg_prefill,
+            commit_extend=owner.commit_extend,
             intake=owner.intake,
             before_forward=owner.before_forward,
             on_prefilled=owner.on_launch,
@@ -1322,6 +1325,7 @@ def init_mode_stages(
     elif (owner := owners.disagg_decode) is not None:
         stages = dict(
             schedule=schedules.schedule_disagg_decode,
+            commit_extend=parts.batch_result_processor.process_batch_result_prefill,
             prefetch=owner.prefetch_prefill_dp_rank_queries,
             intake=functools.partial(owner.intake, lora_ids_in_use=lora_ids_in_use),
             hold_finished=(
@@ -1337,7 +1341,10 @@ def init_mode_stages(
             ),
         )
     else:
-        stages = dict(schedule=schedules.schedule)
+        stages = dict(
+            schedule=schedules.schedule,
+            commit_extend=parts.batch_result_processor.process_batch_result_prefill,
+        )
     if hisparse is not None:
         # Launched prefills stage until their host copy lands (PD prefill
         # hands them over instead); the normal schedule then admits them.

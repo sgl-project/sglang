@@ -110,6 +110,7 @@ _DECLARED = {
         "LaunchCounters",
         "RequestRetirer",
         "Workers",
+        "CoreLists",
     ],
     "DisaggDecode": [
         "KvResources",

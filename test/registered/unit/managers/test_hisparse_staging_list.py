@@ -53,6 +53,7 @@ class TestHiSparseStagingList(unittest.TestCase):
             HiSparseCoordinator
         )
         scheduler.hisparse_coordinator.staging = []
+        scheduler.parts.batch_result_processor = Mock()
         scheduler.mode.stages = init_mode_stages(
             scheduler.parts, scheduler.loop_schedules(), lora_ids_in_use=set
         )

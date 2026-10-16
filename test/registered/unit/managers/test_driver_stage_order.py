@@ -101,6 +101,9 @@ class _PrefillOwner:
         self.shell.log("dp.after_commit")
         return waiting
 
+    def commit_extend(self, step, result):
+        self.shell.log("dp.commit_extend", step.name)
+
     def is_result_ready(self, result, *status):
         ready = self.shell.iteration >= result.ready_at
         self.shell.log("dp.ready", result.name, ready)
@@ -173,6 +176,9 @@ class _DllmOwner:
 
     def on_launch(self, step):
         self.shell.log("dllm.on_launch", step.name)
+
+    def commit_extend(self, step, result):
+        self.shell.log("dllm.commit_extend", step.name)
 
 
 class _Hook:
@@ -265,6 +271,11 @@ class _Shell:
         s._apply_war_barrier = lambda: self.log("war_barrier")
         s.process_batch_result = self.process_batch_result
         s.parts.step_counters = SimpleNamespace(record=lambda record: None)
+        s.parts.batch_result_processor = SimpleNamespace(
+            process_batch_result_prefill=lambda step, result: self.log(
+                "commit_prefill", step.name
+            )
+        )
         s.on_idle = lambda: self.log("idle")
 
     def log(self, *event):
@@ -642,6 +653,29 @@ class TestRingDriverStageOrder(CustomTestCase):
             + _at(1, ("exchange", 0), *consensus(0))
             + _at(1, ("commit", "d0"), "send", "send", "send", "send"),
         )
+
+
+class TestCommitExtendStage(CustomTestCase):
+    """Each mode commits an extend step through its own stage: dLLM and PD
+    prefill through their owner, the rest through the prefill result
+    processor."""
+
+    def test_binding(self):
+        expected = {
+            "normal": "commit_prefill",
+            "decode": "commit_prefill",
+            "dllm": "dllm.commit_extend",
+            "prefill": "dp.commit_extend",
+        }
+        for mode, event in expected.items():
+            with self.subTest(mode):
+                shell = _Shell(mode, 0)
+                with published_topology():
+                    stages = init_mode_stages(
+                        shell.s.parts, shell.s.loop_schedules(), lora_ids_in_use=set
+                    )
+                stages.commit_extend(_step("p0"), None)
+                self.assertEqual(shell.events, [(-1, event, "p0")])
 
 
 class _StageRecorder:

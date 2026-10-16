@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
+from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -79,6 +80,7 @@ def _owner():
         req_to_metadata_buffer_idx_allocator=Mock(),
         send_kv_chunk=Mock(),
         output_streamer=Mock(),
+        core_lists=CoreLists(),
     )
 
 
@@ -118,7 +120,7 @@ def test_aborted_final_result_releases_hybrid_cache(
     owner.kv_senders[req.rid] = req.sender
     owner.prefilling = [req]
 
-    owner.commit_extend(_batch(req), _result(), [], None)
+    owner.commit_extend(_batch(req), _result())
 
     assert owner.prefilling == []
     release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
@@ -147,7 +149,7 @@ def test_aborted_middle_result_releases_after_last_chunk(release_kv_cache):
     owner.kv_senders[req.rid] = req.sender
     req.extend_end = 50
 
-    owner.commit_extend(_batch(req, middle_chunk=True), _result(), [], None)
+    owner.commit_extend(_batch(req, middle_chunk=True), _result())
 
     release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
     owner.output_streamer.stream_output.assert_called_once_with([req], False)
@@ -165,13 +167,13 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
     # Its final chunk launched while the middle chunk was still in flight.
     owner.prefilling = [req]
 
-    owner.commit_extend(_batch(req, middle_chunk=True), _result(), [], None)
+    owner.commit_extend(_batch(req, middle_chunk=True), _result())
 
     release_kv_cache.assert_not_called()
     owner.output_streamer.stream_output.assert_not_called()
     assert owner.prefilling == [req]
 
-    owner.commit_extend(_batch(req), _result(), [], None)
+    owner.commit_extend(_batch(req), _result())
 
     assert owner.prefilling == []
 
@@ -185,7 +187,7 @@ def test_delayed_result_ignores_already_retired_request(release_kv_cache):
     req = _Req(allocated=False)
     owner.kv_senders[req.rid] = req.sender
 
-    owner.commit_extend(_batch(req), _result(), [], None)
+    owner.commit_extend(_batch(req), _result())
 
     release_kv_cache.assert_not_called()
     req.sender.abort.assert_not_called()
@@ -202,7 +204,7 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     owner.kv_senders[req.rid] = req.sender
     req.sender.abort.side_effect = RuntimeError("transport is down")
 
-    owner.commit_extend(_batch(req), _result(), [], None)
+    owner.commit_extend(_batch(req), _result())
 
     release_kv_cache.assert_called_once_with(req, owner.tree_cache, checkpoint=False)
     owner.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
@@ -225,7 +227,7 @@ def test_grammar_rejection_retires_prefill_before_transfer(
     req.grammar = Mock()
     req.grammar.accept_token.side_effect = ValueError("invalid token")
 
-    owner.commit_extend(_batch(req), _result(), [], None)
+    owner.commit_extend(_batch(req), _result())
 
     req.grammar.accept_token.assert_called_once_with(11)
     assert req.grammar.finished
@@ -248,7 +250,7 @@ def test_aborted_result_releases_mamba_allocated_before_kv():
     req.to_finish = FINISH_ABORT()
     req.finished_reason = None
 
-    owner.commit_extend(_batch(req), _result(), [], None)
+    owner.commit_extend(_batch(req), _result())
 
     owner.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
     assert req.kv.mamba_pool_idx is None
@@ -270,7 +272,7 @@ def test_failed_kv_load_is_aborted_instead_of_sent_to_decode(release_kv_cache):
         logits_output=LogitsProcessorOutput(next_token_logits=None),
     )
 
-    owner.commit_extend(_batch(req), result, [], None)
+    owner.commit_extend(_batch(req), result)
 
     assert req.finished_reason.status_code == 503
     assert req.output_ids == []
@@ -314,8 +316,8 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     )
 
     with get_context().override_server_args(sampling_mask_max_tokens=64):
-        owner.commit_extend(_batch(req), result, [], None)
-        owner.commit_extend(_batch(req), result, [], None)
+        owner.commit_extend(_batch(req), result)
+        owner.commit_extend(_batch(req), result)
 
     assert req.finished_reason.status_code == http_status
     assert req.finished_reason.err_type == err_type
@@ -375,7 +377,7 @@ class TestPrefillCompleteResult(CustomTestCase):
             )
 
         req.sender.mark_prefill_complete.side_effect = ready
-        owner.commit_extend(batch, result, [], None)
+        owner.commit_extend(batch, result)
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
         self.assertTrue(req.disagg.pending_bootstrap)
         owner.send_kv_chunk.assert_not_called()
@@ -388,7 +390,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         owner = _owner()
         req = _Req()
         owner.kv_senders[req.rid] = req.sender
-        owner.commit_extend(_batch(req), _result(), [], None)
+        owner.commit_extend(_batch(req), _result())
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(owner.transfer, [])
@@ -404,7 +406,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         owner.optimistic_release_and_requeue = lambda r, waiting: (
             retried.append(r) or waiting
         )
-        owner.commit_extend(_batch(req), _result(), [], None)
+        owner.commit_extend(_batch(req), _result())
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])
         self.assertEqual(owner.transfer, [])

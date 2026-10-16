@@ -1194,19 +1194,11 @@ class Scheduler:
             if self.hisparse_coordinator is not None:
                 self.hisparse_coordinator.free_remapped_decode_slots()
         elif batch.forward_mode.is_extend():
-            if self.dllm is not None:
-                self.dllm.commit_extend(batch, result)
-            elif self.disagg_prefill is not None:
-                self.parts.lists.waiting_queue = self.disagg_prefill.commit_extend(
-                    batch,
-                    result,
-                    self.parts.lists.waiting_queue,
-                    self.parts.lists.chunked_req,
-                )
-            else:
-                self.parts.batch_result_processor.process_batch_result_prefill(
-                    batch, result
-                )
+            if requeued := self.mode.stages.commit_extend(batch, result):
+                self.parts.lists.waiting_queue = [
+                    *requeued,
+                    *self.parts.lists.waiting_queue,
+                ]
             # None on decode->extend converted batches; they are decode work and
             # have no prefill stats to report.
             if batch.prefill_stats is not None:
