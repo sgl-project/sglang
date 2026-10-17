@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 VENDORS = {
     "bf16": ("cutedsl", "triton"),
     "fp8": ("cutedsl", "triton"),
+    "nvfp4": ("marlin",),
 }
 
 
@@ -76,3 +77,9 @@ def select_provider_cls(
             )
 
             return TritonFp8ContiguousProvider
+        case "marlin", "nvfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.marlin_nvfp4 import (
+                MarlinNvFp4ContiguousProvider,
+            )
+
+            return MarlinNvFp4ContiguousProvider
