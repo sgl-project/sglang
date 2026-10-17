@@ -1033,9 +1033,14 @@ def _fwd_kernel_ep_scatter_1(
         other=0,
     )
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
-    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    # Each program finalizes only its own expert's offset. Reading it back from
+    # expert_start_loc would depend on the visibility of the vector store above
+    # (issued across this block's warps), so select the value from the
+    # in-register cumsum instead; a garbage base pointer would produce an
+    # intermittent warp illegal address in the m_indices store loop below.
+    cur_expert_start = tl.sum(tl.where(offset_cumsum == cur_expert, cumsum, 0))
+    tl.store(expert_start_loc + cur_expert, cur_expert_start)
     cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
     cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
 
@@ -1044,9 +1049,11 @@ def _fwd_kernel_ep_scatter_1(
 
     for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
         offsets = start_m + off_expert
+        # Safety net; callers already pad the counts to BLOCK_E.
         tl.store(
             m_indices_start_ptr + offsets,
             tl.where(offsets < cur_expert_valid_token_num, cur_expert, -1),
+            mask=offsets < cur_expert_padded_token_num,
         )
 
 
@@ -1158,8 +1165,8 @@ def ep_scatter(
     expert_alignment: int = 128,
     expert_start: int = 0,
 ):
-    # tl.arange needs pow2, and the kernel's unmasked stores need BLOCK_E to
-    # divide the expert_alignment-padded segments; lowbit satisfies both.
+    # tl.arange needs pow2; lowbit gives the largest pow2 dividing
+    # expert_alignment, which callers pad the per-expert counts to.
     BLOCK_E = expert_alignment & -expert_alignment
     BLOCK_D = quant_block_size  # block size of quantization
     num_warps = 8
