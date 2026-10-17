@@ -303,7 +303,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
-        mrope_section = [0, 0, 0]
+        # npu_mrope reads an all-zero section as "M-RoPE disabled"; pass the real
+        # split when the positions carry the three axes.
+        is_mrope = positions.ndim == 2 and self.mrope_section
+        mrope_section = self.mrope_section if is_mrope else [0, 0, 0]
+        # cache_mode picks the axis map, not the pairing: 'interleave' is the
+        # round-robin mapping mrope_interleaved selects, 'default' the contiguous.
+        cache_mode = "interleave" if is_mrope and self.mrope_interleaved else "default"
         query_out, key_out = torch_npu.npu_mrope(
             positions,
             query,
@@ -312,6 +318,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.head_size,
             mrope_section=mrope_section,
             rotary_mode=rotary_mode,
+            cache_mode=cache_mode,
         )
         return query_out, key_out
 
