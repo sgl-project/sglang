@@ -15,6 +15,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
@@ -1561,6 +1562,101 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         params2 = json.loads(tool_calls_parameters[1])
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
+
+
+class TestDeepSeekV31Detector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+        self.detector = DeepSeekV31Detector()
+
+    def tool_call(self, city):
+        info = self.detector.structure_info()("get_weather")
+        return info.begin + json.dumps({"city": city}) + info.end
+
+    def test_structure_info_round_trip(self):
+        for prefix in ("", "Checking the weather.\n"):
+            with self.subTest(prefix=prefix):
+                result = self.detector.detect_and_parse(
+                    prefix + self.tool_call("Paris"), self.tools
+                )
+                self.assertEqual(result.normal_text, prefix.strip())
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "get_weather")
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"city": "Paris"}
+                )
+
+    def test_has_tool_call_detects_both_markers(self):
+        self.assertTrue(self.detector.has_tool_call(self.detector.bot_token))
+        self.assertTrue(self.detector.has_tool_call(self.tool_call("Paris")))
+        self.assertFalse(self.detector.has_tool_call("No tool call here"))
+
+    def test_parallel_calls_with_and_without_section(self):
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                text = self.tool_call("Paris") + self.tool_call("Tokyo")
+                if wrapped:
+                    text = self.detector.bot_token + text + self.detector.eot_token
+                result = self.detector.detect_and_parse(
+                    "Checking.\n" + text, self.tools
+                )
+                self.assertEqual(result.normal_text, "Checking.")
+                self.assertEqual(
+                    [call.name for call in result.calls], ["get_weather"] * 2
+                )
+                self.assertEqual(
+                    [json.loads(call.parameters) for call in result.calls],
+                    [{"city": "Paris"}, {"city": "Tokyo"}],
+                )
+
+    def test_plain_text_is_preserved(self):
+        text = "  No calls here.\n"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
+
+    def test_invalid_json_is_preserved(self):
+        info = self.detector.structure_info()("get_weather")
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                text = info.begin + '{"city":' + info.end
+                if wrapped:
+                    text = self.detector.bot_token + text + self.detector.eot_token
+                with self.assertLogs(
+                    "sglang.srt.function_call.deepseekv31_detector", level="ERROR"
+                ):
+                    result = self.detector.detect_and_parse(text, self.tools)
+                self.assertEqual(result.normal_text, text)
+                self.assertEqual(result.calls, [])
+
+    def test_standalone_call_matches_streaming(self):
+        info = self.detector.structure_info()("get_weather")
+        chunks = [info.begin, '{"city": "Paris"}' + info.end]
+        streaming_calls = []
+        for chunk in chunks:
+            streaming_calls.extend(
+                self.detector.parse_streaming_increment(chunk, self.tools).calls
+            )
+        non_streaming = DeepSeekV31Detector().detect_and_parse(
+            "".join(chunks), self.tools
+        )
+        self.assertEqual(len(non_streaming.calls), 1)
+        self.assertEqual(non_streaming.calls[0].name, streaming_calls[0].name)
+        self.assertEqual(
+            json.loads(non_streaming.calls[0].parameters),
+            json.loads("".join(call.parameters for call in streaming_calls)),
+        )
 
 
 class TestDeepSeekV32Detector(unittest.TestCase):
