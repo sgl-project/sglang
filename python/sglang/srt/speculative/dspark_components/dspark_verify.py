@@ -162,7 +162,7 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
-            return self.verify_epilogue.read_accept(bs)
+            return self.verify_epilogue.snapshot_accept(bs)
 
         simulate = self._simulated_correct_len is not None
         # Simulated acceptance overwrites correct_len below, so a sampling accept
@@ -672,6 +672,8 @@ class DsparkVerifyEpilogue:
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:
+        """Views of the accept buffers: the in-graph accept writes through them
+        (`_accept` passes them as `out`), so they must stay aliases."""
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],
             bonus=self.bonus_buf[:bs],
@@ -679,6 +681,27 @@ class DsparkVerifyEpilogue:
             commit_lens=self.commit_lens_buf[:bs],
             new_seq_lens=self.new_seq_lens_buf[:bs],
             out_tokens=self.out_tokens_buf[:bs],
+        )
+
+    def snapshot_accept(self, bs: int) -> AcceptOuts:
+        """Copies of this step's accept outputs, for readers outside the graph.
+
+        The buffers are rewritten by the next target-verify replay. Under the
+        overlap scheduler the result readback (`accept_lens`, `next_token_ids`)
+        runs on copy_stream, which forward_stream never waits on, so a view read
+        late returns step N+1's values, independently on each TP rank (#42465).
+        The clones are made on the current (forward) stream right after the
+        replay, so stream order pins them to step N; `async_d2h`'s
+        `record_stream` keeps them alive until the readback has run.
+        """
+        views = self.read_accept(bs)
+        return AcceptOuts(
+            correct_len=views.correct_len.clone(),
+            bonus=views.bonus.clone(),
+            cap_trim_lens=views.cap_trim_lens.clone(),
+            commit_lens=views.commit_lens.clone(),
+            new_seq_lens=views.new_seq_lens.clone(),
+            out_tokens=views.out_tokens.clone(),
         )
 
     @property
