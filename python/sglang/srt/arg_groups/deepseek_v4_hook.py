@@ -326,11 +326,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        # This validation runs before validate_deepseek_v4_cp resolves
+        # attn_cp_size from TP. Keep the existing interleave prefill CP path
+        # alongside DP-only attention; CP+DP remains unsupported.
         supported_prefill_cp = (
             cfg.disaggregation_mode == "prefill"
             and cfg.enable_prefill_cp
             and cfg.cp_strategy == "interleave"
+            and cfg.dp_size == 1
+            and cfg.attn_cp_size in (1, cfg.tp_size)
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
@@ -361,6 +365,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         and prefill_graph.max_seq_len is None
         and not cp_breakable_prefill
     ):
+        # The non-CP captured low-ratio indexer scores a static context width.
+        # CP BCG runs these sources eagerly with live prefix metadata, so this
+        # default would only force long-prefix CP batches back to eager.
+        # Explicit max_seq_len values still constrain both paths.
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",

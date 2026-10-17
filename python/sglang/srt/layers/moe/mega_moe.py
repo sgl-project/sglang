@@ -99,12 +99,11 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
     # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
-    # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
-    # from token TMA loads, so intermediate % 128 suffices, including V4.1
-    # Flash's 2304-wide intermediate dimension.
-    # Keep the existing restrictions on the other MMA paths.
+    # Retain upstream input/NVFP4 alignment, but also admit the verified W4A4
+    # MXFP4 Flash shape (5120, 2304). Both FP8/FP4 and MXFP4 use 128-column
+    # intermediate tiles; a 512-channel gate would reject the latter.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "mxf4xmxf4") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
@@ -524,9 +523,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         build_flydsl_mega_moe_weights(experts)
         return
 
-    from deep_gemm import (
-        transform_sf_into_required_layout,
-    )
+    from deep_gemm import transform_sf_into_required_layout
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
