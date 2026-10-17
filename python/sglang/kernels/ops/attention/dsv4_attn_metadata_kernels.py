@@ -449,9 +449,8 @@ def late_layer_tail_layout(
     or its whole extend where whole_extend is set.
     Returns (token indices into the extend, per-request tail lengths, per-row
     absolute window floor). The floor is seq_len - tail_len, so a tail shorter
-    than tail_len reads rows the request wrote before this extend. In a whole
-    extend, the last tail_len rows keep that floor and earlier rows keep their
-    plain window."""
+    than tail_len reads rows the request wrote before this extend. A whole
+    extend keeps every row's plain window."""
     if whole_extend is not None and any(whole_extend):
         return _whole_extend_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
@@ -494,13 +493,14 @@ def _whole_extend_tail_layout(
         for n, whole in zip(extend_lens_cpu, whole_extend)
     ]
     token_indices, floor, start = [], [], 0
-    for n, t, s in zip(extend_lens_cpu, tail_lens_cpu, seq_lens_cpu):
+    for n, t, s, whole in zip(
+        extend_lens_cpu, tail_lens_cpu, seq_lens_cpu, whole_extend
+    ):
         token_indices.append(torch.arange(start + n - t, start + n))
-        row_floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32)
-        # Rows before the last tail_len sit at s - t or later, so this floor
-        # never cuts their plain window.
-        row_floor[: max(0, t - tail_len)] = max(0, s - t - tail_len)
-        floor.append(row_floor)
+        # A whole extend's rows sit at s - t or later, so its floor never cuts
+        # their plain window.
+        row_floor = max(0, s - t - tail_len) if whole else max(0, s - tail_len)
+        floor.append(torch.full((t,), row_floor, dtype=torch.int32))
         start += n
     return (
         torch.cat(token_indices).to(device, non_blocking=True),

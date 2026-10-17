@@ -137,9 +137,10 @@ class ExecFeatures(msgspec.Struct):
         Optional[bool],
         Arg(
             help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
-            "for supported configurations. Use --no-enable-decoder-swa-bounded-replay "
-            "to retain full prefill or request prompt logprobs. "
-            "Not numerically equivalent to full prefill.",
+            "for supported configurations. Not numerically equivalent to full "
+            "prefill; requests for prompt logprobs compute every prompt row. Use "
+            "--no-enable-decoder-swa-bounded-replay to retain full prefill, e.g. "
+            "for RL rollouts whose logprobs must match the trainer.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),

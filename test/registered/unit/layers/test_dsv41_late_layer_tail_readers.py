@@ -40,12 +40,11 @@ def _batch(extend_lens, starts=None, capture=CaptureHiddenMode.NULL):
 
 class TestWholeExtendRequests(CustomTestCase):
     def test_no_prompt_reader_keeps_the_window_tail(self):
-        # No logprobs, output-only logprobs (start == extend), and prompt
-        # logprobs inside the last window all fit the SWA_WINDOW tail.
+        # No logprobs and output-only logprobs (start == extend) read no
+        # prompt row.
         for batch in (
             _batch([300, 50]),
             _batch([300, 50], starts=[300, 50]),
-            _batch([300, 50], starts=[300 - SWA_WINDOW, 0]),
             _batch([300], capture=CaptureHiddenMode.LAST),
         ):
             self.assertIsNone(late_layer_whole_extend(batch, dspark=False))
@@ -56,10 +55,12 @@ class TestWholeExtendRequests(CustomTestCase):
         batch = _batch([300], capture=CaptureHiddenMode.FULL)
         self.assertIsNone(late_layer_whole_extend(batch, dspark=True))
 
-    def test_prompt_logprobs_before_the_window(self):
-        batch = _batch([300, 300, 50], starts=[0, 300, 0])
+    def test_any_prompt_logprob_reads_the_whole_extend(self):
+        # Inside the last window too, and in a prompt shorter than a window:
+        # those rows would otherwise get the window floor.
+        batch = _batch([300, 300, 300, 50], starts=[0, 300, 300 - SWA_WINDOW, 0])
         whole = late_layer_whole_extend(batch, dspark=False)
-        self.assertEqual(whole, [True, False, False])
+        self.assertEqual(whole, [True, False, True, True])
 
     def test_full_hidden_capture_reads_every_row(self):
         batch = _batch([300, 50], capture=CaptureHiddenMode.FULL)
@@ -68,7 +69,7 @@ class TestWholeExtendRequests(CustomTestCase):
 
 class TestWholeExtendLayout(CustomTestCase):
     def test_other_requests_match_the_window_layout(self):
-        extend_lens, seq_lens = [200, 300, 50], [300, 400, 50]
+        extend_lens, seq_lens = [200, 300, 50], [300, 600, 50]
         token_indices, tail_lens, floor = late_layer_tail_layout(
             extend_lens_cpu=extend_lens,
             seq_lens_cpu=seq_lens,
@@ -89,13 +90,24 @@ class TestWholeExtendLayout(CustomTestCase):
         torch.testing.assert_close(floor[:128], base_floor[:128])
         torch.testing.assert_close(token_indices[428:], base_indices[256:])
         torch.testing.assert_close(floor[428:], base_floor[256:])
-        # The whole request: every row of its extend; its last window keeps the
-        # window floor (so its sampled token does not change), earlier rows keep
-        # their plain window.
+        # The whole request: every row of its extend, each with its plain window
+        # (a floor a window below the extend start).
         torch.testing.assert_close(token_indices[128:428], torch.arange(200, 500))
-        torch.testing.assert_close(floor[300:428], base_floor[128:256])
-        expected = torch.tensor([0] * 172 + [272] * 128, dtype=torch.int32)
+        expected = torch.full((300,), 600 - 300 - SWA_WINDOW, dtype=torch.int32)
         torch.testing.assert_close(floor[128:428], expected)
+
+    def test_short_whole_extend_keeps_its_plain_window(self):
+        # A chunk shorter than a window is floored one window back otherwise.
+        _, tail_lens, floor = late_layer_tail_layout(
+            extend_lens_cpu=[40],
+            seq_lens_cpu=[300],
+            tail_len=SWA_WINDOW,
+            device=CPU,
+            whole_extend=[True],
+        )
+        self.assertEqual(tail_lens, [40])
+        expected = torch.full((40,), 300 - 40 - SWA_WINDOW, dtype=torch.int32)
+        torch.testing.assert_close(floor, expected)
 
 
 class TestPrefillGraphTailCapacity(CustomTestCase):

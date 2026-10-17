@@ -950,11 +950,11 @@ def _tail_rows(
 def late_layer_whole_extend(
     forward_batch: ForwardBatch, *, dspark: bool
 ) -> Optional[List[bool]]:
-    """Requests whose tail is their whole extend under decoder SWA bounded replay:
-    those that read rows before their last SWA_WINDOW (prompt logprobs, or every
-    hidden state outside DSpark, whose draft reads tail rows only). None when no
-    request in the batch does. dspark comes from the server: a capture batch
-    carries DSpark's FULL capture mode without its spec_algorithm."""
+    """Requests that run their whole extend with plain windows under decoder SWA
+    bounded replay: those that read prompt rows (prompt logprobs,
+    or every hidden state outside DSpark, whose draft reads tail rows only). None
+    when no request in the batch does. dspark comes from the server: a capture
+    batch carries DSpark's FULL capture mode without its spec_algorithm."""
     return late_layer_whole_extend_of(
         extend_lens=forward_batch.extend_seq_lens_cpu,
         logprob_start_lens=(
@@ -979,9 +979,7 @@ def late_layer_whole_extend_of(
         return [True] * len(extend_lens)
     if not return_logprob:
         return None
-    whole = [
-        start < n - SWA_WINDOW for start, n in zip(logprob_start_lens, extend_lens)
-    ]
+    whole = [start < n for start, n in zip(logprob_start_lens, extend_lens)]
     return whole if any(whole) else None
 
 
