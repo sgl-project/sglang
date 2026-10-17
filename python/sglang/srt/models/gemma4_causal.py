@@ -867,6 +867,26 @@ class Gemma4DecoderLayer(nn.Module):
 
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
+        self._xpu_ple_add_scale = None
+        if (
+            self.has_ple
+            and not self.enable_moe_block
+            and quant_config is None
+            and self.hidden_size == 1536
+            and self.hidden_size_per_layer_input == 256
+            and get_parallel().tp_size == 1
+            and get_fused_op_backend() is None
+            and torch.xpu.is_available()
+            and "B70" in torch.xpu.get_device_name(torch.xpu.current_device())
+        ):
+            from sglang.kernels.ops.elementwise import bf16_add_then_scale
+            from sglang.kernels.selector import get_kernel
+            from sglang.kernels.spec import KernelBackend
+
+            # Resolve imports/device selection before fullgraph tracing. This
+            # replaces only post-norm tensor arithmetic, never the norm module.
+            get_kernel("elementwise.bf16_add_then_scale", KernelBackend.TRITON)
+            self._xpu_ple_add_scale = bf16_add_then_scale
         self.prefix = prefix
         attn, ffn = self.stage_facts(
             config, layer_id, post_attention_layernorm=self.post_attention_layernorm
@@ -1025,6 +1045,29 @@ class Gemma4DecoderLayer(nn.Module):
                 per_layer_contribution = self.post_per_layer_input_norm(
                     per_layer_contribution
                 )
+                if (
+                    self._xpu_ple_add_scale is not None
+                    and get_fused_op_backend() is None
+                    and not torch.is_grad_enabled()
+                    and hidden_states.shape == (4096, 1536)
+                    and hidden_states.device.type == "xpu"
+                    and hidden_states.dtype == torch.bfloat16
+                    and hidden_states.is_contiguous()
+                    and not hidden_states.requires_grad
+                    and per_layer_contribution.shape == hidden_states.shape
+                    and per_layer_contribution.device == hidden_states.device
+                    and per_layer_contribution.dtype == torch.bfloat16
+                    and per_layer_contribution.is_contiguous()
+                    and not per_layer_contribution.requires_grad
+                    and self.layer_scalar.shape == (1,)
+                    and self.layer_scalar.device == hidden_states.device
+                    and self.layer_scalar.dtype == torch.bfloat16
+                    and self.layer_scalar.is_contiguous()
+                    and not self.layer_scalar.requires_grad
+                ):
+                    return self._xpu_ple_add_scale(
+                        hidden_states, per_layer_contribution, self.layer_scalar
+                    )
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar

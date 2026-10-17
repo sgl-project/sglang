@@ -202,6 +202,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
+        "'sglang.kernels.ops.elementwise.xpu_bf16_add_then_scale', "
         "'sglang.kernels.ops.speculative.row_argmax')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
@@ -276,6 +277,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "elementwise.qwen4_gate",
         "elementwise.row_scale",
         "elementwise.hc_combine_decode",
+        "elementwise.xpu_bf16_add_then_scale",
         "mamba.qwen4_short_conv",
         "mamba.lfm_short_conv",
         "gemm.dsv4_wo_a",
@@ -308,6 +310,18 @@ def test_reclassified_public_entry_points_are_inventoried():
             ):
                 continue
             assert f"sglang.kernels.ops.{module}:{node.name}" in targets
+
+
+@pytest.mark.parametrize(
+    "device, expected", [("xpu", True), ("cpu", False), ("cuda", False)]
+)
+def test_bf16_add_then_scale_registry_requires_xpu(device, expected):
+    spec = K.select_kernel("elementwise.bf16_add_then_scale", KernelBackend.TRITON)
+    assert (
+        spec.target
+        == "sglang.kernels.ops.elementwise.xpu_bf16_add_then_scale:bf16_add_then_scale"
+    )
+    assert spec.is_available(PlatformInfo(device_type=device)) is expected
 
 
 @pytest.mark.parametrize(
