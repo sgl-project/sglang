@@ -170,8 +170,7 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
 
     monkeypatch.setattr(backend, "_fast_flashmla_sched_shape", lambda q: True)
     monkeypatch.setattr(backend, "_num_sms", lambda _: 148)
-    max_batch = (48 * 1024 // 4 - 1 - 148 * 8) // 5
-    for b in (max_batch + 1, 5000, 16384):
+    for b in (_first_unfit_batch(148), 5000, 16384):
         meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
         backend._maybe_precompute_flashmla_sched_meta(
             meta,
@@ -183,6 +182,37 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
         )
         assert meta.tile_scheduler_metadata is None
         assert meta.num_splits is None
+
+
+def _first_unfit_batch(num_sm_parts: int) -> int:
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import sched_meta_fits
+
+    b = 1
+    while sched_meta_fits(batch_size=b, num_sm_parts=num_sm_parts):
+        b += 1
+    return b
+
+
+@pytest.mark.parametrize("offset", [-3, -2, -1, 0, 1, 2])
+def test_precompute_at_shared_memory_limit(offset: int):
+    """Schedules that fit launch; the first size that does not takes the fallback."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as backend
+
+    b = _first_unfit_batch(backend._num_sms(torch.cuda.current_device())) + offset
+    topk = 512
+    meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
+    backend._maybe_precompute_flashmla_sched_meta(
+        meta,
+        q=torch.empty((b, 1, H_Q, D_QK), device="cuda", dtype=torch.bfloat16),
+        indices=torch.zeros((b, 1, topk), device="cuda", dtype=torch.int32),
+        topk_length=torch.full((b,), topk, device="cuda", dtype=torch.int32),
+        extra_indices=None,
+        extra_topk_length=None,
+    )
+    torch.cuda.synchronize()
+    assert (meta.tile_scheduler_metadata is not None) == (offset < 0)
 
 
 if __name__ == "__main__":
