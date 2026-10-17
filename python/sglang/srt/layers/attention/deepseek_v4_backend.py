@@ -259,7 +259,9 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
-def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
+def _low_ratio_source_projections(
+    layer, x, q_lora, positions, bufs, run_compressor, run_indexer
+):
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         get_tc_piecewise_forward_context,
     )
@@ -284,12 +286,12 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
             buf.zero_()
         return
 
-    if layer.compressor is not None:
+    if run_compressor and layer.compressor is not None:
         kv, score = layer.compressor.project(x[:real])
         put("kv", kv)
         if score is not None:
             put("score", score)
-    if layer.indexer is not None:
+    if run_indexer and layer.indexer is not None:
         indexer = layer.indexer
         put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
         put("w", indexer.head_weights(x[:real]))
@@ -908,8 +910,8 @@ class DSV4AttnMetadata:
 
 
 class LateLayerTail(msgspec.Struct, frozen=True):
-    """Rows the layers after the last kv_source layer run over under decoder SWA
-    bounded replay: the last tail tokens of each request in the extend."""
+    """Rows the layers from late_layer_start on run over under decoder SWA bounded
+    replay: the last tail tokens of each request in the extend."""
 
     token_indices: torch.Tensor
     positions: torch.Tensor
@@ -1238,6 +1240,8 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Set by write_tail_source_kv until exit_late_layer_tail.
+        self.tail_source_kv_layer_id: Optional[int] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
         self._bcg_tail_capacity: Optional[int] = None
@@ -1940,6 +1944,22 @@ class DeepseekV4AttnBackend(
             pad_rows=pad_rows,
         )
 
+    def write_tail_source_kv(
+        self, *, layer, x, positions, forward_batch: ForwardBatch
+    ) -> None:
+        """Write every row's compressed KV for the source layer the tail starts at,
+        before enter_late_layer_tail; the layer's own pass inside the tail then
+        skips its compressor."""
+        self.forward_low_ratio_sources(
+            layer=layer,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
+        self.tail_source_kv_layer_id = layer.layer_id
+
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail; the return value goes back to
         exit_late_layer_tail."""
@@ -1969,31 +1989,7 @@ class DeepseekV4AttnBackend(
                 )
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
-        # The layers before the switch published top-k into the full metadata's
-        # buffers; carry the tail rows into the tail metadata's (padding stays -1).
-        full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
-        for ratio in tail_core.low_ratios:
-            for full_buf, tail_buf in (
-                (
-                    full_core.sparse_page_indices(ratio),
-                    tail_core.sparse_page_indices(ratio),
-                ),
-                (
-                    full_core.sparse_topk_lengths(ratio),
-                    tail_core.sparse_topk_lengths(ratio),
-                ),
-                (
-                    full_core.sparse_raw_indices(ratio),
-                    tail_core.sparse_raw_indices(ratio),
-                ),
-            ):
-                if full_buf is None or tail_buf is None:
-                    continue
-                rows = tail.real_rows(full_buf)
-                if tail.real_rows_count is not None:
-                    rows = rows[: tail.real_rows_count]
-                tail_buf[: rows.shape[0]].copy_(rows)
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -2017,6 +2013,7 @@ class DeepseekV4AttnBackend(
         forward_batch.global_num_token_non_padded_cpu = non_padded
         forward_batch.global_num_token_non_padded = non_padded_gpu
         forward_batch.num_token_non_padded = local_non_padded
+        self.tail_source_kv_layer_id = None
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
@@ -3108,6 +3105,9 @@ class DeepseekV4AttnBackend(
             return
         if forward_batch.encoder_swa_replay:
             run_compressor = False
+        if layer.layer_id == self.tail_source_kv_layer_id:
+            run_compressor = False
+        meta = self.forward_metadata
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -3119,7 +3119,6 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
-        meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
         if (
@@ -3138,7 +3137,9 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
+            _bcg_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, run_compressor, run_indexer
+            )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
@@ -3680,15 +3681,6 @@ class DeepseekV4AttnBackend(
         if published is None:
             return
         self.forward_metadata.candidate_metadata = published
-        tail_metadata = self.tail_forward_metadata
-        if tail_metadata is None or tail_metadata is self.forward_metadata:
-            return
-        tail = tail_metadata.late_layer_tail
-        tail_metadata.candidate_metadata = published.tail(
-            tail.local_lens_cpu
-            if tail.cp_metadata is not None
-            else tail.extend_seq_lens_cpu
-        )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
