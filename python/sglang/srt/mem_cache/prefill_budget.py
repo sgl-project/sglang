@@ -140,9 +140,13 @@ class PrefillBudget:
         return paged_input <= min(self.remaining_current, self.remaining_total)
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        available = min(chunk_limit, int(self.remaining_total))
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        available = min(
+            chunk_limit,
+            int(self.remaining_total),
+            int(self.remaining_current) - self.page_size,
+        )
+        available = available // self.page_size * self.page_size
+        return available if available > 0 else None
 
     def fit_chunk(
         self,
@@ -166,6 +170,10 @@ class PrefillBudget:
         immediate = extend_input_len + self.page_size + extra_tokens
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
+
+    def reserve_unfinished_chunk(self, remaining_tokens: int) -> None:
+        """Keep later admissions away from a single-pool continuation's rest."""
+        self.reserve(remaining_tokens, 0, is_chunked_continuation=True)
 
 
 class SWAPrefillBudget(PrefillBudget):
@@ -315,6 +323,9 @@ class SWAPrefillBudget(PrefillBudget):
                 max_new_tokens,
                 chunk_limit=chunk_limit,
             )
+
+    def reserve_unfinished_chunk(self, remaining_tokens: int) -> None:
+        """SWA keeps only a window between chunks, so the rest needs no slot."""
 
 
 class SharedSWAPrefillBudget(SWAPrefillBudget):
