@@ -83,6 +83,18 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def matches_abort_rid(req_rid: str, abort_rid: str) -> bool:
+    """Whether an ``AbortReq`` carrying ``abort_rid`` targets ``req_rid``.
+
+    A caller-supplied ``rid`` is expanded by ``GenerateReqInput._normalize_rid``
+    into the sub-request ids ``f"{rid}_{i}"`` (batch requests, parallel
+    sampling), so those children must remain abortable through their parent
+    rid. Matching on a bare prefix would instead also abort unrelated requests
+    such as ``job-10`` when the caller aborts ``job-1``.
+    """
+    return req_rid == abort_rid or req_rid.startswith(abort_rid + "_")
+
+
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for single-request IPC payloads."""
 
