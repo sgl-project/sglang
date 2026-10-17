@@ -45,9 +45,16 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
+            // Proto3 has no null, so an unset `max_new_tokens` cannot be
+            // distinguished from "no limit" on the wire. Mirror the HTTP
+            // `null` behavior: forward an explicit JSON null (no limit)
+            // instead of omitting the key, which the scheduler would read as
+            // the 128-token `SamplingParams` default. See #44121.
+            map.insert(
+                "max_new_tokens".into(),
+                p.max_new_tokens
+                    .map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
+            );
             if let Some(v) = p.min_new_tokens {
                 map.insert("min_new_tokens".into(), serde_json::json!(v));
             }
@@ -644,6 +651,72 @@ mod tests {
             assert!(!mapped.contains_key("priority"));
             assert!(!mapped.contains_key("require_reasoning"));
             assert!(!mapped.contains_key("max_thinking_tokens"));
+        }
+    }
+
+    #[test]
+    fn unset_max_new_tokens_maps_to_null_not_omitted() {
+        // Regression test for https://github.com/sgl-project/sglang/issues/44121:
+        // proto3 has no null, so an unset max_new_tokens must be forwarded as
+        // an explicit JSON null (no limit) instead of being omitted, which the
+        // scheduler would read as the 128-token SamplingParams default.
+        let text_request = proto::TextGenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.0),
+                ignore_eos: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let token_request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.0),
+                ignore_eos: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("request-1", &text_request).unwrap(),
+            build_generate_dict("request-2", &token_request).unwrap(),
+        ] {
+            let sampling_params = mapped["sampling_params"].as_object().unwrap();
+            assert!(
+                sampling_params.contains_key("max_new_tokens"),
+                "unset max_new_tokens must be forwarded explicitly, got: {sampling_params:?}"
+            );
+            assert_eq!(
+                sampling_params["max_new_tokens"],
+                serde_json::Value::Null,
+                "unset max_new_tokens must map to null (no limit)"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_max_new_tokens_still_maps_to_value() {
+        let text_request = proto::TextGenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                max_new_tokens: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let token_request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                max_new_tokens: Some(64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for mapped in [
+            build_text_generate_dict("request-1", &text_request).unwrap(),
+            build_generate_dict("request-2", &token_request).unwrap(),
+        ] {
+            let sampling_params = mapped["sampling_params"].as_object().unwrap();
+            assert_eq!(sampling_params["max_new_tokens"], serde_json::json!(64));
         }
     }
 
