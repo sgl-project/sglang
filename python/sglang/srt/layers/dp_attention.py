@@ -14,7 +14,6 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -680,7 +679,7 @@ def _dp_gather_via_all_reduce(
         assert global_tokens.dtype == torch.bfloat16
         reduced = outplace_all_reduce(
             global_tokens,
-            group_name=get_tp_group().unique_name,
+            group_name=get_parallel().tp_group.unique_name,
             outplace_all_reduce_method="ca",
         )
         copy_bf16_canonical_zero(global_tokens, reduced)

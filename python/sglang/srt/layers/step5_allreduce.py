@@ -6,16 +6,10 @@ from typing import Optional
 import torch
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import all_reduce_fusion
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_attn_tp_group,
-    get_moe_ep_group,
-    get_moe_tp_group,
-    in_the_same_node_as,
-)
+from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.layers.flashinfer_comm_fusion import (
     FlashInferWorkspaceManager,
     resolve_flashinfer_allreduce_fusion_backend,
@@ -60,13 +54,15 @@ def _get_comm() -> Optional[CustomAllReduceV2]:
         or not (a2a_backend.is_none() or a2a_backend.is_megamoe())
     ):
         return None
-    group = get_tp_group()
-    moe_group = get_moe_ep_group() if parallel.moe_ep_size > 1 else get_moe_tp_group()
+    group = parallel.tp_group
+    moe_group = (
+        parallel.moe_ep_group if parallel.moe_ep_size > 1 else parallel.moe_tp_group
+    )
     if (
         not isinstance(group.ca_comm, CustomAllReduceV2)
         or group.ca_comm.disabled
         or not group.ca_comm.has_multicast
-        or group.ranks != get_attn_tp_group().ranks
+        or group.ranks != parallel.attn_tp_group.ranks
         or group.ranks != moe_group.ranks
         or not all(in_the_same_node_as(group.cpu_group, source_rank=0))
     ):
@@ -99,7 +95,7 @@ def _get_verify_workspace():
 
     import torch.distributed as dist
 
-    group = get_tp_group()
+    group = get_parallel().tp_group
     # The package version alone does not identify the RMSNorm arithmetic fix.
     try:
         from flashinfer.jit.comm import gen_trtllm_mnnvl_comm_module
@@ -343,7 +339,7 @@ class Step5BoundaryFusions:
             )
         if (
             isinstance(owed, UnreducedOutput)
-            and owed.group is get_tp_group()
+            and owed.group is get_parallel().tp_group
             and self._can_use_verify_workspace(owed.partial, residual)
         ):
             return self._verify_allreduce_norm(owed.partial, residual, plan.norm)
