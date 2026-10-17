@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from weakref import WeakValueDictionary
 
 import msgspec
 import numpy as np
@@ -89,15 +90,19 @@ rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, Set[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 cond_dict_lock = asyncio.Lock()
-rid_to_cond: Dict[str, asyncio.Condition] = {}
+# Waiters and notifiers own their condition while using it. A metadata pull that
+# times out before encode publishes has no request state for the sweeper to free.
+rid_to_cond: WeakValueDictionary[str, asyncio.Condition] = WeakValueDictionary()
 encode_state_condition = asyncio.Condition()
 
 
 async def _get_receive_condition(req_id: str) -> asyncio.Condition:
     async with cond_dict_lock:
-        if req_id not in rid_to_cond:
-            rid_to_cond[req_id] = asyncio.Condition()
-        return rid_to_cond[req_id]
+        cond = rid_to_cond.get(req_id)
+        if cond is None:
+            cond = asyncio.Condition()
+            rid_to_cond[req_id] = cond
+        return cond
 
 
 async def _notify_receive_waiters(req_id: str) -> None:
