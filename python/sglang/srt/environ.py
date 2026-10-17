@@ -572,6 +572,10 @@ class Envs:
     # Per-call move cap on a non-urgent lazy-compaction flush, so a large
     # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
     SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    # Max pages one compaction move-kernel launch copies (eager or lazy, urgent
+    # or not); a larger move is issued as consecutive launches of this size
+    # within the same compaction call.
+    SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)

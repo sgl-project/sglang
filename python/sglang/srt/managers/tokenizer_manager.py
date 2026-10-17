@@ -2434,8 +2434,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self._dispatch_to_scheduler(FreezeGCReq())
-        freeze_gc("Tokenizer Manager")
+        gc_threshold = get_device().gc_threshold
+        self._dispatch_to_scheduler(FreezeGCReq(gc_threshold=gc_threshold))
+        freeze_gc("Tokenizer Manager", gc_threshold)
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):

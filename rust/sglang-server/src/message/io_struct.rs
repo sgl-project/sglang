@@ -92,6 +92,12 @@ control_messages! {
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
 
+    /// `/flush_cache`'s control request: the scheduler flushes its caches in
+    /// its own loop, waiting up to `timeout_s` for running requests to drain.
+    FlushCacheReqInput {
+        timeout_s: Option<f64>,
+    }
+
     /// `/weights_checker`'s control request: every scheduler rank runs the
     /// weight checker's `action` on the runners `selector` names.
     CheckWeightsReqInput {
@@ -167,6 +173,12 @@ impl GetInternalStateReq {
     }
 }
 
+impl FlushCacheReqInput {
+    pub fn new(rid: String, timeout_s: Option<f64>) -> Self {
+        Self { rid, timeout_s }
+    }
+}
+
 impl CheckWeightsReqInput {
     pub fn new(
         rid: String,
@@ -216,6 +228,24 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    #[test]
+    fn flush_cache_req_msgpack_shape() {
+        let b = FlushCacheReqInput::new("7".into(), Some(30.0))
+            .encode()
+            .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            4,
+            "FlushCacheReqInput = [tag, rid, http_ipc, timeout_s]"
+        );
+        assert_eq!(arr[0].as_str(), Some("FlushCacheReqInput"));
+        assert_eq!(arr[1].as_str(), Some("7"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_f64(), Some(30.0));
     }
 
     #[test]
