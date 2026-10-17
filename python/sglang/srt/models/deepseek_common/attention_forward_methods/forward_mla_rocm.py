@@ -1090,7 +1090,13 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = (
+                None
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI or is_kv_b_lora_active(self)
+                else self.fused_absorb_v_epilogue(attn_output)
+            )
+            if attn_bmm_output is None:
+                attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (

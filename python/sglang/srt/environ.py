@@ -1029,6 +1029,9 @@ class Envs:
     # gfx950: run the head-padded asm MLA target verify with a unit-scale fp8 query
     # (the a8w8 kernel) instead of bf16, as the qlen > 4 path already does.
     SGLANG_AITER_MLA_VERIFY_FP8_Q = EnvBool(True)
+    # Kimi-K3 on gfx950: combine the split MLA decode/verify partials, the W_vc
+    # up-projection and the output gate in one kernel for up to 64 query rows.
+    SGLANG_ROCM_K3_FUSED_MLA_EPILOGUE = EnvBool(True)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
