@@ -444,6 +444,13 @@ def _local_prefill_cuda_graph_vote(
         return True
     if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
         return False
+    backend_vote = prefill_graph_runner._backend_vote_prefill_cuda_graph
+    if (
+        mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and backend_vote is not None
+        and not backend_vote(local_batch)
+    ):
+        return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,
