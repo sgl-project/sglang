@@ -28,7 +28,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     use_mla_backend,
 )
-from sglang.srt.configs.model_config import uses_kda_attention
+from sglang.srt.configs.model_config import is_hybrid_swa_model, uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
@@ -39,6 +39,17 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+# DeepSeek V4 keeps its sliding-window KV in its own pool; Inkling asserts the hybrid SWA pool.
+_HYBRID_SWA_POOL_REQUIRED_ARCHS = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
+        "DeepseekV4ForCausalLMDSpark",
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
+    }
+)
 
 
 # Largest GQA group DISPATCH_DECODE instantiates in sgl-kernel-xpu flash_attention.cpp.
@@ -618,9 +629,11 @@ def handle_deterministic_inference(server_args: Any):
 
         run_post_process_pass(server_args, _deterministic_sampling_backend)
         is_deepseek_model = False
+        is_hybrid_swa = False
         if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
             try:
-                hf_config = model_config_of(server_args).hf_config
+                model_config = model_config_of(server_args)
+                hf_config = model_config.hf_config
                 model_arch = hf_config.architectures[0]
                 is_deepseek_model = model_arch in [
                     "DeepseekV2ForCausalLM",
@@ -632,6 +645,12 @@ def handle_deterministic_inference(server_args: Any):
                     "Glm4MoeLiteForCausalLM",
                     "Glm5NextForConditionalGeneration",
                 ]
+                is_hybrid_swa = is_hybrid_swa_model(
+                    hf_config.architectures, model_config.hf_text_config
+                ) and not any(
+                    arch in _HYBRID_SWA_POOL_REQUIRED_ARCHS
+                    for arch in hf_config.architectures
+                )
             except Exception:
                 pass
 
@@ -661,6 +680,22 @@ def handle_deterministic_inference(server_args: Any):
             )
             logger.warning(
                 f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
+            )
+
+        # With the radix cache, how much of a cached prefix the SWA pool can reuse depends on
+        # which sliding-window KV it has evicted, so a result would depend on earlier requests.
+        if (
+            is_hybrid_swa
+            and not cfg.disable_radix_cache
+            and not cfg.disable_hybrid_swa_memory
+        ):
+            logger.warning(
+                "Disable the hybrid SWA memory pool because deterministic inference is enabled with the radix cache."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_deterministic_inference",
+                disable_hybrid_swa_memory=True,
             )
 
         # Check TP size
