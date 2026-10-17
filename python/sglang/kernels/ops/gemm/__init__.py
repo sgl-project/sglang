@@ -643,3 +643,11 @@ register_kernel(
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.kimi_k3_latent_mxfp4",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.gemm.latent_mxfp4_aiter_hip:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
