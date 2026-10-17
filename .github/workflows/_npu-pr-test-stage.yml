@@ -70,6 +70,7 @@ env:
 
 jobs:
   run:
+    name: ${{ inputs.use_coverage_runner && inputs.self_name || 'run' }} (${{ matrix.partition }})
     runs-on: ${{ inputs.runner_config }}
     container:
       image: ${{ inputs.image }}

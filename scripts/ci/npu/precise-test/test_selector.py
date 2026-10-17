@@ -40,8 +40,15 @@ REPO_NAME = "sglang"
 PRODUCT_PREFIX = "python/sglang/"
 
 
-# Directory prefix of test case folders under coverage data dir.
-TEST_CASE_DIR_PREFIX = "____w__sglang__sglang__test__"
+# Encoded workspace marker in test case folder names under the coverage
+# data dir. run_tests_with_coverage.sh encodes the absolute test path, so
+# folder names embed the runner's checkout root: ____w__sglang__sglang__...
+# (k8s pool, /__w/sglang/sglang) or __home__runner__work__sglang__sglang__...
+# (hosted runners, /home/runner/work/sglang/sglang). Everything through the
+# first __sglang__sglang__ anchor is the workspace root; what follows is the
+# test/ layout (registered CI tests) or the python/sglang/ layout
+# (multimodal case-level node ids).
+WORKSPACE_MARKER = "__sglang__sglang__"
 
 # Coverage density threshold: proportion of changed lines covered
 # Range: 0.0 ~ 1.0, higher value = stricter filtering
@@ -79,7 +86,7 @@ def _get_test_files_from_pr_diff(diff_file: str) -> list[str]:
     #   - rename to test/registered/unit/xxx/test_xxx.py (renamed test file)
     # Test files must be in test/ directory and start with test_
     test_file_pattern = re.compile(
-        r"^(?:\+\+\+ [ab]/|rename to )((?:test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py))",
+        r"^(?:\+\+\+ [ab]/|rename to )((?:test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py|python/sglang/multimodal_gen/test(?:/.+)?/test_\w+\.py))",
         re.MULTILINE,
     )
 
@@ -127,7 +134,7 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
     # Pattern to match deleted test files (test/registered/ directory)
     # Match --- a/test/... followed by +++ /dev/null (deleted file marker)
     deleted_pattern = re.compile(
-        r"^--- a/(test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py)\s*\n\s*\+\+\+ [ab]?/dev/null",
+        r"^--- a/(test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py|python/sglang/multimodal_gen/test(?:/.+)?/test_\w+\.py)\s*\n\s*\+\+\+ [ab]?/dev/null",
         re.MULTILINE,
     )
 
@@ -173,10 +180,10 @@ class CoverageSelector:
             if not item.is_dir():
                 continue
             name = item.name
-            # sglang naming: ____w__sglang__sglang__test__... (GitHub Actions encoded path)
-            is_sglang_layout = TEST_CASE_DIR_PREFIX and name.startswith(
-                TEST_CASE_DIR_PREFIX
-            )
+            # sglang naming: encoded absolute test path under the runner's
+            # checkout root — ____w__sglang__sglang__test__... (k8s pool) or
+            # __home__runner__work__sglang__sglang__test__... (hosted runners)
+            is_sglang_layout = name.startswith("__") and WORKSPACE_MARKER in name
             if not is_sglang_layout:
                 continue
             # coverage.* files directly under test case dir (sglang)
@@ -189,18 +196,24 @@ class CoverageSelector:
     def normalize_test_name(test_name: str) -> str:
         """
         Convert test case directory name to standard script name format.
-        sglang (GitHub Actions encoded dir name: /__w/sglang/sglang/test/... -> ____w__sglang__sglang__test__...):
-        - ____w__sglang__sglang__test__registered__npu__xxx__test_foo.py
+        sglang (encoded dir name: <encoded workspace root><test or python path>):
+        - k8s pool: /__w/sglang/sglang/... -> ____w__sglang__sglang__...
+        - hosted runners: /home/runner/work/sglang/sglang/... -> __home__runner__work__sglang__sglang__...
+        - ...test__registered__npu__xxx__test_foo
           -> test/registered/npu/xxx/test_foo.py (file-level)
         - ...--test_foo -> test/registered/npu/xxx/test_foo.py::test_foo (function-level)
+        - ...python__sglang__multimodal_gen__...__test_foo.py--Class--test_bar[case_id]
+          -> python/sglang/multimodal_gen/.../test_foo.py::Class::test_bar[case_id] (multimodal case-level)
         """
-        # sglang layout: strip ____w__sglang__sglang__test__ prefix (encoded /__w/sglang/sglang/test/)
-        if not TEST_CASE_DIR_PREFIX or not test_name.startswith(TEST_CASE_DIR_PREFIX):
+        # sglang layout: the encoded workspace root ends with the
+        # __sglang__sglang__ anchor (k8s and hosted runners alike).
+        if not test_name.startswith("__") or WORKSPACE_MARKER not in test_name:
             return test_name
-        # rest: encoded path after /test/ (e.g. registered__npu__xxx__test_foo.py)
-        rest = test_name[len(TEST_CASE_DIR_PREFIX) :]
-        # Restore test/ prefix (TEST_CASE_DIR_PREFIX ends with test__, __ encodes /)
-        result = "test/" + rest.replace("__", "/")
+        # rest: encoded workspace-relative path (test__registered__... or
+        # python__sglang__...), split at the FIRST anchor so multimodal
+        # python/sglang paths are never truncated.
+        _, _, rest = test_name.partition(WORKSPACE_MARKER)
+        result = rest.replace("__", "/")
         # Handle function-level marker: .../test_foo.py--test_bar -> .../test_foo.py::test_bar
         result = result.replace("--", "::")
         # File-level tests need .py suffix; avoid double .py when name already ends with .py
@@ -1899,7 +1912,20 @@ def main():
     # Add new test files
     existing_test_names = {s[0] for s in base_selected}
     for test_name in new_test_files:
-        if test_name not in existing_test_names:
+        if test_name in existing_test_names:
+            continue
+        # Multimodal map keys are case-level pytest node ids: expand a changed
+        # test file into its case-level keys from the map; fall back to the
+        # file path itself when the map has no cases for it.
+        case_keys = [
+            key for key in selector.test_case_map if key.split("::")[0] == test_name
+        ]
+        if case_keys:
+            for key in case_keys:
+                if key not in existing_test_names:
+                    base_selected.append((key, {}, 0))
+                    existing_test_names.add(key)
+        else:
             base_selected.append((test_name, {}, 0))
             existing_test_names.add(test_name)
 

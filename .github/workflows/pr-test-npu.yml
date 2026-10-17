@@ -5,7 +5,7 @@ on:
     branches: [ main ]
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
-  pull_request:
+  # pull_request:
   workflow_dispatch:
     inputs:
       coverage_mode:
@@ -169,6 +169,84 @@ jobs:
           cd test
           python3 run_suite.py --hw npu --suite base-a-test-npu
 
+  # Coverage-mode-only counterpart of the base-a PR gate above. Unlike the
+  # other coverage jobs it stays on ubuntu-latest: the base-a suite is
+  # CPU-only by contract (its UTs mock torch_npu/sgl_kernel_npu and require a
+  # CPU triton), and the NPU image's triton-ascend conflicts with those mocks
+  # at import time (collection error on the 800t pool). The shared
+  # _npu-pr-test-stage.yml template cannot be used because its CANN
+  # `container:` block is unconditional. Coverage data is shipped to
+  # setup-covstub via an artifact (downloaded and merged into the shared-disk
+  # RUN_DIR) instead of being written to the shared disk directly.
+  base-a-test-npu-cov:
+    needs: [set-image-config]
+    if: ${{ inputs.coverage_mode == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Pin to the event SHA so this job tests the same commit as the rest of the run.
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_npu.toml'
+
+      - name: Install dependencies
+        timeout-minutes: 30
+        env:
+          # uv pip targets a venv by default; setup-python has no venv.
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          # Same dependency set as the base-a PR gate above (CPU torch + CPU
+          # triton, no Ascend wheels); keep the two blocks in sync.
+          rm -f python/pyproject.toml
+          mv python/pyproject_npu.toml python/pyproject.toml
+          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple/ \
+            --index-strategy unsafe-best-match
+          uv pip install -e "python[dev_npu]" --index-strategy unsafe-best-match
+          pip install coverage==7.8.*
+
+      - name: Run test with coverage
+        timeout-minutes: 15
+        run: |
+          # Hosted runners cannot write the shared /root/.cache disk; stage
+          # coverage data locally. run_tests_with_coverage.sh derives RUN_DIR
+          # and the date tag from run-level GITHUB_* env vars, so the staged
+          # layout matches the shared-disk layout exactly and setup-covstub
+          # can merge it 1:1 after downloading this artifact.
+          export PRECISE_TEST_CACHE_ROOT=/tmp/precise-test
+          cd test
+          python3 ../scripts/ci/npu/precise-test/list_tests.py --hw npu --suite base-a-test-npu \
+            -o /tmp/selected_tests.txt
+          echo "Selected test files:"
+          cat /tmp/selected_tests.txt
+          if [ -s /tmp/selected_tests.txt ]; then
+            bash ../scripts/ci/npu/precise-test/run_tests_with_coverage.sh $(cat /tmp/selected_tests.txt)
+          fi
+
+      - name: Upload coverage outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-outputs-base-a-test-npu
+          path: /tmp/precise-test/
+          retention-days: 7
+          if-no-files-found: warn
+
   base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
@@ -242,7 +320,7 @@ jobs:
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -290,7 +368,10 @@ jobs:
         run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
 
       - name: Run test
-        timeout-minutes: 60
+        # Coverage mode: round-robin sharding is less balanced than PR-mode
+        # LPT (heavier part gets 4 targets incl. server starts per target),
+        # so widen the cap.
+        timeout-minutes: ${{ inputs.coverage_mode == true && 90 || 60 }}
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -299,7 +380,32 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+        # bash only: the k8s runner pool defaults to `sh -e`, which lacks
+        # `[[` and mapfile — under sh the coverage branch silently falls
+        # through to the PR-mode path below.
+        shell: bash
         run: |
+          # Coverage mode: enumerate case-level pytest node ids and run each
+          # through run_tests_with_coverage.sh (per-target coverage dirs on
+          # the 800t shared disk). PR mode below stays unchanged.
+          if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            # Coverage tracing inflates Python-heavy stage timings (e.g. text
+            # encoding ~2.5x); widen the non-denoise stage tolerance so
+            # coverage runs collect data without perf-gating.
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=3.0
+            python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-1-npu-a3 \
+              --auto-partition-id ${{ matrix.part }} \
+              --auto-partition-size 2 \
+              -o /tmp/selected_tests.txt
+            echo "Selected test targets:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              mapfile -t targets < /tmp/selected_tests.txt
+              bash scripts/ci/npu/precise-test/run_tests_with_coverage.sh "${targets[@]}"
+            fi
+            exit 0
+          fi
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-npu \
@@ -317,7 +423,7 @@ jobs:
 
   multimodal-gen-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -360,7 +466,10 @@ jobs:
           python3 scripts/ci/utils/diffusion/prefetch_consistency_gt.py
 
       - name: Run test
-        timeout-minutes: 60
+        # Coverage mode: round-robin sharding is less balanced than PR-mode
+        # LPT (heavier part gets 4 targets incl. server starts per target),
+        # so widen the cap.
+        timeout-minutes: ${{ inputs.coverage_mode == true && 90 || 60 }}
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -369,7 +478,32 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+        # bash only: the k8s runner pool defaults to `sh -e`, which lacks
+        # `[[` and mapfile — under sh the coverage branch silently falls
+        # through to the PR-mode path below.
+        shell: bash
         run: |
+          # Coverage mode: enumerate case-level pytest node ids and run each
+          # through run_tests_with_coverage.sh (per-target coverage dirs on
+          # the 800t shared disk). PR mode below stays unchanged.
+          if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
+            pip install coverage==7.8.*
+            # Coverage tracing inflates Python-heavy stage timings (e.g. text
+            # encoding ~2.5x); widen the non-denoise stage tolerance so
+            # coverage runs collect data without perf-gating.
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=3.0
+            python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-4-npu-a3 \
+              --auto-partition-id ${{ matrix.part }} \
+              --auto-partition-size 2 \
+              -o /tmp/selected_tests.txt
+            echo "Selected test targets:"
+            cat /tmp/selected_tests.txt
+            if [ -s /tmp/selected_tests.txt ]; then
+              mapfile -t targets < /tmp/selected_tests.txt
+              bash scripts/ci/npu/precise-test/run_tests_with_coverage.sh "${targets[@]}"
+            fi
+            exit 0
+          fi
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-npu \
@@ -572,11 +706,14 @@ jobs:
     needs:
       [
         set-image-config,
+        base-a-test-npu-cov,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
         base-b-test-8-npu-a3,
         base-b-test-16-npu-a3,
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-4-npu-a3,
         base-c-test-acc-2-npu-a3,
         base-c-test-acc-16-npu-a3,
         base-c-test-perf-2-npu-a3,
@@ -594,12 +731,36 @@ jobs:
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Collect base-a coverage artifact
+        # base-a-test-npu-cov runs on ubuntu-latest (its suite mocks the NPU
+        # stack and requires a CPU triton), so its coverage data arrives via
+        # an artifact rather than the shared disk.
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-outputs-base-a-test-npu
+          path: /tmp/base-a-coverage
+
+      - name: Merge base-a coverage into shared run dir
+        run: |
+          # The artifact contains {RUN_DIR}/outputs/... with RUN_DIR derived
+          # from the same run-level GITHUB_RUN_ID/RUN_ATTEMPT as the shared
+          # disk, so it merges 1:1 into the expected layout.
+          CACHE_ROOT="/root/.cache/tests/precise-test"
+          mkdir -p "${CACHE_ROOT}"
+          cp -a /tmp/base-a-coverage/. "${CACHE_ROOT}/"
+          echo "Merged base-a coverage into ${CACHE_ROOT}:"
+          find "${CACHE_ROOT}" -maxdepth 3 -type d | head -20
+
       - name: Copy sglang source to covstub
         run: |
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           COVSTUB="${RUN_DIR}/outputs/covstub"
           mkdir -p "${COVSTUB}"
           cp -r python/sglang "${COVSTUB}/"
+          # _version.py is generated at build time and git-ignored, so it is
+          # missing from the copied tree; coverage html exits non-zero when a
+          # recorded source file has no source on disk. Provide a placeholder.
+          echo '__version__ = "0.0.0"' > "${COVSTUB}/sglang/_version.py"
 
       - name: Build test case map
         shell: bash
@@ -656,6 +817,102 @@ jobs:
           test -s "${MAP_FILE}"
           du -h "${MAP_FILE}"
 
+      - name: Generate HTML coverage report
+        # Best-effort add-on: failures must never block the baseline publish
+        # steps (Archive/Publish) below. continue-on-error keeps the job
+        # green and later steps running, while the step itself still shows
+        # a red ✗ in the UI when generation fails — visible, non-blocking.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          # Date tag derivation must match run_tests_with_coverage.sh.
+          if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
+            COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
+            COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          else
+            COV_DATE_TAG="$(date +%Y%m%d)"
+          fi
+          COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          # Outside outputs/ so the published baseline tar.gz stays unchanged.
+          REPORT_DIR="${RUN_DIR}/htmlcov"
+
+          # Same skip conditions as map building: no data -> nothing to report.
+          if [ ! -d "${COV_ROOT}" ] \
+            || [ "$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)" -eq 0 ]; then
+            echo "::warning::No coverage data found, skip HTML report"
+            exit 0
+          fi
+
+          # Any failure below exits non-zero (parent errexit propagates it),
+          # so this step shows a red ✗ in the UI — while continue-on-error
+          # on the step keeps the job green and the Archive/Publish/Cleanup
+          # steps running. Do NOT convert failures to exit 0 behind an
+          # `if ! ( set -e; ... )` guard: bash ignores -e inside a subshell
+          # running in a condition context, which silently swallowed three
+          # "No module named coverage" failures in run 38713909169.
+
+          # The CANN image python has no coverage package (the test jobs
+          # install it via "pip install coverage==7.8.*"); keep the same pin
+          # so combine can read the SQLite data written by the test runners.
+          if ! python3 -c "import coverage" 2>/dev/null; then
+            pip install coverage==7.8.* \
+              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              --retries 3 --timeout 60 \
+              || pip install coverage==7.8.* -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+          fi
+
+          # Alias runner-specific absolute paths onto the covstub copy so
+          # coverage can find the source to render. First entry must be a
+          # real local path (no wildcards).
+          {
+            echo "[run]"
+            echo "branch = True"
+            echo "[paths]"
+            echo "sglang ="
+            echo "    ${COVSTUB}/sglang/"
+            echo "    */python/sglang/"
+          } > /tmp/report-rc
+
+          # --keep preserves the per-test raw coverage files: the test
+          # case map and the published baseline read them directly.
+          COVERAGE_FILE=/tmp/.coverage-all \
+            python3 -m coverage combine --rcfile=/tmp/report-rc --keep \
+            $(find "${COV_ROOT}" -name 'coverage.*' -type f)
+
+          rm -rf "${REPORT_DIR}"
+          COVERAGE_FILE=/tmp/.coverage-all \
+            python3 -m coverage html --rcfile=/tmp/report-rc \
+            --directory="${REPORT_DIR}"
+
+          # Surface the total directly on the run page.
+          # GITHUB_STEP_SUMMARY may be unset on the k8s runner pool.
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### Coverage"
+              echo '```'
+              COVERAGE_FILE=/tmp/.coverage-all \
+                python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
+              echo '```'
+              echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`index.html\`."
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          echo "HTML coverage report: ${REPORT_DIR}"
+
+      - name: Upload HTML coverage report
+        # Report upload must never block the baseline publish pipeline.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-report
+          path: /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/htmlcov
+          if-no-files-found: ignore
+
       - name: Archive outputs
         run: |
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
@@ -688,8 +945,16 @@ jobs:
           mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
           mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
 
+          # Also keep the HTML report on the shared disk, one tar.gz per run
+          # (packaged to avoid flooding the disk with many small HTML files).
+          # Old copies accumulate; prune manually when needed.
+          if [ -d "${RUN_DIR}/htmlcov" ]; then
+            tar -czf "${PUBLISH_DIR}/htmlcov-${{ github.run_id }}-attempt-${{ github.run_attempt }}.tar.gz" \
+              -C "${RUN_DIR}" htmlcov
+          fi
+
           echo "Published baseline to ${PUBLISH_DIR}"
-          du -h "${PUBLISH_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/test_case_map.json"
+          ls -lh "${PUBLISH_DIR}" | tail -n +2
 
       - name: Clean up per-run directory
         # Skipped on publish failure, keeping RUN_DIR for manual recovery.
@@ -706,6 +971,7 @@ jobs:
         check-changes,
 
         base-a-test-npu,
+        base-a-test-npu-cov,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,

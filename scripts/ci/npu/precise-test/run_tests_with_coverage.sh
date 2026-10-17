@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CACHE_ROOT="/root/.cache/tests/precise-test"
+# Overridable so jobs without shared-disk access (e.g. hosted ubuntu runners)
+# can stage coverage data locally and ship it to setup-covstub via an artifact.
+CACHE_ROOT="${PRECISE_TEST_CACHE_ROOT:-/root/.cache/tests/precise-test}"
 
 # Per-CI-run, per-attempt unique directory (no cross-run residue, no overwrite on re-run)
 RUN_ID="${GITHUB_RUN_ID:-local}"
@@ -36,15 +38,18 @@ results=()
 # Derive a filesystem-safe directory name from a test target:
 #   1. strip the trailing ".py"
 #   2. flatten path separators:  /  ->  __
-#   3. flatten pytest separators: ::  ->  --
+#   3. flatten pytest separators:  ::  ->  --
 #   4. replace any remaining unsafe character with "_"
+#      (keep "[" and "]" so parametrized pytest node ids
+#       ...::test_x[case_id] stay reversible: "]"+first / "["+in-class
+#       / "-"-last are all literals inside the bracket expression)
 # Each test gets its own COVERAGE_FILE so results never collide.
 setup_coverage() {
   local target="$1"
   local name="${target%.py}"
   name="${name//\//__}"
   name="${name//::/--}"
-  name="${name//[^a-zA-Z0-9_.-]/_}"
+  name="${name//[^]a-zA-Z0-9_.[-]/_}"
   local covdir="${COV_ROOT}/${name}"
   mkdir -p "${covdir}"
   export COVERAGE_FILE="${covdir}/coverage"
