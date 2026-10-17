@@ -84,6 +84,54 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
 
+def validate_hisparse_speculative(
+    server_args: ServerArgs, *, is_v4: bool, is_m3: bool
+) -> None:
+    cfg = resolving_view(server_args)
+    algorithm = (cfg.speculative_algorithm or "NONE").upper()
+    if algorithm == "NONE":
+        return
+    supported_algorithms = ("EAGLE", "EAGLE3")
+    if is_v4:
+        supported_algorithms += ("DSPARK",)
+    else:
+        # DSA STANDALONE uses the same linear verify/commit path as EAGLE.
+        supported_algorithms += ("STANDALONE",)
+    if is_m3 or algorithm not in supported_algorithms:
+        raise ValueError(
+            "HiSparse speculative decoding supports DSA with linear EAGLE/EAGLE3, "
+            "or STANDALONE, and DeepSeek V4 with linear EAGLE/EAGLE3 "
+            "or DSPARK."
+        )
+    if (cfg.speculative_eagle_topk or 1) != 1:
+        raise ValueError(
+            "HiSparse requires linear speculation; use --speculative-eagle-topk 1."
+        )
+    if cfg.speculative_adaptive:
+        raise ValueError(
+            "HiSparse uses fixed verify width; --speculative-adaptive is unsupported."
+        )
+    if algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "HiSparse DSPARK requires fixed verify width; "
+                "set SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+    if is_v4 and (get_platform().is_hip or get_platform().is_xpu):
+        raise ValueError(
+            "HiSparse DeepSeek V4 speculative transfers require NVIDIA CUDA."
+        )
+    if is_v4 and cfg.page_size != 256:
+        raise ValueError(
+            "HiSparse DeepSeek V4 speculation requires --page-size 256 (64 C4 slots)."
+        )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -111,20 +159,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
     validate_hisparse_feature_combos(server_args)
 
-    enable_spec = (
-        cfg.speculative_algorithm is not None
-        and cfg.speculative_algorithm.upper() != "NONE"
+    validate_hisparse_speculative(
+        server_args, is_v4=is_v4_hisparse, is_m3=is_m3_hisparse
     )
-    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
-        raise ValueError(
-            "The minimal HiSparse spec integration supports linear speculation "
-            "only; use --speculative-eagle-topk 1."
-        )
-    if enable_spec and cfg.speculative_adaptive:
-        raise ValueError(
-            "HiSparse speculative decoding uses statically sized swap state; "
-            "--speculative-adaptive is not supported."
-        )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
