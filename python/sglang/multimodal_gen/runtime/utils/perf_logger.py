@@ -51,7 +51,7 @@ class MemorySnapshot:
         }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(eq=False)
 class RequestMetrics:
     """Performance metrics for a single request, including timings and memory snapshots."""
 
@@ -148,15 +148,15 @@ def get_git_commit_hash() -> str:
         if not commit_hash:
             commit_hash = (
                 subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                    ["git", "rev-parse", "HEAD"],
+                    stderr=subprocess.DEVNULL,
+                    cwd=os.path.dirname(os.path.abspath(sglang.__file__)),
                 )
                 .strip()
                 .decode("utf-8")
             )
-        _CACHED_COMMIT_HASH = commit_hash
         return commit_hash
     except (subprocess.CalledProcessError, FileNotFoundError):
-        _CACHED_COMMIT_HASH = "N/A"
         return "N/A"
 
 
@@ -462,7 +462,7 @@ class PerformanceLogger:
     def log_request_summary(
         cls,
         metrics: "RequestMetrics",
-        tag: str = "total_inference_time",
+        tag: str = "pipeline_stage_metrics",
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
@@ -486,7 +486,7 @@ class PerformanceLogger:
         record = RequestPerfRecord(
             metrics.request_id,
             commit_hash=get_git_commit_hash(),
-            tag="pipeline_stage_metrics",
+            tag=tag,
             stages=formatted_stages,
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,
