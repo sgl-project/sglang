@@ -1,4 +1,8 @@
-"""XPU coverage for the FLUX.2 LayerNorm+modulate and gated residual norm fast paths."""
+"""FLUX.2 XPU LayerNorm+modulate and gated residual norm fast paths.
+
+The fusion cases need an Intel XPU; the Intel-Triton import regression runs
+on any device, so the file is also registered on the CPU suite.
+"""
 
 import subprocess
 import sys
@@ -17,9 +21,10 @@ from sglang.kernels.ops.diffusion import (
     xpu_gated_resnorm,
     xpu_layernorm_modulate,
 )
-from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 _HIDDEN = 6144
@@ -40,6 +45,45 @@ def _inputs(rows: int, magnitude: float, seed: int):
     params = (torch.randn(1, 1, 3 * _HIDDEN, device="xpu") * 0.5).bfloat16()
     gate, scale, shift = params.chunk(3, dim=-1)
     return x, update, gate.contiguous(), scale.contiguous(), shift.contiguous()
+
+
+class TestFlux2ImportWithoutIntelTriton(CustomTestCase):
+    # Runs on any device: the subprocess only imports flux_2.
+    def test_flux2_imports_without_intel_triton(self):
+        # Regression: the kernel module imported `triton.language.extra.intel`
+        # at module scope. The package facade resolves `_EXPORTS` eagerly on
+        # attribute access, so flux_2.py's top-level import of the XPU entry
+        # points made Intel Triton an import-time requirement on *every*
+        # platform -- `import flux_2` then raised ModuleNotFoundError on CUDA,
+        # taking out FLUX.2 there entirely. Run in a subprocess so blocking the
+        # module cannot leak into this interpreter's import state.
+        script = textwrap.dedent(
+            """
+            import importlib.abc
+            import sys
+
+            import triton
+            import triton.language  # import triton fully first, as CUDA would
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.startswith("triton.language.extra.intel"):
+                        raise ImportError(name)
+                    return None
+
+            for mod in [m for m in sys.modules if "extra.intel" in m]:
+                del sys.modules[mod]
+            if hasattr(triton.language.extra, "intel"):
+                del triton.language.extra.intel
+            sys.meta_path.insert(0, Blocker())
+
+            import sglang.multimodal_gen.runtime.models.dits.flux_2  # noqa: F401
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
 
 @unittest.skipUnless(_has_xpu(), "requires an Intel XPU")
@@ -107,42 +151,6 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         x = torch.randn(1, 8, 3072, device="xpu", dtype=torch.bfloat16)
         row = torch.randn(3072, device="xpu", dtype=torch.bfloat16)
         self.assertFalse(can_use_xpu_layernorm_modulate(x, row, row))
-
-    def test_flux2_imports_without_intel_triton(self):
-        # Regression: the kernel module imported `triton.language.extra.intel`
-        # at module scope. The package facade resolves `_EXPORTS` eagerly on
-        # attribute access, so flux_2.py's top-level import of the XPU entry
-        # points made Intel Triton an import-time requirement on *every*
-        # platform -- `import flux_2` then raised ModuleNotFoundError on CUDA,
-        # taking out FLUX.2 there entirely. Run in a subprocess so blocking the
-        # module cannot leak into this interpreter's import state.
-        script = textwrap.dedent(
-            """
-            import importlib.abc
-            import sys
-
-            import triton
-            import triton.language  # import triton fully first, as CUDA would
-
-            class Blocker(importlib.abc.MetaPathFinder):
-                def find_spec(self, name, path=None, target=None):
-                    if name.startswith("triton.language.extra.intel"):
-                        raise ImportError(name)
-                    return None
-
-            for mod in [m for m in sys.modules if "extra.intel" in m]:
-                del sys.modules[mod]
-            if hasattr(triton.language.extra, "intel"):
-                del triton.language.extra.intel
-            sys.meta_path.insert(0, Blocker())
-
-            import sglang.multimodal_gen.runtime.models.dits.flux_2  # noqa: F401
-            """
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True
-        )
-        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
 
 if __name__ == "__main__":

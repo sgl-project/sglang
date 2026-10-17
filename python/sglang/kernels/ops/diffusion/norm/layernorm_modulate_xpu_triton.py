@@ -33,11 +33,11 @@ versions may pick a different work-group size, so callers must verify
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+
+from sglang.srt.environ import envs
 
 try:
     from triton.language.extra.intel import libdevice  # type: ignore
@@ -57,8 +57,6 @@ _SIMD = 32
 _VEC = 4
 # 8-byte alignment is what torch-xpu requires to take the vectorized kernel for bf16.
 _ALIGN = _VEC * 2
-# Triton threads per program; the result does not depend on it (layout only).
-_NUM_WARPS = int(os.environ.get("SGLANG_XPU_LN_MOD_NUM_WARPS", "4"))
 
 
 @triton.jit
@@ -333,7 +331,7 @@ def xpu_layernorm_modulate(
         WG=_WG,
         SIMD=_SIMD,
         GATED=False,
-        num_warps=_NUM_WARPS,
+        num_warps=envs.SGLANG_XPU_LN_MOD_NUM_WARPS.get(),
     )
     return out
 
@@ -391,7 +389,7 @@ def xpu_gated_resnorm(
         WG=_WG,
         SIMD=_SIMD,
         GATED=True,
-        num_warps=_NUM_WARPS,
+        num_warps=envs.SGLANG_XPU_LN_MOD_NUM_WARPS.get(),
     )
     return out, residual_out
 
