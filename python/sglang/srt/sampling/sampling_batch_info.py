@@ -102,6 +102,12 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
+    # CPU per-row greedy flags (top_k <= 1). They let filter_batch recompute
+    # is_all_greedy / is_any_greedy without a device sync once rows leave the
+    # batch. None when the info was built without them; the two batch flags
+    # are then only combined on merge and never refreshed on filter.
+    greedy_rows: Optional[List[bool]] = None
+
     watermark_keys: Optional[torch.Tensor] = None
     watermark_context_windows: Optional[torch.Tensor] = None
     watermark_enabled: Optional[torch.Tensor] = None
@@ -284,14 +290,16 @@ class SamplingBatchInfo:
             },
         )
 
+        greedy_rows = [r.sampling_params.top_k <= 1 for r in reqs]
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
+            is_all_greedy=all(greedy_rows),
+            is_any_greedy=any(greedy_rows),
+            greedy_rows=greedy_rows,
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
@@ -489,6 +497,14 @@ class SamplingBatchInfo:
             ]
             self.has_watermark_candidates = any(self.watermark_candidates_host)
 
+        if self.greedy_rows is not None:
+            # merge_batch can only clear is_all_greedy (and only set
+            # is_any_greedy), so refresh both here once the rows that changed
+            # them have left the batch.
+            self.greedy_rows = [self.greedy_rows[i] for i in keep_indices]
+            self.is_all_greedy = all(self.greedy_rows)
+            self.is_any_greedy = any(self.greedy_rows)
+
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
         if self.return_sampling_masks is not None:
@@ -630,6 +646,13 @@ class SamplingBatchInfo:
             self.watermark_candidates_host.extend(other.watermark_candidates_host)
             self.has_watermark_candidates = any(self.watermark_candidates_host)
 
+        # Build a new list rather than extend in place: copy_for_forward()
+        # copies share this list with the scheduler's info.
+        self.greedy_rows = (
+            self.greedy_rows + other.greedy_rows
+            if self.greedy_rows is not None and other.greedy_rows is not None
+            else None
+        )
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
