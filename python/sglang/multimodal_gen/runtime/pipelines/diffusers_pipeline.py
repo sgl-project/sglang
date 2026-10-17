@@ -163,11 +163,12 @@ class DiffusersExecutionStage(PipelineStage):
             tensor = torch.from_numpy(data).float()
             if tensor.max() > 1.0:
                 tensor = tensor / 255.0
-            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, C, T, H, W)
+            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, T, C, H, W),
+            # the layout _fix_output_shape expects for videos.
             if tensor.ndim == 4:
                 tensor = tensor.permute(0, 3, 1, 2)
             elif tensor.ndim == 5:
-                tensor = tensor.permute(0, 4, 1, 2, 3)
+                tensor = tensor.permute(0, 1, 4, 2, 3)
             return tensor
 
         if isinstance(data, Image.Image):
@@ -182,36 +183,29 @@ class DiffusersExecutionStage(PipelineStage):
         """Convert a list of items to a tensor."""
         first = data[0]
 
-        # Nested list (e.g., [[frame1, frame2, ...]] for video batches)
-        if isinstance(first, list) and len(first) > 0:
+        # A nested list (e.g., [[frame1, frame2, ...]]) is one video; a flat
+        # list is a batch of images.
+        is_video = isinstance(first, list) and len(first) > 0
+        if is_video:
             data = first
             first = data[0]
 
         if isinstance(first, Image.Image):
-            tensors = [T.ToTensor()(img) for img in data]
-            stacked = torch.stack(tensors)
-            if len(tensors) > 1:
-                return stacked.permute(1, 0, 2, 3)  # (T, C, H, W) -> (C, T, H, W)
-            return stacked[0]
-
-        if isinstance(first, torch.Tensor):
+            stacked = torch.stack([T.ToTensor()(img) for img in data])
+        elif isinstance(first, torch.Tensor):
             stacked = torch.stack(data)
-            if len(data) > 1:
-                return stacked.permute(1, 0, 2, 3)
-            return stacked[0]
-
-        if isinstance(first, np.ndarray):
+        elif isinstance(first, np.ndarray):
             tensors = [torch.from_numpy(arr).float() for arr in data]
             if tensors[0].max() > 1.0:
                 tensors = [t / 255.0 for t in tensors]
             if tensors[0].ndim == 3:
                 tensors = [t.permute(2, 0, 1) for t in tensors]
             stacked = torch.stack(tensors)
-            if len(data) > 1:
-                return stacked.permute(1, 0, 2, 3)
-            return stacked[0]
+        else:
+            return None
 
-        return None
+        # (T, C, H, W) -> (1, T, C, H, W) for a video, else (N, C, H, W)
+        return stacked.unsqueeze(0) if is_video else stacked
 
     def _postprocess_output(self, output: torch.Tensor) -> torch.Tensor:
         """Post-process output tensor to ensure valid values and correct shape."""
@@ -729,7 +723,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.initialize_pipeline(self.server_args)
         self.create_pipeline_stages(self.server_args)
 
-    def add_stage(self, stage_name: str, stage: PipelineStage) -> None:
+    def add_stage(self, stage: PipelineStage, stage_name: str | None = None) -> None:
         """Add a stage to the pipeline."""
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)
