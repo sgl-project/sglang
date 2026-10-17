@@ -135,9 +135,6 @@ class TestFoldedExtendRows(CustomTestCase):
             folded.row_floor,
             torch.tensor([0] * 40 + [384] * 158 + [0] * 84),
         )
-        torch.testing.assert_close(
-            folded.compress_skip, torch.tensor([0, 128, 64], dtype=torch.int32)
-        )
         # Input logprobs cover the same tokens, so their row count is unchanged.
         self.assertEqual(fb.extend_logprob_start_lens, [40, 158, 69])
         logprob_rows = [
@@ -196,6 +193,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             req_pool_indices=fb.req_pool_indices,
             out_cache_loc=fb.out_cache_loc,
             positions=fx.folded_positions(),
+            encoder_swa_compress_rows=fx.folded.keep_rows,
         )
 
     def _tail_metadata(self, backend, forward_batch):
@@ -262,6 +260,40 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         self.assertEqual(int((tail_loc == 0).sum()), 98 + 64)
         torch.testing.assert_close(tail_loc, expected[token_indices])
         torch.testing.assert_close(backend._cache_write_loc(forward_batch), expected)
+
+    def test_unfused_compressor_writes_each_row_at_its_own_slot(self):
+        """Without the fused kernels the compressor gets every folded row and the
+        slot of that same row: new rows their KV slots, replay rows the padding
+        slot. It used to drop the replay rows from the rows but not from the
+        slots, so each new row landed on another row's slot."""
+        fx = _Fixture()
+        backend = self._backend(fx)
+        forward_batch = self._forward_batch(fx)
+        write_loc = backend._cache_write_loc(forward_batch)
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(c1_out_loc=write_loc, raw_out_loc=write_loc)
+        )
+        written = []
+        backend._low_ratio_write_group = lambda layer, kv, slots, pos, **_: (
+            written.append((kv, slots))
+        )
+        layer = SimpleNamespace(
+            compress_ratio=1,
+            layer_id=0,
+            compressor=SimpleNamespace(
+                use_fused_compress=False, project=lambda x: (x, None)
+            ),
+        )
+        fb = fx.folded.batch
+        req = fb.req_pool_indices.repeat_interleave(torch.tensor(fb.extend_lens))
+        rows = torch.arange(write_loc.shape[0], dtype=torch.float32)[:, None]
+        backend._low_ratio_compress(
+            layer, rows, req, forward_batch.positions, forward_batch
+        )
+
+        ((kv, slots),) = written
+        torch.testing.assert_close(kv, rows)
+        torch.testing.assert_close(slots, write_loc)
 
     def test_short_tail_floors_one_window_back(self):
         """A final chunk shorter than a window reads the rows the previous chunk's

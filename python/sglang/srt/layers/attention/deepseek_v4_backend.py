@@ -1633,7 +1633,8 @@ class DeepseekV4AttnBackend(
         return self._bcg_tail_buffers
 
     def _cache_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """The extend's KV write locations, with folded replay rows padded."""
+        """The compressors' write locations for this extend, with folded replay rows
+        on the padding slot."""
         if self.token_to_kv_pool.request_window is None:
             return forward_batch.out_cache_loc
         return _pad_folded_replay_rows(
@@ -3153,11 +3154,6 @@ class DeepseekV4AttnBackend(
             # length is the request count; padded rows belong to no request.
             start_loc = forward_batch.extend_start_loc
             seq_lens = forward_batch.extend_seq_lens[: start_loc.shape[0]]
-            skip = forward_batch.encoder_swa_compress_skip
-            if skip is not None:
-                # Folded replay rows are cached already; compress the new rows only.
-                start_loc = start_loc + skip
-                seq_lens = seq_lens - skip
             self._low_ratio_compress_fused(
                 layer,
                 x,
@@ -3166,9 +3162,6 @@ class DeepseekV4AttnBackend(
                 extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
             )
         else:
-            rows = forward_batch.encoder_swa_compress_rows
-            if rows is not None and forward_batch.forward_mode.is_extend():
-                x, req, pos = x[rows], req[rows], pos[rows]
             self._low_ratio_compress_torch(
                 layer,
                 x,

@@ -12,7 +12,6 @@ class FoldedExtend(msgspec.Struct, frozen=True):
     keep_rows: torch.Tensor  # [original rows] int64, folded-row index of each
     scheduled_row: torch.Tensor  # [folded rows] int64, original row, -1 if replayed
     row_floor: torch.Tensor  # [folded rows] int64
-    compress_skip: torch.Tensor  # [bs] int32, leading replay rows per request
     replay_lens: list[int]  # [bs] leading replay rows per request
     num_rows: int
 
@@ -41,7 +40,6 @@ def folded_replay_rows(batch) -> int:
 
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_row_floor = folded.row_floor
-    forward_batch.encoder_swa_compress_skip = folded.compress_skip
     forward_batch.encoder_swa_compress_rows = folded.keep_rows
 
 
@@ -240,9 +238,6 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         keep_rows=keep_rows.to(device, non_blocking=True),
         scheduled_row=scheduled_row.to(device, non_blocking=True),
         row_floor=row_floor.to(device, non_blocking=True),
-        compress_skip=torch.tensor(replay, dtype=torch.int32).to(
-            device, non_blocking=True
-        ),
         replay_lens=replay,
         num_rows=fold_off,
     )
