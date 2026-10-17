@@ -9,7 +9,10 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import (
+    apply_rotary_emb,
+    rotary_embedding_cpu,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (
@@ -434,7 +437,7 @@ class RotaryEmbedding(BaseFusedOp):
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            return rotary_embedding_cpu(
                 positions,
                 query,
                 key,
