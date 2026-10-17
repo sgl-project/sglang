@@ -586,12 +586,11 @@ def _simulate_balanced_routing(
 class TopK(BaseFusedOp):
     """
     Parameters:
-    --top_k: The all number of top experts selected per token, including the fused shared expert(s).
+    --top_k: the number of routed experts selected per token. When the model being built
+      fuses shared experts (``get_num_fused_shared_experts``), their columns follow: written
+      by the router (``TopKConfig.num_shared_expert_columns``), or appended by Waterfill.
     --layer_id: global index of the owning layer. Required: routed-experts capture and
       per-layer EPLB state are keyed by it.
-    --num_fused_shared_experts: shared experts the experts layer runs as extra expert slots.
-      Their trailing top-k columns are written by the router, or by Waterfill when it is
-      enabled (``TopKConfig.num_shared_expert_columns`` then excludes them).
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
     --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
       topk weight (models pass 1/ep_size under standard EP, where the per-rank shared-expert
@@ -607,7 +606,6 @@ class TopK(BaseFusedOp):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         renormalize: bool = True,
-        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
@@ -630,18 +628,15 @@ class TopK(BaseFusedOp):
 
         self.layer_id = layer_id
 
-        self.enable_waterfill = waterfill_routes_shared_experts(
-            num_fused_shared_experts
-        )
+        self.enable_waterfill = waterfill_routes_shared_experts()
         self.waterfill_balancer = None
-        num_shared_columns = topk_shared_expert_columns(num_fused_shared_experts)
-        num_routed_experts_per_token = top_k - num_fused_shared_experts
+        num_shared_columns = topk_shared_expert_columns()
 
         # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
         # (consumes topk_ids/weights); otherwise BYPASSED. No-op on other backends.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
-            top_k=num_routed_experts_per_token + num_shared_columns,
+            top_k=top_k + num_shared_columns,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,

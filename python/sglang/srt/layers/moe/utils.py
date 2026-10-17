@@ -542,30 +542,44 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
     return moe.speculative_a2a_backend
 
 
+def _refuse_inside_forward(accessor: str) -> None:
+    from sglang.srt.model_executor.forward_context import has_forward_context
+
+    if has_forward_context():
+        raise AssertionError(
+            f"{accessor} called inside a forward: shared-experts fusion is "
+            "construction-time state (it can hold the draft's value while a draft "
+            "builds). Read the value your build baked in, e.g. the layer's "
+            "num_fused_shared_experts."
+        )
+
+
 def is_shared_experts_fusion_disabled() -> bool:
     """The ACTIVE shared-experts-fusion decision for the model being built.
 
-    Written (both ways) by each MoE model's gate before its layers construct;
-    falls back to the config intent when no gate has run (models without an
-    auto-disable gate read the intent directly off the bag instead).
+    Installed by the loader before the model's layers construct; falls back to
+    the config intent when no model has been built.
 
     Construction-time only: a forward reads what its build baked in
     (``num_fused_shared_experts`` on the layer). During a draft's build this
     flag holds the DRAFT's decision, so a forward-time read would race the
     build window — refuse it loudly."""
-    from sglang.srt.model_executor.forward_context import has_forward_context
-
-    if has_forward_context():
-        raise AssertionError(
-            "is_shared_experts_fusion_disabled() called inside a forward: the "
-            "fusion decision is construction-time state (it can hold the draft's "
-            "value while a draft builds). Read the value your build baked in, "
-            "e.g. the layer's num_fused_shared_experts."
-        )
+    _refuse_inside_forward("is_shared_experts_fusion_disabled()")
     moe = get_flags().moe
     if moe.disable_shared_experts_fusion is None:
         return get_exec().moe.disable_shared_experts_fusion
     return moe.disable_shared_experts_fusion
+
+
+def get_num_fused_shared_experts() -> int:
+    """Shared experts the model being built runs as extra expert slots of its
+    MoE layers (0 when fusion is off or the model declares none).
+
+    Installed by the loader together with the fusion decision; construction-time
+    only, for the same reason as ``is_shared_experts_fusion_disabled``."""
+    _refuse_inside_forward("get_num_fused_shared_experts()")
+    num_fused = get_flags().moe.num_fused_shared_experts
+    return 0 if num_fused is None else num_fused
 
 
 @contextmanager
@@ -574,9 +588,10 @@ def draft_model_build_scope():
     settings; every value below returns to the target's on exit, including on
     error.
 
-    - Shared-experts fusion: the gates the draft runs also record their
-      decision on the speculative leaf; the target's ACTIVE
-      ``disable_shared_experts_fusion`` is restored.
+    - Shared-experts fusion: the draft's decision and fused count also land on
+      the speculative leaves; the target's ACTIVE
+      ``disable_shared_experts_fusion`` and ``num_fused_shared_experts`` are
+      restored.
     - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
       Boundaries built here keep the resolved value after exit.
     - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
@@ -589,6 +604,7 @@ def draft_model_build_scope():
     """
     moe = get_flags().moe
     original_fusion = moe.disable_shared_experts_fusion
+    original_num_fused = moe.num_fused_shared_experts
     original_scope = moe.in_speculative_scope
     try:
         moe.in_speculative_scope = True
@@ -604,6 +620,7 @@ def draft_model_build_scope():
     finally:
         moe.in_speculative_scope = original_scope
         moe.disable_shared_experts_fusion = original_fusion
+        moe.num_fused_shared_experts = original_num_fused
 
 
 def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
@@ -618,33 +635,47 @@ def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
 def install_shared_experts_fusion_decision(
     model_class, hf_config, quant_config
 ) -> None:
-    """Decide whether this runner's model fuses its shared experts, and install
-    the answer for the model it is about to build.
+    """Decide whether this runner's model fuses its shared experts, and how many,
+    and install the answer for the model it is about to build.
 
     Called from the loader's single model-instantiation point, so the decision
     is made once per runner — before any layer exists — and the model classes
-    are pure readers (``is_shared_experts_fusion_disabled``). A model family
-    that can auto-disable exposes the conditions as
+    are pure readers (``is_shared_experts_fusion_disabled``,
+    ``get_num_fused_shared_experts``). A model family that can auto-disable
+    exposes the conditions as
     ``shared_experts_fusion_disable_reason(hf_config, quant_config)``; families
-    without one follow the user's intent.
+    without one follow the user's intent. An entry class whose layers fuse
+    shared experts as routed slots also declares how many with
+    ``num_fusable_shared_experts(hf_config)``. One that declares no count, or
+    no gate, fuses none here, so an entry class missing either hook runs its
+    shared experts unfused instead of fusing without its family's conditions.
+    (A block that fuses a gated shared expert of its own, such as Qwen2-MoE's,
+    states that count to its experts layer itself.)
 
     Inside ``draft_model_build_scope`` the answer also lands on the speculative
-    leaf, so a flags dump afterwards shows both runners' decisions.
+    leaves, so a flags dump afterwards shows both runners' decisions.
     """
 
     disabled = get_exec().moe.disable_shared_experts_fusion
+    gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
     if not disabled:
-        gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
         reason = gate(hf_config, quant_config) if gate is not None else None
         if reason:
             log_info_on_rank0(
                 logger, f"{reason} Shared experts fusion optimization is disabled."
             )
             disabled = True
+    count_fusable = getattr(model_class, "num_fusable_shared_experts", None)
+    if disabled or gate is None or count_fusable is None:
+        num_fused = 0
+    else:
+        num_fused = count_fusable(hf_config)
     moe = get_flags().moe
     moe.disable_shared_experts_fusion = disabled
+    moe.num_fused_shared_experts = num_fused
     if moe.in_speculative_scope:
         moe.speculative_disable_shared_experts_fusion = disabled
+        moe.speculative_num_fused_shared_experts = num_fused
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -699,22 +730,21 @@ def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
     return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
 
 
-def waterfill_routes_shared_experts(num_fused_shared_experts: int) -> bool:
-    """Whether Waterfill, not the top-k router, writes the fused shared experts' column.
+def waterfill_routes_shared_experts() -> bool:
+    """Whether Waterfill, not the top-k router, writes the fused shared experts'
+    column for the model being built.
 
     Waterfill appends that column after the EPLB remap and may place it on another
     rank, so the router it follows emits the routed columns only."""
-    return num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+    return get_num_fused_shared_experts() > 0 and get_exec().moe.enable_waterfill
 
 
-def topk_shared_expert_columns(num_fused_shared_experts: int) -> int:
-    """How many trailing top-k columns the router fills with fused shared experts.
-
-    ``num_fused_shared_experts`` counts the shared experts the experts layer runs as
-    extra expert slots; the router writes their columns unless Waterfill does."""
-    if waterfill_routes_shared_experts(num_fused_shared_experts):
+def topk_shared_expert_columns() -> int:
+    """How many trailing top-k columns the router fills with fused shared experts,
+    for the model being built: all of them, unless Waterfill writes them."""
+    if waterfill_routes_shared_experts():
         return 0
-    return num_fused_shared_experts
+    return get_num_fused_shared_experts()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

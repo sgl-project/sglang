@@ -135,7 +135,7 @@ bag to override at all.
   instance: **constructor arguments** (`ModelRunner(draft_attention_backend=...)`,
   `MMEncoder(gpu_id=...)`) and **runner attributes holding the resolved value**
   (`model_runner.kv_cache_dtype_str`, `prefill_attention_backend_str`,
-  `num_fused_shared_experts`, `linear_attn_backends`) — threaded to consumers as
+  `linear_attn_backends`) — threaded to consumers as
   arguments, never backfilled onto a shared object. A per-runner choice also stays
   *out* of the bags: recording it there is how a second runner inherits the first
   one's answer, which is exactly the bug `linear_attn_backends` replaced. The one sanctioned bend in that rule is
@@ -327,7 +327,8 @@ where an object was handed one; it is not a global accessor.
   dist init to answer.
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
-  `draft_attention_backend`, `num_fused_shared_experts` on the model).
+  `draft_attention_backend`); for what the model's layers bake in at
+  construction, the layer (`num_fused_shared_experts` on a MoE block).
 
 `self.server_args.field` is still right for handed per-instance config (see
 "Reads that legitimately stay on a ServerArgs instance" above for the full set —
@@ -451,12 +452,15 @@ Never assign `server_args` fields from model code. Declare instead
   its checkpoint drives (shared-experts fusion) is a question the *loader* asks
   the model class — `shared_experts_fusion_disable_reason(hf_config,
   quant_config)`, a classmethod answering without an instance — at the single
-  model-instantiation point, and
-  `install_shared_experts_fusion_decision` writes the answer to the ACTIVE moe
-  flag before that model's layers build and read it
-  (`is_shared_experts_fusion_disabled`, config-intent fallback).
+  model-instantiation point, together with how many shared experts it fuses
+  (`num_fusable_shared_experts(hf_config)`; an entry class without both hooks
+  fuses none), and `install_shared_experts_fusion_decision` writes both answers
+  to the ACTIVE moe flags before that model's layers build and read them
+  (`is_shared_experts_fusion_disabled`, config-intent fallback;
+  `get_num_fused_shared_experts`, which TopK and the MoE blocks read instead of
+  taking the count as a constructor argument).
   `draft_model_build_scope` brackets every draft build and routes the draft's
-  answer to the speculative leaf, so a draft's decision never overwrites the
+  answers to the speculative leaves, so a draft's decision never overwrites the
   target's. A process-level load-time fact (the sm80 dtype fallback —
   device-driven, identical for every runner) records directly via
   `get_context().override`.

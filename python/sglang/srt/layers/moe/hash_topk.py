@@ -41,7 +41,6 @@ class HashTopK(nn.Module):
         self,
         topk,
         num_experts,
-        num_fused_shared_experts,
         vocab_size,
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
@@ -51,22 +50,18 @@ class HashTopK(nn.Module):
         super().__init__()
         self.layer_id = layer_id
 
-        self.enable_waterfill = waterfill_routes_shared_experts(
-            num_fused_shared_experts
-        )
+        self.enable_waterfill = waterfill_routes_shared_experts()
         self.waterfill_balancer = None
-        num_routed_experts_per_token = topk - num_fused_shared_experts
 
         self.num_experts = num_experts
-        # Trailing columns the hash router fills with fused shared experts.
-        self.num_shared_expert_columns = topk_shared_expert_columns(
-            num_fused_shared_experts
-        )
-        self.topk = num_routed_experts_per_token + self.num_shared_expert_columns
+        # topk counts routed experts; the trailing columns the hash router fills
+        # with fused shared experts follow them.
+        self.num_shared_expert_columns = topk_shared_expert_columns()
+        self.topk = topk + self.num_shared_expert_columns
         self.routed_scaling_factor = routed_scaling_factor
         self.score_func = scoring_func
         self.tid2eid = nn.Parameter(
-            torch.empty(vocab_size, num_routed_experts_per_token, dtype=torch.int32),
+            torch.empty(vocab_size, topk, dtype=torch.int32),
             requires_grad=False,
         )
         self._init_default_tid2eid()

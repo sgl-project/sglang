@@ -167,6 +167,13 @@ class DeepseekVL2ForCausalLM(nn.Module):
             language_config, None
         )
 
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        language_config = hf_config.language_config
+        if not language_config.use_mla:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(language_config)
+
     def __init__(
         self,
         config: DeepseekVL2Config,

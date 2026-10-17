@@ -652,6 +652,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
             hf_config.text_config, quant_config
         )
 
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        if hf_config.encoder_only:
+            return 0
+        return DeepseekV3ForCausalLM.num_fusable_shared_experts(hf_config.text_config)
+
     def __init__(
         self,
         config: KimiK25Config,

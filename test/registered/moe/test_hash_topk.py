@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -38,14 +38,14 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
 
     monkeypatch.setattr(get_resources(), "expert_distribution_recorder", FakeRecorder())
 
-    topk = HashTopK(
-        topk=3,
-        num_experts=256,
-        num_fused_shared_experts=1,
-        vocab_size=2,
-        scoring_func="sqrtsoftplus",
-        routed_scaling_factor=2.5,
-    )
+    with get_flags().moe.override(num_fused_shared_experts=1):
+        topk = HashTopK(
+            topk=2,
+            num_experts=256,
+            vocab_size=2,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=2.5,
+        )
     with torch.no_grad():
         topk.tid2eid.copy_(torch.tensor([[0, 65], [63, 127]], dtype=torch.int32))
 
@@ -88,13 +88,13 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
         hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
     )
 
-    topk = HashTopK(
-        topk=7,
-        num_experts=256,
-        num_fused_shared_experts=1,
-        vocab_size=2,
-        scoring_func="softmax",
-    )
+    with get_flags().moe.override(num_fused_shared_experts=1):
+        topk = HashTopK(
+            topk=6,
+            num_experts=256,
+            vocab_size=2,
+            scoring_func="softmax",
+        )
 
     output = topk.empty_topk_output(torch.device("cpu"))
 

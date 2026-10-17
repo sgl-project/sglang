@@ -1436,6 +1436,15 @@ class DeepseekOCRForCausalLM(nn.Module):
             text_config, quant_config
         )
 
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = hf_config.text_config
+        if is_ocr2_config(hf_config) or not (
+            text_config.topk_method == "noaux_tc" or text_config.use_mla
+        ):
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(text_config)
+
     def __init__(
         self,
         *,
