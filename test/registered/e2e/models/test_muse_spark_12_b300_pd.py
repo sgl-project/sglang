@@ -38,11 +38,11 @@ MOONCAKE_ENV = {
 
 class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
     gsm8k_accuracy_thres = 0.93
-    gsm8k_accept_length_thres = 3.5
-    mmmu_pro_score_threshold = 0.7
+    gsm8k_accept_length_thres = 4.7
+    mmmu_pro_score_threshold = 0.8
     mmmu_pro_num_examples = 50
-    accept_length_thres = 4.0
-    bs_1_speed_thres = 350
+    accept_length_thres = 4.7
+    bs_1_speed_thres = 580
     prefill_tp_size = 4
     decode_tp_size = 4
     # CUDA_VISIBLE_DEVICES remaps decode GPUs 4-7 to local ordinals 0-3.
