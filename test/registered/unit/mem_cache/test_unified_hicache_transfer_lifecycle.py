@@ -30,7 +30,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -164,13 +164,13 @@ def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
     for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
         kvcache = side._kvcache
-        move = kvcache.move_kv_cache
+        move = kvcache.move_physical_pages
 
-        def recorded(dst, src, *, move=move, name=side.sub_pool_name):
+        def recorded(dst, src, page_size, *, move=move, name=side.sub_pool_name):
             log.append(("move", name))
-            return move(dst, src)
+            return move(dst, src, page_size)
 
-        kvcache.move_kv_cache = recorded
+        kvcache.move_physical_pages = recorded
 
 
 class _ConfigCase(unittest.TestCase):
@@ -518,12 +518,13 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.auxiliary_swa_host_hit_length = 0
         req.retracted_stain = False
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
         req.materialized_host_hit_len.return_value = match.host_hit_length
         req.fulfilled_storage_hit_len.return_value = 0
-        req.kv = SimpleNamespace(
+        req.kv = ReqKvInfo(
             cache_protected_len=match.device_prefix_len, mamba_pool_idx=None
         )
         type(req).extend_len = mock.PropertyMock(

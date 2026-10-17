@@ -39,9 +39,10 @@ also applies **admission control**, **failure handling**, and **retries**.
 ### 1.3 Example: load-aware routing
 
 The router tries each **bucket** that fits the request's length, ordered by SLO
-preference, capacity, then `rank`. In each bucket it picks the **less loaded of
-two sampled engines** and checks **admission**; on rejection it moves to the
-next bucket, and returns **503** when none admit. If **dispatch** fails before
+preference, capacity, then `rank`. In each bucket it drops the engines that fail
+**admission**, then picks the **less loaded of two engines sampled** from those
+that remain; when no engine admits the request it moves to the next bucket, and
+returns **503** when no bucket has one. If **dispatch** fails before
 any response and **retries** remain, it excludes that engine and restarts from
 the first bucket.
 
@@ -55,9 +56,9 @@ then KV usage.
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#eaf3fb", "primaryTextColor": "#172b4d", "primaryBorderColor": "#345779", "lineColor": "#345779", "edgeLabelBackground": "#ffffff"}, "flowchart": {"curve": "stepAfter", "rankSpacing": 30, "nodeSpacing": 30}}}%%
 flowchart TD
     R([Request]) --> B["1. Take next compatible bucket"]
-    B --> S["2. Sample engines<br/>Pick the less loaded one"]
-    S --> A{"3. Engine can admit<br/>the request?"}
-    A -->|yes| D["4. Dispatch to engine"]
+    B --> A{"2. Any engine can admit<br/>the request?"}
+    A -->|yes| S["3. Sample two admitted engines<br/>Pick the less loaded one"]
+    S --> D["4. Dispatch to engine"]
     A -->|no| M{"More buckets?"}
     M -->|no| X(["503 to client"])
     D -->|success, or<br/>out of retries| E([Response to client])
@@ -160,9 +161,10 @@ sgl-router --model-id qwen3 --chat-routing reorg \
     `x-session-id` stick to the prefill engine they are bound to.
   - Decode engines use `power_of_two`. To make decode session-aware too, use a
     bucket file whose decode group sets `"policy": "session_aware"`.
-- **Affinity:** the session moves to another engine only when the bound engine
-  has more than 2x its running requests **and** more than 4 extra (the
-  defaults).
+- **Affinity:** in balanced mode the router samples an alternative engine, and
+  the session moves to it when the bound engine has more than 2x the
+  alternative's running requests **and** more than 4 more than it (the
+  defaults). The session also moves when the bound engine fails admission.
 - **Admission:** prefill and decode engines are rejected at 90% KV usage.
 
 ### Example C: P/D buckets from a file

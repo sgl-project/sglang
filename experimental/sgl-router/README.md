@@ -16,7 +16,8 @@ discovers engines from a static URL list or Kubernetes EndpointSlices.
 - [Other features](#other-features)
 
 Related docs: [ARCHITECTURE.md](ARCHITECTURE.md) (routing design and bucket
-configuration), [monitoring/README.md](monitoring/README.md) (metrics and
+configuration), [REFERENCE.md](REFERENCE.md) (detailed feature behavior),
+[monitoring/README.md](monitoring/README.md) (metrics and
 Grafana), [BENCHMARKS.md](BENCHMARKS.md),
 [sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer).
 
@@ -103,7 +104,8 @@ every flag.
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
 Both edges speak cleartext HTTP/2 where the peer does; see
-[operations](#operations).
+[operations](#operations). With `--grpc-port`, the router also serves the
+engine's [native gRPC](#native-grpc) API.
 
 ### Key flags
 
@@ -250,68 +252,102 @@ admission and fallback fit together.
 
 ## Other features
 
+Each item links to its full description in [REFERENCE.md](REFERENCE.md).
+
 ### Native `/generate`
 
 Same body and response as the engine's `/generate`, buffered or SSE. With a
 tokenizer loaded, `text` is forwarded as `input_ids` so routing sees the
-engine's exact tokens (`--disable-input-ids-forwarding` turns this off).
+engine's exact tokens (`--disable-input-ids-forwarding` turns this off). See
+[native `/generate`](REFERENCE.md#native-generate).
 
 ### OpenAI over /generate
 
 For `/v1/chat/completions` and `/v1/completions`, the router runs SGLang's
 OpenAI layer itself: it sends the request to `/generate` and builds the OpenAI
 response. Requests it cannot reproduce exactly (for example media or strict
-tools) go to the engine's own route unchanged.
+tools) go to the engine's own route unchanged. See
+[OpenAI over /generate](REFERENCE.md#openai-over-generate) for the exact
+conditions, and [chat rendering](REFERENCE.md#chat-rendering) plus the
+per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
+[GLM-5.3](REFERENCE.md#glm-53), [Qwen3.8](REFERENCE.md#qwen38),
+[Kimi-K3](REFERENCE.md#kimi-k3)) for which chats forward `input_ids`.
 
 ### Anthropic Messages
 
 `/v1/messages` is converted to a chat completion and back.
 `/v1/messages/count_tokens` is answered by the router from the chat template.
+See [Anthropic Messages](REFERENCE.md#anthropic-messages).
 
 ### Embeddings, classify and rerank
 
 Engine request and response bodies, routed on load. Not available on P/D fleets.
+See [embeddings](REFERENCE.md#embeddings), [classify](REFERENCE.md#classify)
+and [rerank](REFERENCE.md#rerank).
+
+### Native gRPC
+
+`--grpc-port` serves the engine's `sglang.runtime.v1.SglangService`. Each RPC is
+routed like its HTTP route and forwarded to the same RPC on the engine's own
+native gRPC port, so engines must run with `--grpc-port` too. See
+[native gRPC](REFERENCE.md#native-grpc).
 
 ### Bucket file
 
 `--bucket-config` defines buckets whose groups set `worker_services`
 (`namespace/name`) or `worker_ids`, plus `policy`, `admission` and `affinity`;
 unset fields inherit the CLI flags. See
-[ARCHITECTURE.md](ARCHITECTURE.md#2-configuration-examples).
+[ARCHITECTURE.md](ARCHITECTURE.md#2-configuration-examples) and
+[bucket file membership](REFERENCE.md#bucket-file-membership).
 
 ### KV cache signals
 
 - **External KV indexer**: `--cache-prefix-provider indexer
-  --kv-indexer-endpoint <url>`; see [sgl-kv-indexer](sgl-kv-indexer/README.md).
+  --kv-indexer-endpoint <url>`; see [sgl-kv-indexer](sgl-kv-indexer/README.md)
+  and [external KV indexer](REFERENCE.md#external-kv-indexer).
 - **KV-event gap replay**: add `"replay_endpoint"` to the engine's
-  `--kv-events-config` so the router can re-fetch dropped KV events.
+  `--kv-events-config` so the router can re-fetch dropped KV events; see
+  [gap replay](REFERENCE.md#kv-event-gap-replay).
 - **Pending prefixes**: `--cache-pending-prefix-ttl-ms` keeps bursts that share
-  a cold prefix on one worker until its KV events arrive.
+  a cold prefix on one worker until its KV events arrive; see
+  [pending prefixes](REFERENCE.md#pending-prefixes).
 - **Peer bootstrap (Kubernetes)**: `--kv-peer-selector
   kubernetes.io/service-name=<router-service>` makes a new replica copy the KV
-  tree from a sibling before `/readyz` passes. Example manifest:
-  `tests/e2e/k8s_integration/manifests/kv-bootstrap.yaml`.
+  tree from a sibling before `/readyz` passes; see
+  [peer bootstrap](REFERENCE.md#peer-bootstrap-kubernetes).
+- **LoRA cache identity**: with workers that publish `BlockStored.lora_name`,
+  prefix matches are kept per adapter; see
+  [LoRA cache identity](REFERENCE.md#lora-cache-identity).
 
 ### Operations
 
 - **No tokenizer**: `--no-tokenizer` for load-only policies (`power_of_two`,
-  `session_aware`).
+  `session_aware`); see [optional tokenizer](REFERENCE.md#optional-tokenizer-for-load-only-routing).
 - **Retries**: `--retry-max-attempts N` resends a request that failed before
-  any response to another worker.
+  any response to another worker; see [retries](REFERENCE.md#retries).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
-  engines.
+  engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
+  or cached prefix decides; see [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
-  decode only within the same engine version.
-- **Engine API key**: `--worker-api-key` for engines launched with `--api-key`.
+  decode only within the same engine version; see
+  [PD version groups](REFERENCE.md#pd-version-groups).
+- **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
+  see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
 - **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
   parameters fleet-wide; `--sampling-param-conflict reject|allow` decides what
-  happens to requests that differ.
+  happens to requests that differ. See
+  [fleet-wide sampling contract](REFERENCE.md#fleet-wide-sampling-contract)
+  for parameter domains and null handling.
 - **Chat rendering**: use the same model files and chat-template settings on
   router and workers, or set `--disable-input-ids-forwarding`.
   `--tokenizer-backend fast` and `--tokenizer-l1-cache-mb N` speed up
   tokenization.
 - **HTTP/2**: no configuration. h2c is used inbound when the client speaks it,
-  and outbound to workers that report `enable_http2`.
+  and outbound to workers that report `enable_http2`; see
+  [HTTP/2](REFERENCE.md#http2).
+- **Upgrading**: the `cache_aware_zmq` policy and the legacy cache and balance
+  threshold flags were removed; see
+  [upgrading](REFERENCE.md#upgrading-from-cache_aware_zmq).
 
 ## License
 
