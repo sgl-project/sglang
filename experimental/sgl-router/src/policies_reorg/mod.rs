@@ -7,6 +7,7 @@
 pub mod admission;
 mod affinity;
 pub mod cache_aware;
+pub mod decode_cache_aware;
 pub mod factory;
 pub mod power_of_two;
 pub mod session_aware;

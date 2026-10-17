@@ -23,6 +23,7 @@ use crate::state::{
 use super::{
     admission::AdmissionLimits,
     cache_aware::{CacheAwarePolicy, CacheSource},
+    decode_cache_aware::DecodeCacheAwarePolicy,
     power_of_two::PowerOfTwoPolicy,
     session_aware::SessionAwarePolicy,
     Policy, Stage,
@@ -325,6 +326,40 @@ impl Groups<'_> {
                 let mut policy = SessionAwarePolicy::new(self.store(), load);
                 policy.admission = admission;
                 policy.config = affinity;
+                Arc::new(policy)
+            }
+            PolicyKind::CacheAware if stage == Stage::Decode => {
+                ensure!(
+                    self.external_index.is_none()
+                        && self.model.cache_aware.as_ref().is_none_or(|cache|
+                            cache.prefix_provider == crate::config::CachePrefixProvider::RadixTree),
+                    "decode cache affinity requires the radix_tree prefix provider; the remote indexer does not expose storage tiers"
+                );
+                // Prefill-token pressure has no meaning for decode. An explicit
+                // per-group metric is validated by the policy constructor.
+                let affinity = if spec
+                    .affinity
+                    .as_ref()
+                    .is_none_or(|a| a.balanced_by.is_none())
+                {
+                    AffinityConfig {
+                        balanced_by: BalancedBy::RunningRequests,
+                        load_gap: spec
+                            .affinity
+                            .as_ref()
+                            .and_then(|a| a.load_gap)
+                            .or(self.affinity.load_gap.filter(|_| {
+                                self.affinity.balanced_by == BalancedBy::RunningRequests
+                            })),
+                        ..affinity
+                    }
+                } else {
+                    affinity
+                };
+                let provider =
+                    RadixTreePrefixProvider::new(self.state.tree(), self.state.block_size_oracle());
+                let mut policy = DecodeCacheAwarePolicy::new(provider, load, affinity)?;
+                policy.admission = admission;
                 Arc::new(policy)
             }
             PolicyKind::CacheAware => {

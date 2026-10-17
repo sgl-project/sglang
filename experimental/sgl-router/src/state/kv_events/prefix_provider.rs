@@ -73,6 +73,31 @@ impl RadixTreePrefixProvider {
         })
     }
 
+    /// Confirmed local-memory prefixes, keyed by worker URL. Rank zero only:
+    /// decode cache affinity currently targets single-rank engines, since the
+    /// rank chosen at dispatch must agree with the cached owner.
+    pub fn decode_prefixes(
+        &self,
+        tokens: &[u32],
+        namespace: &CacheNamespace,
+    ) -> BTreeMap<String, (u64, u64)> {
+        let Some(hashes) = self.block_hashes(tokens, namespace) else {
+            return BTreeMap::new();
+        };
+        let block_size = u64::from(self.block_size_oracle.get().unwrap());
+        self.tree
+            .resident_prefix_depths(&hashes)
+            .into_iter()
+            .filter(|(worker, _)| worker.dp_rank == 0)
+            .map(|(worker, (resident, device))| {
+                (
+                    worker.url,
+                    (resident as u64 * block_size, device as u64 * block_size),
+                )
+            })
+            .collect()
+    }
+
     /// Remember that `signal`'s prompt was just routed to `url`.
     pub fn record_route(&self, signal: &PrefixLookupResult, url: &str) {
         if let Some(hashes) = &signal.block_hashes {

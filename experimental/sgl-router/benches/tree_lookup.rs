@@ -35,7 +35,7 @@ use std::thread;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sgl_router::state::kv_events::tree::{HashTree, KvWorkerId};
+use sgl_router::state::kv_events::tree::{HashTree, KvWorkerId, Tiers};
 
 fn build_tree(num_workers: usize, blocks_per_worker: usize, seed: u64) -> HashTree {
     let tree = HashTree::new();
@@ -242,11 +242,38 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// Paired lookups over the same shared prefix, with device and host owners.
+fn bench_resident_prefix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resident_prefix");
+    for (workers, blocks) in [(8, 64), (32, 512)] {
+        let tree = HashTree::new();
+        let hashes: Vec<i64> = (1..=blocks).collect();
+        for rank in 0..workers {
+            let worker = KvWorkerId::new(format!("http://w{rank}"), 0);
+            let tier = if rank % 2 == 0 {
+                Tiers::DEVICE
+            } else {
+                Tiers::HOST
+            };
+            tree.insert_tiered(&worker, None, &hashes, tier);
+        }
+        let label = format!("w{workers}_b{blocks}");
+        group.bench_function(format!("{label}/any_tier"), |b| {
+            b.iter(|| tree.prefix_depths(None, black_box(&hashes)))
+        });
+        group.bench_function(format!("{label}/resident"), |b| {
+            b.iter(|| tree.resident_prefix_depths(black_box(&hashes)))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert,
     bench_insert_continuation,
     bench_match_prefix,
-    bench_contended_match
+    bench_contended_match,
+    bench_resident_prefix
 );
 criterion_main!(benches);

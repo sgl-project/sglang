@@ -180,26 +180,31 @@ pub struct CacheAwarePolicy {
     pub fallback: Arc<dyn Policy>,
 }
 
+pub(super) fn validate_config(config: &AffinityConfig) -> Result<(), PickError> {
+    let unit = |ratio: f64| ratio.is_finite() && (0.0..=1.0).contains(&ratio);
+    let valid = (1..=config.cache_candidate_max_workers)
+        .contains(&config.cache_candidate_min_workers)
+        && unit(config.cache_candidate_ratio)
+        && config.cache_affinity_min_match_ratio.is_none_or(unit)
+        && config.load_factor.is_finite()
+        && config.load_factor >= 1.0
+        && config.worker_queue_limit.is_none()
+        && config.saturation_queue_floor.is_none();
+    if !valid {
+        return Err(PickError::InvalidConfiguration(
+            "invalid cache candidate bounds or affinity settings".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CacheAwarePolicy {
     pub fn new(
         source: Arc<CacheSource>,
         engine_load: Arc<EngineReportedLoadTable>,
         config: AffinityConfig,
     ) -> Result<Self, PickError> {
-        let unit = |ratio: f64| ratio.is_finite() && (0.0..=1.0).contains(&ratio);
-        let valid = (1..=config.cache_candidate_max_workers)
-            .contains(&config.cache_candidate_min_workers)
-            && unit(config.cache_candidate_ratio)
-            && config.cache_affinity_min_match_ratio.is_none_or(unit)
-            && config.load_factor.is_finite()
-            && config.load_factor >= 1.0
-            && config.worker_queue_limit.is_none()
-            && config.saturation_queue_floor.is_none();
-        if !valid {
-            return Err(PickError::InvalidConfiguration(
-                "invalid cache candidate bounds or affinity settings".into(),
-            ));
-        }
+        validate_config(&config)?;
         Ok(Self {
             source,
             fallback: Arc::new(PowerOfTwoPolicy::new(Arc::clone(&engine_load))),

@@ -19,3 +19,5 @@ mod policies_reorg_session_aware;
 mod policies_reorg_slo;
 mod tokenizer;
 mod workers;
+
+mod decode_cache_aware;
