@@ -515,7 +515,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 json_output += json.dumps(content, ensure_ascii=False)[
                                     1:-1
                                 ]
-                                self._current_value += content
+                                # Already emitted values are not read at closing;
+                                # retaining them copies the growing value per char.
                                 self._xml_tag_buffer = ""
                         else:
                             # object/array/boolean values stream through verbatim
@@ -523,7 +524,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 if not self._value_started:
                                     self._value_started = True
                                 json_output += content
-                                self._current_value += content
                                 self._xml_tag_buffer = ""
 
         return json_output
