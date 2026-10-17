@@ -1,7 +1,6 @@
 import json
 import logging
-import re
-from typing import List
+from typing import List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -14,6 +13,50 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
+
+
+_CALL_BEGIN = "<｜tool▁call▁begin｜>"
+_CALL_END = "<｜tool▁call▁end｜>"
+_SEP = "<｜tool▁sep｜>"
+_JSON_OPEN = "\n```json\n"
+_JSON_CLOSE = "\n```"
+
+
+def _greedy_chain_search(
+    text: str, a: str, b: str, c: str, d: str
+) -> Optional[Tuple[str, str, str, int]]:
+    # Linear equivalent of re.search(a(.*)b(.*)c(.*)d, DOTALL) for literal tokens
+    # -> (g1, g2, g3, match end). The regex backtracks quadratically over every
+    # a/b occurrence; greedy groups pick the last feasible d, then c, then b.
+    start = text.find(a)
+    d_pos = text.rfind(d)
+    if start == -1 or d_pos == -1:
+        return None
+    c_pos = text.rfind(c, 0, d_pos)
+    if c_pos == -1:
+        return None
+    b_pos = text.rfind(b, start + len(a), c_pos)
+    if b_pos == -1:
+        return None
+    return (
+        text[start + len(a) : b_pos],
+        text[b_pos + len(b) : c_pos],
+        text[c_pos + len(c) : d_pos],
+        d_pos + len(d),
+    )
+
+
+def _iter_call_blocks(text: str):
+    # Linear scan for `begin.*?end` blocks; a regex rescans to the end from every
+    # begin token when the end token never arrives.
+    start = text.find(_CALL_BEGIN)
+    while start != -1:
+        end = text.find(_CALL_END, start + len(_CALL_BEGIN))
+        if end == -1:
+            return
+        end += len(_CALL_END)
+        yield start, end
+        start = text.find(_CALL_BEGIN, end)
 
 
 class DeepSeekV3Detector(BaseFormatDetector):
@@ -46,8 +89,6 @@ class DeepSeekV3Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
-        self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
 
@@ -67,14 +108,16 @@ class DeepSeekV3Detector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        match_result_list = [text[s:e] for s, e in _iter_call_blocks(text)]
         calls = []
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
-                func_name = func_detail.group(2)
-                func_args = func_detail.group(3)
+                func_detail = _greedy_chain_search(
+                    match_result, _CALL_BEGIN, _SEP, _JSON_OPEN, _JSON_CLOSE + _CALL_END
+                )
+                func_name = func_detail[1]
+                func_args = func_detail[2]
                 func_args = json.loads(func_args)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": func_args}
@@ -111,14 +154,12 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
-                string=current_text,
-                flags=re.DOTALL,
+            partial_match = _greedy_chain_search(
+                current_text, _CALL_BEGIN, _SEP, _JSON_OPEN, _JSON_CLOSE
             )
             if partial_match:
-                func_name = partial_match.group(2).strip()
-                func_args_raw = partial_match.group(3).strip()
+                func_name = partial_match[1].strip()
+                func_args_raw = partial_match[2].strip()
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -177,15 +218,10 @@ class DeepSeekV3Detector(BaseFormatDetector):
                             pass
 
                         # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-                        )
-                        match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
-                        if match:
+                        block = next(_iter_call_blocks(current_text), None)
+                        if block is not None:
                             # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[match.end() :]
+                            self._buffer = current_text[block[1] :]
                         else:
                             self._buffer = ""
 
