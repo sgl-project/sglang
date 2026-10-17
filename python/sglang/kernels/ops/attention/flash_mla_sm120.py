@@ -13,8 +13,9 @@ separate region at the end of each page.
 
 import logging
 import math
+from collections.abc import Container, Iterable
 from functools import lru_cache
-from typing import FrozenSet, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import torch
 import triton
@@ -267,20 +268,74 @@ def _flash_mla_sm120_prefill(
     return (output.unsqueeze(1), None)
 
 
+# How the installed FlashInfer publishes its DSV4 decode dispatch (see
+# _flashinfer_dsv4_decode_dispatch): "pairs", "envelope", or "none".
+_DISPATCH_PAIRS = "pairs"
+_DISPATCH_ENVELOPE = "envelope"
+_DISPATCH_NONE = "none"
+
+
 @lru_cache(maxsize=1)
+def _flashinfer_dsv4_decode_dispatch() -> Tuple[int, FrozenSet[int], str]:
+    """Read the installed FlashInfer DSV4 decode dispatch once.
+
+    Returns ``(decode_max_tokens, supported head widths, shape)``. FlashInfer
+    publishes the dispatch in two shapes:
+
+    * ``pairs`` (<= 0.6.18): ``_DECODE_DSV4_DISPATCH`` is a table of
+      ``(num_heads, topk)`` tuples; the head widths are its first elements.
+    * ``envelope`` (main since flashinfer-ai/flashinfer#4802, 453aa7c7296e,
+      2026-09-03, in every 0.7.0 build): ``_DECODE_DSV4_DISPATCH`` is a
+      ``_DecodeDispatchEnvelope`` predicate with ``__contains__`` only,
+      ``(heads, topk) in envelope`` for ``1 <= heads <= _DECODE_MAX_HEADS`` and
+      ``topk >= min_topk``. It is not iterable (iterating it raises
+      ``TypeError: '_DecodeDispatchEnvelope' object is not iterable`` at
+      EagerRunner warm-up), so the head widths are probed one by one against
+      ``_DECODE_MAX_HEADS`` with the envelope's own ``min_topk``.
+
+    Anything else (no FlashInfer, no dispatch attribute, an envelope without
+    ``_DECODE_MAX_HEADS``, a predicate that raises) reads as ``none`` with no
+    heads, which keeps every caller on the padded 64-head decode path.
+    """
+    try:
+        from flashinfer.mla import _sparse_mla_sm120 as fi_sm120
+
+        dispatch = fi_sm120._DECODE_DSV4_DISPATCH
+        decode_max_tokens = int(fi_sm120._DECODE_MAX_TOKENS)
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return 0, frozenset(), _DISPATCH_NONE
+
+    if isinstance(dispatch, Iterable):
+        try:
+            heads = frozenset(int(num_heads) for num_heads, _ in dispatch)
+        except (TypeError, ValueError):
+            return 0, frozenset(), _DISPATCH_NONE
+        return decode_max_tokens, heads, _DISPATCH_PAIRS
+
+    max_heads = getattr(fi_sm120, "_DECODE_MAX_HEADS", None)
+    if (
+        not isinstance(dispatch, Container)
+        or not isinstance(max_heads, int)
+        or max_heads < 1
+    ):
+        return 0, frozenset(), _DISPATCH_NONE
+    min_topk = getattr(dispatch, "min_topk", 1)
+    probe_topk = min_topk if isinstance(min_topk, int) and min_topk >= 1 else 1
+    try:
+        heads = frozenset(
+            num_heads
+            for num_heads in range(1, max_heads + 1)
+            if (num_heads, probe_topk) in dispatch
+        )
+    except Exception:
+        return 0, frozenset(), _DISPATCH_NONE
+    return decode_max_tokens, heads, _DISPATCH_ENVELOPE
+
+
 def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
     """Read the installed FlashInfer DSV4 decode capabilities once."""
-    try:
-        from flashinfer.mla._sparse_mla_sm120 import (
-            _DECODE_DSV4_DISPATCH,
-            _DECODE_MAX_TOKENS,
-        )
-    except (AttributeError, ImportError):
-        return 0, frozenset()
-
-    return int(_DECODE_MAX_TOKENS), frozenset(
-        heads for heads, _ in _DECODE_DSV4_DISPATCH
-    )
+    decode_max_tokens, supported_heads, _ = _flashinfer_dsv4_decode_dispatch()
+    return decode_max_tokens, supported_heads
 
 
 def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
@@ -293,6 +348,68 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
     """
     decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
     return num_tokens <= decode_max_tokens and num_heads in supported_heads
+
+
+def _describe_dsv4_decode_dispatch() -> str:
+    """``envelope(max_tokens=64, heads=1-128)`` / ``pairs(max_tokens=64,
+    heads=8,16,32,64,128)`` / ``none`` for the log line."""
+    decode_max_tokens, heads, shape = _flashinfer_dsv4_decode_dispatch()
+    if shape == _DISPATCH_NONE or not heads:
+        return _DISPATCH_NONE
+    lo, hi = min(heads), max(heads)
+    if shape == _DISPATCH_ENVELOPE and len(heads) == hi - lo + 1:
+        heads_text = f"{lo}-{hi}"
+    else:
+        heads_text = ",".join(str(h) for h in sorted(heads))
+    return f"{shape}(max_tokens={decode_max_tokens}, heads={heads_text})"
+
+
+# The decode head-width routings this process resolved, keyed by (per-rank
+# head count, native); each is logged once.
+_DSV4_DECODE_PATHS: Dict[Tuple[int, bool], Dict[str, Any]] = {}
+DSV4_DECODE_PATH_NATIVE = "native"
+DSV4_DECODE_PATH_PADDED = "padded"
+
+
+def flashinfer_dsv4_decode_native_heads(num_heads: int, num_tokens: int) -> bool:
+    """Whether a DSV4 decode call of ``num_heads`` per-rank query heads runs
+    FlashInfer at that exact width instead of the padded 64-head path.
+
+    Decode (``num_tokens`` <= SM120_DECODE_MAX_TOKENS) takes FlashInfer's
+    native ``num_heads`` kernel whenever the installed build covers it
+    (sgl-project/sglang#36655). ``SGLANG_SM120_DSV4_DECODE_PADDED=1`` keeps the
+    padded 64-head decode path instead: on 4x RTX PRO 6000 with TP4 (16 local
+    heads) the native 16-head kernel measured single-request decode TPOT
+    +12.6% (9.134 vs 8.115 ms) against the padded path, with batch 4 / 8 and
+    prefill unchanged, so a deployment tuned for c=1 latency may want the
+    pad. A width the installed FlashInfer does not cover takes the padded
+    path either way (fail closed). The resolution is logged once per head
+    count.
+    """
+    padded = bool(envs.SGLANG_SM120_DSV4_DECODE_PADDED.get())
+    supported = flashinfer_dsv4_decode_supports_num_heads(num_heads, num_tokens)
+    native = supported and not padded
+    key = (int(num_heads), native)
+    if key not in _DSV4_DECODE_PATHS:
+        record = {
+            "num_heads": int(num_heads),
+            "native": native,
+            "path": DSV4_DECODE_PATH_NATIVE if native else DSV4_DECODE_PATH_PADDED,
+            "padded_knob": padded,
+            "flashinfer_supports": supported,
+            "dispatch": _describe_dsv4_decode_dispatch(),
+        }
+        _DSV4_DECODE_PATHS[key] = record
+        logger.info(
+            "SM120 DSV4 decode heads: path=%s local_heads=%d flashinfer_supports=%s "
+            "flashinfer_dispatch=%s SGLANG_SM120_DSV4_DECODE_PADDED=%d",
+            record["path"],
+            record["num_heads"],
+            "yes" if supported else "no",
+            record["dispatch"],
+            int(padded),
+        )
+    return native
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
