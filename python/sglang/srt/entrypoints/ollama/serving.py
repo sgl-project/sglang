@@ -52,7 +52,7 @@ class OllamaServing:
                 "stop": "stop",
                 "presence_penalty": "presence_penalty",
                 "frequency_penalty": "frequency_penalty",
-                "seed": "seed",
+                "seed": "sampling_seed",
             }
             for ollama_param, sglang_param in param_mapping.items():
                 if ollama_param in options:
