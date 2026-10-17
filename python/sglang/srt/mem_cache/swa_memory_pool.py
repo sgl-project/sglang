@@ -246,8 +246,8 @@ class SWAKVPool(BaseSWAKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ):
         # loc_info bundles the full loc and the pre-translated SWA loc.
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
