@@ -100,6 +100,7 @@ def _make_tools():
                             "enum": ["none", "low", "high"],
                         },
                         "optional": {"type": ["string", "null"]},
+                        "fallback": {"type": ["string", "integer", "null"]},
                     },
                 },
             ),
@@ -371,6 +372,61 @@ class TestMinimaxM3NoneNullRegression(CustomTestCase):
         calls, _ = _parse_segments(segments, self.tools)
         self.assertEqual(calls[0]["args"], {"optional": "none"})
 
+    def test_nullable_param_null_becomes_none_streaming(self):
+        """A string parameter that allows null, written as null or left empty, streams as JSON null."""
+        for param in ("optional", "fallback"):
+            for value in ("null", "Null", "NULL", ""):
+                with self.subTest(param=param, value=value):
+                    segments = self._configure_segments(param, value)
+                    calls = _stream_segments(segments, self.tools)
+                    self.assertEqual(calls[0]["args"], {param: None})
+
+    def test_nullable_param_agrees_at_every_split_point(self):
+        """Streamed arguments equal detect_and_parse wherever the chunk boundary falls."""
+        for value in ("null", "", "nu", "nullable", "hello"):
+            segments = self._configure_segments("optional", value)
+            expected, _ = _parse_segments(segments, self.tools)
+            wire = _wire(*segments)
+            for split in range(len(wire) + 1):
+                with self.subTest(value=value, split=split):
+                    detector = MinimaxM3Detector()
+                    all_calls = []
+                    for text in (wire[:split], wire[split:]):
+                        result = detector.parse_streaming_increment(text, self.tools)
+                        all_calls.extend(result.calls)
+                    (call,) = _collect_streamed_tool_calls(all_calls)
+                    self.assertEqual(
+                        json.loads(call["parameters"]), expected[0]["args"]
+                    )
+
+    def test_empty_value_in_one_chunk_matches_non_streaming(self):
+        """An empty value whose closing tag shares its chunk keeps the type detect_and_parse gives."""
+        for param in ("note", "undeclared"):
+            with self.subTest(param=param):
+                segments = (
+                    "<tool_call>",
+                    '<invoke name="add_note">',
+                    "<{}>".format(param),
+                    "</{}>".format(param),
+                    "</invoke>",
+                    "</tool_call>",
+                )
+                expected, _ = _parse_segments(segments, self.tools)
+                result = MinimaxM3Detector().parse_streaming_increment(
+                    _wire(*segments), self.tools
+                )
+                (call,) = _collect_streamed_tool_calls(result.calls)
+                self.assertEqual(json.loads(call["parameters"]), expected[0]["args"])
+
+    def test_nullable_param_text_streams_before_closing_tag(self):
+        """A non-null value of a nullable string still streams before its closing tag."""
+        detector = MinimaxM3Detector()
+        for text in _segments(
+            "<tool_call>", '<invoke name="configure">', "<optional>hello"
+        ):
+            result = detector.parse_streaming_increment(text, self.tools)
+        self.assertIn('"hello', "".join(c.parameters for c in result.calls))
+
 
 class TestMinimaxM3Streaming(CustomTestCase):
     def setUp(self):
@@ -515,6 +571,25 @@ class TestMinimaxM3Malformed(CustomTestCase):
         result = detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, text)
+
+    def test_mismatched_closing_tag_after_opening_tag_in_one_chunk(self):
+        """A wrong closing tag right after a scalar's opening tag is not streamed as its value."""
+        text = _wire(
+            "<tool_call>",
+            '<invoke name="add_note">',
+            "<note>",
+            "</wrong>",
+            "</note>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        try:
+            calls = (
+                MinimaxM3Detector().parse_streaming_increment(text, self.tools).calls
+            )
+        except ValueError:
+            calls = []
+        self.assertNotIn("wrong", "".join(c.parameters or "" for c in calls))
 
     def test_truncated_streaming_does_not_crash(self):
         segments = (
