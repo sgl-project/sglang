@@ -2054,6 +2054,8 @@ class MQALayer(MqaAttentionBase):
             unified and (is_decode or fuse_verify or fuse_prefill)
         ) or (not unified and self.use_fused_qk_norm_rope)
 
+        # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
+        q_lora_quant = None
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
@@ -2063,6 +2065,7 @@ class MQALayer(MqaAttentionBase):
                     e8m0=self._q_lora_quant_e8m0(with_indexer=True),
                 )
                 q, _ = self.wq_b(q_for_wqb)
+                q_lora_quant = q_for_wqb
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
                 q, _ = self.wq_b(q_for_wqb)
@@ -2334,6 +2337,7 @@ class MQALayer(MqaAttentionBase):
                         q_lora=q_lora,
                         forward_batch=forward_batch,
                         attn_backend=attn_backend,
+                        q_lora_quant=q_lora_quant,
                     )
             if self.compressor is not None:
                 if use_npu_cp_full_metadata:
@@ -3767,7 +3771,8 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
-            and (forward_batch.is_extend_in_batch or _is_hip)
+            # The prefill graph's capture batch leaves is_extend_in_batch unset.
+            and (forward_batch.is_extend_in_batch or tail_in_graph or _is_hip)
         ):
             late_dp_counts = late_layer_dp_counts(
                 forward_batch,
@@ -4283,6 +4288,14 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+            # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+            # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+            # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+            from sglang.srt.models.deepseek_common.amd.aiter_intree_tune import (
+                install_aiter_intree_tune,
+            )
+
+            install_aiter_intree_tune()
             if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
                 set_dense_mxscale(True)
         self.config = config

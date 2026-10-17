@@ -40,6 +40,7 @@ pub(super) fn model_info(info: ModelInfo) -> Result<api::GetModelInfoResponse, S
 
 pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse, String> {
     let ServerInfo {
+        launch_fields: _,
         model_path,
         served_model_name,
         tokenizer_path,
@@ -47,6 +48,7 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         max_total_num_tokens,
         version,
         frontend: _,
+        startup_time: _,
         internal_states,
     } = info;
     let max_context_length = u32::try_from(max_context_length)
