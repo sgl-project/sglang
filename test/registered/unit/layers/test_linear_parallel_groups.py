@@ -510,6 +510,50 @@ class TestLinearParallelGroups(CustomTestCase):
                                         )
                                     self.assertEqual(rank_size(layer), (rank, size))
 
+    def test_row_symmetric_output_opt_out_skips_only_the_allocation(self):
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock(side_effect=lambda x: x * 2))
+        attn = SimpleNamespace(
+            world_size=2, all_reduce=Mock(side_effect=lambda x: x * 3)
+        )
+        for group, rank, size in (("tp", 3, 4), ("replicated", 0, 1)):
+            for attention_reduce in (False, True):
+                with self.subTest(group=group, attention_reduce=attention_reduce):
+                    layer = RowParallelLinear(
+                        8,
+                        8,
+                        bias=False,
+                        input_is_parallel=False,
+                        parallel_group=group,
+                        use_dp_attention_reduce=attention_reduce,
+                        symmetric_output=False,
+                    )
+                    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+                        layer.weight.weight_loader(layer.weight, self.weight)
+                    shard = self.weight.chunk(size, dim=1)[rank]
+                    partial = F.linear(self.x.chunk(size, dim=1)[rank], shard)
+                    tp.all_reduce.reset_mock()
+                    attn.all_reduce.reset_mock()
+                    with (
+                        parallel_scope(tp_group=tp, attn_tp_group=attn),
+                        patch(
+                            "sglang.srt.layers.linear.use_symmetric_memory",
+                            return_value=nullcontext(),
+                        ) as allocator,
+                    ):
+                        out = layer(self.x)[0]
+                    allocator.assert_not_called()
+                    # Opting out of the symmetric output leaves the reduction alone.
+                    if size > 1:
+                        selected = attn if attention_reduce else tp
+                        torch.testing.assert_close(
+                            out, partial * (3 if attention_reduce else 2)
+                        )
+                        selected.all_reduce.assert_called_once()
+                    else:
+                        torch.testing.assert_close(out, partial)
+                        tp.all_reduce.assert_not_called()
+                        attn.all_reduce.assert_not_called()
+
     def test_replicated_model_mlps_keep_weights_and_tp_output_allocation(self):
         from sglang.srt.models.exaone_moe import ExaoneMoEMLP
         from sglang.srt.models.laguna import LagunaMLP
