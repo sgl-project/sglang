@@ -73,9 +73,9 @@ from sglang.srt.elastic_ep.topology import (
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import (
     get_processor,
-    get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.hf_transformers.processor import get_text_tokenizer
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
     CanaryInfoTokenizerManagerHook,
     ReqStateCanaryInfo,
@@ -792,8 +792,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_serving().skip_tokenizer_init:
                 self.tokenizer = None
             else:
-                self.tokenizer = get_tokenizer(
+                self.tokenizer = get_text_tokenizer(
                     get_serving().tokenizer_path,
+                    model_architectures=self.model_config.hf_config.architectures,
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
