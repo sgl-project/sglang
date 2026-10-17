@@ -145,8 +145,8 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Normalize types
         normalized_types = [t.lower() for t in param_types]
 
-        # Try null first if it's in the list
-        if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
+        # A nullable schema still needs to convert non-null values normally.
+        if value.lower() in ("null", "none", "nil"):
             return None
 
         # Try each type in order of preference (most specific first, string as fallback)
