@@ -39,6 +39,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -2286,7 +2287,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
 
-class TestQwen3CoderDetector(unittest.TestCase):
+class TestQwen3CoderDetector(CustomTestCase):
     """Test suite for Qwen3CoderDetector."""
 
     def setUp(self):
@@ -2527,23 +2528,44 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params["days"], 5)
 
     def test_boolean_parameter_conversion(self):
-        """
-        Test correct type conversion for boolean parameters.
+        """Boolean padding must not flip a tool argument or strip string arguments."""
+        cases = [
+            ("true", True),
+            ("false", False),
+            ("true ", True),
+            (" true", True),
+            ("\tTrUe\t", True),
+            ("true\r", True),
+            ("\ntrue\n\n", True),
+            ("\r\nfalse\r\n", False),
+        ]
+        query = "  SELECT 1  "
+        for value, expected in cases:
+            text = (
+                "<tool_call>\n<function=sql_interpreter>\n"
+                f"<parameter=query>{query}</parameter>\n"
+                f"<parameter=dry_run>{value}</parameter>\n"
+                "</function>\n</tool_call>"
+            )
+            for streaming in (False, True):
+                with self.subTest(value=value, streaming=streaming):
+                    detector = Qwen3CoderDetector()
+                    if streaming:
+                        arguments = ""
+                        for chunk in text:
+                            result = detector.parse_streaming_increment(
+                                new_text=chunk, tools=self.tools
+                            )
+                            arguments += "".join(
+                                call.parameters for call in result.calls
+                            )
+                    else:
+                        result = detector.detect_and_parse(text=text, tools=self.tools)
+                        arguments = result.calls[0].parameters
 
-        Scenario: Tool call with boolean parameter.
-        Purpose: Verify boolean values are correctly parsed.
-        """
-        text = """<tool_call>
-<function=sql_interpreter>
-<parameter=query>SELECT 1</parameter>
-<parameter=dry_run>True</parameter>
-</function>
-</tool_call>"""
-        result = self.detector.detect_and_parse(text, self.tools)
-
-        params = json.loads(result.calls[0].parameters)
-        self.assertIsInstance(params["dry_run"], bool)
-        self.assertEqual(params["dry_run"], True)
+                    params = json.loads(arguments)
+                    self.assertIs(params["dry_run"], expected)
+                    self.assertEqual(params["query"], query)
 
     def test_complex_array_parameter(self):
         """
