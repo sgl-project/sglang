@@ -255,6 +255,17 @@ class _ChunkedPrefixCaptureBuffers:
     kv_indices: torch.Tensor  # (max_chunks, prefix_chunk_capacity)
 
 
+def _replay_waits_for_whole_load(backend: Any, attn_backend: Any) -> bool:
+    # Full replay skips the per-layer load waits in the pool accessors; breakable
+    # replay runs them at its eager breaks unless a captured segment reads state.
+    if isinstance(backend, FullCudaGraphBackend):
+        return True
+    return (
+        isinstance(backend, BreakableCudaGraphBackend)
+        and attn_backend.breakable_graph_reads_captured_state
+    )
+
+
 def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
     numbered suggestion list. The runner is only constructed for BREAKABLE
@@ -658,6 +669,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
+        )
+        self._waits_for_whole_load = _replay_waits_for_whole_load(
+            self.backend, model_runner.attn_backend
         )
 
         # BCG and Full CG capture only the transformer body (layer_model.forward),
@@ -2268,6 +2282,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def _wait_for_layer_loads(self) -> None:
+        if not self._waits_for_whole_load:
+            return
+        counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
+        if counter is not None and counter.consumer_index >= 0:
+            counter.wait_until(counter.num_layers - 1)
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
@@ -2285,6 +2306,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             maybe_publish_prefill_shared_read_done(
                 self.model_runner, forward_batch, self.device_module
             )
+            self._wait_for_layer_loads()
 
             if self.enable_cp_bcg_capture:
                 assert self.max_context_size is None, (

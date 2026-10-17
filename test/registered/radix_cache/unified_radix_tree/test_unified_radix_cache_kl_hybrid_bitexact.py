@@ -52,6 +52,7 @@ import unittest
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
@@ -84,7 +85,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=3140, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=3340, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -365,6 +366,16 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             max_new_tokens=512,
             sampling_temperature=0,
         )
+
+
+class TestUnifiedHybridHiCacheSlowLoadBitExact(TestUnifiedHybridHiCacheBitExact):
+    """A prefill CUDA graph must not replay over a host-to-device load that has not
+    landed; the delay makes the load lose that race every time."""
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.override(50_000_000):
+            super().setUpClass()
 
 
 class TestUnifiedHybridMTPBitExact(CustomTestCase):
