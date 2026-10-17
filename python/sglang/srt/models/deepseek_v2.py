@@ -118,7 +118,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    is_routed_scaling_factor_fused_in_topk,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     adds_replicated_output_to_partial,
@@ -625,6 +630,24 @@ class MergedMoEOutput(MoEOutput):
         return self.routed
 
 
+def _scale_routed_and_add_shared(
+    routed: torch.Tensor,
+    shared: Optional[torch.Tensor],
+    *,
+    routed_scaling_factor: float,
+    fused_in_topk: bool,
+) -> torch.Tensor:
+    """Finish an all-to-all MoE output: apply routed_scaling_factor unless top-k
+    already did, then add the shared experts' output."""
+    if shared is not None:
+        if fused_in_topk:
+            return shared.add_(routed)
+        return shared.add_(routed, alpha=routed_scaling_factor)
+    if not fused_in_topk:
+        routed *= routed_scaling_factor
+    return routed
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -736,6 +759,11 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
+        self.routed_scaling_factor_fused_in_topk = (
+            is_routed_scaling_factor_fused_in_topk(
+                self.experts.should_fuse_routed_scaling_factor_in_topk
+            )
+        )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
@@ -785,11 +813,8 @@ class DeepseekV2MoE(nn.Module):
                         getattr(config, "model_type", None) == "deepseek_v41"
                     ),
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
-                    apply_routed_scaling_factor_on_output=(
-                        True
-                        if _use_aiter
-                        else self.experts.should_fuse_routed_scaling_factor_in_topk
-                    ),
+                    # Ungrouped routing never reaches aiter's folding router.
+                    apply_routed_scaling_factor_on_output=self.routed_scaling_factor_fused_in_topk,
                 )
             self.topk = TopK(**topk_kwargs)
 
@@ -1705,22 +1730,12 @@ class DeepseekV2MoE(nn.Module):
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
-        if shared_output is not None:
-            x = shared_output
-            # aiter moe call will handle routed_scaling_factor in the function
-            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
-            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            if not (
-                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
-            ):
-                final_hidden_states *= self.routed_scaling_factor
-
-        return final_hidden_states
+        return _scale_routed_and_add_shared(
+            final_hidden_states,
+            shared_output,
+            routed_scaling_factor=self.routed_scaling_factor,
+            fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+        )
 
     def _forward_shared_experts(
         self,
@@ -1987,20 +2002,12 @@ class DeepseekV2MoE(nn.Module):
             num_tokens = state.pop("num_tokens")
             final_hidden_states = final_hidden_states[:num_tokens]
 
-        if (shared_output := state.pop("shared_output")) is not None:
-            x = shared_output
-            if _use_aiter:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        elif _use_aiter:
-            # fused in aiter_biased_grouped_topk so we can skip here
-            pass
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        state.hidden_states_mlp_output = final_hidden_states
+        state.hidden_states_mlp_output = _scale_routed_and_add_shared(
+            final_hidden_states,
+            state.pop("shared_output"),
+            routed_scaling_factor=self.routed_scaling_factor,
+            fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+        )
 
 
 class DeepseekV2AttentionMLA(
