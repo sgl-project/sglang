@@ -1044,6 +1044,17 @@ class VisionIntelXPUAttention(nn.Module):
         )
         if s_aux is not None:
             fa_kwargs["sinks"] = s_aux
+        if bsz > 1 and q.shape[0] != int(cu_seqlens[-1]):
+            # rows are padded per image to seq_len while cu_seqlens holds the real lengths
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            valid = (
+                torch.arange(seq_len, device=q.device)[None] < seq_lens[:, None]
+            ).flatten()
+            output = q.new_zeros(q.shape[0], q.shape[1], v.shape[-1])
+            output[valid] = flash_attn_varlen_func(
+                q[valid], k[valid], v[valid], **fa_kwargs
+            )
+            return output
         output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
 
         return output
