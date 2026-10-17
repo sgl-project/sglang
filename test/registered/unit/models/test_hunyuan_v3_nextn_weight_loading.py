@@ -1,5 +1,5 @@
 """
-Unit tests for HYV3ForCausalLMNextN.load_weights.
+Unit tests for Hunyuan V3 checkpoint selection and draft weight loading.
 
 Regression test for the released Hy3 MTP checkpoint key
 ``model.layers.<num_hidden_layers>.final_layernorm.weight``, which must load
@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.models.hunyuan_v3 import HYV3ForCausalLM
 from sglang.srt.models.hunyuan_v3_nextn import HYV3ForCausalLMNextN
 
 
@@ -87,6 +88,38 @@ class TestHunyuanV3NextNWeightLoading(unittest.TestCase):
 
         for name, param in params.items():
             self.assertIsNone(param.loaded, f"{name} should have been skipped")
+
+    def test_draft_checkpoint_selection_matches_loaded_weights(self):
+        model = self._make_minimal_model()
+        for name, unused in (
+            ("model.layers.0.self_attn.q_proj.weight", True),
+            ("model.layers.80.enorm.weight", False),
+            ("model.layers.80.final_layernorm.weight", False),
+            ("model.shared_head.norm.weight", False),
+            ("model.embed_tokens.weight", True),
+            ("model.layers.80.self_attn.rotary_emb.inv_freq", True),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(model.is_unused_checkpoint_weight(name), unused)
+
+
+class TestHunyuanV3MainCheckpointSelection(unittest.TestCase):
+    def test_main_excludes_nextn_and_tied_head_weights(self):
+        model = object.__new__(HYV3ForCausalLM)
+        model.config = SimpleNamespace(
+            num_hidden_layers=80,
+            num_nextn_predict_layers=1,
+            tie_word_embeddings=True,
+        )
+        for name, unused in (
+            ("model.layers.0.self_attn.q_proj.weight", False),
+            ("model.layers.80.self_attn.q_proj.weight", True),
+            ("model.layers.0.self_attn.rotary_emb.inv_freq", True),
+            ("lm_head.weight", True),
+            ("model.embed_tokens.weight", False),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(model.is_unused_checkpoint_weight(name), unused)
 
 
 if __name__ == "__main__":

@@ -1167,6 +1167,13 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
+    @staticmethod
+    def _is_unused_checkpoint_weight(name: str, is_mtp: bool) -> bool:
+        return "rotary_emb.inv_freq" in name or (("mtp" in name) != is_mtp)
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=False)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
@@ -1190,10 +1197,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if self._is_unused_checkpoint_weight(name, is_mtp):
+                continue
             if is_mtp:
-                if "mtp" not in name:
-                    continue
-
                 if name in [
                     "mtp.fc.weight",
                     "mtp.pre_fc_norm_embedding.weight",
@@ -1202,8 +1208,6 @@ class Qwen3MoeForCausalLM(nn.Module):
                     name = name.replace("mtp.", "")
                 else:
                     name = name.replace("mtp", "model")
-            elif "mtp" in name:
-                continue
 
             layer_id = get_layer_id(name)
             if (
@@ -1216,8 +1220,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             ):
                 continue
 
-            if "rotary_emb.inv_freq" in name:
-                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:

@@ -792,6 +792,22 @@ class Step3p5ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    @staticmethod
+    def _get_layer_id_from_weight_name(weight_name: str) -> Optional[int]:
+        parts = weight_name.split(".")
+        if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+            try:
+                return int(parts[2])
+            except ValueError:
+                return None
+        return None
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if not getattr(self.config, "num_nextn_predict_layers", 0):
+            return False
+        layer_id = self._get_layer_id_from_weight_name(name)
+        return layer_id is not None and layer_id >= self.config.num_hidden_layers
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         # NOTE:
         # Step3p5 HF checkpoints (e.g. MTP/nextn variants) may include an extra
@@ -800,16 +816,6 @@ class Step3p5ForCausalLM(nn.Module):
         # This implementation currently does NOT instantiate those nextn modules,
         # so we must safely skip them (or load them only when a corresponding
         # nextn model is implemented).
-
-        def _get_layer_id_from_weight_name(weight_name: str) -> Optional[int]:
-            # Expected format: "model.layers.<id>...."
-            parts = weight_name.split(".")
-            if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
-                try:
-                    return int(parts[2])
-                except ValueError:
-                    return None
-            return None
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -847,11 +853,11 @@ class Step3p5ForCausalLM(nn.Module):
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
                 if num_nextn_layers and name.startswith("model.layers."):
-                    layer_id = _get_layer_id_from_weight_name(name)
+                    layer_id = self._get_layer_id_from_weight_name(name)
                     if layer_id is not None:
                         if not is_nextn:
                             # Normal load: skip layers appended after the main decoder.
-                            if layer_id >= self.config.num_hidden_layers:
+                            if self.is_unused_checkpoint_weight(name):
                                 continue
                         else:
                             # nextn load: only keep the appended nextn layer.

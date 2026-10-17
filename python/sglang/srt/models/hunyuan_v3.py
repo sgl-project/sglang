@@ -538,6 +538,20 @@ class HYV3ForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if "lm_head.weight" in name and getattr(
+            self.config, "tie_word_embeddings", False
+        ):
+            return True
+        if "rotary_emb.inv_freq" in name:
+            return True
+        if getattr(self.config, "num_nextn_predict_layers", 0) > 0 and name.startswith(
+            "model.layers."
+        ):
+            parts = name.split(".")
+            return len(parts) >= 3 and int(parts[2]) >= self.config.num_hidden_layers
+        return False
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -557,21 +571,9 @@ class HYV3ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
-
         for name, loaded_weight in weights:
-            if "lm_head.weight" in name and getattr(
-                self.config, "tie_word_embeddings", False
-            ):
+            if self.is_unused_checkpoint_weight(name):
                 continue
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if num_nextn_layers > 0 and name.startswith("model.layers."):
-                parts = name.split(".")
-                if len(parts) >= 3 and int(parts[2]) >= self.config.num_hidden_layers:
-                    continue
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:

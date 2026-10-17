@@ -328,6 +328,41 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+    @staticmethod
+    def _checkpoint_weight_name(name: str) -> str:
+        if "language_model" in name:
+            name = name.replace(r"model.language_model.", r"model.")
+        if "model.visual." in name:
+            name = name.replace("model.visual.", "visual.")
+        return name
+
+    def _is_unused_checkpoint_weight(self, name: str, is_nextn: bool) -> bool:
+        if "rotary_emb.inv_freq" in name:
+            return True
+        if is_nextn:
+            nextn_layer_id = (
+                0
+                if self.config.num_hidden_layers == 1
+                else self.config.num_hidden_layers
+            )
+            return (
+                not name.startswith(f"model.layers.{nextn_layer_id}")
+                or "shared_head.head" in name
+                or "embed_tokens" in name
+            )
+        if getattr(self.config, "num_nextn_predict_layers", 0) > 0 and name.startswith(
+            "model.layers"
+        ):
+            parts = name.split(".")
+            if len(parts) >= 3:
+                return int(parts[2]) >= self.config.num_hidden_layers
+        return False
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(
+            self._checkpoint_weight_name(name), is_nextn=False
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -374,31 +409,10 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         # it does not belong to this pipeline stage, thus we simply continue.
 
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            name = self._checkpoint_weight_name(name)
+            if self._is_unused_checkpoint_weight(name, is_nextn):
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if "model.visual." in name:
-                name = name.replace("model.visual.", "visual.")
-
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
-
+            if is_nextn:
                 is_decoder = True
                 # For nextn specific weights
                 for weight_name in nextn_spec_weight_names:

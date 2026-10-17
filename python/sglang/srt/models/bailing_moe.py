@@ -92,6 +92,29 @@ from sglang.srt.utils import (
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
+
+
+def is_unused_bailing_checkpoint_weight(name: str, config, is_nextn: bool) -> bool:
+    if (
+        name.startswith("model.mtp")
+        or "v_head" in name
+        or "inv_freq" in name
+        or (config.tie_word_embeddings and "lm_head" in name)
+    ):
+        return True
+    if is_nextn:
+        nextn_layer_id = (
+            0 if config.num_hidden_layers == 1 else config.num_hidden_layers
+        )
+        return not name.startswith(f"model.layers.{nextn_layer_id}.") or (
+            "shared_head.head" in name or "embed_tokens" in name
+        )
+    if name.startswith("model.layers."):
+        layer_id = name.split(".")[2]
+        return layer_id.isdecimal() and int(layer_id) >= config.num_hidden_layers
+    return False
+
+
 _is_cuda = is_cuda()
 
 
@@ -929,6 +952,9 @@ class BailingMoEForCausalLM(nn.Module):
         else:
             return hidden_states
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_bailing_checkpoint_weight(name, self.config, is_nextn=False)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -972,11 +998,7 @@ class BailingMoEForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if (
-                ("v_head" in name)
-                or ("inv_freq" in name)
-                or (self.config.tie_word_embeddings and "lm_head" in name)
-            ):
+            if self.is_unused_checkpoint_weight(name):
                 continue
 
             if (

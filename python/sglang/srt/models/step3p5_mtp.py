@@ -186,6 +186,19 @@ class Step3p5MTP(Step3p5ForCausalLM):
     def set_embed_and_head(self, embed, head):
         return
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if self.draft_model_idx is None:
+            return False
+        return self.is_unused_checkpoint_weight_with_draft_model_idx(name)
+
+    def is_unused_checkpoint_weight_with_draft_model_idx(self, name: str) -> bool:
+        if "rotary_emb.inv_freq" in name:
+            return True
+        spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+        if spec_layer is not None:
+            return spec_layer != (self.config.num_hidden_layers + self.draft_model_idx)
+        return "embed_tokens" not in name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -205,15 +218,9 @@ class Step3p5MTP(Step3p5ForCausalLM):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            if self.is_unused_checkpoint_weight_with_draft_model_idx(name):
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None and spec_layer != (
-                self.config.num_hidden_layers + self.draft_model_idx
-            ):
-                continue
-            if "embed_tokens" not in name and spec_layer is None:
-                continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
