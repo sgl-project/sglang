@@ -145,6 +145,9 @@ def test_tree_speculative_sampling_target_only(
         ([1, 2, 3], [0.0, 0.25, 0.0, 0.75], 0.25, 1.0, 3, 1),
         ([1], [0.0, 0.25, 0.75], 0.0, 1.0, 1, 1),
         ([1], [0.0, 1.0], 1.0 - 2**-24, 1.0, 1, 1),
+        ([1], [0.0, 1.0 - 2**-24, 0.0], 1.0 - 2**-24, 1.0, 1, 0),
+        ([1], [0.0, 1.0 - 2**-23, 0.0], 1.0 - 2**-24, 1.0, 1, 0),
+        ([1, 2], [0.0, 0.25, 0.75 - 2**-23, 0.0], 1.0 - 2**-24, 1.0, 2, 0),
     ],
     ids=[
         "zero-mass-zero-threshold",
@@ -152,6 +155,9 @@ def test_tree_speculative_sampling_target_only(
         "interior-boundary",
         "lower-endpoint",
         "upper-endpoint",
+        "single-token-rounded-cdf-equality",
+        "single-token-rounded-cdf-shortfall",
+        "siblings-exhaust-rounded-support",
     ],
 )
 def test_target_only_sampling_cdf_boundaries(
