@@ -92,13 +92,13 @@ class TestKimiK3GGUFMapping(unittest.TestCase):
             _kda_a_log_target_value(torch.tensor([-1.0, float("nan")]))
 
     def test_merged_gguf_output_uses_logical_shard_order(self) -> None:
-        qweight = torch.tensor([[30], [0], [20], [10]], dtype=torch.uint8)
+        qweight = torch.tensor([30, 0, 20, 10], dtype=torch.uint8)
         qweight.shard_id = [3, 0, 2, 1]
-        qweight.shard_offset_map = {
+        qweight.shard_flat_map = {
             3: (0, 1, 1),
-            0: (1, 2, 1),
-            2: (2, 3, 1),
-            1: (3, 4, 1),
+            0: (1, 1, 1),
+            2: (2, 1, 1),
+            1: (3, 1, 1),
         }
         qweight.gguf_prefix = ""
         layer = SimpleNamespace(
