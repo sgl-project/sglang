@@ -757,6 +757,22 @@ def handle_model_capability_adjustments(server_args: Any):
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
 
+    if (
+        get_platform().is_npu
+        and "UnlimitedOCRForCausalLM" in getattr(hf_config, "architectures", [])
+        and cfg.speculative_algorithm == "NGRAM"
+    ):
+        # Reference-aware corpus verification uses eager, dynamically gathered
+        # live KV. Other Unlimited-OCR serving configs retain ACLGraph support.
+        for phase in Phase.ALL:
+            declare_resolution(
+                server_args,
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, phase, backend=Backend.DISABLED
+                ),
+            )
+
     # HRM-Text needs bidirectional prompt attention (prefill), which only
     # the Triton backend honors at the kernel level. Radix/prefix reuse is
     # also unsafe: the recurrent forward writes direction-dependent KV

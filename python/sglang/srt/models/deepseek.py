@@ -28,6 +28,8 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -36,8 +38,14 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import (
+    adds_replicated_output_to_partial,
+    get_moe_a2a_backend,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -75,6 +83,7 @@ class DeepseekMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        parallel_group: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -83,6 +92,7 @@ class DeepseekMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -91,6 +101,7 @@ class DeepseekMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -103,6 +114,85 @@ class DeepseekMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+
+def _uses_unlimited_parallel_moe(config):
+    return (
+        _is_npu
+        and getattr(config, "model_type", None) == "unlimited_language"
+        and (get_parallel().moe_ep_size > 1 or get_parallel().attn_dp_size > 1)
+    )
+
+
+class UnlimitedOCRParallelMoE(nn.Module):
+    """Unlimited-OCR MoE using the existing TP/EP dispatcher contract."""
+
+    def __init__(self, config, layer_id, quant_config=None, prefix=""):
+        super().__init__()
+        if get_parallel().moe_ep_size > 1 and get_moe_a2a_backend().is_none():
+            raise ValueError(
+                "Unlimited-OCR EP requires an expert communication backend: "
+                "use --moe-a2a-backend deepep or ascend_fuseep. The Ascend TP "
+                "dispatcher does not remap global expert IDs to EP-local weights."
+            )
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
+            renormalize=config.norm_topk_prob,
+        )
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
+        )
+        self.experts = get_moe_impl_class(quant_config)(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            reduce_results=False,
+            inplace=False,
+            prefix=add_prefix("experts", prefix),
+        )
+        # A replicated shared MLP works both for globally gathered TP rows and
+        # local all-to-all rows. The stage boundary counts it exactly once.
+        self.shared_experts = (
+            DeepseekMLP(
+                config.hidden_size,
+                config.moe_intermediate_size * config.n_shared_experts,
+                config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                parallel_group="replicated",
+                prefix=add_prefix("shared_experts", prefix),
+            )
+            if config.n_shared_experts
+            else None
+        )
+
+    def forward(self, hidden_states, forward_batch=None):
+        if hidden_states.shape[0] == 0:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            shared_output = None
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            shared_output = (
+                self.shared_experts(hidden_states)
+                if self.shared_experts is not None
+                else None
+            )
+        output = self.experts(hidden_states, topk_output)
+        if shared_output is not None and (
+            is_moe_input_scattered_across_dp_ranks()
+            or adds_replicated_output_to_partial()
+        ):
+            output = output + shared_output
+        return output
 
 
 class DeepseekMoE(nn.Module):
@@ -237,10 +327,16 @@ class DeepseekAttention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        parallel_group: Optional[str] = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_parallel().tp_size
+        tp_size = (
+            get_parallel().attn_tp_size
+            if parallel_group == "attn_tp"
+            else get_parallel().tp_size
+        )
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -269,6 +365,7 @@ class DeepseekAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            parallel_group=parallel_group,
         )
 
         self.o_proj = RowParallelLinear(
@@ -277,6 +374,8 @@ class DeepseekAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            parallel_group=parallel_group,
+            reduce_results=reduce_results,
         )
 
         self.rotary_emb = get_rope(
@@ -320,6 +419,7 @@ class DeepseekDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.unlimited_parallel_moe = _uses_unlimited_parallel_moe(config)
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = DeepseekAttention(
@@ -332,13 +432,17 @@ class DeepseekDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            parallel_group="attn_tp" if self.unlimited_parallel_moe else None,
+            reduce_results=not self.unlimited_parallel_moe,
         )
         if (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekMoE(
+            self.mlp = (
+                UnlimitedOCRParallelMoE if self.unlimited_parallel_moe else DeepseekMoE
+            )(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -351,11 +455,26 @@ class DeepseekDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=not self.unlimited_parallel_moe,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        if self.unlimited_parallel_moe:
+            sparse = isinstance(self.mlp, UnlimitedOCRParallelMoE)
+            self.attn_boundary, self.ffn_boundary = append_stages(
+                (declare_attn(gathers_attn_tp_input=False), self.input_layernorm),
+                (
+                    declare_ffn(
+                        sparse=sparse,
+                        next_layer_sparse=True,
+                        dense_tp_size=None if sparse else get_parallel().tp_size,
+                    ),
+                    self.post_attention_layernorm,
+                ),
+            )
 
     def forward(
         self,
@@ -364,6 +483,15 @@ class DeepseekDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if self.unlimited_parallel_moe:
+            hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
+            if hidden_states.shape[0]:
+                hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+            hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+            hidden_states = self.mlp(hidden_states)
+            return self.ffn_boundary.finish(hidden_states, forward_batch), None
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -392,24 +520,42 @@ class DeepseekModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.unlimited_parallel_moe = _uses_unlimited_parallel_moe(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            use_attn_tp_group=self.unlimited_parallel_moe,
         )
-        self.layers = nn.ModuleList(
-            [
-                DeepseekDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
+        if self.unlimited_parallel_moe:
+            from sglang.srt.layers.layer_boundary import layer_stack
+
+            with layer_stack():
+                self.layers = nn.ModuleList(
+                    [
+                        DeepseekDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
+                        for layer_id in range(config.num_hidden_layers)
+                    ]
                 )
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
+        else:
+            self.layers = nn.ModuleList(
+                [
+                    DeepseekDecoderLayer(
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                    )
+                    for layer_id in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -425,11 +571,17 @@ class DeepseekModel(nn.Module):
         else:
             hidden_states = input_embeds
 
+        if self.unlimited_parallel_moe:
+            residual_batch.start(forward_batch)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
+            )
+        if self.unlimited_parallel_moe:
+            return residual_batch.final_norm(
+                hidden_states, forward_batch, self.norm, skip_empty=True
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -453,6 +605,7 @@ class DeepseekForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=_uses_unlimited_parallel_moe(config),
         )
         self.logits_processor = LogitsProcessor(config)
 
