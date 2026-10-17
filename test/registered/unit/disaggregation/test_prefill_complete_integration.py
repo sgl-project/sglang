@@ -1053,5 +1053,63 @@ class TestFirstChunkAllocationIntegration(TestAllocationIntegration):
         self.assertEqual(list(self.wire), [])
 
 
+class TestDeferredMambaChunkHandoff(CustomTestCase):
+    def test_recurrent_state_is_read_only_for_the_final_chunk(self):
+        import torch
+
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        sender = Mock()
+        sender.get_max_transfer_tokens.return_value = None
+        sender.should_send_kv_chunk.side_effect = lambda pages, last: pages > 0 or last
+        pool = SimpleNamespace(
+            req_to_token=torch.arange(8, dtype=torch.int32).reshape(1, 8),
+            req_index_to_mamba_index_mapping=torch.tensor([7], dtype=torch.int32),
+            translate_mamba_indices=Mock(side_effect=lambda indices: indices),
+        )
+        scheduler = SimpleNamespace(
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=4,
+                translate_kv_indices_for_transfer=lambda indices: indices,
+            ),
+            enable_staging=False,
+            disagg_metadata_buffers=Mock(),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(
+                kv_manager=SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=[StateType.MAMBA])
+                ),
+            ),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        req = SimpleNamespace(
+            rid="hybrid",
+            origin_input_ids=list(range(8)),
+            extend_end=4,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+            kv=SimpleNamespace(req_pool_idx=0),
+        )
+        SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+            scheduler, req, last_chunk=False
+        )
+        pool.translate_mamba_indices.assert_not_called()
+        self.assertIsNone(sender.send.call_args.args[1])
+        self.assertEqual(req.start_send_idx, 4)
+        # The recurrent state evolves as later chunks run. Read its final slot,
+        # not a snapshot captured when the first chunk became allocatable.
+        pool.req_index_to_mamba_index_mapping[0] = 11
+        req.extend_end = 8
+        SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+            scheduler, req, last_chunk=True
+        )
+        pool.translate_mamba_indices.assert_called_once()
+        self.assertEqual(np.asarray(sender.send.call_args.args[1][0]).tolist(), [11])
+        self.assertEqual(req.start_send_idx, 8)
+        self.assertEqual(sender.send.call_count, 2)
+        scheduler.disagg_metadata_buffers.set_buf.assert_called_once_with(req)
+
+
 if __name__ == "__main__":
     unittest.main()

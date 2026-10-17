@@ -385,9 +385,14 @@ class CommonKVManager(BaseKVManager):
         )
         self.deferred_bootstrap = None
         if self.defer_decode_allocation:
-            if any(state != StateType.DSA for state in args.state_types):
+            # Recurrent states retain the existing final-chunk-only handoff.
+            # Allocation readiness does not publish them or make D runnable.
+            if any(
+                state not in (StateType.DSA, StateType.MAMBA)
+                for state in args.state_types
+            ):
                 raise ValueError(
-                    f"{get_disagg().disaggregation_decode_allocation_policy} currently supports full-attention and DSA KV pools only"
+                    f"{get_disagg().disaggregation_decode_allocation_policy} currently supports full-attention, DSA and Mamba KV pools only"
                 )
             if disaggregation_mode == DisaggregationMode.PREFILL:
                 self.deferred_bootstrap = DeferredBootstrap(
