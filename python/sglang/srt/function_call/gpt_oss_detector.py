@@ -22,6 +22,9 @@ class GptOssDetector(BaseFormatDetector):
 
     Handles tool calls in the format:
     <|channel|>commentary to={namespace.function}<|constrain|>json<|message|>{args}<|call|>
+
+    The <|constrain|>json part is optional, and the recipient may also sit in the role
+    header: <|start|>assistant to={namespace.function}<|channel|>commentary ...
     """
 
     def __init__(self):
@@ -30,15 +33,23 @@ class GptOssDetector(BaseFormatDetector):
         self.bot_token = "<|start|>assistant<|channel|>commentary"
         self.eot_token = "<|call|>"
 
+        # A call that is the first message of a completion has no <|start|>assistant
+        # before its channel header (the generation prompt already ends with it), and
+        # a call may carry its recipient in the role header instead of the channel header.
+        self.tool_start_pattern = re.compile(
+            r"<\|channel\|>commentary\s+to=|<\|start\|>assistant\s+to=functions\."
+        )
+
         # Pattern to extract function name and JSON from tool_call event content
         self.tool_extract_pattern = re.compile(
-            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
+            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*(?:<\|channel\|>commentary\s*)?"
+            r"(?:<\|constrain\|>json)?<\|message\|>(.*?)(?:<\|call\|>|$)",
             re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
-        return self.bot_token in text
+        return self.bot_token in text or bool(self.tool_start_pattern.search(text))
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
