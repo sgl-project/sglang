@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils im
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @torch.inference_mode()

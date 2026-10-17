@@ -22,7 +22,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly expands the representative PR cases below to the complete matrix.
 register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
 

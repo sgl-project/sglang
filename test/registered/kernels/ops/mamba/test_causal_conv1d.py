@@ -33,7 +33,7 @@ from sglang.kernels.ops.mamba.causal_conv1d import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=180, stage="nightly", runner_config="1-gpu-large")
 

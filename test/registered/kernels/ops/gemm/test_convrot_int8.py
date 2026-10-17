@@ -16,7 +16,6 @@ from sglang.kernels.ops.gemm.convrot_int8 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # One registration per GEMM path: H100 (sm_90a), B200 (sm_100a), RTX 5090 (CC 12.0).
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 

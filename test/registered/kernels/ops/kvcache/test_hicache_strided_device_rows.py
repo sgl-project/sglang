@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _L, _H, _D, _ROWS = 2, 2, 64, 64
 # One slot holds every layer's K and V plus a gap, as a unified-pool entry.

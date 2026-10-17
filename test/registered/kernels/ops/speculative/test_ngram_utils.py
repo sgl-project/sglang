@@ -6,7 +6,7 @@ import torch
 from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 

@@ -7,7 +7,7 @@ from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize("rows,heads", [(6, 16), (9, 128), (4097, 16)])

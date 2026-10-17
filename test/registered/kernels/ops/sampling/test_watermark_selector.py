@@ -18,7 +18,7 @@ from sglang.srt.sampling.watermarking.core import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=43, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def test_selector_matches_torch_across_split_boundaries():

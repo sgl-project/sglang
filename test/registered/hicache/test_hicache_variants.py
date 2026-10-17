@@ -1,20 +1,21 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=534, stage="base-b", runner_config="1-gpu-large")
+# The MLA class (DeepSeek-Coder-V2-Lite, ~31 GB bf16) does not fit a 32 GB card;
+# it is in test_hicache_mla.py.
+register_cuda_ci(est_time=400, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
-Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
+Tests HiCache with different configurations: standard, EAGLE, and page size variants.
 """
 
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import is_hip
-from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
+from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -71,23 +72,6 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     mmlu_score_threshold = 0.64
     mmlu_num_examples = 256
     mmlu_num_threads = 32
-
-
-class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
-    """HiCache with MLA model tests"""
-
-    model_name = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
-    hicache_args = [
-        "--trust-remote-code",
-        "--enable-hierarchical-cache",
-    ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
-    mmlu_score_threshold = 0.54
-    mmlu_num_examples = 256
-    mmlu_num_threads = 32
-    mgsm_en_score_threshold = 0.8
-    if _is_hip:
-        mgsm_en_num_threads = 32
 
 
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")

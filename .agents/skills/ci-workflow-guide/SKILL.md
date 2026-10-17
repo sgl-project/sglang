@@ -283,9 +283,11 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `base-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
 | `base-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
 | `base-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
+| `base-b-kernel-unit-test-1-gpu-small` | 4 | `1-gpu-5090` | — |
 | `base-b-kernel-unit-test-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
 | `base-b-kernel-unit-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
 | `base-b-kernel-unit-test-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
+| `base-b-kernel-benchmark-test-1-gpu-small` | 1 (no matrix) | `1-gpu-5090` | — |
 | `base-b-kernel-benchmark-test-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
 | `base-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
 | `base-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |

@@ -50,7 +50,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cuda_ci(est_time=38, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=38, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"

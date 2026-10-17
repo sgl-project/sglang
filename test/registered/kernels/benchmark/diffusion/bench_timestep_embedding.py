@@ -13,7 +13,7 @@ from sglang.kernels.ops.diffusion import timestep_embedding
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 BATCHES = [1, 2, 8, 63, 256, 512, 613, 1024, 1536]

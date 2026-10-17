@@ -10,8 +10,6 @@ import unittest
 import torch
 
 import sglang as sgl
-from sglang.benchmark.offline_throughput import BenchArgs, throughput_test
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -20,7 +18,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=276, stage="base-b", runner_config="1-gpu-large")
+# The offline throughput floor is H100-tuned; it is in test_srt_engine_throughput.py.
+register_cuda_ci(est_time=220, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -115,14 +114,6 @@ class TestSRTEngine(CustomTestCase):
         print("==== Answer 2 ====")
         print(out2)
         self.assertEqual(out1, out2)
-
-    def test_7_engine_offline_throughput(self):
-        server_args = ServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-        )
-        bench_args = BenchArgs(num_prompts=10)
-        result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3000)
 
     def test_8_engine_async_encode_consistency(self):
         prompt = "Today is a sunny day and I like"

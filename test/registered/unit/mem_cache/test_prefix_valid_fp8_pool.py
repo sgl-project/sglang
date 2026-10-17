@@ -17,7 +17,7 @@ from sglang.test.kernels.prefix_valid import (
 from sglang.test.test_utils import CustomTestCase
 
 # Preserve the original GPU lanes; the kernel file retains the other 25 seconds.
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: loaded FP8 scales are doubled for ROCm's E4M3FNUZ format.
 register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 

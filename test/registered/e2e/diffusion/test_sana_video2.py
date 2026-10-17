@@ -12,7 +12,7 @@ from PIL import Image
 from sglang.multimodal_gen import DiffGenerator
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="diffusion-1-gpu-h100")
+register_cuda_ci(est_time=165, stage="base-b", runner_config="diffusion-1-gpu-5090")
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),

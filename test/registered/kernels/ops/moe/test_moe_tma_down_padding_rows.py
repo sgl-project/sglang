@@ -14,7 +14,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 E, TOPK, HIDDEN, INTER, BLOCK = 256, 8, 2048, 512, [128, 128]
 CASES = ((1, 16), (32, 16), (300, 32), (2048, 64))  # (num_tokens, BLOCK_SIZE_M)

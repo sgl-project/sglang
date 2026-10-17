@@ -13,7 +13,7 @@ from sglang.kernels.ops.attention.minimax_qknorm_rope import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 HEAD_DIM, ROTARY_DIM, BASE, EPS, MAXPOS = 128, 64, 5_000_000, 1e-6, 131072

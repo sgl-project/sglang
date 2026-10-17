@@ -1559,6 +1559,13 @@ def _discover_unit_tests() -> list[str]:
 
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
+    # The full unit suite runs on the 5090; these files also hold cases that only
+    # run on H100 (SM90 kernels, pre-Blackwell fallbacks, FA on SM90, >=48 GiB free).
+    "unit-h100": [
+        "../unit/test_kandinsky6_bf16_dtype.py",
+        "../unit/test_mxfp8_online_gemm.py",
+        "../unit/test_subblock_sparse_attention.py",
+    ],
     "component-accuracy": [
         "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
         "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
@@ -1678,7 +1685,7 @@ SUITES = {
     },
 }
 
-STRICT_SUITES = {"unit", "bcg-diffusion"}
+STRICT_SUITES = {"unit", "unit-h100", "bcg-diffusion"}
 COMPONENT_ACCURACY_SUITES = {
     "component-accuracy",
     "component-accuracy-1-gpu",
