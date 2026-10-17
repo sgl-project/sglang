@@ -315,6 +315,66 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     encoder.assert_called_once()
 
 
+def test_npu_qwen3_vl_batches_cross_request_image_misses(monkeypatch):
+    """NPU Qwen3-VL must batch misses without mixing request-owned embeddings."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+
+    # Qwen3-VL-30B-A3B, the documented NPU deployment target, uses the MoE
+    # wrapper while inheriting the same packed-image implementation.
+    class Qwen3VLMoeForConditionalGeneration:
+        def __init__(self):
+            self.calls = []
+
+        def get_image_feature(self, items):
+            self.calls.append(list(items))
+            return torch.cat(
+                [
+                    torch.full(
+                        (_num_tokens(item), HIDDEN),
+                        item.hash,
+                        dtype=torch.float32,
+                    )
+                    for item in items
+                ]
+            )
+
+    first = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=101,
+        feature=torch.zeros(1),
+        offsets=[(1, 2)],
+    )
+    second = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=202,
+        feature=torch.zeros(1),
+        offsets=[(0, 2)],
+    )
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    assert model.calls == [[first, second]]
+    expected = torch.cat(
+        [
+            torch.full((2, HIDDEN), first.hash, dtype=torch.float32),
+            torch.full((3, HIDDEN), second.hash, dtype=torch.float32),
+        ]
+    )
+    torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+
 def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()

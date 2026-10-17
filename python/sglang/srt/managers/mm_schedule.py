@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -17,6 +18,11 @@ from sglang.utils import logger
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+_NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS = {
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3VLMoeForConditionalGeneration",
+}
 
 embedding_cache: Optional[MultiModalStaticCache] = None
 host_offload_event: Optional[torch.cuda.Event] = None
@@ -221,6 +227,30 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
     }
 
 
+def _can_batch_cross_request_image_misses(
+    data_embedding_func: DataEmbeddingFunc,
+) -> bool:
+    """Whether per-image cache misses may share one encoder invocation.
+
+    CUDA keeps the existing cross-request batching behavior. HIP and XPU retain
+    their per-request paths because those backends have not been validated for
+    this optimization. On NPU, limit the initial enablement to Qwen3-VL image
+    encoders, whose ``get_image_feature`` already accepts multiple items and
+    materializes them as one packed visual batch.
+    """
+    if _is_hip or _is_xpu:
+        return False
+    if not _is_npu:
+        return True
+
+    owner = getattr(data_embedding_func, "__self__", None)
+    return (
+        owner is not None
+        and getattr(data_embedding_func, "__name__", None) == "get_image_feature"
+        and owner.__class__.__name__ in _NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS
+    )
+
+
 def _move_items_to_device(
     items: List[MultimodalDataItem],
     device: torch.device,
@@ -346,6 +376,32 @@ class PerImageRequestInfo:
     overlapping: List[Tuple[int, MultimodalDataItem, int]] = field(default_factory=list)
 
 
+def _chunk_misses_by_token_budget(
+    miss_items: List[MultimodalDataItem],
+    token_counts: List[int],
+    budget: int,
+) -> List[Tuple[List[MultimodalDataItem], List[int]]]:
+    """Split cache-miss items into groups whose total ViT token count stays
+    within the per-call budget, bounding the batched ViT workspace. An item
+    larger than the budget forms its own group. budget <= 0 means no limit."""
+    if budget <= 0:
+        return [(miss_items, token_counts)]
+    groups: List[Tuple[List[MultimodalDataItem], List[int]]] = []
+    cur_items: List[MultimodalDataItem] = []
+    cur_counts: List[int] = []
+    cur_tokens = 0
+    for item, count in zip(miss_items, token_counts):
+        if cur_items and cur_tokens + count > budget:
+            groups.append((cur_items, cur_counts))
+            cur_items, cur_counts, cur_tokens = [], [], 0
+        cur_items.append(item)
+        cur_counts.append(count)
+        cur_tokens += count
+    if cur_items:
+        groups.append((cur_items, cur_counts))
+    return groups
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -400,32 +456,39 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    # Phase 1b: single ViT call for all unique cache misses
+    # Phase 1b: encode all unique cache misses, chunked by per-call ViT token budget
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
         _move_items_to_device(miss_items, device, data_embedding_func)
-        all_miss_embedding = data_embedding_func(miss_items)
+        budget = envs.SGLANG_MM_CROSS_REQUEST_BATCH_TOKEN_BUDGET.get()
+        split_embeddings: List[torch.Tensor] = []
+        for group_items, group_counts in _chunk_misses_by_token_budget(
+            miss_items, token_counts, budget
+        ):
+            group_embedding = data_embedding_func(group_items)
 
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+            if isinstance(group_embedding, list):
+                # Per-item embeddings: no split needed, and each cache entry owns
+                # its storage (a torch.split view would pin the whole concatenated
+                # buffer for as long as any single item stays cached). Mirrors
+                # _get_chunked_embedding_by_item.
+                assert len(group_embedding) == len(group_items), (
+                    f"per-item embedding count {len(group_embedding)} != "
+                    f"cache-miss item count {len(group_items)}"
+                )
+                split_embeddings.extend(
+                    emb.reshape(-1, emb.shape[-1]) for emb in group_embedding
+                )
+            else:
+                group_embedding = group_embedding.reshape(
+                    -1, group_embedding.shape[-1]
+                )
+                split_embeddings.extend(
+                    torch.split(group_embedding, group_counts, dim=0)
+                )
         for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
             if embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb)):
                 cached = embedding_cache.get_single(cache_key[0])
@@ -549,8 +612,8 @@ def _get_chunked_prefill_embedding(
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     Chunked prefill embedding: encode items across all requests and extract
-    per-request chunks. Images from all requests are batched into a single
-    ViT call for efficiency.
+    per-request chunks. On supported platform/model combinations, images from
+    all requests are batched into a single ViT call for efficiency.
     """
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
@@ -591,9 +654,9 @@ def _get_chunked_prefill_embedding(
             for item in embedding_items_per_req
         )
         if is_per_image:
-            if _is_hip or _is_npu or _is_xpu:
-                # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
+            if not _can_batch_cross_request_image_misses(data_embedding_func):
+                # ROCm CI regressed with one large cross-request ViT batch. Keep
+                # HIP/XPU and unvalidated NPU models on the per-request path.
                 chunk_slices = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
