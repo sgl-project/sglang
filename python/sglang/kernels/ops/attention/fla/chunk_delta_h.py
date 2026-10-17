@@ -18,11 +18,18 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.utils import is_gfx1250_supported
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+# gfx1250: Triton's pipeliner miscompiles the in-place state store at BV=32/4 warps/2 stages,
+# silently corrupting the recurrent state for ragged batches. BV=64 with 8 warps keeps
+# pipelining, is deterministic, and is bit-exact with num_stages=1.
+_GFX1250 = is_gfx1250_supported()
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "64" if _GFX1250 else "32"))
+GDN_CHUNK_H_NUM_WARPS = int(
+    os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "8" if _GFX1250 else "4")
+)
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
