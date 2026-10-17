@@ -10,6 +10,7 @@ CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -70,6 +71,101 @@ TOTAL_LEN = 30
 CHUNKS = [(0, 8), (8, 8), (16, 8), (24, 6)]
 
 _CPU = torch.device("cpu")
+
+
+@pytest.mark.parametrize(
+    "budget,expected", [(0, [(0, 4)]), (6, [(0, 2), (2, 3), (3, 4)])]
+)
+def test_image_batch_patch_budget(budget, expected):
+    items = [SimpleNamespace(feature=torch.empty(n, 2)) for n in (2, 4, 9, 3)]
+    assert list(mm_schedule._image_batch_ranges(items, budget)) == expected
+    assert list(mm_schedule._image_batch_ranges([], budget)) == []
+
+
+def test_npu_image_batch_gate(monkeypatch):
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "8")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    owner = type("Qwen3VLForConditionalGeneration", (), {})()
+    owner.use_data_parallel = False
+    owner.quant_config = None
+    encoder = SimpleNamespace(__self__=owner, __name__="get_image_feature")
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.empty(4, 2))
+    assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 8
+    with get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2):
+        assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 0
+    for attr, value in [("use_data_parallel", True), ("quant_config", object())]:
+        old = getattr(owner, attr)
+        setattr(owner, attr, value)
+        assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 0
+        setattr(owner, attr, old)
+    encoder.__name__ = "get_video_feature"
+    assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 0
+    encoder.__name__ = "get_image_feature"
+    item.feature = torch.empty(4)
+    assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 0
+    item.feature = torch.empty(4, 2)
+    for budget in ("0", "-1"):
+        monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", budget)
+        assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 0
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "8")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    assert mm_schedule._npu_image_batch_budget(encoder, [item]) == 0
+
+
+@pytest.mark.parametrize("cache_bytes", [0, 1 << 20])
+def test_bounded_cross_request_images(monkeypatch, cache_bytes):
+    monkeypatch.setattr(mm_schedule, "_move_items_to_device", lambda *args: None)
+    mm_schedule.init_mm_embedding_cache(cache_bytes)
+    items = _make_items()
+    for item, patches in zip(items, (4, 6, 10)):
+        item.feature = torch.empty(patches, 2)
+    requests = [
+        mm_schedule.PerImageRequestInfo(i, [item], item.offsets, 0, TOTAL_LEN)
+        for i, item in enumerate([*items, items[0]])
+    ]
+    encoder = Mock(side_effect=_encoder_tensor)
+    embeddings = mm_schedule._batch_encode_per_image_misses(
+        encoder, requests, _CPU, max_patches=10
+    )
+    assert [len(call.args[0]) for call in encoder.call_args_list] == [2, 1]
+    for request in requests:
+        item = request.items[0]
+        torch.testing.assert_close(
+            embeddings[(item.hash, _num_tokens(item))], _item_embedding(item)
+        )
+    encoder.reset_mock()
+    mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU, max_patches=10)
+    assert encoder.call_count == (0 if cache_bytes else 2)
+
+
+@pytest.mark.parametrize("budget,call_sizes", [(0, [1, 1, 1]), (10, [2, 1])])
+def test_npu_cross_request_dispatch_and_chunk_slices(monkeypatch, budget, call_sizes):
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setattr(mm_schedule, "_npu_image_batch_budget", lambda *args: budget)
+    monkeypatch.setattr(mm_schedule, "_move_items_to_device", lambda *args: None)
+    mm_schedule.init_mm_embedding_cache(0)
+    items = _make_items()
+    for item, patches in zip(items, (4, 6, 10)):
+        item.feature = torch.empty(patches, 2)
+    encoder = Mock(side_effect=_encoder_tensor)
+    # Start one token into each image: only the requested chunk is assembled,
+    # while the encoder still needs the full image and its full patch budget.
+    prefixes = [item.offsets[0][0] + 1 for item in items]
+    actual, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        items,
+        [0, 1, 2, 3],
+        prefixes,
+        [2, 2, 2],
+        [item.offsets for item in items],
+        torch.zeros(6, dtype=torch.int64),
+    )
+    expected = torch.cat([_item_embedding(item)[1:3] for item in items])
+    torch.testing.assert_close(actual, expected)
+    assert [len(call.args[0]) for call in encoder.call_args_list] == call_sizes
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:

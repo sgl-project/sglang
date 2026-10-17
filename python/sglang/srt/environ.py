@@ -1487,6 +1487,9 @@ class Envs:
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Opt-in cross-request Qwen3-VL image encoding on NPU, in input patches.
+    # Nonpositive values disable batching. An oversized image runs alone.
+    SGLANG_NPU_VIT_MAX_BATCH_PATCHES = EnvInt(0)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.

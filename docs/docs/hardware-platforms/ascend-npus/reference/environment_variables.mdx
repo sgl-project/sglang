@@ -18,6 +18,11 @@ This document provides a list of commonly used environment variables and aims to
   </thead>
   <tbody>
     <tr>
+      <td><code>SGLANG_NPU_VIT_MAX_BATCH_PATCHES</code></td>
+      <td>Opt in to bounded cross-request Qwen3-VL image encoding on a single NPU. The budget counts input patches before spatial merging. Nonpositive values disable batching; an oversized image runs alone. See the example below.</td>
+      <td><code>0</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td>Adopts the <code>MLAPO</code> fusion operator in the attention <br/> preprocessing stage of the MLA model.</td>
       <td><code>false</code></td>
@@ -44,6 +49,40 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
   </tbody>
 </table>
+
+## Cross-request image batching
+
+For unquantized Qwen3-VL image requests on a single Ascend NPU, you can batch
+uncached images from requests already selected for the same Prefill batch.
+This does not wait for additional requests. Image-cache hits skip encoding, and
+duplicate misses are encoded once before their embeddings are scattered back
+to each request's chunk.
+
+The following configuration was tested with Qwen3-VL-8B-Instruct BF16 on A2
+(910B3), CANN 9.0.0, and the Python dependencies required by this checkout:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 \
+ASCEND_USE_FIA=1 \
+SGLANG_VIT_ENABLE_CUDA_GRAPH=0 \
+SGLANG_NPU_VIT_MAX_BATCH_PATCHES=2048 \
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --tp-size 1 --attention-backend ascend --device npu --dtype bfloat16 \
+  --context-length 8192 --chunked-prefill-size 512 \
+  --max-running-requests 8 --mem-fraction-static 0.7 \
+  --disable-cuda-graph
+```
+
+The patch budget is not the LLM token budget or a strict memory limit. Increase
+it only after measuring peak memory and first-token latency for your image
+sizes and concurrency. A single image larger than the budget is never split.
+
+Video, other model classes, tensor parallelism greater than one, DP encoders,
+quantized models, and ViT graph execution retain the per-request path. This
+setting does not enable ViT graph support. BF16 results can differ numerically
+between batched and individual encoding; validate your task's accuracy before
+deployment. A3 and A5 have not been validated for this configuration.
 
 ## Used in DeepEP Ascend
 
