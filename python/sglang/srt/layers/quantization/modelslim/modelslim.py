@@ -435,6 +435,18 @@ class ModelSlimConfig(QuantizationConfig):
 
         return w13_scheme, w2_scheme
 
+    def should_split_merged_linear(self, prefixes: list[str]) -> bool:
+        """Keep explicitly heterogeneous checkpoint projections separate.
+
+        A missing entry is not evidence of mixed precision: leave it to the
+        existing fused-layer checks rather than silently treating it as FLOAT.
+        """
+        schemes = [
+            self.quant_description.get(self._resolve_quant_prefix(prefix) + ".weight")
+            for prefix in prefixes
+        ]
+        return all(scheme is not None for scheme in schemes) and len(set(schemes)) > 1
+
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
     ):
