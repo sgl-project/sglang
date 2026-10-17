@@ -4,6 +4,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import Empty, Queue
@@ -898,6 +899,30 @@ class EmbeddingCacheController:
         with self.lock:
             entry = self.entries.get(mm_hash)
             return entry is not None and entry.state == EntryState.READY
+
+    @contextmanager
+    def retain_ready_entries(self, mm_hashes: List[str]):
+        """Keep READY hits alive while an encoder stages misses and assembles output."""
+        retained = {}
+        with self.lock:
+            for mm_hash in mm_hashes:
+                entry = self.entries.get(mm_hash)
+                if (
+                    mm_hash not in retained
+                    and entry is not None
+                    and entry.state == EntryState.READY
+                ):
+                    self._pin_read(entry)
+                    retained[mm_hash] = entry
+        try:
+            yield set(retained)
+        finally:
+            with self.lock:
+                for mm_hash, entry in retained.items():
+                    if self.entries.get(mm_hash) is entry:
+                        self._unpin_read(entry)
+                    else:
+                        entry.unpin()
 
     def store_to_pool_async(
         self,
