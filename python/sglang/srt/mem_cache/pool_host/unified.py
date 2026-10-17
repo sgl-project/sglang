@@ -6,7 +6,11 @@ from contextlib import contextmanager
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    HostKVCache,
+    host_memory_budget_bytes,
+    resolve_storage_dtype,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -756,6 +760,12 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         self.lock = _shared_backing.lock
         self._destroyed = False
         _shared_backing.retain(pool_label)
+
+    def get_storage_dtype(self) -> torch.dtype:
+        # The uint8 envelope mirrors the pool's stored K/V representation.
+        return resolve_storage_dtype(
+            self.device_pool.store_dtype, self.device_pool.dtype
+        )
 
     @classmethod
     def build_hybrid_swa_pool_pair(
