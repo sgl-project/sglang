@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,6 +84,89 @@ def test_health_encode_rechecks_busy_state_after_waiting(monkeypatch):
         assert response.status_code == 200
         assert broadcasts == []
         assert encoder.encode_calls == []
+
+    asyncio.run(run_test())
+
+
+def test_health_timeout_while_waiting_for_dispatch_lock(monkeypatch):
+    async def run_test():
+        encoder = _FakeEncoder()
+        broadcasts = _install_tp_encoder(monkeypatch, encoder)
+        monkeypatch.setattr(http_server, "HEALTH_CHECK_TIMEOUT", 0.01)
+        await encoder.encode_dispatch_lock.acquire()
+        try:
+            response = await asyncio.wait_for(http_server.health_generate(), timeout=1)
+            assert response.status_code == 503
+            assert encoder.encode_dispatch_lock.locked()
+            assert broadcasts == []
+            assert encoder.encode_calls == []
+            assert encoder.released == []
+        finally:
+            encoder.encode_dispatch_lock.release()
+
+        response = await http_server.health_generate()
+        assert response.status_code == 200
+        assert not encoder.encode_dispatch_lock.locked()
+        assert len(encoder.encode_calls) == 1
+
+    asyncio.run(run_test())
+
+
+def test_cancelled_health_waiter_does_not_release_existing_dispatch(monkeypatch):
+    async def run_test():
+        encoder = _FakeEncoder()
+        broadcasts = _install_tp_encoder(monkeypatch, encoder)
+        await encoder.encode_dispatch_lock.acquire()
+        task = asyncio.create_task(http_server.health_generate())
+        try:
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert encoder.encode_dispatch_lock.locked()
+            assert broadcasts == []
+            assert encoder.encode_calls == []
+            assert encoder.released == []
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            encoder.encode_dispatch_lock.release()
+
+        assert (await http_server.health_generate()).status_code == 200
+
+    asyncio.run(run_test())
+
+
+def test_health_encode_uses_budget_remaining_after_lock_wait(monkeypatch):
+    async def run_test():
+        encoder = _FakeEncoder()
+        _install_tp_encoder(monkeypatch, encoder)
+        monkeypatch.setattr(http_server, "HEALTH_CHECK_TIMEOUT", 10.0)
+        # Simulate seven seconds spent acquiring the lock without delaying CI.
+        times = iter((100.0, 107.0))
+        monkeypatch.setattr(
+            http_server, "time", SimpleNamespace(monotonic=lambda: next(times))
+        )
+        timeouts = []
+
+        async def wait_for(awaitable, timeout):
+            timeouts.append(timeout)
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(
+            http_server,
+            "asyncio",
+            SimpleNamespace(
+                create_task=asyncio.create_task,
+                shield=asyncio.shield,
+                wait_for=wait_for,
+                TimeoutError=asyncio.TimeoutError,
+            ),
+        )
+        response = await http_server.health_generate()
+        assert response.status_code == 200
+        assert timeouts == [10.0, 3.0]
+        assert not encoder.encode_dispatch_lock.locked()
 
     asyncio.run(run_test())
 
