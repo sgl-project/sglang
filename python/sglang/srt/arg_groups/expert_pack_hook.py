@@ -9,7 +9,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    model_config_of,
+    resolving_view,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -27,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 def handle_expert_pack(server_args: Any) -> None:
     """Normalize expert-pack settings and report all startup errors together."""
+
     cfg = resolving_view(server_args)
     if cfg.load_format != "expert_pack":
         return
@@ -35,6 +40,7 @@ def handle_expert_pack(server_args: Any) -> None:
     parallelism = (
         ("tensor", "--tp-size", cfg.tp_size),
         ("data", "--dp-size", cfg.dp_size),
+        ("attention data", "--attn-dp-size", cfg.attn_dp_size),
         ("expert", "--ep-size", cfg.ep_size),
     )
     for label, option, size in parallelism:
@@ -146,7 +152,7 @@ def handle_expert_pack(server_args: Any) -> None:
             )
         else:
             try:
-                hf_config = server_args.get_model_config().hf_config
+                hf_config = model_config_of(server_args).hf_config
             except Exception as exc:
                 errors.append(f"failed to load expert_pack model config: {exc}")
             else:

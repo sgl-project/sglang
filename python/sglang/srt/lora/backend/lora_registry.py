@@ -44,11 +44,11 @@ def create_torch_native_backend():
     return TorchNativeLoRABackend
 
 
-@register_lora_backend("flashinfer")
-def create_flashinfer_backend():
-    raise ValueError(
-        "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
-    )
+@register_lora_backend("uno_cublas")
+def create_uno_cublas_backend():
+    from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
+
+    return UnoCublasLoRABackend
 
 
 def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:

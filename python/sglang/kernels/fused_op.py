@@ -9,7 +9,7 @@ a proper :class:`torch.nn.Module` and covers **two independent dimensions**:
 - **Kernel backend (provenance)** — where an implementation comes from
   (:class:`~sglang.kernels.spec.KernelBackend`): ``forward_native`` (pure
   torch, required), ``forward_torch_compile``, ``forward_triton``,
-  ``forward_jit``, ``forward_aot``, ``forward_cute_dsl``,
+  ``forward_jit``, ``forward_aot``, ``forward_cute_dsl``, ``forward_helion``,
   ``forward_flashinfer``, ``forward_deepgemm``, ``forward_aiter``,
   ``forward_torch_npu``. Which *devices* a backend supports is per-``(op,
   backend)`` metadata (:attr:`BaseFusedOp.capabilities`), never implied by the
@@ -108,6 +108,8 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.AOT: "forward_aot",
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
     KernelBackend.FLYDSL: "forward_flydsl",
+    KernelBackend.HELION: "forward_helion",
+    KernelBackend.KDA: "forward_kda",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
@@ -122,11 +124,13 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 # must never trigger a surprise compilation in a serving process; force it
 # explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
+    KernelBackend.KDA,
     KernelBackend.AOT,
     KernelBackend.JIT,
     KernelBackend.FLASHINFER,
     KernelBackend.DEEPGEMM,
     KernelBackend.CUTE_DSL,
+    KernelBackend.HELION,
     KernelBackend.AITER,
     KernelBackend.TORCH_NPU,
     KernelBackend.TRITON,
@@ -434,6 +438,12 @@ class BaseFusedOp(nn.Module, ABC):
     def forward_cute_dsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no cute_dsl backend")
 
+    def forward_helion(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no helion backend")
+
+    def forward_kda(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no KDA backend")
+
     def forward_flashinfer(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no flashinfer backend")
 
@@ -565,9 +575,16 @@ class BaseFusedOp(nn.Module, ABC):
         """Per-call backend selection for ops with input-dependent gates."""
         for backend in self._dynamic_backend_candidates:
             if self.backend_eligible(backend, *args, **kwargs):
-                return getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
+                result = getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
+                if _trace_enabled:
+                    _record_trace(self, backend.value, args, kwargs)
+                return result
         method = self._platform_method(_platform_key())
-        return (method or self.forward_native)(*args, **kwargs)
+        method = method or self.forward_native
+        result = method(*args, **kwargs)
+        if _trace_enabled:
+            _record_trace(self, _dispatch_label(method), args, kwargs)
+        return result
 
     def dispatch_forward(self) -> Callable:
         """The static dispatch target for this op on the current platform."""
@@ -652,7 +669,10 @@ class BaseFusedOp(nn.Module, ABC):
         if method is None:
             method = self._forward_method = self._resolve_forward_method()
         result = method(*args, **kwargs)
-        if _trace_enabled:
+        if _trace_enabled and (
+            getattr(method, "__func__", None)
+            is not BaseFusedOp._forward_backend_dynamic
+        ):
             _record_trace(self, _dispatch_label(method), args, kwargs)
         return result
 

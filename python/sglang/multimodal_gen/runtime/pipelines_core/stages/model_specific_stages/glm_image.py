@@ -15,7 +15,6 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
@@ -362,6 +362,23 @@ class GlmImageAR(PipelineStage):
                 e,
             )
             raise
+        except requests.HTTPError as e:
+            # HTTPError alone omits the server's request-validation details.
+            response = e.response
+            if response is not None:
+                logger.error(
+                    "SGLang encoder at %s returned HTTP %s: %s",
+                    server_args.srt_encoder_url,
+                    response.status_code,
+                    response.text[:2000],
+                )
+            else:
+                logger.error(
+                    "SGLang encoder at %s failed with no response: %s",
+                    server_args.srt_encoder_url,
+                    e,
+                )
+            raise
         except requests.RequestException as e:
             logger.error(
                 "SGLang encoder request to %s failed: %s",
@@ -414,7 +431,7 @@ class GlmImageAR(PipelineStage):
             Tuple of the D16 prior token IDs, optional source-image token IDs,
             and optional usage statistics returned by an external AR server.
         """
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         is_text_to_image = image is None or len(image) == 0
@@ -516,8 +533,9 @@ class GlmImageAR(PipelineStage):
         height: int,
         width: int,
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> tuple[list[torch.Tensor], list[dict[str, int] | None]]:
-        device = get_local_torch_device()
+        device = device or current_platform.get_local_torch_device()
         _validate_glm_image_resolution_alignment(width, height)
 
         input_ids = []
@@ -577,27 +595,15 @@ class GlmImageAR(PipelineStage):
             usages.append(_extract_srt_usage(item.get("meta_info")))
         return prior_token_ids, usages
 
-    def run_grouped_requests(
+    def generate_and_assign_prior_tokens(
         self,
         batches: list[Req],
         server_args: ServerArgs,
+        device: Optional[torch.device] = None,
     ) -> list[Req]:
-        can_batch_ar = (
-            len(batches) > 1
-            and server_args.srt_encoder_url is not None
-            and all(
-                isinstance(batch.prompt, str) and batch.image_path is None
-                for batch in batches
-            )
-        )
-        if not can_batch_ar:
-            return super().run_grouped_requests(batches, server_args)
-
+        """Generate one AR batch and assign its tokens and usage to each request."""
         height = batches[0].height
         width = batches[0].width
-        if any(batch.height != height or batch.width != width for batch in batches[1:]):
-            return super().run_grouped_requests(batches, server_args)
-
         start_time = time.time()
         output_counts = [_num_outputs_per_prompt(batch) for batch in batches]
         prompts = [
@@ -616,6 +622,7 @@ class GlmImageAR(PipelineStage):
             height=height,
             width=width,
             server_args=server_args,
+            device=device,
         )
         duration = time.time() - start_time
         logger.info(
@@ -641,6 +648,29 @@ class GlmImageAR(PipelineStage):
                 batch.metrics.record_stage(stage_name, duration)
             output_offset += output_count
         return batches
+
+    def run_grouped_requests(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> list[Req]:
+        can_batch_ar = (
+            len(batches) > 1
+            and server_args.srt_encoder_url is not None
+            and all(
+                isinstance(batch.prompt, str) and batch.image_path is None
+                for batch in batches
+            )
+        )
+        if not can_batch_ar:
+            return super().run_grouped_requests(batches, server_args)
+
+        height = batches[0].height
+        width = batches[0].width
+        if any(batch.height != height or batch.width != width for batch in batches[1:]):
+            return super().run_grouped_requests(batches, server_args)
+
+        return self.generate_and_assign_prior_tokens(batches, server_args)
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
@@ -714,7 +744,7 @@ class GlmImageAR(PipelineStage):
         else:
             ar_condition_images = None
 
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
@@ -892,14 +922,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             else 8
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-
-        self.default_sample_size = (
-            self.transformer.config.sample_size
-            if hasattr(self, "transformer")
-            and self.transformer is not None
-            and hasattr(self.transformer.config, "sample_size")
-            else 128
-        )
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -1158,7 +1180,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         height = batch.height
         width = batch.width
 
-        device = get_local_torch_device()
+        device = current_platform.get_local_torch_device()
         batch_size = _num_outputs_per_prompt(batch)
         max_sequence_length = 1024
         seed = getattr(batch, "seed", None)

@@ -145,9 +145,9 @@ def smart_nframes(
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not (
-        "fps" in ele and "nframes" in ele
-    ), "Only accept either `fps` or `nframes`"
+    assert not ("fps" in ele and "nframes" in ele), (
+        "Only accept either `fps` or `nframes`"
+    )
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
@@ -426,9 +426,9 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
-        assert (
-            input_ids.shape[0] == mrope_positions.shape[-1]
-        ), "input_ids and mrope_positions should have the same length"
+        assert input_ids.shape[0] == mrope_positions.shape[-1], (
+            "input_ids and mrope_positions should have the same length"
+        )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),

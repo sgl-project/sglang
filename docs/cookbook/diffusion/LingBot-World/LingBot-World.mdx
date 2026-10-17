@@ -1,5 +1,6 @@
 ---
 title: LingBot World
+description: "Serve LingBot World realtime camera-controlled video world models with SGLang-diffusion."
 metatags:
     description: "Serve LingBot World realtime camera-controlled video world models with SGLang-diffusion."
 tag: REALTIME
@@ -9,13 +10,28 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["realtime", "world model", "continuous video", "camera control", "causal KV cache"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/LingBot/lingbot-world.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+Use the [Realtime WebUI](#3-realtime-webui) to start a camera-controlled session. The Request tab checks model metadata; video generation uses WebSocket, not an HTTP POST.
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LingBot World](https://huggingface.co/robbyant/lingbot-world-fast-diffusers) is a realtime camera-controlled video world model. It keeps a live causal session, applies prompt and camera events between chunks, reuses DiT/VAE state, and streams decoded frames instead of finishing a bounded clip before returning.
 
 Choose it for interactive exploration and continuous control, not one-shot cinematic generation. The causal window makes long sessions practical but gives up the global bidirectional context available to offline Wan or LTX pipelines; session state and cache policy are therefore part of the serving contract.
 
-## 2. Deployment
+<a id="2-deployment" />
+
+## 3. Deployment
 
 ```bash Command
 sglang serve \
@@ -37,7 +53,9 @@ The current and most recent completed chunks remain in BF16. See
 for the algorithm, tuning options, measured memory-latency tradeoff, and
 support limits.
 
-## 3. Realtime WebUI
+<a id="3-realtime-webui" />
+
+## 4. Realtime WebUI
 
 The lightweight local WebUI is useful for validating latency, frame transport, and camera control behavior.
 
@@ -51,7 +69,9 @@ Open `http://127.0.0.1:18080` and use:
 ws://127.0.0.1:30000/v1/realtime_video/generate
 ```
 
-## 4. HTTP and WebSocket API
+<a id="4-http-and-websocket-api" />
+
+## 5. HTTP and WebSocket API
 
 LingBot World uses the realtime video WebSocket endpoint. The server keeps one live session, generates one chunk at a time, and accepts runtime control events while generation is running.
 
@@ -79,7 +99,7 @@ Send this MessagePack map immediately after the WebSocket opens.
 | `num_inference_steps` | integer | No | Denoising steps per chunk. LingBot defaults to `4` when omitted. |
 | `guidance_scale` | number | No | Classifier-free guidance scale. Realtime LingBot commonly uses `1`. |
 | `negative_prompt` | string | No | Negative prompt passed to the diffusion pipeline. |
-| `quality` | `"lossless"`, `"high"` | No | `lossless` keeps FP32 VAE decode. `high` uses the validated BF16 decode path for lower per-chunk latency. |
+| `quality` | `"exact"`, `"lossless"`, `"high"` | No | `lossless` keeps FP32 VAE decode. `lossless` keeps FP32 decode and enables only any eligible request-gated kernel fusions. `high` includes those fusions and uses the validated BF16 decode path for lower per-chunk latency. |
 | `max_chunks` | integer | No | Stop after this many chunks. Omit for a continuous session. |
 | `realtime_causal_sink_size` | integer | No | Number of sink frames/tokens retained in the causal attention window. |
 | `realtime_causal_kv_cache_num_frames` | integer | No | Number of recent frames retained in the causal KV cache window. |
@@ -150,12 +170,24 @@ ws.send_binary(msgspec.msgpack.encode({
 }))
 ```
 
-## 5. Consistency
+<a id="5-consistency" />
+
+## 6. Consistency
 
 LingBot World uses raw-frame websocket GT plus per-chunk latency guards for consistency checks.
 
-## 6. Notes
+<a id="6-notes" />
+
+## 7. Notes
 
 - Use the realtime endpoint for interactive sessions: `/v1/realtime_video/generate`.
 - Prefer WebP preview transport for interactive testing; use raw-frame transport for consistency checks.
 - Long-running sessions should be validated with raw-frame consistency before changing causal cache, condition sampling, or VAE decode behavior.
+
+<a id="7-run-in-comfyui" />
+
+## 8. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

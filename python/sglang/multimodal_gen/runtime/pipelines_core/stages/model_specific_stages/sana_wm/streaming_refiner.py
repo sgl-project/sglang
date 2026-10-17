@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
     unpack_latents,
@@ -26,11 +27,11 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer impor
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-from . import parity_probe
 from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
     _as_additive_attention_mask,
+    _forward_diffusers_video_block,
     _unwrap_diffusers_ltx2_refiner,
     log_sana_wm_tensor_stats,
     sana_wm_skip_refiner_enabled,
@@ -240,45 +241,6 @@ def streaming_self_attention(
     return attn.to_out[1](hidden_states)
 
 
-def forward_video_block(
-    *,
-    block,
-    hidden_states,
-    encoder_hidden_states,
-    temb,
-    video_rotary_emb,
-    encoder_attention_mask,
-    n_context_tokens,
-):
-    batch = hidden_states.size(0)
-    norm_hidden_states = block.norm1(hidden_states)
-    num_ada_params = block.scale_shift_table.shape[0]
-    ada_values = block.scale_shift_table[None, None].to(temb.device) + temb.reshape(
-        batch, temb.size(1), num_ada_params, -1
-    )
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(
-        dim=2
-    )
-    norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-    attn_hidden_states = streaming_self_attention(
-        attn=block.attn1,
-        hidden_states=norm_hidden_states,
-        query_rotary_emb=video_rotary_emb,
-        n_context_tokens=n_context_tokens,
-    )
-    hidden_states = hidden_states + attn_hidden_states * gate_msa
-    norm_hidden_states = block.norm2(hidden_states)
-    attn_hidden_states = block.attn2(
-        norm_hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        query_rotary_emb=None,
-        attention_mask=encoder_attention_mask,
-    )
-    hidden_states = hidden_states + attn_hidden_states
-    norm_hidden_states = block.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
-    return hidden_states + block.ff(norm_hidden_states) * gate_mlp
-
-
 class _RefinerCore:
     """Adapts the unwrapped diffusers refiner transformer to the
     DiffusersLTX2Refiner interface RefinerChunkRunner expects."""
@@ -321,8 +283,9 @@ class _RefinerCore:
             batch, -1, hidden_states.size(-1)
         )
         for block in transformer.transformer_blocks:
-            hidden_states = forward_video_block(
+            hidden_states = _forward_diffusers_video_block(
                 block=block,
+                self_attention=streaming_self_attention,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
@@ -671,6 +634,8 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
             )
             return batch
         n_blocks = math.ceil(n_active / self.block_size)
+        total_iterations = n_blocks * (len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1)
+        batch.record_stage_iterations(total_iterations, total_iterations)
         self.log_info(
             "SANA-WM streaming refiner: latent=%s, sink=%d, block=%d, blocks=%d, kv_max=%d, seed=%d",
             tuple(latents.shape),

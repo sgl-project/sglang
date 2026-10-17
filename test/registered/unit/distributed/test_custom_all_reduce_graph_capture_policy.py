@@ -25,7 +25,7 @@ def test_registered_graph_inputs_enabled_by_default():
         ),
         mock.patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
     ):
-        get_parallel.return_value.enable_dp_attention = True
+        get_parallel.return_value = types.SimpleNamespace(attn_dp_enabled=True)
         assert custom_all_reduce._enable_register_for_capturing()
 
 
@@ -42,7 +42,7 @@ def test_registered_graph_inputs_disabled_for_dsa_dp_attention():
         ),
         mock.patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
     ):
-        get_parallel.return_value.enable_dp_attention = True
+        get_parallel.return_value = types.SimpleNamespace(attn_dp_enabled=True)
         assert not custom_all_reduce._enable_register_for_capturing()
 
 
@@ -59,7 +59,7 @@ def test_registered_graph_inputs_remain_enabled_for_dsa_without_dp_attention():
         ),
         mock.patch("sglang.srt.runtime_context.get_parallel") as get_parallel,
     ):
-        get_parallel.return_value.enable_dp_attention = False
+        get_parallel.return_value = types.SimpleNamespace(attn_dp_enabled=False)
         assert custom_all_reduce._enable_register_for_capturing()
 
 

@@ -744,12 +744,19 @@ _B_DESC_CACHE_MAX = 64
 _B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
+def clear_b_tma_desc_cache() -> None:
+    """Drop all cached B TensorDescriptors, releasing the weights they pin."""
+    _B_DESC_CACHE.clear()
+
+
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
-    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    Keyed by tensor identity + storage ptr + shape/stride/dtype + tile shape.
     """
     key = (
+        # offload can rebind a Parameter while another tensor reuses its address
+        id(B),
         int(B.data_ptr()),
         tuple(B.shape),
         tuple(B.stride()),
@@ -866,9 +873,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert (
-                per_channel_quant
-            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            assert per_channel_quant, (
+                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            )
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -902,23 +909,23 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when fuse_add_to_output=True"
+        assert not fuse_sum_all_reduce, (
+            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when fuse_add_to_output=True"
+        )
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert (
-            not fuse_add_to_output
-        ), "mask_output and fuse_add_to_output are mutually exclusive"
-        assert (
-            not fuse_sum_all_reduce
-        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when mask_output=True"
+        assert not fuse_add_to_output, (
+            "mask_output and fuse_add_to_output are mutually exclusive"
+        )
+        assert not fuse_sum_all_reduce, (
+            "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when mask_output=True"
+        )
     # ===== END TO BE REFACTORED ====
 
     if (
@@ -926,9 +933,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        assert not fuse_sum_all_reduce, (
+            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        )
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -1281,10 +1288,12 @@ def _fused_append_shared_experts_kernel(
     out_weights_ptr,
     N_BASE,  # runtime scalar
     scale_factor,  # runtime scalar
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1310,22 +1319,35 @@ def _fused_append_shared_experts_kernel(
     ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
     ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
-
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
+    if HAS_PADDING:
+        # Padded rows zero routed ids and all weights.
+        if pid >= tl.load(num_token_non_padded_ptr):
+            ids = tl.zeros([BLOCK_K], dtype=ids.dtype)
+            ws = tl.zeros([BLOCK_K], dtype=ws.dtype)
+            shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
-    topk_ids, topk_weights, num_fused_shared_experts, scale_factor, N=None
+    topk_ids,
+    topk_weights,
+    num_fused_shared_experts,
+    scale_factor,
+    N=None,
+    num_token_non_padded=None,
 ):
+    """Append shared experts and optionally materialize padded rows."""
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1337,6 +1359,8 @@ def fused_append_shared_experts(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_shared_experts_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1344,10 +1368,12 @@ def fused_append_shared_experts(
         out_weights,
         N_BASE=N,
         scale_factor=scale_factor,
+        num_token_non_padded_ptr=ntnp_ptr,
         K=k,
         S=s,
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1559,9 +1585,9 @@ def fused_append_shared_experts_with_weights(
       ``apply_sigmoid`` (the sigmoid is intrinsic), so the two are mutually
       exclusive.
     """
-    assert not (
-        fuse_gate and apply_sigmoid
-    ), "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
+    assert not (fuse_gate and apply_sigmoid), (
+        "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
+    )
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1569,9 +1595,9 @@ def fused_append_shared_experts_with_weights(
         return topk_ids, topk_weights
 
     if fuse_gate:
-        assert (
-            hidden_states is not None and gate_weight is not None
-        ), "fuse_gate=True requires hidden_states and gate_weight"
+        assert hidden_states is not None and gate_weight is not None, (
+            "fuse_gate=True requires hidden_states and gate_weight"
+        )
         hidden_arg = hidden_states.contiguous()
         wgate_arg = gate_weight.reshape(-1).contiguous()
         hidden_dim = hidden_arg.shape[1]

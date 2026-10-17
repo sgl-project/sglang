@@ -448,7 +448,7 @@ def _enable_register_for_capturing() -> bool:
     from sglang.srt.runtime_context import attention_backends, get_parallel
 
     _prefill_backend, decode_backend = attention_backends()
-    return not (get_parallel().enable_dp_attention and decode_backend == "dsa")
+    return not (get_parallel().attn_dp_enabled and decode_backend == "dsa")
 
 
 def _use_amd_deterministic_impl() -> bool:

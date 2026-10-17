@@ -59,7 +59,8 @@ class Pi05Pipeline(ComposedPipelineBase):
             or bool(server_args.text_encoder_cpu_offload)
         )
         logger.info(
-            "Pi05 memory config: prefix_cache=%s/%s, cuda_graph=%s/%s/%s, "
+            "Pi05 memory config: prefix_cache=%s/%s, "
+            "cuda_graph=prefix:%s/%s action:%s/%s buckets:%s, "
             "offload_image=%s, offload_image_after_embed=%s, "
             "offload_tokens=%s, offload_language_layers=%s, "
             "offload_language_after_prefix=%s/%s, "
@@ -69,6 +70,8 @@ class Pi05Pipeline(ComposedPipelineBase):
             pipeline_config.enable_prefix_cuda_graph,
             pipeline_config.prefix_cuda_graph_max_entries,
             pipeline_config.enable_action_cuda_graph,
+            pipeline_config.action_cuda_graph_max_entries,
+            pipeline_config.prompt_token_buckets,
             pipeline_config.offload_prefix_image_encoder,
             pipeline_config.offload_prefix_image_encoder_after_embed,
             pipeline_config.offload_prefix_token_embedding,
@@ -98,6 +101,12 @@ class Pi05Pipeline(ComposedPipelineBase):
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         pipeline_config: Pi05PipelineConfig = server_args.pipeline_config
+        if pipeline_config.enable_segmented_actions and (
+            server_args.sp_degree != 1 or server_args.enable_cfg_parallel
+        ):
+            raise ValueError(
+                "Segmented pi05 actions require SP=1 and CFG parallelism disabled"
+            )
         self.preprocessor = Pi05Preprocessor(pipeline_config)
         self.prefix_cache = VLAPrefixCacheManager(
             max_entries=pipeline_config.prefix_cache_max_entries

@@ -376,7 +376,6 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
 
 
 class Qwen3OmniMoeVisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,

@@ -1,6 +1,4 @@
-"""KDA bfa side-stream overlap: forward_qkvbfg_fused must produce outputs
-bit-identical to the serial path, both eager and under CUDA graph
-capture/replay (the overlap only engages in capture mode)."""
+"""K3 attention overlap parity under CUDA graph capture and changed-input replay."""
 
 import unittest
 from types import SimpleNamespace
@@ -10,12 +8,13 @@ import torch
 
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
+    KimiK3MLAAttention,
     _get_k3_dense_weight,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 _H = 7168
 _QKVG = 6144  # q,k,v,g slices per rank at TP8
@@ -67,31 +66,32 @@ class TestKimiK3BfaOverlap(CustomTestCase):
     def test_capture_replay_matches_serial(self):
         torch.manual_seed(0)
         for T in (1, 4, 12):
-            with self.subTest(T=T):
-                x = (
-                    torch.randn(T, _H, device="cuda", dtype=torch.float32)
-                    .mul(0.05)
-                    .to(torch.bfloat16)
-                )
-                serial = _run(_make_owner(with_stream=False), x)
-
-                owner = _make_owner(with_stream=True)
-                with patch(
-                    "sglang.srt.models.kimi_k3.get_is_capture_mode",
-                    return_value=True,
-                ):
-                    # warm up allocations/JIT outside capture
-                    _ = _run(owner, x)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        captured = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
-                    graph.replay()
-                    torch.cuda.synchronize()
-                # note: owners share the same seeded weights
-                for got, ref, name in zip(
-                    captured, serial, ("qkv", "beta", "forget_gate", "g")
-                ):
-                    self.assertTrue(torch.equal(got, ref), f"T={T} {name} mismatch")
+            for defer_f_b in (False, True):
+                with self.subTest(T=T, defer_f_b=defer_f_b):
+                    x = torch.empty(T, _H, device="cuda", dtype=torch.bfloat16)
+                    x.normal_(std=0.05)
+                    serial_owner = _make_owner(with_stream=False)
+                    owner = _make_owner(with_stream=True)
+                    forward = KimiK3DeltaAttention.forward_qkvbfg_fused
+                    with patch(
+                        "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                        return_value=True,
+                    ):
+                        # Warm up allocations/JIT outside capture.
+                        forward(owner, x, defer_f_b=defer_f_b)
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            captured = forward(owner, x, defer_f_b=defer_f_b)
+                        for _ in range(3):
+                            # Changed inputs expose stale reads or missing dependencies.
+                            x.normal_(std=0.05)
+                            serial = forward(serial_owner, x, defer_f_b=defer_f_b)
+                            graph.replay()
+                            torch.cuda.synchronize()
+                            for got, ref, name in zip(
+                                captured, serial, ("qkv", "beta", "forget_gate", "g")
+                            ):
+                                self.assertTrue(torch.equal(got, ref), name)
 
     def test_eager_stream_branch_not_taken(self):
         x = torch.randn(3, _H, device="cuda", dtype=torch.bfloat16)
@@ -99,6 +99,51 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         overlap = _run(_make_owner(with_stream=True), x)  # capture mode False
         for got, ref in zip(overlap, serial):
             self.assertTrue(torch.equal(got, ref))
+
+    def test_mla_gate_capture_matches_serial(self):
+        x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+        qkv_weight = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+        gate_weight = torch.randn_like(qkv_weight)
+        project = torch.nn.functional.linear
+        owner = SimpleNamespace(
+            _gate_alt_stream=torch.cuda.Stream(),
+            _gate_bs_limit=128,
+            g_proj=lambda value: (project(value, gate_weight), None),
+        )
+
+        def forward():
+            # Both branches must wait for this in-graph input producer.
+            hidden = x * 0.5
+            KimiK3MLAAttention._fork_output_gate(owner, hidden)
+            qkv = project(hidden, qkv_weight)
+            gate = KimiK3MLAAttention._compute_output_gate(owner, hidden)
+            return qkv * torch.sigmoid(gate)
+
+        for capture_mode, breakable in ((True, False), (True, True), (False, False)):
+            with (
+                self.subTest(capture_mode=capture_mode, breakable=breakable),
+                patch(
+                    "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                    return_value=capture_mode,
+                ),
+                patch(
+                    "sglang.srt.models.kimi_k3.is_in_breakable_cuda_graph",
+                    return_value=breakable,
+                ),
+            ):
+                forward()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = forward()
+                for _ in range(3):
+                    x.normal_()
+                    hidden = x * 0.5
+                    expected = project(hidden, qkv_weight) * torch.sigmoid(
+                        project(hidden, gate_weight)
+                    )
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(captured, expected))
 
     def test_block_fp8_weight_is_dequantized_for_tiny_gemm(self):
         module = SimpleNamespace(

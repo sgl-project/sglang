@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import torch
@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True, kw_only=True)
 class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
-    tp_rank: int
+    # Registration may run after the runner's construction scope has exited.
+    tp_rank: int = field(init=False, default_factory=lambda: get_parallel().tp_rank)
     gpu_id: int
     engine: Optional[Any] = None
     session_id: str = ""
@@ -78,13 +79,11 @@ class RemoteInstanceWeightTransporter:
         """
         import requests as http_requests
 
-        if get_parallel().config.dist_init_addr:
+        if get_parallel().dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).
             # Derive host from dist_init_addr (shared across all nodes).
             bootstrap_host = (
-                NetworkAddress.parse(get_parallel().config.dist_init_addr)
-                .resolved()
-                .host
+                NetworkAddress.parse(get_parallel().dist_init_addr).resolved().host
             )
         else:
             bootstrap_host = "127.0.0.1"

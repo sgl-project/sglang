@@ -81,9 +81,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/gemm
    */
-  m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
-  m.impl("awq_dequantize", torch::kMUSA, &awq_dequantize);
-
   m.def(
       "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
@@ -286,7 +283,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "musa_fused_moe_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
       "Tensor! topk_weights, Tensor! topk_ids, bool mul_routed_weight, int topk, bool use_int4_w4a16,"
       "bool use_swigelu) -> ()");
-  m.impl("fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
+  m.impl("musa_fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
 
   m.def(
       "musa_fused_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"

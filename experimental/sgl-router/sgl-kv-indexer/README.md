@@ -18,6 +18,9 @@ SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> in-memory indexe
 - SGLang publishes `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` events.
 - One `kv-indexer-bridge` follows each independent worker/rank event stream.
 - One `kv-indexer-server` applies event batches and serves match queries.
+- For LoRA, the bridge translates worker block IDs into lookup keys derived
+  from tokens, `lora_name`, and `cache_salt`. It tracks each external ID and tier
+  independently so removing one adapter load does not revoke another.
 - Placement, worker metadata, reverse holdings, and hit counters live in that
   server process behind a single read/write lock.
 
@@ -133,7 +136,8 @@ sgl-router \
   --model-id <model-id> \
   --tokenizer-path <huggingface-repo-or-tokenizer> \
   --worker-urls http://127.0.0.1:30000 \
-  --policy cache_aware_zmq \
+  --policy cache_aware \
+  --cache-prefix-provider indexer \
   --kv-indexer-endpoint http://127.0.0.1:50051 \
   --kv-indexer-query-timeout-ms 100 \
   --kv-indexer-query-max-inflight 32

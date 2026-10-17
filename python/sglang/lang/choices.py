@@ -12,7 +12,6 @@ class ChoicesDecision:
 
 
 class ChoicesSamplingMethod(ABC):
-
     @property
     def requires_unconditional_logprobs(self) -> bool:
         return False
@@ -30,7 +29,6 @@ class ChoicesSamplingMethod(ABC):
 
 
 class TokenLengthNormalized(ChoicesSamplingMethod):
-
     def __call__(
         self,
         *,
@@ -54,7 +52,6 @@ token_length_normalized = TokenLengthNormalized()
 
 
 class GreedyTokenSelection(ChoicesSamplingMethod):
-
     def __call__(
         self,
         *,
@@ -108,7 +105,6 @@ greedy_token_selection = GreedyTokenSelection()
 
 
 class UnconditionalLikelihoodNormalized(ChoicesSamplingMethod):
-
     @property
     def requires_unconditional_logprobs(self) -> bool:
         return True

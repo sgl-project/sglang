@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAECo
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    get_channelwise_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
@@ -249,31 +252,9 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
     def get_decode_scale_and_shift(
         self, device, dtype, vae
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get VAE denormalization scale and shift.
-
-        Args:
-            device: Target device
-            dtype: Target dtype
-            vae: VAE model
-
-        Returns:
-            Tuple of (scaling_factor, shift_factor)
-        """
-        vae_arch_config = self.vae_config.arch_config
-
-        # Create scale factor: 1.0 / std
-        scaling_factor = 1.0 / torch.tensor(
-            vae_arch_config.latents_std, device=device
-        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(device, dtype)
-
-        # Create shift factor: mean
-        shift_factor = (
-            torch.tensor(vae_arch_config.latents_mean)
-            .view(1, vae_arch_config.z_dim, 1, 1, 1)
-            .to(device, dtype)
+        return get_channelwise_decode_scale_and_shift(
+            self.vae_config.arch_config, device, dtype
         )
-
-        return scaling_factor, shift_factor
 
     def prepare_calculated_size(self, img: Image.Image) -> Tuple[int, int]:
         img_h, img_w = img.size[1], img.size[0]  # PIL (w,h)
@@ -428,3 +409,21 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
         cond_norm = torch.norm(noise_pred_cond, dim=2, keepdim=True)
         noise_norm = torch.norm(noise_pred, dim=2, keepdim=True).clamp_min(1e-12)
         return noise_pred * (cond_norm / noise_norm)
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.joy_image import (
+        JoyImageEditSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=JoyImageEditSamplingParams,
+        pipeline_config_cls=JoyImageEditPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "joyai-image-edit" in hf_id.lower(),
+        ],
+    )

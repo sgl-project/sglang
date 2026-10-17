@@ -11,7 +11,7 @@ from sglang.srt.utils import get_cuda_driver_bindings, is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=28, stage="base-b", runner_config="2-gpu-large")
 
 WORLD_SIZE = 2
 
@@ -62,9 +62,7 @@ def _run_rank(rank, world_size, port, scenario, result_q):
 
             free, _total = torch.cuda.mem_get_info(rank)
             target = max(free - (1 << 30), 0)
-            granularity_flag = (
-                cuda_driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
-            )
+            granularity_flag = cuda_driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
             err, gran = cuda_driver.cuMemGetAllocationGranularity(
                 prop,
                 granularity_flag,

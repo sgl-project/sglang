@@ -114,10 +114,10 @@ class Sidecar:
             kill_process_tree(self.proc.pid, wait_timeout=self.shutdown_timeout)
 
 
-def start_sidecar(server_args) -> Sidecar:
-    module_name = server_args.sidecar
+def start_sidecar() -> Sidecar:
+    module_name = get_serving().sidecar
     assert module_name is not None
-    sidecar_args, shutdown_timeout = _parse_sidecar_args(server_args.sidecar_args)
+    sidecar_args, shutdown_timeout = _parse_sidecar_args(get_serving().sidecar_args)
     endpoint = build_sidecar_endpoint(get_serving().host, get_serving().grpc_port)
     proc = mp.get_context("spawn").Process(
         name=f"sglang_sidecar_{module_name}",

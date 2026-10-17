@@ -16,7 +16,10 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _is_complete_json
+from sglang.srt.function_call.utils import (
+    _is_complete_json,
+    get_schema_properties,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +140,9 @@ class DotsToolDetector(BaseFormatDetector):
             schema = tool.function.parameters
             if not isinstance(schema, dict):
                 break
-            properties = schema.get("properties", {})
             defs = schema.get("$defs", {})
             return (
-                properties if isinstance(properties, dict) else {},
+                get_schema_properties(schema),
                 defs if isinstance(defs, dict) else {},
             )
         return {}, {}

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    FalconMambaConfig,
     GraniteMoeHybridConfig,
     InklingMMConfig,
     InklingModelConfig,
@@ -15,6 +16,8 @@ from sglang.srt.configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -23,6 +26,7 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
     ZayaConfig,
 )
+from sglang.srt.utils.hf_transformers.common import get_hf_text_config
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -78,7 +82,10 @@ def mamba2_config(model_config: ModelConfig):
         | Lfm2Config
         | Lfm2MoeConfig
         | Lfm2VlConfig
-        | ZayaConfig,
+        | ZayaConfig
+        | Mamba2Config
+        | MambaConfig
+        | FalconMambaConfig,
     ):
         return config
     if isinstance(config, InklingModelConfig):
@@ -107,10 +114,27 @@ def kimi_linear_config(model_config: ModelConfig):
         return config
     if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config
+    text_config = get_hf_text_config(config)
+    if isinstance(text_config, BailingHybridConfig) and text_config.use_kda:
+        return text_config
     text_config = getattr(config, "text_config", None)
     if isinstance(text_config, KimiLinearConfig):
         return text_config
     return None
+
+
+def glm5_next_config(model_config: ModelConfig):
+    hf_config = model_config.hf_config
+    if (
+        getattr(hf_config, "model_type", None) == "glm5_next"
+        and not model_config.is_draft_model
+    ):
+        return hf_config.get_text_config()
+    return None
+
+
+def hybrid_kda_config(model_config: ModelConfig):
+    return kimi_linear_config(model_config) or glm5_next_config(model_config)
 
 
 def linear_attn_model_spec(model_config: ModelConfig):
@@ -122,7 +146,7 @@ def mambaish_config(model_config: ModelConfig):
     existing = (
         mamba2_config(model_config)
         or hybrid_gdn_config(model_config)
-        or kimi_linear_config(model_config)
+        or hybrid_kda_config(model_config)
         or hybrid_lightning_config(model_config)
     )
     if existing:

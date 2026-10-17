@@ -16,15 +16,39 @@ from pathlib import Path
 import deep_ep
 import torch
 import torch.distributed as dist
-from deepep_utils import (
+
+from sglang.test.test_deepep_utils import (
     bench,
     calc_diff,
     create_grouped_scores,
-    init_dist,
     inplace_unique,
     per_token_cast_back,
     per_token_cast_to_fp8,
 )
+
+
+def init_dist(local_rank: int, num_local_ranks: int, args):
+    ip = args.master_addr
+    port = args.master_port
+    num_nodes = args.nnodes
+    node_rank = args.node_rank
+    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://{ip}:{port}",
+        world_size=num_nodes * num_local_ranks,
+        rank=node_rank * num_local_ranks + local_rank,
+    )
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    torch.cuda.set_device(local_rank)
+
+    return (
+        dist.get_rank(),
+        dist.get_world_size(),
+        dist.new_group(list(range(num_local_ranks * num_nodes))),
+    )
 
 
 def test_main(
@@ -155,7 +179,7 @@ def test_main(
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f"[testing] Running with {'FP8' if isinstance(current_x, tuple) else 'BF16'}, {'with' if with_topk else 'without'} top-k (async={async_mode}, previous={previous_mode}) ...",
                             flush=True,
                             end="",
                         )
@@ -198,9 +222,9 @@ def test_main(
 
                     # Checks
                     recv_gbl_rank_prefix_sum = handle[-4]
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), (
+                        f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    )
                     assert (
                         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                         == recv_num_tokens_per_expert_list
@@ -325,11 +349,14 @@ def test_main(
                 tune_args = {"x": current_x, "handle": handle, "config": config}
                 t = bench(lambda: buffer.dispatch(**tune_args))[0]
                 if t < best_time:
-                    best_time, best_results = t, (
-                        num_sms,
-                        nvl_chunk_size,
-                        rdma_chunk_size,
-                        config_kwargs,
+                    best_time, best_results = (
+                        t,
+                        (
+                            num_sms,
+                            nvl_chunk_size,
+                            rdma_chunk_size,
+                            config_kwargs,
+                        ),
                     )
                 if local_rank == 0:
                     print(
@@ -338,7 +365,7 @@ def test_main(
                     )
         if local_rank == 0:
             print(
-                f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)',
+                f"[tuning] Best dispatch ({'FP8' if isinstance(current_x, tuple) else 'BF16'}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)",
                 flush=True,
             )
             print("", flush=True)
@@ -399,11 +426,14 @@ def test_main(
                     flush=True,
                 )
                 if t < best_time:
-                    best_time, best_results = t, (
-                        num_sms,
-                        nvl_chunk_size,
-                        rdma_chunk_size,
-                        config_kwargs,
+                    best_time, best_results = (
+                        t,
+                        (
+                            num_sms,
+                            nvl_chunk_size,
+                            rdma_chunk_size,
+                            config_kwargs,
+                        ),
                     )
 
     if local_rank == 0:

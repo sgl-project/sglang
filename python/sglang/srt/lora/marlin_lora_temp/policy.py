@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang.srt.arg_groups.overrides import resolving_view
+
 
 def validate_experimental_sgl_marlin_server_args(
     server_args: Any, resolved_args: Any
 ) -> None:
     """Validate startup options before the experimental runner is constructed."""
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)
 
@@ -46,7 +47,6 @@ def validate_experimental_sgl_marlin_server_args(
         or cfg.enable_eplb
         or cfg.elastic_ep_backend is not None
         or cfg.enable_elastic_expert_backup
-        or cfg.elastic_ep_rejoin
     ):
         raise ValueError(
             "experimental_sgl_marlin EP requires trivial expert placement "

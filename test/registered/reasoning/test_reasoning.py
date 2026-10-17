@@ -18,6 +18,9 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=129, stage="base-b", runner_config="1-gpu-large")
+# Backend-specific: the thinking-token and separate-reasoning assertions read
+# decoded output from a 30B MoE, so a ROCm fused-MoE or sampling regression
+# shows up here as malformed reasoning_content that CUDA cannot catch.
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 

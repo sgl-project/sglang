@@ -311,7 +311,6 @@ def copy_trace_files(source_dir, target_base_path):
     for root, dirs, files in os.walk(source_dir):
         for file in files:
             if file.endswith(".json.gz"):
-
                 # Only upload TP rank 0 traces to avoid duplicates across tensor parallel ranks
                 if "TP-" in file and "TP-0" not in file:
                     continue
