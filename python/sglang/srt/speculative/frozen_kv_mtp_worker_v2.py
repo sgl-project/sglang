@@ -21,6 +21,7 @@ start of the next draft.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from dataclasses import fields
@@ -28,6 +29,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_uniform_func,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -81,6 +86,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     get_plan_stream,
+    record_stream_each,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -769,6 +775,75 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    def _target_graph_capture_kwargs(self, speculative_num_steps: int) -> dict:
+        if speculative_num_steps == 0 and envs.SGLANG_FROZEN_KV_ZERO_DECODE.get():
+            return dict(
+                capture_forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+        return {}
+
+    def _use_zero_decode(self, batch: ScheduleBatch) -> bool:
+        return (
+            self.speculative_num_steps == 0
+            and envs.SGLANG_FROZEN_KV_ZERO_DECODE.get()
+            and batch.forward_mode.is_decode()
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and batch.hisparse_coordinator is None
+        )
+
+    def _forward_zero_decode(self, batch: ScheduleBatch, on_publish=None):
+        """Consume the carried bonus through ordinary target DECODE + sampling.
+
+        Scheduler spec preparation already reserved KV slots. Unlike verify,
+        DECODE lengths include the token being consumed. Keep those lengths in
+        a shallow forward-only batch so scheduler's pre-iteration state survives.
+        """
+        decode_batch = copy.copy(batch)
+        decode_batch.spec_info = None
+        decode_batch.input_ids = batch.spec_info.bonus_tokens.to(torch.int64)
+        decode_batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            batch_size=len(batch.seq_lens),
+            draft_token_num=1,
+            device=self.device,
+        )
+        decode_batch.seq_lens = batch.seq_lens + 1
+        decode_batch.seq_lens_cpu = (
+            batch.seq_lens_cpu + 1 if batch.seq_lens_cpu is not None else None
+        )
+        decode_batch.orig_seq_lens = decode_batch.seq_lens
+        decode_batch.seq_lens_sum = None
+        stream = torch.get_device_module(self.device).current_stream()
+        record_stream_each(
+            (batch.seq_lens, batch.req_pool_indices, batch.spec_info.bonus_tokens),
+            stream,
+        )
+        forward_batch = ForwardBatch.init_new(
+            decode_batch,
+            self._target_worker.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        result = self._target_worker.forward_batch_generation(
+            batch=None, forward_batch=forward_batch
+        )
+        result.speculative_num_draft_tokens = 1
+        result.accept_lens = torch.ones_like(batch.seq_lens, dtype=torch.int32)
+        result.new_seq_lens = decode_batch.seq_lens
+        if on_publish is not None:
+            on_publish(result.new_seq_lens)
+        # Graph output storage is reused on replay. Own the hidden seed before
+        # the next iteration, including consecutive zero-step decodes.
+        result.next_draft_input = self.draft_worker._build_seed_draft_input(
+            result.next_token_ids, result.logits_output.hidden_states.clone()
+        )
+        result.extra_keep_alive_refs = [forward_batch]
+        return result
+
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         super().apply_runtime_state(state)
         # EAGLE binds this through its draft-extend backend. Frozen has no
@@ -831,6 +906,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
             if batch.spec_info is None:
                 batch.spec_info = self.draft_worker._idle_seed()
+            if self._use_zero_decode(batch):
+                return self._forward_zero_decode(batch, on_publish=on_publish)
             if self.speculative_num_steps == 0:
                 verify_input = self._build_trivial_verify_input(batch)
             else:
