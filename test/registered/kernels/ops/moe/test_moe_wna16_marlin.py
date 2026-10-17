@@ -584,6 +584,73 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     assert out.shape == (m, hidden_size)
 
 
+def test_prepare_moe_nvfp4_marlin_repacks_experts_in_place():
+    """Marlin preparation must not hold a second copy of a layer's experts: large NVFP4
+    MoE checkpoints ran out of memory at load time while every expert was duplicated."""
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        _repack_moe_fp4_weight_for_marlin,
+    )
+
+    torch.manual_seed(0)
+    e, intermediate_size, hidden_size, dtype = 64, 256, 1024, torch.bfloat16
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=16)
+    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.params_dtype = dtype
+    layer.intermediate_size_per_partition = intermediate_size
+    for name, n, k in (
+        ("w13", 2 * intermediate_size, hidden_size),
+        ("w2", hidden_size, intermediate_size),
+    ):
+        weight = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+        scale = torch.rand((e, n, k // 16), device="cuda", dtype=dtype)
+        setattr(
+            layer, f"{name}_weight", torch.nn.Parameter(weight, requires_grad=False)
+        )
+        setattr(
+            layer,
+            f"{name}_weight_scale",
+            torch.nn.Parameter(scale, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{name}_weight_scale_2",
+            torch.nn.Parameter(
+                torch.ones((e,), device="cuda", dtype=dtype), requires_grad=False
+            ),
+        )
+    perm = torch.empty(0, dtype=torch.int, device="cuda")
+    expected_w13 = _repack_moe_fp4_weight_for_marlin(
+        layer.w13_weight.data.clone(),
+        num_experts=e,
+        size_n=2 * intermediate_size,
+        size_k=hidden_size,
+        perm=perm,
+    )
+    expected_w2 = _repack_moe_fp4_weight_for_marlin(
+        layer.w2_weight.data.clone(),
+        num_experts=e,
+        size_n=hidden_size,
+        size_k=intermediate_size,
+        perm=perm,
+    )
+    w13_ptr, w2_ptr = layer.w13_weight.data_ptr(), layer.w2_weight.data_ptr()
+    expert_bytes = layer.w13_weight.numel() + layer.w2_weight.numel()
+
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+    torch.cuda.synchronize()
+
+    assert torch.equal(layer.w13_weight, expected_w13)
+    assert torch.equal(layer.w2_weight, expected_w2)
+    assert layer.w13_weight.data_ptr() == w13_ptr
+    assert layer.w2_weight.data_ptr() == w2_ptr
+    # Scale permutation and one expert's repack scratch fit under one copy of the experts.
+    assert torch.cuda.max_memory_allocated() - baseline < expert_bytes
+
+
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
