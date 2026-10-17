@@ -125,6 +125,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `rmsnorm_cast_before_weight_modulate_bitexact` | Triton | ATen-ordered FP32 reduction and exact BF16 modulation | MOSS-Image BSC, width 3072 |
 | `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
@@ -139,6 +140,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `rmsnorm_cast_before_weight_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm |
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
 | `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU; `[ROWS, C]` tiles (~3 TB/s at C = 96); optional `conv_bias` folds the preceding conv's bias with aten `add_` arithmetic |
@@ -165,6 +167,12 @@ for coalesced residual reads and output writes. The contiguous layouts use
 JIT CUDA. Do not insert a `.contiguous()` to reach that path: it adds a full
 tensor copy at each residual site.
 
+### Activations
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `fused_situ_softcap_mul_bitexact` | Triton | bit-exact vs MOSSImage's nine-op BF16 SiTU chain | CUDA BF16 `[B, S, D]`, dense rows or strided halves of a packed FFN projection; first-use verification in the model wrapper |
+
 ### RoPE / QK-norm
 
 | Entry point | Backend | Contract |
@@ -174,6 +182,7 @@ tensor copy at each residual site.
 | `fused_qknorm_rope_out_of_place` | JIT CUDA | as above, bit-equal to the in-place kernel; reads strided q/k and writes contiguous copies, inputs untouched (VDN-H3 keeps the raw q/k for its linear branch) |
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
+| `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
 | `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
 | `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
@@ -242,6 +251,35 @@ once they run channels_last end-to-end.
 `(table + temb.float()).chunk(6, dim=2)` materializes ~8 GB of fp32 at
 704p/121f *and* hands six strided slices downstream, whose `.contiguous()`
 calls copy each one again.
+
+### BF16 activation and normalization contracts
+
+MOSS-Image's `fused_situ_softcap_mul_bitexact` uses exact BF16 lookup tables for inputs with
+at least 65536 elements. The two factors are evaluated with the live aten CUDA
+formula for every BF16 encoding, preserving each rounding boundary; the fused
+kernel then looks up both factors and multiplies them. Tables use 256 KiB per
+device and remain alive for captured graphs. Initialization finishes before
+publication to other streams. Small inputs and captures without initialized
+tables use the direct fused formula. This is an exact path, subject to the first-use bit-exact check.
+
+MOSS-Image uses `rmsnorm_cast_before_weight_bitexact` for contiguous CUDA BF16 token and
+per-head tensors. Widths 3072 and 128 with at least 16 rows and fewer than
+`2**29` elements use one kernel that reproduces ATen's vectorized FP32 mean
+reduction order; other shapes retain ATen's mean with fused pointwise
+operations around it (three kernels).
+Both round the normalized value to BF16 **before** multiplying by the learned
+weight. The model verifies each width/reduction regime on first sight and
+falls back on unsupported layouts or a mismatch. Unverified regimes use the
+native path during compilation or CUDA graph capture.
+
+MOSS-Image also uses `rmsnorm_cast_before_weight_modulate_bitexact` for width-3072 BSC
+activations and `rmsnorm_cast_before_weight_rope_bitexact` for width-128 BSHD heads.
+Both retain the same ordered reduction and BF16 round-before-gamma contract,
+then preserve each modulation or rotate-half rounding boundary. Their guards
+require contiguous CUDA BF16 tensors, at least 16 normalization rows, and
+fewer than `2**29` elements. Modulation tensors may have a strided batch axis,
+as produced by `unbind`, with contiguous channels. Model wrappers verify against the existing chain
+before enabling either fusion and retain the separate operations on fallback.
 
 ## What is not a kernel
 
