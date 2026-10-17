@@ -162,7 +162,7 @@ class GlobalMetadataState:
                 with rank_meta.lock:
                     serializable_state[key_str] = {
                         "num_pages": rank_meta.num_pages,
-                        "free_pages": rank_meta.free_pages,
+                        "free_pages": list(rank_meta.free_pages),
                         "key_to_index": list(rank_meta.key_to_index.items()),
                     }
 
