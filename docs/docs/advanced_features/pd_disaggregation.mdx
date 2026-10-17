@@ -59,8 +59,8 @@ whole-transfer and final-token checks still apply. Pending requests retain KV on
 prefill; decode-capacity pressure can therefore become prefill-capacity pressure.
 The readiness/admission/transfer timeout budgets start at their existing phase
 boundaries, with the first accepted chunk replacing final-result acceptance as
-the initial readiness boundary. There are no SGLang performance measurements for
-this policy yet; compare it with both `early` and `prefill_complete` for your load.
+the initial readiness boundary. Compare this policy with both `early` and
+`prefill_complete` for your workload; benefits depend on admission and transfer pressure.
 
 The following deferred-allocation restrictions apply to **both** `first_chunk`
 and `prefill_complete`. Set matching policies on P and D, and upgrade both roles
@@ -90,8 +90,15 @@ for transfer.
 
 The option does not support staging buffers, runtime PD role switching, PD
 multiplexing, encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
-HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
-`write_back` and no storage backend. Unsupported configurations fail validation.
+HiCache, or auxiliary state pools other than DSA or Mamba. Prefill HiCache is
+limited to L2 with `write_back` and no storage backend. Unsupported configurations
+fail validation.
+
+For Mamba-state models, intermediate chunks transfer only their completed KV
+indices. Convolution and recurrent state use the existing final-chunk handoff;
+allocation readiness neither snapshots intermediate recurrent state nor makes a
+decode request runnable. Final state, metadata, and ownership cleanup must still
+complete before decode proceeds.
 
 All communicating workers must use the same revision and enable the same policy. This
 version of the decode worker rejects policy or peer-layout mismatches before
