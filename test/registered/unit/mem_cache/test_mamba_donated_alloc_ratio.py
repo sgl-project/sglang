@@ -364,7 +364,15 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
             speculative_num_draft_tokens=draft_tokens,
         )
         args.update(schedule)
-        with rc.get_context().override_server_args(**args):
+        with rc.get_context().override_server_args(**args) as server_args:
+            # The fixed-capacity branch only trusts an operator-passed
+            # --max-running-requests. The harness records test values as
+            # resolutions (which never touch _raw_input), so mirror an
+            # explicit pass in the pre-resolution snapshot.
+            if args.get("max_running_requests") is not None:
+                server_args._raw_input["max_running_requests"] = args[
+                    "max_running_requests"
+                ]
             remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
 
@@ -430,6 +438,82 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                     ),
                     (8, 44 << 20),
                 )
+
+
+class TestSpecDecodeAutoDefaultRadixDisabled(unittest.TestCase):
+    """sgl-project/sglang#44355: with speculative decoding, --max-running-requests
+    auto-resolves to 48 when omitted. With --disable-radix-cache, the mamba state
+    pool must not treat that auto default as a user-chosen limit: sizing the pool
+    for 48 requests (plus per-draft-token verify snapshots) can leave no memory
+    for the attention KV cache and fail startup with ValueError. An explicitly
+    passed --max-running-requests still sizes the pool directly."""
+
+    PER_REQ = 4 << 20
+    DRAFT_TOKENS = 6
+    BUDGET_GB = 1.0
+
+    @staticmethod
+    def _size(*, max_running_requests, explicit):
+        import types as _types
+
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import get_schedule
+
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1, 2, 3],
+                    mamba_cache_per_req=TestSpecDecodeAutoDefaultRadixDisabled.PER_REQ,
+                )
+            ),
+            extra_mamba_cache_bytes_per_req=0,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            attn_dp_size=1,
+            pp_size=1,
+            hybrid_gdn_config=None,
+            hybrid_kda_config=None,
+            model_config=SimpleNamespace(num_hidden_layers=4),
+        )
+        # Bind the real ratio helper (returns 1 with the radix cache disabled).
+        fake._calculate_mamba_ratio = _types.MethodType(
+            KVCacheConfigurator._calculate_mamba_ratio, fake
+        )
+        with rc.get_context().override_server_args(
+            disable_radix_cache=True,
+            max_mamba_cache_size=None,
+            max_running_requests=max_running_requests,
+            mamba_full_memory_ratio=0.5,
+            enable_linear_replayssm_spec=False,
+            speculative_num_draft_tokens=(
+                TestSpecDecodeAutoDefaultRadixDisabled.DRAFT_TOKENS
+            ),
+        ) as server_args:
+            # The harness records test values as resolutions (which never touch
+            # _raw_input); mirror what the operator actually passed in the
+            # pre-resolution snapshot the fix reads.
+            server_args._raw_input["max_running_requests"] = (
+                max_running_requests if explicit else None
+            )
+            remaining = KVCacheConfigurator._handle_max_mamba_cache(
+                fake, TestSpecDecodeAutoDefaultRadixDisabled.BUDGET_GB
+            )
+            return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
+
+    def test_auto_default_fits_memory_and_leaves_kv_room(self):
+        # 48 is the speculative auto-default here, not a user choice. The old
+        # code sized 48 slots + 49*6 draft snapshots = 1372 MiB against a
+        # 1 GiB budget and returned negative memory (the startup ValueError).
+        # The pool must auto-fit instead: 11 slots, 688 MiB left for KV cache.
+        self.assertEqual(
+            self._size(max_running_requests=48, explicit=False), (11, 688 << 20)
+        )
+
+    def test_explicit_limit_still_sizes_pool_directly(self):
+        # A user-passed --max-running-requests keeps the direct sizing branch,
+        # including the issue's --max-running-requests 10 workaround value.
+        self.assertEqual(self._size(max_running_requests=8, explicit=True)[0], 8)
+        self.assertEqual(self._size(max_running_requests=48, explicit=True)[0], 48)
 
 
 if __name__ == "__main__":
