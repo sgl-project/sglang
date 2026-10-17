@@ -229,6 +229,21 @@ def choose_output_image_ext(
     return "jpg"
 
 
+_MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
+
+
+def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
+    """Client-supplied model paths must not make the server fetch arbitrary URLs."""
+    for name in _MODEL_PATH_FIELDS:
+        value = kwargs.get(name)
+        if isinstance(value, str) and "://" in value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a local path or a HuggingFace repo id, "
+                "not a URL",
+            )
+
+
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
@@ -253,6 +268,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    _reject_remote_model_paths(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
@@ -292,9 +308,12 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # SamplingParams.__post_init__ may have resolved with the wrong data_type
     # (default VIDEO) before _adjust() set the correct one.
     if not has_explicit_compression and output_quality is not None:
-        sampling_params.output_compression = adjust_output_quality(
-            output_quality, sampling_params.data_type
-        )
+        try:
+            sampling_params.output_compression = adjust_output_quality(
+                output_quality, sampling_params.data_type
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return sampling_params
 
@@ -418,6 +437,28 @@ async def _maybe_url_image(
         raise ValueError("Unsupported image url format")
 
 
+# Arbitrary cap; keeps a hostile or mistaken URL from filling server memory.
+_MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+
+async def _read_capped_body(response: httpx.Response) -> bytes:
+    declared = response.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
+        raise ValueError(
+            f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > _MAX_IMAGE_DOWNLOAD_BYTES:
+            raise ValueError(
+                f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _save_url_image_to_path(
     image_url: str, target_path: str, *, uploads_root: str | None = None
 ) -> str:
@@ -448,8 +489,11 @@ async def _save_url_image_to_path(
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for attempt in range(1, max_attempts + 1):
                 try:
-                    response = await client.get(image_url, timeout=10.0)
-                    response.raise_for_status()
+                    async with client.stream(
+                        "GET", image_url, timeout=10.0
+                    ) as response:
+                        response.raise_for_status()
+                        body = await _read_capped_body(response)
 
                     # Determine file extension from content type or URL after downloading
                     if not os.path.splitext(target_path)[1]:
@@ -489,7 +533,7 @@ async def _save_url_image_to_path(
                     if uploads_root is not None:
                         target_path = ensure_path_within_root(target_path, uploads_root)
                     with open(target_path, "wb") as f:
-                        f.write(response.content)
+                        f.write(body)
 
                     return target_path
                 except Exception as e:
