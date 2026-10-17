@@ -204,7 +204,7 @@ Prefill/decode disaggregation is validated token-identical against a single serv
 
 One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
 
-PD and speculative decoding cannot be combined.
+PD runs with DSpark: on a DSpark recipe both Playground roles keep the speculative flags, and the prefill and decode servers must both pass them. The server accepts this with Mooncake or NIXL transfer, static verification (`SGLANG_RAGGED_VERIFY_MODE`, `static` by default), and no context parallelism on decode (CP=1, DCP=1); it rejects any other combination at startup.
 
 ### 3.5 HiCache (Hierarchical KV Caching)
 
