@@ -13,7 +13,7 @@ register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # Qwen3.8-2.4T TP8: in_proj_qkvz and out_proj.
 SHAPES = ((4608, 8192), (8192, 2048))
-# Both sides of the preshuffled-scale split at 32 rows and of the 64-row cut.
+# Rows on both sides of the 32-row scale-layout split and of the 64-row kernel cut.
 ROWS = (1, 4, 16, 31, 32, 64, 65, 256)
 
 

@@ -1909,7 +1909,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.5 / Qwen3.8 on gfx95x with <code>SGLANG_USE_AITER=1</code>: comma-separated BF16 GDN projections (<code>in_proj_qkvz</code>, <code>out_proj</code>) to quantize to MXFP4 after load. Up to 64 rows they run the AITER preshuffled MXFP4 GEMM when AITER has a tuned config for the shape, otherwise the ASM <code>gemm_a4w4</code>. Empty keeps the BF16 path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated BF16 GDN projections of Qwen3.5 / Qwen3.8 (<code>in_proj_qkvz</code>, <code>out_proj</code>) to quantize to MXFP4 after load. Needs gfx95x and <code>SGLANG_USE_AITER=1</code>. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Empty keeps the BF16 path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
   </tbody>

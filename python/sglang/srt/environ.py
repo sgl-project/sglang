@@ -948,7 +948,8 @@ class Envs:
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     # Comma-separated BF16 Qwen3.5/3.8 GDN projections ("in_proj_qkvz",
-    # "out_proj") to quantize to MXFP4 after loading. gfx95x with AITER only.
+    # "out_proj") to quantize to MXFP4 after loading. Needs gfx95x and
+    # SGLANG_USE_AITER=1.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvStr("")
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton

@@ -768,11 +768,11 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
 
 class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
-    """MXFP4 GEMM for a loaded BF16 linear, quantized once by ``quantize_``.
+    """MXFP4 GEMM for a loaded BF16 linear that ``quantize_`` converts once.
 
-    The weight and its E8M0 scales are stored preshuffled. Batches of at most
-    ``PRESHUFFLE_MAX_M`` rows run the Triton preshuffled GEMM when AITER ships
-    a tuned config for (N, K); everything else runs the ASM ``gemm_a4w4``.
+    ``quantize_`` stores the weight and its E8M0 scales preshuffled. Batches of
+    at most ``PRESHUFFLE_MAX_M`` rows run the Triton preshuffled GEMM if AITER
+    has a tuned config for (N, K). All other batches run the ASM ``gemm_a4w4``.
     """
 
     PRESHUFFLE_MAX_M = 64

@@ -188,7 +188,7 @@ _gdn_online_mxfp4 = tuple(
 )
 if not set(_gdn_online_mxfp4) <= {"in_proj_qkvz", "out_proj"}:
     raise ValueError(
-        f"SGLANG_ROCM_GDN_ONLINE_MXFP4 takes in_proj_qkvz, out_proj; got {_gdn_online_mxfp4}"
+        f"SGLANG_ROCM_GDN_ONLINE_MXFP4 accepts in_proj_qkvz and out_proj, got {_gdn_online_mxfp4}"
     )
 if _gdn_online_mxfp4 and not (_use_aiter and _is_gfx95):
     logger.warning("SGLANG_ROCM_GDN_ONLINE_MXFP4 needs gfx95x and SGLANG_USE_AITER=1")
@@ -1850,7 +1850,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             packed = mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
-                    # Before packing: an MXFP4 in_proj_qkvz is not packed with in_proj_ba.
+                    # Quantize first, so that an MXFP4 in_proj_qkvz is not packed with in_proj_ba.
                     mxfp4 += module.quantize_online_mxfp4()
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
