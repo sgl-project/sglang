@@ -346,6 +346,8 @@ class MockDSV4ModelRunner:
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
+        # The fixture uses unquantized projections, with no FP8 wo_a epilogue.
+        self.model = nn.Module()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
