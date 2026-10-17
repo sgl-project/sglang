@@ -133,6 +133,8 @@ _run_splitk_dense = None
 _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
+_warp_splitk_tactic = None
+_run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
@@ -149,14 +151,10 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (2, 512, 8192): (64, 8, 4, 12),
     (4, 512, 8192): (64, 8, 4, 10),
     (8, 512, 8192): (64, 8, 4, 12),
+    (12, 512, 8192): (64, 8, 4, 12),
     (16, 512, 8192): (64, 8, 4, 12),
     (24, 512, 8192): (64, 8, 4, 12),
     (32, 512, 8192): (64, 16, 4, 9),
-    (1, 2304, 8192): (128, 8, 4, 6),
-    (2, 2304, 8192): (64, 8, 2, 12),
-    (4, 2304, 8192): (128, 8, 4, 6),
-    (8, 2304, 8192): (64, 8, 4, 10),
-    (16, 2304, 8192): (64, 16, 4, 9),
     (24, 2304, 8192): (64, 32, 2, 9),
     (32, 2304, 8192): (64, 32, 2, 9),
     (1, 2560, 8192): (64, 8, 2, 10),
@@ -166,6 +164,23 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
+    # MuseSpark TP8 unpooler slice; only swept M are listed.
+    (4, 1024, 4096): (64, 8, 4, 12),
+    (8, 1024, 4096): (64, 8, 4, 12),
+    (12, 1024, 4096): (64, 16, 4, 8),
+    (16, 1024, 4096): (64, 16, 4, 8),
+    # MuseSpark TP4 qkvg and pooler/unpooler slices on GB300, same method;
+    # only swept M are listed; other M were not tuned and stay on TGV/cuBLAS.
+    (24, 4608, 8192): (64, 32, 2, 9),
+    (32, 4608, 8192): (64, 32, 2, 9),
+    (1, 1024, 8192): (64, 16, 4, 10),
+    (2, 1024, 8192): (64, 16, 4, 10),
+    (4, 1024, 8192): (64, 16, 4, 10),
+    (8, 1024, 8192): (64, 16, 4, 10),
+    (12, 1024, 8192): (64, 16, 4, 10),
+    (16, 1024, 8192): (64, 16, 4, 10),
+    (24, 1024, 8192): (64, 16, 4, 10),
+    (32, 1024, 8192): (64, 16, 4, 10),
     # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
     # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
     (1, 320, 2560): (64, 8, 4, 11),
@@ -210,9 +225,54 @@ _BF16_SPLITK_TUNED_TACTICS = {
     (8, 4120, 2560): (64, 8, 2, 6),
 }
 
+# FlashInfer warp split-K (output_tile, token_tile, k_tile, stages, b_loader_warps),
+# MuseSpark TP4/TP8 on GB300 of the per-M best.
+# Takes precedence over _BF16_SPLITK_TUNED_TACTICS.
+_BF16_WARP_SPLITK_TUNED_TACTICS = {
+    # TP4 qkvg, o_proj and unpooler slice.
+    (1, 4608, 8192): (32, 8, 256, 10, 2),
+    (2, 4608, 8192): (32, 8, 256, 10, 2),
+    (4, 4608, 8192): (32, 8, 256, 10, 2),
+    (8, 4608, 8192): (32, 8, 256, 10, 2),
+    (12, 4608, 8192): (32, 16, 256, 9, 2),
+    (16, 4608, 8192): (32, 16, 256, 9, 2),
+    (1, 8192, 2048): (16, 8, 256, 4, 2),
+    (2, 8192, 2048): (16, 8, 256, 4, 2),
+    (4, 8192, 2048): (16, 8, 256, 4, 2),
+    (8, 8192, 2048): (16, 8, 256, 4, 2),
+    (12, 8192, 2048): (32, 16, 256, 4, 2),
+    (16, 8192, 2048): (32, 16, 256, 4, 2),
+    (1, 2048, 4096): (16, 8, 256, 15, 2),
+    (2, 2048, 4096): (16, 8, 256, 15, 2),
+    (4, 2048, 4096): (16, 8, 256, 15, 2),
+    (8, 2048, 4096): (16, 8, 256, 15, 2),
+    (12, 2048, 4096): (16, 16, 256, 12, 2),
+    (16, 2048, 4096): (16, 16, 256, 12, 2),
+    (24, 2048, 4096): (32, 16, 256, 9, 2),
+    (32, 2048, 4096): (32, 16, 256, 9, 2),
+    # TP8 qkvg, o_proj and unpooler slice.
+    (1, 2304, 8192): (16, 8, 256, 16, 2),
+    (2, 2304, 8192): (16, 8, 256, 16, 2),
+    (4, 2304, 8192): (16, 8, 256, 16, 2),
+    (8, 2304, 8192): (16, 8, 256, 16, 2),
+    (12, 2304, 8192): (16, 16, 256, 13, 2),
+    (16, 2304, 8192): (16, 16, 256, 13, 2),
+    (1, 8192, 1024): (32, 8, 128, 8, 2),
+    (2, 8192, 1024): (32, 8, 128, 8, 2),
+    (4, 8192, 1024): (32, 8, 128, 8, 2),
+    (8, 8192, 1024): (32, 8, 128, 8, 2),
+    (12, 8192, 1024): (32, 16, 256, 4, 2),
+    (16, 8192, 1024): (32, 16, 256, 4, 2),
+    (1, 1024, 4096): (16, 8, 256, 16, 2),
+    (2, 1024, 4096): (16, 8, 256, 16, 2),
+    (24, 1024, 4096): (16, 16, 256, 10, 2),
+    (32, 1024, 4096): (16, 16, 256, 10, 2),
+}
+
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
-    return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
+    key = (m, n, k)
+    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
 
 
 def precompile_splitk_tactics() -> bool:
@@ -221,7 +281,7 @@ def precompile_splitk_tactics() -> bool:
     if not _enable_bf16_splitk_gemm:
         return False
     device = torch.cuda.current_device()
-    for m, n, k in _BF16_SPLITK_TUNED_TACTICS:
+    for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
@@ -243,6 +303,7 @@ def initialize_bf16_gemm_config() -> None:
     global _direct_default_tactic
     global _prefer_direct
     global _run_direct_dense
+    global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm
 
     backend_str = get_exec().kernel.bf16_gemm_backend
@@ -297,12 +358,18 @@ def initialize_bf16_gemm_config() -> None:
             SplitKTactic,
             run_splitk_dense,
         )
+        from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+            WarpSplitKTactic,
+            run_warp_splitk_dense,
+        )
 
         _splitk_tactic = SplitKTactic
         _run_splitk_dense = run_splitk_dense
         _direct_default_tactic = default_tactic
         _prefer_direct = prefer_direct_bf16_gemm_sm100
         _run_direct_dense = run_direct_dense
+        _warp_splitk_tactic = WarpSplitKTactic
+        _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
 
     _BF16_GEMM_BACKEND = backend
@@ -321,7 +388,12 @@ def _bf16_splitk_gemm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    if bias is None and _prefer_direct(m, n, k):
+    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
+    if warp_tactic is not None:
+        _run_warp_splitk_dense(
+            x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias
+        )
+    elif bias is None and _prefer_direct(m, n, k):
         tactic = _direct_default_tactic(m, n, k)
         _run_direct_dense(x_2d, weight.T, out, True, tactic)
     else:

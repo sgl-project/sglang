@@ -216,6 +216,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
+          HF_MUSE_SPARK_TOKEN: ${{ inputs.self_name == 'base-c-test-8-gpu-b300' && secrets.HF_MUSE_SPARK_TOKEN || '' }}
           # Read only by test_runai_model_loader.py (nightly 1-gpu); inert elsewhere.
           # Left unconditional because an `env:` key cannot be omitted, and an empty
           # value would reach the runai streamer as a malformed limit.
