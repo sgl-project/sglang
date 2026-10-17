@@ -52,8 +52,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -998,7 +998,6 @@ class InklingForConditionalGeneration(nn.Module):
             if build_multimodal and self.config.vision_config.decoder_dmodel is not None
             else None
         )
-        self.mm_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
     def model(self) -> nn.Module:
@@ -1070,7 +1069,7 @@ class InklingForConditionalGeneration(nn.Module):
         # The processor expands one placeholder per media item into a run of the same
         # token id; the scheduler calls this to replace each run with the item's
         # pad_value (radix hash), which _embed_mm then masks on to scatter the embeds.
-        return self.mm_pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.llm.embed_tokens

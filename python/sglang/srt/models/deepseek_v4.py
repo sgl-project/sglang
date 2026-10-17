@@ -104,8 +104,8 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
@@ -1377,9 +1377,28 @@ class MQALayer(MqaAttentionBase):
             self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
         )
         if self.mega_wq_b_permuted:
-            for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
-                param.data.copy_(interleave_query_rows(param.data, self.n_local_heads))
-            self.wq_b.quant_method._process_mxfp8_linear_weight_scale(self.wq_b)
+            method = self.wq_b.quant_method
+            if method.use_mxfp8:
+                for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
+                    param.data.copy_(
+                        interleave_query_rows(param.data, self.n_local_heads)
+                    )
+                method._process_mxfp8_linear_weight_scale(self.wq_b)
+            else:
+                block_n, block_k = method.weight_block_size
+                sf = self.wq_b.weight_scale_inv.data.repeat_interleave(
+                    block_n // 16, dim=0
+                )
+                sf = (
+                    sf.view(self.n_local_heads, 32, -1)
+                    .transpose(0, 1)
+                    .reshape(sf.shape)
+                )
+                self.wq_b.weight.data.copy_(
+                    interleave_query_rows(self.wq_b.weight.data, self.n_local_heads)
+                )
+                self.wq_b.weight_scale_inv.data = sf.contiguous()
+                method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
@@ -1387,7 +1406,10 @@ class MQALayer(MqaAttentionBase):
         method = self.wq_b.quant_method
         backend = getattr(method, "mxfp8_dense_backend", None)
         return bool(
-            getattr(method, "use_mxfp8", False)
+            (
+                getattr(method, "use_mxfp8", False)
+                or getattr(method, "block_fp8_as_mxfp8", False)
+            )
             and backend is not None
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
         )
@@ -2054,6 +2076,8 @@ class MQALayer(MqaAttentionBase):
             unified and (is_decode or fuse_verify or fuse_prefill)
         ) or (not unified and self.use_fused_qk_norm_rope)
 
+        # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
+        q_lora_quant = None
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
@@ -2063,6 +2087,7 @@ class MQALayer(MqaAttentionBase):
                     e8m0=self._q_lora_quant_e8m0(with_indexer=True),
                 )
                 q, _ = self.wq_b(q_for_wqb)
+                q_lora_quant = q_for_wqb
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
                 q, _ = self.wq_b(q_for_wqb)
@@ -2334,6 +2359,7 @@ class MQALayer(MqaAttentionBase):
                         q_lora=q_lora,
                         forward_batch=forward_batch,
                         attn_backend=attn_backend,
+                        q_lora_quant=q_lora_quant,
                     )
             if self.compressor is not None:
                 if use_npu_cp_full_metadata:
@@ -3690,26 +3716,30 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
-        # Rows outside the tail are never computed past the last kv_source layer.
+    def _check_late_layer_tail_readers(
+        self, forward_batch: ForwardBatch, tail: LateLayerTail
+    ) -> None:
+        # Rows outside the tail are never computed past the last kv_source layer;
+        # late_layer_whole_extend gives the requests that read them a whole tail.
+        extend_lens = forward_batch.extend_seq_lens_cpu
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
+            and list(tail.extend_seq_lens_cpu) != list(extend_lens)
         ):
             raise ValueError(
-                "decoder SWA bounded replay cannot capture hidden states of all "
-                "prompt tokens"
+                "decoder SWA bounded replay tail misses captured hidden-state rows"
             )
         if forward_batch.return_logprob and any(
-            start < n
-            for start, n in zip(
+            start < n - t
+            for start, n, t in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
+                extend_lens,
+                tail.extend_seq_lens_cpu,
             )
         ):
             raise ValueError(
-                "decoder SWA bounded replay cannot return logprobs of prompt tokens; "
-                "set logprob_start_len to the prompt length"
+                "decoder SWA bounded replay tail misses prompt-logprob rows"
             )
 
     def _forward_layers_hc_pre_from_prev(
@@ -3754,9 +3784,9 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+            self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -3767,7 +3797,8 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
-            and (forward_batch.is_extend_in_batch or _is_hip)
+            # The prefill graph's capture batch leaves is_extend_in_batch unset.
+            and (forward_batch.is_extend_in_batch or tail_in_graph or _is_hip)
         ):
             late_dp_counts = late_layer_dp_counts(
                 forward_batch,
@@ -4283,6 +4314,14 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+            # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+            # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+            # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+            from sglang.srt.models.deepseek_common.amd.aiter_intree_tune import (
+                install_aiter_intree_tune,
+            )
+
+            install_aiter_intree_tune()
             if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
                 set_dense_mxscale(True)
         self.config = config
@@ -4417,9 +4456,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
-        )
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
@@ -4589,7 +4626,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
-            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = (
+                # A prompt-logprob reader's tail is its whole extend, so its start
+                # stands; every other start is the extend's end.
+                [
+                    min(start, t)
+                    for start, t in zip(
+                        forward_batch.extend_logprob_start_lens_cpu,
+                        tail.extend_seq_lens_cpu,
+                    )
+                ]
+                if forward_batch.return_logprob
+                else tail.extend_seq_lens_cpu
+            )
 
         output = self.logits_processor(
             input_ids,
