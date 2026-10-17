@@ -32,6 +32,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -527,6 +528,28 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         k_pe = latent[..., self.kv_lora_rank :].unsqueeze(1)
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         return k_nope, k_pe
+
+    def write_context_kv(
+        self,
+        *,
+        pool,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Write this layer's rows for target-context tokens; with cache_loc_2d,
+        only each request's first commit_lens rows."""
+        k_nope, k_pe = self.project_context_kv(positions, hidden_states)
+        if cache_loc_2d is None:
+            pool.set_mla_kv_buffer(
+                self.attn_mqa, KVWriteLoc(cache_loc, physical=True), k_nope, k_pe
+            )
+        else:
+            pool.set_mla_kv_buffer_prefix_valid(
+                self.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
+            )
 
 
 class DFlashMLP(nn.Module):

@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.models.dflash import DFlashMLAAttention
@@ -211,12 +210,13 @@ class TestDFlashMLABackends(unittest.TestCase):
             )
             for i, ctx in enumerate(prefix):
                 if len(ctx):
-                    k_nope, k_pe = module.project_context_kv(
-                        torch.arange(len(ctx), device="cuda"), ctx
-                    )
-                    locs = runner.req_to_token_pool.req_to_token[i, : len(ctx)].long()
-                    runner.token_to_kv_pool.set_mla_kv_buffer(
-                        module.attn_mqa, KVWriteLoc(locs, physical=True), k_nope, k_pe
+                    module.write_context_kv(
+                        pool=runner.token_to_kv_pool,
+                        positions=torch.arange(len(ctx), device="cuda"),
+                        hidden_states=ctx,
+                        cache_loc=runner.req_to_token_pool.req_to_token[
+                            i, : len(ctx)
+                        ].long(),
                     )
             expected = _expanded_reference(
                 module, prefix, hidden, batch.positions, causal=causal

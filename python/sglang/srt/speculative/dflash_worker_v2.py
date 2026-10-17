@@ -1920,11 +1920,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                         layer, ctx_hidden
                     )
                     if isinstance(attn, DFlashMLAAttention):
-                        k_nope, k_pe = attn.project_context_kv(
-                            positions, layer_ctx_hidden
-                        )
-                        self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer_prefix_valid(
-                            attn.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
+                        attn.write_context_kv(
+                            pool=self.draft_model_runner.token_to_kv_pool,
+                            positions=positions,
+                            hidden_states=layer_ctx_hidden,
+                            cache_loc=cache_loc,
+                            cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
                         )
                         continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
@@ -1978,12 +1980,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 layer, ctx_hidden
             )
             if isinstance(attn, DFlashMLAAttention):
-                k_nope, k_pe = attn.project_context_kv(ctx_positions, layer_ctx_hidden)
-                self.draft_model_runner.token_to_kv_pool.set_mla_kv_buffer(
-                    attn.attn_mqa,
-                    KVWriteLoc(ctx_cache_loc, physical=True),
-                    k_nope,
-                    k_pe,
+                attn.write_context_kv(
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=ctx_positions,
+                    hidden_states=layer_ctx_hidden,
+                    cache_loc=ctx_cache_loc,
                 )
                 continue
             if _is_npu:
