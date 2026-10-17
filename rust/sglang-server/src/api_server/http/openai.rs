@@ -179,21 +179,6 @@ fn indexed_decode_stream(
     .boxed()
 }
 
-fn contains_media(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
-            object.keys().any(|key| {
-                matches!(
-                    key.as_str(),
-                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
-                )
-            }) || object.values().any(contains_media)
-        }
-        _ => false,
-    }
-}
-
 /// Why a chat or completions request's `model` cannot be served, if it
 /// cannot. Any name is served, as Python's handlers serve it, except the
 /// `base-model:adapter` form: there it asks for that LoRA adapter, which
