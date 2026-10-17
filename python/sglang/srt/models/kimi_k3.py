@@ -6,12 +6,13 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import inspect
 import logging
 import os
 import re
 from array import array
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, lru_cache
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -202,6 +203,38 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     )
 
 
+@lru_cache(maxsize=1)
+def _tgemm_mm_accepts_out() -> bool:
+    try:
+        from aiter.tuned_gemm import tgemm
+    except Exception:
+        return False
+    return "out" in inspect.signature(tgemm.mm).parameters
+
+
+def _k3_aiter_gemm_into(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+) -> bool:
+    """Write one bf16 GEMM into ``out`` through Aiter. False leaves the caller on torch."""
+    if not (_is_hip and envs.SGLANG_USE_AITER.get() and _tgemm_mm_accepts_out()):
+        return False
+    if x.dtype != torch.bfloat16:
+        return False
+    weight_data = weight if type(weight) is torch.Tensor else weight.data
+    if type(weight_data) is not torch.Tensor or weight_data.dtype != torch.bfloat16:
+        return False
+    from aiter.tuned_gemm import tgemm
+
+    try:
+        y = tgemm.mm(x, weight_data, None, otype=out.dtype, out=out)
+    except ValueError:
+        # Unsupported shape or alignment stays on the torch path below.
+        return False
+    if y.data_ptr() != out.data_ptr():
+        out.copy_(y)
+    return True
+
+
 def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -216,6 +249,9 @@ def _k3_bf16_gemm(
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
         )
+    # Shared down writes the all-reduce slice. out=None is unchanged.
+    if out is not None and _k3_aiter_gemm_into(x, weight, out):
+        return out
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
