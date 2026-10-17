@@ -3325,6 +3325,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Best-effort auto-detach of the storage backend on process shutdown."""
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
+        controller = self.cache_controller
+        context = getattr(controller, "mla_dedup", None) if controller else None
+        if context is not None:
+            context.destroy()
+            controller.mla_dedup = None
 
     def clear_storage_backend(self) -> bool:
         if self._storage_attachment is None:

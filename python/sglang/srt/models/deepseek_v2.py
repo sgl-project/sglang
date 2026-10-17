@@ -3155,8 +3155,11 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
+                load_handle = getattr(forward_batch, "mla_forward_load_counter", None)
+                if load_handle is not None:
+                    load_handle.before_layer(i - self.start_layer)
                 layer = self.layers[i]
-                (hidden_states, topk_indices) = layer(
+                hidden_states, topk_indices = layer(
                     positions,
                     hidden_states,
                     forward_batch,
@@ -3164,9 +3167,9 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices=index_topk_share.topk_indices,
-                    captured_last_layer_outputs=aux_hidden_states
-                    if i in self.layers_to_capture
-                    else None,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                     next_full_attention_layer_id=self.next_full_attention_layer_id.get(
                         i
                     ),
@@ -3220,6 +3223,7 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+    supports_mla_forward_load = True
     # for quark model load
     packed_modules_mapping = {}
 
