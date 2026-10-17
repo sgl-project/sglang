@@ -167,14 +167,18 @@ def test_processors_outside_the_worker_pool_are_declared():
             "async def process_mm_data_async" in source
             or "async def _process_special_format" in source
         )
-        if entry_points and "process_and_combine_mm_data_async" not in source:
+        routed = (
+            "process_and_combine_mm_data_async" in source
+            or "_run_mm_processor" in source
+        )
+        if entry_points and not routed:
             unrouted.add(path.name)
 
     newly_unrouted = unrouted - _NO_WORKER_POOL_ROUTE
     assert not newly_unrouted, (
         "these processors reach preprocessing without going through the worker "
         "pool, so they will serve at one-worker speed; either route them through "
-        "`process_and_combine_mm_data_async` or add them to "
+        "`process_and_combine_mm_data_async` or `_run_mm_processor`, or add them to "
         f"_NO_WORKER_POOL_ROUTE with a reason: {sorted(newly_unrouted)}"
     )
     now_routed = _NO_WORKER_POOL_ROUTE - unrouted
