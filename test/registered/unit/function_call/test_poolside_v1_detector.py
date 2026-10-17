@@ -1,6 +1,7 @@
 """Unit tests for PoolsideV1Detector — no server, no model loading."""
 
 import json
+import time
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -219,6 +220,26 @@ class TestPoolsideV1Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "NYC"})
+
+    def test_unclosed_tags_parse_in_linear_time(self):
+        """Unclosed `<arg_value>` tags inside a call and unclosed `<tool_call>`
+        tags after it must not stall the parser (it runs on the event loop);
+        the complete pair and call still parse."""
+        text = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n"
+            + "<arg_key>count</arg_key><arg_value>1" * 8000
+            + "</tool_call>"
+            + "<tool_call> " * 20000
+        )
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "NYC"})
 
     def test_arg_key_without_value_emits_empty_call(self):

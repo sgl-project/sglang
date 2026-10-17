@@ -224,7 +224,10 @@ class PoolsideV1Detector(BaseFormatDetector):
         normal_text = text[:first_idx] if first_idx > 0 else ""
 
         calls: List[ToolCallItem] = []
-        for body in self.tool_call_regex.findall(text):
+        # Scanning only up to the last end tag yields the same matches; lazy
+        # scans for a missing end tag would otherwise make findall quadratic.
+        text_end = text.rfind(self.tool_call_end_token) + len(self.tool_call_end_token)
+        for body in self.tool_call_regex.findall(text, 0, text_end):
             # _find_name_boundary searches for `\n` / `<arg_key>` /
             # `</tool_call>`, but the regex already stripped `</tool_call>`,
             # so a no-arg call without a trailing newline
@@ -237,7 +240,8 @@ class PoolsideV1Detector(BaseFormatDetector):
 
             schema = self._get_param_schema(name, tools)
             args: dict = {}
-            for raw_key, raw_val in self.arg_pair_regex.findall(body):
+            body_end = body.rfind(self.arg_value_end) + len(self.arg_value_end)
+            for raw_key, raw_val in self.arg_pair_regex.findall(body, 0, body_end):
                 key = raw_key.strip()
                 # Strip at most one wrapping `\n` on each side (template adds
                 # them around the value); preserve newlines that are part of
