@@ -1057,6 +1057,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
+            if self.scheduler.enable_overlap:
+                # A request that finished last step can still have its forward in
+                # flight, writing slots this request was just given.
+                self.scheduler.schedule_stream.wait_stream(
+                    self.scheduler.forward_stream
+                )
             restore_kv_cache(
                 req,
                 self.tree_cache,
