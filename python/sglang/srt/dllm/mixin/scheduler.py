@@ -468,7 +468,6 @@ class DllmManager:
         return self.dllm_config is not None and len(self.staging_queue) > 0
 
     def any_context_in_progress(self) -> bool:
-        """Check if a request has prefilled part of its context."""
         return any(
             req.dllm_phase == DllmReqPhase.STAGING_PREFILL and req.prefix_len > 0
             for req in (*self.waiting_queue, *self.staging_queue)

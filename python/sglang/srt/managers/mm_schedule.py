@@ -346,7 +346,6 @@ def _keep_prefill_rows(
     if key is None:
         return
     if last_token < chunk_end:
-        # Drop only the entry these rows came from; another may have replaced it.
         if _prefill_rows.get(key) is rows:
             del _prefill_rows[key]
         return

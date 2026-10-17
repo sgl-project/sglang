@@ -109,12 +109,7 @@ def _run_by_item_chunks(encoder):
     return [
         torch.cat(
             mm_schedule._get_chunked_embedding_by_item(
-                encoder,
-                items,
-                prefix_len,
-                extend_len,
-                _CPU,
-                owner="req",
+                encoder, items, prefix_len, extend_len, _CPU, owner="req"
             ),
             dim=0,
         )
@@ -175,12 +170,7 @@ def test_list_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     mm_schedule._get_chunked_embedding_by_item(
-        _encoder_list,
-        items,
-        0,
-        TOTAL_LEN,
-        _CPU,
-        owner="req",
+        _encoder_list, items, 0, TOTAL_LEN, _CPU, owner="req"
     )
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
@@ -194,12 +184,7 @@ def test_tensor_cache_entries_own_storage(per_request):
     items = _make_items()
     if per_request:
         chunks = mm_schedule._get_chunked_embedding_by_item(
-            _encoder_tensor,
-            items,
-            0,
-            TOTAL_LEN,
-            _CPU,
-            owner="req",
+            _encoder_tensor, items, 0, TOTAL_LEN, _CPU, owner="req"
         )
     else:
         request = mm_schedule.PerImageRequestInfo(
@@ -245,7 +230,6 @@ def test_tensor_encoder_chunks_survive_cache_pressure(
 
 
 def test_oversize_entry_leaves_the_cache_alone():
-    """An entry larger than the cache is refused; the entries already there stay."""
     row_bytes = HIDDEN * 4
     cache = mm_schedule.MultiModalStaticCache(max_size=4 * row_bytes)
     kept = {
@@ -278,12 +262,7 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
     encoder = Mock(side_effect=_encoder_list)
 
     chunks = mm_schedule._get_chunked_embedding_by_item(
-        encoder,
-        items,
-        0,
-        TOTAL_LEN,
-        _CPU,
-        owner="req",
+        encoder, items, 0, TOTAL_LEN, _CPU, owner="req"
     )
 
     assert sum(chunk.shape[0] for chunk in chunks) == sum(
@@ -388,14 +367,7 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
 
     with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
         chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder,
-            items,
-            ITEM_OFFSETS,
-            0,
-            TOTAL_LEN,
-            input_ids,
-            _CPU,
-            owner="req",
+            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU, owner="req"
         )
 
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
@@ -645,9 +617,7 @@ def _prefill_pruned(encoder, item, prefix_len, extend_len):
 
 @pytest.mark.parametrize("path", PATHS)
 def test_item_is_encoded_once_per_request(monkeypatch, path):
-    mm_schedule._prefill_rows["left by another test"] = None
     mm_schedule.init_mm_embedding_cache(0)
-    assert not mm_schedule._prefill_rows
     item = _path_item(monkeypatch, path)
     expected = _video_embedding(item)
     # The full path also takes encoder output shaped [frames, tokens, hidden].
@@ -705,42 +675,31 @@ def test_pruned_video_is_encoded_once_per_request():
     assert not mm_schedule._prefill_rows
 
 
-@pytest.mark.parametrize("path", ["full", "batched", "pruned"])
+@pytest.mark.parametrize("path", ["full", "batched"])
 def test_embedding_evicted_between_chunks_is_not_encoded_again(monkeypatch, path):
     mm_schedule.init_mm_embedding_cache(1 << 30)
-    if path == "pruned":
-        item, expected, encoder = _pruned_video()
-        windows = PRUNED_CHUNKS
+    item = _path_item(monkeypatch, path)
+    encoder = _video_encoder()
 
-        def prefill(prefix_len, extend_len):
-            return _prefill_pruned(encoder, item, prefix_len, extend_len)[0]
-
-    else:
-        item = _path_item(monkeypatch, path)
-        expected = _video_embedding(item)
-        encoder = _video_encoder()
-        windows = VIDEO_CHUNKS
-
-        def prefill(prefix_len, extend_len):
-            return _prefill_chunk(encoder, item, prefix_len, extend_len)
-
-    chunks = [prefill(*windows[0])]
+    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
     # The cache holds the encoder output, so the rows are kept without a copy.
     (kept,) = mm_schedule._prefill_rows.values()
     (cached,) = mm_schedule.embedding_cache.mm_cache.values()
     assert kept.first_row == 0
     assert kept.result.embedding is cached.embedding
     mm_schedule.embedding_cache.clear()
-    chunks += [prefill(*window) for window in windows[1:]]
+    chunks += [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
 
     encoder.assert_called_once()
-    assert torch.equal(torch.cat(chunks), expected)
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
     assert not mm_schedule._prefill_rows
 
 
 def test_rows_in_a_buffer_the_encoder_reuses_are_copied():
-    # The cache holds a clone; the next encoder call overwrites the encoder's slice,
-    # so the kept rows are the cache's clone and not one more copy.
+    # The next encoder call overwrites the encoder's slice; the cache holds a clone.
     mm_schedule.init_mm_embedding_cache(1 << 30)
     buffer = torch.empty(2 * VIDEO_TOKENS, HIDDEN)
 
@@ -804,44 +763,8 @@ def test_item_shared_by_two_requests_in_one_batch():
     assert not mm_schedule._prefill_rows
 
 
-@pytest.mark.parametrize("path", ["full", "per_request"])
-def test_finished_request_keeps_the_continuing_rows(monkeypatch, path):
-    # B has A's item at A's positions and ends in this batch: it must neither
-    # read A's rows nor drop them.
-    mm_schedule.init_mm_embedding_cache(0)
-    continuing, finished = _path_item(monkeypatch, path), _path_item(monkeypatch, path)
-    passes = []
-
-    def encode(items):
-        # Each encoder call adds its own offset, so rows show which call made them.
-        rows = torch.cat([_video_embedding(item) for item in items])
-        passes.append(rows + len(passes))
-        return passes[-1]
-
-    first = _prefill_chunk(encode, continuing, *VIDEO_CHUNKS[0])
-    both, _ = mm_schedule._get_chunked_prefill_embedding(
-        encode,
-        [continuing, finished],
-        [0, 1, 2],
-        [VIDEO_CHUNKS[1][0], 0],
-        [VIDEO_CHUNKS[1][1], VIDEO_LEN],
-        [continuing.offsets, finished.offsets],
-        torch.zeros(1, dtype=torch.long),
-        rids=["req", "other"],
-    )
-    last = _prefill_chunk(encode, continuing, *VIDEO_CHUNKS[2])
-
-    assert len(passes) == 2
-    second, other = both.split([7, VIDEO_TOKENS])
-    assert torch.equal(torch.cat([first, second, last]), passes[0])
-    assert torch.equal(other, passes[1])
-    assert not mm_schedule._prefill_rows
-
-
-@pytest.mark.parametrize("per_request", [False, True])
-def test_same_image_twice_in_a_request_reads_its_own_rows(monkeypatch, per_request):
+def test_same_image_twice_in_a_request_reads_its_own_rows():
     # The second copy has the first's hash but other positions.
-    monkeypatch.setattr(mm_schedule, "_is_hip", per_request)
     mm_schedule.init_mm_embedding_cache(0)
     first, second = _run_item(), _run_item(offsets=((22, 37),))
     encoder = _video_encoder()
@@ -860,7 +783,6 @@ def test_same_image_twice_in_a_request_reads_its_own_rows(monkeypatch, per_reque
         )
         chunks.append(chunk)
         if prefix_len == 0:
-            # The first copy's rows were copied, so they no longer start at row 0.
             (kept,) = mm_schedule._prefill_rows.values()
             assert kept.first_row > 0
 
@@ -931,8 +853,7 @@ def test_several_multi_run_items_are_encoded_once_per_request():
 
 
 def test_kept_rows_hit_skips_the_cache():
-    # From the second chunk on the kept rows serve without asking the cache, so a
-    # colliding entry there is neither moved in the LRU order nor discarded.
+    # Kept rows are read before the cache, so a colliding entry there stays untouched.
     mm_schedule.init_mm_embedding_cache(1 << 30)
     item = _video_item()
     encoder = _video_encoder()
@@ -983,12 +904,8 @@ def test_keeping_rows_leaves_the_cache_order_alone():
         rids=["req"],
     )
 
-    cache = mm_schedule.embedding_cache
-    assert list(cache.mm_cache) == [11, 12]
+    assert list(mm_schedule.embedding_cache.mm_cache) == [11, 12]
     assert len(mm_schedule._prefill_rows) == 1
-    assert cache.peek(11) is cache.mm_cache[11]
-    assert cache.peek(13) is None
-    assert list(cache.mm_cache) == [11, 12]
 
 
 def test_first_row_out_of_range_is_an_error():

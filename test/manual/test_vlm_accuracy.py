@@ -268,7 +268,6 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
                 placeholder_tokens={
                     Modality.IMAGE: self.processor.tokenizer.unk_token_id,
                 },
-                rids=None,
             )
 
         self.compare_outputs(sglang_output, hf_output)

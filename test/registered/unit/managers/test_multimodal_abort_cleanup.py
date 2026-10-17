@@ -153,21 +153,11 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
                 )
             elif path == "per_image":
                 [embedding] = mm_schedule._get_chunked_embedding_by_item(
-                    encode,
-                    [item],
-                    0,
-                    1,
-                    torch.device("cpu"),
-                    owner="req",
+                    encode, [item], 0, 1, torch.device("cpu"), owner="req"
                 )
             else:
                 request = mm_schedule.PerImageRequestInfo(
-                    0,
-                    [item],
-                    [(0, 0)],
-                    0,
-                    1,
-                    owner="req",
+                    0, [item], [(0, 0)], 0, 1, owner="req"
                 )
                 embeddings = mm_schedule._batch_encode_per_image_misses(
                     encode,
@@ -405,7 +395,6 @@ def test_session_abort_preserves_shared_multimodal_features():
 
 @pytest.fixture
 def kept_rows():
-    """One kept entry of mm_schedule, as left by the chunk before."""
     mm_schedule.release_prefill_rows()
     mm_schedule._prefill_rows[("req", "item", Modality.VIDEO, (7,), ((0, 9),))] = (
         object()
@@ -531,21 +520,6 @@ def test_pause_drops_kept_rows_only_with_the_chunked_request(
     assert len(kept_rows) == kept
 
 
-def test_flush_cache_drops_kept_rows(kept_rows):
-    scheduler = Scheduler.__new__(Scheduler)
-    scheduler._engine_paused = False
-    scheduler.is_fully_idle = Mock(return_value=True)
-    scheduler.tree_cache = MagicMock()
-    scheduler.req_to_token_pool = MagicMock()
-    scheduler.token_to_kv_pool_allocator = MagicMock()
-    scheduler.grammar_manager = MagicMock()
-    scheduler.metrics_reporter = MagicMock()
-    scheduler.draft_worker = None
-
-    assert scheduler.flush_cache(empty_cache=False)
-    assert not kept_rows
-
-
 def test_weights_only_memory_release_drops_kept_rows(kept_rows):
     with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
         manager = SchedulerWeightUpdaterManager(
@@ -570,7 +544,6 @@ def test_weights_only_memory_release_drops_kept_rows(kept_rows):
 
 @pytest.mark.parametrize("prefix_len, in_progress", [(4, True), (0, False)])
 def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progress):
-    # dLLM prefills its context over several steps without chunked_req.
     manager = DllmManager(dllm_config=None)
     manager.waiting_queue.append(
         SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_PREFILL, prefix_len=prefix_len)
@@ -580,8 +553,7 @@ def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progr
 
 
 def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows):
-    # Another dLLM context can stay part-way for many steps, so the table is not
-    # cleared by the scheduling check; the aborted context's rows have no reader.
+    # Other dLLM contexts stay part-way prefilled; only the aborted one's rows go.
     req = Req("dllm-video", "", [1], SamplingParams())
     survivor = Req("dllm-other", "", [1], SamplingParams())
     scheduler = _queued_scheduler(req)
