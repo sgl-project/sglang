@@ -41,7 +41,10 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.datasets.mooncake import (
+    get_mooncake_request_over_time,
+    get_mooncake_rounds,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1436,27 +1439,9 @@ async def benchmark(
 
     # Handle the data structure difference for the warmup request
     if is_mooncake:
-        # For mooncake, input_requests is a list of dicts.
-        # We need to build a temporary DatasetRow for the warmup phase.
-        warmup_record = input_requests[0]
-
-        # Build prompt from hash_ids, just like in the async generator
-        hash_ids = warmup_record.get("hash_ids", [])
-        prompt_text = ""
-        for hash_id in hash_ids:
-            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
-        prompt_text += "Can you tell me a detailed story in 1000 words?"
-
-        output_len = warmup_record.get("output_length", 32)
-        prompt_len = len(tokenizer.encode(prompt_text))
-
-        # Create a temporary DatasetRow object for warmup
-        test_request = DatasetRow(
-            prompt=prompt_text,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            image_data=None,  # Mooncake doesn't have image data
-        )
+        # Replay sorts the trace. Warm exactly that first request's prompt.
+        warmup_record = min(input_requests, key=lambda record: record["timestamp"])
+        test_request = next(get_mooncake_rounds(warmup_record, tokenizer, 1))
     else:
         # For all other datasets, input_requests is a list of DatasetRow objects
         test_request = input_requests[0]
@@ -1545,9 +1530,7 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and is_mooncake
-    ):  # Assuming mooncake is mainly for sglang or similar backends
+    if is_mooncake:
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
             input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
