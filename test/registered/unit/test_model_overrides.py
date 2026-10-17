@@ -226,6 +226,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "disaggregation_decode_retraction_backup",
                 }
             ),
         )
@@ -3833,8 +3834,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(plain["moe_runner_backend"], "flashinfer_trtllm")
             self.assertNotIn("disable_attn_tp_gather", plain)
 
-            with self.assertRaises(ValueError):
-                _step3p_overrides(_args(enable_dp_attention=True), None)
+            # Step5 gathers and scatters attention-DP tokens explicitly.
+            self.assertEqual(
+                _step3p_overrides(_args(enable_dp_attention=True), None), mega
+            )
 
 
 class TestDeclarationValidation(CustomTestCase):

@@ -34,14 +34,11 @@ from sglang.srt.configs.step5 import (
 )
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
-    get_attn_tp_group,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
-from sglang.srt.distributed.parallel_state import get_moe_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -659,7 +656,7 @@ class Step5MoE(nn.Module):
             )
 
     def _can_use_allreduce_dp_gather(self, gathered, forward_batch):
-        comm = get_tp_group().ca_comm
+        comm = get_parallel().tp_group.ca_comm
         return (
             self.use_allreduce_dp_gather
             and not world_dp_gather_enabled()
@@ -674,13 +671,15 @@ class Step5MoE(nn.Module):
         )
 
     def _forward_dp(self, hidden_states, forward_batch):
-        gathered = get_global_dp_buffer(get_tp_group())
+        gathered = get_global_dp_buffer(get_parallel().tp_group)
         overlap = (
             self.dp_alt_stream is not None
             and self._can_use_allreduce_dp_gather(gathered, forward_batch)
             and 0 < hidden_states.shape[0] <= self.dp_overlap_max_rows
-            and get_attn_tp_group()._can_use_flashinfer_allreduce(hidden_states)
-            and get_tp_group()._can_use_flashinfer_allreduce(gathered)
+            and get_parallel().attn_tp_group._can_use_flashinfer_allreduce(
+                hidden_states
+            )
+            and get_parallel().tp_group._can_use_flashinfer_allreduce(gathered)
             and (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_target_verify()
@@ -709,7 +708,7 @@ class Step5MoE(nn.Module):
         self, hidden_states: torch.Tensor, *, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         # DP gather may overwrite nonleader inputs; compute shared output first.
-        gathered = get_global_dp_buffer(get_tp_group())
+        gathered = get_global_dp_buffer(get_parallel().tp_group)
         # Small B300 DP2 gathers use custom allreduce v2 instead of an
         # attention-TP reduce-scatter followed by a global allgather. Retain
         # each DP leader as the source, even if other attention ranks differ.
@@ -728,7 +727,7 @@ class Step5MoE(nn.Module):
                 gathered,
                 topk.topk_ids,
                 topk.topk_weights,
-                group=get_moe_tp_group().device_group,
+                group=get_parallel().moe_tp_group.device_group,
                 activation_clamp=self.swiglu_limit,
             )
         else:
@@ -773,7 +772,7 @@ class Step5MoE(nn.Module):
                 hidden_states,
                 topk.topk_ids,
                 topk.topk_weights,
-                group=get_moe_tp_group().device_group,
+                group=get_parallel().moe_tp_group.device_group,
                 activation_clamp=self.swiglu_limit,
             )
         elif (
