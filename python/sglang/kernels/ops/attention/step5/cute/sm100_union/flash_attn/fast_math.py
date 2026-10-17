@@ -47,10 +47,10 @@ def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
 
 class FastDivmod:
     def __init__(
-        self, divisor: Int32, multipler: Uint32, shift_right: Uint32, *, loc=None, ip=None
+        self, divisor: Int32, multiplier: Uint32, shift_right: Uint32, *, loc=None, ip=None
     ):
         self.divisor = divisor
-        self.multiplier = multipler
+        self.multiplier = multiplier
         self.shift_right = shift_right
         self._loc = loc
 
