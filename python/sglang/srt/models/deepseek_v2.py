@@ -514,7 +514,11 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
             # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not is_glm_moe_dsa(config):
+            if (
+                quant_config is not None
+                and not is_glm_moe_dsa(config)
+                and getattr(config, "model_type", None) != "glm5_next_text"
+            ):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
