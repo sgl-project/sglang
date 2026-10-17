@@ -189,10 +189,6 @@ class UnifiedCacheLinker(ABC):
     def close(self) -> None:
         """Quiesce all transfers and release backend resources."""
 
-    def restores_swa(self) -> bool:
-        """Whether the store carries SWA pages; False tombstones restored tails."""
-        return PoolName.SWA in self.pools
-
 
 class ExternalCacheHitMarker(NamedTuple):
     """What ``match`` found in the external store, consumed by ``load_back``.
@@ -232,7 +228,8 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and not cache_linker.restores_swa()
+        # A store without SWA pages tombstones restored tails instead.
+        self._skip_swa = swa is not None and PoolName.SWA not in cache_linker.pools
         self._components = tuple(
             component
             for component in cache._components_tuple

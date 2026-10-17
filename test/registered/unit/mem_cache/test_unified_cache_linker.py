@@ -1317,11 +1317,11 @@ def test_cache_without_swa_needs_no_reprefill():
     assert cache.swa_reprefill_tail_tokens() == 0
 
 
-@pytest.mark.parametrize("restores_swa", [True, False])
-def test_skip_swa_when_linker_store_lacks_swa(restores_swa):
+@pytest.mark.parametrize("swa_stored", [True, False])
+def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
     """A store without SWA pages must tombstone restored tails, not mark them hit."""
     linker = _FakeLinker()
-    if restores_swa:
+    if swa_stored:
         linker.pools[PoolName.SWA] = object()
     swa = object()
     cache = _cache_for_wrapper(
@@ -1330,8 +1330,8 @@ def test_skip_swa_when_linker_store_lacks_swa(restores_swa):
         tree_components=(ComponentType.FULL, ComponentType.SWA),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    assert wrapper._skip_swa is (not restores_swa)
-    assert (swa in wrapper._components) is restores_swa
+    assert wrapper._skip_swa is (not swa_stored)
+    assert (swa in wrapper._components) is swa_stored
 
 
 @pytest.fixture
