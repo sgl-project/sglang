@@ -2,7 +2,8 @@
 
 Each server configuration lives in its own file under
 ``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
-configurations partition independently across GB300 runners.
+configurations partition independently across GB300 runners. All use default
+decoder bounded replay and explicitly enabled breakable prefill graphs.
 """
 
 import requests
@@ -36,8 +37,17 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     mmmu_pro_load_preset_from_model_id = MODEL
 
     mem_fraction_static = "0.8"
-    max_running_requests = "64"
-    graph_args = []
+    max_running_requests = "32"
+    graph_args = [
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--cuda-graph-max-bs-prefill",
+        "8192",
+        "--cuda-graph-max-seq-len-prefill",
+        "16384",
+        "--chunked-prefill-size",
+        "8192",
+    ]
     parallel_args = []
     server_env = {}
 
