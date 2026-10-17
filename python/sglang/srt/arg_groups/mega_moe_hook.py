@@ -46,14 +46,6 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "kernels over CUDA symmetric memory. On ROCm, set "
             "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
         )
-    if cfg.enable_eplb and platform.is_cuda and platform.is_sm100:
-        # The SM100 kernels read copies of the expert scales made at load, which
-        # an EPLB rebalance does not rewrite.
-        raise ValueError(
-            "--moe-a2a-backend megamoe on SM100 does not support --enable-eplb: "
-            "a rebalance would leave moved experts with stale scales; disable "
-            "--enable-eplb."
-        )
 
 
 # MoE blocks with no fused-MoE fallback under megamoe.
