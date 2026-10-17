@@ -3307,6 +3307,25 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and mhc.can_fuse_post(self.hc_cfg)
         )
 
+    def write_low_ratio_sources(
+        self,
+        *,
+        state: mhc.HcState,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Write this layer's compressed KV and index K from every row of ``state``,
+        without running its indexer or attention."""
+        assert self.attn_hc is not None
+        get_attn_backend().forward_low_ratio_sources(
+            layer=self.self_attn,
+            x=mhc.combine(self.attn_hc, state),
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
+
 
 def _gather_late_layer_ids(
     input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
@@ -3652,16 +3671,26 @@ class DeepseekV4Model(nn.Module):
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
-        # Decoder SWA bounded replay: layers past the last kv_source layer run over
-        # each request's last SWA_WINDOW extend tokens only.
+        # Decoder SWA bounded replay: layers from late_layer_start on run over each
+        # request's last SWA_WINDOW extend tokens only.
         self.late_layer_start: Optional[int] = None
+        # The last kv_source layer when the tail starts there: it writes every row's
+        # compressed KV before the switch.
+        self.tail_source_layer: Optional[int] = None
         if get_exec().features.enable_decoder_swa_bounded_replay:
             assert config.kv_source_layer_ids, (
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
-            self.late_layer_start = max(config.kv_source_layer_ids) + 1
+            last_source = max(config.kv_source_layer_ids)
+            self.late_layer_start = last_source + 1
+            # The ROCm fused boundary keeps the whole source layer on every row.
+            if not _is_hip:
+                assert self.layers[last_source].engram is None, (
+                    "the last kv_source layer must not carry an Engram"
+                )
+                self.late_layer_start = self.tail_source_layer = last_source
             late_ratios = set(
-                config.compress_ratios[self.late_layer_start : config.num_hidden_layers]
+                config.compress_ratios[last_source + 1 : config.num_hidden_layers]
             )
             assert late_ratios <= {
                 0,
@@ -3840,6 +3869,10 @@ class DeepseekV4Model(nn.Module):
                         hidden_states, forward_batch, next=next_boundary
                     )
             if tail is not None and i == self.late_layer_start:
+                if i == self.tail_source_layer:
+                    self.layers[i].write_low_ratio_sources(
+                        state=state, positions=positions, forward_batch=forward_batch
+                    )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
