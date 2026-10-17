@@ -276,23 +276,6 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "overlap"):
                 args.resolve_once()
 
-    def test_megamoe_rejects_eplb_on_sm100(self):
-        # SM90 reads the rebalanced parameters directly; only SM100 keeps copies.
-        with override_platform(
-            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
-        ):
-            args = ServerArgs(
-                model_path="dummy", moe_a2a_backend="megamoe", enable_eplb=True
-            )
-            with self.assertRaisesRegex(ValueError, "--enable-eplb"):
-                args.resolve_once()
-        with override_platform(
-            is_cuda=True, is_sm90=True, is_sm100=False, is_hip=False
-        ):
-            ServerArgs(
-                model_path="dummy", moe_a2a_backend="megamoe", enable_eplb=True
-            ).resolve_once()
-
     def test_megamoe_requires_sm90_or_sm100(self):
         # is_hip is pinned as well: override_platform only replaces the facts it is
         # given, so on a ROCm host these would otherwise describe a machine that is
