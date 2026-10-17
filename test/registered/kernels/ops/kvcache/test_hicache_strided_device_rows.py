@@ -65,6 +65,7 @@ class TestHiCacheStridedDeviceRows(unittest.TestCase):
                     device="cpu",
                     allocator_type="default",
                 )
+                self.addCleanup(host.destroy)
                 if not host.can_use_jit:
                     self.skipTest("strided device rows need the JIT HiCache kernels")
 
