@@ -1122,6 +1122,72 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         self.assertIsNone(req.multimodal_inputs)
 
 
+class TestShmFeatureDispatch(unittest.TestCase):
+    @staticmethod
+    def _tokenized_obj():
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+
+        items = [MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(2))]
+        return SimpleNamespace(
+            rid="test-request",
+            mm_inputs=MultimodalProcessorOutput(input_ids=[1], mm_items=items),
+        )
+
+    def test_features_are_wrapped_off_the_event_loop(self):
+        from sglang.srt.managers import tokenizer_manager
+
+        manager = object.__new__(tokenizer_manager.TokenizerManager)
+        wrap_threads = []
+
+        def wrap(obj):
+            wrap_threads.append(threading.get_ident())
+            return obj
+
+        async def send():
+            with patch.object(tokenizer_manager, "wrap_shm_features", wrap):
+                await manager._wrap_shm_features_async(self._tokenized_obj())
+            return threading.get_ident()
+
+        loop_thread = asyncio.run(send())
+
+        self.assertEqual(len(wrap_threads), 1)
+        self.assertNotEqual(wrap_threads[0], loop_thread)
+
+    def test_cancelled_dispatch_discards_wrapped_features(self):
+        from sglang.srt.managers import tokenizer_manager
+
+        manager = object.__new__(tokenizer_manager.TokenizerManager)
+        tokenized_obj = self._tokenized_obj()
+        wrap_started = threading.Event()
+        release_wrap = threading.Event()
+
+        def wrap(obj):
+            wrap_started.set()
+            release_wrap.wait()
+            return obj
+
+        async def cancel_mid_wrap():
+            task = asyncio.create_task(manager._wrap_shm_features_async(tokenized_obj))
+            await asyncio.to_thread(wrap_started.wait)
+            task.cancel()
+            release_wrap.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        discard = MagicMock()
+        with (
+            patch.object(tokenizer_manager, "wrap_shm_features", wrap),
+            patch.object(tokenizer_manager, "discard_shm_features", discard),
+        ):
+            asyncio.run(cancel_mid_wrap())
+
+        discard.assert_called_once_with(tokenized_obj)
+
+
 class TestVmmConsumerCount(unittest.TestCase):
     def test_proxy_defaults_to_one_consumer(self):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
