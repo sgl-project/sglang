@@ -221,14 +221,14 @@ class Conversation:
             else:
                 ret = "[INST] "
             for i, (role, message) in enumerate(self.messages):
-                tag = self.roles[i % 2]
                 if message:
-                    if i == 0:
+                    if i == 0 and role == self.roles[0]:
                         ret += message + " "
                     else:
-                        ret += tag + " " + message + seps[i % 2]
+                        sep = seps[0] if role == self.roles[0] else seps[1]
+                        ret += role + " " + message + sep
                 else:
-                    ret += tag
+                    ret += role
             return ret
         elif self.sep_style == SeparatorStyle.CHATGLM:
             # source: https://huggingface.co/THUDM/chatglm-6b/blob/1d240ba371910e9282298d4592532d7f0f3e9f3e/modeling_chatglm.py#L1302-L1308
