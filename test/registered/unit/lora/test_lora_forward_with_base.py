@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock, sentinel
 
 import pytest
@@ -144,6 +145,92 @@ def test_routing_cache_reset_preserves_batch_metadata_and_storage(has_workspace)
         assert workspace.routes is routes and not routes
         assert workspace._graph_storage == {"buffer": sentinel.graph_buffer}
         assert workspace._eager_buffers == {"buffer": sentinel.eager_buffer}
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_moe_core_calls_bound_runner_with_batch_metadata(
+    monkeypatch, is_prefill, use_cuda_graph
+):
+    module = ModuleType("sglang.srt.lora.moe.runner")
+    module.MoeLoraBatch = SimpleNamespace
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    layout = SimpleNamespace(TP_GLOBAL=sentinel.global_layout)
+    metadata = SimpleNamespace(
+        token_slots=[-1, 1, -1],
+        num_tokens=2,
+        is_prefill=is_prefill,
+        use_cuda_graph=use_cuda_graph,
+    )
+    calls = Mock()
+    calls.get_batch_info.return_value = metadata
+    calls.run.return_value = sentinel.combine_input
+    layer = SimpleNamespace(
+        lora_backend=SimpleNamespace(get_batch_info=calls.get_batch_info),
+        _moe_lora_runner=SimpleNamespace(run=calls.run),
+        gate_up_lora_a_weights=sentinel.gate_up_a,
+        gate_up_lora_b_weights=sentinel.gate_up_b,
+        down_lora_a_weights=sentinel.down_a,
+        down_lora_b_weights=sentinel.down_b,
+    )
+    for name in ("_get_moe_lora_batch", "_run_moe_core_with_lora"):
+        method = _lora_method("layers.py", "FusedMoEWithLoRA", name)
+        method.__globals__["LoRABatchLayout"] = layout
+        setattr(layer, name, MethodType(method, layer))
+
+    assert layer._run_moe_core_with_lora(sentinel.dispatch) is sentinel.combine_input
+    calls.run.assert_called_once()
+    dispatch, batch = calls.run.call_args.args
+    assert dispatch is sentinel.dispatch
+    assert batch.gate_up_lora_a is sentinel.gate_up_a
+    assert batch.gate_up_lora_b is sentinel.gate_up_b
+    assert batch.down_lora_a is sentinel.down_a
+    assert batch.down_lora_b is sentinel.down_b
+    assert batch.token_lora_mapping == [-1, 1]
+    assert batch.is_prefill is is_prefill
+    assert batch.use_cuda_graph is use_cuda_graph
+    assert all(
+        call.args == (sentinel.global_layout,)
+        for call in calls.get_batch_info.call_args_list
+    )
+
+
+def test_moe_core_without_batch_preserves_existing_base_callback():
+    method = _lora_method("layers.py", "FusedMoEWithLoRA", "_run_moe_core_with_lora")
+    method.__globals__["LoRABatchLayout"] = SimpleNamespace(
+        TP_GLOBAL=sentinel.global_layout
+    )
+    base = Mock(return_value=sentinel.combine_input)
+    layer = SimpleNamespace(
+        lora_backend=SimpleNamespace(get_batch_info=lambda layout: None),
+        _base_run_moe_core=base,
+    )
+    assert method(layer, sentinel.dispatch) is sentinel.combine_input
+    base.assert_called_once_with(dispatch_output=sentinel.dispatch)
+
+
+def test_moe_initialization_only_binds_the_owned_runner(monkeypatch):
+    calls = Mock()
+    calls.from_layer.return_value = sentinel.runner
+    runner_module = ModuleType("sglang.srt.lora.moe.runner")
+    runner_module.MoeLoraRunner = SimpleNamespace(from_layer=calls.from_layer)
+    monkeypatch.setitem(sys.modules, runner_module.__name__, runner_module)
+    base = SimpleNamespace(run_moe_core=sentinel.base_callback)
+    layer = SimpleNamespace(
+        lora_backend=SimpleNamespace(lora_workspace=sentinel.workspace),
+        experts_shared_outer_loras=True,
+        _max_lora_rank=32,
+        _run_moe_core_with_lora=sentinel.callback,
+    )
+    _lora_method("layers.py", "FusedMoEWithLoRA", "_initialize_moe_lora_execution")(
+        layer, base
+    )
+    calls.from_layer.assert_called_once_with(
+        base, workspace=sentinel.workspace, is_shared_outer=True, physical_rank=32
+    )
+    assert layer._moe_lora_runner is sentinel.runner
+    assert layer._base_run_moe_core is sentinel.base_callback
+    assert base.run_moe_core is sentinel.callback
 
 
 @pytest.mark.parametrize("legacy_signature", [False, True], ids=["v2", "legacy"])
