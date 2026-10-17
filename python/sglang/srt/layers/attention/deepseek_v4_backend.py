@@ -421,6 +421,9 @@ class DSV4AttnMetadata:
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
 
+    # Only BCG window metadata uses the cross-bucket backing buffers.
+    bcg_shared_page_table: bool = False
+
     @property
     def positions(self) -> torch.Tensor:
         return self.positions_casual
@@ -589,6 +592,7 @@ class DSV4AttnMetadata:
             src=other,
             dst=self,
             check_eq_fields=[
+                "bcg_shared_page_table",
                 "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
@@ -675,6 +679,7 @@ class DSV4AttnMetadata:
             "trtllm_c128_lens",
         ]
         reference_assign_fields = [
+            "request_window_layout",
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
@@ -691,6 +696,10 @@ class DSV4AttnMetadata:
             "trtllm_prefill_c4_indices",
             "trtllm_prefill_c128",
         ]
+        if self.bcg_shared_page_table:
+            reference_assign_fields.remove("page_table")
+            tensor_copy_fields.append("page_table")
+
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
         for field_name in tensor_copy_fields:
@@ -1198,6 +1207,8 @@ class DeepseekV4AttnBackend(
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
+        self._bcg_shared_core_buffers = {}
+        self._bcg_candidate_owners = (None, None)
         self._bcg_tail_capacity: Optional[int] = None
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
@@ -1559,6 +1570,8 @@ class DeepseekV4AttnBackend(
         """Whether ratio-1/2 sources use captured projections and indexer metadata."""
         return (
             bool(self.low_ratios)
+            # Replay rows must not update compressed state; use the eager break.
+            and self.token_to_kv_pool.request_window is None
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1
@@ -1879,7 +1892,15 @@ class DeepseekV4AttnBackend(
             forward_batch.num_token_non_padded,
         )
         if tail.real_rows_count is not None:
-            forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+            live_rows = forward_batch.global_num_token_non_padded_cpu
+            # DP idle ranks must stay idle through the tail graph break. The
+            # tail metadata can still describe its capture bucket on an idle
+            # rank; never turn its zero live rows back into captured rows.
+            forward_batch.global_num_token_non_padded_cpu = (
+                tail.real_rows_count
+                if live_rows is None
+                else min(live_rows, tail.real_rows_count)
+            )
             non_padded = forward_batch.global_num_token_non_padded
             if non_padded is not None:
                 if self._bcg_tail_num_token_non_padded is None:
@@ -2818,15 +2839,50 @@ class DeepseekV4AttnBackend(
 
         return metadata
 
+    def _share_bcg_window_core(self, metadata: DSV4Metadata, role: str) -> None:
+        """Bucket views share backing storage; full and tail rows never alias.
+
+        Capture visits the largest bucket first. Replay refreshes the page
+        table and each eager indexer fills its output before attention reads it.
+        Only the request-window eager-indexer path uses these buffers.
+        """
+        if self.token_to_kv_pool.request_window is None or self.low_ratios != (1, 2):
+            return
+        core = metadata.core_attn_metadata
+        for name in (
+            "page_table",
+            "c1_sparse_page_indices",
+            "c1_sparse_raw_indices",
+            "c2_sparse_page_indices",
+            "c2_sparse_raw_indices",
+        ):
+            value = getattr(core, name)
+            if value is None:
+                continue
+            key = (role, name)
+            buffer = self._bcg_shared_core_buffers.get(key)
+            if buffer is None:
+                self._bcg_shared_core_buffers[key] = value
+                continue
+            assert value.shape[1:] == buffer.shape[1:]
+            assert value.shape[0] <= buffer.shape[0], "capture largest bucket first"
+            view = buffer[: value.shape[0]]
+            view.copy_(value)
+            setattr(core, name, view)
+        core.bcg_shared_page_table = True
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        self._share_bcg_window_core(self.forward_metadata, "full")
         with_tail = (
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -2886,6 +2942,8 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        self.encoder_replay = metadata_batch.encoder_swa_replay
+        self.encoder_row_floor = metadata_batch.encoder_swa_row_floor
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2913,6 +2971,7 @@ class DeepseekV4AttnBackend(
         rows = self._prefill_graph_tail_block_rows(forward_batch)
         held = self._bcg_tail_metadata.get(rows)
         if held is None:
+            self._share_bcg_window_core(fresh, "tail")
             self._bcg_tail_metadata[rows] = fresh
             return fresh
         held.refresh_for_breakable_cuda_graph_replay_(fresh)
@@ -3037,11 +3096,12 @@ class DeepseekV4AttnBackend(
         if (
             hoisted_req is not None
             and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
+            and hoisted_pos.shape[0] >= positions.shape[0]
         ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
+            # Eager graph breaks consume the live prefix of bucket-sized rows.
+            # In late layers these rows describe the tail, not the full extend.
+            req = hoisted_req[: positions.shape[0]]
+            pos = hoisted_pos[: positions.shape[0]]
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
@@ -3227,6 +3287,8 @@ class DeepseekV4AttnBackend(
 
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
+        # An eager BCG break sees live rows while core metadata is bucket-sized.
+        raw_out_loc = core.raw_out_loc[: x.shape[0]]
         compressor = layer.compressor
         layer_id = layer.layer_id
         # Contiguous complex64 freqs_cis gives a real/imag-interleaved view without copying.
@@ -3247,14 +3309,14 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
                 page_size=page_size,
                 layout=kv_layout,
             )
-            out_loc = core.c1_out_loc
+            out_loc = core.c1_out_loc[: x.shape[0]]
         else:
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
@@ -3265,7 +3327,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3286,7 +3348,7 @@ class DeepseekV4AttnBackend(
                     ring_size=state.ring_size,
                     layout=kv_layout,
                 )
-            out_loc = core.c2_out_loc
+            out_loc = core.c2_out_loc[: x.shape[0]]
 
         indexer = layer.indexer
         if indexer is not None and indexer.owns_k:
@@ -3599,6 +3661,17 @@ class DeepseekV4AttnBackend(
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):
         if published is None:
             return
+        # Eager BCG source/consumer calls resolve the current metadata at run
+        # time. A finished bucket's last published table is not graph storage.
+        # Retain only the active full/tail pair, rather than one table per bucket.
+        if self.forward_metadata.core_attn_metadata.bcg_shared_page_table:
+            owners = (self.forward_metadata, self.tail_forward_metadata)
+            for previous in self._bcg_candidate_owners:
+                if previous is not None and all(
+                    previous is not owner for owner in owners
+                ):
+                    previous.candidate_metadata = None
+            self._bcg_candidate_owners = owners
         self.forward_metadata.candidate_metadata = published
         tail_metadata = self.tail_forward_metadata
         if tail_metadata is None or tail_metadata is self.forward_metadata:

@@ -1938,6 +1938,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
             encoder_lens=forward_batch.encoder_lens,
+            encoder_swa_replay=forward_batch.encoder_swa_replay,
+            encoder_swa_row_floor=forward_batch.encoder_swa_row_floor,
+            encoder_swa_compress_skip=forward_batch.encoder_swa_compress_skip,
+            encoder_swa_compress_rows=forward_batch.encoder_swa_compress_rows,
             return_logprob=(
                 forward_batch.return_logprob
                 if isinstance(self.backend, BreakableCudaGraphBackend)

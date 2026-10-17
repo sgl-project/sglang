@@ -2,6 +2,7 @@
 folded batch and the paths that consume it. CPU only."""
 
 import unittest
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -402,6 +403,123 @@ class TestFoldMlpSync(CustomTestCase):
         )
         # One sampled row per replayed request, as the scheduler would count it.
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
+
+
+class TestEncoderReplayBCGMetadata(CustomTestCase):
+    def test_request_layout_refresh_allows_changed_request_count(self):
+        # Bucket shape stays fixed while the number of history groups changes.
+        def core(layout):
+            obj = object.__new__(DSV4AttnMetadata)
+            for item in fields(DSV4AttnMetadata):
+                setattr(obj, item.name, None)
+            obj.present_ratios = ()
+            obj.low_ratios = ()
+            obj.request_window_layout = layout
+            return obj
+
+        first = window_layout(
+            torch.ones(16, dtype=torch.int64), torch.arange(16), num_groups=1
+        )
+        second = window_layout(
+            torch.arange(2).repeat_interleave(8),
+            torch.arange(8).repeat(2),
+            num_groups=2,
+        )
+        held, fresh = core(first), core(second)
+        held.refresh_for_breakable_cuda_graph_replay_(fresh)
+        self.assertIs(held.request_window_layout, second)
+        self.assertNotEqual(first.size, second.size)
+
+    def test_bcg_tail_preserves_idle_and_live_row_bounds(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        core = SimpleNamespace(low_ratios=())
+        backend.tail_forward_metadata = SimpleNamespace(
+            core_attn_metadata=core,
+            late_layer_tail=SimpleNamespace(real_rows_count=8, cp_metadata=None),
+        )
+        backend._bcg_tail_num_token_non_padded = None
+        for live in [0, 6, 16]:
+            backend.forward_metadata = SimpleNamespace(core_attn_metadata=core)
+            batch = SimpleNamespace(
+                attn_cp_metadata=None,
+                global_num_token_non_padded_cpu=live,
+                global_num_token_non_padded=torch.tensor(live),
+                num_token_non_padded=torch.tensor(live),
+            )
+            with patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_local_dp_buffer_len",
+                return_value=0,
+            ):
+                backend.enter_late_layer_tail(batch)
+            self.assertEqual(batch.global_num_token_non_padded_cpu, min(live, 8))
+            self.assertEqual(batch.global_num_token_non_padded.item(), min(live, 8))
+
+    def test_bcg_bucket_storage_shared_but_tail_isolated(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.token_to_kv_pool = SimpleNamespace(request_window=object())
+        backend.low_ratios = (1, 2)
+        backend._bcg_shared_core_buffers = {}
+
+        def metadata(rows, value):
+            return SimpleNamespace(
+                core_attn_metadata=SimpleNamespace(
+                    **{
+                        name: torch.full((rows, 4), value, dtype=torch.int32)
+                        for name in (
+                            "page_table",
+                            "c1_sparse_page_indices",
+                            "c1_sparse_raw_indices",
+                            "c2_sparse_page_indices",
+                            "c2_sparse_raw_indices",
+                        )
+                    }
+                )
+            )
+
+        big, small, tail = metadata(8, 1), metadata(4, 2), metadata(4, 3)
+        backend._share_bcg_window_core(big, "full")
+        backend._share_bcg_window_core(small, "full")
+        backend._share_bcg_window_core(tail, "tail")
+        a, b, c = (x.core_attn_metadata for x in (big, small, tail))
+        self.assertEqual(a.page_table.data_ptr(), b.page_table.data_ptr())
+        self.assertNotEqual(a.page_table.data_ptr(), c.page_table.data_ptr())
+        self.assertNotEqual(
+            a.c1_sparse_raw_indices.data_ptr(), a.c2_sparse_raw_indices.data_ptr()
+        )
+        torch.testing.assert_close(
+            a.page_table[:4], torch.full((4, 4), 2, dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            c.page_table, torch.full((4, 4), 3, dtype=torch.int32)
+        )
+        with self.assertRaisesRegex(AssertionError, "largest bucket"):
+            backend._share_bcg_window_core(metadata(9, 4), "full")
+
+    def test_bcg_candidate_scratch_does_not_accumulate_per_bucket(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        old = SimpleNamespace(candidate_metadata=object())
+        old_tail = SimpleNamespace(candidate_metadata=object())
+        backend._bcg_shared_core_buffers = {("full", "page_table"): object()}
+        backend._bcg_candidate_owners = (old, old_tail)
+        backend.forward_metadata = SimpleNamespace(
+            candidate_metadata=None,
+            core_attn_metadata=SimpleNamespace(bcg_shared_page_table=True),
+        )
+        backend.tail_forward_metadata = None
+        published = object()
+        backend._publish_candidate_metadata(published)
+        self.assertIsNone(old.candidate_metadata)
+        self.assertIsNone(old_tail.candidate_metadata)
+        self.assertIs(backend.forward_metadata.candidate_metadata, published)
+        previous = backend.forward_metadata
+        backend.forward_metadata = SimpleNamespace(
+            candidate_metadata=None,
+            core_attn_metadata=SimpleNamespace(bcg_shared_page_table=False),
+        )
+        backend._publish_candidate_metadata(object())
+        self.assertIs(previous.candidate_metadata, published)
+        self.assertIs(backend._bcg_candidate_owners[0], previous)
 
 
 if __name__ == "__main__":
