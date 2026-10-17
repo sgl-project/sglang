@@ -461,7 +461,39 @@ class Gemma4Attention(nn.Module):
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
         )
-        if can_fuse_qkv_norm:
+        fused_qkv_rope = (
+            can_fuse_qkv_norm
+            and q.is_xpu
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and self.rotary_emb.is_neox_style
+            and self.head_dim in (128, 256, 512)
+        )
+        if fused_qkv_rope:
+            from sglang.kernels.ops.attention.gemma_qkv_norm_rope import (
+                gemma_qkv_norm_rope,
+            )
+
+            gemma_qkv_norm_rope(
+                q,
+                None if is_kv_shared else k,
+                None if is_kv_shared else v,
+                self.q_norm.weight.data,
+                None if is_kv_shared else self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.eps,
+            )
+            if is_kv_shared:
+                k = None
+                v = None
+            else:
+                k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+                v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        elif can_fuse_qkv_norm:
             if is_kv_shared:
                 gemma_qkv_rmsnorm(
                     q,
@@ -509,7 +541,7 @@ class Gemma4Attention(nn.Module):
 
         # Apply rotary embedding
         use_fused_kv = False
-        if k is not None:
+        if k is not None and not fused_qkv_rope:
             k = k.flatten(-2, -1)
             # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
             # DISABLED: causes accuracy regression in launch_server path
@@ -525,7 +557,7 @@ class Gemma4Attention(nn.Module):
                 fused_arg = None
             q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        else:
+        elif not fused_qkv_rope:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer
             dummy_k = torch.zeros_like(q[:, : self.kv_size])
             q, _ = self.rotary_emb(positions, q, dummy_k)

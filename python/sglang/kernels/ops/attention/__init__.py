@@ -402,7 +402,7 @@ register_kernel(
         op="attention.gemma_qkv_norm_rope",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.XPU}),
         format_signature=FormatSignature(
             supported_dtypes=("float16", "bfloat16"),
             in_place=True,
