@@ -6,6 +6,9 @@ vLLM Kimi's `delta.reasoning`. Without explicit support, bench_serving only
 inspects `delta.content` and silently reports zero TTFT / ITL and an empty
 `generated_text`, which then retokenizes to 0 tokens even though the backend
 completed real work.
+
+The loopback SSE fixture also covers optional spaces after data: for JSON
+events and [DONE] across the benchmark's streaming request clients.
 """
 
 import asyncio
@@ -15,18 +18,22 @@ import threading
 import time
 import unittest
 from argparse import Namespace
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_openai_completions,
+    async_request_sglang_generate,
+    async_request_truss,
     calculate_metrics,
     set_global_args,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 
 def _free_port() -> int:
@@ -40,6 +47,8 @@ class _SSEHandler(BaseHTTPRequestHandler):
 
     chunks: list = []
     chunk_delay_s: float = 0.02
+    data_prefix: bytes = b"data: "
+    done_prefix: bytes = b"data: "
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
         length = int(self.headers.get("Content-Length", "0"))
@@ -49,12 +58,16 @@ class _SSEHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        for chunk in self.chunks:
-            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+        # A failing client may disconnect before the fixture finishes writing.
+        with suppress(BrokenPipeError, ConnectionResetError):
+            for chunk in self.chunks:
+                self.wfile.write(
+                    self.data_prefix + json.dumps(chunk).encode() + b"\n\n"
+                )
+                self.wfile.flush()
+                time.sleep(self.chunk_delay_s)
+            self.wfile.write(self.done_prefix + b"[DONE]\n\n")
             self.wfile.flush()
-            time.sleep(self.chunk_delay_s)
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
 
     def log_message(self, fmt, *args):  # silence access logs
         return
@@ -121,23 +134,40 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 print_requests=False,
                 tokenizer="",
                 header=None,
+                return_logprob=False,
+                return_routed_experts=False,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                logprob_start_len=-1,
+                temperature=0.0,
+                top_p=1.0,
             )
         )
 
-    def _run(self, chunks):
+    def _run(
+        self,
+        chunks,
+        *,
+        request_func=async_request_openai_chat_completions,
+        endpoint="chat/completions",
+        data_prefix=b"data: ",
+        done_prefix=b"data: ",
+    ):
         port = _free_port()
 
         class Handler(_SSEHandler):
             pass
 
         Handler.chunks = list(chunks)
+        Handler.data_prefix = data_prefix
+        Handler.done_prefix = done_prefix
         server = HTTPServer(("127.0.0.1", port), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             req = RequestFuncInput(
                 prompt="hello",
-                api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                api_url=f"http://127.0.0.1:{port}/v1/{endpoint}",
                 prompt_len=1,
                 output_len=64,
                 model="dummy-model",
@@ -145,10 +175,64 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 image_data=None,
                 extra_request_body={},
             )
-            return asyncio.run(async_request_openai_chat_completions(req))
+            return asyncio.run(request_func(req))
         finally:
             server.shutdown()
             server.server_close()
+
+    def _check_optional_sse_space(
+        self, chunks, request_func, endpoint, expected_output_len=2
+    ):
+        for data_prefix in (b"data: ", b"data:"):
+            for done_prefix in (b"data: ", b"data:"):
+                with self.subTest(data_prefix=data_prefix, done_prefix=done_prefix):
+                    out = self._run(
+                        chunks,
+                        request_func=request_func,
+                        endpoint=endpoint,
+                        data_prefix=data_prefix,
+                        done_prefix=done_prefix,
+                    )
+                    self.assertTrue(out.success, msg=out.error)
+                    self.assertEqual(out.generated_text, "hello world")
+                    self.assertEqual(out.output_len, expected_output_len)
+                    self.assertGreater(out.ttft, 0.0)
+                    self.assertEqual(len(out.itl), 1)
+
+    def test_optional_sse_space_chat_completions(self):
+        self._check_optional_sse_space(
+            [
+                _make_chunk(content="hello "),
+                _make_chunk(content="world", completion_tokens=2),
+            ],
+            async_request_openai_chat_completions,
+            "chat/completions",
+        )
+
+    def test_optional_sse_space_completions(self):
+        chunks = [
+            {"choices": [{"text": "hello "}]},
+            {"choices": [{"text": "world"}], "usage": {"completion_tokens": 2}},
+        ]
+        self._check_optional_sse_space(
+            chunks, async_request_openai_completions, "completions"
+        )
+
+    def test_optional_sse_space_truss(self):
+        chunks = [
+            {"choices": [{"text": "hello "}]},
+            {"choices": [{"text": "world"}]},
+        ]
+        self._check_optional_sse_space(chunks, async_request_truss, "predict", 64)
+
+    def test_optional_sse_space_generate(self):
+        chunks = [
+            {"text": "hello ", "meta_info": {"completion_tokens": 1}},
+            {"text": "hello world", "meta_info": {"completion_tokens": 2}},
+        ]
+        self._check_optional_sse_space(
+            chunks, async_request_sglang_generate, "generate"
+        )
 
     def test_reasoning_only_stream_populates_metrics(self):
         chunks = [
