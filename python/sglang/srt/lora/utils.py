@@ -78,7 +78,7 @@ class LoRABatchInfo:
     seg_lens: Optional[torch.Tensor]
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
-    permutation: Optional[torch.Tensor]
+    permutation: Optional[torch.Tensor] = None
 
     # Total number of tokens this batch info expects (host-side int).
     # Used by lm_head LoRA to validate input shape without GPU sync.
@@ -87,6 +87,8 @@ class LoRABatchInfo:
     # CPU-side flag: True when at least one request uses a LoRA adapter.
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
+
+    is_prefill: bool = False
 
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
@@ -673,3 +675,13 @@ def build_lm_head_pass_segments(
         result.append((seg_wi, seg_lens))
 
     return result
+
+
+def capturing_lora_graph() -> bool:
+    """Whether capture is active, excluding the decode "nolora" variant."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_lora_variant,
+        get_is_capture_mode,
+    )
+
+    return get_is_capture_mode() and get_capture_lora_variant() != "nolora"
