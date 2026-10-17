@@ -108,11 +108,15 @@ def make_int8_weights(e, out_dim, in_dim, int8_max=127, int8_min=-128):
     return weight
 
 
-def make_fp8_weights(e, out_dim, in_dim):
+def make_fp8_weights(e, out_dim, in_dim, per_tensor=False):
     weight_fp32 = torch.randn(e, out_dim, in_dim)
     weight = (
         (weight_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
     )
+
+    if per_tensor:
+        weight_s = torch.rand(e) * factor_for_scale
+        return weight, weight_s, weight.float() * weight_s.view(e, 1, 1)
 
     weight_s = (
         torch.rand(e, math.ceil(out_dim / BLOCK_N), math.ceil(in_dim / BLOCK_K))
@@ -336,17 +340,59 @@ class TestFusedExperts:
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
+    @pytest.mark.parametrize("M", [1, 2, 129])
+    @pytest.mark.parametrize("N", [352, 512])
+    @pytest.mark.parametrize("K", [256, 320])
+    @pytest.mark.parametrize("E", [8])
+    @pytest.mark.parametrize("topk", [4])
+    @pytest.mark.parametrize("activation", ["silu", "gelu"])
+    def test_fp8_moe_per_tensor_scale(self, M, N, K, E, topk, activation):
+        a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
+
+        w1_fp32 = torch.randn(E, 2 * N, K, dtype=torch.float32) / 10
+        w2_fp32 = torch.randn(E, K, N, dtype=torch.float32) / 10
+        w1 = w1_fp32.to(torch.float8_e4m3fn)
+        w2 = w2_fp32.to(torch.float8_e4m3fn)
+        w1s = torch.rand(E, dtype=torch.float32) * factor_for_scale
+        w2s = torch.rand(E, dtype=torch.float32) * factor_for_scale
+        w1_scaled = w1.float() * w1s.view(E, 1, 1)
+        w2_scaled = w2.float() * w2s.view(E, 1, 1)
+
+        routing = make_routing(M, E, topk, dtype=dtype, return_score=True)
+        topk_weight, topk_ids = routing[0], routing[1]
+        ref_out = native_fp8_fused_moe(
+            a, w1_scaled, w2_scaled, topk_weight, topk_ids, topk, activation=activation
+        )
+        out = run_fused_experts(
+            a,
+            kernel.convert_weight_packed(w1),
+            kernel.convert_weight_packed(w2),
+            topk_weight,
+            topk_ids,
+            quant=CPUQuantMethod.FP8_W8A16,
+            w1_scale=w1s,
+            w2_scale=w2s,
+            block_size=None,
+            is_vnni=True,
+            activation=activation,
+            inplace=False,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
     @pytest.mark.parametrize("m", [1, 32])
     @pytest.mark.parametrize("n", [128, 64])
     @pytest.mark.parametrize("k", [128, 64])
     @pytest.mark.parametrize("e", [4])
     @pytest.mark.parametrize("topk", [2])
     @pytest.mark.parametrize("renormalize", [False])
-    def test_fp8_moe_bias(self, m, n, k, e, topk, renormalize):
+    @pytest.mark.parametrize("per_tensor", [False, True])
+    def test_fp8_moe_bias(self, m, n, k, e, topk, renormalize, per_tensor):
         a = torch.randn((m, k), dtype=dtype) / 10
 
-        w1, w1s, w1_scaled = make_fp8_weights(e, 2 * n, k)
-        w2, w2s, w2_scaled = make_fp8_weights(e, k, n)
+        w1, w1s, w1_scaled = make_fp8_weights(e, 2 * n, k, per_tensor=per_tensor)
+        w2, w2s, w2_scaled = make_fp8_weights(e, k, n, per_tensor=per_tensor)
         w1_b = torch.randn((e, 2 * n), dtype=torch.float32) / 10
 
         w2_b = torch.randn((e, k), dtype=torch.float32) / 10
@@ -384,7 +430,7 @@ class TestFusedExperts:
             quant=CPUQuantMethod.FP8_W8A16,
             w1_scale=w1s,
             w2_scale=w2s,
-            block_size=[BLOCK_N, BLOCK_K],
+            block_size=None if per_tensor else [BLOCK_N, BLOCK_K],
             w1_bias=w1_b,
             w2_bias=w2_b,
             alpha=alpha,

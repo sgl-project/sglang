@@ -162,7 +162,7 @@ void fused_experts_int8_kernel_impl(
     int64_t num_tokens_post_pad);
 
 // moe implementations for fp8 w8a16 and mxfp4
-template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4, bool is_fp8_pertensor = false>
 void fused_experts_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
@@ -325,7 +325,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
     const float* __restrict__ Bbias,
-    float scale,
+    const float scale,
     int64_t M,
     int64_t N,
     int64_t K,
@@ -333,6 +333,7 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
+    int64_t block_size_K = 0,  // only for compatibility with the MoE interface
     bool do_unpack = true);
 
 // mxfp4
