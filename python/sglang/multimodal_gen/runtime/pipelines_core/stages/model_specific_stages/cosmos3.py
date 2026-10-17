@@ -12,6 +12,7 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -1098,10 +1099,34 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.vae = vae
         self._logged_parallel_config = False
         self._logged_cfg_split = False
+        self._mlp_cuda_graphs = None
 
         # Apply torch.compile if enabled
         if server_args is not None:
             self._maybe_enable_torch_compile(transformer, server_args)
+            self._maybe_enable_mlp_cuda_graphs(transformer, server_args)
+
+    def _maybe_enable_mlp_cuda_graphs(self, transformer, server_args):
+        if not server_args.enable_breakable_cuda_graph:
+            return
+        if (
+            server_args.enable_torch_compile
+            or not current_platform.is_cuda()
+            or server_args.num_gpus != 1
+            or server_args.canonical_residency_mode("transformer") != "resident"
+        ):
+            logger.info(
+                "Cosmos3 MLP CUDA graphs require one CUDA GPU, resident transformer "
+                "weights, and torch.compile disabled; keeping the existing path."
+            )
+            return
+        from sglang.multimodal_gen.runtime.breakable_cuda_graph.cosmos3_mlp import (
+            Cosmos3MLPCudaGraphs,
+        )
+
+        self._mlp_cuda_graphs = Cosmos3MLPCudaGraphs(
+            transformer, get_local_torch_device()
+        )
 
     def _maybe_enable_torch_compile(
         self, transformer: nn.Module, server_args: ServerArgs
@@ -1867,14 +1892,20 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return batch
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if batch.extra.get("transfer_plan") is not None:
-            return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
-        ):
-            return self._denoise_once(batch, server_args)
+        graph_context = (
+            self._mlp_cuda_graphs.activate(is_warmup=batch.is_warmup)
+            if self._mlp_cuda_graphs is not None and not batch.rollout
+            else nullcontext()
+        )
+        with graph_context:
+            if batch.extra.get("transfer_plan") is not None:
+                return self._forward_transfer(batch, server_args)
+            with self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ):
+                return self._denoise_once(batch, server_args)
 
     def _predict_noise_cfg(
         self,
