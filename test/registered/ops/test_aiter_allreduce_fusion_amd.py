@@ -24,6 +24,15 @@ register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 HIDDEN_DIMS = [2880, 4096, 5120, 6144, 7168, 8192]
 
 
+def _lossless_reference_env():
+    # The unfused reference goes through the regular all-reduce dispatcher,
+    # which prefers QuickReduce; its quantized codecs would make it lossy.
+    env = os.environ.copy()
+    env["ROCM_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+    env["AITER_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+    return env
+
+
 def _run_residual_accuracy_check():
     """Distributed entry point: residual accuracy across 1-stage/2-stage paths.
 
@@ -206,11 +215,10 @@ class TestAiterAllreduceFusionAmd(unittest.TestCase):
                 str(csv_path),
             ]
 
-            env = os.environ.copy()
             result = subprocess.run(
                 cmd,
                 cwd=str(repo_root),
-                env=env,
+                env=_lossless_reference_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -329,7 +337,7 @@ class TestAiterAllreduceFusionAmd(unittest.TestCase):
         result = subprocess.run(
             cmd,
             cwd=str(Path(__file__).resolve().parents[3]),
-            env=os.environ.copy(),
+            env=_lossless_reference_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -88,7 +88,8 @@ class QuickAllReduce:
         self.disabled = True
         if not qr_rocm_arch_available():
             logger.debug(
-                "Custom quick allreduce is only supported on ROCm MI300 series."
+                "Custom quick allreduce is only supported on ROCm "
+                "MI30X/MI35X/MI45X series."
             )
             return
 
@@ -264,3 +265,117 @@ class QuickAllReduce:
 
     def __del__(self):
         self.close()
+
+
+class _QuickAllReduceAdapter:
+    """Expose the SGLang QuickReduce interface for bundled and AITER backends."""
+
+    def __init__(self, communicator: Any) -> None:
+        self._communicator = communicator
+
+    @property
+    def disabled(self) -> bool:
+        # AITER does not guarantee this attribute across releases. If it is
+        # absent, the presence of its eligibility method is the enable signal.
+        return bool(getattr(self._communicator, "disabled", False))
+
+    def should_quick_allreduce(self, inp: torch.Tensor) -> bool:
+        eligibility = getattr(self._communicator, "should_quick_allreduce", None)
+        if eligibility is None:
+            return False
+        return bool(eligibility(inp))
+
+    def quick_all_reduce(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        reduce = self._communicator.quick_all_reduce
+        if out is None:
+            return reduce(inp)
+        return reduce(inp, out=out)
+
+    def close(self) -> None:
+        close = getattr(self._communicator, "close", None)
+        if close is not None:
+            close()
+
+
+_QUICK_REDUCE_ENV_ALIASES = {
+    "ROCM_QUICK_REDUCE_QUANTIZATION": "AITER_QUICK_REDUCE_QUANTIZATION",
+    "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": "AITER_QUICK_REDUCE_CAST_BF16_TO_FP16",
+    "ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": "AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB",
+}
+
+# Codecs served by the bundled INT8 codec. AITER has no INT8 codec, and
+# released AITER FP8 returns NaN for near-zero blocks with FP16 kernels.
+_BUNDLED_INT8_CODECS = ("INT8", "FP8")
+
+
+def _configure_aiter_quickreduce_env() -> None:
+    """Translate legacy SGLang QuickReduce settings for AITER.
+
+    Explicit AITER settings always win. This keeps existing launch scripts
+    working while allowing users to migrate one variable at a time.
+    """
+    for legacy_name, aiter_name in _QUICK_REDUCE_ENV_ALIASES.items():
+        if aiter_name in os.environ or legacy_name not in os.environ:
+            continue
+        os.environ[aiter_name] = os.environ[legacy_name]
+
+
+def _requested_codec() -> Optional[str]:
+    return os.environ.get(
+        "AITER_QUICK_REDUCE_QUANTIZATION",
+        os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION"),
+    )
+
+
+def _configure_bundled_int8_env() -> None:
+    """Select the bundled INT8 codec, keeping explicit AITER size and cast
+    settings unless the matching legacy setting is also given."""
+    os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "INT8"
+    for legacy_name, aiter_name in _QUICK_REDUCE_ENV_ALIASES.items():
+        if aiter_name in os.environ:
+            os.environ.setdefault(legacy_name, os.environ[aiter_name])
+
+
+def create_quick_allreduce(
+    group: ProcessGroup, device: Union[int, str, torch.device]
+) -> Optional[_QuickAllReduceAdapter]:
+    """Create the configured QuickReduce communicator.
+
+    AITER is opt-in through ``SGLANG_USE_AITER``. INT8 and FP8 requests run
+    on the bundled INT8 codec, as does a missing AITER installation.
+    Constructor failures intentionally propagate: distributed initialization
+    may already have exchanged resources, so silently creating a second
+    communicator is unsafe.
+    """
+    if not qr_rocm_arch_available():
+        return None
+
+    if os.environ.get("SGLANG_USE_AITER", "0").lower() in ("1", "true"):
+        codec = _requested_codec()
+        if codec in _BUNDLED_INT8_CODECS:
+            logger.info(
+                "Using bundled QuickAllReduce INT8 codec for requested %s "
+                "QuickReduce quantization",
+                codec,
+            )
+            _configure_bundled_int8_env()
+            return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
+        _configure_aiter_quickreduce_env()
+        try:
+            from aiter.dist.device_communicators.quick_all_reduce import (
+                QuickAllReduce as AiterQuickAllReduce,
+            )
+        except (ImportError, AttributeError) as exc:
+            logger.info(
+                "AITER QuickAllReduce unavailable; using bundled QuickAllReduce: %s",
+                exc,
+            )
+        else:
+            logger.info("Using AITER QuickAllReduce")
+            return _QuickAllReduceAdapter(
+                AiterQuickAllReduce(group=group, device=device)
+            )
+
+    return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
