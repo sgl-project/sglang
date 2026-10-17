@@ -46,10 +46,10 @@ def _validate_efa_allocator_compatibility(
 
     if enable_custom_mem_pool and custom_mem_pool_type in ("NVLINK", "BAREX"):
         raise ValueError(
-            f"SGLANG_MOONCAKE_CUSTOM_MEM_POOL={custom_mem_pool_type} is "
+            f"SGLANG_CUSTOM_MEM_POOL={custom_mem_pool_type} is "
             "incompatible with MOONCAKE_PROTOCOL=efa. Mooncake custom memory "
             "pools use CUDA VMM allocations, which the current libfabric EFA "
-            "provider cannot transfer. Unset SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+            "provider cannot transfer. Unset SGLANG_CUSTOM_MEM_POOL."
         )
 
     expandable_segments_var = _cuda_expandable_segments_enabled()
@@ -136,7 +136,7 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool_type)
     """
-    custom_mem_pool_type = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+    custom_mem_pool_type = envs.SGLANG_CUSTOM_MEM_POOL.get()
 
     if custom_mem_pool_type is not None:
         # Handle boolean True as NVLINK

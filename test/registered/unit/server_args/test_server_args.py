@@ -4025,7 +4025,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 return_value=True,
             ),
             patch.object(
-                envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
+                envs.SGLANG_CUSTOM_MEM_POOL,
                 "get",
                 return_value=None,
             ),
