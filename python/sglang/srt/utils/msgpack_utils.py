@@ -147,6 +147,11 @@ def _decode_cuda_ipc_tensor_proxy(
     obj.sync_data_meta = _from_msgpack_state(state["sync_data_meta"])
     obj.sync_buffer = None
     obj._consumer_acknowledged = False
+    if obj.proxy_state.get("ipc_extra", {}).get("transport_mode") == "npu_ipc":
+        # The Ascend NPU IPC transport keeps its payload inside ``ipc_extra``
+        # and owns no pool lease, so the consumer-side state has to be rebuilt
+        # from the serialized proxy instead of the fields set above.
+        obj._restore_npu_ipc_proxy_state()
     return obj
 
 

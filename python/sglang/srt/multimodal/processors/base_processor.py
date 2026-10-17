@@ -46,6 +46,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.multimodal.transport.npu_ipc_bridge import is_device_tensor
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -439,22 +440,24 @@ class BaseMultimodalProcessor(ABC):
         if self.use_cuda_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
-            # workers doesn't multiply the GPU-side footprint.
+            # workers doesn't multiply the GPU-side footprint. NPU ignores the
+            # budget: it uses torch_npu reduce_tensor memory sharing instead.
             worker_num = get_serving().tokenizer_worker_num
             per_worker_pool_size = get_mm_feature_pool_size_per_worker(
                 MM_FEATURE_CACHE_SIZE, worker_num
             )
-            total_pool_size = per_worker_pool_size * worker_num
-            logger.info(
-                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
-                "budget %.0f MiB).",
-                total_pool_size / (1024 * 1024),
-                self.server_args.base_gpu_id,
-                per_worker_pool_size / (1024 * 1024),
-                worker_num,
-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
-            )
+            if not _is_npu:
+                total_pool_size = per_worker_pool_size * worker_num
+                logger.info(
+                    "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
+                    "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
+                    "budget %.0f MiB).",
+                    total_pool_size / (1024 * 1024),
+                    self.server_args.base_gpu_id,
+                    per_worker_pool_size / (1024 * 1024),
+                    worker_num,
+                    MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+                )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -1709,8 +1712,8 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        """helper function to turn a tensor into a device-ipc tensor"""
+        if not is_device_tensor(tensor):
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
