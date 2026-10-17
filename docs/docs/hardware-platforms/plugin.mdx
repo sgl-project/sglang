@@ -1028,6 +1028,10 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
   </tbody>
 </table>
 
+### CUDA graph extension plugins
+
+An external plugin can save captured CUDA graphs once and restore them on later starts, without new call sites in SGLang. [Foundry](https://github.com/foundry-org/foundry), activated by `FOUNDRY_GRAPH_EXTENSION_CONFIG`, wraps existing functions on their dotted paths (the targets a `HookType.AROUND` hook would use): the CUDA graph runners' `capture`, `FullCudaGraphBackend.capture_one`, the parallel bring-up and the memory-pool configuration. `test/registered/unit/plugins/test_foundry_plugin_contract.py` pins those symbols and signatures.
+
 ---
 
 ## File Reference
