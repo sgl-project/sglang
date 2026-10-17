@@ -319,6 +319,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     cand_end_param = rest_of_slice.find(self.parameter_end_token)
                     cand_next_param = rest_of_slice.find(self.parameter_prefix)
                     cand_end_func = rest_of_slice.find(self.function_end_token)
+                    cand_end_tool = rest_of_slice.find(self.tool_call_end_token)
 
                     candidates = []
                     if cand_end_param != -1:
@@ -329,6 +330,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         candidates.append((cand_next_param, 0))
                     if cand_end_func != -1:
                         candidates.append((cand_end_func, 0))
+                    if cand_end_tool != -1:
+                        candidates.append((cand_end_tool, 0))
 
                     if candidates:
                         best_cand = min(candidates, key=lambda x: x[0])
@@ -389,7 +392,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 4. Function End: </function>
             # -------------------------------------------------------
-            if current_slice.startswith(self.function_end_token):
+            if current_slice.startswith(self.function_end_token) or (
+                self.current_func_name is not None
+                and current_slice.startswith(self.tool_call_end_token)
+            ):
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
@@ -399,8 +405,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 calls.append(
                     ToolCallItem(tool_index=self.current_tool_id, parameters="}")
                 )
-                self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
+                if current_slice.startswith(self.function_end_token):
+                    self.parsed_pos += len(self.function_end_token)
                 continue
 
             # -------------------------------------------------------
