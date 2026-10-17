@@ -2335,6 +2335,32 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _compute_trtllm_gated_act_params(
+    *,
+    activation: Optional[str],
+    gemm1_alpha: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    swiglu_limit: Optional[float],
+    g1_alphas: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    params = {}
+    is_situ = activation == "situ"
+    clamp_limit = None if is_situ else (gemm1_clamp_limit or swiglu_limit)
+    if clamp_limit is not None:
+        params["gemm1_clamp_limit"] = (clamp_limit / g1_alphas).to(torch.float32)
+
+    if gemm1_alpha is not None:
+        params["gemm1_alpha"] = torch.full_like(
+            g1_alphas, gemm1_alpha, dtype=torch.float32
+        )
+        params["gemm1_beta"] = (
+            torch.full_like(g1_alphas, gemm1_clamp_limit, dtype=torch.float32)
+            if is_situ
+            else (1.0 / g1_alphas).to(torch.float32)
+        )
+    return params
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2788,39 +2814,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
-            is_situ = runner_config.activation == "situ"
-            gemm1_clamp_limit = (
-                None
-                if is_situ
-                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+            gated_act_params = _compute_trtllm_gated_act_params(
+                activation=runner_config.activation,
+                gemm1_alpha=runner_config.gemm1_alpha,
+                gemm1_clamp_limit=runner_config.gemm1_clamp_limit,
+                swiglu_limit=runner_config.swiglu_limit,
+                g1_alphas=layer.g1_alphas,
             )
-            if gemm1_clamp_limit is not None:
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_clamp_limit",
-                    (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
-                )
-
-            if runner_config.gemm1_alpha is not None:
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_alpha",
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_alpha,
-                        dtype=torch.float32,
-                    ),
-                )
-                gemm1_beta = (
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_clamp_limit,
-                        dtype=torch.float32,
-                    )
-                    if is_situ
-                    else (1.0 / layer.g1_alphas).to(torch.float32)
-                )
-                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
+            for name, value in gated_act_params.items():
+                copy_or_rebind_param(layer, name, value)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
