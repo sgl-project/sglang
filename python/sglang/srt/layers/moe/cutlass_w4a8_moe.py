@@ -332,25 +332,40 @@ def cutlass_w4a8_moe_deepep_normal(
         topk_ids_, num_experts
     )
     num_total_tokens = reorder_topk_ids.numel()
+    a_is_static_fp8 = a.dtype == torch.float8_e4m3fn
+    if a_is_static_fp8:
+        # Static-FP8 dispatch payload: already per-tensor quantized with the
+        # checkpoint's scale on the sender. Permute through a BF16 view (the
+        # exact same 2-byte element-copy path as the BF16 flow) and skip the
+        # receive-side requantization.
+        assert a.shape[1] % 2 == 0, "static-FP8 payload requires even hidden size"
+        a_perm = a.view(torch.bfloat16)
+    else:
+        a_perm = a
     gateup_input_pre_reorder = torch.empty(
-        (int(num_total_tokens), a.shape[1]),
+        (int(num_total_tokens), a_perm.shape[1]),
         device=device,
-        dtype=a.dtype,
+        dtype=a_perm.dtype,
     )
     deepep_permute_triton_kernel[(a.shape[0],)](
-        a,
+        a_perm,
         gateup_input_pre_reorder,
         src2dst,
         topk_ids_.to(torch.int64),
         None,
         topk,
-        a.shape[1],
+        a_perm.shape[1],
         BLOCK_SIZE=512,
     )
-    gateup_input = torch.empty(
-        gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
-    )
-    per_tensor_quant_fp8(gateup_input_pre_reorder, gateup_input, a1_scale.float(), True)
+    if a_is_static_fp8:
+        gateup_input = gateup_input_pre_reorder.view(torch.float8_e4m3fn)
+    else:
+        gateup_input = torch.empty(
+            gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
+        )
+        per_tensor_quant_fp8(
+            gateup_input_pre_reorder, gateup_input, a1_scale.float(), True
+        )
     del gateup_input_pre_reorder
     local_topk_ids = topk_ids_
     local_topk_ids = (

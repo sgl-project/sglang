@@ -284,15 +284,25 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
-            # The normal kernel requantizes BF16 inputs with the checkpoint's
-            # static activation scale. The low-latency kernel instead consumes
-            # DeepEP's FP8 payload together with its per-token-group scales.
-            layer.dispatcher.set_quant_config(
-                {
-                    "normal_dispatcher_output_dtype": "bf16",
-                    "low_latency_dispatcher_output_dtype": "fp8",
-                }
-            )
+            # The normal dispatcher stays on its plain BF16 all-to-all path.
+            # On DeepEP backends we additionally hand it the checkpoint's
+            # static activation scale so it per-tensor quantizes the
+            # activations to FP8 *before* the all-to-all and ships the FP8
+            # payload in a BF16 view (see _DeepEPDispatcherImplNormal in
+            # token_dispatcher/deepep.py). This halves the dispatch traffic
+            # and removes the receive-side requantization, which is exact
+            # here because the scale is a single static scalar. The
+            # low-latency dispatcher is unchanged: it consumes DeepEP's FP8
+            # payload together with its per-token-group scales.
+            quant_config = {
+                "normal_dispatcher_output_dtype": "bf16",
+                "low_latency_dispatcher_output_dtype": "fp8",
+            }
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+
+            if get_moe_a2a_backend().is_deepep():
+                quant_config["normal_static_fp8_scale"] = layer.w13_input_scale
+            layer.dispatcher.set_quant_config(quant_config)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -396,9 +406,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
 
-        if hidden_states.dtype != torch.bfloat16:
+        if hidden_states.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise RuntimeError(
-                "W4AFP8 DeepEP normal requires BF16 dispatcher output, "
+                "W4AFP8 DeepEP normal requires BF16 dispatcher output or "
+                "statically-quantized FP8 payload, "
                 f"but got {hidden_states.dtype}."
             )
 
