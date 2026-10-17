@@ -782,6 +782,29 @@ def _resolve_remote_repo_model_index_path(
         raise
 
 
+def _download_overlay_manifest(repo_id: str, filename: str) -> str:
+    """``hf_hub_download`` for the overlay manifest that most repos lack.
+
+    For a file the repo never had, ``hf_hub_download`` waits out each Hub rate
+    limit before giving up, which can stall the startup of a fully cached
+    checkpoint for minutes. Overlay repos hold only metadata, so a complete
+    cached snapshot without the manifest is a regular checkpoint, which
+    maybe_download_model serves from the cache, and needs no Hub request.
+    Offline, ``hf_hub_download`` already answers from the cache without waiting.
+    """
+    from huggingface_hub import is_offline_mode, try_to_load_from_cache
+
+    if not envs.SGLANG_USE_MODELSCOPE.get() and not is_offline_mode():
+        cached_index = try_to_load_from_cache(repo_id, "model_index.json")
+        if isinstance(cached_index, str):
+            snapshot = os.path.dirname(cached_index)
+            if not os.path.exists(
+                os.path.join(snapshot, filename)
+            ) and _verify_diffusers_model_complete(snapshot):
+                raise EntryNotFoundError(f"{filename} not found in {repo_id}")
+    return hf_hub_download(repo_id=repo_id, filename=filename)
+
+
 def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     Download and extract just the model_index.json for a Hugging Face model.
@@ -795,7 +818,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     overlay_config = maybe_load_overlay_model_index(
         model_name_or_path,
         snapshot_download_fn=snapshot_download,
-        hf_hub_download_fn=hf_hub_download,
+        hf_hub_download_fn=_download_overlay_manifest,
     )
     if overlay_config is not None:
         return overlay_config
@@ -892,7 +915,7 @@ def maybe_download_model(
             download=download,
             allow_patterns=allow_patterns,
             snapshot_download_fn=snapshot_download,
-            hf_hub_download_fn=hf_hub_download,
+            hf_hub_download_fn=_download_overlay_manifest,
             verify_diffusers_model_complete_fn=_verify_diffusers_model_complete,
             base_model_download_fn=maybe_download_model,
         )

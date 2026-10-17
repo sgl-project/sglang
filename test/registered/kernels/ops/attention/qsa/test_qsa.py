@@ -1,4 +1,5 @@
 import sys
+from itertools import accumulate
 from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -1638,6 +1640,175 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
                     torch.testing.assert_close(
                         value, getattr(ref.indexer_metadata, key), rtol=0, atol=0
                     )
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "dtype,output_dtype",
+    [
+        (torch.bfloat16, None),
+        (torch.float8_e4m3fn, None),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("head_dim,num_kv_heads,group_size", [(128, 2, 4), (256, 1, 6)])
+@pytest.mark.parametrize(
+    "query_lens,prefix_lens",
+    [
+        ([1, 7], [31, 19]),
+        ([17, 33], [23, 0]),
+        ([2049, 3], [7, 40]),
+        ([3, 1, 2], [1018, 128, 128]),
+        ([3, 1, 2], [253, 63, 62]),
+        ([3, 1, 2], [254, 63, 62]),
+        ([3, 1, 2], [8189, 2047, 2046]),
+        ([3, 1, 2], [8190, 2047, 2046]),
+    ],
+)
+def test_qsa_prefill_kv_packing(
+    dtype,
+    output_dtype,
+    head_dim,
+    num_kv_heads,
+    group_size,
+    query_lens,
+    prefix_lens,
+    strided,
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(42)
+    device = "cuda"
+    lens = [q + p for q, p in zip(query_lens, prefix_lens)]
+    request_ids = [3, 1, 0][: len(lens)]
+    replay_ids = [2, 0, 3][: len(lens)]
+    table_width = max(lens) + 11
+    pool_size = 16 * table_width
+    table = torch.randperm(pool_size, device=device).reshape(8, table_width * 2)[
+        ::2, ::2
+    ]
+    if strided:
+        table = table.to(torch.int32)
+    req_indices = torch.tensor(request_ids, device=device, dtype=torch.int64)
+    k = torch.randn(
+        pool_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(dtype)
+    v = torch.randn_like(k.to(torch.bfloat16)).to(dtype)
+    if strided:
+        k_storage = torch.empty(
+            pool_size, num_kv_heads, head_dim * 2, device=device, dtype=dtype
+        )
+        v_storage = torch.empty_like(k_storage)
+        k = k_storage[..., ::2].copy_(k)
+        v = v_storage[..., ::2].copy_(v)
+    q = torch.randn(
+        sum(query_lens),
+        num_kv_heads * group_size,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    cu_q = torch.tensor([0, *accumulate(query_lens)], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, *accumulate(lens)], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor(lens, device=device, dtype=torch.int32)
+    indices = torch.full((sum(query_lens), 32), -1, device=device, dtype=torch.int32)
+    row = 0
+    for count, prefix in zip(query_lens, prefix_lens):
+        for offset in range(count):
+            visible = prefix + offset + 1
+            selected = torch.randperm(visible, device=device)[:32]
+            indices[row, : selected.numel()] = selected
+            row += 1
+
+    def reference(request_ids):
+        slots = torch.cat([table[request_ids[i], :n] for i, n in enumerate(lens)])
+        return sparse_gqa_fwd_interface_triton_ck(
+            q,
+            k.index_select(0, slots).to(output_dtype or k.dtype),
+            v.index_select(0, slots).to(output_dtype or v.dtype),
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            head_dim**-0.5,
+        )
+
+    def packed():
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=k,
+            v=v,
+            req_to_token=table,
+            req_indices=req_indices,
+            cu_k=cu_k,
+            total_k=sum(lens),
+            max_k=max(lens),
+            output_dtype=output_dtype,
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            slots = torch.cat([table[req_indices[i], :n] for i, n in enumerate(lens)])
+            torch.testing.assert_close(
+                packed_k.float(), k.index_select(0, slots).float(), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                packed_v.float(), v.index_select(0, slots).float(), rtol=0, atol=0
+            )
+        return packed_k, packed_v
+
+    def attend(packed_k, packed_v):
+        return sparse_gqa_fwd_interface_triton_ck(
+            q,
+            packed_k,
+            packed_v,
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            head_dim**-0.5,
+        )
+
+    expected = reference(request_ids)
+    actual = attend(*packed())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = packed()
+    req_indices.copy_(torch.tensor(replay_ids, device=device))
+    expected = reference(replay_ids)
+    graph.replay()
+    torch.testing.assert_close(attend(*captured), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("heads", [1, 3, 6, 12])
+def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(19)
+    rows, prefix, topk = 2053, 64, 64
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(rows + prefix, 1, head_dim, device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    v = torch.randn_like(k.to(torch.bfloat16)).to(k.dtype)
+    visible = torch.arange(rows, device="cuda") + prefix + 1
+    indices = (
+        torch.arange(topk, device="cuda")[None, :]
+        + torch.arange(rows, device="cuda")[:, None] * 7
+    ) % visible[:, None]
+    indices = indices.to(torch.int32)
+    cu_q = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, rows + prefix], device="cuda", dtype=torch.int32)
+    lengths = cu_k[1:]
+    actual = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu_q, cu_k, lengths, head_dim**-0.5
+    )
+    for row in [0, 17, rows // 2, rows - 1]:
+        keys = k.index_select(0, indices[row].long()).squeeze(1).double()
+        values = v.index_select(0, indices[row].long()).squeeze(1).double()
+        expected = (
+            torch.softmax(q[row].double() @ keys.T * head_dim**-0.5, dim=-1) @ values
+        )
+        torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":
