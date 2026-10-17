@@ -649,33 +649,41 @@ class TestDisaggregationWire(unittest.TestCase):
         )
         self.assertEqual(info.dst_aux_item_lens, [4096])
 
-    def test_aux_buffer_validation_checks_each_buffer_stride(self):
+    def test_aux_buffer_validation_allows_decode_only_speculation(self):
+        """Non-spec prefill and EAGLE decode have different hidden-state strides."""
+        prefill = MetadataBuffers(1, 16, torch.float32, 0)
+        decode = MetadataBuffers(1, 128, torch.float16, 0)
+        src_ptrs, _, src_lens = prefill.get_buf_infos()
+        dst_ptrs, _, dst_lens = decode.get_buf_infos()
         manager = object.__new__(CommonKVManager)
         manager.kv_args = SimpleNamespace(
-            aux_data_ptrs=[0x1000, 0x2000], aux_item_lens=[64, 128]
+            aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
         )
-        manager.validate_aux_buffers([0x3000, 0x4000], [64, 128])
-        for local_lens, dst_ptrs, dst_lens in (
-            ([64, 128], [0x3000, 0x4000], [64, 64]),
-            ([64, 128], [0x3000, 0x4000], [64, 256]),
-            ([64, 128], [0x3000, 0x4000], [128, 64]),
-            ([64, 128], [0x3000], [64]),
-            ([64, 128], [0x3000, 0x4000], [64]),
-            ([64, 128], [0x3000, 0x4000], []),
-            ([64], [0x3000, 0x4000], [64]),
-            ([64, 128], [0x3000, 0x4000], None),
+        self.assertNotEqual(src_lens, dst_lens)
+        manager.validate_aux_buffers(dst_ptrs, dst_lens)
+        for local_lens, peer_ptrs, peer_lens in (
+            (src_lens, dst_ptrs, dst_lens[:6] + [2048] + dst_lens[7:]),
+            (src_lens, dst_ptrs, dst_lens[:6] + [8192] + dst_lens[7:]),
+            (src_lens, dst_ptrs, dst_lens[:7] + [32] + dst_lens[8:]),
+            (src_lens, dst_ptrs[:-1], dst_lens[:-1]),
+            (src_lens, dst_ptrs, dst_lens[:-1]),
+            (src_lens, dst_ptrs, []),
+            (src_lens[:-1], dst_ptrs, dst_lens),
+            (src_lens, dst_ptrs, None),
         ):
-            with self.subTest(local_lens=local_lens, dst_lens=dst_lens):
+            with self.subTest(local_lens=local_lens, peer_lens=peer_lens):
                 manager.kv_args.aux_item_lens = local_lens
                 with self.assertRaisesRegex(
                     ValueError, "metadata buffer layout mismatch"
                 ):
-                    manager.validate_aux_buffers(dst_ptrs, dst_lens)
+                    manager.validate_aux_buffers(peer_ptrs, peer_lens)
 
     def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
         manager = object.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(
-            aux_data_ptrs=[0x1000], aux_item_lens=[64], kv_data_ptrs=[0x2000]
+            aux_data_ptrs=[0x1000] * 8,
+            aux_item_lens=[64] * 6 + [4096, 64],
+            kv_data_ptrs=[0x2000],
         )
         manager.enable_trace = manager.enable_staging = False
         manager.enable_deferred_decode_kv_release = False
@@ -706,8 +714,8 @@ class TestDisaggregationWire(unittest.TestCase):
         }
         manager.decode_kv_args_table = {
             str(room): SimpleNamespace(
-                dst_aux_ptrs=[0x3000],
-                dst_aux_item_lens=[32 if room == 21 else 64],
+                dst_aux_ptrs=[0x3000] * 8,
+                dst_aux_item_lens=[64] * 6 + [2048 if room == 21 else 4096, 64],
                 requires_dcp_relayout=False,
             )
             for room in (21, 22)

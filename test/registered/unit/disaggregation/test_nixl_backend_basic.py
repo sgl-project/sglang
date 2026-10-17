@@ -712,8 +712,13 @@ class TestNixlTransferWorker(CustomTestCase):
 
     def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
         mgr = self._make_manager(21)
-        mgr.decode_kv_args_table["agent"].dst_aux_item_lens = [32]
         healthy = self._make_manager(22)
+        mgr.kv_args.aux_data_ptrs = [0] * 8
+        mgr.kv_args.aux_item_lens = [64] * 6 + [4096, 64]
+        for manager, capacity in ((mgr, 2048), (healthy, 4096)):
+            peer = manager.decode_kv_args_table["agent"]
+            peer.dst_aux_ptrs = [0] * 8
+            peer.dst_aux_item_lens = [64] * 6 + [capacity, 64]
         healthy_req = healthy.transfer_infos[22]["agent"]
         healthy_req.agent_name = "healthy"
         mgr.transfer_infos[22] = {"healthy": healthy_req}

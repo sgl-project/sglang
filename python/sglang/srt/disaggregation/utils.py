@@ -586,8 +586,13 @@ class MetadataBuffers:
                     ),
                 )
             )
+            if payload:
+                # Reject schema errors before they can abort the decode scheduler.
+                msgspec.msgpack.decode(
+                    payload, type=dict[str, list[object]], ext_hook=ext_hook
+                )
         except (TypeError, ValueError, OverflowError) as exc:
-            raise CustomizedInfoError(f"Cannot encode customized_info: {exc}") from exc
+            raise CustomizedInfoError(f"Invalid customized_info: {exc}") from exc
         if len(payload) > self.output_customized_info.shape[1]:
             raise CustomizedInfoError(
                 f"customized_info payload ({len(payload)} bytes) exceeds "

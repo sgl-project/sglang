@@ -162,14 +162,18 @@ class TestMooncakeAbortNotification(
         manager.failed_sessions = set()
         manager.state_layout_rejections = {}
         manager.req_to_decode_prefix_len = {}
-        manager.kv_args = MagicMock(kv_data_ptrs=[0x1000])
+        manager.kv_args = MagicMock(
+            kv_data_ptrs=[0x1000], aux_data_ptrs=[0] * 8, aux_item_lens=[64] * 8
+        )
         manager._get_dsa_cache_transfer_skip_flags = lambda info: (False, False)
         manager.decode_kv_args_table = {}
         manager.transfer_infos = {ROOM: {}}
         for i in range(num_dsts):
             session = f"decode-session-{i}"
             manager.decode_kv_args_table[session] = MagicMock(
-                requires_dcp_relayout=False
+                requires_dcp_relayout=False,
+                dst_aux_ptrs=[0] * 8,
+                dst_aux_item_lens=[64] * 8,
             )
             manager.transfer_infos[ROOM][(DECODE_IP, DECODE_PORT + i)] = TransferInfo(
                 room=ROOM,

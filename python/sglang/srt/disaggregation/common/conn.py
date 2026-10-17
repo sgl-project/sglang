@@ -575,9 +575,15 @@ class CommonKVManager(BaseKVManager):
     ) -> None:
         src_ptrs = self.kv_args.aux_data_ptrs
         src_item_lens = self.kv_args.aux_item_lens
+        # Hidden-state strides can differ with decode-only speculation. Only
+        # customized_info (slots 6 and 7 in MetadataBuffers) needs equal strides.
         if not (
-            len(src_ptrs) == len(src_item_lens) == len(dst_aux_ptrs)
-            and src_item_lens == dst_aux_item_lens
+            dst_aux_item_lens is not None
+            and len(src_ptrs)
+            == len(src_item_lens)
+            == len(dst_aux_ptrs)
+            == len(dst_aux_item_lens)
+            and src_item_lens[6:8] == dst_aux_item_lens[6:8]
         ):
             raise ValueError(
                 "Disaggregation metadata buffer layout mismatch: "

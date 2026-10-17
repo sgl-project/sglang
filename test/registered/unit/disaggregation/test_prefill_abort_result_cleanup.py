@@ -307,10 +307,17 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
     scheduler.send_kv_chunk.assert_not_called()
 
 
-@pytest.mark.parametrize("value", ["x" * 8192, object()], ids=["overflow", "encoding"])
+@pytest.mark.parametrize(
+    "customized_info",
+    [{"scores": ["x" * 8192]}, {"scores": [object()]}, {1: [0.5]}],
+    ids=["overflow", "encoding", "non-string-key"],
+)
 @patch("sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group")
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache")
-def test_customized_info_failure_is_request_local(release_kv_cache, poll, value):
+def test_customized_info_failure_is_request_local(
+    release_kv_cache, poll, customized_info
+):
+    """Invalid sampler metadata aborts its request before reaching decode."""
     scheduler = _Scheduler()
     scheduler.scheduler_stage_metrics = None
     scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
@@ -333,13 +340,13 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
     release_kv_cache.side_effect = _free_req
     poll.return_value = [KVPoll.Failed]
 
-    for index, payload in enumerate((value, 0.5)):
+    for index, payload in enumerate((customized_info, {"scores": [0.5]})):
         req = Req(f"customized-info-{index}", "", [1], SamplingParams())
         req.kv = ReqKvInfo(req_pool_idx=0, kv_allocated_len=1)
         req.metadata_buffer_index = 0
         req.extend_end = 1
         req.output_ids.append(2)
-        req.customized_info = {"scores": [payload]}
+        req.customized_info = payload
         req.disagg_kv_sender = Mock()
         req.disagg_kv_sender.get_max_transfer_tokens.return_value = None
         req.time_stats = Mock()
