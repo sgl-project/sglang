@@ -188,6 +188,9 @@ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
+# How decoder layers run: their modules, or a model's fused whole-layer (mono) kernels.
+LAYER_BACKEND_CHOICES = ["module", "mono"]
+
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
     "cutedsl",
