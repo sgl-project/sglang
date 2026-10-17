@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     _cutedsl_prefill_backend_fill,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
+    _deterministic_rocm_rccl_check,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
     _intel_xpu_page_constraint,
@@ -668,6 +669,7 @@ def handle_deterministic_inference(server_args: Any):
             if get_platform().is_hip:
                 # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
+                run_post_process_pass(server_args, _deterministic_rocm_rccl_check)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
             else:
                 # CUDA: use NCCL tree algorithm
