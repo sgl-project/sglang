@@ -1620,7 +1620,33 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.kv.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
+                    from sglang.srt.system_prompt import is_system_prefix_warm
+
+                    if is_system_prefix_warm(
+                        req.system_prefix_boundary,
+                        req.prefix_len,
+                        req.mamba_branching_seqlen,
+                    ):
+                        # Fixed system prompt, warm request: the boundary state
+                        # is already cached and the suffix is neither tracked
+                        # (mask=False in _mamba_radix_cache_v2_req_prepare_for_extend)
+                        # nor donated (cap_mamba_donate_len). It needs no real
+                        # ping-pong slot. Use reserved slot 0 as the sentinel
+                        # (MambaSlotAllocator.clear never hands slot 0 out): it is
+                        # a valid dummy write/gather/COW target, so any index
+                        # consumer (decode track kernel dst, donate path, COW-from
+                        # root under eviction) stays in bounds. free_mamba_cache
+                        # filters 0 (and -1 for lazy) so slot 0 is never returned
+                        # to the free list. Real allocations start at 1, so
+                        # excluding 0 is a no-op on cold/lazy buffers.
+                        req.kv.mamba_ping_pong_track_buffer = torch.zeros(
+                            (self.mamba_ping_pong_track_buffer_size,),
+                            dtype=torch.int64,
+                            device=self.device,
+                        )
+                        req.kv.mamba_next_track_idx = 0
+                    else:
+                        self._alloc_ping_pong_buffer(req)
                 mamba_ping_pong_track_buffers.append(
                     req.kv.mamba_ping_pong_track_buffer
                 )
@@ -1865,12 +1891,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     mamba_ping_pong_track_buffer_to_free = (
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
-            if self.enable_mamba_extra_buffer_lazy:
-                mamba_ping_pong_track_buffer_to_free = (
-                    mamba_ping_pong_track_buffer_to_free[
-                        mamba_ping_pong_track_buffer_to_free != -1
-                    ]
-                )
+            # Drop sentinel entries before freeing. -1 = lazy unallocated second
+            # slot; 0 = fixed-system-prompt warm sentinel (reserved slot 0, never
+            # freed). Real allocations start at 1 (MambaSlotAllocator.clear
+            # reserves slot 0), so excluding both is a no-op on real slots and
+            # guarantees neither sentinel is ever returned to the free list.
+            sentinel_mask = (mamba_ping_pong_track_buffer_to_free != -1) & (
+                mamba_ping_pong_track_buffer_to_free != 0
+            )
+            mamba_ping_pong_track_buffer_to_free = (
+                mamba_ping_pong_track_buffer_to_free[sentinel_mask]
+            )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
             # Match the req.kv.mamba_pool_idx=None clear above so the next
             # alloc() doesn't see a stale ping-pong reference on the req

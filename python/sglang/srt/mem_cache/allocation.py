@@ -304,7 +304,17 @@ def ensure_mamba_capacity(
             needed += 1
 
         if req.kv.mamba_ping_pong_track_buffer is None:
-            needed += req_to_token_pool.mamba_initial_tracking_slots
+            # Fixed system prompt: a warm request gets a sentinel-only ping-pong
+            # buffer (reserved slot 0, no real allocation), so charge nothing;
+            # a cold request still needs the full tracking slots.
+            from sglang.srt.system_prompt import is_system_prefix_warm
+
+            if not is_system_prefix_warm(
+                req.system_prefix_boundary,
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+            ):
+                needed += req_to_token_pool.mamba_initial_tracking_slots
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = req_to_token_pool.mamba_allocator
