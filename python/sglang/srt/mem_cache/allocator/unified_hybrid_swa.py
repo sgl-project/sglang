@@ -346,6 +346,11 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
+    def prewarm_compaction(self) -> None:
+        """Prewarm the page-move path of every member that compacts."""
+        for allocator in self._move_gate_targets():
+            allocator.prewarm_compaction()
+
     def translate_write_loc(
         self,
         loc: torch.Tensor,

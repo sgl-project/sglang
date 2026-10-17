@@ -29,6 +29,16 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def folded_replay_rows(batch) -> int:
+    if not batch.forward_mode.is_extend_without_speculative():
+        return 0
+    return sum(
+        min(end, 128)
+        for reset, end in zip(batch.encoder_swa_reset, batch.prefix_lens)
+        if reset
+    )
+
+
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_row_floor = folded.row_floor
     forward_batch.encoder_swa_compress_skip = folded.compress_skip
@@ -216,7 +226,6 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         folded.engram_history = _engram_history(
             reqs=batch.reqs, starts=pre, runner=runner
         )
-    _set_execution_counts(batch=folded, scheduled=batch)
     floor = torch.tensor(
         [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
     )
@@ -243,7 +252,7 @@ def _set_execution_counts(*, batch, scheduled) -> None:
     """MLP-sync counts of a batch copied from `scheduled` with different rows."""
     if scheduled.global_num_tokens is None:
         return
-    # The flag rejects attention DP, so the gather holds only this rank's count.
+    # Attention DP is admitted only with the fold, so the gather holds one count.
     if (
         len(scheduled.global_num_tokens) != 1
         or scheduled.global_num_tokens[0] != scheduled.extend_num_tokens

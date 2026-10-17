@@ -34,6 +34,8 @@ uuid = { workspace = true }
 
 arc-swap = "1"
 axum = { version = "0.8.9", features = ["json", "tokio"] }
+# Already in the tree via dynamo-renderer; `/v1/loads` timestamps.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
 core_affinity = "0.8"
