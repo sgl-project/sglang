@@ -177,6 +177,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -201,6 +202,8 @@ def fused_marlin_moe(
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
     - num_bits (int): The number of bits in expert weights quantization.
+    - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
+        ``[num_tokens, topk, hidden]``, instead of their top-k sum.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -408,6 +411,9 @@ def fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
+
+    if no_combine:
+        return intermediate_cache3
 
     output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:
