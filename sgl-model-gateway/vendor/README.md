@@ -1,0 +1,1 @@
+openai-protocol 1.0.0 is vendored from crates.io under Apache-2.0. Local changes extend the chat top_logprobs maximum to128 and preserve input_ids and return_meta_info so session clients retain exact tokenization and replay metadata. Validation remains in the schema, including cross-field checks. All other protocol fields remain unchanged.
