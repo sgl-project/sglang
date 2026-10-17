@@ -5,6 +5,7 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.models import minimax_m3
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -66,6 +67,23 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
         self.assertEqual(len(kv_args.state_item_lens[0]), pool.index_k_pool.layer_num)
         self.assertEqual(len(kv_args.state_data_ptrs[1]), 6)
         self.assertEqual(len(kv_args.state_item_lens[1]), 6)
+
+    def test_tc_piecewise_positions_match_local_pp_hidden_tokens(self):
+        normalize = getattr(
+            minimax_m3, "_normalize_qknorm_rope_positions_for_cuda_graph", None
+        )
+        self.assertIsNotNone(normalize)
+        if normalize is None:
+            return
+
+        positions = torch.arange(3584)
+        hidden_states = torch.zeros((3372, 3))
+        normalized = normalize(positions, hidden_states)
+
+        self.assertEqual(normalized.shape, (3372,))
+        torch.testing.assert_close(normalized, positions[:3372])
+        equal_positions = torch.arange(3372)
+        self.assertIs(normalize(equal_positions, hidden_states), equal_positions)
 
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()
