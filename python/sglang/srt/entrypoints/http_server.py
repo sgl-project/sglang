@@ -1091,6 +1091,9 @@ async def list_external_corpora():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
     """Clear the hierarchical cache storage backend."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
+
     ret = await _global_state.tokenizer_manager.clear_hicache_storage()
     return Response(
         content="Hierarchical cache storage backend cleared.\n",
@@ -1300,6 +1303,9 @@ async def init_weights_send_group_for_remote_instance(
     obj: Annotated[InitWeightsSendGroupForRemoteInstanceReqInput, Body()],
     request: Request,
 ):
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
+
     (
         success,
         message,
@@ -1318,6 +1324,9 @@ async def init_weights_send_group_for_remote_instance(
 async def send_weights_to_remote_instance(
     obj: Annotated[SendWeightsToRemoteInstanceReqInput, Body()], request: Request
 ):
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
+
     (
         success,
         message,
