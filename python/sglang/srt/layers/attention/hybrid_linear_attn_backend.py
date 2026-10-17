@@ -1512,6 +1512,15 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
         request_number = last_correct_step_indices.shape[0]
+        req_pool = self.linear_attn_backend.req_to_token_pool
+        if self._commit_gdn_replayssm_after_direct_verify(
+            req_pool,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            req_pool_indices,
+        ):
+            return
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
             src_indices_raw = req_pool_indices[:request_number]
@@ -1535,7 +1544,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 ]
             )
 
-        req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
         # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
@@ -1605,6 +1613,102 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_steps_to_track,
             src_indices_raw,
         )
+
+    @staticmethod
+    def _commit_gdn_replayssm_after_direct_verify(
+        req_pool,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+        req_pool_indices: Optional[torch.Tensor],
+    ) -> bool:
+        """GDN ReplaySSM commit for DFLASH, which commits through this hook rather
+        than spec_utils.commit_mamba_states_after_verify. Runs the GDN branches of
+        that function with a linear chain's accept lengths: the fold under
+        SGLANG_ENABLE_GDN_REPLAYSSM_FOLD, else the circular ring. Returns False
+        when the pool has no GDN spec-verify ring, so the stock scatter commits.
+        """
+        mamba_pool = req_pool.mamba_pool
+        # Decode-only --enable-linear-replayssm also allocates the replay rings,
+        # but its verify still writes per-position states.
+        if mamba_pool.replayssm_is_kda or not mamba_pool.enable_linear_replayssm_spec:
+            return False
+        fold = mamba_pool.replayssm_spec_fold
+        if not fold and mamba_pool.replayssm_cache_base is None:
+            return False
+        if req_pool_indices is None:
+            raise RuntimeError(
+                "GDN ReplaySSM spec-verify commit needs req_pool_indices."
+            )
+        if last_correct_step_indices.numel() == 0:
+            return True
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        state_batch_indices = req_pool.get_mamba_indices(req_pool_indices)
+        # Linear chain: the accept length (with the bonus token) is the last
+        # accepted step + 1.
+        accept_lens = (last_correct_step_indices + 1).to(torch.int32)
+        if fold:
+            from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+                commit_gdn_replayssm_fold_after_verify,
+            )
+
+            commit_gdn_replayssm_fold_after_verify(
+                spec_state=spec_state,
+                state_batch_indices=state_batch_indices,
+                accept_lens=accept_lens,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return True
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_circular,
+            commit_gdn_replayssm_spec,
+        )
+
+        commit_gdn_replayssm_spec(
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_accepted=accept_lens,
+            replay_indices=req_pool_indices,
+            max_cache_len=spec_state.replayssm_d.shape[-2],
+            max_spec_len=int(get_spec().speculative_num_draft_tokens),
+            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            null_block_id=-1,
+        )
+        commit_gdn_replayssm_circular(
+            checkpoint_state=spec_state.temporal,
+            d_cache=spec_state.replayssm_d,
+            k_cache=spec_state.replayssm_k,
+            g_cache=spec_state.replayssm_g,
+            d_residual_cache=spec_state.replayssm_rawv,
+            k_residual_cache=spec_state.replayssm_rawk,
+            state_batch_indices=state_batch_indices,
+            replay_indices=req_pool_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
+        )
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            state_batch_indices,
+            last_correct_step_indices,
+        )
+        if mamba_track_indices is not None:
+            fused_conv_window_scatter_with_mask(
+                spec_state.conv[0],
+                spec_state.intermediate_conv_window[0],
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        return True
 
     @staticmethod
     def _scatter_speculative_state_with_mask(

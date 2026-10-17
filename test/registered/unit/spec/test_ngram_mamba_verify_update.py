@@ -362,5 +362,97 @@ class TestMtpVerifyHookSignature(CustomTestCase):
             )
 
 
+class TestDflashGdnReplaySSMCommit(CustomTestCase):
+    """DFLASH commits through the backend's update_mamba_state_after_mtp_verify
+    rather than spec_utils, so the hook routes GDN ReplaySSM pools itself.
+    Decode-only rings must keep the stock scatter (that verify writes per-position
+    states), and a fold pool, which has no circular cursors, must not fall through
+    to it."""
+
+    MODULE = "sglang.srt.layers.attention.hybrid_linear_attn_backend"
+
+    def _backend(self, *, spec: bool, fold: bool, cursors: bool):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        backend.linear_attn_backend = MagicMock()
+        backend.linear_attn_backend.accept_lens_pool = None
+        req_pool = backend.linear_attn_backend.req_to_token_pool
+        req_pool.mamba_pool.replayssm_is_kda = False
+        req_pool.mamba_pool.enable_linear_replayssm_spec = spec
+        req_pool.mamba_pool.replayssm_spec_fold = fold
+        req_pool.mamba_pool.replayssm_cache_base = (
+            torch.zeros(4, dtype=torch.int32) if cursors else None
+        )
+        req_pool.get_mamba_indices.return_value = torch.tensor(
+            [5, 7], dtype=torch.int32
+        )
+        req_pool.get_speculative_mamba2_params_all_layers.return_value = (
+            TestPPReplaySSMVerifySourceRows._spec_state()
+        )
+        return backend
+
+    def test_hook_routes_gdn_replayssm_pools(self):
+        cases = (
+            # (pool, --enable-linear-replayssm-spec, fold, circular cursors, commit)
+            ("decode-only rings", False, False, True, "stock"),
+            ("circular ring", True, False, True, "circular"),
+            ("fold", True, True, False, "fold"),
+        )
+        for pool, spec, fold, cursors, expected in cases:
+            with (
+                self.subTest(pool=pool),
+                patch(f"{self.MODULE}.scatter_mamba_states_after_mtp_verify") as stock,
+                patch(f"{self.MODULE}.fused_conv_window_scatter_with_mask"),
+                patch(
+                    f"{self.MODULE}.get_spec",
+                    return_value=MagicMock(speculative_num_draft_tokens=3),
+                ),
+                patch(
+                    f"{self.MODULE}.HybridLinearAttnBackend."
+                    "_update_ple_state_after_mtp_verify"
+                ),
+                patch(
+                    "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                    "commit_gdn_replayssm_spec"
+                ),
+                patch(
+                    "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                    "commit_gdn_replayssm_circular"
+                ) as circular,
+                patch(
+                    "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold."
+                    "commit_gdn_replayssm_fold_after_verify"
+                ) as fold_commit,
+            ):
+                self._backend(
+                    spec=spec, fold=fold, cursors=cursors
+                ).update_mamba_state_after_mtp_verify(
+                    last_correct_step_indices=torch.tensor([2, 0]),
+                    mamba_track_indices=None,
+                    mamba_steps_to_track=None,
+                    model=None,
+                    req_pool_indices=torch.tensor([17, 23]),
+                )
+
+                commits = {"stock": stock, "circular": circular, "fold": fold_commit}
+                self.assertEqual(
+                    [name for name, mock in commits.items() if mock.called],
+                    [expected],
+                )
+                if expected != "stock":
+                    kwargs = commits[expected].call_args.kwargs
+                    # A linear chain accepts the last correct step plus one tokens.
+                    torch.testing.assert_close(
+                        kwargs["accept_lens"], torch.tensor([3, 1], dtype=torch.int32)
+                    )
+                    torch.testing.assert_close(
+                        kwargs["state_batch_indices"],
+                        torch.tensor([5, 7], dtype=torch.int32),
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
