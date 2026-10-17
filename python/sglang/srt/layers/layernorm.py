@@ -63,6 +63,29 @@ if _is_cuda or _is_xpu or _is_musa:
         try:
             import flashinfer.norm
 
+            if _is_cuda:
+                # DSA indexer LayerNorm runs inside a breakable prefill interval.
+                # Newer FlashInfer uses a pure CuTe compile factory here; reuse
+                # SGLang's disk cache instead of recompiling at every startup.
+                try:
+                    from pathlib import Path
+
+                    import flashinfer.norm.kernels.layernorm as fi_layernorm
+
+                    from sglang.kernels.jit.cute_aot_cache import (
+                        persistent_compile_cache,
+                    )
+
+                    fi_layernorm._get_compiled_layernorm_kernel = (
+                        persistent_compile_cache(
+                            "flashinfer_layernorm",
+                            source_paths=(Path(flashinfer.__file__).parent, __file__),
+                        )(fi_layernorm._get_compiled_layernorm_kernel)
+                    )
+                except (ImportError, AttributeError):
+                    # Older FlashInfer releases use a different implementation.
+                    pass
+
             from sglang.srt.utils.custom_op import register_custom_op
 
             def _layernorm_fake_impl(
