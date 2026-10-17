@@ -182,6 +182,9 @@ class WhisperProcessor(BaseMultimodalProcessor):
         # Check if this is a fused auto-detect request (decoder prompt = [SOT] only,
         # structured generation handles the rest via regex constraint).
         detect_language = self._pop_sampling_param(request_obj, FUSED_AUTODETECT_FLAG)
+        task = self._pop_sampling_param(request_obj, "task") or "transcribe"
+        if task not in ("transcribe", "translate"):
+            raise ValueError("Whisper task must be 'transcribe' or 'translate'.")
         # timestamp_granularities is a transcription-level field; it must be
         # popped in both branches or it leaks into SamplingParams(**kwargs)
         # downstream and TypeErrors. In the fused branch the FSM regex was
@@ -205,7 +208,7 @@ class WhisperProcessor(BaseMultimodalProcessor):
 
         # Whisper is a pure speech-to-text model; text prompts are ignored.
         # The full decoder sequence is:
-        #   <|startoftranscript|> <|lang|> <|transcribe|> [<|notimestamps|> | <|0.00|>]
+        #   <|startoftranscript|> <|lang|> <|task|> [<|notimestamps|> | <|0.00|>]
         #
         # When language is known, we build this prefix explicitly below.
         # When auto-detecting (_detect_language=True), we feed only <|startoftranscript|>
@@ -225,9 +228,7 @@ class WhisperProcessor(BaseMultimodalProcessor):
             )
             language_token_id = self._get_language_token_id(language)
 
-            transcribe_token_id = self._tokenizer.convert_tokens_to_ids(
-                "<|transcribe|>"
-            )
+            task_token_id = self._tokenizer.convert_tokens_to_ids(f"<|{task}|>")
 
             # Use <|0.00|> to enable timestamp generation, or <|notimestamps|> to disable
             if timestamp_granularities:
@@ -240,7 +241,7 @@ class WhisperProcessor(BaseMultimodalProcessor):
             input_ids = [
                 decoder_start_token_id,
                 language_token_id,
-                transcribe_token_id,
+                task_token_id,
                 timestamp_token_id,
             ]
 
