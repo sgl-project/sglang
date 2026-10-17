@@ -971,6 +971,13 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    # Kimi-K3 TP8 on gfx950: run the latent-MoE tail (latent RMSNorm, up-projection,
+    # shared + residual add) as one kernel for decode-sized batches.
+    SGLANG_ROCM_K3_FUSED_LATENT_TAIL = EnvBool(True)
+    # Run that tail column-parallel (each rank reads 1/8 of the replicated up_proj)
+    # and fuse its all-gather with the next layer's attention read, up to 64 tokens
+    # (LL collectives, layers/communication/k3_ll_comm_hip.py).
+    SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
