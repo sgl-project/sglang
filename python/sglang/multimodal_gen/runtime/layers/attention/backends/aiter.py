@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
     USE_AITER_GFX95,
     USE_AITER_GFX942,
+    USE_AITER_GFX1250,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ AITER_BF16_CVT_MODE: int = 2
 
 if _use_fp8_attn:
     logger.info("DiT FP8 attention enabled via SGLANG_DIFFUSION_AITER_FP8_ATTN=1")
+
+if _use_fp8_attn and USE_AITER_GFX1250:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_mxfp8 import (
+        can_use_mxfp8_attention,
+        mxfp8_attention,
+    )
 
 
 @triton.jit
@@ -344,6 +351,7 @@ class AITerImpl(AttentionImpl):
     ) -> torch.Tensor:
         """
         Performs attention using one of:
+          - mxfp8_attention (MXFP8 on gfx1250, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
           - flash_attn_func (BF16, default or FP8 fallback for unsupported shapes)
 
@@ -356,6 +364,14 @@ class AITerImpl(AttentionImpl):
         Returns:
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
+        if (
+            _use_fp8_attn
+            and USE_AITER_GFX1250
+            and self.dropout_p == 0.0
+            and can_use_mxfp8_attention(query, key, value, self.causal)
+        ):
+            return mxfp8_attention(query, key, value, self.softmax_scale)
+
         if _use_fp8_attn:
             output = self._forward_fp8(query, key, value)
             if output is not None:
