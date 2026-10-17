@@ -137,28 +137,39 @@ class GuidanceGrammar(BaseGrammarObject):
         self._check_err()
 
         self.eos_tokens = set(self.llguidance_tokenizer.eos_tokens)
+        # Own flag, not ``finished``: the scheduler overwrites ``finished`` with
+        # the request's finish state, which stays False under ignore_eos.
+        self.terminated = False
+        # Whether the terminating EOS bypassed ll_matcher (it had already stopped).
+        self.eos_outside_matcher = False
 
     def accept_token(self, token: int):
-        if self.finished:
+        if self.terminated:
             return
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
-            self.finished = True
+            self.terminated = True
+            self.eos_outside_matcher = True
             return
         self.ll_matcher.consume_token(token)
         self._check_err()
+        # An extensible grammar (e.g. ``a+``) stops when ll_matcher consumes EOS.
+        if token in self.eos_tokens and self.ll_matcher.is_stopped():
+            self.terminated = True
+            self.eos_outside_matcher = False
 
     def rollback(self, num_tokens: int) -> None:
         if num_tokens <= 0:
             return
-        if self.finished:
-            self.finished = False
+        if self.terminated:
+            self.terminated = False
             # EOS token after stop isn't tracked in ll_matcher
-            num_tokens -= 1
+            if self.eos_outside_matcher:
+                num_tokens -= 1
         self.ll_matcher.rollback(num_tokens)
         self._check_err()
 
     def is_terminated(self):
-        return self.finished
+        return self.terminated
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         fill_next_token_bitmask(self.ll_matcher, vocab_mask, idx)

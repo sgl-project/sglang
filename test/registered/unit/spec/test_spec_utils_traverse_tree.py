@@ -10,7 +10,9 @@ import unittest
 from unittest.mock import MagicMock
 
 import torch
+from llguidance import LLTokenizer, grammar_from
 
+from sglang.srt.constrained.llguidance_backend import GuidanceGrammar
 from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -105,6 +107,84 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         # Node 1 accepted+filled; node 2 rejected -> node 2 and node 3 skipped.
         self.assertEqual(accept_calls, [5])
         self.assertEqual(fill_calls, [0, 1])
+
+
+class TestTraverseTreeGrammarTermination(unittest.TestCase):
+    """A terminated grammar leaves its tree rows unconstrained (ignore_eos)."""
+
+    def setUp(self):
+        self.tokenizer = LLTokenizer("byte")
+        self.eos = self.tokenizer.eos_token
+        self.a, self.b, self.x = self.tokenizer.tokenize_str("abx")
+
+    def _grammar(self, regex, prefix):
+        grammar = GuidanceGrammar(
+            llguidance_tokenizer=self.tokenizer,
+            serialized_grammar=grammar_from("regex", regex),
+        )
+        for token in self.tokenizer.tokenize_str(prefix):
+            grammar.accept_token(token)
+        return grammar
+
+    def _traverse(self, grammar, rnt, rns, draft_tokens):
+        bitmask = grammar.allocate_vocab_mask(
+            self.tokenizer.vocab_size, len(draft_tokens), "cpu"
+        )
+        traverse_tree(
+            torch.tensor(rnt, dtype=torch.int32),
+            torch.tensor(rns, dtype=torch.int32),
+            torch.tensor(draft_tokens, dtype=torch.int64),
+            grammar,
+            bitmask,
+        )
+        return bitmask
+
+    def _mask(self, grammar):
+        mask = grammar.allocate_vocab_mask(self.tokenizer.vocab_size, 1, "cpu")
+        grammar.fill_vocab_mask(mask, 0)
+        return mask[0]
+
+    def test_termination_inside_tree(self):
+        # ``ab+`` matcher consumes EOS itself; ``ab`` stops before EOS, so its
+        # EOS is handled outside the matcher. Root (col 0) is the committed "b":
+        #   0 ─┬─ 1 (EOS) ─── 2 (x)
+        #      └─ 3 (b) ───── 4 (EOS)
+        for regex in ("ab+", "ab"):
+            with self.subTest(regex=regex):
+                grammar = self._grammar(regex, "ab")
+                root_mask = self._mask(grammar)
+                bitmask = self._traverse(
+                    grammar,
+                    rnt=[1, 2, -1, 4, -1],
+                    rns=[-1, 3, -1, -1, -1],
+                    draft_tokens=[self.b, self.eos, self.x, self.b, self.eos],
+                )
+
+                self.assertTrue(torch.equal(bitmask[0], root_mask))
+                # Rows at and below a terminating EOS are not filled.
+                for row in (1, 2, 4):
+                    self.assertTrue((bitmask[row] == -1).all(), row)
+                if regex == "ab+":
+                    self.assertTrue(torch.equal(bitmask[3], root_mask))
+                # Rolling back the EOS before the sibling restores the root state.
+                self.assertFalse(grammar.is_terminated())
+                self.assertTrue(torch.equal(self._mask(grammar), root_mask))
+
+                # The scheduler commits EOS and stops feeding the grammar. The next
+                # iteration's tree is rooted at a terminated grammar: nothing is
+                # accepted, filled or rolled back.
+                grammar.accept_token(self.eos)
+                grammar.finished = False
+                bitmask = self._traverse(
+                    grammar,
+                    rnt=[1, 2, -1],
+                    rns=[-1, -1, -1],
+                    draft_tokens=[self.x, self.a, self.x],
+                )
+                self.assertTrue((bitmask == -1).all())
+                self.assertTrue(grammar.is_terminated())
+                grammar.rollback(1)
+                self.assertTrue(torch.equal(self._mask(grammar), root_mask))
 
 
 if __name__ == "__main__":
