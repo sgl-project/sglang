@@ -37,6 +37,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils.common import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -535,7 +536,9 @@ class AiterAttnBackend(AttentionBackend):
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
 
-        if self.use_sliding_window_kv_pool:
+        # paged_attention_ragged (cpp_itfs, GFX9-only) and the CK
+        # mha_batch_prefill have no gfx1250 implementation.
+        if self.use_sliding_window_kv_pool or is_gfx1250_supported():
             self.use_triton_unified_attention = True
         else:
             self.use_triton_unified_attention = get_bool_env_var(
