@@ -9,8 +9,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 from sglang.srt.layers.layernorm import (
     GemmaRMSNorm,
     RMSNorm,
-    _flashinfer_rmsnorm_fp4quant_available,
-    _flashinfer_rmsnorm_quant_available,
 )
 from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -69,8 +67,8 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
 
-        if not _flashinfer_rmsnorm_quant_available:
-            raise unittest.SkipTest("flashinfer rmsnorm_quant is not available")
+        if torch.version.hip is not None:
+            raise unittest.SkipTest("FlashInfer fusion requires CUDA")
         torch.set_default_device("cuda")
 
     def _run_fusion_test(self, num_tokens, hidden_size, add_residual, dtype):
@@ -190,6 +188,8 @@ class TestGemmaRMSNormInputQuantFusion(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+        if torch.version.hip is not None:
+            raise unittest.SkipTest("FlashInfer fusion requires CUDA")
         torch.set_default_device("cuda")
 
     def _layer_and_inputs(self, num_tokens, add_residual):
@@ -222,8 +222,6 @@ class TestGemmaRMSNormInputQuantFusion(CustomTestCase):
 
     def test_fp8(self):
 
-        if not _flashinfer_rmsnorm_quant_available:
-            self.skipTest("flashinfer rmsnorm_quant is not available")
         # 0-dim, as ModelOpt FP8 linears hold their static input scale.
         scale = torch.tensor(0.05, dtype=torch.float32)
         for num_tokens, add_residual in itertools.product(
@@ -246,8 +244,6 @@ class TestGemmaRMSNormInputQuantFusion(CustomTestCase):
 
     def test_nvfp4(self):
 
-        if not _flashinfer_rmsnorm_fp4quant_available or fp4_quantize is None:
-            self.skipTest("flashinfer rmsnorm_fp4quant / fp4_quantize not available")
         if torch.cuda.get_device_capability()[0] < 10:
             self.skipTest("NVFP4 quantization needs SM100 or newer")
         # 0-dim, as ModelOpt NVFP4 linears hold input_scale_inv.
@@ -297,6 +293,8 @@ class TestPrequantizedFp8Linear(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+        if torch.version.hip is not None:
+            raise unittest.SkipTest("FlashInfer fusion requires CUDA")
         torch.set_default_device("cuda")
 
     def _operands(self):

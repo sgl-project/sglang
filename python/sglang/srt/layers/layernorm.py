@@ -68,8 +68,14 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
-_flashinfer_rmsnorm_quant_available = False
-_flashinfer_rmsnorm_fp4quant_available = False
+
+if _is_cuda:
+    from flashinfer.norm import add_rmsnorm_fp4quant as _flashinfer_add_rmsnorm_fp4quant
+    from flashinfer.norm import (
+        fused_add_rmsnorm_quant as _flashinfer_fused_add_rmsnorm_quant,
+    )
+    from flashinfer.norm import rmsnorm_fp4quant as _flashinfer_rmsnorm_fp4quant
+    from flashinfer.norm import rmsnorm_quant as _flashinfer_rmsnorm_quant
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -98,29 +104,6 @@ if _is_cuda or _is_xpu or _is_musa:
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
-
-        try:
-            from flashinfer.norm import (
-                fused_add_rmsnorm_quant as _flashinfer_fused_add_rmsnorm_quant,
-            )
-            from flashinfer.norm import rmsnorm_quant as _flashinfer_rmsnorm_quant
-
-            _flashinfer_rmsnorm_quant_available = True
-        except (ImportError, AttributeError):
-            _flashinfer_rmsnorm_quant_available = False
-
-        try:
-            from flashinfer.norm import (
-                add_rmsnorm_fp4quant as _flashinfer_add_rmsnorm_fp4quant,
-            )
-            from flashinfer.norm import rmsnorm_fp4quant as _flashinfer_rmsnorm_fp4quant
-
-            _flashinfer_rmsnorm_fp4quant_available = True
-        except (ImportError, AttributeError):
-            _flashinfer_rmsnorm_fp4quant_available = False
-    else:
-        _flashinfer_layernorm_available = False
-        _flashinfer_rmsnorm_quant_available = False
 
     from sgl_kernel import (
         fused_add_rmsnorm,
@@ -658,11 +641,7 @@ class RMSNorm(BaseFusedOp):
         # norm when supported. Placed after the empty / variance-override /
         # batch-invariant guards above (all incompatible with the fused kernel)
         # and gated on not-HF-cast, so it only runs on the standard RMSNorm path.
-        if (
-            quant_linear is not None
-            and not self.cast_x_before_out_mul
-            and _flashinfer_rmsnorm_quant_available
-        ):
+        if quant_linear is not None and not self.cast_x_before_out_mul and _is_cuda:
             scale = _fp8_static_input_scale(quant_linear)
             if scale is not None:
                 return self.forward_with_per_tensor_quant_fusion(
@@ -1219,21 +1198,22 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor],
     ):
+        if not _is_cuda:
+            return None
         # The fused kernels apply the stored (1 + w) as a plain RMSNorm weight.
         linear = self._quant_linear
-        if _flashinfer_rmsnorm_quant_available:
-            scale = _fp8_static_input_scale(linear)
-            if scale is not None:
-                return _rmsnorm_per_tensor_fp8_quant(
-                    x,
-                    self.gemma_weight,
-                    self.variance_epsilon,
-                    scale,
-                    residual,
-                    post_residual_addition,
-                    torch.float8_e4m3fn,
-                )
-        if _flashinfer_rmsnorm_fp4quant_available and x.dim() == 2:
+        scale = _fp8_static_input_scale(linear)
+        if scale is not None:
+            return _rmsnorm_per_tensor_fp8_quant(
+                x,
+                self.gemma_weight,
+                self.variance_epsilon,
+                scale,
+                residual,
+                post_residual_addition,
+                torch.float8_e4m3fn,
+            )
+        if x.dim() == 2:
             global_scale = _nvfp4_input_global_scale(linear)
             if global_scale is not None:
                 return _rmsnorm_nvfp4_quant(
