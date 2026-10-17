@@ -937,7 +937,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     with (
                         mock.patch.object(cache, "cache_controller", mock.Mock()),
                         mock.patch.object(
-                            cache, "_execute_and_commit_kv_backup", return_value=0
+                            cache, "_execute_and_commit_kv_backup", return_value=None
                         ) as backup,
                     ):
                         cache._evict_components({ComponentType.FULL: 0, ct: 2}, tracker)
@@ -6992,7 +6992,9 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(cache.tree_core.is_full_device_evicted(node))
 
         # Backup failure falls back to dropping the unlocked subtree.
-        with mock.patch.object(cache, "_execute_and_commit_kv_backup", return_value=0):
+        with mock.patch.object(
+            cache, "_execute_and_commit_kv_backup", return_value=None
+        ):
             result = cache.evict(EvictParams(num_tokens=len(seq)))
 
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
@@ -7348,6 +7350,82 @@ class UnifiedRadixCacheSuite:
             0,
             "write_through keeps the legacy drop: frontier capped at root",
         )
+        cache.sanity_check()
+
+    def _build_backed_up_mamba_fixture(self):
+        """seq_a's Full KV is on host and its Mamba checkpoint only on device."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        seq_a = self._make_seq(1, 2)
+        seq_b = seq_a + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, seq_b)
+        cache.evict(EvictParams(num_tokens=len(seq_b)))
+        node = self._insert(cache, allocator, req_to_token_pool, seq_a).last_device_node
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNone(_host_value(cache, node, ComponentType.MAMBA))
+        return cache, allocator, req_to_token_pool, seq_a, node
+
+    def test_hicache_write_back_leaf_evict_backs_up_mamba_of_backed_up_node(self):
+        if not self.cfg.has_mamba or self._skip_unsupported_hicache_test():
+            self.skipTest("requires Mamba component without SWA")
+        cache, _, _, seq_a, node = self._build_backed_up_mamba_fixture()
+
+        cache.evict(EvictParams(num_tokens=len(seq_a)))
+
+        self.assertIsNone(_device_value(cache, node, ComponentType.FULL))
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.MAMBA))
+        cache.sanity_check()
+
+    def test_hicache_write_back_internal_mamba_evict_backs_up_backed_up_node(self):
+        if not self.cfg.has_mamba or self._skip_unsupported_hicache_test():
+            self.skipTest("requires Mamba component without SWA")
+        cache, allocator, req_to_token_pool, seq_a, node = (
+            self._build_backed_up_mamba_fixture()
+        )
+        self._insert(
+            cache, allocator, req_to_token_pool, seq_a + self._make_seq(2000, 1)
+        )
+
+        cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.FULL))
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.MAMBA))
+        cache.sanity_check()
+
+    def test_hicache_write_back_failed_component_backup_still_demotes(self):
+        if not self.cfg.has_mamba or self._skip_unsupported_hicache_test():
+            self.skipTest("requires Mamba component without SWA")
+        cache, _, _, seq_a, node = self._build_backed_up_mamba_fixture()
+
+        with mock.patch.object(
+            cache, "_execute_and_commit_kv_backup", return_value=None
+        ):
+            cache.evict(EvictParams(num_tokens=len(seq_a)))
+
+        self.assertTrue(cache.tree_core.contains_node(node))
+        self.assertIsNone(_device_value(cache, node, ComponentType.FULL))
+        self.assertIsNone(_host_value(cache, node, ComponentType.MAMBA))
+        cache.sanity_check()
+
+    def test_hicache_write_back_component_backup_keeps_full_host_copy(self):
+        if not self.cfg.has_mamba or self._skip_unsupported_hicache_test():
+            self.skipTest("requires Mamba component without SWA")
+        cache, _, _, seq_a, node = self._build_backed_up_mamba_fixture()
+        write = cache.cache_controller.write
+
+        def write_after_host_eviction(*args, **kwargs):
+            # A shared Full/SWA host pool evicts Full KV from host to make room.
+            cache.evict_host(len(seq_a))
+            return write(*args, **kwargs)
+
+        with mock.patch.object(
+            cache.cache_controller, "write", side_effect=write_after_host_eviction
+        ):
+            cache.evict(EvictParams(num_tokens=len(seq_a)))
+
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.FULL))
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.MAMBA))
         cache.sanity_check()
 
     def _build_internal_swa_fixture(self, write_policy):

@@ -1001,9 +1001,15 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
     tc.sanity_check(&active, &[]);
 
     tc.evict_device_start(MAMBA, 1);
-    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
-    tc.evict_device_end(MAMBA);
+    let (next, mut step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
     assert_eq!(next, None);
+    if !pin_ancestor {
+        // A's checkpoint has no host copy, so write-back requests a backup first.
+        assert_eq!(step.mamba_backup_node_id, Some(a_id));
+        assert!(step.tracker.is_empty() && step.device_frees.is_empty());
+        step = tc.finish_mamba_state_eviction(a_id);
+    }
+    tc.evict_device_end(MAMBA);
     assert_eq!(step.mamba_backup_node_id, None);
     assert_eq!(
         step.tracker.get(&MAMBA).copied().unwrap_or(0),

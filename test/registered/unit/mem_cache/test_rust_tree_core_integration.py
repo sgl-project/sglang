@@ -3844,18 +3844,24 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
         for component in (ComponentType.FULL, ComponentType.SWA)
     }
 
-    def evict_one_mamba_state():
+    def evict_one_mamba_state(backup_requested=False):
         tracker, frees = {ComponentType.MAMBA: 0}, {}
         core.evict_device_start(ComponentType.MAMBA, 1)
         try:
             step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
+            if backup_requested:
+                # The checkpoint has no host copy, so write-back requests a backup first.
+                _assert_internal_eviction_pending(step, ComponentType.MAMBA, parent)
+                step = core.finish_mamba_state_eviction(parent)
             assert step.node_id is None and step.mamba_backup_node_id is None
             _accumulate_step(step, tracker, frees, {})
         finally:
             core.evict_device_end(ComponentType.MAMBA)
         return [value.tolist() for value in frees.get(ComponentType.MAMBA, [])]
 
-    assert evict_one_mamba_state() == ([] if pin_ancestor else [[211]])
+    assert evict_one_mamba_state(backup_requested=not pin_ancestor) == (
+        [] if pin_ancestor else [[211]]
+    )
     # The actual Mamba DMA source remains protected by its own device lock.
     assert core.get_component_device_value(child, ComponentType.MAMBA).tolist() == [202]
     core.sanity_check([(child, child)] + active, [])

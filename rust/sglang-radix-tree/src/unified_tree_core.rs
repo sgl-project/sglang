@@ -2083,6 +2083,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         })
     }
 
+    /// Whether an auxiliary component holds device state that Host lacks.
+    fn has_unbacked_component_state_(&self, node_id: NodeIdx_) -> bool {
+        self.components.iter().any(|component| {
+            component.component_type() != BASE_COMPONENT_TYPE
+                && component.needs_incremental_backup(self, node_id)
+        })
+    }
+
     /// Check whether the insert target needs a Host backup.
     fn should_backup_after_insert_(
         &mut self,
@@ -2587,9 +2595,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .evict_device_end(self);
     }
 
-    /// Evict one device leaf (demote if backuped, delete if write-through);
-    /// for an unbacked write-back node, return the BackupKV for the cache to
-    /// execute and then demote, else None.
+    /// Evict one device leaf (demote if backuped, delete if write-through).
+    /// For a write-back node whose Full KV or component state has no host
+    /// copy, return the BackupKV for the cache to execute and then demote,
+    /// else None.
     pub fn evict_device_leaf(
         &mut self,
         node_id: NodeId,
@@ -2606,7 +2615,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         assert!(self.tracked_unbacked_tokens.is_none());
         self.tracked_unbacked_tokens = Some(0);
-        if self.arena.node(node_id).backuped() {
+        // Write-back defers component backups to eviction.
+        if self.arena.node(node_id).backuped()
+            && !(is_write_back && self.has_unbacked_component_state_(node_id))
+        {
             self.demote_(
                 node_id,
                 &mut result.tracker,

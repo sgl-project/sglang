@@ -1408,6 +1408,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
+    def _has_unbacked_component_state(self, node: UnifiedTreeNode) -> bool:
+        """Whether an auxiliary component holds device state that Host lacks."""
+        return any(
+            component.needs_incremental_backup(node)
+            for component in self.components
+            if component.component_type != BASE_COMPONENT_TYPE
+        )
+
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
@@ -1758,20 +1766,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_leaf(
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
-        """Evict one device leaf (demote if backuped, delete if write-through);
-        for an unbacked write-back node, the result carries the BackupKV for
-        the cache to execute and then demote."""
+        """Evict one device leaf (demote if backuped, delete if write-through).
+        For a write-back node whose Full KV or component state has no host
+        copy, the result carries the BackupKV for the cache to execute and
+        then demote."""
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
         self._begin_tracking_unbacked_tokens()
         try:
+            # Write-back defers component backups to eviction.
+            if is_write_back and (
+                not node.backuped or self._has_unbacked_component_state(node)
+            ):
+                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+                return result
             if not node.backuped:
-                if is_write_back:
-                    result.backup_kv = self._build_backup_kv_action(
-                        node, write_back=True
-                    )
-                    return result
                 # Write-through: node has no backup, delete entirely.
                 self._delete_unbacked_device_leaf(
                     node,
