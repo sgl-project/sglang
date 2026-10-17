@@ -20,7 +20,10 @@ _QUERY = "bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported"
 _HAS_FAST_PREFILL = (
     torch.xpu.is_available()
     and "B70" in torch.xpu.get_device_name()
-    and getattr(sgl_kernel, _QUERY, lambda *args: False)(4096, 24576, 1536)
+    and all(
+        getattr(sgl_kernel, _QUERY, lambda *args: False)(4096, n, 1536)
+        for n in (12288, 24576)
+    )
 )
 
 
@@ -97,117 +100,119 @@ class TestGemma4PrefillGemm(CustomTestCase):
             ):
                 wide, narrow = make_mlp(12288), make_mlp(6144)
                 self.assertIsNotNone(wide._xpu_prefill_gate_up_lut)
-                self.assertIsNone(narrow._xpu_prefill_gate_up_lut)
+                self.assertIsNotNone(narrow._xpu_prefill_gate_up_lut)
                 owner = make_owner(wide, narrow)
                 for mlp in (wide, narrow):
                     self.assertIs(
                         mlp._xpu_gate_up_gelu_table, owner._xpu_gate_up_lut_owner
                     )
-                graphs = []
+                for mlp in (wide, narrow):
+                    graphs = []
 
-                def backend(graph, _):
-                    graphs.append(graph)
-                    return graph.forward
+                    def backend(graph, _):
+                        graphs.append(graph)
+                        return graph.forward
 
-                compiled = torch.compile(wide, backend=backend, fullgraph=True)
-                original_weight = wide.gate_up_proj.weight.detach().clone()
-                for offset, scale in ((32, 1), (1, 0.5), (0, -1)):
+                    compiled = torch.compile(mlp, backend=backend, fullgraph=True)
+                    original_weight = mlp.gate_up_proj.weight.detach().clone()
+                    for offset, scale in ((32, 1), (1, 0.5), (0, -1)):
+                        x = torch.full(
+                            (4096 * 1536 + offset,),
+                            1 / 32 * scale,
+                            device="xpu",
+                            dtype=torch.bfloat16,
+                        )[offset:].view(4096, 1536)
+                        weight = torch.empty(
+                            original_weight.numel() + offset,
+                            device="xpu",
+                            dtype=torch.bfloat16,
+                        )[offset:].view_as(original_weight)
+                        weight.copy_(original_weight * scale)
+                        mlp.gate_up_proj.weight.data = weight
+                        torch.testing.assert_close(
+                            compiled(x), reference(mlp, x), atol=0, rtol=0
+                        )
+                    self.assertTrue(graphs)
+                    self.assertTrue(all(native_count(graph) == 1 for graph in graphs))
+                    self.assertTrue(
+                        all(
+                            "triton_kernel_wrapper" not in str(graph.graph)
+                            for graph in graphs
+                        )
+                    )
+
+                    # Both operands are offset-one views so host alignment clones
+                    # must themselves be captured and read changed data on replay.
                     x = torch.full(
-                        (4096 * 1536 + offset,),
-                        1 / 32 * scale,
-                        device="xpu",
-                        dtype=torch.bfloat16,
-                    )[offset:].view(4096, 1536)
+                        (4096 * 1536 + 1,), 1 / 32, device="xpu", dtype=torch.bfloat16
+                    )[1:].view(4096, 1536)
                     weight = torch.empty(
-                        original_weight.numel() + offset,
-                        device="xpu",
-                        dtype=torch.bfloat16,
-                    )[offset:].view_as(original_weight)
-                    weight.copy_(original_weight * scale)
-                    wide.gate_up_proj.weight.data = weight
-                    torch.testing.assert_close(
-                        compiled(x), reference(wide, x), atol=0, rtol=0
-                    )
-                self.assertTrue(graphs)
-                self.assertTrue(all(native_count(graph) == 1 for graph in graphs))
-                self.assertTrue(
-                    all(
-                        "triton_kernel_wrapper" not in str(graph.graph)
-                        for graph in graphs
-                    )
-                )
-
-                # Both operands are offset-one views so host alignment clones
-                # must themselves be captured and read changed data on replay.
-                x = torch.full(
-                    (4096 * 1536 + 1,), 1 / 32, device="xpu", dtype=torch.bfloat16
-                )[1:].view(4096, 1536)
-                weight = torch.empty(
-                    original_weight.numel() + 1, device="xpu", dtype=torch.bfloat16
-                )[1:].view_as(original_weight)
-                weight.copy_(original_weight)
-                wide.gate_up_proj.weight.data = weight
-                wide(x)
-                torch.xpu.synchronize()
-                graph = torch.xpu.XPUGraph()
-                with torch.xpu.graph(graph):
-                    output = wide(x)
-                for scale_x, scale_w in ((0.5, 2), (-1, 0.25)):
-                    x.mul_(scale_x)
-                    weight.mul_(scale_w)
-                    output.fill_(float("nan"))
-                    graph.replay()
+                        original_weight.numel() + 1, device="xpu", dtype=torch.bfloat16
+                    )[1:].view_as(original_weight)
+                    weight.copy_(original_weight)
+                    mlp.gate_up_proj.weight.data = weight
+                    mlp(x)
                     torch.xpu.synchronize()
+                    graph = torch.xpu.XPUGraph()
+                    with torch.xpu.graph(graph):
+                        output = mlp(x)
+                    for scale_x, scale_w in ((0.5, 2), (-1, 0.25)):
+                        x.mul_(scale_x)
+                        weight.mul_(scale_w)
+                        output.fill_(float("nan"))
+                        graph.replay()
+                        torch.xpu.synchronize()
+                        torch.testing.assert_close(
+                            output, reference(mlp, x), atol=0, rtol=0
+                        )
+
+                    mlp.gate_up_proj.weight.data = weight.clone()
+                    x = x.clone()
+
+                    def forbidden(*args):
+                        raise AssertionError(
+                            "guarded fallback reached an optimized callback"
+                        )
+
+                    mlp._xpu_prefill_gate_up_lut = forbidden
+                    mlp._xpu_gelu_mul_lut = forbidden
+                    # M128 remains the ordinary parent model route.
+                    small = x[:128].contiguous()
                     torch.testing.assert_close(
-                        output, reference(wide, x), atol=0, rtol=0
+                        mlp(small), Gemma3MLP.forward(mlp, small), atol=0, rtol=0
                     )
+                    for method in ("forward_xpu", "_forward_impl"):
+                        original = getattr(mlp.act_fn, method)
+                        calls = []
 
-                wide.gate_up_proj.weight.data = weight.clone()
-                x = x.clone()
+                        def replacement(module, value):
+                            calls.append(method)
+                            return torch.zeros_like(value[..., : value.shape[-1] // 2])
 
-                def forbidden(*args):
-                    raise AssertionError(
-                        "guarded fallback reached an optimized callback"
+                        setattr(mlp.act_fn, method, MethodType(replacement, mlp.act_fn))
+                        mlp.act_fn._forward_method = None
+                        try:
+                            self.assertEqual(torch.count_nonzero(mlp(x)).item(), 0)
+                            self.assertEqual(calls, [method])
+                        finally:
+                            setattr(mlp.act_fn, method, original)
+                            mlp.act_fn._forward_method = None
+                    observed = []
+                    handle = mlp.act_fn.register_forward_hook(
+                        lambda *args: observed.append(True)
                     )
-
-                wide._xpu_prefill_gate_up_lut = forbidden
-                wide._xpu_gelu_mul_lut = forbidden
-                # M128 remains the ordinary parent model route.
-                small = x[:128].contiguous()
-                torch.testing.assert_close(
-                    wide(small), Gemma3MLP.forward(wide, small), atol=0, rtol=0
-                )
-                for method in ("forward_xpu", "_forward_impl"):
-                    original = getattr(wide.act_fn, method)
-                    calls = []
-
-                    def replacement(module, value):
-                        calls.append(method)
-                        return torch.zeros_like(value[..., :12288])
-
-                    setattr(wide.act_fn, method, MethodType(replacement, wide.act_fn))
-                    wide.act_fn._forward_method = None
                     try:
-                        self.assertEqual(torch.count_nonzero(wide(x)).item(), 0)
-                        self.assertEqual(calls, [method])
+                        torch.testing.assert_close(
+                            mlp(x), reference(mlp, x), atol=0, rtol=0
+                        )
+                        self.assertEqual(len(observed), 1)
                     finally:
-                        setattr(wide.act_fn, method, original)
-                        wide.act_fn._forward_method = None
-                observed = []
-                handle = wide.act_fn.register_forward_hook(
-                    lambda *args: observed.append(True)
-                )
-                try:
+                        handle.remove()
+                    set_fused_op_backend(KernelBackend.TORCH)
                     torch.testing.assert_close(
-                        wide(x), reference(wide, x), atol=0, rtol=0
+                        mlp(x), Gemma3MLP.forward(mlp, x), atol=0, rtol=0
                     )
-                    self.assertEqual(len(observed), 1)
-                finally:
-                    handle.remove()
-                set_fused_op_backend(KernelBackend.TORCH)
-                torch.testing.assert_close(
-                    wide(x), Gemma3MLP.forward(wide, x), atol=0, rtol=0
-                )
+                    set_fused_op_backend(None)
         finally:
             set_fused_op_backend(previous)
             torch._dynamo.reset()
@@ -225,54 +230,70 @@ class TestGemma4PrefillGemm(CustomTestCase):
                 self.assertTrue(
                     hasattr(torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20")
                 )
-                for mode in ("missing", "false"):
+                for mode in ("missing", "false", "wide_only"):
                     with self.subTest(mode=mode):
-                        original = getattr(sgl_kernel, _QUERY)
-                        calls = []
+                        for intermediate in (6144, 12288):
+                            original = getattr(sgl_kernel, _QUERY)
+                            calls = []
 
-                        def unsupported(*shape):
-                            calls.append(shape)
-                            return False
+                            def unsupported(*shape):
+                                calls.append(shape)
+                                return mode == "wide_only" and shape[1] == 24576
 
-                        try:
-                            if mode == "missing":
-                                delattr(sgl_kernel, _QUERY)
-                            else:
-                                setattr(sgl_kernel, _QUERY, unsupported)
-                            mlp = make_mlp(12288)
-                        finally:
-                            setattr(sgl_kernel, _QUERY, original)
-                        self.assertIsNone(mlp._xpu_prefill_gate_up_lut)
-                        if mode == "false":
-                            self.assertEqual(calls, [(4096, 24576, 1536)])
-                        owner = make_owner(mlp)
-                        self.assertIs(
-                            mlp._xpu_gate_up_gelu_table, owner._xpu_gate_up_lut_owner
-                        )
-                        x = torch.full(
-                            (4096, 1536), 1 / 32, device="xpu", dtype=torch.bfloat16
-                        )
-                        graphs = []
-
-                        def backend(graph, _):
-                            graphs.append(graph)
-                            return graph.forward
-
-                        compiled = torch.compile(mlp, backend=backend, fullgraph=True)
-                        torch.testing.assert_close(
-                            compiled(x), reference(mlp, x), atol=0, rtol=0
-                        )
-                        self.assertTrue(graphs)
-                        self.assertTrue(
-                            all(native_count(graph) == 0 for graph in graphs)
-                        )
-                        self.assertTrue(
-                            all(
-                                "triton_kernel_wrapper" in str(graph.graph)
-                                for graph in graphs
+                            try:
+                                if mode == "missing":
+                                    delattr(sgl_kernel, _QUERY)
+                                else:
+                                    setattr(sgl_kernel, _QUERY, unsupported)
+                                mlp = make_mlp(intermediate)
+                            finally:
+                                setattr(sgl_kernel, _QUERY, original)
+                            native_expected = (
+                                mode == "wide_only" and intermediate == 12288
                             )
-                        )
-                        torch._dynamo.reset()
+                            self.assertEqual(
+                                mlp._xpu_prefill_gate_up_lut is not None,
+                                native_expected,
+                            )
+                            if mode != "missing":
+                                self.assertEqual(
+                                    calls, [(4096, 2 * intermediate, 1536)]
+                                )
+                            owner = make_owner(mlp)
+                            self.assertIs(
+                                mlp._xpu_gate_up_gelu_table,
+                                owner._xpu_gate_up_lut_owner,
+                            )
+                            x = torch.full(
+                                (4096, 1536), 1 / 32, device="xpu", dtype=torch.bfloat16
+                            )
+                            graphs = []
+
+                            def backend(graph, _):
+                                graphs.append(graph)
+                                return graph.forward
+
+                            compiled = torch.compile(
+                                mlp, backend=backend, fullgraph=True
+                            )
+                            torch.testing.assert_close(
+                                compiled(x), reference(mlp, x), atol=0, rtol=0
+                            )
+                            self.assertTrue(graphs)
+                            self.assertTrue(
+                                all(
+                                    native_count(graph) == int(native_expected)
+                                    for graph in graphs
+                                )
+                            )
+                            self.assertTrue(
+                                all(
+                                    ("triton_kernel_wrapper" in str(graph.graph))
+                                    == (not native_expected)
+                                    for graph in graphs
+                                )
+                            )
+                            torch._dynamo.reset()
         finally:
             set_fused_op_backend(previous)
             torch._dynamo.reset()

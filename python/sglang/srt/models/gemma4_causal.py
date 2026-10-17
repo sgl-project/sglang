@@ -146,36 +146,34 @@ class Gemma4MLP(Gemma3MLP):
                     self._xpu_gelu_mul_device = torch.device(
                         "xpu", torch.xpu.current_device()
                     )
-                    if intermediate_size == 12288:
-                        # Older wheels expose the tensor API with a slow
-                        # large-M kernel. Resolve the binary's fast-shape
-                        # capability before compile/capture, never in forward.
-                        try:
-                            from sgl_kernel import (
-                                bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported,
-                            )
-                        except ImportError:
-                            bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported = None
-                        if (
-                            bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported
-                            is not None
-                            and bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(
-                                4096, 24576, 1536
-                            )
-                        ):
-                            from sglang.kernels.ops.gemm import (
-                                bf16_dense_gelu_tanh_mul_lut_xe20,
-                            )
-                            from sglang.kernels.selector import get_kernel
-                            from sglang.kernels.spec import KernelBackend
+                    # Older wheels expose the tensor API with a slow
+                    # large-M kernel. Resolve the binary's fast-shape
+                    # capability before compile/capture, never in forward.
+                    try:
+                        from sgl_kernel import (
+                            bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported,
+                        )
+                    except ImportError:
+                        bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported = None
+                    if (
+                        bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported is not None
+                        and bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(
+                            4096, 2 * intermediate_size, 1536
+                        )
+                    ):
+                        from sglang.kernels.ops.gemm import (
+                            bf16_dense_gelu_tanh_mul_lut_xe20,
+                        )
+                        from sglang.kernels.selector import get_kernel
+                        from sglang.kernels.spec import KernelBackend
 
-                            get_kernel(
-                                "gemm.bf16_dense_gelu_tanh_mul_lut_xe20",
-                                KernelBackend.AOT,
-                            )
-                            self._xpu_prefill_gate_up_lut = (
-                                bf16_dense_gelu_tanh_mul_lut_xe20
-                            )
+                        get_kernel(
+                            "gemm.bf16_dense_gelu_tanh_mul_lut_xe20",
+                            KernelBackend.AOT,
+                        )
+                        self._xpu_prefill_gate_up_lut = (
+                            bf16_dense_gelu_tanh_mul_lut_xe20
+                        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         projection = self.gate_up_proj
@@ -240,10 +238,7 @@ class Gemma4MLP(Gemma3MLP):
             and not x.requires_grad
             and not projection.weight.requires_grad
         ):
-            if (
-                self._xpu_prefill_gate_up_lut is not None
-                and projection.weight.shape == (24576, 1536)
-            ):
+            if self._xpu_prefill_gate_up_lut is not None:
                 x = self._xpu_prefill_gate_up_lut(
                     x, projection.weight, self._xpu_gate_up_gelu_table
                 )
