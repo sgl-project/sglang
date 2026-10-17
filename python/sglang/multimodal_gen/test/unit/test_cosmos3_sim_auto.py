@@ -72,6 +72,11 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
     rgb_sensor_grid,
     ring_slot_for_step,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_parallel import (
+    ChunkShard,
+    UlyssesGroup,
+    local_head_group,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_sim_auto import (
     ReplayRing,
@@ -191,6 +196,8 @@ def _artifact(**overrides):
 def _transformer_config(artifact=None):
     return {
         "backbone_type": "cosmos3_multiview",
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
         COSMOS3_SIM_AUTO_ARTIFACT_KEY: _artifact() if artifact is None else artifact,
     }
 
@@ -855,6 +862,62 @@ class TestBlockMask(unittest.TestCase):
         torch.testing.assert_close(fa4.float(), triton.float(), atol=3e-2, rtol=3e-2)
 
 
+class TestUlyssesShard(unittest.TestCase):
+    """Token shards and head groups partition a chunk the way the per-layer exchange assumes."""
+
+    def test_rank_splits_reassemble_the_chunk(self):
+        tokens = torch.arange(38 * 3, dtype=torch.float32).view(1, 38, 3)
+        positions = torch.arange(38)
+        for world_size in (2, 4):
+            with self.subTest(world_size=world_size):
+                shards = [
+                    UlyssesGroup(rank=rank, world_size=world_size).shard(38)
+                    for rank in range(world_size)
+                ]
+                local = shards[0].local_tokens
+                self.assertEqual(local, -(-38 // world_size))
+                self.assertEqual(shards[0].padded_tokens, local * world_size)
+                hidden_parts = [shard.split(tokens, dim=1) for shard in shards]
+                position_parts = [shard.split(positions, dim=0) for shard in shards]
+                self.assertTrue(all(part.shape[1] == local for part in hidden_parts))
+                torch.testing.assert_close(
+                    torch.cat(hidden_parts, dim=1)[:, :38], tokens
+                )
+                torch.testing.assert_close(torch.cat(position_parts)[:38], positions)
+                # The padding repeats the last token, so its RoPE position stays valid.
+                tail = torch.cat(position_parts)[38:]
+                self.assertTrue(bool((tail == 37).all()))
+
+    def test_head_groups_follow_rank_order(self):
+        kv_heads = 8
+        for world_size in (2, 4, 8):
+            groups = [
+                UlyssesGroup(rank=rank, world_size=world_size)
+                for rank in range(world_size)
+            ]
+            covered = [group.head_slice(kv_heads) for group in groups]
+            self.assertEqual(covered[0].start, 0)
+            self.assertEqual(covered[-1].stop, kv_heads)
+            for earlier, later in zip(covered, covered[1:]):
+                self.assertEqual(earlier.stop, later.start)
+        layer_kv = [(torch.randn(1, 5, kv_heads, 4), torch.randn(1, 5, kv_heads, 4))]
+        self.assertIs(local_head_group(layer_kv, None)[0][0], layer_kv[0][0])
+        mine = local_head_group(layer_kv, UlyssesGroup(rank=1, world_size=4))
+        torch.testing.assert_close(mine[0][1], layer_kv[0][1][:, :, 2:4])
+        self.assertTrue(mine[0][0].is_contiguous())
+
+    def test_rejects_bad_geometry(self):
+        with self.assertRaisesRegex(ValueError, "Invalid Ulysses rank"):
+            UlyssesGroup(rank=2, world_size=2)
+        with self.assertRaisesRegex(ValueError, "not divisible"):
+            UlyssesGroup(rank=0, world_size=3).head_slice(8)
+        with self.assertRaisesRegex(ValueError, "at least one token"):
+            ChunkShard(group=UlyssesGroup(rank=0, world_size=2), num_tokens=0)
+        shard = UlyssesGroup(rank=0, world_size=2).shard(5)
+        with self.assertRaisesRegex(ValueError, "Expected 5 tokens"):
+            shard.split(torch.zeros(1, 6, 2), dim=1)
+
+
 class TestPositions(unittest.TestCase):
     """The chunk's absolute mRoPE ids equal the Cosmos3 helper's FPS-modulated ids per item."""
 
@@ -1082,10 +1145,12 @@ class TestConfigAndSamplingParams(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be one of"):
                 config.resolved_multiview_backend()
 
-    def test_config_resolves_manifest_and_rejects_sequence_parallel(self):
+    def test_config_resolves_manifest_and_sequence_parallel_rules(self):
+        """Ulysses only, equal to sp_degree, dividing the heads with TP; gather and ring are refused."""
         config = _config()
         self.assertEqual(config.sim_auto_manifest.frames_per_chunk, 3)
         self.assertEqual(config.multiview_deployment.num_views, 11)
+        self.assertEqual(config.sim_auto_heads, (32, 8))
         self.assertIsNone(config.scheduler_class_override)
         deployment = config.get_model_deployment_config()
         self.assertFalse(deployment.supports_cfg_parallel)
@@ -1094,15 +1159,31 @@ class TestConfigAndSamplingParams(unittest.TestCase):
             sp_degree=1,
             ulysses_degree=1,
             ring_degree=1,
+            kv_gather_degree=1,
             enable_cfg_parallel=False,
             num_gpus=1,
         )
         config.validate_server_args(SimpleNamespace(**base))
         config.validate_server_args(SimpleNamespace(**{**base, "tp_size": 2}))
-        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
-            config.validate_server_args(
-                SimpleNamespace(**{**base, "sp_degree": 2, "ulysses_degree": 2})
-            )
+        for accepted in (
+            {"sp_degree": 2, "ulysses_degree": 2},
+            {"sp_degree": 8, "ulysses_degree": 8},
+            {"tp_size": 2, "sp_degree": 4, "ulysses_degree": 4},
+        ):
+            config.validate_server_args(SimpleNamespace(**{**base, **accepted}))
+        for rejected, message in (
+            ({"ring_degree": 2}, "ring_degree"),
+            (
+                {"kv_gather_degree": 2, "ulysses_degree": 2, "sp_degree": 2},
+                "kv_gather_degree",
+            ),
+            ({"sp_degree": 2}, "must equal"),
+            ({"sp_degree": 3, "ulysses_degree": 3}, "divide"),
+            ({"tp_size": 4, "sp_degree": 4, "ulysses_degree": 4}, "divide"),
+        ):
+            with self.subTest(rejected=rejected):
+                with self.assertRaisesRegex(ValueError, message):
+                    config.validate_server_args(SimpleNamespace(**{**base, **rejected}))
         with (
             mock.patch(
                 "sglang.multimodal_gen.configs.pipeline_configs.cosmos3_sim_auto._transformer_config",

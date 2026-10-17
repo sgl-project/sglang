@@ -54,6 +54,8 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
     multiview_attention_backend: str | None = None
     # Parsed once from transformer/config.json in update_config_from_dict.
     sim_auto_manifest: Cosmos3SimAutoManifest | None = None
+    # (query, key/value) head counts, for the TP x Ulysses divisibility rule.
+    sim_auto_heads: tuple[int, int] | None = None
     # The stage contract derived from the manifest; the multiview sampling
     # params and stages read it under this name.
     multiview_deployment: Cosmos3MultiviewDeploymentConfig | None = None
@@ -61,11 +63,14 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
         if self.model_path:
-            manifest = load_cosmos3_sim_auto_manifest(
-                _transformer_config(self.model_path)
-            )
+            transformer_config = _transformer_config(self.model_path)
+            manifest = load_cosmos3_sim_auto_manifest(transformer_config)
             self._validate_scheduler(manifest)
             self.sim_auto_manifest = manifest
+            self.sim_auto_heads = (
+                int(transformer_config["num_attention_heads"]),
+                int(transformer_config["num_key_value_heads"]),
+            )
             self.multiview_deployment = multiview_deployment_from_manifest(manifest)
             # Fail on a bad backend name at launch, not on the first request.
             backend, source = resolve_multiview_backend_request(
@@ -108,13 +113,32 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
-        for name in ("sp_degree", "ulysses_degree", "ring_degree"):
+        # Ulysses shards the chunk over ranks and trades tokens for heads around
+        # every replay attention; the mask spans the whole chunk, so ring
+        # attention and the K/V-gather exchange are not supported.
+        for name in ("ring_degree", "kv_gather_degree"):
             if int(getattr(server_args, name) or 1) > 1:
                 raise ValueError(
-                    f"{type(self).__name__} does not support sequence parallelism "
-                    f"({name}={getattr(server_args, name)} for num_gpus={server_args.num_gpus}); "
-                    "the causal ring attends one chunk on one rank. Use --dp-size for "
-                    "independent replicas or --tp-size to shard the transformer."
+                    f"{type(self).__name__} does not support {name} > 1; pass "
+                    "--ulysses-degree explicitly for sequence parallelism."
+                )
+        ulysses = int(server_args.ulysses_degree or 1)
+        sp_degree = int(server_args.sp_degree or 1)
+        if sp_degree != ulysses:
+            raise ValueError(
+                f"{type(self).__name__} sequence parallelism is Ulysses only: sp_degree "
+                f"({sp_degree}) must equal ulysses_degree ({ulysses}); pass "
+                "--ulysses-degree explicitly (with two GPUs the launcher otherwise "
+                "picks the K/V-gather exchange)."
+            )
+        if ulysses > 1 and self.sim_auto_heads is not None:
+            tp_size = int(server_args.tp_size or 1)
+            query_heads, kv_heads = self.sim_auto_heads
+            if query_heads % (tp_size * ulysses) or kv_heads % (tp_size * ulysses):
+                raise ValueError(
+                    f"{type(self).__name__} query ({query_heads}) and key/value "
+                    f"({kv_heads}) heads must divide by tp_size x ulysses_degree "
+                    f"({tp_size} x {ulysses})."
                 )
 
     def supports_action_endpoint(self) -> bool:

@@ -62,6 +62,10 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
     rgb_sensor_grid,
     ring_slot_for_step,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_parallel import (
+    current_ulysses_group,
+    local_head_group,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -474,6 +478,9 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         self.transformer = transformer
         self.manifest = manifest
         self.attention_backend = attention_backend
+        # Ring and caption K/V hold the rank's head group; the rollout itself
+        # runs replicated on every Ulysses rank.
+        self.ulysses = current_ulysses_group()
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -516,6 +523,11 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
             f"ring {session.ring.cache_chunks} x {session.ring.frame_unit} tokens, captions "
             f"{session.captions.num_tokens} tokens (text extent {session.text_extent}), seed {session.seed}, "
             f"attention {self.attention_backend}"
+            + (
+                f", ulysses {self.ulysses.world_size}"
+                if self.ulysses is not None
+                else ""
+            )
         )
         for chunk in session.schedule:
             self._run_chunk(session, chunk)
@@ -759,6 +771,7 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 keys.append(k)
                 values.append(v)
             und_kv.append((torch.cat(keys, dim=1), torch.cat(values, dim=1)))
+        und_kv = local_head_group(und_kv, self.ulysses)
         documents = build_caption_documents(
             lengths=lengths, sink_tokens=sink_tokens, horizon_seconds=horizon_seconds
         )

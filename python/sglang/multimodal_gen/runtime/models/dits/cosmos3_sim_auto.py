@@ -20,6 +20,7 @@ import msgspec
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.cosmos3_sim_auto import (
     Cosmos3SimAutoManifest,
     load_cosmos3_sim_auto_manifest,
@@ -28,7 +29,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoC
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     COSMOS3_MULTIVIEW_BACKBONE_TYPE,
 )
-from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -46,6 +46,12 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
     StreamItem,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_parallel import (
+    ChunkShard,
+    SpCheck,
+    UlyssesGroup,
+    current_ulysses_group,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3CrossAttention,
@@ -77,8 +83,15 @@ def _replay_layer_attention(
     history: KVPair,
     captions: KVPair,
     mask: ReplayMask,
+    shard: ChunkShard | None,
+    sp_check: SpCheck | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V."""
+    """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V.
+
+    With ``shard`` the hidden states, RoPE positions and output are the rank's
+    token shard, while the K/V streams and the returned K/V hold every token
+    for the rank's head group.
+    """
     batch_size, seq_len = hidden.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
@@ -98,12 +111,18 @@ def _replay_layer_attention(
         cos_sin_cache,
         rope_positions,
     )
+    if shard is not None:
+        q, k, v = shard.heads_from_tokens(q, k, v)
     k = k.contiguous()
     v = v.contiguous()
     # Key order is the plan's stream order: current chunk, ring, captions.
     keys = torch.cat([k, history[0], captions[0]], dim=1)
     values = torch.cat([v, history[1], captions[1]], dim=1)
     out = replay_attention(q, keys, values, mask)
+    if shard is not None:
+        if sp_check is not None:
+            sp_check.compare(shard, q=q, keys=keys, values=values, mask=mask, out=out)
+        out = shard.tokens_from_heads(out)
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out, k, v
 
@@ -169,6 +188,7 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         rig = manifest.rig_view_embedding
         self.rig_view_embed = nn.Embedding(int(rig["num_embeddings"]), self.hidden_size)
         self.rig_lidar_id = int(rig["lidar_id"])
+        self.ulysses: UlyssesGroup | None = current_ulysses_group()
         # A checkpoint without the rig table would run on random rows and no
         # error; the loader turns the missing tensor into a hard failure.
         self.rig_view_embed.weight.missing_param_init = "error"
@@ -209,10 +229,6 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                     f"Cosmos3-Nano-Sim-Auto {name} differs between transformer config and artifact: "
                     f"{arch_value} != {manifest_value}."
                 )
-        if get_sp_world_size() > 1:
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Auto supports tensor parallelism but not sequence parallelism."
-            )
 
     def lidar_patch_grid(self, height: int, width: int) -> tuple[int, int]:
         """LiDAR token grid ``(patch_h, patch_w)`` of a latent of this height and width."""
@@ -369,7 +385,9 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         ``und_kv`` holds the per-layer caption K/V ``[1, U, H_kv, D]`` and
         ``history_kv`` the per-layer ring K/V ``[1, R, H_kv, D]`` over the whole
         ring capacity; the plan behind ``mask`` decides which of their
-        tokens a query may read.
+        tokens a query may read. Under Ulysses every K/V argument and result
+        holds the rank's head group for every token; only the GEN layers run
+        on a token shard.
         """
         if (
             len(und_kv) != self.num_hidden_layers
@@ -394,6 +412,13 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 position_ids.unsqueeze(1), cache_dtype=hidden.dtype
             )
         )
+        shard = None if self.ulysses is None else self.ulysses.shard(hidden.shape[1])
+        sp_check = None
+        if shard is not None:
+            hidden = shard.split(hidden, dim=1)
+            rope_positions = shard.split(rope_positions, dim=0)
+            if envs.SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK:
+                sp_check = SpCheck()
         current_kv: list[KVPair] = []
         for layer_idx, layer in enumerate(self.gen_layers):
             hidden, k, v = _gen_layer_forward(
@@ -404,8 +429,14 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 history=history_kv[layer_idx],
                 captions=und_kv[layer_idx],
                 mask=mask,
+                shard=shard,
+                sp_check=sp_check,
             )
             current_kv.append((k, v))
+        if shard is not None:
+            hidden = shard.gather(hidden)
+            if sp_check is not None:
+                logger.info(sp_check.summary(shard.group))
         hidden = self.norm_moe_gen(hidden)
         outputs = []
         parts = hidden.split([item.num_tokens for item in items], dim=1)
