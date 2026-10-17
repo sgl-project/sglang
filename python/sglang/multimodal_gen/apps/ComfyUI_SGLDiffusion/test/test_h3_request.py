@@ -5,7 +5,9 @@ only HTTP, so a change on either side of the payload contract fails here.
 """
 
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 from pathlib import Path
 from unittest import mock
@@ -129,20 +131,32 @@ def _run_node(**node_kwargs):
     """Drive the node through the real client and capture the POST payload."""
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:30010")
     captured = {}
+    # A real, existing path: the client now checks the server's reported
+    # file_path with os.path.exists before trusting it (see
+    # SGLDiffusionServerAPI._localize_video_result), since on a remote
+    # server that path belongs to a different filesystem.
+    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
 
-    def fake_post(url, json=None, headers=None, timeout=None):
-        captured.update(json)
+    def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
+        captured.update(json or data or {})
         return _Response({"id": "job-1"})
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **kwargs):
         return _Response(
             {
                 "id": "job-1",
                 "status": "completed",
                 "size": RESOLVED_SIZE,
-                "file_path": "/tmp/out.mp4",
+                "file_path": out_path,
             }
         )
+
+    def fake_get_image_path(image):
+        # _image_material_uri reads this file's bytes and then deletes it.
+        fh = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        fh.close()
+        return fh.name
 
     node = SGLDiffusionGenerateH3()
     with (
@@ -156,7 +170,7 @@ def _run_node(**node_kwargs):
         ),
         mock.patch(
             f"{PKG}.nodes.get_image_path",
-            side_effect=lambda image: "/tmp/frame.png",
+            side_effect=fake_get_image_path,
         ),
     ):
         result = node.generate(sgld_client=client, **node_kwargs)
@@ -191,7 +205,11 @@ def test_fl2va_maps_keyframes_to_frame_indices():
 
     assert [c["role"] for c in payload["conditions"]] == ["keyframe", "keyframe"]
     assert [c["frame_index"] for c in payload["conditions"]] == [0, -1]
-    assert all(c["uri"].startswith("file:///") for c in payload["conditions"])
+    # Images are embedded inline (data: URI), not as a local file:// path
+    # the server may not be able to read.
+    assert all(
+        c["uri"].startswith("data:image/png;base64,") for c in payload["conditions"]
+    )
 
 
 def test_ref2va_preserves_modality_order_for_prompt_tags():
@@ -222,7 +240,7 @@ def test_node_reports_the_server_resolved_canvas():
     _, (video, video_path) = _run_node(positive_prompt="a cat", task="t2va")
 
     assert video.get_dimensions() == (1344, 768)
-    assert video_path == "/tmp/out.mp4"
+    assert os.path.exists(video_path)
 
 
 @pytest.mark.parametrize(
@@ -242,9 +260,10 @@ def test_extra_fields_win_over_generic_defaults():
     """A model's own field must not be shadowed by a same-named generic default."""
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:30010")
     captured = {}
+    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
 
-    def fake_post(url, json=None, headers=None, timeout=None):
-        captured.update(json)
+    def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
+        captured.update(json or data or {})
         return _Response({"id": "job-1"})
 
     with (
@@ -255,7 +274,12 @@ def test_extra_fields_win_over_generic_defaults():
         mock.patch(
             f"{PKG}.core.server_api.requests.get",
             side_effect=lambda *a, **k: _Response(
-                {"id": "job-1", "status": "completed", "size": RESOLVED_SIZE}
+                {
+                    "id": "job-1",
+                    "status": "completed",
+                    "size": RESOLVED_SIZE,
+                    "file_path": out_path,
+                }
             ),
         ),
     ):
