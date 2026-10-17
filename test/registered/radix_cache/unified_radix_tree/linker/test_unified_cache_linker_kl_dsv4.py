@@ -20,12 +20,10 @@ DSV4_FLASH_MODEL = os.environ.get(
 )
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=210, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=420, stage="extra-b", runner_config="4-gpu-h100")
 
 
-class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
-    UnifiedRadixTreeTestMixin, CustomTestCase
-):
+class _DeepSeekV4FlashLinkerKLBase(UnifiedRadixTreeTestMixin):
     page_size = 256
     kl_threshold = 0.01
     sampling_temperature = 0
@@ -35,11 +33,19 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
     decode_hit_inter_batch_delay_s = 0.5
 
     @classmethod
+    def start_linker_services(cls) -> tuple[list[str], dict[str, str]]:
+        """Start the store and return the server's linker args and env."""
+        raise NotImplementedError
+
+    @classmethod
+    def stop_linker_services(cls) -> None:
+        pass
+
+    @classmethod
     def setUpClass(cls):
         cls.model = DSV4_FLASH_MODEL
         cls.base_url = f"http://127.0.0.1:{find_available_port(30000)}"
-        cls.mooncake = MooncakeTestServices()
-        cls.mooncake.start()
+        linker_args, linker_env = cls.start_linker_services()
         cls.process = None
         try:
             cls.process = popen_launch_server(
@@ -67,11 +73,10 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                     "1",
                     "--enable-cache-report",
                     "--enable-unified-cache-external-linker",
-                    "--hicache-storage-backend-extra-config",
-                    json.dumps({"enable_group_semantics": True}),
+                    *linker_args,
                 ],
                 env={
-                    **cls.mooncake.server_env(),
+                    **linker_env,
                     "SGLANG_DSV4_FP4_EXPERTS": "0",
                 },
             )
@@ -81,7 +86,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                 if cls.process is not None:
                     terminate_and_kill_process_tree(cls.process)
             finally:
-                cls.mooncake.stop()
+                cls.stop_linker_services()
             raise
 
     @classmethod
@@ -90,7 +95,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
             if cls.process is not None:
                 terminate_and_kill_process_tree(cls.process)
         finally:
-            cls.mooncake.stop()
+            cls.stop_linker_services()
 
     @unittest.skip("Linker CI targets Direct load-back KL accuracy")
     def test_gsm8k(self):
@@ -128,7 +133,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
         self.assertGreater(
             self._direct_remote_tokens,
             0,
-            "Expected this KL case to load KV through the Mooncake Direct Linker",
+            "Expected this KL case to load KV through the direct linker",
         )
 
     def test_multiturn_logprobs_match(self):
@@ -139,6 +144,40 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
 
     def test_multiturn_decode_cache_hit_branching(self):
         self._run_linker_kl_case(super().test_multiturn_decode_cache_hit_branching)
+
+
+class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
+    _DeepSeekV4FlashLinkerKLBase, CustomTestCase
+):
+    @classmethod
+    def start_linker_services(cls):
+        cls.mooncake = MooncakeTestServices()
+        cls.mooncake.start()
+        extra_config = json.dumps({"enable_group_semantics": True})
+        return (
+            ["--hicache-storage-backend-extra-config", extra_config],
+            cls.mooncake.server_env(),
+        )
+
+    @classmethod
+    def stop_linker_services(cls):
+        cls.mooncake.stop()
+
+
+class TestDeepSeekV4FlashUnifiedCacheLocalLinkerKL(
+    _DeepSeekV4FlashLinkerKLBase, CustomTestCase
+):
+    @classmethod
+    def start_linker_services(cls):
+        return (
+            [
+                "--unified-cache-external-linker-backend",
+                "local",
+                "--hicache-storage-backend-extra-config",
+                json.dumps({"capacity_gb": 8}),
+            ],
+            {},
+        )
 
 
 if __name__ == "__main__":

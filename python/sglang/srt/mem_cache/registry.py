@@ -211,6 +211,12 @@ def create_unified_radix_cache(
             )
 
             linker_cls = UMBPDirectLinker
+        elif backend == "local":
+            from sglang.srt.mem_cache.storage.local_store.local_direct_linker import (
+                LocalDirectLinker,
+            )
+
+            linker_cls = LocalDirectLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"
