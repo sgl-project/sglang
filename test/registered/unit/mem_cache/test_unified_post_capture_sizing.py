@@ -180,6 +180,9 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
             kvcache.finalize_backing(
                 SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
             )
+            # Move the grow-down allocator's frontier into the backed range
+            # before allocating; it still reflects the larger reservation.
+            allocator.resize(SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES))
             handed = allocator.alloc(_PAGE_SIZE)
             self.assertIsNotNone(handed)
             with self.assertRaisesRegex(RuntimeError, "non-empty"):
