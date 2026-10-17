@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from contextlib import contextmanager
@@ -16,7 +17,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    AscendAttnBackend,
+    ForwardMetadata,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
@@ -206,6 +210,7 @@ class CompressorAscendBackendMixin:
             device=forward_batch.seq_lens.device,
             req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            seq_lens_max_override=self._prefill_graph_max_context_size(forward_batch),
         )
         for k, v in result.items():
             setattr(fm, k, v)
@@ -226,7 +231,7 @@ class CompressorAscendBackendMixin:
             self._build_npu_compress_metadata_verify(forward_batch)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
-        # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
+        # Built outside graph recording; host reads (cu_cpu) are safe here.
         fm = self.forward_metadata
         device = forward_batch.seq_lens.device
         positions = forward_batch.positions
@@ -308,11 +313,16 @@ class CompressorAscendBackendMixin:
                 if bundle is not None
                 else None
             )
-            setattr(
-                fm,
-                f"c{ratio}_loc",
-                bundle_loc.to(torch.int32) if bundle_loc is not None else None,
-            )
+            if bundle_loc is not None:
+                setattr(fm, f"c{ratio}_loc", bundle_loc.to(torch.int32))
+            elif is_npu_arch35():
+                # A5: DP/TP ranks can reach prefill compression without the
+                # scheduler's KV bundle (out_cache_loc_dsv4 absent). The fused
+                # indexer epilog must not raise on a missing slot map there:
+                # an empty loc routes the prefill epilog to a no-op write.
+                setattr(fm, f"c{ratio}_loc", torch.empty(0, dtype=torch.int32, device=device))
+            else:
+                setattr(fm, f"c{ratio}_loc", None)
 
     def _compute_compress_locs(
         self,
@@ -900,6 +910,11 @@ class C4IndexerAscendBackendMixin:
             )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
+        captured_outputs = getattr(self.forward_metadata, "source_graph_topk", None)
+        if captured_outputs is not None:
+            # Python assignments do not repeat at graph replay. Retain each
+            # layer's recorded output so its eager attention reads the right tensor.
+            captured_outputs[c4_indexer.layer_id] = topk_idxs
         compress_layer_id = self.token_to_kv_pool.layer_mapping[
             c4_indexer.layer_id
         ].compress_layer_id
@@ -914,6 +929,196 @@ class C4IndexerAscendBackendMixin:
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
+    # Source kernels read per-bucket metadata at stable addresses. Refresh the
+    # fixed request axis before replay, and let eager attention use the live
+    # request layout and each layer's captured indexer output.
+    use_captured_forward_metadata_for_breakable_cuda_graph = True
+    supports_prefill_cuda_graph_max_context_size = True
+
+    def can_run_prefill_cuda_graph(self, forward_batch) -> bool:
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if isinstance(prefix_lens, torch.Tensor):
+            prefix_lens = prefix_lens.tolist()
+        capture_sizes = getattr(self, "_dsv4_prefill_capture_num_tokens", (128,))
+        num_tokens = forward_batch.input_ids.numel()
+        has_compatible_bucket = any(num_tokens <= bucket for bucket in capture_sizes)
+        return (
+            0 < forward_batch.batch_size <= self.req_to_token_pool.size
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and num_tokens > 0
+            and has_compatible_bucket
+            and prefix_lens is not None
+            and len(prefix_lens) == forward_batch.batch_size
+            and all(int(length) >= 0 for length in prefix_lens)
+            and forward_batch.out_cache_loc_dsv4 is not None
+            and getattr(forward_batch, "attn_cp_metadata", None) is None
+        )
+
+    @staticmethod
+    def _source_graph_pad_batch(
+        forward_batch: ForwardBatch, request_slots: int
+    ) -> ForwardBatch:
+        """Pad source metadata without adding query tokens or changing the live batch."""
+        batch = copy.copy(forward_batch)
+        bs = forward_batch.batch_size
+        if not 0 < bs <= request_slots:
+            raise ValueError(
+                f"Source graph requires 1..{request_slots} requests, got {bs}"
+            )
+        batch.batch_size = request_slots
+        for field, fill in (
+            ("req_pool_indices", 0),
+            ("seq_lens", 1),
+            ("seq_lens_cpu", 1),
+            ("extend_seq_lens", 0),
+            ("extend_prefix_lens", 0),
+            ("extend_start_loc", 0),
+        ):
+            value = getattr(forward_batch, field, None)
+            if value is not None:
+                padded = torch.full(
+                    (request_slots,), fill, dtype=value.dtype, device=value.device
+                )
+                padded[:bs].copy_(value)
+                setattr(batch, field, padded)
+        for field in ("extend_seq_lens_cpu", "extend_prefix_lens_cpu"):
+            value = getattr(forward_batch, field, None)
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                value = value.tolist()
+            setattr(batch, field, list(value) + [0] * (request_slots - bs))
+        return batch
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardMetadata:
+        """Allocate per-token-bucket metadata before recording the source kernels."""
+        # Every live request contributes at least one query token. This fixed
+        # request axis can therefore serve every batch that fits the token bucket.
+        request_slots = min(
+            self.req_to_token_pool.size, forward_batch.input_ids.numel()
+        )
+        source_batch = self._source_graph_pad_batch(forward_batch, request_slots)
+        self.init_forward_metadata(source_batch)
+        fm = self.forward_metadata
+        fm.source_graph_topk: dict[int, torch.Tensor] = {}
+        fm.source_live_metadata = None
+        fm.source_graph_num_tokens = int(forward_batch.input_ids.numel())
+        fm.source_graph_request_slots = request_slots
+        for ratio in (4, 128):
+            loc = getattr(fm, f"c{ratio}_loc", None)
+            if loc is not None:
+                # A prefix can complete one additional compression group per
+                # request. Reserve those boundary outputs as well as full groups.
+                capacity = min(
+                    fm.source_graph_num_tokens,
+                    fm.source_graph_num_tokens // ratio + request_slots,
+                )
+                fm_loc = torch.zeros(capacity, dtype=loc.dtype, device=loc.device)
+                self._source_graph_copy(fm_loc, loc)
+                setattr(fm, f"c{ratio}_loc", fm_loc)
+        fm.swa_loc = torch.zeros_like(forward_batch.out_cache_loc, dtype=torch.int64)
+        # Build these outside recording. Their locations must follow the live
+        # request pool, rather than the synthetic capture request's pool index.
+        for ratio, state_pool in self._dsv4_state_pools_by_ratio.items():
+            if is_npu_arch35() or ratio not in (4, 128):
+                continue
+            fm.dsv4_explicit_state_block_tables[ratio] = (
+                _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=2 if ratio == 4 else 1,
+                    state_pool=state_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=source_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            )
+        return fm
+
+    @staticmethod
+    def _source_graph_copy(
+        dst: torch.Tensor, src: Optional[torch.Tensor], *, fill: int = 0
+    ) -> None:
+        """Refresh captured storage in place and clear stale rows and columns."""
+        if src is not None and (
+            dst.ndim != src.ndim or any(a < b for a, b in zip(dst.shape, src.shape))
+        ):
+            raise RuntimeError(
+                f"Source graph metadata overflow: {tuple(src.shape)} > {tuple(dst.shape)}"
+            )
+        dst.fill_(fill)
+        if src is not None and src.numel():
+            dst[tuple(slice(0, n) for n in src.shape)].copy_(src)
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata: ForwardMetadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh graph inputs while retaining a live layout for eager attention."""
+        batch = copy.copy(forward_batch)
+        if static_forward_batch is not None:
+            batch.max_seq_len_override = static_forward_batch.max_seq_len_override
+        self.init_forward_metadata(batch)
+        live = self.forward_metadata
+        fm = capture_metadata
+        source_batch = self._source_graph_pad_batch(
+            batch, fm.source_graph_request_slots
+        )
+        self.init_forward_metadata(source_batch)
+        source_metadata = self.forward_metadata
+        for field in (
+            "actual_seq_lengths_q",
+            "actual_seq_lengths_q_pa",
+            "actual_seq_lengths_kv",
+            "start_pos",
+            "seqused",
+            "c4_page_table",
+            "c128_page_table",
+            "positions_cmp_padding_c4",
+            "positions_cmp_padding_c128",
+            "c4_loc",
+            "c128_loc",
+            "dsv4_cycle_state_block_table",
+        ):
+            dst = getattr(fm, field, None)
+            if dst is not None:
+                self._source_graph_copy(dst, getattr(source_metadata, field, None))
+        for key, dst in fm.kernel_metadata.items():
+            self._source_graph_copy(dst, source_metadata.kernel_metadata[key])
+        self._source_graph_copy(
+            fm.swa_loc,
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            ),
+        )
+        for ratio, dst in getattr(fm, "dsv4_explicit_state_block_tables", {}).items():
+            table = _build_explicit_state_block_table(
+                compress_ratio=ratio,
+                coff=2 if ratio == 4 else 1,
+                state_pool=self._dsv4_state_pools_by_ratio[ratio],
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=source_batch.req_pool_indices,
+                start_pos=source_metadata.start_pos,
+                cu_seqlens=source_metadata.actual_seq_lengths_q_pa,
+                seqused=source_metadata.seqused,
+                max_input_capacity=fm.dsv4_max_input_capacity,
+            )
+            dst.copy_(table)
+        # Attention remains an eager BCG callback and uses the unpadded request
+        # layout. Only the source kernels consume capture-owned buffers.
+        live.source_graph_topk = fm.source_graph_topk
+        fm.source_live_metadata = live
+        self.forward_metadata = fm
+
     _DSV4_CP_LOCAL_FIELDS = (
         "actual_seq_lengths_q",
         "actual_seq_lengths_q_pa",
@@ -986,6 +1191,35 @@ class DeepseekV4AscendAttnBackend(
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
+
+    def prepare_prefill_graph_capture_batch(self, forward_batch: ForwardBatch) -> None:
+        """Give DSV4 compressors valid scratch locations during BCG capture.
+
+        Dummy prefill batches have no DSV4 allocator bundle. The compressor
+        epilogue nevertheless writes its indexer KV result through ``c4_loc``;
+        without a bundle that location is None and capture fails before graph
+        recording. Paged allocators reserve token slot 0 for padded/dummy
+        writes, so use it only for this synthetic capture batch.
+        """
+        num_tokens = int(forward_batch.input_ids.numel())
+        # The runner splits aggregate token buckets into context-bounded
+        # requests when --cuda-graph-prefill-max-context is set.
+        if forward_batch.batch_size == 0 or num_tokens == 0 or num_tokens % 128:
+            raise ValueError(
+                "DSV4 NPU prefill graph capture requires a non-empty batch "
+                "and a non-zero token count aligned to 128"
+            )
+
+        device = forward_batch.input_ids.device
+        zeros = lambda count: torch.zeros(count, dtype=torch.int64, device=device)
+        seq_lens = forward_batch.extend_seq_lens_cpu
+        forward_batch._dsv4_prefill_graph_capture = True
+        forward_batch.out_cache_loc_dsv4 = DSV4OutCacheLoc(
+            out_full_loc=forward_batch.out_cache_loc,
+            out_swa_loc=zeros(num_tokens),
+            out_c4_loc=zeros(sum(int(length) // 4 for length in seq_lens)),
+            out_c128_loc=zeros(sum(int(length) // 128 for length in seq_lens)),
+        )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -2086,7 +2320,9 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        fm = self.forward_metadata
+        fm = getattr(self.forward_metadata, "source_live_metadata", None)
+        if fm is None:
+            fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
@@ -2128,7 +2364,9 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor],
         compress_ratio: int,
     ) -> torch.Tensor:
-        fm = self.forward_metadata
+        fm = getattr(self.forward_metadata, "source_live_metadata", None)
+        if fm is None:
+            fm = self.forward_metadata
         pool = self.token_to_kv_pool
         metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
         cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
@@ -2184,7 +2422,14 @@ class DeepseekV4AscendAttnBackend(
         )
         # c4 attends via indexer topk; c128 reads the full compressed history
         if compress_ratio == 4:
-            topk = fm.c4_topk_indices
+            # The capture-owned top-k buffer uses the bucket T dimension, but
+            # the breakable attention op receives only real query rows.
+            captured_outputs = getattr(fm, "source_graph_topk", None)
+            topk = (
+                captured_outputs[layer.layer_id]
+                if captured_outputs is not None
+                else fm.c4_topk_indices
+            )[: q.shape[0]]
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
