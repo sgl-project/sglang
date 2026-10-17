@@ -199,7 +199,7 @@ class TokenizerControlMixin:
 
         from sglang.srt.weight_sync.gpu_delta.tokenizer import GpuDeltaTokenizerControl
 
-        self.gpu_delta = GpuDeltaTokenizerControl(self, get_parallel().dp_size)
+        self.gpu_delta = GpuDeltaTokenizerControl(self, get_parallel().num_dp_ranks)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (

@@ -578,7 +578,10 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
         )
         for stem, (weight, scale) in zip(("w13", "w2"), transformed):
             bind(stem + "_weight", weight)
-            bind(stem + "_" + scale_name, scale)
+            target_scale = (
+                "weight_scale_inv_shuffled" if layout.format == "mxfp4" else scale_name
+            )
+            bind(stem + "_" + target_scale, scale)
     elif layout.format == "bf16":
         from flashinfer.fused_moe.core import (
             _maybe_get_cached_w3_w1_permute_indices,
@@ -636,6 +639,10 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
         method = Mxfp4FlashinferTrtllmMoEMethod.__new__(Mxfp4FlashinferTrtllmMoEMethod)
         method._fp8 = SimpleNamespace(process_weights_after_loading=lambda _: None)
         method.prefix = "delta_test"
+        method._intermediate_size_unpadded = intermediate
+        method._weights_in_kernel_layout = False
+        layer.register_buffer("_mxfp4_w13_restore_rows", None, persistent=False)
+        layer.register_buffer("_mxfp4_w2_restore_rows", None, persistent=False)
         method.process_weights_after_loading(layer)
     else:
         for stem in ("w13", "w2"):
@@ -737,9 +744,15 @@ def test_flashinfer_matrix_matches_native_preprocessing(
         )
     assert _apply_prepared_masks(bindings, masks) is not None
     for name, value in expected.named_parameters():
+        if format == "mxfp4" and name.endswith("_weight_scale_inv"):
+            # Native MXFP4 retains loader-only canonical scales separately;
+            # GPU delta owns and updates the shuffled inference images.
+            reference = before[name]
+        else:
+            reference = value.contiguous().view(torch.uint8)
         torch.testing.assert_close(
             images[name].contiguous().view(torch.uint8),
-            value.contiguous().view(torch.uint8),
+            reference,
             rtol=0,
             atol=0,
         )

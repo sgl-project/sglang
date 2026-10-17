@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 import torch
+
 from sglang.srt.weight_sync.gpu_delta.bindings import (
     ConsumerSnapshot,
     DerivedImage,
@@ -46,9 +47,18 @@ def _indexer_norm_binding(name, meta, target):
 class DeepSeekMlaMapping:
     """DeepSeek MLA/DSA family, including GLM's shared runtime implementation."""
 
+    # Canonical aliases used by DeepseekV2WeightLoaderMixin. The ordinary loader
+    # owns its mappings locally; admission resolves only existing live targets.
+    stacked_params = (
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
+        ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+        ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+    )
+
     def __init__(self, model):
         self.model = model
-        self.parameters = ParameterBindings(model, model.stacked_params_mapping)
+        self.parameters = ParameterBindings(model, self.stacked_params)
         self.mla_layers = {}
         self.derived = []
         self.consumers = []
@@ -63,10 +73,15 @@ class DeepSeekMlaMapping:
                 "loader ignores computed rotary frequencies"
             )
             return None
-        target_name = self.model.mutate_weight_preload(name)
+        target_name = name
+        if self.model.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            target_name = name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.model.config.n_routed_experts}",
+            )
         target = self.parameters.params.get(target_name)
         if target is None and ".experts." not in target_name:
-            for param_stem, source_stem, shard in self.model.stacked_params_mapping:
+            for param_stem, source_stem, shard in self.stacked_params:
                 if (
                     param_stem != "fused_qkv_a_proj_with_mqa"
                     or source_stem not in target_name

@@ -251,11 +251,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         root.config = SimpleNamespace(
             num_hidden_layers=1, architectures=["GlmMoeDsaForCausalLM"]
         )
-        root.mutate_weight_preload = lambda name: name
-        root.stacked_params_mapping = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        root.num_fused_shared_experts = 0
         root.model = torch.nn.Module()
         root.model.layers = torch.nn.ModuleList([torch.nn.Module()])
         layer = root.model.layers[0]
@@ -724,12 +720,9 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             q_lora_rank=3,
             kv_lora_rank=2,
             qk_rope_head_dim=2,
+            n_routed_experts=1,
         )
-        root.mutate_weight_preload = lambda name: name
-        root.stacked_params_mapping = [
-            ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
-            ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
-        ]
+        root.num_fused_shared_experts = 1
         root.model = torch.nn.Module()
         root.model.layers = torch.nn.ModuleList([torch.nn.Module()])
         layer = root.model.layers[0]
@@ -778,10 +771,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         experts.moe_runner_config = SimpleNamespace(
             is_gated=True, activation="silu", gemm1_clamp_limit=None, swiglu_limit=None
         )
-        experts.num_local_experts = experts.num_experts = 1
-        experts.moe_ep_rank = 0
+        experts.num_local_experts, experts.num_experts = 1, 2
+        experts.moe_ep_rank = 1
         experts.w13_input_scale_quant = experts.w2_input_scale_quant = torch.ones(1)
-        experts._map_global_expert_id_to_local_expert_id = lambda expert: expert
+        experts._map_global_expert_id_to_local_expert_id = lambda expert: expert - 1
         experts.w13_weight_scale_2 = torch.nn.Parameter(
             torch.ones(1, 2), requires_grad=False
         )
@@ -795,7 +788,8 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         experts._cutedsl_scales = (torch.ones(1), torch.ones(1), torch.ones(1))
         experts._cutedsl_input_scale = torch.ones(1)
         experts.quant_config = SimpleNamespace(use_per_token_activation=False)
-        inventory["model.layers.0.mlp.experts.0.gate_proj.weight_scale_2"] = {
+        shared_scale = "model.layers.0.mlp.shared_experts.gate_proj.weight_scale_2"
+        inventory[shared_scale] = {
             "dtype": "F32",
             "shape": [],
         }
@@ -826,6 +820,11 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         require_topology.assert_called_once_with(moe)
         self.assertEqual(len(plan.excluded), 2)
         for binding in plan.bindings:
+            if binding.name == shared_scale:
+                self.assertEqual(
+                    binding.storage[0].data_ptr(),
+                    experts.w13_weight_scale_2[0, 0].data_ptr(),
+                )
             relative = binding.name.removeprefix(prefix)
             if relative in expected_views:
                 target = expected_views[relative]

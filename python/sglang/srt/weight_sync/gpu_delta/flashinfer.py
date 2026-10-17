@@ -238,6 +238,10 @@ def _scale_parameter(layer, stem, layout):
         or type(layer.quant_method).__name__ == "Mxfp4MoEMethod"
     ):
         return getattr(layer, f"{stem}_weight_scale")
+    if layout.format == "mxfp4":
+        # TRTLLM and MegaMoE retain checkpoint scales separately from the
+        # shuffled inference image. Delta updates target the live consumer.
+        return getattr(layer, f"{stem}_weight_scale_inv_shuffled")
     return getattr(layer, f"{stem}_weight_scale_inv")
 
 
@@ -522,9 +526,6 @@ def consumer_objects(layer, layout):
             config = mega._megakernel_config
             objects.extend(
                 (
-                    config.fc1_alpha,
-                    config.fc2_alpha,
-                    config.fc1_norm_const,
                     config.input_norm_const,
                     layer._flashinfer_megamoe_input_norm_const,
                 )
@@ -544,5 +545,5 @@ def consumer_objects(layer, layout):
             )
         )
     elif type(method).__name__ == "Mxfp4FlashinferTrtllmMoEMethod":
-        objects.append(method._gemm1_clamp_limit_tensor)
+        objects.append(layer._gemm1_clamp_limit_tensor)
     return tuple(objects)
