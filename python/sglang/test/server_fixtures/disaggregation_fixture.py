@@ -49,6 +49,7 @@ def assert_process_healthy(test_case, name, process, url, health_path="/health")
 
 
 class PDDisaggregationServerBase(CustomTestCase):
+    launch_module: ClassVar[str] = "sglang.launch_server"
     capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
@@ -149,6 +150,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
             env=dict(cls.extra_prefill_env),
+            launch_module=cls.launch_module,
             return_stdout_stderr=(
                 (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
                 if cls.capture_per_side_logs
@@ -180,6 +182,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
             env=dict(cls.extra_decode_env),
+            launch_module=cls.launch_module,
             return_stdout_stderr=(
                 (cls._decode_stdout_buf, cls._decode_stderr_buf)
                 if cls.capture_per_side_logs

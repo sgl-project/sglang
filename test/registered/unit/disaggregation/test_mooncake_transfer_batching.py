@@ -476,6 +476,8 @@ class TestMooncakeEarlySend(unittest.TestCase):
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
             dst_attn_tp_size=1,
+            dst_aux_ptrs=[2000],
+            dst_aux_item_lens=[16],
         )
         manager = SimpleNamespace(
             enable_trace=False,
@@ -497,6 +499,7 @@ class TestMooncakeEarlySend(unittest.TestCase):
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
             _maybe_ack_drained_abort=MagicMock(),
+            validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
