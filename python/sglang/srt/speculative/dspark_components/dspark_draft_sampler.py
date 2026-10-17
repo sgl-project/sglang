@@ -31,6 +31,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        sharded_accept: bool = False,
         out=None,
     ):
         self.model = model
@@ -60,6 +61,7 @@ class DsparkDraftSampler:
                 device=device,
             )
         self.greedy_draft = greedy_draft
+        self.sharded_accept = sharded_accept
         self._noise = noise
         self._tp_sync = tp_sync
         # Staged before each replay.
@@ -78,8 +80,9 @@ class DsparkDraftSampler:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
             assert not torch.cuda.is_current_stream_capturing()
+            width = _step_logits_width(self.model, self.sharded_accept)
             self.step_logits = torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, width),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
                 device=base_logits.device,
             )
@@ -116,6 +119,7 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            sharded_accept=self.sharded_accept,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
@@ -128,7 +132,9 @@ class DsparkDraftSampler:
             self.confidence_raw_out[:bs].copy_(confidence_raw)
 
 
-def _step_logits_width(model) -> int:
+def _step_logits_width(model, sharded_accept: bool) -> int:
+    if sharded_accept:
+        return int(model.lm_head.num_embeddings_per_partition)
     # Unsharded base logits span the cropped vocab.
     return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
@@ -143,6 +149,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    sharded_accept: bool = False,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -170,5 +177,6 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        sharded_accept=sharded_accept,
         out=out,
     )
