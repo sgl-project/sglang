@@ -1,6 +1,6 @@
 """Ordered control plane for an exclusively owned GPU delta receiver.
 
-A Miles coordinator or standalone loader sends ordered controls.
+The tokenizer sends ordered controls for a Miles-owned update.
 Concurrent administration, retries, and arbitrary API sequences are unsupported.
 Preparation owns immutable buffers; update pauses, fences readers, retracts, then mutates on the
 scheduler thread. Failed or ambiguous updates require restart, never XOR retry.
@@ -185,7 +185,7 @@ class DeltaSession:
         with self._lock:
             session = self._session
             # The scheduler has stopped new work. From this point a peer may
-            # already be mutating. Miles does not abort after dispatching apply.
+            # already be mutating. The tokenizer does not abort after apply dispatch.
             session.state = "APPLYING"
             session.pause_started_ns = time.monotonic_ns()
             if profiling.ENABLED:
@@ -238,7 +238,7 @@ class DeltaSession:
             session.state = "RESUMED"
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
-            # it before the next prepare. Miles sends resume after every rank applied.
+            # it before the next prepare. Resume follows the all-rank apply barrier.
             self._release_future = self._executor.submit(prepared.release_and_close)
             return self.status()
 
@@ -441,6 +441,8 @@ class GpuDeltaSchedulerControl:
                 )
             elif isinstance(request, delta_io.GetGpuDeltaStatusReqInput):
                 receipt = self.session.status()
+                if receipt.get("session_id") != request.session_id:
+                    raise ValueError("delta status belongs to a different session")
             elif isinstance(request, delta_io.ApplyGpuDeltaReqInput):
                 self.scheduler._engine_paused = True
                 receipt = self.session.apply(

@@ -1,18 +1,13 @@
 """Control plane for engines exclusively owned by the GPU-delta coordinator."""
 
 import asyncio
-import hashlib
-import uuid
-from pathlib import Path
-
-import orjson
+import time
 
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.weight_sync.gpu_delta.io import (
     AbortGpuDeltaReqInput,
     ApplyGpuDeltaReqInput,
     ClearGpuDeltaStateReqInput,
-    GetGpuDeltaInfoReqInput,
     GetGpuDeltaStatusReqInput,
     GpuDeltaReqOutput,
     PrepareGpuDeltaReqInput,
@@ -36,33 +31,29 @@ class GpuDeltaTokenizerControl:
         )
 
     async def request(self, obj):
-        if isinstance(
-            obj, (UpdateWeightsFromGpuDeltaReqInput, ClearGpuDeltaStateReqInput)
-        ):
-            try:
-                if isinstance(obj, UpdateWeightsFromGpuDeltaReqInput):
-                    return await self._update(obj)
+        try:
+            if isinstance(obj, UpdateWeightsFromGpuDeltaReqInput):
+                return await self._update(obj)
+            if isinstance(obj, ClearGpuDeltaStateReqInput):
                 return await self._clear()
-            except Exception as exc:
-                return {"success": False, "message": str(exc), "participants": []}
-        if isinstance(obj, ApplyGpuDeltaReqInput):
-            result, _ = await self._apply(obj)
+            # Admission/status do not gate generation or acquire its writer lock.
+            return await self._request(obj)
+        except Exception as exc:
+            return {"success": False, "message": str(exc), "participants": []}
+
+    async def _resume(self, obj):
+        async with self.manager.is_pause_cond:
+            result = await self._request(obj)
+            if result["success"]:
+                self.manager._update_weight_version_if_provided(
+                    str(result["participants"][0]["target_version"])
+                    if obj.weight_version is None
+                    else obj.weight_version
+                )
+                if not obj.keep_pause:
+                    self.manager.is_pause = False
+                    self.manager.is_pause_cond.notify_all()
             return result
-        if isinstance(obj, ResumeGpuDeltaReqInput):
-            async with self.manager.is_pause_cond:
-                result = await self._request(obj)
-                if result["success"]:
-                    self.manager._update_weight_version_if_provided(
-                        str(result["participants"][0]["target_version"])
-                        if obj.weight_version is None
-                        else obj.weight_version
-                    )
-                    if not obj.keep_pause:
-                        self.manager.is_pause = False
-                        self.manager.is_pause_cond.notify_all()
-                return result
-        # Preparation/status do not gate generation or acquire its writer lock.
-        return await self._request(obj)
 
     async def _apply(self, obj):
         async with self.manager.is_pause_cond:
@@ -80,65 +71,61 @@ class GpuDeltaTokenizerControl:
             return result, was_paused
 
     async def _update(self, obj):
-        path = Path(obj.manifest_path).resolve(strict=True)
-        content = await asyncio.to_thread(path.read_bytes)
-        manifest = orjson.loads(content)
-        if manifest["base_version"] != 0:
-            raise ValueError("standalone delta loading requires an HF-base publication")
-        described = await self._request(
-            GetGpuDeltaInfoReqInput(engine_id="standalone-" + uuid.uuid4().hex)
-        )
-        if not described["success"]:
-            return described
-        if any(
-            rank["version"] != 0 or rank["state"] not in {"IDLE", "CLEARED"}
-            for rank in described["participants"]
-        ):
-            raise ValueError(
-                "standalone delta loading requires freshly loaded base weights"
-            )
-        session_id = uuid.uuid4().hex
+        started = time.monotonic()
         prepare = PrepareGpuDeltaReqInput(
-            session_id=session_id,
-            manifest_path=str(path),
-            manifest_sha256=hashlib.sha256(content).hexdigest(),
-            stream_id=manifest["stream_id"],
-            base_version=manifest["base_version"],
-            target_version=manifest["target_version"],
-            plan_digest=manifest["plan_digest"],
-            participants=[rank["identity"] for rank in described["participants"]],
+            session_id=obj.session_id,
+            manifest_path=obj.manifest_path,
+            manifest_sha256=obj.manifest_sha256,
+            stream_id=obj.stream_id,
+            base_version=obj.base_version,
+            target_version=obj.target_version,
+            plan_digest=obj.plan_digest,
+            participants=obj.participants,
         )
-        del manifest, content
         # Preparation can fail safely while the engine still serves base weights.
-        # After update dispatch, neither cancellation nor failure may replay XOR
+        # After apply dispatch, neither cancellation nor failure may replay XOR
         # or reopen admission: a participant may already have modified weights.
         try:
             result = await asyncio.wait_for(self._prepare(prepare), timeout=1800)
         except BaseException:
-            await self._request(AbortGpuDeltaReqInput(session_id=session_id))
+            await self._request(AbortGpuDeltaReqInput(session_id=obj.session_id))
             raise
         if not result["success"]:
-            await self._request(AbortGpuDeltaReqInput(session_id=session_id))
+            await self._request(AbortGpuDeltaReqInput(session_id=obj.session_id))
             return result
-        result, was_paused = await self._apply(
+        prepared_at = time.monotonic()
+        applied, was_paused = await self._apply(
             ApplyGpuDeltaReqInput(
-                session_id=session_id,
+                session_id=obj.session_id,
                 flush_cache=obj.flush_cache,
                 abort_all_requests=obj.abort_all_requests,
             ),
         )
-        if not result["success"]:
-            return result
-        result = await self.request(
+        if not applied["success"]:
+            return applied
+        applied_at = time.monotonic()
+        result = await self._resume(
             ResumeGpuDeltaReqInput(
-                session_id=session_id,
+                session_id=obj.session_id,
                 keep_pause=was_paused,
                 weight_version=obj.weight_version,
             )
         )
         if not result["success"]:
             return result
-        return await self._clear() if obj.release_state else result
+        resumed_at = time.monotonic()
+        result["applied_participants"] = applied["participants"]
+        result["timings"] = {
+            "prepare_s": prepared_at - started,
+            "apply_s": applied_at - prepared_at,
+            "resume_s": resumed_at - applied_at,
+            "activation_s": resumed_at - started,
+        }
+        if obj.release_state:
+            cleared = await self._clear()
+            if not cleared["success"]:
+                return cleared
+        return result
 
     async def _prepare(self, request):
         result = await self._request(request)

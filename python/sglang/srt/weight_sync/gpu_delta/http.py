@@ -9,13 +9,9 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortGpuDeltaReqInput,
-    ApplyGpuDeltaReqInput,
     ClearGpuDeltaStateReqInput,
     GetGpuDeltaInfoReqInput,
     GetGpuDeltaStatusReqInput,
-    PrepareGpuDeltaReqInput,
-    ResumeGpuDeltaReqInput,
     UpdateWeightsFromGpuDeltaReqInput,
 )
 
@@ -51,37 +47,9 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
     ):
         return await dispatch(obj)
 
-    @app.post("/prepare_gpu_delta")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def prepare_gpu_delta(
-        obj: Annotated[PrepareGpuDeltaReqInput, Body()],
-    ):
-        return await dispatch(obj)
-
     @app.post("/get_gpu_delta_status")
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def get_gpu_delta_status(
         obj: Annotated[GetGpuDeltaStatusReqInput, Body()],
-    ):
-        return await dispatch(obj)
-
-    @app.post("/apply_gpu_delta")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def apply_gpu_delta(
-        obj: Annotated[ApplyGpuDeltaReqInput, Body()],
-    ):
-        return await dispatch(obj)
-
-    @app.post("/resume_gpu_delta")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def resume_gpu_delta(
-        obj: Annotated[ResumeGpuDeltaReqInput, Body()],
-    ):
-        return await dispatch(obj)
-
-    @app.post("/abort_gpu_delta")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def abort_gpu_delta(
-        obj: Annotated[AbortGpuDeltaReqInput, Body()],
     ):
         return await dispatch(obj)

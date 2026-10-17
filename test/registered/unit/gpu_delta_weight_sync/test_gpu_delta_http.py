@@ -15,14 +15,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
 from sglang.srt.weight_sync.gpu_delta.io import (
-    AbortGpuDeltaReqInput,
-    ApplyGpuDeltaReqInput,
     ClearGpuDeltaStateReqInput,
     GetGpuDeltaInfoReqInput,
     GetGpuDeltaStatusReqInput,
     GpuDeltaReqOutput,
-    PrepareGpuDeltaReqInput,
-    ResumeGpuDeltaReqInput,
     UpdateWeightsFromGpuDeltaReqInput,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,18 +62,27 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
             "target_version": 1,
         }
     ]
+    publication = session | {
+        "manifest_path": "/immutable/manifest.json",
+        "manifest_sha256": "a" * 64,
+        "stream_id": "run-1",
+        "base_version": 0,
+        "target_version": 1,
+        "plan_digest": "b" * 64,
+        "participants": [],
+    }
     cases = [
         (
             "update_weights_from_gpu_delta",
             UpdateWeightsFromGpuDeltaReqInput,
-            {"manifest_path": "/immutable/manifest.json"},
+            publication,
         ),
         (
             "update_weights_from_gpu_delta",
             UpdateWeightsFromGpuDeltaReqInput,
-            {
-                "manifest_path": "/immutable/manifest.json",
-                "release_state": False,
+            publication
+            | {
+                "release_state": True,
                 "flush_cache": False,
                 "abort_all_requests": True,
                 "weight_version": "actor-42",
@@ -85,33 +90,14 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         ),
         ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
         ("get_gpu_delta_info", GetGpuDeltaInfoReqInput, {"engine_id": "e0"}),
-        (
-            "prepare_gpu_delta",
-            PrepareGpuDeltaReqInput,
-            session
-            | {
-                "manifest_path": "/immutable/manifest.json",
-                "manifest_sha256": "a" * 64,
-                "stream_id": "run-1",
-                "base_version": 0,
-                "target_version": 1,
-                "plan_digest": "b" * 64,
-                "participants": [],
-            },
-        ),
         ("get_gpu_delta_status", GetGpuDeltaStatusReqInput, session),
-        (
-            "apply_gpu_delta",
-            ApplyGpuDeltaReqInput,
-            session | {"flush_cache": False, "abort_all_requests": True},
-        ),
-        (
-            "resume_gpu_delta",
-            ResumeGpuDeltaReqInput,
-            session | {"keep_pause": True, "weight_version": "actor-42"},
-        ),
-        ("abort_gpu_delta", AbortGpuDeltaReqInput, session),
     ]
+    assert {route.path for route in app.routes if "gpu_delta" in route.path} == {
+        "/update_weights_from_gpu_delta",
+        "/clear_gpu_delta_state",
+        "/get_gpu_delta_info",
+        "/get_gpu_delta_status",
+    }
     for name, request_type, payload in cases:
         route = next(route for route in app.routes if route.path == f"/{name}")
         assert isinstance(route, route_class)
@@ -135,6 +121,11 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
     received = msgpack_decode(msgpack_encode(response))
     assert type(received) is GpuDeltaReqOutput and received == response
     assert len(calls) == len(cases)
+    assert calls[0].release_state is False
+    rejected = client.post(
+        "/update_weights_from_gpu_delta", json={"manifest_path": "/manifest.json"}
+    )
+    assert rejected.status_code == 422 and len(calls) == len(cases)
 
     # A real scheduler failure retains the same typed HTTP route and response.
     reply.update(success=False, message="delta payload checksum failed")

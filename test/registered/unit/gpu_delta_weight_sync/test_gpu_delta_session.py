@@ -132,6 +132,18 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     status = session.status()
     assert status["state"] == "PREPARING"
     assert backend.payload.applications == 0
+    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=False))
+    control.session = session
+    matched = control.handle(
+        delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1")
+    )
+    assert matched.success and matched.participant["session_id"] == "publication-1"
+    mismatched = control.handle(
+        delta_io.GetGpuDeltaStatusReqInput(session_id="another-publication")
+    )
+    assert not mismatched.success and "different session" in mismatched.message
+    assert mismatched.participant["session_id"] == "publication-1"
+    assert session.status()["state"] == "PREPARING"
     session.abort("publication-1")
     backend.ready.set()
     assert backend.payload.closed.wait(2)

@@ -54,13 +54,26 @@ rejected at admission. Delta application adds no distributed collectives.
 
 ## Ownership and lifecycle
 
-One coordinator exclusively owns model updates, pause/resume, memory residency
-and topology for a stream's lifetime. Mixing another updater or administrative
-mutation into those engines is unsupported. There is no server-wide ownership
-lock, XOR retry, rollback or automatic replay of an uncertain update.
+Miles exclusively owns model updates, pause/resume, memory residency and topology
+for a stream's lifetime. There is no server-wide ownership lock, XOR retry,
+rollback or automatic replay of an uncertain update.
 
 Routes, IPC schemas, tokenizer coordination and scheduler handlers live under
-`srt/weight_sync/gpu_delta/`; shared files only register them. Each engine follows:
+`srt/weight_sync/gpu_delta/`; shared files only register them. The four HTTP POST
+endpoints are an internal interface to Miles:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `get_gpu_delta_info` | Admit the receiver and return its canonical plan, original participants and version. |
+| `update_weights_from_gpu_delta` | Prepare, apply and resume one publication, returning both phase receipts and server timings. |
+| `get_gpu_delta_status` | Inspect the identified session without repeating its update. |
+| `clear_gpu_delta_state` | Release retained delta resources while preserving weights and committed version. |
+
+The update request carries the negotiated participants, caller-generated session
+ID and publication descriptor: manifest path/SHA256, stream, base/target versions
+and plan digest. Rolling updates and HF-base recovery use the same request shape;
+the tokenizer does not reread the manifest or repeat admission. Each engine's
+tokenizer owns the following internal phases:
 
 1. **Prepare:** background work authenticates the manifest, qualifies the canonical
    plan, admits the encoded cache and prepares local host payloads, small GPU
@@ -70,23 +83,22 @@ Routes, IPC schemas, tokenizer coordination and scheduler handlers live under
    requests and optionally flush caches. Allocate two decoded-mask slots, bind
    pointers, decode and apply. `APPLIED` requires GPU completion and successful
    native size/status checks. A failed fence cannot reclaim KV/cache.
-3. **Resume:** after every original rank of that engine applies, Miles sends
-   resume. SGLang records the model version and reopens generation. The trainer
-   advances its baseline only after all engines finish. Independent engines need
-   not pause together.
+3. **Resume:** after every original rank of that engine applies, the tokenizer
+   sends the internal resume message. SGLang records the model version and reopens
+   generation. Miles advances its baseline only after all engines finish.
+   Independent engines need not pause together.
 
-Partial mutation or uncertain apply/resume keeps admission closed and requires
-restart. Preparation may be aborted before apply dispatch, while old-version
-serving continues. Arbitrary call ordering, retries and concurrent administration
-are outside the exclusive-coordinator contract; there is no separate global
-quiesce/commit round or resume certificate.
+Preparation failure aborts that engine's preparation while old-version serving
+continues. Internal apply/resume failures leave admission closed. A lost HTTP
+response may instead mean the server has already completed and resumed; Miles
+does not abort or replay the update on transport failure. The session ID permits
+inspection of that outcome. There is no separate global quiesce/commit round.
 
-Staged apply and one-shot updates accept `flush_cache=true` and
-`abort_all_requests=false`. A trusted caller may disable flushing only after
-invalidating KV and multimodal caches. Reader fencing and retraction still run;
-optional abort occurs after new admission closes. One-shot updates preserve the
-pause present at the apply boundary. `resume_gpu_delta(keep_pause=true)` commits
-the version and releases delta resources without reopening generation; its
+Updates accept `flush_cache=true` and `abort_all_requests=false`. Miles may disable
+flushing only after invalidating KV and multimodal caches. Reader fencing and retraction still run;
+optional abort occurs after new admission closes. Updates preserve the pause
+present at the apply boundary. An internally retained pause commits the version
+and releases per-update resources without reopening generation; its
 `RESUMED` receipt has `generation_paused=true` and null `resumed_ns`/`blocked_s`.
 The optional `weight_version` labels admitted generations independently of the
 transport's target sequence; omission uses the transport target version.
@@ -99,20 +111,12 @@ version, process identity, small provenance and pause state remain unchanged.
 Describe can recreate the backend at that version. Framework allocator/JIT caches
 are not cleared.
 
-A standalone load requires a fresh version-0 engine using the matching immutable
-HF base. Keep it out of routing until success; the publication path must be visible
-to all ranks. The loader discovers fresh participants and composes a 0→V update:
-
-```bash
-curl -f -X POST http://localhost:30000/update_weights_from_gpu_delta \
-  -H 'Content-Type: application/json' \
-  -d '{"manifest_path":"/checkpoints/step-100/gpu-delta/manifest.json"}'
-curl -f -X POST http://localhost:30000/clear_gpu_delta_state \
-  -H 'Content-Type: application/json' -d '{}'
-```
-
-`release_state=true` clears delta resources after a successful one-shot load.
-Miles recovery uses `false` to retain the backend for later staged updates.
+HF-base recovery requires a fresh version-0 engine using the matching immutable
+checkpoint. Miles negotiates its new participants and submits the base-relative
+publication through the same update endpoint. The publication path must be visible
+to all ranks. Delta resources are retained by default (`release_state=false`);
+`release_state=true` clears them after successful activation while retaining the
+APPLIED/RESUMED receipts in the response.
 
 ## Payload and cache contracts
 

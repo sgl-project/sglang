@@ -1,4 +1,4 @@
-"""Admission remains paused until the dedicated delta acknowledgment succeeds."""
+"""Unified updates retain preparation, mutation and resume failure boundaries."""
 
 import asyncio
 from types import SimpleNamespace
@@ -35,158 +35,116 @@ def control(monkeypatch):
     return control, sent, versions
 
 
-def reply(control, obj, state, success=True):
+@pytest.fixture
+def publication():
+    return dict(
+        session_id="publication-1",
+        manifest_path="/immutable/manifest.json",
+        manifest_sha256="a" * 64,
+        stream_id="run-1",
+        base_version=2,
+        target_version=7,
+        plan_digest="b" * 64,
+        participants=[
+            dict(
+                engine_id="e0",
+                rank_id=f"r{i}",
+                hostname=f"host-{i // 2}",
+                host_cache_id=f"cache-{i // 2}",
+            )
+            for i in range(3)
+        ],
+    )
+
+
+def reply(control, obj, state, rank=0):
     control.communicator.handle_recv(
         io.GpuDeltaReqOutput(
             rid=obj.rid,
-            success=success,
-            message="" if success else "rejected",
+            success=True,
+            message="",
             participant={
-                "identity": {"engine_id": "engine-0", "rank_id": "rank-0"},
+                "identity": {"engine_id": "e0", "rank_id": f"r{rank}"},
                 "session_id": obj.session_id,
                 "state": state,
-                "target_version": 1,
+                "target_version": 7,
             },
         )
     )
 
 
-@pytest.mark.parametrize(
-    "resume_success,flush_cache,abort_all_requests,weight_version",
-    [
-        (True, True, False, None),
-        (True, False, True, "0"),
-        (True, False, True, "actor-42"),
-        (False, True, False, None),
-        (False, False, True, "0"),
-    ],
-)
-def test_only_update_gates_admission_and_successful_resume_releases_it(
-    control, resume_success, flush_cache, abort_all_requests, weight_version
-):
+def test_update_waits_for_every_rank_before_apply_and_resume(control, publication):
     async def run():
-        facade, sent, versions = control
-        cache_clears = []
-        facade.manager.mm_processor = SimpleNamespace(
-            clear_preprocess_cache=lambda: cache_clears.append("clear")
+        facade, _, versions = control
+        sent = asyncio.Queue()
+        facade.communicator._send = sent.put_nowait
+        facade.communicator.set_fan_out(2)
+        task = asyncio.create_task(
+            facade.request(io.UpdateWeightsFromGpuDeltaReqInput(**publication))
         )
-
-        def abort(abort_all):
-            assert facade.manager.is_pause and abort_all
-            sent.append("abort")
-
-        facade.manager.abort_request = abort
-        status = io.GetGpuDeltaStatusReqInput(session_id="publication-1")
-        task = asyncio.create_task(facade.request(status))
-        await asyncio.sleep(0)
+        prepare = await sent.get()
+        assert type(prepare) is io.PrepareGpuDeltaReqInput
         assert not facade.manager.is_pause
-        reply(facade, status, "PREPARED")
-        assert (await task)["success"]
-        update = io.ApplyGpuDeltaReqInput(
-            session_id="publication-1",
-            flush_cache=flush_cache,
-            abort_all_requests=abort_all_requests,
-        )
-        task = asyncio.create_task(facade.request(update))
+        reply(facade, prepare, "PREPARED")
         await asyncio.sleep(0)
-        assert sent == [status] + (["abort"] if abort_all_requests else []) + [update]
+        assert sent.empty() and not task.done()
+        reply(facade, prepare, "PREPARED", rank=1)
+        apply = await sent.get()
+        assert type(apply) is io.ApplyGpuDeltaReqInput
         assert facade.manager.is_pause
-        reply(facade, update, "APPLIED")
-        assert (await task)["success"] and facade.manager.is_pause
-        assert cache_clears == (["clear"] if flush_cache else [])
-
-        def record_version(version):
-            assert facade.manager.is_pause
-            versions.append(version)
-
-        facade.manager._update_weight_version_if_provided = record_version
-        resume = io.ResumeGpuDeltaReqInput(
-            session_id="publication-1", weight_version=weight_version
-        )
-        task = asyncio.create_task(facade.request(resume))
+        reply(facade, apply, "APPLIED")
         await asyncio.sleep(0)
-        reply(
-            facade,
-            resume,
-            "RESUMED" if resume_success else "RESUMING",
-            success=resume_success,
-        )
-        assert (await task)["success"] is resume_success
-        assert facade.manager.is_pause is not resume_success
-        assert versions == (
-            ["1" if weight_version is None else weight_version]
-            if resume_success
-            else []
-        )
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("failure", ["send", "cancel"])
-def test_uncertain_update_keeps_admission_paused(control, failure):
-    async def run():
-        facade, _, _ = control
-        if failure == "send":
-
-            def fail(_):
-                raise OSError("transport unavailable")
-
-            facade.communicator._send = fail
-        update = io.ApplyGpuDeltaReqInput(session_id="publication-1")
-        task = asyncio.create_task(facade.request(update))
+        assert sent.empty() and facade.manager.is_pause
+        reply(facade, apply, "APPLIED", rank=1)
+        resume = await sent.get()
+        assert type(resume) is io.ResumeGpuDeltaReqInput
+        assert facade.manager.is_pause and versions == []
+        reply(facade, resume, "RESUMED")
         await asyncio.sleep(0)
-        if failure == "cancel":
-            task.cancel()
-        with pytest.raises(OSError if failure == "send" else asyncio.CancelledError):
-            await task
-        assert facade.manager.is_pause
+        assert not task.done() and facade.manager.is_pause and versions == []
+        reply(facade, resume, "RESUMED", rank=1)
+        result = await task
+        assert result["success"] and not facade.manager.is_pause
+        assert versions == ["7"] and sent.empty()
+        assert [r["state"] for r in result["applied_participants"]] == ["APPLIED"] * 2
+        assert [r["state"] for r in result["participants"]] == ["RESUMED"] * 2
 
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=2))
 
 
 @pytest.mark.parametrize(
-    "failure,release_state,flush_cache,abort_all_requests,pause_at",
+    "failure,release_state,flush_cache,abort_all_requests,weight_version,pause_at",
     [
-        (None, True, True, False, None),
-        (None, False, True, False, None),
-        (None, False, False, True, None),
-        (None, True, True, False, "entry"),
-        (None, True, True, False, "prepare"),
-        ("prepare", True, True, False, None),
-        ("apply", True, True, False, None),
-        ("resume", True, True, False, None),
-        ("uncertain_apply", True, True, False, None),
-        ("prepare", True, False, True, "entry"),
+        (None, False, True, False, None, None),
+        (None, True, False, True, "0", None),
+        (None, False, False, True, "actor-42", None),
+        (None, True, True, False, None, "entry"),
+        (None, False, True, False, None, "prepare"),
+        ("prepare", True, True, False, None, None),
+        ("apply", True, True, False, None, None),
+        ("resume", True, True, False, None, None),
+        ("uncertain_apply", True, True, False, None, None),
+        ("clear", True, True, False, None, None),
+        ("release", True, True, False, None, None),
     ],
 )
-def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
-    control, tmp_path, failure, release_state, flush_cache, abort_all_requests, pause_at
+def test_update_preserves_receipts_options_and_failure_boundaries(
+    control,
+    publication,
+    monkeypatch,
+    failure,
+    release_state,
+    flush_cache,
+    abort_all_requests,
+    weight_version,
+    pause_at,
 ):
-    import hashlib
-
-    import orjson
-
-    weight_version = None if release_state else "actor-42"
+    # The same negotiated input contract supports fresh-base and rolling updates.
+    if release_state:
+        publication["base_version"] = 0
+    now = [0.0]
+    monkeypatch.setattr(tokenizer, "time", SimpleNamespace(monotonic=lambda: now[0]))
     serving_version = "7" if weight_version is None else weight_version
-    manifest = {
-        "base_version": 0,
-        "target_version": 7,
-        "stream_id": "saved-training-run",
-        "plan_digest": "b" * 64,
-        "codec": "lz4",
-    }
-    path = tmp_path / "manifest.json"
-    content = orjson.dumps(manifest)
-    path.write_bytes(content)
-    identities = [
-        dict(
-            engine_id="e0",
-            rank_id=f"r{i}",
-            hostname=f"host-{i // 2}",
-            host_cache_id=f"cache-{i // 2}",
-        )
-        for i in range(3)
-    ]
     calls = []
 
     async def run():
@@ -205,19 +163,15 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
 
         async def request(obj):
             calls.append(obj)
-            if isinstance(obj, io.GetGpuDeltaInfoReqInput):
-                state, phase = "IDLE", "describe"
-            elif isinstance(obj, io.PrepareGpuDeltaReqInput):
-                state, phase = "PREPARING", "prepare"
-                assert obj.participants == identities
-                assert obj.manifest_sha256 == hashlib.sha256(content).hexdigest()
-                assert obj.base_version == 0 and obj.target_version == 7
-                assert obj.stream_id == manifest["stream_id"]
-                assert obj.plan_digest == manifest["plan_digest"]
+            if type(obj) is io.PrepareGpuDeltaReqInput:
+                assert not facade.manager.is_pause_cond.locked()
+                assert facade.manager.is_pause is (pause_at == "entry")
+                assert obj == io.PrepareGpuDeltaReqInput(**publication)
+                state, phase, duration = "PREPARING", "prepare", 2
             elif isinstance(obj, io.GetGpuDeltaStatusReqInput):
                 if pause_at == "prepare":
                     facade.manager.is_pause = True
-                state, phase = "PREPARED", "status"
+                state, phase, duration = "PREPARED", "status", 3
             elif isinstance(obj, io.ApplyGpuDeltaReqInput):
                 assert facade.manager.is_pause
                 assert obj.flush_cache is flush_cache
@@ -225,51 +179,55 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
                 assert aborted == (["abort"] if abort_all_requests else [])
                 if failure == "uncertain_apply":
                     raise OSError("lost apply acknowledgment")
-                state, phase = "APPLIED", "apply"
+                state, phase, duration = "APPLIED", "apply", 7
             elif isinstance(obj, io.ResumeGpuDeltaReqInput):
                 assert facade.manager.is_pause
                 assert obj.keep_pause is (pause_at is not None)
                 assert obj.weight_version == weight_version
-                state, phase = "RESUMED", "resume"
+                state, phase, duration = "RESUMED", "resume", 11
             elif isinstance(obj, io.AbortGpuDeltaReqInput):
-                state, phase = "ABORTED", "abort"
+                state, phase, duration = "ABORTED", "abort", 0
             else:
                 assert facade.manager.is_pause is (pause_at is not None)
                 assert versions == [serving_version]
-                state, phase = "CLEARED", "clear"
+                state, phase, duration = "CLEARED", "clear", 13
                 if isinstance(obj, io.ReleaseGpuDeltaCacheReqInput):
+                    phase, duration = "release", 17
                     assert obj.owner_rank_ids == ["r0", "r2"]
                     assert isinstance(calls[-2], io.ClearGpuDeltaStateReqInput)
+                else:
+                    assert isinstance(obj, io.ClearGpuDeltaStateReqInput)
+            now[0] += duration
             return {
                 "success": failure != phase,
                 "message": "" if failure != phase else "injected failure",
                 "participants": [
                     dict(
                         identity=identity,
+                        session_id=publication["session_id"],
                         state=state,
-                        version=0 if phase == "describe" else 7,
+                        version=7,
                         target_version=7,
                     )
-                    for identity in identities
+                    for identity in publication["participants"]
                 ],
             }
 
         facade._request = request
-        # Omitting the option preserves the standalone path-only API.
-        options = {} if release_state else {"release_state": False}
-        if weight_version is not None:
-            options["weight_version"] = weight_version
-        if not flush_cache:
-            options["flush_cache"] = False
-        if abort_all_requests:
-            options["abort_all_requests"] = True
         result = await facade.request(
-            io.UpdateWeightsFromGpuDeltaReqInput(manifest_path=str(path), **options)
+            io.UpdateWeightsFromGpuDeltaReqInput(
+                **publication,
+                release_state=release_state,
+                flush_cache=flush_cache,
+                abort_all_requests=abort_all_requests,
+                weight_version=weight_version,
+            )
         )
         assert result["success"] is (failure is None)
-        assert path.read_bytes() == content
         assert cache_clears == (
-            ["clear"] if flush_cache and failure in {None, "resume"} else []
+            ["clear"]
+            if flush_cache and failure in {None, "resume", "clear", "release"}
+            else []
         )
         assert aborted == (
             ["abort"] if abort_all_requests and failure != "prepare" else []
@@ -277,7 +235,6 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
         if failure is None:
             assert versions == [serving_version]
             expected = [
-                io.GetGpuDeltaInfoReqInput,
                 io.PrepareGpuDeltaReqInput,
                 io.GetGpuDeltaStatusReqInput,
                 io.ApplyGpuDeltaReqInput,
@@ -290,71 +247,75 @@ def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
                 ]
             assert [type(obj) for obj in calls] == expected
             assert facade.manager.is_pause is (pause_at is not None)
-            assert all(rank["version"] == 7 for rank in result["participants"])
+            assert all(rank["state"] == "RESUMED" for rank in result["participants"])
             assert all(
-                rank["state"] == ("CLEARED" if release_state else "RESUMED")
-                for rank in result["participants"]
+                rank["state"] == "APPLIED" for rank in result["applied_participants"]
             )
+            assert result["timings"] == {
+                "prepare_s": 5.0,
+                "apply_s": 7.0,
+                "resume_s": 11.0,
+                "activation_s": 23.0,
+            }
+            assert now[0] == (53.0 if release_state else 23.0)
         else:
-            assert not any(
-                isinstance(obj, io.ClearGpuDeltaStateReqInput) for obj in calls
-            )
-            assert facade.manager.is_pause is (
-                pause_at == "entry" or failure != "prepare"
-            )
             assert any(isinstance(obj, io.AbortGpuDeltaReqInput) for obj in calls) is (
                 failure == "prepare"
             )
+            assert facade.manager.is_pause is (
+                failure in {"apply", "resume", "uncertain_apply"}
+            )
+            if failure == "clear":
+                assert not any(
+                    isinstance(obj, io.ReleaseGpuDeltaCacheReqInput) for obj in calls
+                )
+            elif failure != "release":
+                assert not any(
+                    isinstance(obj, io.ClearGpuDeltaStateReqInput) for obj in calls
+                )
+            assert versions == (
+                [serving_version] if failure in {"clear", "release"} else []
+            )
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("state,version", [("RESUMED", 7), ("POISONED", 0)])
-def test_standalone_load_never_replays_applied_or_ambiguous_base(
-    control, tmp_path, state, version
+@pytest.mark.parametrize("phase", ["prepare", "apply"])
+def test_cancel_only_aborts_before_apply_and_never_reopens_admission(
+    control, publication, phase
 ):
-    import orjson
-
-    path = tmp_path / "manifest.json"
-    path.write_bytes(orjson.dumps({"base_version": 0}))
-
     async def run():
-        facade, _, _ = control
+        facade, _, versions = control
+        reached = asyncio.Event()
         calls = []
 
         async def request(obj):
             calls.append(obj)
-            return {
-                "success": True,
-                "participants": [{"state": state, "version": version}],
-            }
+            if isinstance(obj, io.PrepareGpuDeltaReqInput):
+                state, current = "PREPARED", "prepare"
+            elif isinstance(obj, io.ApplyGpuDeltaReqInput):
+                state, current = "APPLIED", "apply"
+            else:
+                assert isinstance(obj, io.AbortGpuDeltaReqInput)
+                state, current = "ABORTED", "abort"
+            if current == phase:
+                reached.set()
+                await asyncio.Future()
+            return {"success": True, "participants": [{"state": state}]}
 
         facade._request = request
-        result = await facade.request(
-            io.UpdateWeightsFromGpuDeltaReqInput(manifest_path=str(path))
+        task = asyncio.create_task(
+            facade.request(io.UpdateWeightsFromGpuDeltaReqInput(**publication))
         )
-        assert not result["success"] and "freshly loaded base" in result["message"]
-        assert len(calls) == 1
+        await reached.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert facade.manager.is_pause is (phase == "apply")
+        assert versions == []
+        assert any(isinstance(obj, io.AbortGpuDeltaReqInput) for obj in calls) is (
+            phase == "prepare"
+        )
+        assert not any(isinstance(obj, io.ResumeGpuDeltaReqInput) for obj in calls)
 
-    asyncio.run(run())
-
-
-def test_clear_does_not_remove_any_cache_until_all_ranks_closed(control):
-    async def run():
-        facade, _, _ = control
-        calls = []
-
-        async def request(obj):
-            calls.append(obj)
-            return {
-                "success": False,
-                "message": "rank release failed",
-                "participants": [],
-            }
-
-        facade._request = request
-        result = await facade.request(io.ClearGpuDeltaStateReqInput())
-        assert not result["success"]
-        assert [type(obj) for obj in calls] == [io.ClearGpuDeltaStateReqInput]
-
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=2))

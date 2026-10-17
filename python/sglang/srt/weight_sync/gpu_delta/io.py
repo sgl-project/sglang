@@ -5,14 +5,6 @@ from typing import Any, Dict, List
 from sglang.srt.managers.io_struct import BaseReq, hook_custom_types
 
 
-class UpdateWeightsFromGpuDeltaReqInput(BaseReq, kw_only=True):
-    manifest_path: str
-    release_state: bool = True
-    flush_cache: bool = True
-    abort_all_requests: bool = False
-    weight_version: str | None = None
-
-
 class ClearGpuDeltaStateReqInput(BaseReq, kw_only=True):
     pass
 
@@ -35,6 +27,13 @@ class PrepareGpuDeltaReqInput(BaseReq, kw_only=True):
     target_version: int
     plan_digest: str
     participants: List[Dict[str, Any]]
+
+
+class UpdateWeightsFromGpuDeltaReqInput(PrepareGpuDeltaReqInput, kw_only=True):
+    release_state: bool = False
+    flush_cache: bool = True
+    abort_all_requests: bool = False
+    weight_version: str | None = None
 
 
 class GetGpuDeltaStatusReqInput(BaseReq, kw_only=True):
