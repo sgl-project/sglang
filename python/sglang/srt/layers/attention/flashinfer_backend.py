@@ -1394,8 +1394,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 ),
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                # Dequant workspaces already contain globally scaled values.
+                k_scale=(
+                    None if self.prefill_uses_dequant_workspace else layer.k_scale_float
+                ),
+                v_scale=(
+                    None if self.prefill_uses_dequant_workspace else layer.v_scale_float
+                ),
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -1456,8 +1461,17 @@ class FlashInferAttnBackend(AttentionBackend):
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                     # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
+                    # The cached prefix has already been globally scaled.
+                    k_scale=(
+                        None
+                        if self.prefill_uses_dequant_workspace
+                        else layer.k_scale_float
+                    ),
+                    v_scale=(
+                        None
+                        if self.prefill_uses_dequant_workspace
+                        else layer.v_scale_float
+                    ),
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
