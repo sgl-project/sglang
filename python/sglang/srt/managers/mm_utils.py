@@ -295,9 +295,10 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
+        data_token_pairs = self.data_token_id_pairs
+        data_start_token_ids = self.data_start_token_ids
         assert_int64_array(input_ids, "input_ids")
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
-        data_token_pairs = self.data_token_id_pairs
         mm_inputs.data_offsets = []
         if data_token_pairs is None:
             data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
@@ -322,7 +323,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         for start_idx, end_idx in zip(start_indices, end_indices):
             padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
-            if input_ids[start_idx] in self.data_start_token_ids:
+            if input_ids[start_idx] in data_start_token_ids:
                 data_idx += 1
                 mm_inputs.data_offsets += [start_idx]
 
