@@ -34,6 +34,10 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     if get_platform().is_hip:
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "triton"
+        # the EAGLE3 draft decodes 16 query heads on one KV head over the whole
+        # context, which Lean's capture policy never bakes (head tiles < 4)
+        if cfg.speculative_algorithm is not None and cfg.enable_lean_attention is None:
+            overrides["enable_lean_attention"] = True
         if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "triton"
         if not envs.USE_ROCM_AITER_ROPE_BACKEND.is_set():

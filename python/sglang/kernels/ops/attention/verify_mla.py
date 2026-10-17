@@ -29,6 +29,8 @@ DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
+    # MiniMax-M3 dense / EAGLE3 draft TP4: one 16-head block per KV head
+    128: (16, 128, 4),
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
     64: (4, 256, 4),  # K3 GQA (dspark draft attention)
 }
@@ -210,7 +212,9 @@ def _verify_mla_prefix_stage1(
         )
         tl.store(
             Att_Out + o_row[:, None] + offs_dv[None, :],
-            (acc / e_sum[:, None]).to(Att_Out.dtype.element_ty),
+            (acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None]).to(
+                Att_Out.dtype.element_ty
+            ),
             mask=row_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
         lse_row = tl.reshape(
@@ -305,12 +309,14 @@ def _verify_mla_combine_stage2(
             other=0.0,
         ).to(tl.float32)
         new_m = tl.maximum(m, lse_s)
-        alpha = tl.exp(m - new_m)
-        beta = tl.exp(lse_s - new_m)
+        # an empty prefix leaves every split at -inf: weight 0 instead of NaN
+        safe_m = tl.where(new_m == float("-inf"), 0.0, new_m)
+        alpha = tl.exp(m - safe_m)
+        beta = tl.exp(lse_s - safe_m)
         acc = acc * alpha[:, None] + o_s * beta[:, None]
         l_acc = l_acc * alpha + beta
         m = new_m
-    o_prefix = acc / l_acc[:, None]
+    o_prefix = acc / tl.where(l_acc > 0, l_acc, 1.0)[:, None]
     lse_prefix = m + tl.log(l_acc)
 
     # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------

@@ -72,9 +72,10 @@ class TestVerifySharedKV(CustomTestCase):
         l_ext=4,
         atol=BF16_ATOL,
         rtol=BF16_RTOL,
+        prefix_lens=(512, 2048),
     ):
         inputs = _build_inputs(
-            prefix_lens=[512, 2048],
+            prefix_lens=list(prefix_lens),
             l_ext=l_ext,
             h_q=h_q,
             h_kv=h_kv,
@@ -159,6 +160,35 @@ class TestVerifySharedKV(CustomTestCase):
             rtol=FP8_RTOL,
         )
 
+    def test_minimax_m3_tp4_shape(self):
+        # MiniMax-M3 dense layers and its EAGLE3 draft at TP4: 16 local query
+        # heads on one KV head, head_dim 128, uneven long prefixes. A padded
+        # draft-extend graph row has an empty prefix.
+        self._run_parity(
+            head_dim=128,
+            v_head_dim=128,
+            h_q=16,
+            prefix_lens=(0, 1, 77, 4099, 70001, 199999),
+        )
+
+    @unittest.skipIf(
+        get_hip_version()[:2] == (7, 0),
+        "Triton 3.4 on ROCm 7.0 aborts gfx950 fp8 KV tl.dot "
+        "(triton-lang/triton#8278). Remove once the image uses Triton >= 3.6.",
+    )
+    def test_minimax_m3_fp8_kv_cache(self):
+        self._run_parity(
+            head_dim=128,
+            v_head_dim=128,
+            h_q=16,
+            cache_dtype=torch.float8_e4m3fn,
+            k_scale=0.5,
+            v_scale=0.25,
+            atol=FP8_ATOL,
+            rtol=FP8_RTOL,
+            prefix_lens=[3000 + 37 * i for i in range(24)],
+        )
+
     def test_kimi_k3_absorbed_mla_shape(self):
         self._run_parity(head_dim=576, v_head_dim=512)
 
@@ -234,6 +264,19 @@ class TestVerifySharedKV(CustomTestCase):
         self.assertFalse(
             _should_use_verify_shared_kv(
                 model_config("LlamaForCausalLM"), 1, False, True
+            )
+        )
+        self.assertTrue(
+            _should_use_verify_shared_kv(
+                model_config("MiniMaxM3SparseForConditionalGeneration"),
+                1,
+                False,
+                True,
+            )
+        )
+        self.assertTrue(
+            _should_use_verify_shared_kv(
+                model_config("LlamaForCausalLMEagle3"), 1, False, True
             )
         )
         self.assertTrue(
