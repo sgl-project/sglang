@@ -22,7 +22,7 @@ gating condition and its `sample_batch_func` closure; only the model forward
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import torch
 
@@ -61,6 +61,7 @@ def _make_forward_batch(req, has_processor=True, grammars=None, is_prefill_only=
     return SimpleNamespace(
         sampling_info=sampling_info,
         is_prefill_only=is_prefill_only,
+        return_logprob=False,
         input_ids=torch.zeros(1, dtype=torch.long),
         seq_lens=torch.ones(1, dtype=torch.long),
         apply_deprecated_skip_attn_backend_init=lambda *args, **kwargs: None,
@@ -72,7 +73,8 @@ def _make_worker(req, sample_history):
 
     `model_runner.sample` records `len(req.output_ids)` at the moment sampling
     runs — exactly the history a processor reads via `__req__` — and returns a
-    fixed token.
+    fixed token. `model_runner` is a read-only property on TpModelWorker, so
+    tests must patch it with a PropertyMock; this helper returns both.
     """
     worker = TpModelWorker.__new__(TpModelWorker)
     worker.enable_overlap = True
@@ -99,8 +101,7 @@ def _make_worker(req, sample_history):
     model_runner.forward.side_effect = fake_forward
     model_runner.sample.side_effect = fake_sample
     model_runner._elastic_cuda_graph_enabled.return_value = False
-    worker.model_runner = model_runner
-    return worker
+    return worker, model_runner
 
 
 class TestDelaySampleCustomLogitProcessor(CustomTestCase):
@@ -113,21 +114,27 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         """
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         forward_batch = _make_forward_batch(req)
 
-        result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            result = worker.forward_batch_generation(None, forward_batch)
 
-        self.assertIsNone(result.next_token_ids)
-        self.assertIsNotNone(result.delay_sample_func)
-        # event_loop_overlap commits the previous batch's token
-        # (process_batch_result_decode) before launch_batch_sample_if_needed
-        # runs the deferred sampling.
-        req.output_ids.append(42)
-        result.delay_sample_func()
-        # The processor must have seen origin_input_ids (2) plus the committed
-        # output token (1) — not a one-token-stale history.
-        self.assertEqual(sample_history, [2])
+            self.assertIsNone(result.next_token_ids)
+            self.assertIsNotNone(result.delay_sample_func)
+            # event_loop_overlap commits the previous batch's token
+            # (process_batch_result_decode) before launch_batch_sample_if_needed
+            # runs the deferred sampling.
+            req.output_ids.append(42)
+            result.delay_sample_func()
+
+        # The processor must have seen the committed output token: output_ids
+        # holds exactly the k-1 = 1 previously sampled token, not a stale
+        # history that lags one token behind.
+        self.assertEqual(sample_history, [1])
         self.assertEqual(result.next_token_ids.tolist(), [[SAMPLED_TOKEN]])
 
     def test_two_overlap_iterations_keep_phase(self):
@@ -140,20 +147,25 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         """
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
 
-        # Iteration 1 (extend): first output token, nothing committed yet.
-        result_1 = worker.forward_batch_generation(
-            None, _make_forward_batch(req, is_prefill_only=False)
-        )
-        result_1.delay_sample_func()
-        req.output_ids.append(SAMPLED_TOKEN)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            # Iteration 1 (extend): first output token, nothing committed yet.
+            result_1 = worker.forward_batch_generation(
+                None, _make_forward_batch(req, is_prefill_only=False)
+            )
+            result_1.delay_sample_func()
+            req.output_ids.append(SAMPLED_TOKEN)
 
-        # Iteration 2 (decode): the commit above happens before this sampling.
-        result_2 = worker.forward_batch_generation(
-            None, _make_forward_batch(req, is_prefill_only=False)
-        )
-        result_2.delay_sample_func()
+            # Iteration 2 (decode): the commit above happens before this
+            # sampling runs.
+            result_2 = worker.forward_batch_generation(
+                None, _make_forward_batch(req, is_prefill_only=False)
+            )
+            result_2.delay_sample_func()
 
         self.assertEqual(sample_history, [0, 1])
         self.assertEqual(result_2.next_token_ids.tolist(), [[SAMPLED_TOKEN]])
@@ -163,10 +175,14 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         path is unchanged: no delay function, next_token_ids set immediately."""
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         forward_batch = _make_forward_batch(req, has_processor=False)
 
-        result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            result = worker.forward_batch_generation(None, forward_batch)
 
         self.assertIsNone(result.delay_sample_func)
         self.assertIsNotNone(result.next_token_ids)
@@ -176,10 +192,14 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         """The existing grammar delay-sampling behavior is preserved."""
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         forward_batch = _make_forward_batch(req, has_processor=False, grammars=["x"])
 
-        result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            result = worker.forward_batch_generation(None, forward_batch)
 
         self.assertIsNone(result.next_token_ids)
         self.assertIsNotNone(result.delay_sample_func)
@@ -188,26 +208,36 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         """Prefill-only requests never sample, so they must not be deferred."""
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         forward_batch = _make_forward_batch(req, is_prefill_only=True)
 
-        result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            result = worker.forward_batch_generation(None, forward_batch)
 
         self.assertIsNone(result.delay_sample_func)
         self.assertEqual(sample_history, [])
         # Dummy zeros for prefill-only, one per sequence.
-        self.assertEqual(result.next_token_ids.tolist(), [[0]])
+        self.assertEqual(result.next_token_ids.tolist(), [0])
 
     def test_delay_sample_env_flag_still_works(self):
         """SGLANG_ENABLE_DELAY_SAMPLE keeps deferring all non-prefill-only
         batches regardless of processors."""
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         forward_batch = _make_forward_batch(req, has_processor=False)
 
-        with patch.object(envs.SGLANG_ENABLE_DELAY_SAMPLE, "get", return_value=True):
-            result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            with patch.object(
+                envs.SGLANG_ENABLE_DELAY_SAMPLE, "get", return_value=True
+            ):
+                result = worker.forward_batch_generation(None, forward_batch)
 
         self.assertIsNone(result.next_token_ids)
         self.assertIsNotNone(result.delay_sample_func)
@@ -217,11 +247,15 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         disabled there."""
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         worker.enable_spec = True
         forward_batch = _make_forward_batch(req)
 
-        result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            result = worker.forward_batch_generation(None, forward_batch)
 
         self.assertIsNone(result.delay_sample_func)
         self.assertEqual(sample_history, [0])
@@ -231,11 +265,15 @@ class TestDelaySampleCustomLogitProcessor(CustomTestCase):
         eager path applies."""
         req = _make_req([1, 2])
         sample_history = []
-        worker = _make_worker(req, sample_history)
+        worker, model_runner = _make_worker(req, sample_history)
         worker.enable_overlap = False
         forward_batch = _make_forward_batch(req)
 
-        result = worker.forward_batch_generation(None, forward_batch)
+        with patch.object(
+            TpModelWorker, "model_runner", new_callable=PropertyMock
+        ) as mock_prop:
+            mock_prop.return_value = model_runner
+            result = worker.forward_batch_generation(None, forward_batch)
 
         self.assertIsNone(result.delay_sample_func)
         self.assertEqual(sample_history, [0])
