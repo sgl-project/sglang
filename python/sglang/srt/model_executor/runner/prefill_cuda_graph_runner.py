@@ -2268,6 +2268,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def _wait_for_layer_loads(self) -> None:
+        # Full replay skips the per-layer load waits in the pool accessors; breakable
+        # replay still runs them at its eager breaks.
+        if not self._is_full_backend:
+            return
+        counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
+        if counter is not None and counter.consumer_index >= 0:
+            counter.wait_until(counter.num_layers - 1)
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
@@ -2285,6 +2294,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             maybe_publish_prefill_shared_read_done(
                 self.model_runner, forward_batch, self.device_module
             )
+            self._wait_for_layer_loads()
 
             if self.enable_cp_bcg_capture:
                 assert self.max_context_size is None, (
