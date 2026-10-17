@@ -22,6 +22,9 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -29,11 +32,14 @@ DEVICE = "cpu"
 
 
 # Helpers: mock Req and ScheduleBatch
-def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(
+    freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2, repetition=1.0
+):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
     req.sampling_params.presence_penalty = presence
+    req.sampling_params.repetition_penalty = repetition
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.eos_token_ids = None
@@ -524,6 +530,93 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+
+# BatchedPenalizerOrchestrator.cumulate_output_tokens_padded
+class TestPaddedOutputTokens(CustomTestCase):
+    """Speculative steps commit a different number of tokens per request."""
+
+    PENALIZERS = {
+        BatchedFrequencyPenalizer,
+        BatchedPresencePenalizer,
+        BatchedRepetitionPenalizer,
+        BatchedMinNewTokensPenalizer,
+    }
+
+    def _orchestrator(self):
+        reqs = [
+            _make_req(freq=0.5, presence=0.25, repetition=1.5, min_tokens=8),
+            _make_req(freq=1.0, presence=0.75, repetition=2.0, min_tokens=8),
+        ]
+        return BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch(reqs), self.PENALIZERS
+        )
+
+    def test_padding_entries_are_not_counted(self):
+        """Row 0 commits 5, 5, 7; row 1 commits only 9 and pads with token 0."""
+        orch = self._orchestrator()
+        orch.cumulate_output_tokens_padded(
+            torch.tensor([[5, 5, 7], [9, 0, 0]]),
+            torch.tensor([[True, True, True], [True, False, False]]),
+        )
+
+        freq = orch.penalizers[BatchedFrequencyPenalizer].cumulated_frequency_penalties
+        expected = torch.zeros(2, VOCAB_SIZE)
+        expected[0, 5], expected[0, 7], expected[1, 9] = 1.0, 0.5, 1.0
+        torch.testing.assert_close(freq, expected)
+
+        presence = orch.penalizers[
+            BatchedPresencePenalizer
+        ].cumulated_presence_penalties
+        expected = torch.zeros(2, VOCAB_SIZE)
+        expected[0, 5], expected[0, 7], expected[1, 9] = 0.25, 0.25, 0.75
+        torch.testing.assert_close(presence, expected)
+
+        repetition = orch.penalizers[
+            BatchedRepetitionPenalizer
+        ].cumulated_repetition_penalties
+        expected = torch.ones(2, VOCAB_SIZE)
+        expected[0, 5], expected[0, 7], expected[1, 9] = 1.5, 1.5, 2.0
+        torch.testing.assert_close(repetition, expected)
+
+        lengths = orch.penalizers[BatchedMinNewTokensPenalizer].len_output_tokens
+        self.assertEqual(lengths.flatten().tolist(), [3, 1])
+
+    def test_padding_keeps_earlier_counts_at_the_padded_index(self):
+        """A padding entry pointing at an already seen token leaves it as is."""
+        orch = self._orchestrator()
+        orch.cumulate_output_tokens(torch.tensor([4, 4]))
+        orch.cumulate_output_tokens_padded(
+            torch.tensor([[6, 4], [4, 4]]),
+            torch.tensor([[True, False], [False, False]]),
+        )
+        presence = orch.penalizers[
+            BatchedPresencePenalizer
+        ].cumulated_presence_penalties
+        self.assertEqual(presence[:, 4].tolist(), [0.25, 0.75])
+        repetition = orch.penalizers[
+            BatchedRepetitionPenalizer
+        ].cumulated_repetition_penalties
+        self.assertEqual(repetition[:, 4].tolist(), [1.5, 2.0])
+        freq = orch.penalizers[BatchedFrequencyPenalizer].cumulated_frequency_penalties
+        self.assertEqual(freq[:, 4].tolist(), [0.5, 1.0])
+
+    def test_matches_feeding_tokens_one_by_one(self):
+        """Without padding the block equals one cumulate_output_tokens per column."""
+        block = torch.tensor([[3, 8, 3, 1], [2, 2, 6, 2]])
+        padded = self._orchestrator()
+        padded.cumulate_output_tokens_padded(block, torch.ones_like(block, dtype=bool))
+        stepwise = self._orchestrator()
+        for column in range(block.shape[1]):
+            stepwise.cumulate_output_tokens(block[:, column])
+        for penalizer in self.PENALIZERS:
+            logits_padded = torch.randn(
+                2, VOCAB_SIZE, generator=torch.Generator().manual_seed(0)
+            )
+            logits_stepwise = logits_padded.clone()
+            padded.penalizers[penalizer].apply(logits_padded)
+            stepwise.penalizers[penalizer].apply(logits_stepwise)
+            torch.testing.assert_close(logits_padded, logits_stepwise)
 
 
 if __name__ == "__main__":
