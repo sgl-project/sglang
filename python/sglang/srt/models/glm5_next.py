@@ -66,6 +66,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -1335,6 +1336,27 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "get_input_embeddings() is not available in encoder-only mode"
             )
         return self.model.embed_tokens
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """LoRA input/output dims; KDA and DSA layers size ``o_proj`` differently."""
+        config = self.config
+        num_heads = config.linear_attn_config["num_heads"]
+        head_dim = config.linear_attn_config["head_dim"]
+        projection_size = num_heads * head_dim
+        # the pool sizes every target on every layer, so DSA layers get unused KDA buffers
+        kda_dims_by_module = {
+            "qkv_proj": (config.hidden_size, 3 * projection_size),
+            "b_proj": (config.hidden_size, num_heads),
+            "f_a_proj": (config.hidden_size, head_dim),
+            "g_a_proj": (config.hidden_size, head_dim),
+            "f_b_proj": (head_dim, projection_size),
+            "g_b_proj": (head_dim, projection_size),
+        }
+        if module_name == "o_proj" and config.is_kda_layer(layer_idx):
+            return projection_size, config.hidden_size
+        if module_name in kda_dims_by_module:
+            return kda_dims_by_module[module_name]
+        return get_default_hidden_dim(module_name, config, layer_idx)
 
     @property
     def routed_experts_weights_of_layer(self):
