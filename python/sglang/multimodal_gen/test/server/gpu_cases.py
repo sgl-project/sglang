@@ -39,6 +39,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params,
     WAN_2_2_ANIMATE_2_14B_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
@@ -64,6 +65,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
+    DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
@@ -475,6 +477,21 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         WAN_2_2_ANIMATE_2_14B_sampling_params,
         # The DiT forward takes a per-clip conditioning container and runs forward_ref,
         # so the raw-component harness contract does not apply.
+        run_perf_check=True,
+        run_component_accuracy_check=False,
+    ),
+    # Distilled checkpoint on the same inputs and server layout: 10 steps at guidance
+    # 1.0, so the denoiser runs the single-forward path (no unconditional batch).
+    DiffusionTestCase(
+        "wan2_2_animate_2_14b_distilled_ref2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST,
+            modality="video",
+            dit_layerwise_offload=True,
+            text_encoder_cpu_offload=True,
+            extras=["--layerwise-offload-components", "transformer"],
+        ),
+        WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params,
         run_perf_check=True,
         run_component_accuracy_check=False,
     ),
