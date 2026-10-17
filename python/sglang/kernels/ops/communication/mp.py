@@ -22,7 +22,8 @@ import sys
 from typing import Any, Callable, List, NoReturn, Optional, Sequence
 
 import psutil
-import torch
+
+from sglang.srt.utils import get_device_count, get_device_module
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ def multigpu_launch(
         rank = int(os.environ["LOCAL_RANK"])
         if rank != 0:
             sys.stdout = open(os.devnull, "w")
-        torch.cuda.set_device(rank)
+        get_device_module().set_device(rank)
         return sys.exit(inner())
     assert pid_key not in os.environ
     if name != "__main__":
@@ -153,7 +154,7 @@ def multigpu_launch(
             "Use `python` to invoke it, which will internally relaunch it "
             "under torchrun for each requested number of GPUs."
         )
-    num_devices = torch.cuda.device_count()
+    num_devices = get_device_count()
     override, forwarded_args = _extract_num_gpus_override(sys.argv[1:])
     if override is not None:
         logger.info(f"--num-gpu override: running only with {override}")
