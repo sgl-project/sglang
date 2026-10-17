@@ -57,7 +57,10 @@ class _FakePolicy:
         return 1 if batch_size >= 8 else 3
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        executed_steps: int | None = None,
     ) -> int | None:
         return self.feedback_step
 
@@ -103,6 +106,16 @@ class TestAdaptiveController(unittest.TestCase):
 
         controller.activate_step_by_batch(batch_size=8)
         controller.activate_step_by_batch(batch_size=8)
+        self.assertEqual(worker.applied_steps, [3, 1])
+
+    def test_explicit_activation_uses_relay_selected_step(self):
+        worker = _FakeWorker(initial_steps=3)
+        controller = AdaptiveController(worker, _FakePolicy())
+        controller.init_states()
+
+        controller.activate_step(1)
+        controller.activate_step(1)
+
         self.assertEqual(worker.applied_steps, [3, 1])
 
     def test_verify_feedback_can_activate_a_state(self):
