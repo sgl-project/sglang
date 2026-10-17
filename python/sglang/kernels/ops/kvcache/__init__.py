@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -54,6 +59,22 @@ def reshape_and_cache_flash(
 
 
 __all__ = ["reshape_and_cache_flash"]
+
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.store_cache_fp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.cache_move:store_cache_fp8",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16", "float32"),
+            in_place=True,
+            description="Read dense NHD sources and scatter E4M3 cache rows; sources are not mutated.",
+        ),
+        description="Dense NHD FP8 scatter with source-dtype rounding (SM89+).",
+    )
+)
 
 
 # Other Triton kernels migrated into this group (from attention/mem_cache
