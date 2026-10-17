@@ -258,6 +258,7 @@ mod tests {
             reasoning_tokens: 0,
             text: text.into(),
             completion_tokens: 1,
+            stop_token_trimmed: false,
             extras: None,
         }
     }
