@@ -574,8 +574,6 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         )
 
     def test_workspace_covers_the_largest_prefill_graph_bucket(self):
-        """A prefill graph pads its layouts to the captured bucket, which DP
-        attention can make larger than this rank's chunk."""
         override = get_context().override_server_args(
             enable_encoder_swa_bounded_replay=True,
             page_size=256,

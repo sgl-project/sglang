@@ -4415,7 +4415,6 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
-            # A prefill CUDA graph pads the queries; only the live rows have a window.
             live = request_window_live_rows
             request_layout = window_layout(
                 req_pool_indices_repeated[:live],
