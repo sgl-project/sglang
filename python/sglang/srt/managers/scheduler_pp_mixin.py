@@ -64,6 +64,22 @@ def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     return fwd_batch
 
 
+def _pp_tensors_to_cpu(tensor_dict: Dict) -> Dict:
+    """Copy a tensor dict with all tensors moved to host memory.
+
+    Non-tensor values (e.g. ``__msg_type__`` / ``__skip__`` markers) are
+    passed through unchanged.
+    """
+    return {
+        key: (
+            value.cpu()
+            if isinstance(value, torch.Tensor) and not value.is_cpu
+            else value
+        )
+        for key, value in tensor_dict.items()
+    }
+
+
 def _pp_exchange_outputs_before_forward(
     cur_batch: Optional[ScheduleBatch],
     spec_relay: bool,
@@ -604,6 +620,39 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
 
+    def _pp_output_via_cpu(self: Scheduler) -> bool:
+        """Whether PP output tensors should be relayed over the CPU (gloo) group.
+
+        The output ring sends first on every rank. On backends where isend
+        blocks at post time until a matching recv is posted (e.g. HCCL on
+        NPU), this deadlocks for pp_size > 2 because the paired
+        batch_isend_irecv path only covers pp_size == 2. Routing the output
+        tensors through gloo makes the all-send-first order safe because
+        gloo's isend does not block at post time.
+
+        With attn_tp_size > 1, CPU tensors bypass the send-allgather
+        scheme (see _pp_output_cpu_bypass_allgather): every TP rank sends
+        the full replicated host tensor and the receiver skips the
+        allgather. Correct because PP output tensors are identical across
+        attn-TP ranks; costs tp_size x wire bandwidth on the (small)
+        output tensors.
+
+        Restrictions:
+        - Incompatible with SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM: the
+          generic path decides skip asymmetrically on sender/receiver,
+          which deadlocks without the __skip__ marker protocol.
+        """
+        if not envs.SGLANG_PP_OUTPUT_VIA_CPU.get():
+            return False
+        if envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
+            logger.warning_once(
+                "SGLANG_PP_OUTPUT_VIA_CPU is incompatible with "
+                "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM; disabling "
+                "SGLANG_PP_OUTPUT_VIA_CPU."
+            )
+            return False
+        return True
+
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
@@ -970,6 +1019,29 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+
+        # When output tensors are relayed over the CPU group
+        # (SGLANG_PP_OUTPUT_VIA_CPU), move the received host tensors back to
+        # the device for local consumption. The original CPU dict is NOT
+        # mutated: pp_outputs is also relayed to the next stage, and relaying
+        # the host tensors keeps subsequent hops on gloo without extra
+        # copies. Note: the first rank pops auxiliary tensors from the local
+        # (device) copy, so they are still relayed onward inside the CPU
+        # dict and simply ignored by the other ranks.
+        if self._pp_output_via_cpu() and any(
+            isinstance(value, torch.Tensor) and value.is_cpu
+            for value in pp_outputs.tensors.values()
+        ):
+            pp_outputs = PPProxyTensors(
+                {
+                    key: (
+                        value.to(self.device)
+                        if isinstance(value, torch.Tensor) and value.is_cpu
+                        else value
+                    )
+                    for key, value in pp_outputs.tensors.items()
+                }
+            )
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1405,9 +1477,15 @@ class SchedulerPPMixin:
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
+                    tensors = pp_outputs_to_send.tensors
+                    if self._pp_output_via_cpu():
+                        # Order the D2H copy after output production before
+                        # the PP comm stream submits the host tensors to gloo.
+                        self.device_module.current_stream().wait_event(q_event)
+                        tensors = _pp_tensors_to_cpu(tensors)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            tensors,
                             async_send=True,
                             msg_type="output",
                             ready_event=q_event,
@@ -1566,6 +1644,8 @@ class SchedulerPPMixin:
                     else:
                         self.device_module.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
+                        if self._pp_output_via_cpu():
+                            send_dict = _pp_tensors_to_cpu(send_dict)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
             if pp_outputs.tensors.get("__skip__"):
