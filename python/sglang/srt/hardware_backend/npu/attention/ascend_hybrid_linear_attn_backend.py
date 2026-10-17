@@ -22,6 +22,121 @@ from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
+# One-shot logs, keyed by reason: these paths run per layer per forward.
+_logged_once: set = set()
+
+
+def _log_once(key: str, msg: str, *, warning: bool = False) -> None:
+    if key not in _logged_once:
+        _logged_once.add(key)
+        (logger.warning if warning else logger.info)(msg)
+
+
+class ReplaySSMDecodeMixin:
+    """ReplaySSM decode ring (--enable-linear-replayssm) for an Ascend backend.
+
+    The ring kernel is the gate-generic Triton implementation shared with CUDA
+    (``sglang.kernels...fla.fused_recurrent_linear_replayssm``); it runs on
+    Ascend through triton-ascend, so this only has to detect that the ring is
+    live for the pool + layer and hand the *packed* post-conv qkv to that kernel
+    instead of splitting q/k/v for the per-step decode. Cursor advance and
+    force-flush stay in the shared metadata path.
+    """
+
+    def _replayssm_ring_args(self, layer, layer_cache, is_kda: bool):
+        """Ring tensors + cursor for this layer, or None to keep the legacy path."""
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None or not getattr(
+            mamba_pool, "enable_linear_replayssm", False
+        ):
+            return None
+        if getattr(mamba_pool, "replayssm_spec_fold", False):
+            return None
+        write_pos = getattr(self.forward_metadata, "replayssm_write_pos", None)
+        if write_pos is None:
+            _log_once(
+                "no_cursor",
+                "--enable-linear-replayssm on NPU: no ring cursor in this forward "
+                "metadata; falling back to the per-step decode.",
+                warning=True,
+            )
+            return None
+        if is_kda and getattr(layer, "lower_bound", None) is not None:
+            # Bounded (safe) gate: the ring kernel implements the plain softplus
+            # gate only, so this layer keeps the per-step decode (as on CUDA).
+            _log_once(
+                "kda_lower_bound",
+                "--enable-linear-replayssm on NPU: this KDA layer uses a bounded "
+                "gate, which the ring kernel does not implement; decoding per-step.",
+                warning=True,
+            )
+            return None
+        d_cache = layer_cache.replayssm_d
+        k_cache = layer_cache.replayssm_k
+        g_cache = layer_cache.replayssm_g
+        if d_cache is None or k_cache is None or g_cache is None:
+            return None
+        return (
+            d_cache,
+            k_cache,
+            g_cache,
+            write_pos,
+            getattr(self.forward_metadata, "replayssm_force_flush", None),
+        )
+
+    def replayssm_decode_npu(
+        self, *, layer, layer_cache, packed_qkv, a, b, ssm_states, cache_indices, is_kda
+    ):
+        """Ring-buffered decode of one batch, or None when the ring is not usable.
+
+        ``packed_qkv`` is the post-conv packed q|k|v the legacy path splits.
+        """
+        args = self._replayssm_ring_args(layer, layer_cache, is_kda)
+        if args is None:
+            return None
+        d_cache, k_cache, g_cache, write_pos, force_flush = args
+        # Geometry the kernel infers from the state pool [slots, HV, V, K].
+        hv, v_dim, k_dim = ssm_states.shape[1:]
+        if is_kda:
+            # Per-K gate: a arrives [B, HV*K], dt_bias [HV*K], A_log [1, 1, HV, 1].
+            B = packed_qkv.shape[0]
+            a = a.reshape(B, hv, k_dim).contiguous()
+            dt_bias = layer.dt_bias.reshape(hv, k_dim).contiguous()
+            A_log = layer.A_log.reshape(-1)
+            b = b.reshape(B, hv).contiguous()
+        else:
+            dt_bias, A_log = layer.dt_bias, layer.A_log
+        _log_once(
+            f"engaged_kda={is_kda}",
+            "--enable-linear-replayssm: ReplaySSM ring decode engaged on NPU "
+            f"(triton-ascend ring kernel, is_kda={is_kda}, L={d_cache.shape[2]}).",
+        )
+        from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+            fused_recurrent_linear_replayssm_decode,
+        )
+
+        out = packed_qkv.new_empty(packed_qkv.shape[0], 1, hv, v_dim)
+        fused_recurrent_linear_replayssm_decode(
+            mixed_qkv=packed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=k_dim**-0.5,
+            initial_state=ssm_states,
+            d_cache=d_cache,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            out=out,
+            ssm_state_indices=cache_indices,
+            write_pos=write_pos,
+            force_flush=force_flush,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=is_kda,
+        )
+        # [B, 1, HV, V] -> the [1, B, ...] layout the packed decode returns.
+        return out.transpose(0, 1)
+
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
@@ -33,6 +148,10 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         )
         draft_token_num = max_num_tokens // max_bs
+        # Static per-bs ReplaySSM ring buffers (None unless the flag is on), refreshed
+        # in place by _replay_metadata before each replay.
+        self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
+        self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -65,6 +184,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            if self.replayssm_write_pos_list is not None:
+                self.replayssm_write_pos_list.append(
+                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
+            if self.replayssm_force_flush_list is not None:
+                self.replayssm_force_flush_list.append(
+                    torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -104,6 +231,18 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        # ReplaySSM: capture the static ring-buffer pointers (None unless the flag is on).
+        replayssm_write_pos = (
+            self.replayssm_write_pos_list[bs - 1]
+            if self.replayssm_write_pos_list is not None
+            else None
+        )
+        replayssm_force_flush = (
+            self.replayssm_force_flush_list[bs - 1]
+            if self.replayssm_force_flush_list is not None
+            else None
+        )
+
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
@@ -115,12 +254,16 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
 
     def _replay_metadata(
@@ -146,7 +289,10 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = 0
+        # Pad rows must carry the pad sentinel (kernel skips state_idx < 0),
+        # NOT 0: with 0 they would read/write physical slot 0's conv/ring
+        # state under graph replay (same sentinel as the CUDA base).
+        mamba_indices[bs - num_padding :] = self.pad_slot_id
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         track_buf = None
         if mamba_track_indices is not None:
@@ -184,6 +330,11 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        # ReplaySSM: snapshot + advance the ring cursor for this replay.
+        replayssm_write_pos, replayssm_force_flush = self._replayssm_graph_buffers(
+            bs, mamba_indices, forward_mode, seq_lens_cpu, in_capture
+        )
+
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
@@ -200,6 +351,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
         else:
             return ForwardMetadata(
@@ -207,6 +360,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
                 mamba_track_indices=track_buf,
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):

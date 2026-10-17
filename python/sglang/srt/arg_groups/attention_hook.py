@@ -412,12 +412,25 @@ def handle_linear_attn_backend(server_args: Any):
                 "KDA, as the linear-attn decode backend; got "
                 f"--linear-attn-decode-backend={decode!r}."
             )
+        if get_platform().is_npu and decode != "triton":
+            raise ValueError(
+                "--enable-linear-replayssm on NPU requires "
+                "--linear-attn-decode-backend triton (the ring kernel runs "
+                f"through triton-ascend); got {decode!r}."
+            )
 
         if mamba_extra_buffer_of(resolved_view(server_args)):
+            page_size = cfg.page_size
+            hint = (
+                " no_buffer in turn requires --page-size 1 (at a larger page size"
+                " the 'auto' strategy resolves to extra_buffer)."
+                if page_size is not None and page_size > 1
+                else ""
+            )
             raise ValueError(
                 "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
-                "no_buffer (the default); the extra_buffer ping-pong "
-                "donation path is not yet supported (follow-up). Got "
+                "no_buffer (the extra_buffer ping-pong donation path is not yet "
+                "supported -- follow-up)." + hint + " Got "
                 f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
             )
         if cfg.disaggregation_mode != "null":

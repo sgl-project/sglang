@@ -10,6 +10,7 @@ from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
+    ReplaySSMDecodeMixin,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -21,7 +22,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 fused_gdn_gating = fused_gdn_gating_npu
 
 
-class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+class AscendGDNAttnBackend(ReplaySSMDecodeMixin, AscendMambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = torch.Size(
@@ -133,11 +134,28 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             conv_states=conv_states,
             bias=layer.bias,
             query_start_loc=query_start_loc,
-            cache_indices=cache_indices,
+            cache_indices=cache_indices.clamp_min(0),
             activation_mode=1,
             pad_slot_id=-1,
             run_mode=1,
         )
+
+        # ReplaySSM ring
+        core_attn_out = self.replayssm_decode_npu(
+            layer=layer,
+            layer_cache=layer_cache,
+            packed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            is_kda=False,
+        )
+        if core_attn_out is not None:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+            return core_attn_out
 
         query, key, value = torch.split(
             mixed_qkv,
