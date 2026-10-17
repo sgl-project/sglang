@@ -46,6 +46,21 @@ DTYPES = [torch.bfloat16]  # [torch.half, torch.bfloat16, torch.float32]
 HIDDEN_SIZES = [256, 1024]
 NUM_TOKENS = [7, 2050]  # Arbitrary values for testing
 SEEDS = [0]
+# Relative L2 limits against gguf-py's dequantization (fp32). The dequant kernels
+# match it to ~1e-3 (half-precision scale arithmetic); MMVQ and MMQ add the q8_1
+# activation rounding (~6e-3).
+DEQUANT_REL_L2 = 2e-3
+MATMUL_REL_L2 = 1e-2
+MMQ_QUANT_TYPES = [
+    GGMLQuantizationType.Q2_K,
+    GGMLQuantizationType.Q3_K,
+    GGMLQuantizationType.Q4_K,
+    GGMLQuantizationType.Q5_K,
+    GGMLQuantizationType.Q6_K,
+    GGMLQuantizationType.Q4_0,
+    GGMLQuantizationType.Q5_0,
+    GGMLQuantizationType.Q8_0,
+]
 QUANT_TYPES = [
     # i-matrix
     GGMLQuantizationType.IQ1_M,
@@ -89,6 +104,70 @@ def test_dequantize(
         )
 
         torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=4e-2)
+
+
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("quant_type", QUANT_TYPES)
+@torch.inference_mode()
+def test_dequantize_matches_gguf_py(hidden_size: int, quant_type: GGMLQuantizationType):
+    # In fp32 the dequantized weights must reproduce gguf-py's; the element-wise
+    # tolerances of test_dequantize let a wrong codebook through (IQ3_S used a
+    # pre-release grid: 1.4e-2 relative L2 on these samples).
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    for tensor in tensors:
+        shape = list(map(int, tensor.name.split("_")[-1].split("x")))
+        ref = torch.tensor(
+            dequantize(tensor.data, quant_type), device="cuda", dtype=torch.float32
+        )
+        out = ggml_dequantize(
+            torch.tensor(tensor.data, device="cuda"), quant_type, *shape, torch.float32
+        )
+        rel = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        assert rel < DEQUANT_REL_L2, f"{quant_type.name}: relative L2 {rel:.2e}"
+
+
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("quant_type", QUANT_TYPES)
+@torch.inference_mode()
+def test_mmvq_matches_gguf_py(hidden_size: int, quant_type: GGMLQuantizationType):
+    # MMVQ quantizes the activations to q8_1, so it is compared in relative L2
+    # against an fp32 product with gguf-py's weights.
+    torch.manual_seed(0)
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    for tensor in tensors:
+        shape = list(map(int, tensor.name.split("_")[-1].split("x")))
+        weight = torch.tensor(
+            dequantize(tensor.data, quant_type), device="cuda", dtype=torch.float32
+        )
+        x = torch.randn(7, shape[1], device="cuda", dtype=torch.bfloat16)
+        out = ggml_mul_mat_vec_a8(
+            torch.tensor(tensor.data, device="cuda"), x, quant_type, shape[0]
+        ).float()
+        ref = x.float() @ weight.T
+        rel = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        assert rel < MATMUL_REL_L2, f"{quant_type.name}: relative L2 {rel:.2e}"
+
+
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("quant_type", MMQ_QUANT_TYPES)
+@torch.inference_mode()
+def test_mmq_matches_gguf_py(hidden_size: int, quant_type: GGMLQuantizationType):
+    # Same check for MMQ (the batched path): its block minimum / offset terms read
+    # the q8_1 block sums, which must cover the quantized activations.
+    torch.manual_seed(0)
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    for tensor in tensors:
+        shape = list(map(int, tensor.name.split("_")[-1].split("x")))
+        weight = torch.tensor(
+            dequantize(tensor.data, quant_type), device="cuda", dtype=torch.float32
+        )
+        x = torch.randn(300, shape[1], device="cuda", dtype=torch.bfloat16)
+        out = ggml_mul_mat_a8(
+            torch.tensor(tensor.data, device="cuda"), x, quant_type, shape[0]
+        ).float()
+        ref = x.float() @ weight.T
+        rel = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        assert rel < MATMUL_REL_L2, f"{quant_type.name}: relative L2 {rel:.2e}"
 
 
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
