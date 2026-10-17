@@ -606,7 +606,7 @@ jobs:
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
   multimodal-diffusion-gen-5090:
-    # The 5090 canary suite is six cases; it is generated whole rather than
+    # The 5090 canary suite is five cases; it is generated whole rather than
     # partitioned, so it needs no entry in the partition plan.
     needs: compute-diffusion-partitions
     if: needs.compute-diffusion-partitions.result == 'success'
@@ -635,6 +635,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        env:
+          # 5090 hosts keep a host-local HF cache, so the install may evict from it.
+          SGLANG_CI_DISK_GUARD: strict
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion

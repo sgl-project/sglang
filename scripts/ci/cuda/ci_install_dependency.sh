@@ -416,7 +416,9 @@ setup_pip_toolchain() {
     # The bootstrap upgrade hit system pip; this upgrades the venv's own.
     python3 -m pip install --upgrade pip
 
-    export UV_LINK_MODE=copy
+    # Share files with the uv cache instead of copying the CUDA stack into every
+    # venv and build env; uv falls back to copying when they are on different filesystems.
+    export UV_LINK_MODE=hardlink
     PIP_CMD="uv pip"
     PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
     PIP_UNINSTALL_CMD="uv pip uninstall"
@@ -846,6 +848,12 @@ install_extra_deps() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+ensure_disk_headroom() {
+    bash "${SCRIPT_DIR}/ensure_disk_headroom.sh"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 prepare_runner() {
     bash "${SCRIPT_DIR}/prepare_runner.sh"
 
@@ -936,6 +944,8 @@ if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
 # ---------------------------------------------------------------------------
 
 main() {
+    # First: configure_environment already writes pip, uv, and possibly a fresh venv.
+    ensure_disk_headroom
     configure_environment "$@"
     detect_host
     kill_existing_processes
