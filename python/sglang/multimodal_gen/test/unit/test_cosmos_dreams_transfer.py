@@ -612,10 +612,6 @@ class TestTransferSamplingParams(unittest.TestCase):
                     CosmosDreamsTransferSamplingParams(**{**base, **overrides})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestTransferDirectResize(unittest.TestCase):
     """The Oct 2026 Transfer export trained on whole frames resized onto the nearest
     canvas (no reflection padding); preprocessing must follow that recipe."""
@@ -741,3 +737,7 @@ class TestTransferDirectResize(unittest.TestCase):
         )
         self.assertAlmostEqual(direct[..., 1].item(), 1.0)
         self.assertAlmostEqual(legacy[..., 1].item(), 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
