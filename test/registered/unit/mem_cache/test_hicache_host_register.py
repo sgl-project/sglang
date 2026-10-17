@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
 )
 from sglang.srt.mem_cache.pool_host import common as host_common
+from sglang.srt.mem_cache.pool_host import hip_host_allocator
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
@@ -88,9 +89,11 @@ class TestHiCacheHostRegister(unittest.TestCase):
             is_hip,
             env,
             mock.patch.object(
-                host_common, "_hip_host_malloc", return_value=ctypes.addressof(backing)
+                hip_host_allocator,
+                "_hip_host_malloc",
+                return_value=ctypes.addressof(backing),
             ) as malloc,
-            mock.patch.object(host_common, "_hip_host_free"),
+            mock.patch.object(hip_host_allocator, "_hip_host_free"),
             mock.patch.object(allocator, "allocate") as allocate,
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
         ):
@@ -118,8 +121,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
         with (
             is_hip,
             env,
-            mock.patch.object(host_common, "_hip_host_malloc", return_value=ptr),
-            mock.patch.object(host_common, "_hip_host_free") as free,
+            mock.patch.object(hip_host_allocator, "_hip_host_malloc", return_value=ptr),
+            mock.patch.object(hip_host_allocator, "_hip_host_free") as free,
         ):
             buffer = host_common.alloc_with_host_register(
                 dims=(4, 16),
@@ -155,7 +158,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with (
                     mock.patch.object(host_common, "_is_hip", hip),
                     mock.patch.dict(os.environ),
-                    mock.patch.object(host_common, "_hip_host_malloc") as malloc,
+                    mock.patch.object(hip_host_allocator, "_hip_host_malloc") as malloc,
                     mock.patch.object(
                         allocator, "allocate", return_value=buffer
                     ) as allocate,
@@ -189,7 +192,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
         with (
             is_hip,
             env,
-            mock.patch.object(host_common, "_hip_runtime", return_value=out_of_memory),
+            mock.patch.object(
+                hip_host_allocator, "_hip_runtime", return_value=out_of_memory
+            ),
             mock.patch.object(allocator, "allocate") as allocate,
             self.assertRaisesRegex(RuntimeError, "mem_info_gtt_total.*--hicache-size"),
         ):
