@@ -674,9 +674,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     has_timing_data: bool = False
 
+    def has_wire_state(self) -> bool:
+        """Whether pickling ships any timing data; if not, __getstate__ is empty."""
+        return self.enable_metrics or self.has_timing_data
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not (self.enable_metrics or self.has_timing_data):
+        if not self.has_wire_state():
             return {}
 
         state = {

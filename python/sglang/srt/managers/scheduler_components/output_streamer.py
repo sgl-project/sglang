@@ -367,6 +367,7 @@ class _GenerationStreamAccumulator:
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
+    has_time_stats: bool = False
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -531,6 +532,8 @@ class _GenerationStreamAccumulator:
             self.weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
+        if req.time_stats is not None and req.time_stats.has_wire_state():
+            self.has_time_stats = True
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -707,7 +710,11 @@ class _GenerationStreamAccumulator:
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
-            time_stats=wrap_as_pickle(self.time_stats),
+            # Without metrics or timing data every entry pickles to an empty
+            # object that the receiver still rebuilds per request per step.
+            time_stats=(
+                wrap_as_pickle(self.time_stats) if self.has_time_stats else None
+            ),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
