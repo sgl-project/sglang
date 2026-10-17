@@ -391,7 +391,9 @@ class StorageAttachment:
         if hicache_write_policy is not None:
             cache.cache_controller.write_policy = hicache_write_policy
             cache.write_through_threshold = (
-                1 if hicache_write_policy == "write_through" else 2
+                1
+                if hicache_write_policy in ("write_through", "write_through_selective")
+                else 2
             )
             cache.is_write_back = hicache_write_policy == "write_back"
             logger.info(f"Set hicache_write_policy to {hicache_write_policy}")

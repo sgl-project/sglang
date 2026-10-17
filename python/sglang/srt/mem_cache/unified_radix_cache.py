@@ -536,8 +536,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.host_pool_group
                 ):
                     self.cache_controller.register_host_pool_entry(entry)
+        # hit_count increments once per finished request (#41520). Threshold 1
+        # backs the prefix up on that first request. write_back stays at 2.
+        policy = get_memory().hicache_write_policy
         self.write_through_threshold = (
-            1 if get_memory().hicache_write_policy == "write_through" else 2
+            1 if policy in ("write_through", "write_through_selective") else 2
         )
         self.is_write_back = (
             self.cache_controller is not None

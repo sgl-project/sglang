@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
+from sglang.srt.mem_cache.pool_host import unified as unified_host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
@@ -657,6 +658,19 @@ class TestWritePolicySwitch(_UnifiedHiCacheCase):
             controller.storage_backend,
             controller.storage_backend_type,
         )
+
+    def test_selective_write_through_uses_first_finished_request_threshold(self):
+        unregister = mock.patch.object(unified_host_memory, "_cuda_host_unregister")
+        unregister.start()
+        self.addCleanup(unregister.stop)
+        self._cache(write_policy="write_through_selective", tokens=64)
+        self.assertEqual(self.cache.write_through_threshold, 1)
+
+        self.cache._storage_attachment._apply_policies(None, "write_back")
+        self.assertEqual(self.cache.write_through_threshold, 2)
+
+        self.cache._storage_attachment._apply_policies(None, "write_through_selective")
+        self.assertEqual(self.cache.write_through_threshold, 1)
 
     def test_incompatible_host_tree_is_rejected_without_side_effects(self):
         self._cache(write_policy="write_back", tokens=64)
