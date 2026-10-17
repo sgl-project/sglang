@@ -844,11 +844,12 @@ The design separates weight quantization from activation scaling:
 - **Weights:** SGLang quantizes each eligible MoE expert weight tensor as it is loaded, using standard 2D NVFP4 weight quantization. The generated NVFP4 weights use static E4M3 block scales plus static per-tensor FP32 scales derived from the weight amax. For gated MoE experts, the w1/w3 pair shares one per-tensor FP32 scale.
 - **Activations:** FlashInfer computes and propagates one FP32 scale per token at runtime. Backends that accept one per-tensor FP32 activation scale must use `modelopt_fp4`.
 - **FP8 checkpoints:** If an eligible expert weight is stored as FP8, SGLang first dequantizes that tensor with the checkpoint scale and then requantizes it to NVFP4 during loading.
+- **MTP and other draft models:** `nvfp4_online` is not inherited by the speculative draft model. By default, the draft keeps its checkpoint precision and quantization, including FP8 when present. Set `--speculative-draft-model-quantization nvfp4_online` explicitly to convert eligible draft MoE experts to NVFP4.
 - **Other layers:** Dense linear layers stay in their source checkpoint precision or checkpoint quantization path.
 
 Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank, while online weight quantization still uses the loaded expert tensor's per-tensor amax-derived FP32 scale.
 
-FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. Both online modes honor `SGLANG_FP4_IGNORED_LAYERS`; for FP8 source checkpoints, listed experts remain FP8 instead of being converted to NVFP4.
+FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. Both online modes honor `SGLANG_FP4_IGNORED_LAYERS`; for FP8 source checkpoints, listed experts remain FP8 instead of being converted to NVFP4. You do not need to list MTP layers to skip their conversion with `nvfp4_online` unless you explicitly opt the draft into online quantization.
 
 ```bash Command
 python3 -m sglang.launch_server \
