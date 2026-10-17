@@ -15,6 +15,9 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_verify_commit_outputs,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.quantization.base_config import (
+    method_has_implemented_embedding,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -22,7 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.runtime_context import get_parallel, mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -53,6 +56,7 @@ if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
@@ -63,6 +67,173 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+
+_FLOAT_ROW_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _select_head_rows(
+    lm_head_module: Optional[VocabParallelEmbedding],
+    head_weight: torch.Tensor,
+    ids: torch.Tensor,
+) -> torch.Tensor:
+    """Rows for shard-local ``ids`` from a vocab-parallel lm_head.
+
+    Heads whose quant method implements ``embedding()`` (unquantized, or
+    NVFP4 embedding heads that dequantize on gather) go through it -- the
+    same call ``VocabParallelEmbedding.forward`` makes for a sharded lookup.
+    Other heads must carry float rows that can be indexed and gathered
+    directly; block-scale quantized lm_heads (NVFP4/AWQ/GPTQ linear layers)
+    keep per-block scales that cannot follow selected rows and are rejected
+    loudly (the historical TP=1 path silently bound garbage packed rows).
+    """
+    qm = getattr(lm_head_module, "quant_method", None)
+    if (
+        lm_head_module is not None
+        and qm is not None
+        and method_has_implemented_embedding(type(qm))
+    ):
+        return qm.embedding(lm_head_module, ids)
+    if head_weight.dtype not in _FLOAT_ROW_DTYPES:
+        raise ValueError(
+            "--speculative-token-map needs extractable rows from the target "
+            f"lm_head, but its weight is {head_weight.dtype} "
+            f"({type(qm).__name__ if qm is not None else 'unknown quant'}). "
+            "Block-scale quantized lm_heads (NVFP4 / AWQ / GPTQ) keep "
+            "per-block scales that cannot follow selected rows; this fails "
+            "at TP=1 too (garbage rows were bound silently). Use a "
+            "checkpoint whose lm_head is unquantized -- ModelOpt FP8 "
+            "checkpoints, for one, keep lm_head in BF16."
+        )
+    return head_weight.index_select(0, ids)
+
+
+def build_hot_token_lm_head(
+    head_weight: torch.Tensor,
+    lm_head_module: Optional[VocabParallelEmbedding],
+    hot_token_id: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Assemble the draft's hot-token lm_head from the target's vocab-sharded one.
+
+    ``hot_token_id`` holds *global* token ids. Under TP>1 the target lm_head
+    is vocab-sharded (each rank holds ~vocab/tp rows), so global ids cannot
+    index the local shard directly (#42397: device-side assert in
+    vectorized_gather_kernel). Each rank selects the rows that live in its
+    shard, and the full reduced head ``[len(hot_token_id), hidden]`` is
+    rebuilt on *every* rank via one padded all-gather. The replicated result
+    keeps the draft logits path shape- and value-identical to the working
+    TP=1 layout; the caller must disable the draft logits processor's
+    vocab-parallel gather accordingly.
+
+    Returns a Parameter when ``head_weight`` is one, mirroring the TP=1
+    ``clone()`` + ``.data``-rebind idiom that ``set_embed_and_head``
+    implementations rely on.
+    """
+    if hot_token_id.dim() != 1 or hot_token_id.numel() == 0:
+        raise ValueError(
+            "--speculative-token-map must be a non-empty 1-D list of token ids, "
+            f"got shape {tuple(hot_token_id.shape)}."
+        )
+    out_of_range = (hot_token_id < 0) | (hot_token_id >= vocab_size)
+    if bool(out_of_range.any()):
+        bad = hot_token_id[out_of_range]
+        raise ValueError(
+            f"--speculative-token-map contains {bad.numel()} id(s) outside "
+            f"[0, {vocab_size}) (min={int(bad.min())}, max={int(bad.max())})."
+        )
+
+    if lm_head_module is None or lm_head_module.tp_size == 1:
+        # Unsharded (or replicated) head: identical to the historical TP=1
+        # behavior, but dequantizing first when the head is quantized and
+        # allocating only the reduced copy instead of a full clone.
+        reduced = _select_head_rows(lm_head_module, head_weight, hot_token_id)
+    else:
+        si = lm_head_module.shard_indices
+        if vocab_size != lm_head_module.num_embeddings:
+            raise ValueError(
+                "Cannot build the hot-token draft lm_head: target vocab size "
+                f"{vocab_size} != lm_head vocab size "
+                f"{lm_head_module.num_embeddings}."
+            )
+        tp_size = lm_head_module.tp_size
+        # The module carries its group on recent trees (self.tp_group); older
+        # ones don't, so derive it from the module's sharding flag instead.
+        group = getattr(lm_head_module, "tp_group", None)
+        if group is None:
+            if getattr(lm_head_module, "use_attn_tp_group", False):
+                group = get_parallel().attn_tp_group
+            else:
+                group = get_parallel().tp_group
+        # Quantized heads pack the row payload (e.g. NVFP4 uint8 stores
+        # hidden/2 bytes per row), so take the logical width from the module.
+        hidden = lm_head_module.embedding_dim
+        num_hot = hot_token_id.numel()
+
+        # Local shard rows for the hot ids that live on this rank, in hot
+        # order (the same masking/offset math VocabParallelEmbedding.forward
+        # applies, inlined to avoid its torch.compile'd helper at init time).
+        org_mask = (hot_token_id >= si.org_vocab_start_index) & (
+            hot_token_id < si.org_vocab_end_index
+        )
+        added_mask = (hot_token_id >= si.added_vocab_start_index) & (
+            hot_token_id < si.added_vocab_end_index
+        )
+        valid = org_mask | added_mask
+        # Local layout per rank: [org rows | org padding | added rows], so an
+        # added-range id's local index subtracts the org rows *and* the org
+        # padding that precede the added block.
+        added_offset = (
+            si.added_vocab_start_index - si.num_org_elements - si.num_org_vocab_padding
+        )
+        local_ids = torch.where(
+            org_mask,
+            hot_token_id - si.org_vocab_start_index,
+            torch.where(added_mask, hot_token_id - added_offset, hot_token_id),
+        )[valid]
+        positions = torch.arange(num_hot, device=hot_token_id.device)[valid]
+        local_rows = _select_head_rows(lm_head_module, head_weight, local_ids)
+        if local_ids.numel() > 0:
+            assert int(local_ids.max()) < head_weight.shape[0], (
+                "hot-token local id exceeds the lm_head shard; "
+                "shard_indices and weight shape disagree."
+            )
+
+        # Exchange per-rank counts so every rank pads to the same width, then
+        # all-gather rows + hot-order positions. The sentinel position
+        # ``num_hot`` absorbs every rank's padding writes into one extra row
+        # that is sliced off below, so duplicate-index assignment stays
+        # deterministic (all padding rows are zeros).
+        local_n = local_rows.shape[0]
+        count_t = torch.tensor([local_n], dtype=torch.int64, device=hot_token_id.device)
+        counts_buf = torch.empty((tp_size, 1), dtype=torch.int64, device=count_t.device)
+        group.all_gather_into_tensor(counts_buf, count_t)
+        n_max = int(counts_buf.max())
+        if n_max == 0:
+            raise ValueError(
+                "--speculative-token-map selected no rows from any lm_head shard."
+            )
+
+        rows_pad = local_rows.new_zeros((n_max, hidden))
+        rows_pad[:local_n] = local_rows
+        pos_pad = torch.full(
+            (n_max,), num_hot, dtype=torch.int64, device=count_t.device
+        )
+        pos_pad[:local_n] = positions
+        gathered_rows = local_rows.new_zeros((tp_size, n_max, hidden))
+        gathered_pos = torch.empty(
+            (tp_size, n_max), dtype=torch.int64, device=count_t.device
+        )
+        group.all_gather_into_tensor(gathered_rows, rows_pad)
+        group.all_gather_into_tensor(gathered_pos, pos_pad)
+
+        reduced = local_rows.new_empty((num_hot + 1, hidden))
+        reduced[gathered_pos.reshape(-1)] = gathered_rows.reshape(-1, hidden)
+        reduced = reduced[:num_hot]
+
+    if isinstance(head_weight, torch.nn.Parameter):
+        return torch.nn.Parameter(reduced, requires_grad=head_weight.requires_grad)
+    return reduced
 
 
 def duplicate_prefix_tail_to_draft_branches(
