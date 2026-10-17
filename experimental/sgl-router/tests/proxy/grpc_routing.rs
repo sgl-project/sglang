@@ -245,7 +245,9 @@ fn router_ctx_with(
             dp_ranks: 1,
             grpc_port,
         };
-        registry.add_with_cb(spec, None, profile).unwrap();
+        registry
+            .add_with_cb(spec, Some(Default::default()), profile)
+            .unwrap();
     }
     if reorg {
         cfg.model.policy = PolicyKind::PowerOfTwo;
