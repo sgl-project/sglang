@@ -79,6 +79,12 @@ def get_current_stream(device: torch.device | None = None) -> torch.Stream:
     return stream
 
 
+def is_breakable_cuda_graph_replaying() -> bool:
+    """True only inside BreakableCUDAGraph.replay(), i.e. while its eager break
+    fns run; False during capture (a capture context is set) and warmup."""
+    return _current_capture_var.get() is None and _current_stream_var.get() is not None
+
+
 def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
     _check_cuda_bindings()
     status, *_ = checkCudaErrors(rt.cudaStreamGetCaptureInfo(stream_ptr))
