@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+import copy
 import importlib
+import pickle
 import sys
 import types
 from types import SimpleNamespace
@@ -19,9 +21,21 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
+    CACHE_OPTIONS_KEY,
+    build_cache_options,
+    guider_runs_cfg,
+    read_cache_options,
+    request_cache_dit_for_run,
+    with_cache_options,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
     FluxAdapter,
     FluxExecutor,
+)
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
+    MiniMaxH3Executor,
+    worker_transformer_options,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
@@ -410,3 +424,108 @@ def test_unbatched_forward_is_a_single_request() -> None:
     av = [torch.zeros(2, 16, 1, 4, 4), torch.zeros(2, 8, 4)]
     ex(av, torch.tensor([0.5, 0.5]), torch.zeros(2, 3, 8))
     assert len(adapter.calls) == 2 and adapter.calls[1][0] is av
+
+
+class _FakePatcher:
+    def __init__(self, model_options, executor):
+        self.model_options = model_options
+        self.model = SimpleNamespace(diffusion_model=executor)
+
+    def clone(self):
+        return _FakePatcher(
+            copy.deepcopy(self.model_options), self.model.diffusion_model
+        )
+
+
+def _bare_executor(cls, enable_cache_dit=None):
+    executor = cls.__new__(cls)
+    torch.nn.Module.__init__(executor)
+    executor.adapter = cls.adapter_cls()
+    executor.enable_cache_dit = enable_cache_dit
+    return executor
+
+
+def test_cache_options_node_returns_clone_and_keeps_input() -> None:
+    patcher = _FakePatcher(
+        {"transformer_options": {"sample_sigmas": [1.0, 0.0]}},
+        _bare_executor(MiniMaxH3Executor),
+    )
+    options = build_cache_options(True, {"max_warmup_steps": 2})
+    out = with_cache_options(patcher, options)
+    assert out is not patcher
+    assert patcher.model_options["transformer_options"] == {"sample_sigmas": [1.0, 0.0]}
+    stored = out.model_options["transformer_options"]
+    assert stored["sample_sigmas"] == [1.0, 0.0]
+    assert read_cache_options(stored) == options
+    pickle.dumps(options)
+
+
+def test_cache_options_reject_bad_requests() -> None:
+    with pytest.raises(ValueError, match="Unknown cache_dit_params"):
+        build_cache_options(True, {"not_a_knob": 1})
+
+
+def test_cache_options_off_drops_tuned_knobs() -> None:
+    """Switching a tuned node to off must not raise; default keeps the knobs."""
+    knobs = {"max_warmup_steps": 2}
+    assert build_cache_options(False, knobs) == {
+        "enable_cache_dit": False,
+        "cache_dit_params": None,
+    }
+    assert build_cache_options(None, knobs)["cache_dit_params"] == knobs
+
+
+def test_cache_dit_run_sends_sampler_steps_and_cfg_mode() -> None:
+    """The worker counts DiT calls as Cache-DiT steps, so it needs the run's
+    step count and whether cond and uncond calls alternate within a step."""
+    sigmas = torch.linspace(1, 0, 26)
+    packed = SimpleNamespace(extra_req={})
+    request_cache_dit_for_run(
+        packed, {"sample_sigmas": sigmas, "cond_or_uncond": [0]}, False
+    )
+    assert packed.extra_req["comfyui_num_steps"] == 25
+    assert packed.extra_req["comfyui_separate_cfg"] is False
+    request_cache_dit_for_run(
+        packed, {"sample_sigmas": sigmas, "cond_or_uncond": [1]}, True
+    )
+    assert packed.extra_req["comfyui_separate_cfg"] is True
+    with pytest.raises(ValueError, match="does not run CFG"):
+        request_cache_dit_for_run(
+            packed, {"sample_sigmas": [1.0, 0.0], "cond_or_uncond": [1]}, False
+        )
+    with pytest.raises(ValueError, match="sample_sigmas"):
+        request_cache_dit_for_run(packed, {"cond_or_uncond": [0]}, False)
+
+
+def test_only_a_cfg_guider_with_a_negative_runs_both_branches() -> None:
+    """ComfyUI skips the uncond call at cfg 1, and BasicGuider has no cfg."""
+    conds = {"positive": [], "negative": []}
+    assert guider_runs_cfg(SimpleNamespace(cfg=4.0, conds=conds))
+    assert not guider_runs_cfg(SimpleNamespace(cfg=1.0, conds=conds))
+    assert not guider_runs_cfg(SimpleNamespace(cfg=4.0, conds={"positive": []}))
+    assert not guider_runs_cfg(SimpleNamespace(conds={"positive": []}))
+
+
+def _h3_kwargs(executor, cache_options):
+    packed = SimpleNamespace(
+        guidance_scale=1.0, height=8, width=8, cache_options=cache_options
+    )
+    return executor._sampling_params_kwargs(packed, torch.tensor([0.5]))
+
+
+@pytest.mark.parametrize("cls", [MiniMaxH3Executor, FluxExecutor])
+def test_per_run_cache_dit_overrides_loader_flag(cls) -> None:
+    loader_on = _bare_executor(cls, enable_cache_dit=True)
+    run_off = build_cache_options(False, None)
+    assert _h3_kwargs(loader_on, run_off)["enable_cache_dit"] is False
+    # Unset per-run value falls back to the loader option (backward compatible).
+    assert _h3_kwargs(loader_on, build_cache_options(None, None))["enable_cache_dit"]
+    assert "enable_cache_dit" not in _h3_kwargs(_bare_executor(cls), {})
+    params = {"max_warmup_steps": 3}
+    kwargs = _h3_kwargs(loader_on, build_cache_options(True, params))
+    assert kwargs["cache_dit_params"] == params
+
+
+def test_cache_options_not_sent_in_h3_worker_transformer_options() -> None:
+    opts = {CACHE_OPTIONS_KEY: build_cache_options(True, None), "sample_sigmas": [1.0]}
+    assert worker_transformer_options(opts) == {"sample_sigmas": [1.0]}

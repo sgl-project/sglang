@@ -31,6 +31,7 @@ class PackedForward:
     pooled_embeds: list[torch.Tensor] | None = None
     extra_req: dict[str, Any] = field(default_factory=dict)
     unpack_ctx: dict[str, Any] = field(default_factory=dict)
+    cache_options: dict[str, Any] = field(default_factory=dict)
 
 
 class ComfyUIModelAdapter:

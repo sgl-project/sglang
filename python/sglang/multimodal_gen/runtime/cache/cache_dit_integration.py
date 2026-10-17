@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 import cache_dit
+from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 
 try:
     from cache_dit import (
@@ -67,6 +68,11 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     cache_dit.disable_cache(target)
     if target is not transformer:
         del transformer._sglang_cache_dit_adapter
+    # cache-dit 1.5.1 marks the FakeDiffusionPipeline class as cached when it
+    # wraps a bare transformer, and disable_cache(transformer) never clears it,
+    # so the next enable skips building a context and asserts.
+    if "_is_cached" in FakeDiffusionPipeline.__dict__:
+        del FakeDiffusionPipeline._is_cached
     for name in ("_is_parallelized", "_parallelism_config"):
         if hasattr(transformer, name):
             delattr(transformer, name)
@@ -536,6 +542,7 @@ def enable_cache_on_transformer(
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     has_separate_cfg: bool = False,
+    separate_cfg_override: bool | None = None,
     joint_cfg_decision: bool = False,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
@@ -592,6 +599,8 @@ def enable_cache_on_transformer(
         # SCM fields
         steps_computation_mask=config.steps_computation_mask,
         steps_computation_policy=config.steps_computation_policy,
+        # None keeps the registered adapter's default for its diffusers pipeline.
+        enable_separate_cfg=separate_cfg_override,
     )
 
     # Build calibrator config. DMD and TaylorSeer are mutually exclusive

@@ -45,7 +45,13 @@ _CONDITIONING_FIELDS = (
     "sigmas",
 )
 _SESSION_SKIP_EXTRA = frozenset(
-    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp"}
+    {
+        "comfyui_session_id",
+        "comfyui_cond_key",
+        "comfyui_cache_fp",
+        "comfyui_num_steps",
+        "comfyui_separate_cfg",
+    }
 )
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _RUNS: dict[str, Any] = {}
@@ -208,6 +214,23 @@ def get_or_create_run_state(req, factory: Callable[[], Any]):
     state = factory()
     set_run_state(req, state)
     return state
+
+
+def comfyui_cache_dit_run(req) -> tuple[int, bool, bool] | None:
+    """(sampler steps in this ComfyUI run, whether this is the run's first call,
+    whether its cond and uncond calls alternate as separate requests).
+
+    Each ComfyUI step is its own request, so Cache-DiT has to keep one context
+    for the whole run instead of refreshing it per request.
+    """
+    extra = getattr(req, "extra", None) or {}
+    steps = extra.get("comfyui_num_steps")
+    if not steps:
+        return None
+    first_call = get_run_state(req) is None
+    if first_call:
+        set_run_state(req, {"cache_dit_steps": int(steps)})
+    return int(steps), first_call, bool(extra.get("comfyui_separate_cfg"))
 
 
 def release_run_state(session_id: str | None) -> None:

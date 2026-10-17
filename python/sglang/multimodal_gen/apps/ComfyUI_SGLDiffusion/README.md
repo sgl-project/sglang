@@ -177,3 +177,14 @@ Per sampler step:
 4. The worker pipeline is the native model class with modules trimmed to `transformer` + pass-through scheduler. A single-file checkpoint goes through `comfyui_checkpoints`. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
 
 Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no extra ComfyUI pipeline class.
+
+## Per-run cache options
+
+`SGLDiffusion Cache Options` takes a MODEL and returns a clone carrying a per-run Cache-DiT toggle (plus optional DBCache knobs; `-1` keeps the server default). It is sent as a per-request sampling field, so changing it between runs does not restart the worker.
+
+- Works for every integrated-mode model. ComfyUI sends one request per DiT call, so the worker keeps one Cache-DiT context for the whole sampler run (sized from the run's `sample_sigmas`) instead of one per request.
+- The run must make one DiT call per step (`cfg` 1, as in the Flux, Z-Image and Qwen-Image workflows); a run that also sends an uncond pass raises a `ValueError`. MiniMax-H3 keeps its own run state and is not limited this way.
+- TeaCache is not exposed: H3 rejects `enable_teacache`, and the other models reset TeaCache state every request.
+- Quality trade-off: Cache-DiT skips transformer blocks on steps whose residual barely changed, so it trades output fidelity for speed. The server defaults (warmup 4, threshold 0.24, up to 3 cached steps in a row) are aggressive and can soften fine detail, especially on few-step or distilled models. Set `preset` to `conservative` (warmup 6, threshold 0.12, up to 2 cached steps in a row) for output closer to the uncached run at a smaller speedup. Explicit knobs override the preset.
+- `off` disables caching and ignores any knobs left set, so there is no need to reset them. `default` keeps the knobs and applies them only if the loader option or server enables caching.
+- The `enable_cache_dit` loader option in `SGLDiffusion Options` still works as the default. A per-run `on`/`off` wins over it; `default` falls back to it.
