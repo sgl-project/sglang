@@ -23,8 +23,7 @@ _STANDARD_JSON_SCHEMA_TYPES = {
 
 # Non-standard ``type`` values commonly emitted by DB/ORM-driven tool-schema
 # generators. Mapped to the closest JSON Schema 2020-12 primitive so that
-# ``Draft202012Validator.check_schema`` does not reject an otherwise-usable
-# tool definition.
+# the tool schema check does not reject an otherwise-usable tool definition.
 _JSON_SCHEMA_TYPE_ALIASES: Dict[str, str] = {
     "str": "string",
     "text": "string",
