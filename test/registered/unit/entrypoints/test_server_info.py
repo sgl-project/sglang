@@ -721,7 +721,7 @@ class TestServerInfoHicacheLayoutField(CustomTestCase):
         self.assertEqual(info["hicache_object_layout"], layout)
         json.dumps(info)
 
-    def test_layout_absent_without_hierarchical_cache(self):
+    def test_legacy_scheduler_without_layout_keeps_field_absent(self):
         args = ServerArgs(model_path="dummy")
 
         info = _call_server_info_with(args)

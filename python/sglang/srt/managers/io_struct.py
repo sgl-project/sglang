@@ -2353,10 +2353,12 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
-    pass
+    """Request the external router's HiCache L3 object layout."""
 
 
 class GetHiCacheL3LayoutReqOutput(BaseReq, kw_only=True):
+    """Carry the L3 availability envelope, including explicit disabled replies."""
+
     # Untyped on purpose, like GetInternalStateReqOutput: the layout dict is
     # sanitized with msgspec_to_builtins and can evolve without a migration.
     layout: Dict[str, Any]

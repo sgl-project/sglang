@@ -1191,10 +1191,12 @@ async def hicache_storage_backend_status():
 @app.get("/get_hicache_l3_cache_layout")
 async def get_hicache_l3_cache_layout():
     """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    from sglang.srt.mem_cache.l3_layout import disabled_l3_layout, merge_l3_layouts
+
     layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
-    if layouts:
-        return layouts[0]
-    return {"enabled": False, "backend": None, "hicache_object_layout": {"pools": []}}
+    return merge_l3_layouts(layouts) or disabled_l3_layout(
+        "No scheduler layout replies"
+    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

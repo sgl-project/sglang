@@ -1894,8 +1894,7 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
-        if self.enable_hierarchical_cache:
-            result_dict["hicache_object_layout"] = self._hicache_l3_layout()
+        result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
         if get_serving().grpc_port is not None and not (
             get_serving().smg_grpc_mode or get_serving().grpc_mode
@@ -5469,41 +5468,48 @@ class Scheduler(
         return self.internal_state.get_internal_state(recv_req)
 
     def _hicache_l3_layout(self) -> dict:
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.l3_layout import disabled_l3_layout
 
-        layout = {
-            "enabled": False,
-            "backend": None,
-            "hicache_object_layout": {"pools": []},
-        }
-        tree_cache = getattr(self, "tree_cache", None)
-        controller = getattr(tree_cache, "cache_controller", None)
-        storage_backend = getattr(controller, "storage_backend", None)
-        if (
-            self.enable_hierarchical_cache
-            and get_memory().hicache_storage_backend == "mooncake"
-            and storage_backend is not None
-            and hasattr(storage_backend, "describe_l3_object_layout")
-        ):
-            swa = getattr(tree_cache, "components", {}).get(ComponentType.SWA)
-            layout = storage_backend.describe_l3_object_layout(
-                sidecar_pool_specs=getattr(tree_cache, "sidecar_pool_specs", []),
-                swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+        if not self.enable_hierarchical_cache:
+            return disabled_l3_layout(
+                "Hierarchical cache is disabled", page_size=self.page_size
+            )
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree_cache = self.tree_cache
+        controller = tree_cache.cache_controller
+        if controller is None:
+            return disabled_l3_layout(
+                "HiCache controller is not attached", page_size=self.page_size
+            )
+        storage_backend = controller.storage_backend
+        if not isinstance(storage_backend, MooncakeStore):
+            return disabled_l3_layout(
+                "Mooncake storage is not attached",
+                backend=controller.storage_backend_type,
                 page_size=self.page_size,
             )
-            layout["enabled"] = True
-        else:
-            # A silently empty layout looks identical to a key mismatch on the
-            # router side, so name the reason the L3 view is unavailable.
-            logger.debug(
-                "No HiCache L3 layout to report: hierarchical=%s storage_backend=%s store=%s",
-                self.enable_hierarchical_cache,
-                get_memory().hicache_storage_backend,
-                type(storage_backend).__name__ if storage_backend else None,
-            )
-        return layout
+
+        sidecar_pool_specs = ()
+        swa = None
+        if isinstance(tree_cache, UnifiedRadixCache):
+            sidecar_pool_specs = tree_cache.sidecar_pool_specs
+            swa = tree_cache.components.get(ComponentType.SWA)
+        return storage_backend.describe_l3_object_layout(
+            sidecar_pool_specs=sidecar_pool_specs,
+            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            page_size=self.page_size,
+        )
 
     def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
+        """Reply with the same external L3 layout used by the startup handshake."""
+        from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+
         return GetHiCacheL3LayoutReqOutput(
             layout=msgspec_to_builtins(self._hicache_l3_layout())
         )
