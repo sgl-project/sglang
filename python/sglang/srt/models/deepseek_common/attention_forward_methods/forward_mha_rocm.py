@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_kv_layers,
@@ -349,7 +350,9 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 or isinstance(
+            get_token_to_kv_pool(), PageInterleaveKVPoolMixin
+        ):
             kv_a, k_pe = (
                 get_kv_layers()
                 .read(self.attn_mha.layer_id)
