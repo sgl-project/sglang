@@ -281,8 +281,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 ),
             ),
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "non-breakable prefill CUDA graphs",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            (
+                "breakable prefill CUDA graphs on non-CUDA hardware",
+                cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+                and not get_platform().is_cuda,
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),

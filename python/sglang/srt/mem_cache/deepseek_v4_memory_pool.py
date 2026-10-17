@@ -39,6 +39,7 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
@@ -1138,6 +1139,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             from sglang.srt.runtime_context import get_schedule
 
             chunk = get_schedule().chunked_prefill_size or 0
+            graph_config = get_exec().graph.cuda_graph_config
+            # DP divides the live chunk budget, but capture buckets can be larger.
+            # Size this once: recorded graphs retain the workspace address.
+            capture_tokens = (
+                max(graph_config.prefill.bs, default=0)
+                if graph_config is not None
+                and graph_config.prefill.backend != Backend.DISABLED
+                else 0
+            )
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
@@ -1147,6 +1157,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
                 + max(
                     chunk,
+                    capture_tokens,
                     (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
                 ),
             )

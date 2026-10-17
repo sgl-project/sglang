@@ -823,6 +823,27 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
 bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_sources)
 
 
+def deepseek_v4_encoder_window_store(layer, x, positions, qkv_a):
+    # Window history and write locations vary with the live folded request batch.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    rows = forward_batch.global_num_token_non_padded_cpu
+    if rows == 0:
+        return
+    layer._compute_kv_to_cache(
+        # Store the whole bucket: metadata write_loc includes padding rows.
+        x,
+        positions,
+        forward_batch,
+        get_attn_backend(),
+        qkv_a=qkv_a,
+    )
+
+
+bcg_deepseek_v4_encoder_window_store = eager_on_graph(True)(
+    deepseek_v4_encoder_window_store
+)
+
+
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -2283,6 +2304,14 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
+            elif (
+                not _is_hip
+                and not _is_npu
+                and is_in_breakable_cuda_graph()
+                and get_token_to_kv_pool().request_window is not None
+            ):
+                bcg_deepseek_v4_encoder_window_store(self, x_linear, positions, qkv_a)
+                kv = None
             else:
                 self._compute_kv_to_cache(
                     x_linear,
@@ -2394,6 +2423,14 @@ class MQALayer(MqaAttentionBase):
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
+
+        if (
+            forward_batch.forward_mode.is_extend()
+            and is_in_breakable_cuda_graph()
+            and get_token_to_kv_pool().request_window is not None
+        ):
+            # Keep dynamic window storage inside its eager boundary.
+            enable_multi_stream = False
 
         low_ratio_multi_stream = (
             ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
