@@ -471,6 +471,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
             self.parsed_pos = 0
 
         normal_text = "".join(normal_text_chunks) if normal_text_chunks else ""
+        # The separator between </tool_call> and the next <tool_call> is returned
+        # in the same StreamingParseResult as the calls, and serving_chat.py emits
+        # normal_text before them. It therefore lands between a tool call's
+        # argument fragments and its closing brace, and any consumer that tracks
+        # content-block type closes the tool_use block mid-arguments. Whitespace-
+        # only text while a tool call is in flight is only ever a separator, so
+        # drop it. See #24293; same approach as #29410 for the DeepSeek V3.2
+        # detector.
+        if (
+            normal_text
+            and not normal_text.strip()
+            and (calls or self.current_tool_id >= 0)
+        ):
+            normal_text = ""
         return StreamingParseResult(calls=calls, normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
