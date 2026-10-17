@@ -8,6 +8,7 @@ from huggingface_hub import snapshot_download
 
 from sglang.kernels.fused_op import get_fused_op_backend, set_fused_op_backend
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.models.gemma4_causal import Gemma4DecoderLayer, Gemma4TextModel
 from sglang.srt.runtime_context import SpawnRanks, create_context, use_context
 from sglang.srt.server_args import ServerArgs
@@ -52,9 +53,10 @@ class TestGemma4PleAddScale(CustomTestCase):
                 context.parallel.override(tp_group=None, attn_tp_group=None),
                 torch.no_grad(),
             ):
-                layer = Gemma4DecoderLayer(0, config).to(
-                    device="xpu", dtype=torch.bfloat16
-                )
+                with layer_stack():
+                    layer = Gemma4DecoderLayer(0, config).to(
+                        device="xpu", dtype=torch.bfloat16
+                    )
                 for parameter in layer.parameters():
                     parameter.requires_grad_(False)
                     parameter.fill_(1 / 256)
@@ -180,7 +182,8 @@ class TestGemma4PleAddScale(CustomTestCase):
                 self.assertEqual(actual.dtype, expected.dtype)
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                 set_fused_op_backend(KernelBackend.TORCH)
-                disabled = Gemma4DecoderLayer(0, config)
+                with layer_stack():
+                    disabled = Gemma4DecoderLayer(0, config)
                 self.assertIsNone(disabled._xpu_ple_add_scale)
         finally:
             set_fused_op_backend(previous)
