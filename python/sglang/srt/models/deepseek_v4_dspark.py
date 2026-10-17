@@ -686,6 +686,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
 
+    def _setup_low_latency_decode(self) -> None:
+        """The draft keeps the regular attention path; precompile_kernels_after_loading
+        calls this on the target model only."""
+
     @classmethod
     def shared_experts_fusion_disable_reason(
         cls,

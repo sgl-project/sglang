@@ -146,6 +146,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
+from sglang.srt.models import deepseek_v4_low_latency as low_latency
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
@@ -877,8 +878,9 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 
 
 class MqaAttentionBase(nn.Module):
-    # Class-level default for subclasses that read it without running __init__.
+    # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
+    ll_chain: Optional[low_latency.LowLatencyChain] = None
 
     def __init__(
         self,
@@ -1394,6 +1396,9 @@ class MQALayer(MqaAttentionBase):
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
         self.mega_wq_b_permuted = False
+        # Resolved by setup_low_latency_decode(), once the weights and the TP push
+        # plane are in place.
+        self.ll_chain: Optional[low_latency.LowLatencyChain] = None
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1479,11 +1484,35 @@ class MQALayer(MqaAttentionBase):
         attn_sink: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-    ) -> torch.Tensor:
+        *,
+        use_low_latency: bool = False,
+        positions: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
 
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
+        if use_low_latency:
+            # The chain's attention takes the query in its per-head layout, so it
+            # precedes pack_query; its e4m3 rows say wo_b is still the post's.
+            # Under mega attention _compute_q_b leaves q un-roped (the mega kernel
+            # rotates it); this attention only folds the inverse RoPE on its output.
+            fused_rope_inplace(
+                q[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+            return mhc.AttnOutput(
+                self.ll_chain.attention(
+                    q=q,
+                    attn_sink=attn_sink[: self.n_local_heads],
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    attn_layer=self.attn_mqa,
+                    compress_ratio=self.compress_ratio,
+                )
+            )
         if not self.mega_wq_b_permuted:
             q = pack_query(q, kernel_num_heads)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
@@ -2659,7 +2688,17 @@ class MQALayer(MqaAttentionBase):
 
         if self.use_mega_attention:
             o = self._forward_mega(
-                q, kernel_num_heads, attn_sink, forward_batch, attn_backend
+                q,
+                kernel_num_heads,
+                attn_sink,
+                forward_batch,
+                attn_backend,
+                use_low_latency=(
+                    defer_all_reduce
+                    and self.ll_chain is not None
+                    and self.ll_chain.is_active(forward_batch, q.shape[0])
+                ),
+                positions=positions,
             )
             return self._project_wo_b(o, defer_all_reduce)
 
@@ -2903,6 +2942,10 @@ class MQALayer(MqaAttentionBase):
         return self._project_wo_b(o, defer_all_reduce)
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
+        if isinstance(o, mhc.AttnOutput):
+            # The low-latency chain already holds wo_b; nothing to project.
+            return o
+
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 
         defer_all_reduce = defer_all_reduce and (
@@ -3463,6 +3506,18 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
                 leave_output_sum=True,
             )
             return output.finish(hidden_states)
+
+    def setup_low_latency_decode(self) -> None:
+        """Resolve the attention's fused low-latency decode chain. Runs after the
+        weights, the norm cache and the TP push plane are all in place."""
+        self.self_attn.ll_chain = low_latency.build_chain(
+            self.self_attn,
+            fused_mhc_post=(
+                self.boundary_mhc_fusions
+                and self.boundary_pre_from_prev
+                and self._can_fuse_attn_mhc
+            ),
+        )
 
     @functools.cached_property
     def _can_fuse_attn_mhc(self) -> bool:
@@ -4892,6 +4947,32 @@ class DeepseekV4ForCausalLM(nn.Module):
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
+        # The chain holds setup_mega_attention()'s wo_a above, so a weight update
+        # that rebuilt it must rebuild the chain too. The first load builds it in
+        # precompile_kernels_after_loading instead: the push plane does not exist yet,
+        # and the chain's gate must not read (and cache) use_flashinfer_mxfp8_wo_b
+        # before wo_b's weight processing has run.
+        self._setup_low_latency_decode(rebuild_only=True)
+
+    def _setup_low_latency_decode(self, *, rebuild_only: bool = False) -> None:
+        if rebuild_only and not any(
+            isinstance(module, DeepseekV4CudaDecoderLayer)
+            and module.self_attn.ll_chain is not None
+            for module in self.modules()
+        ):
+            return
+        chains = []
+        for module in self.modules():
+            if isinstance(module, DeepseekV4CudaDecoderLayer):
+                module.setup_low_latency_decode()
+                if module.self_attn.ll_chain is not None:
+                    chains.append(module.self_attn.ll_chain)
+        if chains:
+            log_info_on_rank0(
+                logger,
+                f"DSv4.1 fused low-latency decode chain on {len(chains)} layers, "
+                f"up to {chains[0].max_tokens} tokens.",
+            )
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (
@@ -4907,6 +4988,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
             register_fused_all_reduce_comm()
+
+        self._setup_low_latency_decode()
 
         for module in self.modules():
             if isinstance(

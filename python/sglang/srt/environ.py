@@ -1769,6 +1769,10 @@ class Envs:
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
     # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
+    # SM100 DeepSeek-V4.1 small-batch decode: replace the mega attention, the
+    # DeepGEMM fp8_einsum wo_a and the (wo_b + fused all-reduce + mHC post) pair
+    # with the fused low-latency chain (models/deepseek_v4_low_latency.py).
+    SGLANG_OPT_DSV41_LOW_LATENCY_DECODE = EnvBool(True)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.

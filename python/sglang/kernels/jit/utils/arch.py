@@ -71,6 +71,11 @@ def _jit_cuda_version() -> tuple[int, ...]:
     return get_cuda_version()
 
 
+def get_jit_cuda_version() -> tuple[int, ...]:
+    """``(major, minor)`` of the nvcc JIT builds run (see `_jit_cuda_version`)."""
+    return _jit_cuda_version()
+
+
 def _sail_arch_suffix(major: int, minor: int) -> str:
     """SAIL devices below the SM89 capability require the arch-specific target
     variant for JIT compilation (the ``"a"`` suffix); SM89+ SAIL devices stay

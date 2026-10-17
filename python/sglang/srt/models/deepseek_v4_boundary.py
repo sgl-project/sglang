@@ -91,6 +91,7 @@ class HcUpdate:
                 next=next,
                 world_size=self.layer.self_attn.attn_tp_size,
                 precomputed=state.stats,
+                chain=self.layer.self_attn.ll_chain,
             )
         return mhc.run_moe_post(
             hc,

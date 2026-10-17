@@ -3957,6 +3957,9 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        # Run the fused low-latency decode instead of the mega kernel; its
+        # cos_sin_cache is then [max_pos, 64] interleaved (cos, sin) pairs.
+        low_latency: bool = False,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -4046,6 +4049,22 @@ class DeepseekV4AttnBackend(
                 extra_indices = extra_indices.unsqueeze(1)
 
             assert attn_sink is not None
+
+            if low_latency:
+                return self._forward_low_latency_decode(
+                    q=q.squeeze(1),
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices.squeeze(1),
+                    positions=match_num_queries(core_attn_metadata.positions, value=0),
+                    cos_sin_cache=cos_sin_cache,
+                    attn_sink=attn_sink,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=(
+                        None if extra_indices is None else extra_indices.squeeze(1)
+                    ),
+                    extra_topk_lengths=extra_topk_lengths,
+                )
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 

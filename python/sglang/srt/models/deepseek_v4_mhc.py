@@ -36,6 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.models import deepseek_v4_low_latency as low_latency
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
@@ -112,7 +113,9 @@ HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
 
 
 class AttnOutput(NamedTuple):
-    """Attention's wo_b rows with the TP reduction left to the fused post."""
+    """Attention's wo_b rows with the TP reduction left to the fused post, or --
+    when they are e4m3 -- the low-latency chain's wo_a rows, which leave wo_b
+    itself to it as well."""
 
     partial: torch.Tensor
 
@@ -670,10 +673,28 @@ def run_attn_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
+    chain: Optional[low_latency.LowLatencyChain] = None,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
-    so the type is the ground truth."""
+    so the type is the ground truth. e4m3 rows are the low-latency chain's wo_a
+    output, which leaves wo_b to that kernel too."""
+    if isinstance(out, AttnOutput) and out.partial.dtype == low_latency.ROWS_DTYPE:
+        if next is not None:
+            pre, post_mix, comb = _compute_triplet(
+                hc, residual, stats_stream, precomputed
+            )
+            updated, normalized = chain.post(
+                out.partial,
+                residual,
+                post_mix,
+                comb,
+                pre,
+                next.norm.weight,
+                next.norm.variance_epsilon,
+            )
+            return HcState(updated, pre, HcNormed(normalized))
+        out = AttnOutput(chain.wo_b(out.partial))
     if isinstance(out, AttnOutput):
         from sglang.kernels.ops.communication.all_reduce_mhc import (
             all_reduce_mhc_post_combine_norm,

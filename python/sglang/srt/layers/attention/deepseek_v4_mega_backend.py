@@ -7,10 +7,16 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    SWA_WINDOW,
+    DeepseekV4AttnBackend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 HEAD_DIM = 512
+# Per-row key counts the low-latency decode kernel is built for (decode_attn.cuh:
+# indices [B, 128], extra_indices [B, 512]).
+LOW_LATENCY_INDEX_WIDTH = 512
 
 
 def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -94,6 +100,49 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             extra_topk_length=extra_topk_lengths,
         )
         return data, scale
+
+    def _forward_low_latency_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        attn_sink: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The fused low-latency decode: the same mega-fp8 ``(data, scale)`` contract
+        as :meth:`_forward_mega_decode`; ``cos_sin_cache`` is the [max_pos, 64]
+        interleaved (cos, sin) table (``view_as_real(freqs_cis).flatten(1)``)."""
+        from sglang.kernels.ops.attention.dsv4.low_latency.decode_attention import (
+            decode_attention,
+        )
+
+        assert swa_page_indices.shape[-1] == SWA_WINDOW, (
+            f"the low-latency decode kernel reads {SWA_WINDOW} SWA keys per row, "
+            f"got {swa_page_indices.shape[-1]}"
+        )
+        assert (
+            extra_indices is None or extra_indices.shape[-1] == LOW_LATENCY_INDEX_WIDTH
+        ), (
+            f"the low-latency decode kernel reads {LOW_LATENCY_INDEX_WIDTH} indexed "
+            f"keys per row, got {extra_indices.shape[-1]}"
+        )
+        return decode_attention(
+            q,
+            swa_k_cache,
+            swa_page_indices,
+            swa_topk_lengths,
+            attn_sink,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_lengths,
+            inv_rope=(cos_sin_cache, positions),
+        )
 
     def _forward_mega_prefill(
         self,
