@@ -377,7 +377,6 @@ class TestPrepareServerArgs(CustomTestCase):
             (16, 16, 4096, 128, "DSPARK", 768),
             (16, 16, None, 4096, "DSPARK", 24576),
             (16, 16, 4096, 4096, None, 256),
-            # Capture pads small request pools to its TP alignment.
             (8, 1, 1, 4096, "DSPARK", 48),
             (16, 4, 36, 4096, "DSPARK", 72),
         ):

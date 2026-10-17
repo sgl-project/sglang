@@ -94,7 +94,6 @@ def mega_moe_decode_tokens_per_rank(cfg) -> int:
     cg_config = cfg.cuda_graph_config
     decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
     if cfg.max_running_requests is not None:
-        # Capture clamps buckets to the per-rank request pool, padded to attn TP x CP.
         per_rank_requests = ceil_align(
             cfg.max_running_requests // cfg.attn_dp_size,
             cfg.tp_size // cfg.attn_dp_size,
