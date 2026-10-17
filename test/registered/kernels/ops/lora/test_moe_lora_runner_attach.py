@@ -194,6 +194,23 @@ class TestEngineAdmission(CustomTestCase):
         layer.w2_weight = layer.w2_weight.to(weight_dtype)
         return layer
 
+    def test_weight_family_of_a_block_fp8_layer(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        assert MoeLoraRunner._weight_family(self._fp8_layer()) == "fp8"
+
+    def test_rejects_per_tensor_fp8(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        with self.assertRaisesRegex(NotImplementedError, "128-block"):
+            MoeLoraRunner._weight_family(self._fp8_layer(block_quant=False))
+
+    def test_rejects_marlin_repacked_fp8(self):
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        with self.assertRaisesRegex(NotImplementedError, "float8_e4m3fn"):
+            MoeLoraRunner._weight_family(self._fp8_layer(weight_dtype=torch.bfloat16))
+
     def test_every_listed_vendor_resolves_and_others_fall_back_to_the_first(self):
         """Mixed-quant layers resolve independently, falling back to their family's vendor."""
         from sglang.srt.lora.moe.base_gemm_provider import VENDORS
