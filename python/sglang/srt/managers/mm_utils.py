@@ -256,8 +256,15 @@ def pad_mm_token_pairs(
     mm_inputs: MultimodalInputs,
     *,
     data_token_pairs: Optional[List[Tuple[int, int]]],
-    data_start_token_ids: List[int],
+    data_start_token_ids: Optional[List[int]] = None,
 ) -> array:
+    """Pad enclosed tokens without mutating input_ids; record item start offsets.
+
+    data_start_token_ids identifies new items, so slices can reuse an item's pad value.
+    By default, every start token begins a new item.
+    """
+    if data_start_token_ids is None:
+        data_start_token_ids = [s for s, _e in data_token_pairs]
     assert_int64_array(input_ids, "input_ids")
     pad_values = [item.pad_value for item in mm_inputs.mm_items]
     mm_inputs.data_offsets = []
@@ -305,6 +312,7 @@ def pad_mm_token_pairs(
 
 
 def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    """Pad inclusive per-item offsets without mutating the input token array."""
     assert_int64_array(input_ids, "input_ids")
     if not input_ids or not mm_inputs.mm_items:
         return input_ids
@@ -360,6 +368,8 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
     The padded value in a region enclosed by a token pair with be the same one, as the MultimodalDataItem's pad value
 
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
+
+    Kept for compatibility; new callers should use pad_mm_token_pairs.
     """
 
     def __init__(
@@ -395,6 +405,8 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
 class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be represented as repetitions of a single token
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
+
+    Kept for compatibility; new callers should use pad_mm_tokens.
     """
 
     def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
