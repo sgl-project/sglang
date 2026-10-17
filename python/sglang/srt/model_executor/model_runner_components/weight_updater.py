@@ -46,8 +46,10 @@ def _unsupported_derived_weight_cache_error(
     """Reject online weight updates that derived-weight caches cannot survive.
 
     Compensated mHC projections and HPC-Ops bf16xfp32 GEMM retain derived
-    weight splits that in-place loader writes do not refresh. Model-owned
-    caches can also declare this constraint via ``_derived_weight_cache_error``.
+    weight splits that in-place loader writes do not refresh. Models and plugins
+    can declare this constraint on any module via
+    ``weight_update_unsupported_reason``; ``_derived_weight_cache_error``
+    remains a backwards-compatible alias.
     Reject before writing weights to avoid serving stale cached values,
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
@@ -70,7 +72,9 @@ def _unsupported_derived_weight_cache_error(
         # Model-owned caches can publish the same rank-uniform constraint
         # without importing individual model implementations in the updater.
         for module in model.modules():
-            reason = getattr(module, "_derived_weight_cache_error", None)
+            reason = getattr(module, "weight_update_unsupported_reason", None)
+            if reason is None:
+                reason = getattr(module, "_derived_weight_cache_error", None)
             if reason is not None:
                 return reason
     from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
