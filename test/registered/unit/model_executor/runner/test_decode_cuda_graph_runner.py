@@ -405,5 +405,26 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
                 torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
 
 
+class TestRankConsistentAttentionGraphVariants(CustomTestCase):
+    def test_dp_attention_keeps_one_graph_per_batch_size(self):
+        """Under DP attention all ranks must replay the same decode graph, so the
+        per-rank DeepSeek-V4.1 variants are dropped; without DP they are kept."""
+        variants = SimpleNamespace(
+            capture_labels=("candidate_all", "candidate_filtered")
+        )
+        for attn_dp_enabled, expected in ((True, None), (False, variants)):
+            with (
+                self.subTest(attn_dp_enabled=attn_dp_enabled),
+                mock.patch.object(
+                    mod,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_dp_enabled=attn_dp_enabled),
+                ),
+            ):
+                self.assertIs(
+                    mod._rank_consistent_attention_graph_variants(variants), expected
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
