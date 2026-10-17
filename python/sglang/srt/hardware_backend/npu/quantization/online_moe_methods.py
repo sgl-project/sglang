@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -58,6 +61,42 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         # AscendRunnerCore.__init__ reads layer.w2_kernel to pick its activation.
         layer.w13_kernel = NPUMXFP8MoEMethod("w13")
         layer.w2_kernel = NPUMXFP8MoEMethod("w2")
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        # Inherited apply() consults this; aiter is CUDA/ROCm-only.
+        self._aiter_runner = None
+
+
+class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Online W4A8 MXFP FusedMoE entry point (``--quantization mxfp_w4a8``).
+
+    Same shape as ``NPUMXFP8OnlineMoEMethod``: weight creation, post-load
+    orchestration and the forward pass are the unquantized Ascend path, and only
+    the per-gmm kernel differs. ``NPUW4A8MXFP4MoEMethod`` then quantizes the BF16
+    expert weights to packed MXFP4 in ``process_weights_after_loading``.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            # Same trap as the MXFP8 entry point: subclassing
+            # UnquantizedFusedMoEMethod puts this method on FusedMoE's shard-swap
+            # list, so a flashinfer backend would load every expert with gate and
+            # up swapped and gmm1 would compute silu(up) * gate silently.
+            raise ValueError(
+                "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
+                f"'ascend', got {backend.value!r}."
+            )
+
+        layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
+        layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
