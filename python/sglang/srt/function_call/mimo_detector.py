@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import html
 import json
 import logging
 import re
@@ -24,6 +23,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
 from sglang.srt.function_call.utils import (
     get_schema_properties,
+    infer_type_from_json_schema,
     safe_literal_eval,
 )
 
@@ -36,7 +36,7 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
         if tool.function.name == func_name:
             props = get_schema_properties(tool.function.parameters)
             if param_name in props:
-                return props[param_name].get("type", "string")
+                return infer_type_from_json_schema(props[param_name]) or "string"
     return "string"
 
 
@@ -47,16 +47,12 @@ def _convert_param_value(
     Convert parameter value based on its type in the schema.
     Adapted from vllm-project/vllm (vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py)
     """
-    param_value = html.unescape(param_value)
-
-    # Handle null value for any type
-    if param_value.lower() == "null":
-        return None
-
     param_type = _get_param_type(func_name, param_name, tools)
 
     if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
         return param_value
+    elif param_value == "null":
+        return None
     elif (
         param_type.startswith("int")
         or param_type.startswith("integer")
@@ -278,7 +274,10 @@ class MiMoDetector(BaseFormatDetector):
         return {"name": func_name, "parameters": params}
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
+
+    def get_structural_tag_name(self) -> str:
+        return "mimo"

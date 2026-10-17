@@ -33,6 +33,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -6022,6 +6023,138 @@ class TestToolCallParserNames(unittest.TestCase):
             sorted(TOOL_CALL_PARSER_NAMES),
             sorted(FunctionCallParser.ToolCallParserEnum),
         )
+
+
+class TestMiMoStructuralTag(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="run",
+                    strict=True,
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "n": {"type": ["integer", "null"]},
+                            "data": {"type": "object"},
+                        },
+                        "required": ["text", "n", "data"],
+                        "additionalProperties": False,
+                    },
+                ),
+            )
+        ]
+        self.call = (
+            "<tool_call><function=run><parameter=text>\n北京 &amp;\n</parameter>"
+            '<parameter=n>2</parameter><parameter=data>{"items": [true, null]}</parameter></function></tool_call>'
+        )
+
+    def test_compact_xml_schema_constraints(self):
+        from xgrammar.testing import _is_grammar_accept_string
+
+        for policy in [
+            "auto",
+            "required",
+            ToolChoice(type="function", function=ToolChoiceFuncName(name="run")),
+        ]:
+            for thinking in [False, True]:
+                with self.subTest(policy=policy, thinking=thinking):
+                    detector = MiMoDetector()
+                    self.assertTrue(detector.supports_structural_tag())
+                    tag = detector.get_structural_tag(
+                        self.tools, policy, thinking_mode=thinking
+                    )
+                    grammar = xgr.Grammar.from_structural_tag(tag)
+                    prefix = "<think>plan</think>" if thinking else ""
+                    self.assertTrue(
+                        _is_grammar_accept_string(grammar, prefix + self.call)
+                    )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, prefix + "answer"),
+                        policy == "auto",
+                    )
+                    for invalid in [
+                        self.call.replace("function=run", "function=unknown"),
+                        self.call.replace("<parameter=n>2</parameter>", ""),
+                        self.call.replace("<parameter=n>2", "<parameter=n>bad"),
+                        self.call.replace("<parameter=n>", "<parameter=extra>"),
+                        self.call.replace(
+                            "</function>", "<parameter=n>3</parameter></function>"
+                        ),
+                    ]:
+                        self.assertFalse(
+                            _is_grammar_accept_string(grammar, prefix + invalid)
+                        )
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, prefix + self.call * 2),
+                        isinstance(policy, str),
+                    )
+                    single = xgr.Grammar.from_structural_tag(
+                        detector.get_structural_tag(
+                            self.tools,
+                            policy,
+                            thinking_mode=thinking,
+                            parallel_tool_calls=False,
+                        )
+                    )
+                    self.assertTrue(
+                        _is_grammar_accept_string(single, prefix + self.call)
+                    )
+                    self.assertFalse(
+                        _is_grammar_accept_string(single, prefix + self.call * 2)
+                    )
+
+    def test_non_strict_keeps_native_parameter_format(self):
+        from xgrammar.testing import _is_grammar_accept_string
+
+        self.tools[0].function.strict = False
+        grammar = xgr.Grammar.from_structural_tag(
+            MiMoDetector().get_structural_tag(self.tools, "required")
+        )
+        self.assertTrue(
+            _is_grammar_accept_string(
+                grammar,
+                "<tool_call><function=run><parameter=extra>anything</parameter></function></tool_call>",
+            )
+        )
+
+    def test_parameters_round_trip_without_html_or_string_coercion(self):
+        for text in ["\n北京 &amp;\n", "null", "42", ""]:
+            for number in ["2", "null"]:
+                with self.subTest(text=text, number=number):
+                    call = self.call.replace("\n北京 &amp;\n", text).replace(
+                        "<parameter=n>2", "<parameter=n>" + number
+                    )
+                    result = MiMoDetector().detect_and_parse(call, self.tools)
+                    self.assertEqual(
+                        json.loads(result.calls[0].parameters),
+                        {
+                            "text": text,
+                            "n": json.loads(number),
+                            "data": {"items": [True, None]},
+                        },
+                    )
+
+    def test_streamed_compact_calls_preserve_arguments(self):
+        # MiMo's tool-call markers are atomic tokenizer tokens; parameter tags are not.
+        chunks = [
+            "<tool_call>",
+            *self.call[len("<tool_call>") : -len("</tool_call>")],
+            "</tool_call>",
+        ]
+        detector = MiMoDetector()
+        calls = []
+        for chunk in chunks * 2:
+            calls.extend(detector.parse_streaming_increment(chunk, self.tools).calls)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call.tool_index for call in calls], [0, 1])
+        for call in calls:
+            self.assertEqual(
+                json.loads(call.parameters),
+                {"text": "\n北京 &amp;\n", "n": 2, "data": {"items": [True, None]}},
+            )
 
 
 if __name__ == "__main__":
