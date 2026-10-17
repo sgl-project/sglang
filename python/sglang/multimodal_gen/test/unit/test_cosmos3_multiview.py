@@ -49,7 +49,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     unpack_state,
     unpatchify_lidar,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     TRITON_SPARSE_BLOCK_SIZES,
     MultiviewBlockSparsity,
     build_multiview_block_sparsity,
@@ -61,7 +61,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention impor
     padded_multiview_flex_attention,
     resolve_masked_backend,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layout import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
@@ -70,13 +70,13 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_vision,
 )
-from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_decoder import (
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.decoder import (
     _DepthToPixels,
     crop_lidar_width,
     depth_to_space,
     lidar_network_to_metric,
 )
-from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.encoder import (
     Cosmos3LidarEncoder,
     _natten_backend_cache,
     _SpaceToDepth,
@@ -84,14 +84,14 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
     required_lidar_sweeps,
     resolve_natten_backend,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_lidar_outputs import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
     lidar_output_payload,
     lidar_payload_for_response,
     pool_lidar_azimuth,
     render_lidar_bev_frames,
     render_lidar_range_frames,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_multiview import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.multiview import (
     COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM,
     COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM,
     COSMOS3_MULTIVIEW_EMPHASIS,
@@ -948,7 +948,7 @@ class TestMaskedBackendResolution(unittest.TestCase):
     """``auto`` takes FA4 wherever its block-sparse kernels run, Triton elsewhere."""
 
     _AVAILABLE = (
-        "sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention"
+        "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention"
         ".fa4_sparse_available"
     )
 
@@ -2071,7 +2071,7 @@ class TestLidarNeighborhoodAttentionBackend(unittest.TestCase):
 
 def _dense_neighborhood_attention(q, k, v, kernel, dilation, scale):
     """Brute-force na2d: per query, softmax over its inward-shifted dilated window."""
-    from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+    from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.neighborhood_attention import (
         neighborhood_window_start,
     )
 
@@ -2106,7 +2106,7 @@ class TestLidarNeighborhoodAttentionFlex(unittest.TestCase):
     """The FlexAttention block mask must reproduce na2d's windows exactly."""
 
     def test_window_start_shifts_inward_and_respects_residue_classes(self):
-        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.neighborhood_attention import (
             neighborhood_window_start,
         )
 
@@ -2123,7 +2123,7 @@ class TestLidarNeighborhoodAttentionFlex(unittest.TestCase):
         )
 
     def test_matches_dense_reference_on_cpu(self):
-        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.neighborhood_attention import (
             neighborhood_attention_2d,
         )
 
@@ -2138,7 +2138,7 @@ class TestLidarNeighborhoodAttentionFlex(unittest.TestCase):
                 torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
 
     def test_rejects_windows_larger_than_a_residue_class(self):
-        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.neighborhood_attention import (
             neighborhood_block_mask,
         )
 
@@ -2151,7 +2151,7 @@ class TestLidarNeighborhoodAttentionFlex(unittest.TestCase):
             self.skipTest("needs natten")
         from natten.functional import na2d
 
-        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.neighborhood_attention import (
             neighborhood_attention_2d,
         )
 

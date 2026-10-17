@@ -11,8 +11,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
     CosmosDreamsRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
@@ -40,10 +38,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.pipelines.cosmos_dreams_realtime_pipeline import (
+from sglang.multimodal_gen.runtime.pipelines.cosmos3_simulation import (
     CosmosDreamsRealtimePipeline,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams_realtime import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.realtime import (
     ACTION_ROWS_CONDITION,
     CosmosDreamsSessionState,
     block_actions,

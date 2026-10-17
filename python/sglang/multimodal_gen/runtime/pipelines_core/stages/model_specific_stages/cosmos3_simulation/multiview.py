@@ -44,16 +44,16 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     pack_state,
     unpack_state,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layout import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
     MultiviewLayout,
     expand_multiview_condition_frame_indexes,
 )
-from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_decoder import (
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.decoder import (
     Cosmos3LidarDecoder,
 )
-from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.encoder import (
     Cosmos3LidarEncoder,
     pad_lidar_sweeps,
     required_lidar_sweeps,
@@ -68,7 +68,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TokenizationStage,
     _pil_to_uint8_tensor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_lidar_outputs import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
     lidar_output_payload,
     write_lidar_outputs,
 )

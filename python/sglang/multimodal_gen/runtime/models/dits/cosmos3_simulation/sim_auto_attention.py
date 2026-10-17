@@ -25,18 +25,18 @@ import msgspec
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     TRITON_KV_BLOCK_SIZE,
     TRITON_Q_BLOCK_SIZE,
     fa4_sparse_block_sizes,
     flex_attention,
     pack_allowed_bits,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_fa4 import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_fa4 import (
     Fa4BlockSparsity,
     fa4_block_sparse_attention,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layout import (
     CAPTION_SCOPE_ALL,
     CAPTION_SCOPE_SAME_VIEW,
     ROLE_CLEAN_TARGET,

@@ -32,7 +32,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     validate_lidar_config,
 )
-from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_neighborhood_attention import (
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.neighborhood_attention import (
     neighborhood_attention_2d,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

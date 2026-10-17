@@ -35,14 +35,16 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
     Cosmos3SimAutoTransformer,
     KVPair,
+    current_ulysses_group,
+    local_head_group,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_attention import (
     REPLAY_BACKENDS,
     ReplayMask,
     build_replay_mask,
     build_replay_plan,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layout import (
     PASS_CLEAN,
     PASS_NOISY,
     CaptionMetadata,
@@ -62,16 +64,12 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
     rgb_sensor_grid,
     ring_slot_for_step,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_parallel import (
-    current_ulysses_group,
-    local_head_group,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_multiview import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.multiview import (
     EXTRA_CAMERAS,
     EXTRA_CAPTION_LENGTHS,
     EXTRA_FRAMES_PER_VIEW,

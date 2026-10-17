@@ -37,10 +37,15 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
+    ChunkShard,
+    UlyssesGroup,
+    local_head_group,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     fa4_sparse_available,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_attention import (
     ReplayBlockMask,
     build_replay_block_mask,
     build_replay_fa4_mask,
@@ -49,7 +54,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_attention import
     dense_token_mask,
     replay_attention,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layout import (
     CAPTION_SCOPE_ALL,
     CAPTION_SCOPE_SAME_VIEW,
     PASS_CLEAN,
@@ -72,13 +77,8 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_layout import (
     rgb_sensor_grid,
     ring_slot_for_step,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto_parallel import (
-    ChunkShard,
-    UlyssesGroup,
-    local_head_group,
-)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_sim_auto import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.sim_auto import (
     ReplayRing,
     camera_major_slice,
     camera_major_write,

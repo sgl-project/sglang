@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams_frustum import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.frustum import (
     POSE_CHUNK_FRAMES,
     FrustumHistorySelector,
     SelectedHistory,

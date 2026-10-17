@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 import msgspec
 import torch
 
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     MultiviewBlockSparsity,
     fa4_sparse_block_sizes,
 )

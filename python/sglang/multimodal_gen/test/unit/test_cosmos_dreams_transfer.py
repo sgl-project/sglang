@@ -36,10 +36,10 @@ from sglang.multimodal_gen.registry import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     build_cosmos_dreams_position_ids,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     append_kv_history,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams_transfer import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.transfer import (
     CONTROL_EMPHASIS_TEMPLATE,
     TRANSFER_SYSTEM_PROMPT,
     align_pixel_frames_to_chunks,

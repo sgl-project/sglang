@@ -204,3 +204,16 @@ def register():
             )
         ],
     )
+
+
+COSMOS_DREAMS_REALTIME_KEEP_RESIDENT_MIN_AVAILABLE_GB = 40
+
+
+@dataclass
+class CosmosDreamsRealtimeConfig(CosmosDreamsConfig):
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return replace(
+            super().get_model_deployment_config(),
+            keep_resident_min_available_gb=COSMOS_DREAMS_REALTIME_KEEP_RESIDENT_MIN_AVAILABLE_GB,
+            keep_resident_components=("dit", "vae"),
+        )

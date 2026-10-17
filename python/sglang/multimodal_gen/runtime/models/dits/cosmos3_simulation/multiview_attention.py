@@ -41,7 +41,7 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.attention.flex_attention import flex_attention as torch_flex_attention
 
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layout import (
     AttentionScope,
     MaskItem,
     MultiviewAttentionContext,
@@ -958,7 +958,7 @@ def padded_multiview_flex_attention(
     )
     buffers = context.buffer_cache
     if context.layout.backend == "fa4":
-        from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_fa4 import (
+        from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_fa4 import (
             multiview_fa4_attention,
         )
 

@@ -638,7 +638,7 @@ def add_common_data_to_response(
             "domain_id": result.action_domain_id,
         }
     if result.lidar is not None:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_lidar_outputs import (
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
             lidar_payload_for_response,
         )
 

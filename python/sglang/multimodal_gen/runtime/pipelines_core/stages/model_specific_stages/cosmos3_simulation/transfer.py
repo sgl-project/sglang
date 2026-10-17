@@ -56,7 +56,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     VIDEO_RES_SIZE_INFO,
     canonical_aspect_ratio,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     EXTRA_GEOMETRY,
     EXTRA_TARGET_LATENT_FRAMES,
     EXTRA_TEXT_IDS,

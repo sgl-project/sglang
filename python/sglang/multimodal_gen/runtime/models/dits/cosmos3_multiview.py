@@ -56,10 +56,10 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     padded_multiview_flex_attention,
 )
-from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_layout import (
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layout import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,

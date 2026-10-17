@@ -10,8 +10,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
     CosmosDreamsRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_transfer import (

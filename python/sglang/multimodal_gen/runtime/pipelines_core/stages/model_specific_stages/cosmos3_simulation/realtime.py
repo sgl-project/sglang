@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     EXTRA_DOMAIN_ID,
     EXTRA_GEOMETRY,
     EXTRA_TEXT_IDS,

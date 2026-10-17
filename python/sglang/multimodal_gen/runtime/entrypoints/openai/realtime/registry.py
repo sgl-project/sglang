@@ -27,7 +27,7 @@ def _register_builtin_realtime_model_adapters() -> None:
     if _BUILTIN_ADAPTERS_REGISTERED:
         return
 
-    from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
         CosmosDreamsRealtimeConfig,
     )
     from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (

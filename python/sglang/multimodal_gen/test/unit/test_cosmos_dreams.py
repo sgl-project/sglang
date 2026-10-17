@@ -28,8 +28,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
-)
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_realtime import (
     CosmosDreamsRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
@@ -51,7 +49,7 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     CausalDecodeQueue,
     CosmosDreamsRolloutStage,
     _history_view,

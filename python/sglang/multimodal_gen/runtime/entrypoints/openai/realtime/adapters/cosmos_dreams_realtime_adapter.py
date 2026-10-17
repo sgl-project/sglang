@@ -36,7 +36,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams_realtime import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.realtime import (
     ACTION_ROWS_CONDITION,
 )
 from sglang.multimodal_gen.runtime.realtime.control_signals import (
