@@ -199,6 +199,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
+    # Lossless verify (--enable-linear-lossless-verify): cache per-position corrected
+    # values u (=beta*(v - k^T h)), the l2-normed k and the decay g instead of
+    # full [K,V] states. Per-layer shapes [slots, cache_steps, HV, {V,K,-}] (no
+    # K x V product -> ~K x smaller). S_accept is replayed post-accept.
+    u_states_buffer=None,
+    k_states_buffer=None,
+    g_states_buffer=None,
+    CACHE_U_TUPLES: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -289,7 +297,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # contiguous but `cache_idx * cache_steps * HV * K * V` can exceed int32 for
     # large slot counts.
     cache_idx = -1
-    if CACHE_INTERMEDIATE_STATES:
+    if CACHE_INTERMEDIATE_STATES or CACHE_U_TUPLES:
         cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
@@ -496,6 +504,37 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
+        # Lossless-verify tuple cache: store the corrected value u (=b_v here) per
+        # position. k (l2-normed) and g are also kept, so any accepted S_p can be
+        # replayed post-accept as h = exp(g) * h + k outer u.
+        if CACHE_U_TUPLES:
+            if cache_idx >= 0:
+                u_ptr = (
+                    u_states_buffer
+                    + cache_idx * cache_steps * HV * V
+                    + step_idx * HV * V
+                    + i_hv * V
+                    + o_v
+                )
+                tl.store(u_ptr, b_v.to(u_ptr.dtype.element_ty), mask=mask_v)
+                # k and g are independent of the V-block, so store them once per
+                # (step, v-head) from the i_v==0 program.
+                if i_v == 0:
+                    k_ptr = (
+                        k_states_buffer
+                        + cache_idx * cache_steps * HV * K
+                        + step_idx * HV * K
+                        + i_hv * K
+                        + o_k
+                    )
+                    tl.store(k_ptr, b_k.to(k_ptr.dtype.element_ty), mask=mask_k)
+                    g_ptr = (
+                        g_states_buffer
+                        + cache_idx * cache_steps * HV
+                        + step_idx * HV
+                        + i_hv
+                    )
+                    tl.store(g_ptr, b_g.to(g_ptr.dtype.element_ty))
         # A BF16 recurrent-state decode persists its state after every token.
         # Multi-token verification must make that precision boundary visible to
         # the next recurrence step instead of retaining the FP32 accumulator for
@@ -565,6 +604,10 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    # Lossless verify tuple ring (per-layer views [slots, steps, HV, ...]).
+    u_states_buffer: Optional[torch.Tensor] = None,
+    k_states_buffer: Optional[torch.Tensor] = None,
+    g_states_buffer: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -607,7 +650,11 @@ def fused_sigmoid_gating_delta_rule_update(
         K,
         V,
         is_kda,
-        target_verify=target_verify,
+        # The lossless tuple verify must tile exactly like the dense one it
+        # replaces, so its outputs stay bit-identical on every arch.
+        target_verify=(
+            target_verify or u_states_buffer is not None
+        ),
         cache_steps=cache_steps,
     )
     BK = triton.next_power_of_2(K)
@@ -639,6 +686,10 @@ def fused_sigmoid_gating_delta_rule_update(
     # allocated per-request pitch, which is preserved in stride(0).
     if intermediate_states_buffer is not None:
         cache_stride_steps = intermediate_states_buffer.stride(0) // (HV * K * V)
+    elif u_states_buffer is not None:
+        # The tuple ring keeps the allocated per-request pitch in dim 1, which
+        # can exceed the runtime draft count under --speculative-adaptive.
+        cache_stride_steps = u_states_buffer.shape[1]
     elif cache_steps is not None and cache_steps > 0:
         cache_stride_steps = cache_steps
     else:
@@ -739,6 +790,10 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_beta_slot=stride_beta_slot,
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
+        u_states_buffer=u_states_buffer,
+        k_states_buffer=k_states_buffer,
+        g_states_buffer=g_states_buffer,
+        CACHE_U_TUPLES=u_states_buffer is not None,
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
         ROUND_STATE_TO_BF16=round_state_to_bf16,
