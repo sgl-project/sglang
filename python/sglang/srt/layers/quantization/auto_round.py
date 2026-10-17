@@ -152,7 +152,7 @@ class AutoRoundConfig(QuantizationConfig):
             name for name, keys in gptq_config_keys.items() if not has_any_key(keys)
         )
 
-        return cls(
+        quant_config = cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
             sym=cls.get_from_keys(config, ["sym"]),
@@ -179,6 +179,18 @@ class AutoRoundConfig(QuantizationConfig):
             static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
             gptq_defaulted_config_keys=gptq_defaulted_config_keys,
         )
+        quant_config.update_packed_modules_mapping(
+            config.get("packed_modules_mapping", {})
+        )
+        return quant_config
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper):
+        if self.block_name_to_quantize is not None:
+            self.block_name_to_quantize = hf_to_sglang_mapper.apply_list(
+                self.block_name_to_quantize
+            )
+        if self.extra_config is not None:
+            self.extra_config = hf_to_sglang_mapper.apply_dict(self.extra_config)
 
     def get_scaled_act_names(self) -> list[str]:
         """Returns the activation function names that should be post-scaled.
