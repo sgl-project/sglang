@@ -132,6 +132,16 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
+        elif selected_backend == AttentionBackendEnum.GLUON_FAV3:
+            # Preserve the explicit backend identity for component validation.
+            # The implementation checks runtime shapes, dtypes, and architecture
+            # and delegates unsupported inputs to AITER.
+            logger.info("Using Gluon FAv3 backend with AITER fallback on ROCm.")
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "gluon_fav3.GluonFAv3Backend"
+            )
+
         elif selected_backend == AttentionBackendEnum.AITER_SAGE:
             if dtype in (torch.float16, torch.bfloat16):
                 logger.info("Using AITER Sage backend on ROCm.")
