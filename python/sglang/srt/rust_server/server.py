@@ -75,7 +75,7 @@ class RustServer:
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
     @classmethod
-    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
+    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[AnyRustMmSpec]:
         """Resolve the built-in Rust MM pipeline for a multimodal model, and
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
