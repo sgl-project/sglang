@@ -62,6 +62,9 @@ class ForwardMetadata:
     # h_track_buf snapshot (KDA path) with plain integer indexing, so the
     # copy into the track slots does not nonzero()-sync the stream.
     track_ssm_h_batch_src: Optional[torch.Tensor] = None
+    # FlashInfer KDA prefill memoizes its host read of cu_seqlens by int64 tensor
+    # identity, so every layer of a forward must get this same tensor object.
+    query_start_loc_int64: Optional[torch.Tensor] = None
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
