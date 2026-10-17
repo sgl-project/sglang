@@ -201,6 +201,9 @@ export const KimiK25Deployment = () => {
     // Blackwell (B300/GB300): CuteDSL MLA attention backend
     if (usesCutedslMla) {
       cmd += ' \\\n  --attention-backend cutedsl_mla';
+      if (speculative === 'enabled') {
+        cmd += ' \\\n  --speculative-attention-mode decode';
+      }
     }
 
     // FP8 KV cache for AMD and Blackwell memory efficiency

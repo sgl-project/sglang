@@ -25,6 +25,7 @@ COMMON_ARGS = [
     "--speculative-algorithm=EAGLE3",
     f"--speculative-draft-model-path={DRAFT_MODEL_PATH}",
     "--speculative-draft-model-quantization=unquant",
+    "--speculative-attention-mode=decode",
     "--nccl-port",
     GB300_NCCL_PORT,
 ]

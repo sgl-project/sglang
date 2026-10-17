@@ -198,6 +198,9 @@ export const KimiK26Deployment = () => {
 
     if (usesCutedslMla) {
       cmd += ' \\\n  --attention-backend cutedsl_mla';
+      if (speculative === 'enabled') {
+        cmd += ' \\\n  --speculative-attention-mode decode';
+      }
     }
 
     if (isAMD || usesCutedslMla) {
