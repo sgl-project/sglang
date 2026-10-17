@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     WaitingZmqRequest,
     WaitingZmqRequestGrpc,
     _ReceiveRegistrationRunner,
+    _select_mm_processor_prompt,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import EncoderDispatchErrorReq
@@ -393,6 +394,23 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestSelectMMProcessorPrompt(CustomTestCase):
+    def test_tokens_in_prompt_is_list(self):
+        """A tokens-in prompt reaches the processor as list[int], not array("q");
+        HTTP sends input_text=None and the gRPC servicer sends ""."""
+        processor = SimpleNamespace(prefer_tokenized_input=False)
+        for input_text in (None, ""):
+            with self.subTest(input_text=input_text):
+                recv_req = SimpleNamespace(
+                    input_text=input_text, input_ids=array("q", [1, 2, 3])
+                )
+
+                prompt = _select_mm_processor_prompt(recv_req, processor)
+
+                self.assertIsInstance(prompt, list)
+                self.assertEqual(prompt, [1, 2, 3])
 
 
 if __name__ == "__main__":
