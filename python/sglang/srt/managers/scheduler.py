@@ -185,6 +185,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromColocatedParamBytesReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1802,6 +1803,10 @@ class Scheduler(
                 (
                     UpdateWeightsFromIPCReqInput,
                     self.weight_updater.update_weights_from_ipc,
+                ),
+                (
+                    UpdateWeightsFromColocatedParamBytesReqInput,
+                    self.weight_updater.update_weights_from_colocated_param_bytes,
                 ),
                 (
                     UpdateWeightVersionReqInput,

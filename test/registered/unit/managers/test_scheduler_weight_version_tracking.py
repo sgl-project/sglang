@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    UpdateWeightsFromColocatedParamBytesReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -471,6 +472,28 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_colocated_param_bytes_pull_needs_an_open_sync_base_session(self):
+        """Outside a sync_base session the weights are in their packed serving layout, so raw param bytes would
+        corrupt them; the pull is refused on every rank before any socket is opened."""
+        for manager in (
+            self._manager(_runner(), session=False),
+            self._build_session_manager(sync_base=False),
+        ):
+            output = manager.update_weights_from_colocated_param_bytes(
+                UpdateWeightsFromColocatedParamBytesReqInput(
+                    socket_paths_by_device_uuid={}, timeout_s=1.0
+                )
+            )
+
+            self.assertFalse(output.success)
+            self.assertIn("sync_base weight-update session", output.message)
+            self.assertIsNone(manager._colocated_pull_socket)
+
+    def _build_session_manager(self, *, sync_base: bool):
+        manager = self._manager(_runner(), session=False)
+        manager._session = _WeightUpdateSession(selector="all", sync_base=sync_base)
+        return manager
+
     def test_distributed_update_receives_once_on_target_loads_into_each(self):
         """A draft runner that received its own broadcast would deadlock the update group."""
         target, draft = _runner(), _runner()
