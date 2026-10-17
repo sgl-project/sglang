@@ -13,6 +13,7 @@ Covers two bugs with the same crash signature
   origin_input_ids. Polarity: cache_k < loc.
 """
 
+import json
 import unittest
 
 import requests
@@ -97,6 +98,7 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--disable-radix-cache",
+                    "--enable-streaming-session",
                     "--chunked-prefill-size",
                     str(CHUNKED_PREFILL_SIZE),
                     "--cuda-graph-max-bs-decode",
@@ -110,6 +112,65 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
 
     def _assert_server_alive(self):
         self.assertIsNone(self.process.poll(), "server process crashed")
+
+    def test_session_input_embeds_rejection_and_recovery(self):
+        embeds = _embeds_for("The capital of France is")
+        sampling = {"temperature": 0, "max_new_tokens": 1}
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                opened = requests.post(
+                    self.base_url + "/open_session",
+                    json={"capacity_of_str_len": 128, "streaming": streaming},
+                    timeout=30,
+                )
+                opened.raise_for_status()
+                sid = opened.json()
+                try:
+                    for stream in (False, True):
+                        rejected = requests.post(
+                            self.base_url + "/generate",
+                            json={
+                                "input_embeds": [embeds, embeds],
+                                "session_params": {"id": sid, "replace": True},
+                                "sampling_params": sampling,
+                                "stream": stream,
+                            },
+                            timeout=30,
+                        )
+                        if stream:
+                            events = [
+                                json.loads(line[6:])
+                                for line in rejected.text.splitlines()
+                                if line.startswith("data: ") and line != "data: [DONE]"
+                            ]
+                            self.assertEqual(events[0]["error"]["code"], 400)
+                            message = events[0]["error"]["message"]
+                        else:
+                            self.assertEqual(rejected.status_code, 400)
+                            message = rejected.text
+                        self.assertIn(
+                            "input_embeds does not support session_params", message
+                        )
+                        recovered = requests.post(
+                            self.base_url + "/generate",
+                            json={
+                                "input_ids": [42, 43],
+                                "session_params": {"id": sid},
+                                "sampling_params": sampling,
+                            },
+                            timeout=120,
+                        )
+                        self.assertEqual(recovered.status_code, 200, recovered.text)
+                        self._assert_server_alive()
+                finally:
+                    requests.post(
+                        self.base_url + "/close_session",
+                        json={"session_id": sid},
+                        timeout=30,
+                    ).raise_for_status()
+        response = _generate(self.base_url, embeds, max_new_tokens=1)
+        self.assertEqual(response.status_code, 200, response.text)
+        self._assert_server_alive()
 
     def test_chunked_prefill_truncation_and_continuation(self):
         """Regression test for #20376.
