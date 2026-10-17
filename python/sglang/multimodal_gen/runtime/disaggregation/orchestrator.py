@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -65,6 +66,7 @@ def _deserialize_request_metrics(data: dict | None) -> RequestMetrics | None:
     metrics.stages = data.get("stages", {})
     metrics.denoising_stages = set(data.get("denoising_stages", ()))
     metrics.steps = data.get("steps", [])
+    metrics.cache_stats = deepcopy(data.get("cache_stats", {}))
     metrics.total_duration_ms = data.get("total_duration_ms", 0.0)
     for name, snapshot in data.get("memory_snapshots", {}).items():
         metrics.memory_snapshots[name] = MemorySnapshot(
