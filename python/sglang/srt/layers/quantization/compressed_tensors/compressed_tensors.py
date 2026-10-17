@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8MXFp8MoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -999,6 +1000,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise NotImplementedError(
                     "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
+        elif is_xpu() and self._is_mxfp8_w8a8(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW8A8MXFp8MoE")
+            return CompressedTensorsW8A8MXFp8MoE(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
