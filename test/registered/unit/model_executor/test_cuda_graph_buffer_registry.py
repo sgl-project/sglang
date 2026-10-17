@@ -1062,6 +1062,49 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))
 
+    def test_pp_input_missing_a_captured_key_leaves_that_slot_alone(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        # Capture buffers always hold a residual; a model whose residual is
+        # folded into hidden_states sends only hidden_states at replay.
+        hs = torch.zeros((8, 2), dtype=torch.int32)
+        residual = torch.zeros((8, 2), dtype=torch.int32)
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+            pp_proxy_tensors={"hidden_states": hs, "residual": residual},
+        )
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        pp = SimpleNamespace(
+            tensors={"hidden_states": torch.ones((3, 2), dtype=torch.int32)}
+        )
+        reg.fill_from(
+            _MiniForwardBatch(batch_size=3),
+            raw_bs=3,
+            padded_bs=4,
+            raw_num_tokens=3,
+            padded_num_tokens=8,
+            pp_proxy_tensors=pp,
+        )
+        self.assertTrue(torch.all(hs[:3] == 1))
+        self.assertTrue(torch.all(residual == 0))
+
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,

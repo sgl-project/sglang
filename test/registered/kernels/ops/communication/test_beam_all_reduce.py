@@ -1,0 +1,469 @@
+"""Beam all-reduce boundary numerics and shared-plane CUDA graph replay."""
+
+import os
+import unittest
+from unittest.mock import patch
+
+import torch
+import torch.distributed as dist
+
+import sglang.srt.distributed.parallel_state as ps
+from sglang.kernels.ops.communication.all_reduce import AllReduceAlgo
+from sglang.kernels.ops.communication.beam_all_reduce import beam_all_reduce_norm
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_forward,
+    get_lora,
+    get_parallel,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=450, stage="extra-b", runner_config="8-gpu-h200")
+
+
+class TestBeamAllReduce(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        override = get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig()
+        )
+        override.install()
+        cls.addClassCleanup(override.restore)
+        rank = int(os.environ["LOCAL_RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(rank)
+        dist.init_process_group(backend="gloo")
+        ps._WORLD = coord = ps.init_world_group(list(range(world)), rank, "nccl")
+        get_parallel().override_permanently(
+            world_group=coord,
+            tp_group=coord,
+            attn_tp_group=coord,
+            tp_size=world,
+            tp_rank=rank,
+            attn_tp_size=world,
+            attn_tp_rank=rank,
+            moe_tp_size=world,
+            moe_tp_rank=rank,
+        )
+        cls.group = coord.device_group
+        cls.comm = CustomAllReduceV2(
+            coord.cpu_group,
+            torch.device("cuda", rank),
+            max_push_size=2 * 1024 * 1024,
+            max_push_blocks=128,
+        )
+        if cls.comm.disabled:
+            raise RuntimeError(
+                "Beam collective test requires an NVLink V2 communicator"
+            )
+        register_comm_cleanup(cls.comm)
+        # Exercise the shared phase counters, regardless of platform tuning.
+        cls.comm.override_algo = AllReduceAlgo.ONE_SHOT_PUSH
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.comm.close()
+        dist.destroy_process_group()
+
+    @staticmethod
+    def norm(x, w):
+        x = x.float()
+        return (
+            x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * w.float()
+        ).bfloat16()
+
+    @staticmethod
+    def local_sum(x):
+        if x.ndim == 2:
+            return x
+        summed = torch.zeros_like(x[:, 0], dtype=torch.float32)
+        for expert in range(8):
+            summed += x[:, expert].float()
+        return (summed * 2.5).bfloat16()
+
+    def reference(self, x, residual, post, next_weight):
+        x = self.local_sum(x)
+        peers = [torch.empty_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(peers, x, group=self.group)
+        reduced = torch.zeros_like(x, dtype=torch.float32)
+        for peer in peers:
+            reduced += peer.float()
+        reduced = reduced.bfloat16()
+        combined = self.norm(reduced, post) * 0.13 + residual * 0.97
+        return (
+            (None if next_weight is None else self.norm(combined, next_weight)),
+            combined,
+            reduced,
+        )
+
+    def test_rounding_graph_replay_and_interleaved_collectives(self):
+        for topk in (1, 8):
+            for rows in (1, 8, 16, 32, 64, 128):
+                torch.manual_seed(42 + rows)
+                shape = (rows, 5120) if topk == 1 else (rows, 8, 5120)
+                x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+                x *= dist.get_rank() + 1
+                # Consecutive zero pairs exercise the 32-bit Lamport marker.
+                x[..., :16] = 0
+                residual = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+                post = torch.randn(5120, device="cuda", dtype=torch.bfloat16)
+                weight = torch.randn_like(post)
+                for next_weight in (None, weight):
+
+                    def fused():
+                        return beam_all_reduce_norm(
+                            self.comm.obj,
+                            x,
+                            residual,
+                            post,
+                            next_weight,
+                            1e-6,
+                            (0.13, 0.97),
+                            routed_scale=2.5,
+                        )
+
+                    fused()  # Compile before capture.
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        normed, combined = fused()
+                        reduced = self.comm.custom_all_reduce(self.local_sum(x))
+                        normed2, combined2 = fused()
+                    # Reuse graph storage with different payloads and several epochs.
+                    for change in (1.0, -0.5, 2.0):
+                        x.mul_(change)
+                        for _ in range(5):
+                            graph.replay()
+                        expected_norm, expected, expected_reduced = self.reference(
+                            x, residual, post, next_weight
+                        )
+                        torch.testing.assert_close(
+                            combined, expected, atol=0.016, rtol=0.016
+                        )
+                        torch.testing.assert_close(combined2, combined, atol=0, rtol=0)
+                        torch.testing.assert_close(
+                            reduced, expected_reduced, atol=0, rtol=0
+                        )
+                        if next_weight is not None:
+                            torch.testing.assert_close(
+                                normed, expected_norm, atol=0.032, rtol=0.016
+                            )
+                            torch.testing.assert_close(normed2, normed, atol=0, rtol=0)
+
+    def test_model_dispatch_preserves_fallbacks(self):
+        """Fusion must not bypass unsupported modes or the workspace bound."""
+        from sglang.srt.models.beam import BeamModel
+
+        model = BeamModel.__new__(BeamModel)
+        torch.nn.Module.__init__(model)
+        model.fuse_moe_all_reduce = True
+        model._beam_all_reduce_comm = None
+        hidden = torch.empty(1, 5120, device="cuda", dtype=torch.bfloat16)
+        with patch.object(get_parallel().tp_group, "ca_comm", self.comm):
+            limits = model._all_reduce_limits(hidden)
+            self.assertIsNotNone(limits)
+            # EP changes expert reduction ownership, not attention's TP group.
+            with get_parallel().override(
+                moe_ep_size=dist.get_world_size(),
+                moe_tp_size=1,
+                moe_ep_rank=dist.get_rank(),
+                moe_tp_rank=0,
+            ):
+                self.assertEqual(model._all_reduce_limits(hidden), (limits[0], 0))
+            # NVFP4 fuses attention only; its TRTLLM experts return summed outputs.
+            with patch.object(model, "fuse_moe_all_reduce", False):
+                self.assertEqual(model._all_reduce_limits(hidden), (limits[0], 0))
+            with get_parallel().override(
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_tp_group=None,
+                attn_dp_size=dist.get_world_size(),
+                attn_dp_rank=dist.get_rank(),
+            ):
+                self.assertIsNone(model._all_reduce_limits(hidden))
+            with get_parallel().override(
+                attn_cp_size=2,
+                attn_cp_rank=dist.get_rank() // (dist.get_world_size() // 2),
+                attn_tp_size=dist.get_world_size() // 2,
+                attn_tp_rank=dist.get_rank() % (dist.get_world_size() // 2),
+                attn_tp_group=None,
+            ):
+                self.assertIsNone(model._all_reduce_limits(hidden))
+            self.assertIsNone(model._beam_all_reduce_comm)
+            # Eligibility does not allocate; first use during capture must fall back.
+            with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+                self.assertIsNone(model._prepare_all_reduce_comm(hidden, max(limits)))
+            self.assertIsNone(model._beam_all_reduce_comm)
+            self.assertIs(
+                model._prepare_all_reduce_comm(hidden, max(limits)), self.comm.obj
+            )
+            with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+                self.assertIs(
+                    model._prepare_all_reduce_comm(hidden, max(limits)), self.comm.obj
+                )
+            self.assertFalse(self.comm.supports_push(nbytes=1, num_blocks=10**9))
+            self.assertFalse(
+                self.comm.supports_push(
+                    nbytes=self.comm.max_push_size + 1, num_blocks=1
+                )
+            )
+            with patch.object(self.comm, "disabled", True):
+                self.assertFalse(self.comm.supports_push(nbytes=1, num_blocks=1))
+            for guard in (
+                get_exec().comm.override(disable_custom_all_reduce=True),
+                get_exec().deterministic.override(enable_deterministic_inference=True),
+                get_lora().override(enable_lora=True),
+                get_forward().scoped(sp_active=True),
+            ):
+                with guard:
+                    self.assertIsNone(model._all_reduce_limits(hidden))
+            with patch.object(self.comm, "max_push_size", 1024):
+                self.assertIsNone(model._prepare_all_reduce_comm(hidden, max(limits)))
+            for unsupported in (hidden.float(), hidden[:, ::2], hidden[:0]):
+                self.assertIsNone(model._all_reduce_limits(unsupported))
+            with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
+                self.assertIsNone(model._all_reduce_limits(hidden))
+            if dist.get_world_size() == 4:
+                with patch("torch.cuda.get_device_capability", return_value=(10, 3)):
+                    hidden64 = torch.empty(
+                        64, 5120, device="cuda", dtype=torch.bfloat16
+                    )
+                    self.assertEqual(model._all_reduce_limits(hidden64[:32]), (32, 32))
+                    self.assertIsNone(model._all_reduce_limits(hidden64))
+
+    def test_flashinfer_ar_band_edges_and_fallbacks(self):
+        """Only token counts inside the measured band take the FlashInfer all-reduce."""
+        from sglang.srt.models.beam import BeamModel, _mlp_owes_single_tp_sum
+
+        model = BeamModel.__new__(BeamModel)
+        torch.nn.Module.__init__(model)
+        model._flashinfer_ar_tokens = (96, 640)
+        model._flashinfer_ar = object()
+
+        def tokens(n, dtype=torch.bfloat16):
+            return torch.empty(n, 5120, device="cuda", dtype=dtype)
+
+        for n, inside in ((95, False), (96, True), (640, True), (641, False)):
+            with self.subTest(tokens=n):
+                self.assertEqual(
+                    model._flashinfer_ar_for(tokens(n)) is not None, inside
+                )
+        self.assertIsNone(model._flashinfer_ar_for(tokens(128, torch.float32)))
+        with get_forward().scoped(sp_active=True):
+            self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
+        # The MLP takes it only when it owes one TP-wide sum that nothing else runs.
+        model._mlp_has_single_tp_sum = _mlp_owes_single_tp_sum()
+        self.assertTrue(model._can_replace_mlp_all_reduce())
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            self.assertFalse(
+                model._can_replace_mlp_all_reduce(), "reduce-scatter owns the sum"
+            )
+        world, rank = dist.get_world_size(), dist.get_rank()
+        if world >= 4:  # EP2 x MoE-TP(world/2): two partial sums, not one
+            half = world // 2
+            with get_parallel().override(
+                moe_ep_size=2,
+                moe_tp_size=half,
+                moe_ep_rank=rank // half,
+                moe_tp_rank=rank % half,
+            ):
+                self.assertFalse(_mlp_owes_single_tp_sum(), "hybrid EP needs two sums")
+        model._flashinfer_ar_tokens = None
+        self.assertIsNone(model._flashinfer_ar_for(tokens(128)))
+
+    def test_flashinfer_all_reduce_graph_replay(self):
+        """FlashInfer's all-reduce returns the FP32 rank-order sum, and replays of
+        consecutive attention/MLP boundaries sharing its workspace stay exact."""
+        from functools import partial
+
+        from sglang.kernels.jit.utils import is_arch_support_pdl
+        from sglang.kernels.ops.layernorm.beam_fused import (
+            fused_sandwich_residual_rmsnorm,
+        )
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            FlashInferWorkspaceManager,
+        )
+        from sglang.srt.models.beam import _flashinfer_all_reduce
+        from sglang.srt.utils import is_flashinfer_available
+
+        coord = get_parallel().tp_group
+        manager = FlashInferWorkspaceManager()
+        if is_flashinfer_available():
+            manager.initialize(
+                world_size=dist.get_world_size(),
+                rank=dist.get_rank(),
+                max_token_num=256,
+                hidden_dim=5120,
+                backend="mnnvl",
+                dtype=torch.bfloat16,
+                device_group=coord.device_group,
+                cpu_group=coord.cpu_group,
+            )
+        ready = torch.tensor([int(manager.workspace is not None)], dtype=torch.int32)
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=coord.cpu_group)
+        self.addCleanup(manager.cleanup)
+        if not ready.item():
+            self.skipTest("FlashInfer MNNVL workspace unavailable")
+        all_reduce = partial(_flashinfer_all_reduce, workspace=manager.workspace)
+        pdl = is_arch_support_pdl()
+        for rows in (96, 256):  # FlashInfer's one-shot and two-shot sizes
+            torch.manual_seed(7 + rows)
+            attn = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+            attn *= dist.get_rank() + 1
+            mlp = torch.randn_like(attn)
+            residual = torch.randn_like(attn)
+            post = torch.randn(5120, device="cuda", dtype=torch.bfloat16)
+            nxt = torch.randn_like(post)
+
+            def boundaries():
+                reduced_attn = all_reduce(attn)
+                normed, combined = fused_sandwich_residual_rmsnorm(
+                    reduced_attn, residual, post, nxt, 1e-6, 0.13, 0.97, enable_pdl=pdl
+                )
+                reduced_mlp = all_reduce(mlp)
+                _, combined2 = fused_sandwich_residual_rmsnorm(
+                    reduced_mlp, combined, post, nxt, 1e-6, 0.13, 0.97, enable_pdl=pdl
+                )
+                return reduced_attn, combined, reduced_mlp, combined2
+
+            boundaries()  # Compile before capture.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replayed = boundaries()
+            for change in (1.0, -0.5, 2.0):
+                attn.mul_(change)
+                mlp.mul_(-change)
+                for _ in range(3):
+                    graph.replay()
+                eager = boundaries()
+                names = ("attn sum", "attn combine", "mlp sum", "mlp combine")
+                for name, r, e in zip(names, replayed, eager):
+                    torch.testing.assert_close(
+                        r, e, atol=0, rtol=0, msg=f"replay {name} {rows=} {change=}"
+                    )
+                for actual, branch in ((replayed[0], attn), (replayed[2], mlp)):
+                    *_, expected = self.reference(branch, residual, post, nxt)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_attention_projection_reduction_ownership(self):
+        """Deferring o_proj must perform exactly one collective before its norm."""
+        from sglang.srt.configs.beam import BeamConfig
+        from sglang.srt.models.beam import BeamAttention
+
+        class IdentityAttention(torch.nn.Module):
+            def forward(self, q, k, v, forward_batch):
+                return v
+
+        config = BeamConfig(
+            hidden_size=5120,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=64,
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            mlp_layer_types=["dense"],
+        )
+        with torch.device("cuda"):
+            attention = BeamAttention(config, 0)
+        attention = attention.bfloat16()
+        attention.attn = IdentityAttention()
+        # All attention projections and o_proj remain real TP operators; only
+        # the KV-cache attention backend is replaced by a fixed local value.
+        torch.manual_seed(104 + dist.get_rank())
+        for name, parameter in attention.named_parameters():
+            if "norm.weight" in name:
+                parameter.data.fill_(1)
+            else:
+                parameter.data.normal_(std=0.01)
+        for rows in (1, 16, 64):
+            torch.manual_seed(211 + rows)
+            hidden = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+            positions = torch.arange(rows, device="cuda")
+            scales = torch.ones(rows, 1, device="cuda")
+            expected = attention(positions, hidden, None, scales)
+            local = attention(positions, hidden, None, scales, skip_all_reduce=True)
+            peers = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+            dist.all_gather(peers, local, group=self.group)
+            # FP32 rank summation is the fused collective's explicit contract.
+            reduced = sum((peer.float() for peer in peers)).bfloat16()
+            torch.testing.assert_close(expected, reduced, atol=0.016, rtol=0.016)
+            self.assertFalse(torch.equal(local, reduced))
+            post = torch.ones(5120, device="cuda", dtype=torch.bfloat16)
+            _, actual = beam_all_reduce_norm(
+                self.comm.obj, local, hidden, post, None, 1e-6, (0.13, 0.97)
+            )
+            combined = self.norm(reduced, post) * 0.13 + hidden * 0.97
+            torch.testing.assert_close(actual, combined, atol=0.016, rtol=0.016)
+
+    def test_dense_mlp_reduction_ownership(self):
+        """A skipped down_proj reduction fuses into the MLP boundary exactly once."""
+        from sglang.srt.configs.beam import BeamConfig
+        from sglang.srt.models.beam import BeamMLP
+
+        config = BeamConfig(hidden_size=5120, intermediate_size=1024)
+        with torch.device("cuda"):
+            mlp = BeamMLP(config).bfloat16()
+        torch.manual_seed(307 + dist.get_rank())
+        for parameter in mlp.parameters():
+            parameter.data.normal_(std=0.02)
+        for rows in (1, 16, 32):
+            torch.manual_seed(401 + rows)
+            hidden = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+            expected = mlp(hidden)
+            local = mlp(hidden, skip_all_reduce=True)
+            peers = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+            dist.all_gather(peers, local, group=self.group)
+            reduced = sum((peer.float() for peer in peers)).bfloat16()
+            torch.testing.assert_close(expected, reduced, atol=0.016, rtol=0.016)
+            self.assertFalse(torch.equal(local, reduced))
+            post = torch.ones(5120, device="cuda", dtype=torch.bfloat16)
+            _, actual = beam_all_reduce_norm(
+                self.comm.obj, local, hidden, post, None, 1e-6, (0.13, 0.97)
+            )
+            combined = self.norm(reduced, post) * 0.13 + hidden * 0.97
+            torch.testing.assert_close(actual, combined, atol=0.016, rtol=0.016)
+
+    def test_deferred_experts_preserve_routing_rounding(self):
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            fused_experts_impl,
+        )
+
+        torch.manual_seed(123 + dist.get_rank())
+        w1 = torch.randn(8, 256, 5120, device="cuda", dtype=torch.bfloat16) * 0.02
+        w2 = torch.randn(8, 5120, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+        for rows in (1, 8, 32):
+            x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+            ids = (
+                torch.arange(8, device="cuda", dtype=torch.int32)
+                .expand(rows, -1)
+                .contiguous()
+            )
+            weights = torch.rand(rows, 8, device="cuda").softmax(-1)
+            for interleaved in (False, True):
+                kwargs = dict(
+                    inplace=False,
+                    filter_expert=False,
+                    routed_scaling_factor=2.5,
+                    fuse_swiglu_interleaved=interleaved,
+                )
+                combined = fused_experts_impl(x, w1, w2, weights, ids, **kwargs)
+                deferred = fused_experts_impl(
+                    x, w1, w2, weights, ids, defer_sum=True, **kwargs
+                )
+                torch.testing.assert_close(
+                    self.local_sum(deferred), combined, atol=0, rtol=0
+                )
+
+
+if __name__ == "__main__":
+    if os.environ.get("_IS_TEST_MULTIGPU_SGLANG_JIT_KERNEL"):
+        unittest.main()
+    else:
+        multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4, 8))

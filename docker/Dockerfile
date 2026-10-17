@@ -518,10 +518,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install nixl nixl-cu13 --no-deps \
     && uv pip install "cuda-python>=13,<14"
 
-# Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+# Keep SGLang's pins and resolve inflect with Dynamo's typeguard dependency.
+# grpcio-tools 1.84.0 supports the Protobuf 7 dependency set.
+# Pin a stable Dynamo release without allowing prereleases: an unbounded
+# request silently resolved to the empty ai-dynamo==0.0.0a0 placeholder.
+# ai-dynamo-runtime caps pydantic below the frozen pin, so release only the
+# pydantic pins for this solve and record the versions it selects.
+ARG INSTALL_DYNAMO=1
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+    set -- "grpcio-tools==1.84.0" \
+    && if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        set -- "$@" "ai-dynamo==1.5.1" inflect \
+        && sed -i -E '/^pydantic(-core)?==/d' /sgl-workspace/constraints.txt; \
+    fi \
+    && uv pip install -c /sgl-workspace/constraints.txt \
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://pypi.nvidia.com/ "$@" \
+    && if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        uv pip freeze | grep -E '^pydantic(-core)?==' >> /sgl-workspace/constraints.txt \
+        && python3 -c "import dynamo.runtime, inflect"; \
+    fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
@@ -620,10 +636,12 @@ ENV SGLANG_RUST_BUILD_MODE=never
 
 
 # Install pre-built gateway artifacts from parallel builder
+# --reinstall re-resolves the wheel's dependencies; the constraints keep the
+# frozen pins, including the Dynamo-compatible pydantic recorded above.
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --reinstall /tmp/gateway_wheels/*.whl \
+    uv pip install --reinstall -c /sgl-workspace/constraints.txt /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory

@@ -55,6 +55,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "input_embeds",
         "kv_hints",
         "log_metrics",
+        "lora_backfill_paths",
         "lora_id",
         "max_dynamic_patch",
         "max_thinking_tokens",
