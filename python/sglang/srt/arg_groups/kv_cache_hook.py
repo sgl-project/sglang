@@ -109,10 +109,78 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         )
 
 
+def _handle_ultraquant_compatibility(cfg: Any, server_args: Any) -> None:
+    """UltraQuant stores keys rotated, so it needs its own attention backend."""
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    uses_ultraquant_kv = cfg.kv_cache_dtype == "ultraquant_4bit"
+    backends = {prefill_backend, decode_backend}
+
+    if uses_ultraquant_kv and backends != {"ultraquant"}:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit requires the ultraquant attention "
+            "backend for both prefill and decode, because UltraQuant stores keys "
+            "Hadamard-rotated. Pass --attention-backend ultraquant. Got prefill="
+            f"{prefill_backend!r}, decode={decode_backend!r}."
+        )
+    if "ultraquant" in backends and not uses_ultraquant_kv:
+        raise ValueError(
+            "--attention-backend ultraquant only reads an UltraQuant KV cache. "
+            "Pass --kv-cache-dtype ultraquant_4bit, or choose another attention "
+            f"backend. Got --kv-cache-dtype={cfg.kv_cache_dtype!r}."
+        )
+    if uses_ultraquant_kv and not get_platform().is_hip:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit is currently validated only on ROCm."
+        )
+    if not uses_ultraquant_kv:
+        return
+
+    # These paths copy KV outside the attention backend or split it across
+    # pools, and have not been validated with the UltraQuant pool layout.
+    unsupported = {
+        "--enable-unified-memory": cfg.enable_unified_memory,
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--enable-lmcache": cfg.enable_lmcache,
+        "--disaggregation-mode": cfg.disaggregation_mode != "null",
+        "--speculative-algorithm": cfg.speculative_algorithm is not None,
+        "--pp-size": cfg.pp_size > 1,
+        "--dcp-size": cfg.dcp_size > 1,
+    }
+    enabled = [flag for flag, is_set in unsupported.items() if is_set]
+    if enabled:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit does not support "
+            f"{', '.join(enabled)} yet."
+        )
+
+    if use_mla_backend(server_args):
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit does not support MLA models; the "
+            "recipe stores separate rotated K and unrotated V."
+        )
+    model_config = model_config_of(server_args)
+    if model_config.is_hybrid_swa:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit does not support hybrid "
+            "sliding-window models yet; SWAKVPool builds its sliding-window "
+            "pool without the UltraQuant recipe."
+        )
+
+    import torch
+
+    if model_config.dtype != torch.bfloat16:
+        raise ValueError(
+            "--kv-cache-dtype=ultraquant_4bit supports bfloat16 models only; "
+            f"got {model_config.dtype}."
+        )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 
     cfg = resolving_view(server_args)
+
+    _handle_ultraquant_compatibility(cfg, server_args)
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return
