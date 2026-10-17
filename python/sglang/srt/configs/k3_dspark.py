@@ -74,4 +74,12 @@ class K3DSparkConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.n_routed_experts = n_routed_experts
         self.block_size = block_size
-        self.rope_parameters = rope_parameters
+        # DeepseekV2DecoderLayer indexes rope_parameters["rope_theta"] whenever
+        # the attribute exists. Leave it unset unless the checkpoint has it, so
+        # the layer reads rope_theta / rope_scaling instead.
+        if rope_parameters is not None:
+            self.rope_parameters = rope_parameters
+        elif hasattr(self, "rope_parameters"):
+            del self.rope_parameters
+        if not hasattr(self, "rope_scaling"):
+            self.rope_scaling = None

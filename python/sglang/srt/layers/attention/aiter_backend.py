@@ -392,6 +392,7 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
         # Captured at init. The process-wide flag is flipped for the K3 MLA
         # draft only; the target keeps the value it saw when it was built.
         self.use_mla_ps_kernel = False
@@ -1465,6 +1466,36 @@ class AiterAttnBackend(AttentionBackend):
             # their KV, and that KV can be NaN. Gluon, the kernel this path
             # replaces, does not read row 0.
             k_buffer_flat[0].zero_()
+        # The K3 draft is bf16 Q against an fp8 latent. Repeat-padding those
+        # heads to 16 and leaving Q in bf16 selects a16w8. Quantize with the
+        # scale the kernel will dequantize, so the launch stays a8w8 qh16.
+        # A draft block is bidirectional: causal=False is what maps qlen>1
+        # onto the msk0 tile. qlen 3 keeps three rows; that tile reads
+        # qo_indptr's width and must not be given a fourth row.
+        if (
+            self.is_draft_worker
+            and self.head_pad_mode == "repeat"
+            and self.use_mla_ps_kernel
+            and self.dcp_world_size <= 1
+            and self.kv_cache_dtype == fp8_dtype
+            and q.dtype != fp8_dtype
+            and int(kwargs.get("max_seqlen_q") or 1) <= _MLA_ASM_PS_MAX_QLEN
+        ):
+            # qseqlen4 only. A draft prefill wider than 4 tokens must stay on
+            # the long-qlen fp8 cast below; quantizing it here launches the
+            # qseqlen4 kernel at that width and page-faults (seen at 90 tokens).
+            q_scale = kwargs.get("q_scale")
+            if not isinstance(q_scale, torch.Tensor) or q_scale.numel() != 1:
+                q_scale = None
+            q_fp8, q_scale = scaled_fp8_quant(q.reshape(q.shape[0], -1), q_scale)
+            q = q_fp8.view(q.shape)
+            kwargs["q_scale"] = q_scale
+            # Only the speculative block is bidirectional. A draft prefill
+            # chunk is wider than num_draft_tokens and stays causal.
+            block_q = int(self.num_draft_tokens or 0)
+            qlen = int(kwargs.get("max_seqlen_q") or 1)
+            if "causal" not in kwargs and block_q > 1 and 1 < qlen <= block_q:
+                kwargs["causal"] = False
         if (
             self.kv_cache_dtype == fp8_dtype
             and self.mla_kernel_num_head_padded == 16
@@ -3115,11 +3146,17 @@ class AiterAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             assert verify_tokens_per_req is not None
-            # MLA uses a fixed draft length (num_draft_tokens); the non-MLA
-            # unified path derives it per batch from input_ids.
-            tokens_per_req = (
-                self.num_draft_tokens if self.use_mla else verify_tokens_per_req
-            )
+            # MLA target verify uses the fixed speculative width. The K3
+            # draft graph is captured at query_token_num (one shorter than
+            # the verify width when sampling from the anchor). input_ids
+            # already has that width; do not substitute the verify width or
+            # the kernel reads a query row the draft never wrote.
+            if self.is_draft_worker:
+                tokens_per_req = int(verify_tokens_per_req)
+            else:
+                tokens_per_req = (
+                    self.num_draft_tokens if self.use_mla else verify_tokens_per_req
+                )
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
@@ -3130,12 +3167,12 @@ class AiterAttnBackend(AttentionBackend):
             )
             if self.use_mla:
                 use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
-                    self.num_draft_tokens
+                    tokens_per_req
                 )
                 kv_lens = (
                     seq_lens
                     if (self.dcp_world_size > 1 and not use_asm_cprr_verify)
-                    else seq_lens + self.num_draft_tokens
+                    else seq_lens + tokens_per_req
                 )
             else:
                 kv_lens = seq_lens
@@ -3145,7 +3182,7 @@ class AiterAttnBackend(AttentionBackend):
             # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
             if seq_lens_sum is not None:
                 kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+                    tokens_per_req * bs if self.use_mla else 0
                 )
                 assert_buffer_fits(
                     kv_indices_used,
@@ -3180,7 +3217,7 @@ class AiterAttnBackend(AttentionBackend):
                         :bs
                     ],
                 )
-                n_rows = bs * self.num_draft_tokens
+                n_rows = bs * tokens_per_req
                 (
                     verify_token_table,
                     local_kv_lens,
@@ -3188,7 +3225,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr,
                     req_pool_indices,
                     bs,
-                    self.num_draft_tokens,
+                    tokens_per_req,
                     self._dcp_graph_max_local_kv_len(),
                     out=self.cuda_graph_verify_token_table[:n_rows],
                     out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
@@ -3202,14 +3239,14 @@ class AiterAttnBackend(AttentionBackend):
                         verify_token_table,
                         local_kv_lens,
                         bs,
-                        self.num_draft_tokens,
+                        tokens_per_req,
                         out_indices=self.cuda_graph_cprr_kv_indices,
                         out_indptr=self.cuda_graph_cprr_kv_indptr,
                         out_empty=self.cuda_graph_cprr_empty_rows,
                     )
 
             if self.use_mla:
-                max_q_len = self.num_draft_tokens
+                max_q_len = tokens_per_req
                 if self.use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):

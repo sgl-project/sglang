@@ -523,6 +523,26 @@ class DSparkWorkerV2(BaseSpecWorker):
                 import sglang.srt.layers.attention.aiter_backend as _aiter_backend
 
                 _aiter_backend._use_mla_ps_kernel = persist_restore
+        # speculative_num_draft_tokens is the target verify width (gamma + 1
+        # when the draft samples from the anchor). The draft graph and its
+        # KV are query_token_num wide. Leaving the backend at the verify
+        # width makes qo_indptr / the KV lookup one row longer than Q, and
+        # mla_a8w8_qh16_qseqlen4 page-faults on that row.
+        if getattr(self, "_draft_mla_no_dcp", False):
+            draft_backend = self.draft_model_runner.attn_backend
+            query_width = int(self.query_token_num)
+            if (
+                draft_backend is not None
+                and query_width > 0
+                and getattr(draft_backend, "num_draft_tokens", None) != query_width
+            ):
+                draft_backend.num_draft_tokens = query_width
+                if get_parallel().tp_rank == 0:
+                    logger.info(
+                        "K3DSpark draft attention width is %s; target verify width stays %s.",
+                        query_width,
+                        self.verify_num_draft_tokens,
+                    )
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
@@ -544,10 +564,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         capture_decode_cuda_graph = self._decode_graph_allowed
-        # The bs=32 draft graph captures, then faults on the first real
-        # proposal. Run this draft eagerly until that replay is fixed.
-        if getattr(self, "_draft_mla_no_dcp", False):
-            capture_decode_cuda_graph = False
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
             self.device,
@@ -577,24 +593,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            # The persistent qh16/qseqlen4 kernel faults on the odd decode
-            # buckets (bs=30 was the first). Capture only bs=32 for this draft.
-            # The target keeps the full bucket list so a one-request verify
-            # replays its own graph instead of padding into the mamba buffer.
-            decode_cfg = get_exec().graph.cuda_graph_config.decode
-            saved_bs = decode_cfg.bs
-            narrow = bool(getattr(self, "_draft_mla_no_dcp", False)) and bool(
-                saved_bs
+            self._draft_worker.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
             )
-            if narrow:
-                decode_cfg.bs = [32] if 32 in list(saved_bs) else [max(saved_bs)]
-            try:
-                self._draft_worker.init_cuda_graphs(
-                    capture_decode_cuda_graph=capture_decode_cuda_graph
-                )
-            finally:
-                if narrow:
-                    decode_cfg.bs = saved_bs
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
