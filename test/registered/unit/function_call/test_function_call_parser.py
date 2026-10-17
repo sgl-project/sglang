@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -33,6 +34,7 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -3981,6 +3983,46 @@ class TestLing3Detector(unittest.TestCase):
                 self.assertEqual(len(tool_calls), 1)
                 self.assertEqual(tool_calls[0]["name"], "get_weather")
                 self.assertEqual(tool_calls[0]["parameters"], expected)
+
+
+class TestMinimaxM2Detector(unittest.TestCase):
+    def test_streaming_unclosed_tags_parse_in_linear_time(self):
+        """Unclosed <invoke name="..."> / <parameter name="..."> tags must not
+        stall the stream (it runs on the event loop); a complete call still
+        streams its name and arguments."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            ),
+        ]
+        detector = MinimaxM2Detector()
+        call = (
+            '<minimax:tool_call><invoke name="get_weather">'
+            '<parameter name="city">Paris</parameter></invoke>'
+        )
+
+        start = time.perf_counter()
+        result = detector.parse_streaming_increment(call, tools)
+        detector.parse_streaming_increment('<invoke name="' * 12000, tools)
+        MinimaxM2Detector().parse_streaming_increment(
+            '<minimax:tool_call><invoke name="get_weather">'
+            + '<parameter name="city">' * 8000,
+            tools,
+        )
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads("".join(c.parameters for c in result.calls)), {"city": "Paris"}
+        )
 
 
 class TestJsonArrayParser(unittest.TestCase):
