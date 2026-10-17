@@ -668,6 +668,10 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Restrict prefill-decode interval protection to unfinished prompt chunks.
+    # DP attention retains its synchronized fixed cadence. Default preserves
+    # protection after every prefill batch.
+    SGLANG_PDI_CHUNKED_ONLY = EnvBool(False)
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)

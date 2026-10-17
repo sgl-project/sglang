@@ -1323,6 +1323,7 @@ class Scheduler(
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
+        self.pdi_chunked_only = envs.SGLANG_PDI_CHUNKED_ONLY.get()
         self._prefill_decode_interval_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -1386,7 +1387,17 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            # Protect decoding between unfinished prompt chunks. Completed
+            # prefills can admit the next request immediately in this mode.
+            # DP ranks retain the globally synchronized fixed cadence.
+            protect_decode = (
+                not self.pdi_chunked_only
+                or self.require_mlp_sync
+                or batch.chunked_req is not None
+            )
+            self._prefill_decode_interval_remaining = (
+                self.prefill_decode_interval if protect_decode else 0
+            )
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
