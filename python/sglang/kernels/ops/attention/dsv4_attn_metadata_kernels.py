@@ -437,6 +437,21 @@ class BuildCausalSwaPageIndices:
         )
 
 
+def late_layer_tail_lens(
+    extend_lens_cpu: list[int],
+    tail_len: int,
+    whole_extend: Optional[list[bool]] = None,
+) -> list[int]:
+    """Each request's late-layer tail: its last min(tail_len, extend_len) tokens,
+    or its whole extend where whole_extend is set."""
+    if whole_extend is None:
+        return [min(tail_len, n) for n in extend_lens_cpu]
+    return [
+        n if whole else min(tail_len, n)
+        for n, whole in zip(extend_lens_cpu, whole_extend)
+    ]
+
+
 def late_layer_tail_layout(
     *,
     extend_lens_cpu: list[int],
@@ -459,7 +474,7 @@ def late_layer_tail_layout(
             device=device,
             whole_extend=whole_extend,
         )
-    tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    tail_lens_cpu = late_layer_tail_lens(extend_lens_cpu, tail_len)
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
         floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
@@ -488,10 +503,7 @@ def _whole_extend_tail_layout(
     device: torch.device,
     whole_extend: list[bool],
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-    tail_lens_cpu = [
-        n if whole else min(tail_len, n)
-        for n, whole in zip(extend_lens_cpu, whole_extend)
-    ]
+    tail_lens_cpu = late_layer_tail_lens(extend_lens_cpu, tail_len, whole_extend)
     token_indices, floor, start = [], [], 0
     for n, t, s, whole in zip(
         extend_lens_cpu, tail_lens_cpu, seq_lens_cpu, whole_extend

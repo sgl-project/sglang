@@ -1,6 +1,5 @@
-"""Decoder SWA bounded replay: requests that read rows before their last
-SWA_WINDOW (prompt logprobs, every hidden state) run their whole extend through
-the late layers. CPU only."""
+"""Decoder SWA bounded replay: requests that read prompt rows (prompt logprobs,
+every hidden state) run their whole extend through the late layers. CPU only."""
 
 import unittest
 from types import SimpleNamespace
@@ -17,7 +16,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     late_layer_whole_extend,
 )
-from sglang.srt.managers.scheduler_components import dp_attn
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -111,53 +109,48 @@ class TestWholeExtendLayout(CustomTestCase):
 
 
 class TestPrefillGraphTailCapacity(CustomTestCase):
-    def _can_run(self, batch, capacity):
+    """The backend's graph check and the DP vote's view of it agree: no DP rank
+    replays the prefill graph while another runs the step eagerly."""
+
+    def _backend(self, capacity):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.enable_decoder_swa_bounded_replay = True
         backend._prefill_graph_tail_capacity = lambda: capacity
         backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
-        batch.seq_lens_cpu = torch.tensor([400] * len(batch.extend_seq_lens_cpu))
-        with patch.object(
-            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=16384
-        ):
-            return backend.can_run_prefill_cuda_graph(batch)
+        return backend
 
-    def test_whole_extend_counts_against_the_tail_block(self):
-        self.assertTrue(self._can_run(_batch([300, 300]), capacity=256))
-        # A prompt-logprob request's tail no longer fits: run the step eagerly.
-        self.assertFalse(self._can_run(_batch([300, 300], starts=[0, 300]), 256))
-        self.assertTrue(self._can_run(_batch([300, 300], starts=[0, 300]), 428))
-
-
-class TestDpPrefillGraphVote(CustomTestCase):
-    def _vote(self, batch, capacity):
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend._prefill_graph_tail_capacity = lambda: capacity
-        runner = SimpleNamespace(
-            _backend_fits_late_tail=backend.prefill_graph_fits_late_tail
-        )
-        return dp_attn._late_layer_tail_vote(batch, runner, SpeculativeAlgorithm.NONE)
-
-    def _schedule_batch(self, extend_lens, starts=None, hidden=None):
-        reqs = [
-            SimpleNamespace(return_hidden_states_mode=hidden or CaptureHiddenMode.NULL)
-            for _ in extend_lens
-        ]
-        return SimpleNamespace(
+    def _both(self, extend_lens, capacity, starts=None, full=False):
+        hidden = CaptureHiddenMode.FULL if full else CaptureHiddenMode.NULL
+        forward_batch = _batch(extend_lens, starts, capture=hidden)
+        forward_batch.seq_lens_cpu = torch.tensor([400] * len(extend_lens))
+        schedule_batch = SimpleNamespace(
             extend_lens=extend_lens,
             extend_logprob_start_lens=starts,
             return_logprob=starts is not None,
-            reqs=reqs,
+            reqs=[SimpleNamespace(return_hidden_states_mode=hidden)] * len(extend_lens),
         )
+        backend = self._backend(capacity)
+        with (
+            patch.object(
+                deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=16384
+            ),
+            patch.object(
+                deepseek_v4_backend,
+                "get_server_return_hidden_states_mode",
+                return_value=CaptureHiddenMode.NULL,
+            ),
+        ):
+            can_run = backend.can_run_prefill_cuda_graph(forward_batch)
+            vote = backend.vote_prefill_cuda_graph(schedule_batch)
+        self.assertEqual(can_run, vote)
+        return vote
 
-    def test_vote_matches_the_backend_check(self):
-        # The vote sees the same tail the backend builds, so no DP rank replays
-        # the graph while another runs the step eagerly.
-        self.assertTrue(self._vote(self._schedule_batch([300, 300]), 256))
-        self.assertFalse(self._vote(self._schedule_batch([300, 300], [0, 300]), 256))
-        self.assertTrue(self._vote(self._schedule_batch([300, 300], [0, 300]), 428))
-        full = self._schedule_batch([300], hidden=CaptureHiddenMode.FULL)
-        self.assertFalse(self._vote(full, 256))
+    def test_whole_extend_counts_against_the_tail_block(self):
+        self.assertTrue(self._both([300, 300], capacity=256))
+        # A prompt-logprob request's tail no longer fits: run the step eagerly.
+        self.assertFalse(self._both([300, 300], 256, starts=[0, 300]))
+        self.assertTrue(self._both([300, 300], 428, starts=[0, 300]))
+        self.assertFalse(self._both([300], 256, full=True))
 
 
 class TestTailReadersCheck(CustomTestCase):

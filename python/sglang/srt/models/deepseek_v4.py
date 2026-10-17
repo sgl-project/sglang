@@ -4607,12 +4607,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
             logits_metadata.extend_logprob_start_lens_cpu = (
-                # Prompt-logprob starts, moved from the extend into the tail.
+                # A prompt-logprob reader's tail is its whole extend, so its start
+                # stands; every other start is the extend's end.
                 [
-                    start - (n - t)
-                    for start, n, t in zip(
+                    min(start, t)
+                    for start, t in zip(
                         forward_batch.extend_logprob_start_lens_cpu,
-                        forward_batch.extend_seq_lens_cpu,
                         tail.extend_seq_lens_cpu,
                     )
                 ]

@@ -13,10 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    get_batch_return_hidden_states_mode,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _decode_total_seq_lens,
     _prefill_attention_pairs,
@@ -36,7 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
@@ -447,8 +444,11 @@ def _local_prefill_cuda_graph_vote(
         return True
     if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
         return False
-    if mode in (ForwardMode.EXTEND, ForwardMode.MIXED) and not _late_layer_tail_vote(
-        local_batch, prefill_graph_runner, spec_algorithm
+    backend_vote = prefill_graph_runner._backend_vote_prefill_cuda_graph
+    if (
+        mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and backend_vote is not None
+        and not backend_vote(local_batch)
     ):
         return False
     return prefill_graph_runner.can_replay_locally(
@@ -477,32 +477,6 @@ def _local_prefill_cuda_graph_vote(
             else None
         ),
     )
-
-
-def _late_layer_tail_vote(
-    local_batch: ScheduleBatch,
-    prefill_graph_runner: PrefillCudaGraphRunner,
-    spec_algorithm: SpeculativeAlgorithm,
-) -> bool:
-    """Decoder SWA bounded replay: the attention backend runs a step eagerly when
-    its late-layer tail outgrows the prefill graph's tail block; the vote carries
-    that verdict so no DP rank replays while another runs eagerly."""
-    fits = prefill_graph_runner._backend_fits_late_tail
-    if fits is None:
-        return True
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        late_layer_whole_extend_of,
-    )
-
-    whole_extend = late_layer_whole_extend_of(
-        extend_lens=local_batch.extend_lens,
-        logprob_start_lens=local_batch.extend_logprob_start_lens,
-        return_logprob=local_batch.return_logprob,
-        full_hidden_states=get_batch_return_hidden_states_mode(local_batch.reqs)
-        == CaptureHiddenMode.FULL
-        and not spec_algorithm.is_dspark(),
-    )
-    return fits(local_batch.extend_lens, whole_extend)
 
 
 def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
