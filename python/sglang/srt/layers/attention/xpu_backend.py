@@ -151,7 +151,17 @@ class XPUAttentionBackend(AttentionBackend):
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.is_frozen_kv_mtp_draft = (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
+        # Frozen-KV drafts own only a dummy pool; reads and SWA translation
+        # must use the target allocator's pool, including during graph setup.
+        self.token_to_kv_pool = (
+            model_runner.token_to_kv_pool_allocator.get_kvcache()
+            if self.is_frozen_kv_mtp_draft
+            else model_runner.token_to_kv_pool
+        )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -160,8 +170,8 @@ class XPUAttentionBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+            and self.token_to_kv_pool.swa_layer_nums > 0
         )
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -1732,7 +1742,7 @@ class XPUAttentionBackend(AttentionBackend):
                 seq_len_delta=kv_len_offset,
             )
 
-        if self.use_sliding_window_kv_pool:
+        if self.use_sliding_window_kv_pool and not self.is_frozen_kv_mtp_draft:
             if forward_batch.out_cache_loc is None:
                 raise ValueError(
                     f"out_cache_loc is None for hybrid SWA model in graph "

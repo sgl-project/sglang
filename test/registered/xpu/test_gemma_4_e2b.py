@@ -10,8 +10,9 @@ Run from test/srt::
 
   python3 -m unittest xpu.test_gemma_4_e2b.TestGemma4E2BXPU.test_simple_qa
 
-Full-model and text-only launches verify that the model boots on XPU,
-preserves processor token IDs, and rejects media without its encoders.
+Full-model, text-only, and frozen-KV MTP launches verify that the model boots
+on XPU and returns coherent replies. The MTP case also exercises repeated
+draft graph replay through a multi-step response.
 
 Server is started with ``sglang serve`` (``--model-impl sglang``).
 """
@@ -183,14 +184,69 @@ class TestGemma4E2BTextOnlyXPU(TestGemma4E2BXPU):
         self.assertIn("--language-model-only", response.text)
 
 
-# Full-model and text-only launches.
+class TestGemma4E2BMTPXPU(TestGemma4E2BXPU):
+    """Synchronous MTP must accept scheduler inputs and capture XPU drafts."""
+
+    server_args = XPU_SERVER_ARGS + [
+        "--language-model-only",
+        "--cuda-graph-backend-decode",
+        "full",
+        "--context-length",
+        "2048",
+        "--max-total-tokens",
+        "32768",
+        "--max-running-requests",
+        "8",
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-draft-model-path",
+        f"{MODEL}-assistant",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--speculative-eagle-topk",
+        "1",
+    ]
+
+    def test_recurrent_draft_graph(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {"role": "user", "content": "Count from 1 to 30, separated by commas."}
+            ],
+            temperature=0,
+            max_tokens=160,
+            extra_body={"return_spec_tokens_details": True},
+        )
+        self.assertIn(
+            ", ".join(str(i) for i in range(1, 31)),
+            response.choices[0].message.content or "",
+        )
+        self.assertGreater(response.usage.completion_tokens, 10)
+        spec = response.model_dump()["sglext"]["spec_tokens_details"]
+        self.assertGreater(spec["spec_verify_ct"], 1)
+        self.assertGreater(spec["spec_accept_length"], 1)
+
+        info = requests.get(
+            f"{self.base_url.removesuffix('/v1')}/server_info",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=30,
+        )
+        info.raise_for_status()
+        state = info.json()["internal_states"][0]
+        self.assertGreater(state["startup_time"]["cuda_graph"]["draft_decode"], 0)
+
+
+# Full-model, text-only, and MTP launches, including recurrent XPU drafts.
 register_xpu_ci(
-    est_time=360,
+    est_time=600,
     suite="nightly-xpu-kernel-main-1-gpu",
     nightly=True,
 )
 register_xpu_ci(
-    est_time=360,
+    est_time=600,
     suite="nightly-xpu-kernel-wheel-1-gpu",
     nightly=True,
 )
