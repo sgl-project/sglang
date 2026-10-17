@@ -352,6 +352,23 @@ def _preprocess_layout_digest(ctx: EncodeContext) -> tuple[int, int]:
 
 
 @dataclass
+class PreparedBatch:
+    """A batch that finished the CPU stage and is waiting for its ViT forward.
+
+    Owns the encode refs taken during preparation, so whoever holds one of these
+    must hand it to MMEncoder.batch_encode_forward — even when `error` is set —
+    or those refs are never released.
+    """
+
+    requests: List[dict]
+    modality: Modality
+    states: List[Optional["ReqState"]]
+    keep_on_gpu: bool
+    ctx: Optional[EncodeContext] = None
+    error: Optional[Exception] = None
+
+
+@dataclass
 class ReqState:
     """The result and in-flight work for one encoder request."""
 
@@ -651,6 +668,8 @@ class MMEncoder:
                 self.context, zmq.PULL, schedule_path, True
             )
         self.background_tasks: Set[asyncio.Task] = set()
+        # Set by enable_forward_thread() when pipelined dispatch is active.
+        self._forward_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
         # Embedding dtype = model param dtype. Always available (both transfer
         # backends and the global-cache pool rely on it).
@@ -1012,7 +1031,37 @@ class MMEncoder:
             offset += num_patches
         return hashes
 
-    def _encode_missing(
+    def enable_forward_thread(self) -> None:
+        """Move ViT forwards onto a dedicated thread.
+
+        The pipelined dispatch path needs the event loop free while the GPU runs,
+        so it can keep preprocessing the next batch. One thread only, so forwards
+        stay serialized exactly as they are inline.
+
+        The worker must adopt this encoder's device: PyTorch's current device is
+        thread-local, so a fresh thread would otherwise issue every op on device
+        0. Same device also means the same default stream, so ordering against
+        work still issued from the loop thread is preserved.
+        """
+        if self._forward_executor is not None:
+            return
+        device_module = torch.get_device_module(self.device)
+        self._forward_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="encoder_forward",
+            initializer=device_module.set_device,
+            initargs=(self.gpu_id,),
+        )
+
+    async def _run_forward(self, fn, *args):
+        """Run one blocking ViT forward, off the loop when a forward thread exists."""
+        if self._forward_executor is None:
+            return fn(*args)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._forward_executor, fn, *args
+        )
+
+    async def _encode_missing(
         self,
         mm_feature,
         preprocess_result: EncoderPreprocessResult,
@@ -1028,16 +1077,21 @@ class MMEncoder:
             mm_feature, preprocess_result, indices, modality
         )
 
-        forward_start = time.perf_counter()
-        with torch.inference_mode():
-            new_embeddings = get_feature_fn(mm_items)
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
-        if encoder_metrics_collector is not None:
-            encoder_metrics_collector.observe_model_forward(
-                time.perf_counter() - forward_start, modality=modality.name.lower()
-            )
+        def _forward() -> torch.Tensor:
+            forward_start = time.perf_counter()
+            with torch.inference_mode():
+                new_embeddings = get_feature_fn(mm_items)
+                if new_embeddings.ndim != 2:
+                    new_embeddings = new_embeddings.reshape(
+                        -1, new_embeddings.shape[-1]
+                    )
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_model_forward(
+                    time.perf_counter() - forward_start, modality=modality.name.lower()
+                )
+            return new_embeddings
 
+        new_embeddings = await self._run_forward(_forward)
         return self.slice_embedding(new_embeddings, (token_counts[i] for i in indices))
 
     def _build_model_mm_items(
@@ -1132,6 +1186,7 @@ class MMEncoder:
         *,
         use_global_cache: bool,
         is_health_check: bool = False,
+        preloaded_images: Optional[List] = None,
     ) -> EncodeContext:
         """Flatten a batch of requests into one EncodeContext (single = N of 1)."""
         modality_str = modality.name.lower()
@@ -1140,7 +1195,9 @@ class MMEncoder:
             (
                 preprocess_result,
                 items_per_req,
-            ) = await self.preprocessor.process_batch_mm_items(requests, modality)
+            ) = await self.preprocessor.process_batch_mm_items(
+                requests, modality, preloaded_images=preloaded_images
+            )
         except MMError:
             raise
         except NotImplementedError as e:
@@ -1173,7 +1230,17 @@ class MMEncoder:
         mm_inputs = preprocess_result.mm_inputs
         grid_thw = preprocess_result.grid_thw
         token_counts = preprocess_result.token_counts
-        mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+        if get_encoder_preprocessed_items(mm_inputs) is not None:
+            # Model preprocessors (EncoderPreprocessOutput) carry per-item
+            # features on mm_items; there may be no aggregate feature tensor and
+            # none is needed: both _build_model_mm_items and
+            # _calculate_hashes_from_features branch on the preprocessed items
+            # and ignore mm_feature.
+            mm_feature = None
+        else:
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+        if mm_feature is not None and not mm_feature.is_cuda:
+            mm_feature = mm_feature.to(self.gpu_id)
         num_items = len(grid_thw)
         if num_items != sum(items_per_req):
             raise InternalError(
@@ -1231,6 +1298,7 @@ class MMEncoder:
         *,
         use_global_cache: bool,
         is_health_check: bool = False,
+        preloaded_images: Optional[List] = None,
     ) -> EncodeContext:
         """Prepare one context consistently before TP ranks enter model forward."""
         ctx = None
@@ -1242,6 +1310,7 @@ class MMEncoder:
                 modality,
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
+                preloaded_images=preloaded_images,
             )
         except Exception as e:
             local_error = e
@@ -1637,7 +1706,7 @@ class MMEncoder:
 
         new_slices = []
         if missing_indices:
-            new_slices = self._encode_missing(
+            new_slices = await self._encode_missing(
                 ctx.mm_feature,
                 ctx.preprocess_result,
                 missing_indices,
@@ -1665,7 +1734,7 @@ class MMEncoder:
                 f"Req {ctx.req_id}: All ranks running ViT fallback "
                 f"for {len(fallback_indices)} items."
             )
-            fallback_slices = self._encode_missing(
+            fallback_slices = await self._encode_missing(
                 ctx.mm_feature,
                 ctx.preprocess_result,
                 fallback_indices,
@@ -1758,17 +1827,25 @@ class MMEncoder:
                         cache_hit = True
 
             if mm_embedding is None:
-                forward_start = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
-                    if not keep_on_gpu:
-                        mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
-                if encoder_metrics_collector is not None and not ctx.is_health_check:
-                    encoder_metrics_collector.observe_model_forward(
-                        time.perf_counter() - forward_start, modality=modality_str
-                    )
+
+                def _forward() -> torch.Tensor:
+                    forward_start = time.perf_counter()
+                    with torch.inference_mode():
+                        embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
+                        if not keep_on_gpu:
+                            embedding = embedding.cpu()
+                    if len(embedding.shape) != 2:
+                        embedding = embedding.reshape(-1, embedding.shape[-1])
+                    if (
+                        encoder_metrics_collector is not None
+                        and not ctx.is_health_check
+                    ):
+                        encoder_metrics_collector.observe_model_forward(
+                            time.perf_counter() - forward_start, modality=modality_str
+                        )
+                    return embedding
+
+                mm_embedding = await self._run_forward(_forward)
 
             try:
                 self._validate_embedding_token_count(ctx, mm_embedding)
@@ -2227,42 +2304,104 @@ class MMEncoder:
         return [(0, 0, 0, msg, code)] * len(requests)
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self,
+        requests: List[dict],
+        modality: Modality,
+        preloaded_images: Optional[List] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
         Fuse-or-not is EncoderScheduler policy, not an API fork. Health probes
         bypass caches and stage on CPU so completion confirms a model forward.
+
+        Thin composition of batch_preprocess (CPU) and batch_encode_forward
+        (GPU), kept as one call so existing callers behave identically. The
+        pipelined dispatch path invokes the two stages separately so the next
+        batch's preprocessing overlaps this batch's ViT forward.
+
+        ``preloaded_images`` (rank-0 IMAGE path) are images already decoded by
+        the out-of-process loader; TP followers always load inline.
+        """
+        prepared = await self.batch_preprocess(
+            requests, modality, preloaded_images=preloaded_images
+        )
+        return await self.batch_encode_forward(prepared)
+
+    async def batch_preprocess(
+        self,
+        requests: List[dict],
+        modality: Modality,
+        preloaded_images: Optional[List] = None,
+    ) -> PreparedBatch:
+        """CPU stage: HF preprocessing and metadata publish.
+
+        The heavy processor work runs in preproc_executor, so awaiting this
+        yields the event loop and lets an already-prepared batch's GPU forward
+        proceed concurrently.
+
+        A failure is recorded on the returned PreparedBatch instead of being
+        raised, because the batch already owns encode refs: the caller must run
+        batch_encode_forward either way, and that is what releases them.
+
+        Uses ``_prepare_encode_context_on_all_ranks`` so the TP path keeps its
+        layout-digest barrier; overlap dispatch is single-rank only and still
+        goes through this call.
         """
         states = [self._acquire_encode_ref(req["req_id"]) for req in requests]
         is_health_check = all(
             is_health_check_request(req["req_id"]) for req in requests
         )
-        keep_on_gpu = self.use_mooncake and not is_health_check
-        use_global_cache = self.mm_global_cache is not None and not is_health_check
+        prepared = PreparedBatch(
+            requests=requests,
+            modality=modality,
+            states=states,
+            keep_on_gpu=self.use_mooncake and not is_health_check,
+        )
         try:
             if self.rank == 0:
                 async with encode_state_condition:
                     encode_state_condition.notify_all()
-            ctx = await self._prepare_encode_context_on_all_ranks(
+            prepared.ctx = await self._prepare_encode_context_on_all_ranks(
                 requests,
                 modality,
-                use_global_cache=use_global_cache,
+                use_global_cache=self.mm_global_cache is not None
+                and not is_health_check,
                 is_health_check=is_health_check,
+                preloaded_images=preloaded_images,
             )
-            mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+        except Exception as e:
+            prepared.error = e
+        return prepared
+
+    async def batch_encode_forward(
+        self, prepared: PreparedBatch
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """GPU stage: ViT forward, staging, and every collective of the batch.
+
+        Always releases the encode refs the PreparedBatch holds, including on
+        the preprocessing-failure path, so a prepared batch can never leak them.
+        """
+        requests = prepared.requests
+        modality = prepared.modality
+        try:
+            if prepared.error is not None:
+                return self._stage_errors(requests, modality, prepared.error)
+            ctx = prepared.ctx
+            mm_embedding = await self._compute_embedding(
+                ctx, keep_on_gpu=prepared.keep_on_gpu
+            )
 
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
 
             return self._stage_embeddings(
-                ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
+                ctx, requests, mm_embedding, keep_on_gpu=prepared.keep_on_gpu
             )
         except Exception as e:
             return self._stage_errors(requests, modality, e)
         finally:
-            for state in states:
+            for state in prepared.states:
                 await self._release_encode_ref(state)
 
     async def encode(
