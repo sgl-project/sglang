@@ -116,11 +116,13 @@ class TestNixlBackendInitialization(CustomTestCase):
             gpu_id=gpu_id,
             kv_data_ptrs=[],
             kv_item_lens=[],
+            state_types=[],
         )
         mgr = object.__new__(NixlKVManager)
         mgr.kv_args = args
         mgr.disaggregation_mode = mode
         mgr.enable_deferred_decode_kv_release = False
+        mgr.pp_size = mgr.attn_cp_size = mgr.dcp_size = 1
 
         api = types.ModuleType("nixl._api")
         api.nixl_agent = MagicMock(return_value=agent)
@@ -509,6 +511,57 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         self.assertIsNone(handle)
         self.assertEqual(mgr.agent.get_xfer_descs_calls, [])
         self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+    def test_prepared_mamba_rejects_stride_mismatch_before_fallback(self):
+        """Different SSM dtypes must not write into the wrong decode request slot."""
+        for src_stride, dst_stride in ((32, 16), (16, 32)):
+            with self.subTest(src_stride=src_stride, dst_stride=dst_stride):
+                mgr = object.__new__(NixlKVManager)
+                mgr.agent = MagicMock()
+                mgr.pp_size = mgr.state_tp_size = 1
+                mgr.is_mla_backend = False
+                mgr._use_strided_descs = True
+                mgr._prepared_state_components = frozenset({0})
+                mgr._prepared_state_plans = {}
+                mgr._state_layout_rejections = {}
+                mgr.kv_args = SimpleNamespace(
+                    state_types=[StateType.MAMBA],
+                    state_data_ptrs=[[0x10000, 0x11000]],
+                    state_data_lens=[[16 * 16, src_stride * 16]],
+                    state_item_lens=[[16, src_stride]],
+                    state_layer_ids=[[0, 0]],
+                    mla_compression_ratios=None,
+                )
+                peer = SimpleNamespace(
+                    agent_name="decode",
+                    decode_tp_size=1,
+                    dst_dcp_size=1,
+                    requires_dcp_relayout=False,
+                    dst_state_data_ptrs=[[0x20000, 0x21000]],
+                    dst_state_data_lens=[[16 * 16, dst_stride * 16]],
+                    dst_state_item_lens=[[16, dst_stride]],
+                    dst_state_layer_ids=[[0, 0]],
+                )
+
+                # Registration records the rejection; each transfer to the peer fails.
+                mgr._prepare_state_xfer(peer)
+
+                self.assertIn("stride mismatch", mgr._state_layout_rejections["decode"])
+                self.assertEqual(mgr._prepared_state_plans, {})
+                mgr.agent.prep_xfer_dlist.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "stride mismatch"):
+                    list(
+                        mgr.maybe_send_extra(
+                            "decode",
+                            [[1]],
+                            peer.dst_state_data_ptrs,
+                            [[2]],
+                            0,
+                            "7_state_0",
+                            1,
+                        )
+                    )
+                mgr.agent.transfer.assert_not_called()
 
     def test_paired_state_entries_reject_item_length_mismatch(self):
         mgr = object.__new__(NixlKVManager)
@@ -1504,6 +1557,9 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr._num_slots_src = 4
         mgr.prep_handles = {}
         mgr.prep_handles_slice_dst = {}
+        mgr._prepared_state_plans = {}
+        mgr._prepared_state_components = frozenset()
+        mgr._state_layout_rejections = {}
         mgr._peer_reload_lock = threading.Lock()
         mgr._peer_reload_times = {}
         mgr.kv_args = SimpleNamespace(
