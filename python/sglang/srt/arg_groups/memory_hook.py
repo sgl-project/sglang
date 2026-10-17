@@ -80,6 +80,7 @@ def handle_gpu_memory_settings(server_args: Any):
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
     decode_cuda_graph_config = cuda_graph_config.decode
     prefill_cuda_graph_config = cuda_graph_config.prefill
+    decode_max_bs_is_default = decode_cuda_graph_config.max_bs is None
 
     # ------------------------------------------------------------------
     # GPU-dependent capacity defaults
@@ -177,6 +178,14 @@ def handle_gpu_memory_settings(server_args: Any):
             )
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
+
+    if (
+        decode_max_bs_is_default
+        and cfg.max_running_requests is not None
+        and decode_cuda_graph_config.max_bs is not None
+        and decode_cuda_graph_config.max_bs > cfg.max_running_requests
+    ):
+        decode_cuda_graph_config.max_bs = cfg.max_running_requests
 
     from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
         expand_multimodal_decode_graph_to_running_limit,

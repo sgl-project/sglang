@@ -68,6 +68,8 @@ with mock.patch.dict(
         _moe_runner_keeps_global_expert_ids,
     )
 
+from sglang.srt.runtime_context import get_parallel
+
 
 class _IdentityMoeSlices:
     def slice_moe_lora_a_weights(self, weights, _rank, _target):
@@ -982,6 +984,21 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 return_value=keeps_global,
             ),
             mock.patch.object(LoRAMemoryPool, "init_buffers", lambda self, _m: None),
+            # The pool reads its TP placement from the parallel context; state
+            # a whole layout so the topology check sees a consistent one.
+            get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                attn_tp_size=tp_size,
+                attn_tp_rank=tp_rank,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                moe_tp_size=tp_size,
+                moe_ep_size=1,
+                moe_dp_size=1,
+            ),
         ):
             hf_cfg = types.SimpleNamespace(
                 num_hidden_layers=1,
@@ -995,9 +1012,6 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 base_hf_config=hf_cfg,
                 max_loras_per_batch=1,
                 dtype=torch.bfloat16,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                attn_tp_size=tp_size,
                 max_lora_rank=8,
                 target_modules={"qkv_proj"},
                 base_model=base_model,

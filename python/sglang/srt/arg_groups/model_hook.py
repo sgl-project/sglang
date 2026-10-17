@@ -97,10 +97,7 @@ def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str
         from transformers.utils.hub import cached_file
 
         model_path = model_config.model_path
-        revision = (
-            getattr(model_config.hf_config, "_commit_hash", None)
-            or model_config.revision
-        )
+        revision = model_config.revision
         index_path = cached_file(
             model_path,
             "model.safetensors.index.json",
@@ -143,6 +140,7 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
@@ -205,6 +203,23 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
             )
 
+    decision_config = model_config.decision_config
+    if (
+        decision_config is not None
+        and decision_config.get("attention_mode") == NONCAUSAL_FULL_ATTENTION
+    ):
+        # A cached prefix or a prefill chunk would attend to only part of its prompt.
+        logger.info(
+            "Radix cache and chunked prefill are disabled for a decision "
+            "checkpoint with noncausal full attention."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+        )
+
     _hybrid_spec = get_linear_attn_spec(hf_config)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
         handle_mamba_radix_cache(server_args, hf_config)
@@ -232,6 +247,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
+
+    if model_arch == "Glm5NextForConditionalGeneration":
+        from sglang.srt.arg_groups.glm5_next_hook import (
+            apply_glm5_next_spec_backend_defaults,
+        )
+
+        apply_glm5_next_spec_backend_defaults(server_args)
 
     if model_arch in [
         "DeepseekV4ForCausalLM",
@@ -618,6 +640,7 @@ def handle_model_specific_adjustments(server_args: Any):
         accepted_backends = (
             "trtllm_mha",
             "triton",
+            "fa4",
             "ascend",
             "intel_xpu",
             "intel_amx",
@@ -626,7 +649,7 @@ def handle_model_specific_adjustments(server_args: Any):
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            "Gemma4 only supports trtllm_mha, triton, fa4, ascend, intel_xpu, intel_amx, or "
             f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
@@ -636,7 +659,11 @@ def handle_model_specific_adjustments(server_args: Any):
         # The prefill attention backend default + validation moved to the
         # override registry (arg_groups/overrides.py: _moss_vl_overrides).
         pass
-    elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
+    elif model_arch in [
+        "Exaone4ForCausalLM",
+        "ExaoneMoEForCausalLM",
+        "ExaoneMoeForCausalLM",
+    ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
             # (arg_groups/overrides.py: _exaone_overrides).
@@ -807,6 +834,24 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.info(
             "Embedding architecture detected: enabling embedding mode automatically."
         )
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_radix_cache
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            disable_radix_cache=True,
+        )
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_chunked_prefill
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            chunked_prefill_size=-1,
+        )
 
     is_embedding_gemma = (
         embedding_model_spec is not None
@@ -930,6 +975,37 @@ def handle_model_capability_adjustments(server_args: Any):
             "prefill; using breakable CUDA graph for CUDA prefill."
         )
 
+    # A Clef checkpoint's joint schema head reads the final hidden state of
+    # every prompt token in one pass, so each request is one complete prefill
+    # with no decode: embedding mode, without prefix reuse or chunking. This
+    # also puts the FA backend on its raw K/V path, which skips the KV pool.
+    if model_config.joint_head_config is not None:
+        if cfg.tp_size != 1 or cfg.pp_size != 1:
+            raise ValueError(
+                "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
+                "since the joint schema head reads full LM head rows"
+            )
+        for key, value in (
+            ("is_embedding", True),
+            ("disable_radix_cache", True),
+            ("chunked_prefill_size", -1),
+        ):
+            declare_resolution(
+                server_args, "_handle_model_capability_adjustments", **{key: value}
+            )
+        for phase in (Phase.DECODE, Phase.PREFILL):
+            declare_resolution(
+                server_args,
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, phase, backend=Backend.DISABLED
+                ),
+            )
+        logger.info(
+            "Clef joint schema head detected: serving /v1/systemone decisions in "
+            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+        )
+
     if (
         model_config.is_multimodal
         and not model_config.is_multimodal_chunked_prefill_supported
@@ -943,6 +1019,13 @@ def handle_model_capability_adjustments(server_args: Any):
             f"Automatically turn off --chunked-prefill-size as it is not supported for "
             f"{hf_config.model_type}"
         )
+
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_encoder_replay_budget,
+        )
+
+        validate_deepseek_v41_encoder_replay_budget(server_args)
 
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
@@ -992,12 +1075,14 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
+    hf_config = model_config_of(server_args).hf_config
+    # V4.1 text-only workers use the standard PD KV transfer path.
+    if cfg.disaggregation_mode != "null" and hf_config.model_type != "deepseek_v41":
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = model_config_of(server_args).hf_config.architectures
+    architectures = hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):

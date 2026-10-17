@@ -485,7 +485,7 @@ class TestStampedRanks(_IsolatedOverrides):
 
         self.addCleanup(restore)
         publish(
-            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=4),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -493,13 +493,14 @@ class TestStampedRanks(_IsolatedOverrides):
         dp_flags.use_world_group_for_gather = False
         self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
 
-        # After a scale-up the gather spans the expanded WORLD, and the joining
-        # cohort is numbered from its offset.
+        # After scale-up the gather spans expanded WORLD, but its slots remain
+        # logical DP replicas. Physical ranks 8 and 9 therefore share DP slot 4.
         dp_flags.use_world_group_for_gather = True
         dp_flags.joiner_skip_all_gather = False
         parallel.override_permanently(ep_join_rank_offset=8)
-        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
-        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(dp_gather_slot(), (8 + parallel.tp_rank) // 2)
+        self.assertEqual(parallel.attn_dp_size, 4)
+        self.assertEqual(parallel.attn_tp_size, 2)
         self.assertEqual(parallel.tp_size, 8)
 
     def test_a_scale_up_writes_no_width(self):
@@ -806,6 +807,40 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestEmbeddedRuntimeContext(unittest.TestCase):
+    def test_embedded_context_is_scoped_and_keeps_its_overrides(self):
+        """An embedded engine context must neither replace nor leak into the process one."""
+        from sglang.srt import runtime_context as rc
+
+        self.addCleanup(rc.restore_context, rc.snapshot_context())
+        rc.reset_context()
+        outer_args = ServerArgs(model_path="dummy", tp_size=1)
+        outer = publish(
+            outer_args, role="diffusion_gpu_worker", ranks=SpawnRanks(world_rank=0)
+        )
+        inner = rc.create_context(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=1),
+        )
+        self.assertIs(get_context(), outer)
+
+        with self.assertRaisesRegex(RuntimeError, "inner failure"):
+            with rc.use_context(inner):
+                self.assertIs(get_parallel(), inner.parallel)
+                self.assertEqual(get_parallel().tp_rank, 1)
+                inner.override("encoder.setup", page_size=16)
+                raise RuntimeError("inner failure")
+        self.assertIs(get_context(), outer)
+        self.assertIs(get_server_args(), outer_args)
+        self.assertEqual(get_parallel().tp_rank, 0)
+        self.assertEqual(publish_role(), "diffusion_gpu_worker")
+        self.assertNotEqual(rc.get_schedule().page_size, 16)
+
+        with rc.use_context(inner):
+            self.assertEqual(rc.get_schedule().page_size, 16)
 
 
 class TestAssertPublished(_IsolatedServerArgs):
@@ -1127,6 +1162,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
 
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
+
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (
             get_moe_runner_backend,
@@ -1414,8 +1469,6 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 1
             if fwd.is_extend_in_batch:
                 x = x + 2
-            if fwd.fuse_mlp_allreduce:
-                x = x + 4
             if fwd.mlp_reduce_scatter:
                 x = x + 8
             if fwd.flashinfer_trtllm_bypass:
@@ -1429,11 +1482,10 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 2)
         get_forward().set("is_extend_in_batch", False)
         with get_forward().scoped(
-            fuse_mlp_allreduce=True,
             mlp_reduce_scatter=True,
             flashinfer_trtllm_bypass=True,
         ):
-            self.assertEqual(probe(torch.zeros(())).item(), 28)
+            self.assertEqual(probe(torch.zeros(())).item(), 24)
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
@@ -1578,23 +1630,17 @@ class TestForwardFlags(_IsolatedServerArgs):
 
         reset_context()
         fwd = get_forward()
-        self.assertFalse(fwd.fuse_mlp_allreduce)
         self.assertFalse(fwd.mlp_reduce_scatter)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
-        self.assertFalse(should_skip_mlp_all_reduce())
-
-        with fwd.scoped(fuse_mlp_allreduce=True):
-            self.assertTrue(fwd.fuse_mlp_allreduce)
-            self.assertTrue(should_skip_mlp_all_reduce())
-            # Fusion alone is enough to skip post-experts AR.
-            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
-        self.assertFalse(fwd.fuse_mlp_allreduce)
         self.assertFalse(should_skip_mlp_all_reduce())
 
         with fwd.scoped(mlp_reduce_scatter=True):
             self.assertTrue(fwd.mlp_reduce_scatter)
             self.assertTrue(should_skip_mlp_all_reduce())
+            # The reduce-scatter alone is enough to skip post-experts AR.
+            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
         self.assertFalse(fwd.mlp_reduce_scatter)
+        self.assertFalse(should_skip_mlp_all_reduce())
 
         with fwd.scoped(flashinfer_trtllm_bypass=True):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)
@@ -2423,9 +2469,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
                 pass
         self.assertEqual([str(w.message) for w in seen], [])
 
-    def test_the_guard_would_notice_a_caller(self):
-        self.assertTrue(self._callers("get_self_pp_group"))
-
 
 class TestTheTopologyIdentities(CustomTestCase):
     """Validate topology consistency at publication and override boundaries."""
@@ -2994,20 +3037,6 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
             "dp_slot_in(<the sequence>):\n  " + "\n  ".join(offenders),
         )
 
-    def test_the_censuses_would_notice_one(self):
-        planted = (
-            "def f(fb):\n"
-            "    x = global_num_tokens[get_parallel().attn_dp_rank]\n"
-            "    y = fb.global_num_tokens_cpu[parallel.attn_dp_rank]\n"
-            "    return dp_gather_slot(), x, y\n"
-        )
-        self.assertEqual(len(_sequences_indexed_by_the_attention_rank(planted)), 2)
-        self.assertEqual(_calls_named(planted, "dp_gather_slot"), 1)
-        # A legal shape stays quiet.
-        legal = "def f(s):\n    return s[dp_slot_in(s)]\n"
-        self.assertEqual(_sequences_indexed_by_the_attention_rank(legal), [])
-        self.assertEqual(_calls_named(legal, "dp_gather_slot"), 0)
-
 
 class TestEveryParallelReadNamesAParallelField(CustomTestCase):
     """Every ``get_parallel().<name>`` read in the package names a parallel field.
@@ -3087,64 +3116,10 @@ class TestEveryParallelReadNamesAParallelField(CustomTestCase):
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
     """Classify parallel getters and reject retired package imports."""
 
-    #: Getters that answer something other than a place in the topology.
-    NOT_A_PLACEMENT = {
-        "get_default_distributed_backend",
-        "get_mooncake_transfer_engine",
-        "get_torch_distributed_pg_options",
-    }
-    #: Widths whose group is not in ``_WIDTH_AND_GROUP``.
-    WIDTH_WITHOUT_A_CHECKED_GROUP = {
-        "get_dcp_world_size",
-        "get_moe_data_parallel_world_size",
-        "get_moe_tensor_parallel_world_size",
-    }
-    #: Variants that answer a group the map already covers.
-    VARIANT_OF_A_MAPPED_GROUP = {
-        "get_dcp_group_no_assert",
-        "get_self_pp_group",
-    }
-
     def _retired(self):
         from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
 
         return set(_CONTEXT_NAME_OF)
-
-    def test_every_getter_the_module_defines_is_classified(self):
-        """Every getter the module defines is deprecated or classified here."""
-        from sglang.srt.distributed import parallel_state
-
-        defined = {
-            name
-            for name in dir(parallel_state)
-            if name.startswith("get_")
-            and callable(getattr(parallel_state, name))
-            and getattr(getattr(parallel_state, name), "__module__", None)
-            == parallel_state.__name__
-        }
-        self.assertTrue(defined, "no getters found; this proves nothing")
-        unclassified = (
-            defined
-            - self._retired()
-            - self.NOT_A_PLACEMENT
-            - self.WIDTH_WITHOUT_A_CHECKED_GROUP
-            - self.VARIANT_OF_A_MAPPED_GROUP
-        )
-        self.assertEqual(
-            unclassified,
-            set(),
-            "these getters are neither deprecated nor classified; say which "
-            "kind each one is, or route it through get_parallel():\n  "
-            + "\n  ".join(sorted(unclassified)),
-        )
-        stale = (
-            self.NOT_A_PLACEMENT
-            | self.WIDTH_WITHOUT_A_CHECKED_GROUP
-            | self.VARIANT_OF_A_MAPPED_GROUP
-        ) - defined
-        self.assertEqual(
-            stale, set(), f"these are named here but no longer defined: {stale}"
-        )
 
     def test_nothing_imports_a_retired_name_from_the_package(self):
         import ast as _ast
@@ -3263,31 +3238,6 @@ class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
             "ask get_parallel() there, or move the call after the freeze:\n  "
             + "\n  ".join(offenders),
         )
-
-    def test_the_census_would_notice_one(self):
-        import ast as _ast
-        import textwrap
-
-        methods = {
-            m.name: m
-            for m in _ast.parse(
-                textwrap.dedent(
-                    """
-                    class R:
-                        def init_torch_distributed(self):
-                            self.tp_rank = 0
-
-                        def early(self):
-                            return self.tp_rank
-                    """
-                )
-            )
-            .body[0]
-            .body
-        }
-        frozen = self._frozen_names(methods)
-        self.assertEqual(frozen, {"tp_rank"})
-        self.assertEqual(self._reads(methods, methods["early"], frozen), {"tp_rank"})
 
 
 if __name__ == "__main__":

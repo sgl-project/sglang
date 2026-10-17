@@ -1,15 +1,96 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from sglang.srt import rust_extensions
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def _scheduler_for_typed_config():
+    return SimpleNamespace(
+        server_args=SimpleNamespace(enable_return_hidden_states=False),
+        model_config=SimpleNamespace(
+            context_len=2048,
+            vocab_size=1000,
+            is_multimodal=False,
+            hf_config=SimpleNamespace(model_type=None),
+            get_default_sampling_params=lambda: {},
+        ),
+        rust_server_tokenizer_path=lambda: "tokenizer",
+        max_total_num_tokens=1024,
+        load_snapshot_writer=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,kwarg,expected",
+    [
+        ({}, "grpc_port", 50051),
+        ({"smg_grpc_mode": True}, "grpc_port", None),
+        ({"grpc_mode": True}, "grpc_port", None),
+        ({"default_priority_value": 5}, "default_priority_value", None),
+        (
+            {"enable_priority_scheduling": True, "default_priority_value": 5},
+            "default_priority_value",
+            5,
+        ),
+    ],
+    ids=[
+        "native-grpc",
+        "legacy-smg",
+        "deprecated-legacy-smg",
+        "priority-off",
+        "priority-on",
+    ],
+)
+def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
+    extension = SimpleNamespace(
+        DisaggregationMode=SimpleNamespace(
+            Null="null", Prefill="prefill", Decode="decode"
+        ),
+        ModelConfig=MagicMock(return_value="model-config"),
+        DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
+        ServerArgs=MagicMock(return_value="server-args"),
+    )
+    with (
+        get_context().override_server_args(grpc_port=50051, **overrides),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        assert (
+            rust_config._build_server_args(_scheduler_for_typed_config())
+            == "server-args"
+        )
+
+    assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+
+
+@pytest.mark.parametrize("enable_metrics", [False, True])
+def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
+    extension = MagicMock()
+    with (
+        get_context().override_server_args(enable_metrics=enable_metrics),
+        patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    metrics = extension.ServerArgs.call_args.kwargs["metrics"]
+    if enable_metrics:
+        extension.MetricsConfig.assert_called_once_with(multiproc_dir="/tmp/prom")
+        assert metrics is extension.MetricsConfig.return_value
+    else:
+        assert metrics is None
 
 
 @pytest.mark.parametrize(

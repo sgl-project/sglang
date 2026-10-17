@@ -54,9 +54,30 @@ class TestKDAGateBetaCumsum(unittest.TestCase):
                         actual_gate, expected_gate, atol=1e-4, rtol=1e-6
                     )
                     torch.testing.assert_close(
-                        actual_beta, beta.float().sigmoid(), atol=1.2e-7, rtol=1e-6
+                        actual_beta, beta.float().sigmoid(), atol=0, rtol=0
                     )
                     self.assertEqual(actual_beta.dtype, torch.float32)
+
+    @torch.inference_mode()
+    def test_gate_cumsum_beta_is_bit_identical_to_torch_sigmoid(self):
+        heads, dim = 2, 128
+        bits = torch.arange(1 << 16, device="cuda").to(torch.int16)
+        beta = bits.view(torch.bfloat16)
+        beta = beta[beta.isfinite()].view(1, -1, heads)
+        tokens = beta.shape[1]
+        gate = torch.zeros(1, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+        a_log = torch.zeros(heads, device="cuda")
+        for cu_seqlens in (
+            None,
+            torch.tensor([0, tokens], device="cuda", dtype=torch.int32),
+        ):
+            with self.subTest(varlen=cu_seqlens is not None):
+                _, actual = kda_gate_chunk_cumsum(
+                    gate, A_log=a_log, chunk_size=64, cu_seqlens=cu_seqlens, beta=beta
+                )
+                torch.testing.assert_close(
+                    actual, beta.float().sigmoid(), atol=0, rtol=0
+                )
 
     @torch.inference_mode()
     def test_chunk_raw_beta_matches_activated_beta_and_final_state(self):
@@ -120,9 +141,9 @@ class TestKDAGateBetaCumsum(unittest.TestCase):
                         initial_state=actual_state,
                         **kwargs,
                     )
-                    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     torch.testing.assert_close(
-                        actual_state, expected_state, atol=2e-4, rtol=2e-3
+                        actual_state, expected_state, atol=0, rtol=0
                     )
 
 

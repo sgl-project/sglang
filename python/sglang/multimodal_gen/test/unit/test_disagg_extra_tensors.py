@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -18,6 +20,22 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
 from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+
+
+def test_task_type_survives_disagg_transfer():
+    """A GLM request must cross the JSON transport after AR completes."""
+    req = Req(
+        request_id="glm-transfer",
+        prompt="test",
+        sampling_params=SamplingParams(task_type=ModelTaskType.TI2I),
+    )
+
+    tensors, scalars = extract_transfer_fields(req)
+    metadata, buffers = pack_tensors(tensors, scalars)
+    received, scalars = unpack_tensors([metadata, *[w._view for w in buffers]])
+    rebuilt = SchedulerDisaggMixin._build_disagg_req(None, scalars, received)
+
+    assert ModelTaskType.parse(rebuilt.task_type) == ModelTaskType.TI2I
 
 
 def test_qwen21_disagg_encoder_loads_condition_vae():

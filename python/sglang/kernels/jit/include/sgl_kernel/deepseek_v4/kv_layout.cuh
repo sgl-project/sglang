@@ -35,7 +35,7 @@ namespace sglang {
 
 namespace deepseek_v4 {
 
-enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2 };
+enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2, UNIFORM_FP8 = 3 };
 
 template <KVLayout kLayout>
 struct KVLayoutTraits;
@@ -65,6 +65,15 @@ struct KVLayoutTraits<KVLayout::V41_FP4> {
   static constexpr int64_t kTileSize = 16;
   static constexpr int64_t kPageAlign = 256;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
+};
+
+template <>
+struct KVLayoutTraits<KVLayout::UNIFORM_FP8> {
+  static constexpr int64_t kDataBytes = 512;
+  static constexpr int64_t kScaleBytes = 0;
+  static constexpr int64_t kTileSize = 512;
+  static constexpr int64_t kPageAlign = 512;
+  static constexpr int64_t kBytesPerToken = kDataBytes;
 };
 
 /// Bytes of one page block: `page_size` tokens, padded up to the reader's row stride.
@@ -206,6 +215,13 @@ SGL_DEVICE void store_row(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, co
   static_assert(kLayout != KVLayout::V4, "V4 rows are written by the caller");
   if constexpr (kLayout == KVLayout::V41) {
     store_row_fp8(data_row, scale_row, tx, v);
+  } else if constexpr (kLayout == KVLayout::UNIFORM_FP8) {
+    device::AlignedVector<fp8x2_e4m3_t, kVecSize / 2> out;
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      out[i] = fp8::pack_fp8(v[2 * i], v[2 * i + 1]);
+    }
+    out.store(data_row, tx);
   } else {
     store_row_fp4(data_row, scale_row, tx, v);
   }

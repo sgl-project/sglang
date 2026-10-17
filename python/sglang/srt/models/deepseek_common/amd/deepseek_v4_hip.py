@@ -21,13 +21,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
-    forward_hc_pre_from_prev_fused_boundary,
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
+wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
 
@@ -149,7 +149,7 @@ def attention_inv_rope(
 
 
 def init_decoder_layer(layer, quant_config) -> None:
-    """The ROCm state of DeepseekV4DecoderLayer.__init__. input_layernorm also emits the
+    """The ROCm state of DeepseekV4DecoderLayerBase.__init__. input_layernorm also emits the
     pre-quantized operand of the dense projections (whether wqkv_a consumes native MXFP8
     resolves on first use), and on gfx950 one launch runs hc_post, the pre-collapse and
     the mixing stats; the kernel only supports hc_mult 4."""
@@ -166,23 +166,38 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
 
 
-def hc_post(layer, x, residual, post, comb) -> Optional[torch.Tensor]:
+def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
     """V4.1's gfx950 hc_post at 768-4096 rows: the split-H kernel with 2048-wide blocks,
     whose ordinary stores preserve locality for the following mHC reader; None elsewhere."""
     if not (
         _is_gfx95_supported
-        and layer.config.model_type == "deepseek_v41"
+        and cfg.pre_from_prev
+        and cfg.mult == 4
         and 768 <= x.shape[0] <= 4096
         and x.shape[1] == 5120
-        and residual.shape == (x.shape[0], 4, 5120)
-        and post.shape == (x.shape[0], 4)
-        and comb.shape == (x.shape[0], 4, 4)
-        and x.dtype == residual.dtype == torch.bfloat16
-        and post.dtype == comb.dtype == torch.float32
-        and all(t.is_contiguous() for t in (x, residual, post, comb))
     ):
         return None
     return mhc_post_split_h(x, residual, post, comb, block_size=2048)
+
+
+def _x_quant_e8m0(layer) -> bool:
+    """Whether input_layernorm's fp8 operand goes out with ue8m0 scales: only when
+    every dense projection reading it (wqkv_a, or wq_a + wkv) runs the e8m0 mxscale
+    GEMM (SGLANG_DSV4_DENSE_MXSCALE). Resolved on first use, after weight load."""
+    cached = layer.__dict__.get("_x_quant_e8m0")
+    if cached is None:
+        from sglang.srt.layers.quantization.fp8_utils import dense_mxscale_ready
+
+        attn = layer.self_attn
+        if getattr(attn, "fuse_wqa_wkv", False):
+            consumers = (getattr(attn, "wqkv_a", None),)
+        else:
+            consumers = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+        cached = all(c is not None for c in consumers) and dense_mxscale_ready(
+            *consumers
+        )
+        layer.__dict__["_x_quant_e8m0"] = cached
+    return cached
 
 
 def input_norm(
@@ -199,7 +214,10 @@ def input_norm(
         if coefficients is not None:
             coefficients.materialize()
         x_quant, hidden_states = fused_rmsnorm_fp8_quant(
-            hidden_states, layer.input_layernorm.weight, layer.rms_norm_eps
+            hidden_states,
+            layer.input_layernorm.weight,
+            layer.rms_norm_eps,
+            e8m0=_x_quant_e8m0(layer),
         )
         return hidden_states, x_quant
     if layer.fused_rmsnorm_fake_quant:
@@ -207,41 +225,3 @@ def input_norm(
     if coefficients is not None:
         coefficients.materialize()
     return layer.input_layernorm(hidden_states), None
-
-
-# ---- DeepseekV4Model layer loop ----
-
-
-def forward_layer_fused_boundary(
-    model,
-    i: int,
-    *,
-    positions: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    input_ids: torch.Tensor,
-    forward_batch,
-    input_ids_global: torch.Tensor,
-    prev_pre: Optional[torch.Tensor],
-    pending_post: Optional[Tuple[torch.Tensor, ...]],
-    capture_dspark: bool,
-):
-    """Layer i through the fused mHC boundary. Its FFN hc_post stays pending for the next
-    layer's boundary launch unless that layer reads the residual stream first (Engram gate,
-    DSpark capture) or there is none; hidden_states is None while a post is pending."""
-    nxt = i + 1
-    defer_post = (
-        nxt < model.end_layer
-        and model.layers[nxt].engram is None
-        and not (capture_dspark and nxt in model.dspark_layers_to_capture)
-    )
-    return forward_hc_pre_from_prev_fused_boundary(
-        model.layers[i],
-        positions=positions,
-        hidden_states=hidden_states,
-        input_ids=input_ids,
-        forward_batch=forward_batch,
-        input_ids_global=input_ids_global,
-        prev_pre=prev_pre,
-        pending_post=pending_post,
-        defer_post=defer_post,
-    )

@@ -3,11 +3,9 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -20,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_position,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -85,6 +84,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
     is_pin_memory_available,
 )
@@ -94,6 +94,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -185,6 +186,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        load_group = get_pp_stage_load_group()
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -197,6 +199,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 draft_worker_cls=draft_worker_cls,
                 random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -231,9 +234,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._mask_token_id = runtime_config.mask_token_id
 
         parallel = get_parallel()
-        self._tp_sync = SpecTpSync(
-            parallel.attn_tp_group if parallel.attn_dp_enabled else parallel.tp_group
-        )
+        self._tp_sync = SpecTpSync(get_dp_tp_group())
         self._draft_graph_group = (
             parallel.attn_tp_group
             if self._draft_dp_context_enabled
@@ -312,6 +313,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        # The step's simulated correct length, read by the eager and graph accepts.
+        self._simulated_correct_len = (
+            torch.zeros((1,), dtype=torch.int64, device=self.device)
+            if self._simulate_acc_len > 0
+            else None
+        )
+        self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -319,6 +328,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
+            random_seed=target_worker.random_seed,
+            greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
@@ -350,6 +361,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=self.device,
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
+                simulated_correct_len=self._simulated_correct_len,
+                simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -364,7 +377,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._verify_epilogue.capture_hook
             )
 
-        self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._simulate_acc_greedy = (
+            _is_hip
+            and self._simulate_acc_len > 0
+            and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
+        )
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
@@ -392,6 +409,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            simulated_correct_len=self._simulated_correct_len,
+            block_verification=get_spec().speculative_use_block_verification,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -498,9 +517,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler(
-                        available_memory_gb=available_mem
-                    )
+                    self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
@@ -510,20 +527,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self._target_tp_rank,
+            noise=self._proposer.noise,
+            greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
-            available_memory_gb=available_memory_gb,
-            confidence_fn=(
-                self._verify_planner.compute_confidence_tensor
-                if self._verify_planner.carries_confidence
-                else None
-            ),
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None
@@ -636,6 +649,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_kv_loc_plan=True,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -681,12 +695,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
-        # thread the per-token state_slot + the req's final position so the
-        # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
+        # A SWA ring is keyed by (draft req slot, position); thread the per-token
+        # state_slot + the req's final position so the injector keeps only the
+        # last SWA window (older prefill tokens share a ring slot and would race).
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        if self._kv_injector.swa_ring_size is not None:
             repeats = ctx_lens.to(torch.int64)
             num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
@@ -699,7 +712,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
-        cache_loc = batch.out_cache_loc
+        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
+        if getattr(draft_pool, "swa_req_ring_valid_from", None) is not None:
+            # A newly placed request's ring holds nothing below its cached prefix.
+            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+            if placed:
+                draft_pool.reset_swa_req_ring(
+                    batch.req_pool_indices[placed],
+                    torch.tensor(
+                        [batch.prefix_lens[i] for i in placed],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                )
+        # The draft KV goes to the slots the target prefill just wrote.
+        cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
+        batch_output.kv_loc_plan = None
         token_indices = logits_output.hidden_states_token_indices
         if token_indices is not None:
             cache_loc = cache_loc[token_indices]
@@ -836,9 +864,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else draft_input.nxt_kv_lens_cpu
+            ),
         )
 
         sampling_info = batch.sampling_info
+        # Simulated acceptance overrides correct_len, so only the bonus token needs the
+        # request's temperature: draft + accept run greedy, the bonus is still sampled.
+        simulate_bonus_sampling_info = None
+        if (
+            self._simulate_acc_greedy
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and not batch.has_grammar
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        ):
+            simulate_bonus_sampling_info = sampling_info
+            sampling_info = None
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -856,13 +904,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
         confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
-            )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -896,14 +937,29 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
-            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
-            and self._simulate_acc_len <= 0
+            # The graph accept is greedy: a sampled simulated bonus stays in the graph
+            # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
+            and (
+                simulate_bonus_sampling_info is None
+                or self._verify_executor.verify_epilogue.simulate_fold
+            )
             and not batch.has_grammar
         )
+        self._verify_executor.begin_simulated_step()
+        if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
+            self._verify_executor.verify_epilogue.begin_sim_bonus(
+                bs,
+                (
+                    None
+                    if simulate_bonus_sampling_info is None
+                    else simulate_bonus_sampling_info.temperatures[:bs]
+                ),
+            )
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -915,6 +971,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,
+                    verify_window=verify_window,
                     inject_gate=fold_eligible,
                 )
             else:
@@ -963,6 +1020,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
@@ -1028,6 +1086,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_logits=logits_output.next_token_logits,
             layout=layout,
             confidence=confidence,
+            confidence_raw=proposal.confidence_raw,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
             draft_block=draft_block,
