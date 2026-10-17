@@ -286,6 +286,7 @@ class LogitsProcessorOutput:
     # or materialize the ordinary FP32 logits. These are never sampler logits.
     deferred_verify_logits: Optional[torch.Tensor] = None
     deferred_verify_softcap: Optional[float] = None
+    deferred_verify_comparison_ranks: Optional[torch.Tensor] = None
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
@@ -461,6 +462,9 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.defer_xpu_verify_logits = defer_xpu_verify_logits
+        self.register_buffer("_verify_softcap_ranks", None, persistent=False)
+        self._verify_softcap_rank_cap = None
+        self._verify_softcap_rank_device = None
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
@@ -515,6 +519,33 @@ class LogitsProcessor(nn.Module):
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
         )
+
+    def _get_verify_softcap_ranks(self, device):
+        cap = self.final_logit_softcapping or None
+        table = self._verify_softcap_ranks
+        if (
+            table is not None
+            and table.device == device
+            and self._verify_softcap_rank_device == device
+            and self._verify_softcap_rank_cap == cap
+        ):
+            return table
+        # Never construct persistent data inside capture. A caller without an
+        # eager warmup retains the existing tanh reduction for this graph.
+        if torch.compiler.is_compiling():
+            return None
+        with torch.xpu.device(device):
+            if torch.xpu.is_current_stream_capturing():
+                return None
+        from sglang.srt.speculative.deferred_verify_logits import (
+            make_verify_softcap_ranks,
+        )
+
+        table = make_verify_softcap_ranks(device, cap)
+        self._verify_softcap_ranks = table
+        self._verify_softcap_rank_cap = cap
+        self._verify_softcap_rank_device = device
+        return table
 
     def forward(
         self,
@@ -634,6 +665,11 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=None if deferred else sampled_logits,
                 deferred_verify_logits=sampled_logits if deferred else None,
+                deferred_verify_comparison_ranks=self._get_verify_softcap_ranks(
+                    sampled_logits.device
+                )
+                if deferred
+                else None,
                 deferred_verify_softcap=self.final_logit_softcapping
                 if deferred
                 else None,
