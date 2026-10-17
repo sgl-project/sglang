@@ -212,6 +212,16 @@ class SfS2TCopies(NamedTuple):
 
 
 class FlashAttentionForwardSm100:
+    # Measurement-only IKeT marks. Off in production; replay --iket flips this
+    # before compile. All marks are behind const_expr so the default binary is
+    # unchanged.
+    IKET_PROBES = False
+
+    def _iket_mark(self, name: str):
+        if const_expr(self.IKET_PROBES):
+            from cutlass.cute.experimental import iket
+
+            iket.mark(name)
 
     def __init__(
         self,
@@ -244,6 +254,7 @@ class FlashAttentionForwardSm100:
         kv_sf_interleaved: bool = False,
         batch_invariant: bool = False,
         tmem_load_red_max: bool = True,
+        use_pdl: bool = False,
     ):
         # MXFP8 block-scaled attention (see interface._flash_attn_fwd):
         #   qk_blockscaled: Q/K fp8 e4m3 + per-32 UE8M0 scales; QK^T runs as
@@ -349,9 +360,10 @@ class FlashAttentionForwardSm100:
         )
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
+        self.use_pdl = use_pdl
         assert not (
-            self.is_split_kv and self.head_dim_v_padded >= 192
-        ), "SplitKV is not supported for hdim >= 192"
+            self.is_split_kv and self.head_dim_v_padded >= 192 and self.q_stage != 1
+        ), "SplitKV for hdim >= 192 requires q_stage == 1"
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.score_vec_size: cutlass.Constexpr = getattr(
@@ -706,9 +718,11 @@ class FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
+        mLeftpadK: Optional[cute.Tensor] = None,  # (b_k,) page-table origin shift
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        head_gate: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
@@ -1404,6 +1418,8 @@ class FlashAttentionForwardSm100:
                 cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width,
             )
         )
+        # K and V alias the same physical buffer and may have different extents.
+        sKV_size = cutlass.max(cute.cosize(sK_layout), cute.cosize(sV_layout))
         if const_expr(self.overlap_sO_sQ and self.has_bias):
             sQ_size = cute.cosize(sQ_layout)
 
@@ -1463,8 +1479,8 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                # Aliased K/V buffer sized for the larger staged layout.
+                cute.struct.MemRange[self.k_dtype, sKV_size],
                 self.buffer_align_bytes,
             ]
             sBias: cute.struct.Align[
@@ -1578,6 +1594,7 @@ class FlashAttentionForwardSm100:
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            mLeftpadK,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -1587,6 +1604,7 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             learnable_sink,
+            head_gate,
             descale_tensors,
             blocksparse_tensors,
             sQ_layout,
@@ -1632,10 +1650,9 @@ class FlashAttentionForwardSm100:
             ),
             stream=stream,
             min_blocks_per_mp=1,
-            # PDL overlaps this grid with the ShearingBias producer that immediately
-            # precedes it on the bias path; the load warp's griddepcontrol_wait
-            # (before the first bias TMA) keeps every read of its output ordered.
-            use_pdl=self.has_bias,
+            # PDL overlaps this grid with the prior kernel. Bias already required
+            # it; use_pdl extends the same overlap to the non-bias SWA path.
+            use_pdl=self.has_bias or self.use_pdl,
         )
 
     def _generate_attention_mask_cls(self, window_size_left, window_size_right):
@@ -1664,6 +1681,7 @@ class FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        mLeftpadK: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -1673,6 +1691,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
+        head_gate: Optional[cute.Tensor],
         descale_tensors: Optional[DescaleTensors],
         blocksparse_tensors: Optional[BlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
@@ -1724,6 +1743,7 @@ class FlashAttentionForwardSm100:
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        self._iket_mark("kernel_enter")
 
         # Prefetch tma descriptor
         if warp_idx == 0:
@@ -2112,6 +2132,7 @@ class FlashAttentionForwardSm100:
         )
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
+        self._iket_mark("pipeline_init_wait")
 
         if const_expr(self.use_clc_scheduler):
             clc_response_ptr = storage.clc_response.data_ptr()
@@ -2187,6 +2208,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+            self._iket_mark("load_enter")
             self.load(
                 thr_mma_qk,
                 thr_mma_pv if const_expr(not self.v_dequant) else thr_mma_pv_vq,
@@ -2197,6 +2219,7 @@ class FlashAttentionForwardSm100:
                 sK,
                 sV if const_expr(not self.v_dequant) else sVq,
                 mPageTable,
+                mLeftpadK,
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
@@ -2234,10 +2257,12 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+            self._iket_mark("mma_setmaxnreg")
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
+            self._iket_mark("mma_tmem_ready")
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -2303,9 +2328,11 @@ class FlashAttentionForwardSm100:
         ) or (const_expr(self.q_stage == 1) and warp_idx <= self.softmax0_warp_ids[-1]):
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
+            self._iket_mark("softmax_setmaxnreg")
             # sync with mma warp before retrieving tmem ptr
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
+            self._iket_mark("softmax_tmem_ready")
             softmax_loop = partial(
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
@@ -2360,9 +2387,11 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
+            self._iket_mark("corr_setmaxnreg")
             # sync with mma warp before retrieving tmem ptr
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
+            self._iket_mark("corr_tmem_ready")
             self.correction_loop(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -2378,6 +2407,7 @@ class FlashAttentionForwardSm100:
                 sm_stats_barrier,
                 pipeline_o_epi,
                 learnable_sink,
+                head_gate,
                 descale_tensors,
                 gmem_tiled_copy_O,
                 tma_atom_O,
@@ -2409,6 +2439,7 @@ class FlashAttentionForwardSm100:
         sK: cute.Tensor,
         sV: cute.Tensor,
         mPageTable: Optional[cute.Tensor],
+        mLeftpadK: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -2468,7 +2499,13 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.use_pdl and not self.has_bias):
+                # Wait before the first global read (seqlen / page table / Q / KV).
+                cute.arch.griddepcontrol_wait()
             seqlen = SeqlenInfoCls(batch_idx)
+            leftpad_k = Int32(0)
+            if const_expr(mLeftpadK is not None):
+                leftpad_k = mLeftpadK[batch_idx]
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
 
             head_idx_kv = (
@@ -2675,7 +2712,7 @@ class FlashAttentionForwardSm100:
                     head_idx_kv,
                     tidx,
                     seqlen.seqlen_k,
-                    0,  # leftpad_k
+                    leftpad_k,
                     self.n_block_size,
                     self.head_dim_padded,
                     self.head_dim_v_padded,
@@ -2781,6 +2818,7 @@ class FlashAttentionForwardSm100:
                         else None
                     )
                     if const_expr(not self.use_tma_KV):
+                        self._iket_mark("load_page_table")
                         paged_kv_manager.load_page_table(n_block_first)
                     # For v_dequant, load V0 first (on vq_producer_state) so the
                     # correction warp's V0 dequant can start immediately.
@@ -2979,6 +3017,9 @@ class FlashAttentionForwardSm100:
             if const_expr(self.v_dequant):
                 pipeline_vq.producer_tail(vq_producer_state)
             pipeline_kv.producer_tail(kv_producer_state)
+            self._iket_mark("load_producer_tail")
+            if const_expr(self.has_bias or self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
         if issue_q_for_this_warp:
             pipeline_q.producer_acquire_w_index_phase(
@@ -3308,6 +3349,7 @@ class FlashAttentionForwardSm100:
         pipeline_sf_overlap: Optional[pipeline.PipelineAsync] = None,
         pipeline_v_mma: Optional[pipeline.PipelineAsync] = None,
     ):
+        self._iket_mark("mma_body")
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
@@ -3419,6 +3461,8 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.use_pdl and not self.has_bias):
+                cute.arch.griddepcontrol_wait()
             seqlen = SeqlenInfoCls(batch_idx)
 
             block_iter_count = Int32(0)
@@ -3858,6 +3902,8 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
+            if const_expr(self.use_pdl and not self.has_bias):
+                cute.arch.griddepcontrol_wait()
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
@@ -4547,6 +4593,7 @@ class FlashAttentionForwardSm100:
         sm_stats_barrier: pipeline.NamedBarrier,
         pipeline_o_epi: pipeline.PipelineAsync,
         learnable_sink: Optional[cute.Tensor],
+        head_gate: Optional[cute.Tensor],
         descale_tensors: Optional[DescaleTensors],
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: cute.CopyAtom,
@@ -4632,6 +4679,8 @@ class FlashAttentionForwardSm100:
                 if cutlass.const_expr(self.v_mma_dtype.width == 8)
                 else Float32(1.0)
             )
+            if const_expr(self.use_pdl and not self.has_bias):
+                cute.arch.griddepcontrol_wait()
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
@@ -4660,17 +4709,11 @@ class FlashAttentionForwardSm100:
                 )[None, mma_tile_coord_v, None, None]
 
             # Default LSE to -inf for invalid split_idx tiles
-            stats = [
-                (
-                    0.0,
-                    (
-                        -Float32.inf
-                        if const_expr(mLSE is not None or learnable_sink is not None)
-                        else None
-                    ),
-                    True,
-                )
-            ] * self.q_stage
+            if const_expr(mLSE is not None or learnable_sink is not None):
+                stats = [(0.0, -Float32.inf, True)] * self.q_stage
+            else:
+                # Match the no-LSE branch across the dynamic has_work condition.
+                stats = [(0.0, None, True)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
                 total_block_count = get_total_block_count(
@@ -4760,6 +4803,11 @@ class FlashAttentionForwardSm100:
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
                 # additional sync because the MMA in the top half must have been done.
                 # Similarly we can write to stage 1 of sO without additional sync.
+                if const_expr(
+                    (self.has_bias or self.use_pdl)
+                    and (learnable_sink is not None or head_gate is not None)
+                ):
+                    cute.arch.griddepcontrol_wait()
                 learnable_sink_val = [None] * self.q_stage
                 if const_expr(learnable_sink is not None):
                     if const_expr(not self.pack_gqa):
@@ -4820,6 +4868,36 @@ class FlashAttentionForwardSm100:
                         row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0
                     )
                     scale = scale * v_descale
+                    if const_expr(head_gate is not None):
+                        idx = (
+                            (
+                                (m_block * self.q_stage + stage)
+                                * self.cta_group_size
+                                + mma_tile_coord_v
+                            )
+                            * self.m_block_size
+                            + tidx
+                        )
+                        if const_expr(self.pack_gqa):
+                            m_idx = idx // self.qhead_per_kvhead
+                            h_idx = (
+                                idx % self.qhead_per_kvhead
+                                + head_idx * self.qhead_per_kvhead
+                            )
+                        else:
+                            m_idx = idx
+                            h_idx = head_idx
+                        token = seqlen.offset_q + m_idx
+                        if const_expr(not seqlen.has_cu_seqlens_q):
+                            token = batch_idx * seqlen.seqlen_q + m_idx
+                        if m_idx < seqlen.seqlen_q:
+                            g = Float32(head_gate[token, h_idx])
+                            scale = scale * cute.arch.rcp_approx(
+                                1.0
+                                + cute.math.exp2(
+                                    -g * utils.LOG2_E, fastmath=True
+                                )
+                            )
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(
                         stage, o_corr_consumer_phase
@@ -4920,8 +4998,6 @@ class FlashAttentionForwardSm100:
                         m_block * self.q_stage + stage
                     ) * self.cta_group_size + mma_tile_coord_v
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
-                    # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
                         (
@@ -5128,6 +5204,8 @@ class FlashAttentionForwardSm100:
         if const_expr(self.use_correction_warps_for_epi):
             assert not self.use_tma_O
             assert gmem_tiled_copy_O is not None
+            if const_expr(self.has_bias or self.use_pdl):
+                cute.arch.griddepcontrol_wait()
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwdSm100.Epilogue),
                 number_of_threads=len(self.epilogue_warp_ids) * cute.arch.WARP_SIZE,
@@ -5152,6 +5230,7 @@ class FlashAttentionForwardSm100:
         m_tile_idx: Int32,
     ):
         """Copy a single stage of O from smem to gmem via registers."""
+        self._iket_mark("store_o")
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         tOsO = gmem_thr_copy_O.partition_S(sO_stage)
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
@@ -5221,6 +5300,8 @@ class FlashAttentionForwardSm100:
             )
 
             if has_work:
+                if const_expr(self.has_bias or self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 if const_expr(self.is_split_kv):
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
                         None, None, head_idx, split_idx

@@ -214,7 +214,6 @@ def _forward_with_allreduce_fusion(
     if residual is not None:
         from sglang.srt.distributed import (
             attention_tensor_model_parallel_all_reduce,
-            tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
@@ -263,10 +262,14 @@ def _forward_with_allreduce_fusion(
                     residual = residual.clone()
                 return norm_module.forward(x, residual, None)
 
-            # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
+            # Eligibility can change after warmup (workspace unavailable,
+            # non-contiguous input, etc.). A failed fusion still owes exactly
+            # one collective, in the same group selected by the fused path.
+            if use_attn_tp_group:
+                x = attention_tensor_model_parallel_all_reduce(x)
+            else:
+                x = deferred_post_experts_all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 
@@ -1130,9 +1133,14 @@ class GemmaRMSNorm(BaseFusedOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        *,
+        weight_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        # Raw zero-centered weights may require FP32 even when the model's
+        # default activation dtype is BF16. Casting before adding one can turn
+        # a small, nonzero scale into zero.
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=weight_dtype))
         self.variance_epsilon = eps
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
@@ -1157,6 +1165,14 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Idle ranks can reach this public op with zero rows. CUDA norm
+        # launchers need a nonempty grid; retain the usual residual contract.
+        if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
+            return x
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
@@ -1168,7 +1184,19 @@ class GemmaRMSNorm(BaseFusedOp):
                 x, residual, self.weight.data, self.variance_epsilon
             )
             return x, residual
-        out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+        if (
+            x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.float32
+        ):
+            # Keep FP32 (1 + weight); casting near -1 before the add loses scale.
+            from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
+                gemma_rmsnorm as mixed_dtype_gemma_rmsnorm,
+            )
+
+            out = mixed_dtype_gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+        else:
+            out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             out = out.reshape(original_shape)
         return out
@@ -1318,7 +1346,7 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=True,
+            use_attn_tp_group=use_attn_tp_group,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(

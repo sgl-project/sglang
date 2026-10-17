@@ -153,6 +153,21 @@ def get_hidden_dim(
         )
 
 
+def lora_adapts_routed_experts(
+    model: torch.nn.Module, target_modules: Iterable[str]
+) -> bool:
+    """Whether the routed experts take LoRA, from the unnormalized target modules.
+
+    gate_up_proj/down_proj normally adapt the routed experts together with the
+    dense and shared-expert MLPs. A model whose leaf names cannot tell them apart
+    (Step5) decides from the full target names; when it says no, its FusedMoE
+    stays unwrapped and gets no expert buffers.
+    """
+    if not hasattr(model, "lora_targets_routed_experts"):
+        return True
+    return model.lora_targets_routed_experts(target_modules)
+
+
 def shared_experts_count(config: AutoConfig) -> Optional[int]:
     # DeepSeek-style configs say n_shared_experts, Kimi K3 says num_shared_experts
     return getattr(config, "n_shared_experts", None) or getattr(

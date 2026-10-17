@@ -10,8 +10,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
+_USE_PIP_FA4 = os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1"
+
 try:
-    if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
+    if _USE_PIP_FA4:
         # A/B debug escape hatch: route through the pip flash-attn-4 package
         # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
         from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
@@ -211,8 +213,10 @@ def flash_attn_varlen_func(
     window_size: Tuple[Optional[int], Optional[int]] = (-1, -1),
     learnable_sink: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    use_pdl: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     q_descale: Optional[
@@ -231,7 +235,9 @@ def flash_attn_varlen_func(
     ] = None,  # MXFP8 UE8M0 per-32-elem block scales (in-kernel V dequant)
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    tile_mn: Optional[Tuple[int, int]] = None,
     return_softmax_lse: bool = False,
+    leftpad_k: Optional[torch.Tensor] = None,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
     **_: object,
@@ -244,6 +250,7 @@ def flash_attn_varlen_func(
         ) from _flash_attn_import_error
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
+    head_gate = _maybe_contiguous(head_gate)
     if qv is None and q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256:
         # The vendored hd256 kernel assumes dense Q/K/V strides.
         # TODO: Remove this workaround after the FA4 in current environment includes
@@ -291,6 +298,23 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    extension_kwargs = {}
+    if _USE_PIP_FA4:
+        if (
+            head_gate is not None
+            or use_pdl
+            or tile_mn is not None
+            or leftpad_k is not None
+        ):
+            raise RuntimeError(
+                "pip flash-attn-4 does not support head_gate, use_pdl, tile_mn, "
+                "or leftpad_k; unset SGLANG_INKLING_FA4_USE_PIP"
+            )
+    else:
+        extension_kwargs["head_gate"] = head_gate
+        extension_kwargs["use_pdl"] = use_pdl
+        extension_kwargs["tile_mn"] = tile_mn
+        extension_kwargs["leftpad_k"] = leftpad_k
     # The kernel writes into out, except where it pads MLA heads: its output
     # then has more heads than out, and the result is a new tensor.
     out_kwargs = (
@@ -324,6 +348,7 @@ def flash_attn_varlen_func(
         **sf_kwargs,
         **descale_kwargs,
         **rel_bias_kwargs,
+        **extension_kwargs,
         **out_kwargs,
     )
     result = _unpad_mla_result(result, mla_head_padding)
@@ -367,6 +392,8 @@ def flash_attn_with_kvcache(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     sinks: Optional[torch.Tensor] = None,
+    head_gate: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     sfq: Optional[torch.Tensor] = None,
@@ -374,6 +401,7 @@ def flash_attn_with_kvcache(
     sfv: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    tile_mn: Optional[Tuple[int, int]] = None,
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
@@ -383,10 +411,12 @@ def flash_attn_with_kvcache(
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
         raise NotImplementedError("FA4 path does not support rotary embedding.")
-    if cache_batch_idx is not None or cache_leftpad is not None:
+    if cache_batch_idx is not None:
         raise NotImplementedError(
-            "FA4 path does not support non-consecutive batch indices or left padding."
+            "FA4 path does not support non-consecutive batch indices."
         )
+    if cache_leftpad is not None and page_table is None:
+        raise NotImplementedError("FA4 cache_leftpad requires a paged KV page_table.")
     if isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
@@ -408,6 +438,8 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         learnable_sink=sinks,
+        head_gate=head_gate,
+        use_pdl=use_pdl,
         mask_mod=mask_mod,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
@@ -419,7 +451,9 @@ def flash_attn_with_kvcache(
         sfv=sfv,
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
+        tile_mn=tile_mn,
         return_softmax_lse=True,
+        leftpad_k=cache_leftpad,
         out=out,
     )
 

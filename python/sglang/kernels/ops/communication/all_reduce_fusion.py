@@ -234,6 +234,107 @@ def moe_finalize_all_reduce(
 
 
 @cache_once
+def _jit_residual_norm_module(
+    world_size, hidden_dim, top_k, cluster_size, weight_dtype
+):
+    require_cluster_launch_arch()
+    args = make_cpp_args(
+        world_size,
+        hidden_dim,
+        top_k,
+        cluster_size,
+        is_arch_support_pdl(),
+        weight_dtype,
+        False,
+        False,
+        False,
+        True,
+        True,
+    )
+    return load_jit(
+        "moe_finalize_all_reduce_residual_norm",
+        *args,
+        cuda_files=["distributed/all_reduce_fusion.cuh"],
+        cuda_wrappers=[
+            ("run", f"MoeFinalizeAllReduceKernel<{args}>::run_residual_norm")
+        ],
+    )
+
+
+@register_custom_op(mutates_args=["out", "residual_out"])
+def _moe_finalize_all_reduce_residual_norm_op(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    out: torch.Tensor,
+    residual_out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+    shared: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> None:
+    comm = _COMM_MAP[world_size]
+    _jit_residual_norm_module(
+        world_size, hidden_dim, top_k, cluster_size, weights.dtype
+    ).run(
+        comm,
+        out,
+        residual_out,
+        gemm2_out,
+        indices,
+        weights,
+        shared,
+        residual,
+        norm_weight,
+        eps,
+    )
+
+
+def moe_finalize_all_reduce_residual_rmsnorm(
+    gemm2_out: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+    shared: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    *,
+    world_size: int,
+    cluster_size: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Finalize routed experts, add shared, reduce, then add residual and normalize.
+
+    The routed sum, shared addition, rank reduction and residual addition each
+    retain their BF16 rounding. ``norm_weight`` includes any Gemma offset.
+    """
+    rows, top_k = weights.shape
+    hidden_dim = gemm2_out.shape[-1]
+    out = torch.empty((rows, hidden_dim), dtype=torch.bfloat16, device=gemm2_out.device)
+    residual_out = torch.empty_like(out)
+    if rows:
+        _moe_finalize_all_reduce_residual_norm_op(
+            world_size,
+            hidden_dim,
+            top_k,
+            cluster_size or default_cluster_size(hidden_dim),
+            out,
+            residual_out,
+            gemm2_out,
+            indices,
+            weights,
+            shared,
+            residual,
+            norm_weight,
+            eps,
+        )
+    return out, residual_out
+
+
+@cache_once
 def _jit_shared_gate_module(
     world_size: int,
     hidden_dim: int,
@@ -253,6 +354,8 @@ def _jit_shared_gate_module(
         False,  # kMhc
         False,  # kQuant
         False,  # kCollapse
+        False,  # kResidual
+        False,  # kMulticast
         True,  # kGatedShared
     )
     return load_jit(

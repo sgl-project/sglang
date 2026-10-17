@@ -44,6 +44,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    lora_adapts_routed_experts,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -804,6 +805,19 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
+        # Full names, before normalization folds them to leaf module names.
+        requested_targets = [
+            *(target_modules or ()),
+            *(
+                target
+                for config in self.configs.values()
+                for target in (
+                    [config.target_modules]
+                    if isinstance(config.target_modules, str)
+                    else config.target_modules or ()
+                )
+            ),
+        ]
         if target_modules and target_modules == {"all"}:
             self.target_modules = auto_detect_lora_target_modules(self.base_model)
             self.target_modules.update(EMBEDDING_NAMES)
@@ -877,6 +891,10 @@ class LoRAManager:
             else:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
+
+        self.adapts_routed_experts = lora_adapts_routed_experts(
+            self.base_model, requested_targets
+        )
 
         unsupported_targets = self.target_modules - _KNOWN_LORA_TARGET_MODULES
         if unsupported_targets:
@@ -1169,6 +1187,7 @@ class LoRAManager:
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            adapts_routed_experts=self.adapts_routed_experts,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
             lora_no_cpu_backup=self.lora_no_cpu_backup,
@@ -1303,7 +1322,10 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)):
+            if (
+                isinstance(module, (FusedMoE, InklingBatchDenseMLP))
+                and self.adapts_routed_experts
+            ):
                 expert_projections = ("gate_up_proj", "down_proj")
                 missing = [
                     x for x in expert_projections if x not in self.target_modules

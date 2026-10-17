@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
     QSATokenToKVPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -640,6 +641,11 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.dst_kv_item_lens, [])
         info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
         self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertEqual(info.step5_layout, b"")
+        layout = b'{"step5": "layout"}'
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128), layout])
+        self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertEqual(info.step5_layout, layout)
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -1867,6 +1873,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
+                    disagg_decode_prealloc_queue=SimpleNamespace(aux_states=[]),
                     batch_result_processor=SimpleNamespace(
                         _maybe_update_reasoning_tokens=lambda req, token_id: None
                     ),
@@ -1921,6 +1928,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.scheduler = SimpleNamespace(
                 kv_checksum_computer=None,
+                disagg_decode_prealloc_queue=SimpleNamespace(aux_states=[]),
                 batch_result_processor=SimpleNamespace(
                     _maybe_update_reasoning_tokens=lambda req, token_id: None
                 ),
@@ -2387,6 +2395,34 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         ptrs, _, items = draft.get_unified_swa_ring_buf_infos()
         self.assertEqual(len(ptrs), 1)
         self.assertEqual(items, [16])
+
+
+class TestSWADraftStateRegistration(unittest.TestCase):
+    def test_draft_swa_pools_sharing_target_mapping_are_registered(self):
+        mapping = torch.arange(16)
+
+        def make_pool(ptr, swa_layer_nums=1, pool_mapping=mapping):
+            pool = object.__new__(SWAKVPool)
+            pool.full_kv_pool = object()
+            pool.swa_kv_pool = object()
+            pool.swa_layer_nums = swa_layer_nums
+            pool.full_to_swa_index_mapping = pool_mapping
+            pool.get_state_buf_infos = lambda: ([ptr, ptr + 1], [64, 64], [8, 8])
+            return pool
+
+        target = make_pool(10)
+        drafts = (
+            make_pool(20),
+            make_pool(30),
+            make_pool(40, swa_layer_nums=0),
+            make_pool(50, pool_mapping=torch.arange(16)),
+        )
+        kv_args = KVArgs()
+
+        setup_state_kv_args(kv_args, target, drafts[0], draft_kv_pools=drafts)
+
+        self.assertEqual(kv_args.state_types, [StateType.SWA] * 3)
+        self.assertEqual(kv_args.state_data_ptrs, [[10, 11], [20, 21], [30, 31]])
 
 
 if __name__ == "__main__":

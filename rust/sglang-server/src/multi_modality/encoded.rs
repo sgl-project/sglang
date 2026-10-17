@@ -46,6 +46,7 @@ pub enum MmMetaValue {
 pub struct MmEncodedItem {
     pub modality: MmModality,
     pub feature: Tensor,
+    pub aux: Vec<(String, Tensor)>,
     /// Content hash of the raw source bytes, or the caller's `mm_hashes`
     /// override; precomputed so draining never hashes.
     pub hash: u64,
@@ -83,6 +84,17 @@ impl MmEncodedEntry {
                 return Err(format!(
                     "multimodal item {index}: feature shape does not match its data"
                 ));
+            }
+            for (name, tensor) in &item.aux {
+                let elements = tensor
+                    .shape
+                    .iter()
+                    .try_fold(1usize, |n, &d| n.checked_mul(d));
+                if elements != Some(tensor.data.len()) {
+                    return Err(format!(
+                        "multimodal item {index}: aux {name} shape does not match its data"
+                    ));
+                }
             }
             if item
                 .offsets

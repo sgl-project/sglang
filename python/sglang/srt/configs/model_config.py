@@ -11,14 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 import copy
 import json
 import logging
 import math
 import os
+from collections.abc import Mapping
 from enum import Enum, IntEnum, auto
 from functools import cached_property, lru_cache
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Set, Union
 
@@ -515,6 +516,10 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        tokenizer_path: Optional[str] = None,
+        tokenizer_mode: str = "auto",
+        tokenizer_backend: str = "huggingface",
+        skip_tokenizer_init: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -798,6 +803,14 @@ class ModelConfig:
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
+        self._resolve_step5_vocabulary(
+            tokenizer_path=tokenizer_path or model_path,
+            tokenizer_mode=tokenizer_mode,
+            tokenizer_backend=tokenizer_backend,
+            skip_tokenizer_init=skip_tokenizer_init,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
 
         # Update hybrid model
         self._derive_hybrid_model()
@@ -841,6 +854,7 @@ class ModelConfig:
         model_revision: str = None,
         is_draft_model: bool = False,
         context_length: Optional[int] = None,
+        tokenizer_path: Optional[str] = None,
         **kwargs,
     ):
         for record_type in type(server_args).__mro__:
@@ -856,6 +870,16 @@ class ModelConfig:
                 )
 
         cfg = resolving_view(server_args)
+        if tokenizer_path is None:
+            from sglang.srt.runtime_context import get_context, get_serving
+
+            context = get_context()
+            tokenizer_path = (
+                get_serving().tokenizer_path
+                if context.is_config_namespace_published("serving")
+                and context.server_args is server_args
+                else cfg.tokenizer_path
+            )
         quantization = (
             cfg.speculative_draft_model_quantization
             if is_draft_model
@@ -893,6 +917,10 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            tokenizer_path=tokenizer_path,
+            tokenizer_mode=cfg.tokenizer_mode,
+            tokenizer_backend=cfg.tokenizer_backend,
+            skip_tokenizer_init=cfg.skip_tokenizer_init,
             **kwargs,
         )
 
@@ -921,10 +949,50 @@ class ModelConfig:
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
 
+    def _resolve_step5_vocabulary(
+        self,
+        *,
+        tokenizer_path,
+        tokenizer_mode,
+        tokenizer_backend,
+        skip_tokenizer_init,
+        trust_remote_code,
+        revision,
+    ):
+        from sglang.srt.configs.step5 import Step5Config, resolve_step5_vocab_size
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        if not isinstance(self.hf_text_config, Step5Config):
+            return
+        tokenizer = None
+        if not skip_tokenizer_init:
+            tokenizer = get_tokenizer(
+                tokenizer_path,
+                tokenizer_mode=tokenizer_mode,
+                tokenizer_backend=tokenizer_backend,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+            )
+        self.vocab_size = resolve_step5_vocab_size(
+            config=self.hf_text_config,
+            tokenizer_vocab_size=(
+                tokenizer_token_id_upper_bound(tokenizer)
+                if tokenizer is not None
+                else None
+            ),
+        )
+        validate_step5_special_tokens(
+            config=self.hf_text_config,
+            generation_config=self.hf_generation_config,
+            tokenizer=tokenizer,
+            vocab_size=self.vocab_size,
+        )
+
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
         from sglang.srt.configs.dots3 import Dots3Config
+        from sglang.srt.configs.step5 import Step5Config
 
         if is_draft_model and isinstance(self.hf_text_config, Dots3Config):
             self.hf_config.architectures[0] = (
@@ -998,6 +1066,9 @@ class ModelConfig:
             self.hf_config.num_nextn_predict_layers = 1
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
+        if is_draft_model and self.hf_config.architectures[0] == "Step5ForCausalLM":
+            # Keep the main depth and absolute MTP metadata from this checkpoint.
+            self.hf_config.architectures[0] = "Step5MTP"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
@@ -1008,12 +1079,26 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "Step3p7ForConditionalGeneration",
+            "Step5ForConditionalGeneration",
         ):
+            if isinstance(self.hf_text_config, Step5Config):
+                image_token_id = self.hf_config.image_token_id
+                self.hf_text_config.mtp_image_token_id = (
+                    image_token_id
+                    if type(image_token_id) is int
+                    and 0 <= image_token_id < self.hf_text_config.vocab_size
+                    else 0
+                )
             self.hf_config = self.hf_text_config
-            self.hf_config.architectures = ["Step3p5MTP"]
+            self.hf_config.architectures = [
+                (
+                    "Step5MTP"
+                    if self.hf_text_config.model_type in ("step5", "step5")
+                    else "Step3p5MTP"
+                )
+            ]
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -2401,6 +2486,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "Step5ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
 ]
@@ -2634,6 +2720,12 @@ def get_hybrid_layer_ids(
     elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
+    elif "Step5MTP" in model_architectures:
+        from sglang.srt.configs.step5 import get_step5_mtp_layer_ids
+
+        swa, full = get_step5_mtp_layer_ids(config=hf_text_config)
+        swa_attention_layer_ids = list(swa)
+        full_attention_layer_ids = list(full)
     elif (
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
@@ -2697,3 +2789,94 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+def _nonnegative_integer(value, *, source: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+        raise ValueError(f"Tokenizer {source} requires non-negative integer IDs/bounds")
+    return int(value)
+
+
+def tokenizer_token_id_upper_bound(tokenizer) -> int:
+    """Use IDs as well as counts; added/special tokens can exceed a sparse map.
+
+    Only unsupported optional tokenizer APIs are ignored. Exceptions raised
+    while reading an implemented vocabulary map propagate to startup.
+    No tokenizer object is modified or retained in a global cache.
+    """
+    bounds = []
+
+    def add_ids(values, source):
+        if values is not None:
+            bounds.extend(
+                _nonnegative_integer(value, source=source) + 1
+                for value in values
+                if value is not None
+            )
+
+    # The methods themselves are optional on third-party tokenizer objects.
+    try:
+        get_vocab = tokenizer.get_vocab
+    except AttributeError:
+        get_vocab = None
+    try:
+        get_added_vocab = tokenizer.get_added_vocab
+    except AttributeError:
+        get_added_vocab = None
+    for method in (get_vocab, get_added_vocab):
+        if method is None:
+            continue
+        try:
+            vocab = method()
+        except NotImplementedError:
+            continue
+        if vocab is not None:
+            if not isinstance(vocab, Mapping):
+                raise ValueError("Tokenizer vocabulary must be a token-to-ID mapping")
+            add_ids(vocab.values(), "vocabulary")
+
+    try:
+        special_ids = tokenizer.all_special_ids
+    except (AttributeError, NotImplementedError):
+        special_ids = None
+    add_ids(special_ids, "all_special_ids")
+    try:
+        count = len(tokenizer)
+    except (TypeError, NotImplementedError):
+        count = None
+    try:
+        base_count = tokenizer.vocab_size
+    except (AttributeError, NotImplementedError):
+        base_count = None
+    for value in (count, base_count):
+        if value is not None:
+            bounds.append(_nonnegative_integer(value, source="vocabulary size"))
+    try:
+        max_id = tokenizer.max_token_id
+    except (AttributeError, NotImplementedError):
+        max_id = None
+    if max_id is not None:
+        if isinstance(max_id, bool) or not isinstance(max_id, Integral) or max_id < -1:
+            raise ValueError("Tokenizer max_token_id requires an integer >= -1")
+        bounds.append(int(max_id) + 1)
+    if not bounds or max(bounds) <= 0:
+        raise ValueError("Tokenizer has no positive token-ID upper bound")
+    return max(bounds)
+
+
+def validate_step5_special_tokens(
+    *, config, generation_config, tokenizer, vocab_size: int
+) -> None:
+    for owner in (config, generation_config, tokenizer):
+        if owner is None:
+            continue
+        for values in (owner.bos_token_id, owner.eos_token_id, owner.pad_token_id):
+            if values is None:
+                continue
+            if not isinstance(values, (list, tuple)):
+                values = (values,)
+            for value in values:
+                if type(value) is not int or not 0 <= value < vocab_size:
+                    raise ValueError(
+                        "Step5 BOS/EOS/pad token is outside effective vocabulary"
+                    )

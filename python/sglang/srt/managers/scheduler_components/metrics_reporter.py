@@ -1225,6 +1225,19 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
+        group = getattr(self.scheduler.tree_cache, "host_pool_group", None)
+        if group is not None:
+            self.stats.hicache_host_pool_tokens = {
+                entry.name.value: (
+                    entry.host_pool.logical_size - entry.host_pool.available_size(),
+                    entry.host_pool.logical_size,
+                )
+                for entry in group.entries
+            }
+        else:
+            self.stats.hicache_host_pool_tokens = {
+                "kv": (self.stats.hicache_host_used_tokens, host_total)
+            }
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""

@@ -33,6 +33,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -494,6 +495,18 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     return target_hidden * num_aux
 
 
+def get_draft_hidden_state_dtype(model_config: ModelConfig) -> torch.dtype:
+    """Storage dtype for incoming and recurrent draft hidden states.
+
+    Step5 passes its pre-norm FP32 residual between depths. Its BF16 weight
+    dtype does not describe that state; narrowing happens inside the predictor
+    before the input norm. Other architectures retain their model dtype.
+    """
+    if model_config.hf_config.architectures[0] == "Step5MTP":
+        return torch.float32
+    return model_config.dtype
+
+
 def get_draft_recurrent_hidden_state_spec_from_config(
     model_config, spec_algorithm
 ) -> tuple[Optional[int], Optional[torch.dtype]]:
@@ -505,7 +518,7 @@ def get_draft_recurrent_hidden_state_spec_from_config(
     """
     if spec_algorithm.is_standalone():
         return None, None
-    return model_config.spec_hidden_size, model_config.dtype
+    return model_config.spec_hidden_size, get_draft_hidden_state_dtype(model_config)
 
 
 def get_draft_recurrent_hidden_state_spec(

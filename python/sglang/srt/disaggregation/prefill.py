@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_cache_dtype_str,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
@@ -175,10 +176,12 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
+        draft_kv_pools: tuple = (),
     ):
         parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_pools = draft_kv_pools
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -243,8 +246,8 @@ class PrefillBootstrapQueue:
             if self.scheduler.rust_server is not None
             else None
         )
-        kv_args.kv_cache_dtype_str = (
-            self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
+        kv_args.kv_cache_dtype_str = get_pd_kv_cache_dtype_str(
+            self.scheduler.tp_worker.model_runner
         )
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
@@ -328,8 +331,9 @@ class PrefillBootstrapQueue:
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
-            self.scheduler.model_config.num_hidden_layers,
+            total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            draft_kv_pools=self.draft_kv_pools if transfer_draft_cache else (),
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1600,6 +1604,10 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.STEP5_COMPRESSED_INDEX_KEY: _full_kv_pages_payload,
+                StateType.STEP5_DSA_TAIL: lambda: np.asarray(
+                    [req.kv.req_pool_idx], dtype=np.int32
+                ),
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),

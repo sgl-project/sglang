@@ -39,17 +39,22 @@ class TestReleaseMemoryFlushOrder(CustomTestCase):
             running_batch=SimpleNamespace(reqs=[]),
             disaggregation_mode=DisaggregationMode.NULL,
         )
-        manager = SchedulerWeightUpdaterManager(
-            tp_worker=None,
-            draft_worker=None,
-            tp_cpu_group=None,
-            memory_saver_adapter=Mock(),
-            flush_cache=lambda empty_cache=False: Scheduler.flush_cache(
-                scheduler, empty_cache=False
-            ),
-            is_fully_idle=scheduler.is_fully_idle,
-            scheduler=scheduler,
-        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.get_parallel",
+            return_value=SimpleNamespace(tp_group=SimpleNamespace(cpu_group=None)),
+        ):
+            manager = SchedulerWeightUpdaterManager(
+                tp_worker=SimpleNamespace(
+                    model_runner=SimpleNamespace(token_to_kv_pool=Mock())
+                ),
+                draft_worker=None,
+                memory_saver_adapter=Mock(),
+                flush_cache=lambda empty_cache=False: Scheduler.flush_cache(
+                    scheduler, empty_cache=False
+                ),
+                is_fully_idle=scheduler.is_fully_idle,
+                scheduler=scheduler,
+            )
         scheduler.weight_updater = manager
         return scheduler, manager
 
