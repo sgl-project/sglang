@@ -189,6 +189,9 @@ class UnifiedCacheLinker(ABC):
     def cancel_queued_load(self, rid: str) -> bool:
         """Cancel a load that has not started yet."""
 
+    def release_lookup(self, rid: str) -> None:
+        """Drop what ``lookup`` reserved for ``rid``."""
+
     @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
@@ -598,6 +601,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.cache_linker.release_lookup(rid)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

@@ -213,8 +213,9 @@ class Memory(msgspec.Struct):
     unified_cache_external_linker_backend: A[
         str,
         Arg(
-            help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            help="Storage backend for --enable-unified-cache-external-linker; "
+            "local keeps pages in this node's pinned DRAM on rank 0.",
+            choices=["mooncake", "mori", "local"],
         ),
     ] = "mooncake"
     enable_linker_mla_dedup: A[
