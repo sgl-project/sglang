@@ -18,6 +18,43 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Invalid JSON constant: {value}")
 
 
+# Keys the model sometimes emits as a spurious wrapper around the real
+# parameter object, e.g. {"arguments": {...}} or {"input": "..."} instead of
+# the tool's declared properties. See sgl-project/sglang#38924.
+_WRAPPER_ARG_KEYS = ("arguments", "input")
+
+
+def _tool_property_names(tool: Tool | None) -> set[str]:
+    """Declared property names of a tool, or an empty set when unknown."""
+    params = tool.function.parameters if tool is not None else None
+    if isinstance(params, dict) and isinstance(params.get("properties"), dict):
+        return set(params["properties"].keys())
+    return set()
+
+
+def _sole_tool_property(tool: Tool | None) -> str | None:
+    """The single property to remap a bare scalar onto: the only declared
+    property, else the only required one. None when the target is ambiguous."""
+    params = tool.function.parameters if tool is not None else None
+    if not isinstance(params, dict):
+        return None
+    props = params.get("properties")
+    if isinstance(props, dict) and len(props) == 1:
+        return next(iter(props))
+    required = params.get("required")
+    if (
+        isinstance(required, list)
+        and len(required) == 1
+        and isinstance(required[0], str)
+    ):
+        return required[0]
+    return None
+
+
+def _tools_by_name(tools: list[Tool]) -> dict[str, Tool]:
+    return {t.function.name: t for t in tools or () if t.function.name}
+
+
 class DeepSeekV32Detector(BaseFormatDetector):
     """
     Detector for DeepSeek V3.2 model function call format.
@@ -192,6 +229,44 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         return json.dumps(parameters, ensure_ascii=False)
 
+    def _unwrap_wrapped_arguments(self, params: dict, tool: Tool | None) -> dict:
+        """Undo a spurious ``{"arguments"/"input": ...}`` wrapper the model emits
+        around the real parameters (sgl-project/sglang#38924).
+
+        No-op unless the object is exactly one wrapper key that is not itself a
+        declared property. A dict value is unwrapped directly, a JSON-object
+        string is decoded first (the XML ``string="true"`` sub-case), and a bare
+        scalar is remapped onto the tool's sole property when unambiguous.
+        """
+        if not isinstance(params, dict) or len(params) != 1:
+            return params
+        ((key, value),) = params.items()
+        if key not in _WRAPPER_ARG_KEYS or key in _tool_property_names(tool):
+            return params
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                decoded = json.loads(value.strip())
+            except (json.JSONDecodeError, ValueError):
+                decoded = None
+            if isinstance(decoded, dict):
+                return decoded
+        target = _sole_tool_property(tool)
+        if target is not None:
+            return {target: value}
+        return params
+
+    def _unwrap_params_json(self, params_json: str, tool: Tool | None) -> str:
+        """``_unwrap_wrapped_arguments`` over the serialized form returned by
+        ``_parse_parameters_from_xml``; the input is returned untouched when
+        there is nothing to unwrap."""
+        params = json.loads(params_json)
+        unwrapped = self._unwrap_wrapped_arguments(params, tool)
+        if unwrapped is params:
+            return params_json
+        return json.dumps(unwrapped, ensure_ascii=False)
+
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -217,6 +292,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
+        tools_by_name = _tools_by_name(tools)
         try:
             # Find all invoke blocks
             for function_calls_content in sections:
@@ -239,7 +315,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
-                        "parameters": json.loads(func_args),
+                        "parameters": self._unwrap_wrapped_arguments(
+                            json.loads(func_args), tools_by_name.get(func_name)
+                        ),
                     }
                     calls.extend(self.parse_base_json(match_result, tools))
 
@@ -292,6 +370,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Only recovered for the first call: the DSML guard above never releases a
         # buffer that still holds a marker, so later prose stays buffered.
         preamble = ""
+        tools_by_name = _tools_by_name(tools)
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -325,7 +404,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     preamble = current_text[:call_start].removesuffix("\n\n")
 
                 try:
-                    current_params = self._parse_parameters_from_xml(invoke_content)
+                    current_params = self._unwrap_params_json(
+                        self._parse_parameters_from_xml(invoke_content),
+                        tools_by_name.get(func_name),
+                    )
                 except ValueError as e:
                     # Fail closed: drop this invoke, keep going for the next one.
                     logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
