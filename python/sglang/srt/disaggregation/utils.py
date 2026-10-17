@@ -549,10 +549,7 @@ class MetadataBuffers:
 
         # Compute multimodal prompt token counts on the prefill node so decode
         # can report them in usage.
-        if req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
-        else:
-            image_t = audio_t = video_t = 0
+        image_t, audio_t, video_t = req.get_mm_token_counts()
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t

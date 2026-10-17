@@ -83,6 +83,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
+    resolve_num_sms,
+    resolve_paged_mqa_logits_metadata_fn,
     should_use_dsa_fused_topk,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -102,9 +104,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
-
-if is_cuda():
-    import deep_gemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -940,6 +939,7 @@ class DeepseekSparseAttnBackend(
             and next_n
             and next_n >= 2
             and get_platform().is_sm100
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -951,8 +951,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32_2d, 64, deep_gemm.get_num_sms()
+        new_schedule = resolve_paged_mqa_logits_metadata_fn()(
+            seqlens_32_2d, 64, resolve_num_sms()
         )
         if metadata.paged_mqa_schedule_metadata is None:
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
@@ -997,6 +997,39 @@ class DeepseekSparseAttnBackend(
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
+
+    def prepare_mtp_seed_indices(
+        self, topk_indices: torch.Tensor, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Export a seed in the representation consumed by the next draft decode."""
+        if (
+            not self.use_fused_topk
+            or self.get_topk_transform_method(forward_mode)
+            != TopkTransformMethod.RAGGED
+        ):
+            # PAGED output is already physical; unfused/PD seeds stay request-local.
+            return topk_indices
+
+        # Prefill addresses concatenated logical KV, but fused draft decode
+        # consumes allocator-local physical slots. Leave prefill's input intact.
+        metadata = self.forward_metadata
+        page_table = metadata.page_table_1_flattened
+        if page_table is None:
+            # Without a cached prefix attention does not need a flattened table.
+            # Build it in the producer indexer's request order for seed export.
+            page_table = torch.cat(
+                [
+                    metadata.page_table_1[i, :length]
+                    for i, length in enumerate(metadata.indexer_seq_lens_cpu.tolist())
+                ]
+            )
+        padding = topk_indices == -1
+        # index_select rejects invalid indices. Replace only the padding sentinel
+        # for the gather, then restore it; never clamp a bad positive index.
+        physical_indices = page_table.index_select(
+            0, topk_indices.masked_fill(padding, 0).reshape(-1).long()
+        ).view_as(topk_indices)
+        return physical_indices.masked_fill(padding, -1)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
@@ -1314,8 +1347,8 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
+                paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
 
         metadata = DSAMetadata(
@@ -1703,8 +1736,8 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
+                paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
 
         metadata = DSAMetadata(
