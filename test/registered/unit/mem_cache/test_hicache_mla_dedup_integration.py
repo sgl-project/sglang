@@ -88,6 +88,64 @@ class TestHiCacheMLADedupIntegration(unittest.TestCase):
         controller._move_mla_write_operation.assert_not_called()
         controller._mla_l2_transfers.assert_not_called()
 
+    def test_write_fences_precede_copy_with_and_without_dedup(self):
+        for dedup in (False, True):
+            for wait_for_forward in (False, True):
+                with self.subTest(dedup=dedup, wait_for_forward=wait_for_forward):
+                    operations = []
+                    op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
+                    completion = SimpleNamespace(
+                        start_event=object(),
+                        finish_event=object(),
+                        timing_enabled=False,
+                    )
+                    controller = HiCacheController.__new__(HiCacheController)
+                    controller.mla_dedup = (
+                        SimpleNamespace(producer_stream=mock.sentinel.producer)
+                        if dedup
+                        else None
+                    )
+                    controller.write_fence_stream = mock.sentinel.forward
+                    controller.write_queue = [op]
+                    controller.ack_write_queue = []
+                    for name in ("_move_write_operation", "_move_mla_write_operation"):
+                        setattr(
+                            controller,
+                            name,
+                            mock.Mock(
+                                return_value=(op.host_indices, op.device_indices, None)
+                            ),
+                        )
+                    for name in ("_l2_transfers", "_mla_l2_transfers"):
+                        setattr(
+                            controller, name, mock.Mock(return_value=[mock.sentinel.kv])
+                        )
+                    controller._num_tokens_by_pool = mock.Mock(return_value={})
+                    controller._transfer_num_bytes = mock.Mock(return_value=0)
+                    controller._mla_transfer_num_bytes = mock.Mock(return_value=0)
+                    controller.mem_pool_device_allocator = mock.Mock()
+
+                    def submit(transfers):
+                        operations.append("copy")
+                        self.assertEqual(transfers, [mock.sentinel.kv])
+                        return completion
+
+                    controller.l2_transfer_engine = SimpleNamespace(
+                        device_to_host_stream=SimpleNamespace(
+                            wait_stream=operations.append
+                        ),
+                        submit_device_to_host=submit,
+                    )
+
+                    controller.start_writing(wait_for_forward=wait_for_forward)
+
+                    expected = [mock.sentinel.forward] if wait_for_forward else []
+                    if dedup:
+                        expected.append(mock.sentinel.producer)
+                    self.assertEqual(operations, [*expected, "copy"])
+                    self.assertEqual(controller.write_queue, [])
+                    self.assertEqual(len(controller.ack_write_queue), 1)
+
     def test_disabled_flag_keeps_original_load_path(self):
         op = CacheOperation(torch.arange(2), torch.arange(2), node_id=1)
         producer_event = SimpleNamespace(start_event=mock.Mock(), complete=mock.Mock())

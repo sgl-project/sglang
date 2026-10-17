@@ -24,6 +24,7 @@ def _scheduler_for_typed_config():
             get_default_sampling_params=lambda: {},
         ),
         rust_server_tokenizer_path=lambda: "tokenizer",
+        tokenizer=None,
         max_total_num_tokens=1024,
         load_snapshot_writer=None,
     )
@@ -91,6 +92,21 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         assert metrics is extension.MetricsConfig.return_value
     else:
         assert metrics is None
+
+
+@pytest.mark.parametrize(
+    "tokenizer,expected",
+    [
+        (None, -1),
+        (SimpleNamespace(), -1),
+        (SimpleNamespace(model_max_length=4096), 4096),
+        # HF's unset sentinel, int(1e30), is not a 64-bit integer.
+        (SimpleNamespace(model_max_length=int(1e30)), 2048),
+    ],
+    ids=["no-tokenizer", "no-attribute", "configured", "unset-sentinel"],
+)
+def test_tokenizer_model_max_length_matches_python_tokenize(tokenizer, expected):
+    assert rust_config._tokenizer_model_max_length(tokenizer, 2048) == expected
 
 
 @pytest.mark.parametrize(
