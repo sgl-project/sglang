@@ -5,10 +5,10 @@ import os
 
 
 def load_module(local_module: str, aiter_module: str):
-    mode = os.environ.get("SGLANG_K3_FLYDSL_SOURCE", "auto").lower()
+    mode = os.environ.get("SGLANG_OPT_HIP_K3_FLYDSL_SOURCE", "auto").lower()
     if mode not in ("auto", "sglang", "aiter"):
         raise ValueError(
-            "SGLANG_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
+            "SGLANG_OPT_HIP_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
         )
 
     candidates = (
