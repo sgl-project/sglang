@@ -21,6 +21,7 @@ from sglang.srt.monokernels.spec import (
     MonoSpec,
     Plan,
     ShapeKey,
+    StepMetadata,
     find_spec,
     spec_registered,
 )
@@ -98,6 +99,14 @@ def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
     if bs <= 0 or rows % bs:
         return None
     return ShapeKey(forward_mode=name, batch_size=bs, tokens_per_request=rows // bs)
+
+
+def is_metadata_unread(
+    model: torch.nn.Module, forward_batch: ForwardBatch, metadata: StepMetadata
+) -> bool:
+    """Whether the monokernel forward that runs this step never reads the metadata."""
+    served, unread = model.__dict__.get("_monokernel_unread_metadata", ((), ()))
+    return metadata in unread and shape_key(forward_batch) in served
 
 
 def install_monokernel_forward(
@@ -340,6 +349,8 @@ def _install_forward(
         return built.forward(Plan(key=key), *args, **kwargs)
 
     model.forward = forward
+    # attention backends ask is_metadata_unread before building per-step metadata
+    model._monokernel_unread_metadata = (served, spec.unread_metadata)
 
 
 def _format_steps(keys: Iterable[ShapeKey]) -> str:
