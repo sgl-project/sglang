@@ -15,7 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.monokernels.spec import Feature, MonoSpec, NumericsKind, find_spec
 
 if TYPE_CHECKING:
@@ -155,9 +155,14 @@ def monokernel_disable_reasons(
 def covered_capture_sizes(
     *, widths: tuple[int, ...], tokens_per_request: int, sizes: list[int]
 ) -> list[int]:
-    """Capture each batch size the spec covers, plus the configured sizes above them."""
+    """Align supported buckets without raising the configured capture ceiling."""
+    max_bs = max(sizes, default=0)
     covered = sorted(
-        {w // tokens_per_request for w in widths if w % tokens_per_request == 0}
+        {
+            w // tokens_per_request
+            for w in widths
+            if w % tokens_per_request == 0 and w // tokens_per_request <= max_bs
+        }
     )
     if not covered:
         return list(sizes)
@@ -183,16 +188,22 @@ def handle_monokernel(server_args: ServerArgs) -> None:
         int(cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
     )
     graph = cfg.cuda_graph_config
-    sizes = list(graph.decode.bs or [])
-    new = covered_capture_sizes(
-        widths=spec.widths(isa), tokens_per_request=tokens, sizes=sizes
+    explicit_bs = (Phase.DECODE, "bs") in getattr(
+        server_args, "_cuda_graph_config_locked", set()
     )
-    if sizes and new != sorted(set(sizes)):
-        declare_resolution(
-            server_args,
-            "handle_monokernel",
-            cuda_graph_config=with_phase(graph, Phase.DECODE, bs=new, max_bs=max(new)),
+    if graph.decode.backend != Backend.DISABLED and not explicit_bs:
+        sizes = list(graph.decode.bs or [])
+        new = covered_capture_sizes(
+            widths=spec.widths(isa), tokens_per_request=tokens, sizes=sizes
         )
+        if sizes and new != sorted(set(sizes)):
+            declare_resolution(
+                server_args,
+                "handle_monokernel",
+                cuda_graph_config=with_phase(
+                    graph, Phase.DECODE, bs=new, max_bs=max(new)
+                ),
+            )
     logger.warning(
         "--monokernel-backend is experimental. Its kernels, coverage and plugin API "
         "may change."
