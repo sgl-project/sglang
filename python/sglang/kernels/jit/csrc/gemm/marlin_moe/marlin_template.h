@@ -724,12 +724,15 @@ __global__ void Marlin(
   if constexpr (has_zp) {
     if constexpr (group_blocks == -1) {
       zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
-    } else {
+    } else if constexpr (group_blocks >= thread_k_blocks) {
       zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + zp_sh_stride * slice_col + threadIdx.x;
+    } else {
+      zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks + threadIdx.x / zp_sh_stride) +
+                 zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
     }
   }
   auto zp_sh_wr = threadIdx.x;
-  bool zp_sh_wr_pred = threadIdx.x < zp_sh_stride;
+  bool zp_sh_wr_pred = threadIdx.x < zp_sh_stage;
 
   // We use a different scale layout for grouped and column-wise quantization as
   // we scale a `half2` tile in column-major layout in the former and in
