@@ -1,14 +1,15 @@
-"""Which top-p / top-k renorm variant runs, decided per call site.
+"""Which top-p / top-k renorm variant runs.
 
 The fast flashinfer kernels pool partial sums with float atomics, so TP ranks
-can disagree in the last bits on identical logits. The deterministic variants
-(flashinfer ``is_deterministic=True``: integer-histogram AIR top-p, fixed-point
-sum radix top-k) close that at a modest cost. Consumers that already broadcast
-their decision from rank 0 (speculative verify: EAGLE always, DFlash/DSpark via
-SGLANG_SPEC_TP_SYNC) keep the fast kernels; the plain sampler has no broadcast
-and goes deterministic as soon as more than one attention-TP rank has to
-agree. SGLANG_RENORM_DETERMINISTIC=0/1 overrides both;
---enable-deterministic-inference forces both on.
+can disagree in the last bits on identical logits; a shared sampling coin that
+lands in that gap commits different tokens on different ranks and the ranks
+later wedge in a collective. The deterministic variants (flashinfer
+``is_deterministic=True``: integer-histogram AIR top-p, fixed-point sum radix
+top-k) close that, at no measurable end-to-end cost. Policy: deterministic
+whenever more than one attention-TP rank has to agree, on every path (plain
+sampler and speculative verify alike); fast on a single rank.
+SGLANG_RENORM_DETERMINISTIC=0/1 overrides; --enable-deterministic-inference
+forces on.
 """
 
 from __future__ import annotations
@@ -46,14 +47,11 @@ _FI_TOP_P_DETERMINISTIC = _flashinfer_has_deterministic("top_p_renorm_probs")
 _FI_TOP_K_DETERMINISTIC = _flashinfer_has_deterministic("top_k_renorm_probs")
 
 
-def renorm_deterministic(*, ranks_agree: bool) -> bool:
-    """``ranks_agree``: the consumer broadcasts its decision from rank 0 anyway."""
+def renorm_deterministic() -> bool:
     if envs.SGLANG_RENORM_DETERMINISTIC.is_set():
         return envs.SGLANG_RENORM_DETERMINISTIC.get()
     if get_exec().deterministic.enable_deterministic_inference:
         return True
-    if ranks_agree:
-        return False
     return get_parallel().attn_tp_size > 1
 
 
@@ -63,7 +61,7 @@ def top_p_renorm_prob(
     deterministic: Optional[bool] = None,
 ) -> torch.Tensor:
     if deterministic is None:
-        deterministic = renorm_deterministic(ranks_agree=False)
+        deterministic = renorm_deterministic()
     if deterministic and _FI_TOP_P_DETERMINISTIC and probs.is_cuda:
         return _flashinfer_sampling.top_p_renorm_probs(
             probs, top_p, is_deterministic=True
@@ -80,7 +78,7 @@ def top_k_renorm_prob(
     deterministic: Optional[bool] = None,
 ) -> torch.Tensor:
     if deterministic is None:
-        deterministic = renorm_deterministic(ranks_agree=False)
+        deterministic = renorm_deterministic()
     if deterministic and _FI_TOP_K_DETERMINISTIC and probs.is_cuda:
         return _flashinfer_sampling.top_k_renorm_probs(
             probs, top_k, is_deterministic=True
@@ -88,27 +86,8 @@ def top_k_renorm_prob(
     return _sgl_kernel.top_k_renorm_prob(probs, top_k)
 
 
-def spec_top_p_renorm_prob(
-    probs: torch.Tensor, top_p: Union[torch.Tensor, float]
-) -> torch.Tensor:
-    """Speculative verify: the accept decision is broadcast from rank 0."""
-    return top_p_renorm_prob(
-        probs, top_p, deterministic=renorm_deterministic(ranks_agree=True)
-    )
-
-
-def spec_top_k_renorm_prob(
-    probs: torch.Tensor, top_k: Union[torch.Tensor, int]
-) -> torch.Tensor:
-    return top_k_renorm_prob(
-        probs, top_k, deterministic=renorm_deterministic(ranks_agree=True)
-    )
-
-
 __all__ = [
     "renorm_deterministic",
-    "spec_top_k_renorm_prob",
-    "spec_top_p_renorm_prob",
     "top_k_renorm_prob",
     "top_p_renorm_prob",
 ]

@@ -1,9 +1,9 @@
 """Which renorm variant each call site gets, from the published config alone.
 
-The fast kernels can leave TP ranks disagreeing in the last bits; the plain
-sampler has no rank-0 broadcast to hide that, speculative verify does. The
-policy must therefore turn deterministic on for the sampler exactly when more
-than one attention-TP rank is involved, and nowhere else unless forced.
+The fast kernels can leave TP ranks disagreeing in the last bits, and every
+consumer (plain sampler, speculative verify) commits what it sampled from them
+to per-rank state. The policy must therefore turn deterministic on exactly when
+more than one attention-TP rank is involved, and nowhere else unless forced.
 """
 
 import unittest
@@ -22,30 +22,28 @@ class TestRenormPolicy(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def test_single_rank_is_fast_everywhere(self):
+    def test_single_rank_is_fast(self):
         with get_context().override_server_args(tp_size=1):
-            self.assertFalse(renorm_deterministic(ranks_agree=False))
-            self.assertFalse(renorm_deterministic(ranks_agree=True))
+            self.assertFalse(renorm_deterministic())
 
-    def test_multi_rank_sampler_is_deterministic_spec_is_not(self):
+    def test_multi_rank_is_deterministic(self):
         with get_context().override_server_args(tp_size=2):
             self.assertEqual(get_parallel().attn_tp_size, 2)
-            self.assertTrue(renorm_deterministic(ranks_agree=False))
-            self.assertFalse(renorm_deterministic(ranks_agree=True))
+            self.assertTrue(renorm_deterministic())
 
     def test_deterministic_inference_forces_on(self):
         with get_context().override_server_args(
             tp_size=1, enable_deterministic_inference=True
         ):
-            self.assertTrue(renorm_deterministic(ranks_agree=True))
+            self.assertTrue(renorm_deterministic())
 
     def test_env_overrides_both_ways(self):
         with get_context().override_server_args(tp_size=2):
             with envs.SGLANG_RENORM_DETERMINISTIC.override(False):
-                self.assertFalse(renorm_deterministic(ranks_agree=False))
+                self.assertFalse(renorm_deterministic())
         with get_context().override_server_args(tp_size=1):
             with envs.SGLANG_RENORM_DETERMINISTIC.override(True):
-                self.assertTrue(renorm_deterministic(ranks_agree=True))
+                self.assertTrue(renorm_deterministic())
 
 
 if __name__ == "__main__":
