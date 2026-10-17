@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.ops.diffusion.common.platform import platform_key
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -152,6 +153,10 @@ def mark_fused_gelu_site(module: nn.Module, linear_attr: str) -> None:
     (``_sgl_fused_gelu_enabled = False``): the module's forward must keep the
     reference path bit-exact until :func:`mount_fused_linear_gelu` enables it.
     """
+    if platform_key() == "npu":
+        # The cublasLt GELU epilogue is CUDA-only; a marked site on NPU can
+        # only ever fail the static guards and log the rejection.
+        return
     _FUSION.mark(module, linear_attr)
 
 
