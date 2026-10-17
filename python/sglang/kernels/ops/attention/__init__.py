@@ -131,6 +131,8 @@ def qwen38_qsa_sm121_varlen(
 
 __all__ = ["can_use_kda_qwen38_qsa_sm121", "qwen38_qsa_sm121_varlen"]
 
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.attention import cake as _cake  # noqa: E402, F401
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated
 # in Phase 2.5 (RFC #29630); representative entry points for inventory.
