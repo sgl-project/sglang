@@ -58,6 +58,11 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`kimi_k2_raw_id`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Same models as `kimi_k2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Parses like `kimi_k2`, but Chat Completions and Anthropic Messages return the model-emitted tool call id (e.g. `functions.get_weather:5`) verbatim instead of renumbering it by the tool-call count of the message history. Ids are not deduplicated. Intended for RL rollouts, where the next turn must reference the exact id the policy generated.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`llama3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Llama 3.1 / 3.2 / 3.3 (e.g. `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`, `meta-llama/Llama-3.3-70B-Instruct`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>

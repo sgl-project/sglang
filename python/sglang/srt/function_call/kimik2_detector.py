@@ -198,6 +198,7 @@ class KimiK2Detector(BaseFormatDetector):
                         tool_index=local_tool_index,
                         name=function_name,
                         parameters=function_args,
+                        tool_call_id=function_id,
                     )
                 )
                 local_tool_index += 1
@@ -329,6 +330,7 @@ class KimiK2Detector(BaseFormatDetector):
                                 else None
                             ),
                             parameters=argument_diff,
+                            tool_call_id=function_id if name_just_resolved else None,
                         )
                     )
                     if argument_diff:

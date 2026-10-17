@@ -22,6 +22,7 @@ TOOL_CALL_PARSER_NAMES = [
     "gpt-oss",
     "k2_horizon",
     "kimi_k2",
+    "kimi_k2_raw_id",
     "kimi_k3",
     "lfm2",
     "ling3",
