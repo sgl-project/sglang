@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -131,6 +132,16 @@ def handle_asr_validation(server_args: Any):
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
+    if (
+        cfg.max_audio_duration_seconds is not None
+        and (
+            not math.isfinite(cfg.max_audio_duration_seconds)
+            or cfg.max_audio_duration_seconds <= 0
+        )
+    ):
+        raise ValueError("max_audio_duration_seconds must be positive")
+    if cfg.max_audio_decoded_bytes is not None and cfg.max_audio_decoded_bytes < 0:
+        raise ValueError("max_audio_decoded_bytes must be non-negative")
     if (
         cfg.mm_preprocess_cache_size_mb is not None
         and cfg.mm_preprocess_cache_size_mb < 0

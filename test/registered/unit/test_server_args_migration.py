@@ -114,6 +114,27 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 
+    def test_audio_decode_limit_args(self):
+        self.assertEqual(self._parse([]).max_audio_decoded_bytes, 256 * 1024 * 1024)
+        sa = self._parse(
+            [
+                "--max-audio-duration-seconds",
+                "30",
+                "--max-audio-decoded-bytes",
+                "1048576",
+            ]
+        )
+        self.assertEqual(sa.max_audio_duration_seconds, 30)
+        self.assertEqual(sa.max_audio_decoded_bytes, 1048576)
+
+    def test_audio_decode_limit_args_reject_invalid_values(self):
+        with self.assertRaises(ValueError):
+            self._parse(["--max-audio-duration-seconds", "0"])
+        with self.assertRaises(ValueError):
+            self._parse(["--max-audio-duration-seconds", "nan"])
+        with self.assertRaises(ValueError):
+            self._parse(["--max-audio-decoded-bytes", "-1"])
+
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""
         sa = self._parse(

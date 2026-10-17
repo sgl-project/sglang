@@ -55,6 +55,10 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.multimodal.audio_limits import (
+    AudioLimitExceeded,
+    configured_audio_decode_limits,
+)
 from sglang.srt.runtime_context import get_serving
 
 if TYPE_CHECKING:
@@ -114,7 +118,6 @@ class OpenAIServingTranscription(OpenAIServingBase):
             import soundfile as sf
 
             info = sf.info(io.BytesIO(audio_data))
-            return info.duration
         except Exception:
             # soundfile can't parse some containers (e.g. mp3 on older
             # libsndfile builds); fall back to a full decode.
@@ -123,9 +126,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
                 audio = load_audio(audio_data, sr=16000, mono=True)
                 return audio.shape[-1] / 16000.0
+            except AudioLimitExceeded:
+                raise
             except Exception as e:
                 logger.warning(f"Could not calculate audio duration: {e}")
                 return 0.0
+        configured_audio_decode_limits().check_duration(info.duration)
+        return info.duration
 
     async def create_transcription(
         self,
@@ -148,7 +155,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Calculate audio duration for usage reporting. Run in a thread:
         # the fallback path decodes the full file and would block the
         # event loop on long inputs.
-        audio_duration_s = await asyncio.to_thread(self._get_audio_duration, audio_data)
+        try:
+            audio_duration_s = await asyncio.to_thread(
+                self._get_audio_duration, audio_data
+            )
+        except AudioLimitExceeded as error:
+            return self.create_error_response(str(error))
 
         # Audio longer than the model's encoder window (30 s for Whisper)
         # would be silently truncated by the feature extractor. Split it
@@ -169,6 +181,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 audio_chunks, chunk_offsets_s = await asyncio.to_thread(
                     split_audio_energy_aware, audio_data, max_clip_s
                 )
+            except AudioLimitExceeded as error:
+                return self.create_error_response(str(error))
             except Exception as e:
                 logger.warning(
                     "Failed to split %.1fs audio into chunks of <=%ss: %s",

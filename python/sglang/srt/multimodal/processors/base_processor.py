@@ -36,6 +36,7 @@ from sglang.srt.multimodal.cache import (
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.audio_limits import AudioLimitExceeded
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -1005,6 +1006,8 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
+        except AudioLimitExceeded:
+            raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
             data_str = str(data)
             if len(data_str) > 100:

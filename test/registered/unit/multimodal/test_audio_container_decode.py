@@ -7,7 +7,8 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import av
 import numpy as np
@@ -19,12 +20,58 @@ from sglang.srt.multimodal.audio_from_video import (
     extract_audio_from_video_bytes,
     is_audio_container,
 )
+from sglang.srt.multimodal.audio_limits import (
+    AudioDecodeLimits,
+    AudioLimitExceeded,
+    decode_torchcodec_samples,
+)
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils.common import load_audio
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestAudioDecodeLimits(CustomTestCase):
+    def test_torchcodec_reads_only_up_to_budget_boundary(self):
+        data = Mock()
+        data.shape = (1, 1025)
+        data.element_size.return_value = 4
+        decoder = Mock()
+        decoder.metadata = SimpleNamespace(
+            duration_seconds=None,
+            duration_seconds_from_header=None,
+            sample_rate=16000,
+            num_channels=1,
+        )
+        decoder.get_samples_played_in_range.return_value = SimpleNamespace(
+            data=data, sample_rate=16000
+        )
+
+        with self.assertRaises(AudioLimitExceeded):
+            decode_torchcodec_samples(
+                decoder, limits=AudioDecodeLimits(max_decoded_bytes=4096)
+            )
+
+        decoder.get_samples_played_in_range.assert_called_once_with(
+            0.0, 1025 / 16000
+        )
+        decoder.get_all_samples.assert_not_called()
+
+    def test_torchcodec_rejects_metadata_before_decoding(self):
+        decoder = Mock()
+        decoder.metadata = SimpleNamespace(
+            duration_seconds=120, duration_seconds_from_header=None
+        )
+
+        with self.assertRaises(AudioLimitExceeded):
+            decode_torchcodec_samples(
+                decoder, limits=AudioDecodeLimits(max_duration_seconds=30)
+            )
+
+        decoder.get_samples_played_in_range.assert_not_called()
+        decoder.get_all_samples.assert_not_called()
 
 
 def _tone(*, sample_rate: int, channels: int = 1) -> np.ndarray:
@@ -187,6 +234,46 @@ class TestAudioContainerDecode(CustomTestCase):
             waveform = load_audio(_encode_wav(), sr=16000)
         decoder.assert_not_called()
         self.assertEqual(waveform.shape, (1600,))
+
+    def test_wav_decoding_enforces_decoded_byte_budget(self):
+        with self.assertRaises(AudioLimitExceeded):
+            load_audio(
+                _encode_wav(),
+                sr=16000,
+                max_decoded_bytes=1024,
+            )
+
+    def test_flac_decoding_enforces_decoded_byte_budget(self):
+        output = io.BytesIO()
+        with soundfile.SoundFile(
+            output, mode="w", samplerate=16000, channels=1, format="FLAC"
+        ) as writer:
+            block = np.zeros(16000, dtype=np.float32)
+            for _ in range(120):
+                writer.write(block)
+        encoded = output.getvalue()
+        self.assertLess(len(encoded), 10_000)
+        with patch("sglang.srt.utils.common._BACKEND", "decord"):
+            with self.assertRaises(AudioLimitExceeded):
+                load_audio(encoded, sr=16000, max_decoded_bytes=1024 * 1024)
+            with self.assertRaises(AudioLimitExceeded):
+                load_audio(encoded, sr=16000, max_duration_seconds=30)
+            waveform = load_audio(encoded, sr=16000, max_decoded_bytes=16 * 1024 * 1024)
+        self.assertEqual(waveform.nbytes, 15_360_000)
+
+    def test_soundfile_mono_without_downmix_keeps_one_dimensional_output(self):
+        with patch("sglang.srt.utils.common._BACKEND", "decord"):
+            audio = load_audio(_encode_wav(), sr=16000, mono=False)
+        self.assertEqual(audio.shape, (1600,))
+
+    def test_container_decoding_enforces_decoded_byte_budget(self):
+        with self.assertRaises(AudioLimitExceeded):
+            decode_audio_container(
+                self.mp4,
+                target_sr=16000,
+                mono=True,
+                max_decoded_bytes=1024,
+            )
 
     def test_amr_decodes_despite_wav_data_url_mime(self):
         """Reproduces AMR bytes mislabeled as WAV by production clients."""

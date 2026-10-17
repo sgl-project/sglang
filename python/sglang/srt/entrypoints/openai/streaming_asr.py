@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.multimodal.audio_limits import configured_audio_decode_limits
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +104,37 @@ def split_audio_chunks(audio_data: bytes, chunk_size_sec: float) -> List[bytes]:
         raise ValueError(f"chunk_size_sec must be positive, got {chunk_size_sec}")
     audio_file = io.BytesIO(audio_data)
     try:
-        data, sample_rate = sf.read(audio_file, dtype="float32")
+        limits = configured_audio_decode_limits()
+        with sf.SoundFile(audio_file) as source:
+            sample_rate = int(source.samplerate)
+            limits.check_samples(
+                int(source.frames),
+                sample_rate,
+                int(source.channels),
+                4,
+                kind="source audio",
+            )
+            data = source.read(dtype="float32", always_2d=True)
+        limits.check_samples(
+            int(data.shape[0]),
+            sample_rate,
+            int(data.shape[1]),
+            int(data.dtype.itemsize),
+            kind="decoded audio",
+        )
     except sf.LibsndfileError as e:
         raise ValueError(f"failed to decode audio: {e}") from e
-    if len(data.shape) > 1:
+    if data.shape[1] > 1:
         data = data.mean(axis=1)
+    else:
+        data = data[:, 0]
+    limits.check_samples(
+        int(data.shape[0]),
+        sample_rate,
+        1,
+        int(data.dtype.itemsize),
+        kind="decoded audio",
+    )
     chunk_size_samples = int(chunk_size_sec * sample_rate)
     total_samples = len(data)
     chunks = []
