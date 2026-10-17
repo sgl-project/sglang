@@ -177,9 +177,17 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 "--speculative-use-block-verification only supports EAGLE / EAGLE3 / "
                 "NEXTN / DFLASH / DSPARK."
             )
-        if cfg.device != "cuda":
+        if cfg.device == "npu":
+            # sgl_kernel_npu implements block verification only for the
+            # chain-mode EAGLE/EAGLE3/NEXTN rejection-sampling kernel.
+            if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+                raise ValueError(
+                    "--speculative-use-block-verification on NPU only supports "
+                    "EAGLE / EAGLE3 / NEXTN."
+                )
+        elif cfg.device != "cuda":
             raise ValueError(
-                "--speculative-use-block-verification only supports CUDA or ROCm."
+                "--speculative-use-block-verification only supports CUDA, ROCm, or NPU."
             )
         # Block verification needs sampled proposals and their full distributions.
         # The DFLASH family's sampled drafts always carry them.
