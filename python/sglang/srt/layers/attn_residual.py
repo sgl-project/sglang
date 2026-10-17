@@ -632,6 +632,41 @@ class AttnResidual:
         self.staged = StagedRead(stream, score_proj, normed, write)
         return stream
 
+    def forward_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        comm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """forward() of hidden_states' TP8 all-reduce with the pending add, the
+        sum and the read in one kernel; None, before anything runs, when the
+        kernel does not take the batch. ``comm`` is k3_ll_comm_hip.get_comm()."""
+        from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+
+        nvb = self.num_valid_blocks
+        if (
+            nvb == 0
+            or self.written_on_slice
+            or not hip.all_reduce_covered(
+                hidden_states, prefix_sum, self.block_residual, nvb
+            )
+        ):
+            return None
+        return hip.all_reduce_attn_res_read(
+            hidden_states,
+            prefix_sum,
+            self.block_residual,
+            nvb,
+            get_cw(score_proj, score_norm),
+            get_fp32_norm_weight(out_norm),
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            comm,
+        )
+
     def forward_sp_all_gather(
         self,
         hidden_states: torch.Tensor,
