@@ -25,6 +25,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from torch import nn
 
 from sglang.multimodal_gen import envs
@@ -758,45 +759,9 @@ class Cosmos3LidarEncoder(nn.Module):
     def from_pretrained(
         cls, model_path: str, config: Mapping[str, Any], device: torch.device | str
     ) -> Cosmos3LidarEncoder:
-        from safetensors.torch import load_file
-
-        folder = os.path.join(model_path, COSMOS3_LIDAR_COMPONENT)
-        config_path = os.path.join(folder, "config.json")
-        weights_path = os.path.join(folder, COSMOS3_LIDAR_WEIGHTS_FILE)
-        if not os.path.isfile(config_path) or not os.path.isfile(weights_path):
-            raise ValueError(
-                f"Incomplete joint checkpoint: {COSMOS3_LIDAR_COMPONENT}/config.json and "
-                f"{COSMOS3_LIDAR_WEIGHTS_FILE} are required for LiDAR requests."
-            )
-        with open(config_path) as handle:
-            component = json.load(handle)
-        _check_component_matches(component, config)
-        model = cls(config).float()
-        state = load_file(weights_path)
-        wanted = {
-            key: value
-            for key, value in state.items()
-            if key.startswith(("encoder.", "quant_conv."))
-            or key in ("coords", "latent_mean", "latent_std")
-        }
-        missing, unexpected = model.load_state_dict(wanted, strict=False)
-        if missing or unexpected:
-            raise ValueError(
-                "Cosmos3 LiDAR encoder weights do not match the exported component: "
-                f"missing={sorted(missing)[:8]}, unexpected={sorted(unexpected)[:8]}."
-            )
-        if (
-            not torch.isfinite(model.latent_mean).all()
-            or not torch.isfinite(model.latent_std).all()
-            or bool((model.latent_std <= 0).any())
-        ):
-            raise ValueError(
-                "Cosmos3 LiDAR latent statistics must be finite with positive std."
-            )
-        logger.info(
-            "Loaded Cosmos3 LiDAR encoder (%d tensors) from %s", len(wanted), folder
+        return _load_lidar_component(
+            cls, model_path, config, device, ("encoder.", "quant_conv.")
         )
-        return model.eval().requires_grad_(False).to(device=device, dtype=torch.float32)
 
     def prepare_input(self, frames: torch.Tensor) -> torch.Tensor:
         """Metric ``[3, T, 128, W]`` range maps to the network's ``[1, 3, T, 128, 1808]``."""
@@ -884,6 +849,42 @@ class Cosmos3LidarEncoder(nn.Module):
                 )
             latent = torch.cat(outputs, dim=2)
             return (latent - self.latent_mean) / self.latent_std
+
+
+def _load_lidar_component(
+    model_cls: type[nn.Module],
+    model_path: str,
+    config: Mapping[str, Any],
+    device: torch.device | str,
+    prefixes: tuple[str, ...],
+) -> nn.Module:
+    folder = os.path.join(model_path, COSMOS3_LIDAR_COMPONENT)
+    with open(os.path.join(folder, "config.json")) as handle:
+        _check_component_matches(json.load(handle), config)
+    model = model_cls(config).float()
+    # read only this half of the VAE, rather than materializing both state dicts
+    with safe_open(
+        os.path.join(folder, COSMOS3_LIDAR_WEIGHTS_FILE), framework="pt", device="cpu"
+    ) as checkpoint:
+        weights = {
+            key: checkpoint.get_tensor(key)
+            for key in checkpoint.keys()
+            if key.startswith(prefixes)
+            or key in ("coords", "latent_mean", "latent_std")
+        }
+    model.load_state_dict(weights, strict=True)
+    if (
+        not torch.isfinite(model.latent_mean).all()
+        or not torch.isfinite(model.latent_std).all()
+        or bool((model.latent_std <= 0).any())
+    ):
+        raise ValueError(
+            "Cosmos3 LiDAR latent statistics must be finite with positive std"
+        )
+    logger.info(
+        "Loaded %s (%d tensors) from %s", model_cls.__name__, len(weights), folder
+    )
+    return model.eval().requires_grad_(False).to(device=device, dtype=torch.float32)
 
 
 def _check_component_matches(

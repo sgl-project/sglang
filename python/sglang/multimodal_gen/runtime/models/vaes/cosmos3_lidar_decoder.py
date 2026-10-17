@@ -13,8 +13,6 @@ meters, unit intensity, and a resolved ``{0, 1}`` validity mask.
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -26,20 +24,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     validate_lidar_config,
 )
 from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
-    COSMOS3_LIDAR_COMPONENT,
     COSMOS3_LIDAR_VALIDITY_THRESHOLD,
-    COSMOS3_LIDAR_WEIGHTS_FILE,
     LidarBottleneckBlock,
     LidarRMSNorm,
     LidarSpatialBlock,
     LidarSpatialPE,
     LidarTemporalBlock,
     _ChannelsLast,
-    _check_component_matches,
+    _load_lidar_component,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 def depth_to_space(x: torch.Tensor) -> torch.Tensor:
@@ -317,37 +310,9 @@ class Cosmos3LidarDecoder(nn.Module):
     def from_pretrained(
         cls, model_path: str, config: Mapping[str, Any], device: torch.device | str
     ) -> Cosmos3LidarDecoder:
-        from safetensors.torch import load_file
-
-        folder = os.path.join(model_path, COSMOS3_LIDAR_COMPONENT)
-        config_path = os.path.join(folder, "config.json")
-        weights_path = os.path.join(folder, COSMOS3_LIDAR_WEIGHTS_FILE)
-        if not os.path.isfile(config_path) or not os.path.isfile(weights_path):
-            raise ValueError(
-                f"Incomplete joint checkpoint: {COSMOS3_LIDAR_COMPONENT}/config.json and "
-                f"{COSMOS3_LIDAR_WEIGHTS_FILE} are required to decode LiDAR."
-            )
-        with open(config_path) as handle:
-            component = json.load(handle)
-        _check_component_matches(component, config)
-        model = cls(config).float()
-        state = load_file(weights_path)
-        wanted = {
-            key: value
-            for key, value in state.items()
-            if key.startswith(("decoder.", "post_quant_conv."))
-            or key in ("coords", "latent_mean", "latent_std")
-        }
-        missing, unexpected = model.load_state_dict(wanted, strict=False)
-        if missing or unexpected:
-            raise ValueError(
-                "Cosmos3 LiDAR decoder weights do not match the exported component: "
-                f"missing={sorted(missing)[:8]}, unexpected={sorted(unexpected)[:8]}."
-            )
-        logger.info(
-            "Loaded Cosmos3 LiDAR decoder (%d tensors) from %s", len(wanted), folder
+        return _load_lidar_component(
+            cls, model_path, config, device, ("decoder.", "post_quant_conv.")
         )
-        return model.eval().requires_grad_(False).to(device=device, dtype=torch.float32)
 
     @torch.no_grad()
     def decode_network(self, latents: torch.Tensor) -> torch.Tensor:
