@@ -7,9 +7,10 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.server_args import ServerArgs
@@ -20,6 +21,69 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiCacheAutoSize(CustomTestCase):
+    @staticmethod
+    def _qsa_pool(size):
+        pool = object.__new__(QSATokenToKVPool)
+        pool.size = size
+        pool.full_kv_pool = Mock(
+            spec=MHATokenToKVPool,
+            size=size,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=(size * 6, size * 4)),
+        )
+        pool.qsa_compressed_k_buffer_pool = [torch.empty(size * 2, dtype=torch.uint8)]
+        # Request-local key/rope states are not mirrored by QSAIndexerPoolHost.
+        pool.qsa_key_state_buffer_pool = [torch.empty(size * 100)]
+        pool.qsa_rope_position_buffer = torch.empty(size * 100, dtype=torch.int64)
+        return pool
+
+    def test_qsa_target_and_draft_count_only_mirrored_state(self):
+        target, draft = self._qsa_pool(100), self._qsa_pool(10)
+        for mode in ("packed", "sidecar"):
+            with self.subTest(mode=mode):
+                params = CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=Mock(
+                        spec=HybridReqToTokenPool,
+                        mamba_pool=Mock(
+                            host_capacity_bytes=None,
+                            get_kv_size_bytes=Mock(return_value=400),
+                        ),
+                    ),
+                    token_to_kv_pool_allocator=Mock(
+                        get_kvcache=Mock(return_value=target)
+                    ),
+                    page_size=4,
+                    mtp_draft_device_pools=(draft,) if mode == "packed" else (),
+                )
+                plan = (
+                    Mock(mode="sidecar", device_pools=(draft,))
+                    if mode == "sidecar"
+                    else None
+                )
+                # Draft host slots follow target capacity, not draft device capacity.
+                self.assertEqual(sizing._estimate_hicache_bytes(params, plan), 2800)
+
+    def test_qsa_auto_ratio_leaves_room_for_compressed_index(self):
+        target = self._qsa_pool(100)
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            page_size=4,
+        )
+        host_free = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000
+        with (
+            get_context().override_server_args(enable_hierarchical_cache=True),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(base, "available_host_memory_bytes", return_value=host_free),
+            sizing.auto_size_hicache(params, None, enabled=True),
+        ):
+            ratio = get_memory().hicache_ratio
+            budget = 1000 * get_memory().hicache_host_memory_fraction
+            self.assertAlmostEqual(ratio, budget * 0.95 / 1200)
+            self.assertLessEqual(ratio * 1200, budget)
+
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
         # follow full target slots; SWA drafts follow the smaller SWA capacity.
