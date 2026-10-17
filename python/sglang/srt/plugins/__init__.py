@@ -35,6 +35,7 @@ _plugins_loaded = False
 def load_plugins_by_group(
     group: str,
     excluded_dists: set[str] | None = None,
+    required_plugins: frozenset[str] = frozenset(),
 ) -> dict[str, tuple[Callable[[], Any], str | None]]:
     """
     Discover and load plugins registered under the given entry point group.
@@ -44,6 +45,8 @@ def load_plugins_by_group(
         excluded_dists: Distribution names to skip. Plugins from these
             distributions are never ``ep.load()``-ed (avoids importing
             their modules and pulling hardware-specific dependencies).
+        required_plugins: Plugin names that raise instead of being skipped
+            when missing, filtered out, or failing to load.
 
     Returns:
         Dictionary mapping plugin name to ``(callable, dist_name)``.
@@ -55,6 +58,12 @@ def load_plugins_by_group(
         allowed_set = {x.strip() for x in allowed_str.split(",") if x.strip()}
 
     discovered = entry_points(group=group)
+    missing_required = required_plugins - {ep.name for ep in discovered}
+    if missing_required:
+        raise RuntimeError(
+            f"Cannot discover required plugins {', '.join(sorted(missing_required))}."
+        )
+
     if len(discovered) == 0:
         logger.debug("No plugins found for group %s.", group)
         return {}
@@ -66,10 +75,18 @@ def load_plugins_by_group(
     plugins: dict[str, tuple[Callable[[], Any], str | None]] = {}
     for ep in discovered:
         if allowed_set is not None and ep.name not in allowed_set:
+            if ep.name in required_plugins:
+                raise RuntimeError(
+                    f"Required plugin {ep.name!r} must be set in SGLANG_PLUGINS."
+                )
             logger.info("Skipping plugin %s (not in SGLANG_PLUGINS)", ep.name)
             continue
         dist_name = ep.dist.name if ep.dist else None
         if excluded_dists and dist_name in excluded_dists:
+            if ep.name in required_plugins:
+                raise RuntimeError(
+                    f"Required plugin {ep.name!r} is excluded by SGLANG_PLATFORM."
+                )
             logger.info(
                 "Skipping plugin %s (dist %s excluded by SGLANG_PLATFORM)",
                 ep.name,
@@ -80,7 +97,9 @@ def load_plugins_by_group(
             func = ep.load()
             plugins[ep.name] = (func, dist_name)
             logger.info("Loaded plugin %s from group %s", ep.name, group)
-        except Exception:
+        except Exception as e:
+            if ep.name in required_plugins:
+                raise RuntimeError(f"Required plugin {ep.name!r} failed to load") from e
             logger.exception("Failed to load plugin %s from group %s", ep.name, group)
 
     return plugins
@@ -121,9 +140,11 @@ def load_plugins():
         return
     _plugins_loaded = True
 
+    required = frozenset(envs.SGLANG_REQUIRED_PLUGINS.get())
     plugins = load_plugins_by_group(
         GENERAL_PLUGINS_GROUP,
         excluded_dists=_get_excluded_dists(),
+        required_plugins=required,
     )
 
     for name, (func, dist_name) in plugins.items():
@@ -132,10 +153,28 @@ def load_plugins():
         try:
             func()
             logger.info("Executed general plugin: %s", name)
-        except Exception:
+        except Exception as e:
+            if name in required:
+                raise RuntimeError(
+                    f"Required plugin {name!r} failed to execute."
+                ) from e
             logger.exception("Failed to execute general plugin: %s", name)
         finally:
             _current_plugin_source.reset(token)
 
     # Apply all registered hooks (idempotent — already-patched targets are skipped).
     HookRegistry.apply_hooks()
+
+    unapplied = sorted(
+        {
+            f"{source.plugin_name} -> {target}"
+            for target, hooks in HookRegistry._hooks.items()
+            if target not in HookRegistry._patched
+            for _, _, source in hooks
+            if source is not None and source.plugin_name in required
+        }
+    )
+    if unapplied:
+        raise RuntimeError(
+            f"Required plugins could not apply hooks: {', '.join(unapplied)}"
+        )
