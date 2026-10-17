@@ -406,5 +406,63 @@ class TestUnifiedKeySchemeRejections(CustomTestCase):
             )
 
 
+class TestObjectLayoutIdentity(CustomTestCase):
+    """``object_layout`` is what keeps non-page_unified bytes out of this keyspace.
+
+    The linker publishes objects that are NOT a page_unified KV page block -- a
+    side pool's raw device view, or a page block with MTP draft rows appended.
+    They are the same size as a page block and would key identically without a
+    declared byte order.
+    """
+
+    @staticmethod
+    def _plan(**overrides):
+        kwargs = dict(
+            model_id="meta-llama/Llama-3.1-8B",
+            dtype="bfloat16",
+            page_size=64,
+            rank_replicated=True,
+            local_kv_heads=0,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            start_layer=0,
+            end_layer=32,
+            is_final_stage=True,
+        )
+        kwargs.update(overrides)
+        return plan_unified_kv(**kwargs)
+
+    def test_default_object_layout_digest_is_pinned(self):
+        # Changing this digest strands every object already in L3. It may only
+        # move with a deliberate _SCHEMA_VERSION bump.
+        plan = self._plan()
+        self.assertEqual(namespace_digest(plan.namespace), "ukv1-aaee23be3ff4c855")
+        self.assertEqual(plan.suffixes[0], "ukv1-aaee23be3ff4c855_L0-32")
+
+    def test_a_different_object_layout_is_a_different_keyspace(self):
+        page_unified = self._plan()
+        device_view = self._plan(object_layout="linker-device-view-v1:kv:deadbeef")
+        self.assertNotEqual(
+            namespace_digest(page_unified.namespace),
+            namespace_digest(device_view.namespace),
+        )
+        # Same grid, so the coordinate half of the suffix is identical -- only
+        # the digest separates them.
+        self.assertTrue(page_unified.suffixes[0].endswith("_L0-32"))
+        self.assertTrue(device_view.suffixes[0].endswith("_L0-32"))
+
+    def test_mtp_packed_layers_get_their_own_keyspace(self):
+        plain = self._plan()
+        with_mtp = self._plan(object_layout="page-unified-v1+mtp1")
+        self.assertNotEqual(
+            namespace_digest(plain.namespace), namespace_digest(with_mtp.namespace)
+        )
+
+    def test_empty_object_layout_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "non-empty object_layout"):
+            self._plan(object_layout="")
+
+
 if __name__ == "__main__":
     unittest.main()
