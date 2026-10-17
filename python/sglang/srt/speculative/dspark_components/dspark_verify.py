@@ -177,7 +177,6 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
-            fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
         )
         sync_site = (
@@ -534,7 +533,6 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
-        fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
         simulate_fold: bool = False,
     ) -> None:
@@ -549,7 +547,6 @@ class DsparkVerifyEpilogue:
         self.sim_seed_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self._sim_greedy_bs: Optional[int] = None
         self.stride = int(verify_num_draft_tokens)
-        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -769,7 +766,6 @@ class DsparkVerifyEpilogue:
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=self._fused_argmax,
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
@@ -934,7 +930,6 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
-    fused_argmax: bool = False,
     block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
@@ -946,7 +941,6 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=fused_argmax,
         )
     if draft_block.greedy_draft:
         # An argmax draft is one-hot: rejection accepts at the target probability.
@@ -982,7 +976,6 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
-        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,

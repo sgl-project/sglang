@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -979,7 +980,7 @@ def apply_dflash_simulated_acceptance(
     bs, block_size = candidates.shape
     if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
         # The sampling-verify branch does not materialize the target argmax.
-        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+        target_predict = sampling_argmax(next_token_logits).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
