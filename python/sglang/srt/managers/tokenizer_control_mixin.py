@@ -652,6 +652,22 @@ class TokenizerControlMixin:
             self.pending_lora_unloads.pop(obj.lora_name)
         return result
 
+    def _check_lora_load_capacity(self: TokenizerManager, lora_name: str):
+        # Called under lora_update_lock before issuing a backend load. Once all
+        # slots are pinned, a new adapter would either exceed the limit or be
+        # immediately evicted again by the post-load LRU loop.
+        limit = get_lora().max_loaded_loras
+        if limit is None:
+            return
+        adapters = self.lora_registry.get_all_adapters()
+        if lora_name in adapters:
+            return  # Keep the backend's existing duplicate-load error.
+        if sum(bool(adapter.pinned) for adapter in adapters.values()) >= limit:
+            raise ValueError(
+                f"Cannot load LoRA adapter '{lora_name}': max_loaded_loras={limit} "
+                "is already occupied by pinned adapters. Unload an adapter first."
+            )
+
     async def load_lora_adapter(
         self: TokenizerManager,
         obj: LoadLoRAAdapterReqInput,
@@ -680,6 +696,8 @@ class TokenizerControlMixin:
                         f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
                         "Retry the unload before loading it again."
                     )
+
+                self._check_lora_load_capacity(obj.lora_name)
 
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
@@ -769,6 +787,8 @@ class TokenizerControlMixin:
                         f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
                         "Retry the unload before loading it again."
                     )
+
+                self._check_lora_load_capacity(obj.lora_name)
 
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
