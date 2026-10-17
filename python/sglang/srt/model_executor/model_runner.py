@@ -259,7 +259,10 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+    from sglang.srt.hardware_backend.npu.utils import (
+        init_npu_backend,
+        maybe_set_npu_deterministic_level,
+    )
 
     init_npu_backend()
 elif current_platform.is_out_of_tree():
@@ -453,6 +456,13 @@ class ModelRunner:
                 f"Context: {self.device=} {get_device().gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
             )
             raise
+
+        # NPU: after the device is set (right above), before the first forward,
+        # optionally raise the CANN deterministic level so batch-consistent ops
+        # (hc_pre / compressor) take the shape-invariant path. No-op unless
+        # SGLANG_DSV4_DETERMINISTIC_LEVEL is set.
+        if _is_npu:
+            maybe_set_npu_deterministic_level()
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
