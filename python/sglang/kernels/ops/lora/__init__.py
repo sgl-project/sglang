@@ -106,4 +106,21 @@ for _mod, _fn, _op in _ENGINE_TRITON_KERNELS:
     )
 del _mod, _fn, _op
 
+# CuTeDSL grouped GEMMs: each compiles once and returns the launchable kernel.
+# Their kernel classes exist for SM90 (WGMMA) and SM100 (tcgen05) only.
+_ENGINE_CUTE_DSL_KERNELS = (
+    "prepare_masked_bf16",
+    "prepare_contiguous_bf16",
+)
+for _fn in _ENGINE_CUTE_DSL_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"lora.{_fn}",
+            backend=KernelBackend.CUTE_DSL,
+            target=f"sglang.kernels.ops.lora.moe.cutedsl.api:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        )
+    )
+del _fn
+
 __all__: list[str] = []
