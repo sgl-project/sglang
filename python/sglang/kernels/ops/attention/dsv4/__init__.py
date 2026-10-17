@@ -13,9 +13,9 @@ from .compress import (
     compress_forward,
     compress_norm_rope_store,
 )
-from .compress_old import fused_norm_rope_inplace
 from .elementwise import (
     fused_k_norm_rope_flashmla,
+    fused_norm_rope_inplace,
     fused_q_indexer_rope_first_quant,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,

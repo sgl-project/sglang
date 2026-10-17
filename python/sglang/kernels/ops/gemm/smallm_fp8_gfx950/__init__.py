@@ -5,6 +5,7 @@ Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below; SGLANG_ROCM_SMALLM_FP8
 """
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ from sglang.kernels.ops.moe.smallm_moe_gfx950 import (
     _hipcc,
     _Kernel,
 )
+from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_fp8_gemm.hip")
 # (N, K) -> ((max M, n-tiles per block, k steps per wave, waves, LDS-staged activations), ...), first match wins.
@@ -34,6 +36,7 @@ SHAPES = {
 }
 _mod = None
 _kernels = {}
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -45,7 +48,7 @@ class Args(ctypes.Structure):
 
 def smallm_fp8_gemm_enabled() -> bool:
     global _mod
-    if os.environ.get("SGLANG_ROCM_SMALLM_FP8_PROJ", "1") == "0":
+    if not envs.SGLANG_ROCM_SMALLM_FP8_PROJ.get():
         return False
     if _mod is None:
         _mod = False
@@ -59,7 +62,7 @@ def smallm_fp8_gemm_enabled() -> bool:
                 _check(_hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
                 _mod = mod
             except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
-                print(f"[smallm_fp8_gemm] disabled: {e}", flush=True)
+                logger.warning("smallm_fp8_gemm disabled: %s", e)
     return _mod is not False
 
 

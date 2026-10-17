@@ -1,7 +1,7 @@
 """Byte-exactness of the V4.1 (fp8 / fp4) FlashMLA KV cache store kernels.
 
 Every store kernel is compared byte for byte with the pure-torch quantizers of
-the two formats (torch_quant.quantize_k_cache_v41 and
+the two formats (dsv41_kv_quant_reference.quantize_k_cache_v41 and
 dsv41_kv_quant_reference.quantize_k_cache_v41_fp4), which follow the decode
 kernel's own reference quantizer.
 """
@@ -24,11 +24,7 @@ from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
-    dequantize_k_cache_v41,
-    fake_quant_compressed_kv,
-    quantize_k_cache_v41,
-)
+from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
@@ -42,11 +38,11 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 REFERENCE = {
-    KVLayout.V41: quantize_k_cache_v41,
+    KVLayout.V41: tq.quantize_k_cache_v41,
     KVLayout.V41_FP4: tq.quantize_k_cache_v41_fp4,
 }
 DEQUANT = {
-    KVLayout.V41: dequantize_k_cache_v41,
+    KVLayout.V41: tq.dequantize_k_cache_v41,
     KVLayout.V41_FP4: tq.dequantize_k_cache_v41_fp4,
 }
 # One quantization step, relative: e4m3 has 3 mantissa bits, e2m1 one.
@@ -476,7 +472,7 @@ class TestV41KVStore(CustomTestCase):
 
 
 CASES = {
-    KVLayout.V41: (quantize_k_cache_v41, dequantize_k_cache_v41),
+    KVLayout.V41: (tq.quantize_k_cache_v41, tq.dequantize_k_cache_v41),
     KVLayout.V41_FP4: (tq.quantize_k_cache_v41_fp4, tq.dequantize_k_cache_v41_fp4),
 }
 

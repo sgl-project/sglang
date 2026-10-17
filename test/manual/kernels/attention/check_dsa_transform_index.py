@@ -2,6 +2,8 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
+)
+from sglang.test.kernels.dsa_transform_index import (
     transform_index_page_table_decode_ref,
 )
 

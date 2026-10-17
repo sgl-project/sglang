@@ -603,17 +603,6 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         try:

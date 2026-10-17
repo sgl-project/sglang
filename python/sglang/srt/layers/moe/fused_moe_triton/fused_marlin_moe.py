@@ -22,6 +22,7 @@ if _is_cuda:
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
+# Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
 @triton.jit
 def _tl_tanh(x):
     return 2.0 * tl.sigmoid(2.0 * x) - 1.0

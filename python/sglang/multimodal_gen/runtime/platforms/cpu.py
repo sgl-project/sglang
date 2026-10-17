@@ -61,10 +61,6 @@ class CpuPlatform(Platform):
         return psutil.virtual_memory().total
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        return True
-
-    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:

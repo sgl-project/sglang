@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.quantization.mxfp8_quant import _mxfp8_quant_kernel
 
 # MXFP8 constants (OCP microscaling: 1x32 block, E8M0 shared scale).
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
@@ -67,47 +68,6 @@ def _mxfp8_e4m3_quantize_torch(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
 
     scales_uint8 = scales_uint8.view(*orig_shape[:-1], num_blocks)
     return x_fp8, scales_uint8
-
-
-@triton.jit
-def _mxfp8_quant_kernel(
-    x_ptr,
-    xq_ptr,
-    s_ptr,
-    M,
-    K,
-    sxm,
-    sxk,
-    sqm,
-    sqk,
-    ssm,
-    ssk,
-    BLOCK_M: tl.constexpr,
-):
-    """Per-32-block E8M0 scale + FP8-E4M3 quant, one program per ``[BLOCK_M, 32]``."""
-    pid_m = tl.program_id(0)
-    pid_b = tl.program_id(1)  # which 32-element block along K
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = pid_b * 32 + tl.arange(0, 32)
-    m_mask = offs_m < M
-    x = tl.load(
-        x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk,
-        mask=m_mask[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30)  # [BLOCK_M]
-    # Round the E8M0 exponent up (ceil(log2(amax / e4m3_max))) so the block amax
-    # stays inside the e4m3 range and the full dynamic range is used.
-    sb = tl.ceil(tl.log2(amax / 448.0)) + 127.0
-    sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
-    descale = tl.exp2(sb - 127.0)
-    xq = tl.clamp(x / descale[:, None], -448.0, 448.0).to(xq_ptr.dtype.element_ty)
-    tl.store(
-        xq_ptr + offs_m[:, None] * sqm + offs_k[None, :] * sqk,
-        xq,
-        mask=m_mask[:, None],
-    )
-    tl.store(s_ptr + offs_m * ssm + pid_b * ssk, sb.to(tl.uint8), mask=m_mask)
 
 
 def _mxfp8_e4m3_quantize_triton(

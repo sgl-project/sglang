@@ -15,7 +15,7 @@ from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_ben
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
@@ -23,7 +23,6 @@ register_cuda_ci(
     runner_config="1-gpu-large",
     disabled="requires multi-GPU, self-skips in CI",
 )
-register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 # ---------------------------------------------------------------------------

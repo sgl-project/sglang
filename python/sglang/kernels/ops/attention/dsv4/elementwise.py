@@ -33,6 +33,23 @@ def _jit_fused_rope_module():
 
 
 @cache_once
+def _jit_fused_norm_rope_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+):
+    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    return load_jit(
+        make_name("fused_norm_rope"),
+        *args,
+        cuda_files=["deepseek_v4/fused_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedNormRopeKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -166,6 +183,26 @@ def fused_rope_inplace(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
+
+
+def fused_norm_rope_inplace(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_fused_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module.forward(
+        kv,
+        weight,
+        positions,
+        freq_cis,
+        2,
+        eps,
+        0,
+    )
 
 
 def fused_q_norm_rope(

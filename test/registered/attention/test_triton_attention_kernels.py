@@ -15,7 +15,6 @@ from sglang.kernels.ops.attention.extend_attention import (
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
-    redundant_attention,
 )
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
@@ -23,6 +22,7 @@ from sglang.kernels.ops.attention.prefill_attention import (
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.extend_attention import redundant_attention
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)

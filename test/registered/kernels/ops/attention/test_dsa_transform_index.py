@@ -7,9 +7,11 @@ import sglang.kernels.ops.attention.dsa.transform_index as transform_index_modul
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
-    transform_index_page_table_prefill_ref,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.dsa_transform_index import (
+    transform_index_page_table_prefill_ref,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-large")
