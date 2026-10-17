@@ -52,7 +52,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
 
         topk_config = TopKConfig(
             top_k=4,
-            num_fused_shared_experts=1,
+            num_shared_expert_columns=1,
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
             apply_routed_scaling_factor_on_output=folded_in_topk,
         )
@@ -180,7 +180,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         topk_weights = torch.tensor([[1.0, 0.5, 0.25, 1.0]], dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_fused_shared_experts=1,
+            num_shared_expert_columns=1,
             fused_shared_experts_scaling_factor=scaling_factor,
             allow_routed_experts_capture=False,
         )
@@ -225,7 +225,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         topk_weights = torch.tensor([[1.0, 0.5, 0.25]], dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_fused_shared_experts=1,
+            num_shared_expert_columns=1,
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
         )
         with (
@@ -253,7 +253,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     def _route_with_per_rank_slots(self, *, num_fused_shared_experts, logits, bias):
         topk_config = TopKConfig(
             top_k=8 + num_fused_shared_experts,
-            num_fused_shared_experts=num_fused_shared_experts,
+            num_shared_expert_columns=num_fused_shared_experts,
             renormalize=True,
             correction_bias=bias,
             torch_native=True,
@@ -310,7 +310,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         here would make the AITER postprocessor append shared ID 288 twice."""
         topk = TopK.__new__(TopK)
         torch.nn.Module.__init__(topk)
-        topk.topk_config = TopKConfig(top_k=9, num_fused_shared_experts=1)
+        topk.topk_config = TopKConfig(top_k=9, num_shared_expert_columns=1)
         topk.enable_waterfill = False
         topk.waterfill_balancer = None
 
