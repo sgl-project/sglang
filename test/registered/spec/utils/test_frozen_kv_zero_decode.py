@@ -147,7 +147,7 @@ class TestFrozenZeroDecode(unittest.TestCase):
             torch.testing.assert_close(result.new_seq_lens, original_lengths + 1)
             self.assertIs(publish.call_args.args[0], result.new_seq_lens)
             self.assertIs(result.extra_keep_alive_refs[0], seen[0])
-            self.assertEqual(result.get_num_proposed_drafts(3), 0)
+            self.assertEqual(result.speculative_num_draft_tokens, 1)
             self.assertEqual(result.accept_lens.tolist(), [1, 1, 1])
             self.assertEqual(
                 result.next_draft_input.bonus_tokens.tolist(), [15, 16, 17]
