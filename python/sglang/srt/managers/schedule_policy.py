@@ -193,6 +193,9 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        *,
+        prefill_interleaving: Optional[bool] = None,
+        prefill_interleaving_min_continuation_tokens: Optional[int] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -202,6 +205,18 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        if prefill_interleaving is None:
+            prefill_interleaving = (
+                self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            )
+        # Keyed on the adjusted policy: HRRN runs as FCFS without a tree cache.
+        self.prefill_interleaving = prefill_interleaving and self.policy in (
+            CacheAwarePolicy.HRRN,
+            CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
+        )
+        self.prefill_interleaving_min_continuation_tokens = (
+            prefill_interleaving_min_continuation_tokens
+        )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -252,7 +267,7 @@ class SchedulePolicy:
                     logger.info(
                         "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
                         len(waiting_queue),
-                        self._shortest_prefill_work(waiting_queue[0]),
+                        self._uncached_prefill_len(waiting_queue[0]),
                     )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
@@ -392,7 +407,7 @@ class SchedulePolicy:
         return temporary_deprioritized
 
     @staticmethod
-    def _shortest_prefill_work(r: Req) -> int:
+    def _uncached_prefill_len(r: Req) -> int:
         return max(
             1,
             len(r.origin_input_ids) + len(r.output_ids) - r.num_matched_prefix_tokens,
@@ -406,30 +421,56 @@ class SchedulePolicy:
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                SchedulePolicy._shortest_prefill_work(r),
+                SchedulePolicy._uncached_prefill_len(r),
                 r.time_stats.wait_queue_entry_time,
             )
         )
 
-    def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+    def reserve_interleaved_prefills(
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        max_reqs: int,
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        """Cap the continuing chunk to reserve whole prefills for at most
+        ``max_reqs`` waiting requests, and move them ahead of the skipped ones."""
+        shortest_first = self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        min_continuation = self.prefill_interleaving_min_continuation_tokens
+        if min_continuation is None:
+            min_continuation = (
+                page_size
+                if shortest_first
+                else max(page_size, _ceil_div(budget, 2 * page_size) * page_size)
+            )
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            or budget < 2 * page_size
+            not self.prefill_interleaving
+            or max_reqs <= 0
+            or budget < min_continuation + page_size
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
-        for req in waiting_queue:
-            work = self._shortest_prefill_work(req)
-            charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+        selected = []
+        skipped = []
+        for req in waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]:
+            if len(selected) == max_reqs:
                 break
+            work = self._uncached_prefill_len(req)
+            charge = _ceil_div(work, page_size) * page_size
+            if (shortest_first and work >= remaining) or (
+                reserved + charge > budget - min_continuation
+            ):
+                skipped.append(req)
+                continue
+            selected.append(req)
             reserved += charge
         if not reserved:
             return None
+        # Admission stops on failure; try fitting requests before skipped ones.
+        waiting_queue[: len(selected) + len(skipped)] = selected + skipped
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
 
@@ -1566,10 +1607,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
+            if has_chunked_req or self.new_chunked_req is not None:
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:

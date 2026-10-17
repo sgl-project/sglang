@@ -66,7 +66,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
         s.policy = Mock()
-        s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.policy.reserve_interleaved_prefills.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None

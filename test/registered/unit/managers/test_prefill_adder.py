@@ -38,6 +38,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+ADMIT_ALL = 1 << 20
+
 
 class _RecordingDelayer:
     """Duck-typed stand-in for PrefillDelayerSinglePassExecutor that records
@@ -206,11 +208,6 @@ class TestPrefillAdder(CustomTestCase):
         return req
 
     def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
-        override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
-        )
-        override.install()
-        self.addCleanup(override.restore)
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_token_allocator.available_size.return_value = 32768
@@ -218,33 +215,51 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
-    def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
-        adder = self.create_shortest_prefill_adder()
-        policy = SchedulePolicy(
-            policy="shortest-prefill-first",
-            tree_cache=RadixCache.create_simulated(),
-            enable_hierarchical_cache=True,
-            enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
-        )
-        continuation = self.create_shared_req("continuation")
-        continuation.full_untruncated_fill_ids = list(range(16384))
-        waiting = [self.create_shared_req("a"), self.create_shared_req("b")]
-        for req, length in zip(waiting, [512, 1024]):
-            req.origin_input_ids = list(range(length))
-            req.full_untruncated_fill_ids = list(range(length))
-            req.num_matched_prefix_tokens = 0
-        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
-            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
-        )
-        self.assertIs(adder.add_chunked_req(continuation), continuation)
-        self.assertEqual(continuation.extend_len, 2560)
-        for req in waiting:
-            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
-        self.assertEqual(adder.can_run_list, [continuation, *waiting])
-        self.assertIsNone(adder.new_chunked_req)
-        self.assertEqual(adder.rem_chunk_tokens, 0)
-        self.assertGreaterEqual(adder.rem_total_tokens, 0)
+    def test_interleaving_admits_complete_waiters(self):
+        for name, lengths, continuation_tokens in (
+            ("shortest-prefill-first", [512, 1024], 2560),
+            ("hrrn", [8192, 257, 2560], 1024),
+        ):
+            with self.subTest(policy=name):
+                adder = self.create_shortest_prefill_adder()
+                policy = SchedulePolicy(
+                    policy=name,
+                    tree_cache=RadixCache.create_simulated(),
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                    prefill_interleaving=True,
+                    prefill_interleaving_min_continuation_tokens=1024,
+                )
+                continuation = self.create_shared_req("continuation")
+                continuation.full_untruncated_fill_ids = list(range(16384))
+                waiting = []
+                for length in lengths:
+                    req = self.create_shared_req(str(length))
+                    req.origin_input_ids = list(range(length))
+                    req.full_untruncated_fill_ids = req.origin_input_ids[:]
+                    req.num_matched_prefix_tokens = 0
+                    waiting.append(req)
+                expected = [continuation, *waiting[-2:]]
+                adder.chunked_req_limit = policy.reserve_interleaved_prefills(
+                    continuation,
+                    waiting,
+                    adder.rem_chunk_tokens,
+                    adder.page_size,
+                    max_reqs=ADMIT_ALL,
+                )
+                self.assertIs(adder.add_chunked_req(continuation), continuation)
+                self.assertEqual(continuation.extend_len, continuation_tokens)
+                for req in waiting:
+                    result = adder.add_one_req(
+                        req, has_chunked_req=True, truncation_align_size=None
+                    )
+                    if result != AddReqResult.CONTINUE:
+                        break
+                self.assertEqual(adder.can_run_list, expected)
+                self.assertIsNone(adder.new_chunked_req)
+                self.assertEqual(adder.rem_chunk_tokens, 0)
+                self.assertGreaterEqual(adder.rem_total_tokens, 0)
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
