@@ -83,18 +83,22 @@ def get_current_process_numa() -> int:
         with open("/proc/self/stat", "r") as f:
             stat_data = f.read()
 
-        # the 39th field is processor
-        fields = stat_data.split()
-        if len(fields) < 39:
+        # comm (field 2) can contain spaces and parentheses. The remaining
+        # fields start at state (field 3), so processor (field 39) is index 36.
+        _, separator, remaining = stat_data.rpartition(")")
+        fields = remaining.split()
+        if not separator or len(fields) < 37:
             return -1
-        current_cpu = int(fields[38])
-        numa_path = f"/sys/devices/system/cpu/cpu{current_cpu}/node0"
-        if os.path.exists(numa_path) and os.path.islink(numa_path):
-            link_target = os.readlink(numa_path)
-            # parse numa node from path
-            match = re.search(r"node(\d+)$", link_target)
-            if match:
-                return int(match.group(1))
+        current_cpu = int(fields[36])
+        cpu_path = f"/sys/devices/system/cpu/cpu{current_cpu}"
+        for entry in os.listdir(cpu_path):
+            if re.fullmatch(r"node\d+", entry):
+                numa_path = os.path.join(cpu_path, entry)
+                if os.path.islink(numa_path):
+                    link_target = os.readlink(numa_path)
+                    match = re.search(r"node(\d+)$", link_target)
+                    if match:
+                        return int(match.group(1))
 
         return -1
     except Exception:
