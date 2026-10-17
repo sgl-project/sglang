@@ -170,6 +170,8 @@ class _ScratchSlot:
         self.tensors = tensors
         self.ready = device_module.Event()
         self.resident_key: Optional[Tuple[int, int]] = None
+        # (resident_key, stream) of the last ``ready`` wait.
+        self.waited = None
 
 
 class PageInterleaveKVPoolMixin:
@@ -224,6 +226,10 @@ class PageInterleaveKVPoolMixin:
                 "Page-interleave KV cache requires an available PyNccl communicator."
             )
         self.kv_gather_stream = self.device_module.Stream()
+        # Re-recorded per layer; wait_event snapshots it, so one event suffices.
+        self._fork_event = self.device_module.Event()
+        # Per-batch (slot, name) -> (send rows, send view, out view).
+        self._gather_views: Dict[Tuple[int, str], Tuple[torch.Tensor, ...]] = {}
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
         scratch_rows = spec.scratch_rows
@@ -258,6 +264,8 @@ class PageInterleaveKVPoolMixin:
         self._send_rows: Optional[torch.Tensor] = None
         self._write_plan_key = None
         self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._skip_rows_key = None
+        self._skip_rows: Optional[torch.Tensor] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
         scratch_bytes = sum(
@@ -414,7 +422,11 @@ class PageInterleaveKVPoolMixin:
         # A prefix page shared by several requests gathers into ONE scratch
         # slot (torch.unique sorts — deterministic, mirrored); chunk pages
         # are per-request fresh allocations, disjoint by construction.
-        prefix_pages = torch.unique(torch.cat(prefix_parts)) if prefix_parts else empty
+        if len(prefix_parts) > 1:
+            prefix_pages = torch.unique(torch.cat(prefix_parts))
+        else:
+            # One request's prefix pages are distinct; skip unique's host sync.
+            prefix_pages = prefix_parts[0] if prefix_parts else empty
         chunk_pages = torch.cat(chunk_parts) if chunk_parts else empty
         n_prefix = prefix_pages.numel()
         n_chunk = chunk_pages.numel()
@@ -441,7 +453,10 @@ class PageInterleaveKVPoolMixin:
             order = torch.argsort(owners * self._local_page_stride + local_pages)
             sorted_pages = prefix_pages[order]
             sorted_owners = owners[order]
-            counts = torch.bincount(sorted_owners, minlength=shard_size)
+            # scatter_add: bincount would host-sync.
+            counts = torch.zeros(
+                shard_size, dtype=torch.int64, device=self.device
+            ).scatter_add_(0, sorted_owners, torch.ones_like(sorted_owners))
             starts = torch.cumsum(counts, 0) - counts
             within = (
                 torch.arange(n_prefix, dtype=torch.int64, device=self.device)
@@ -462,20 +477,17 @@ class PageInterleaveKVPoolMixin:
         self._block_pages = block_pages
         self._shard_extend_active = True
         self._translate_cache.clear()
+        self._gather_views.clear()
         if block_pages:
-            # This rank's owned pages in slot order (already local-sorted) —
-            # logical page l is its local physical page l // N — padded to
-            # the regular allgather block with the reserved trash page
-            # (local page 0), whose rows the plan never references.
-            own_local = sorted_pages[sorted_owners == self.shard_rank] // shard_size
-            n_pad = block_pages - own_local.numel()
-            if n_pad:
-                own_local = torch.cat(
-                    [
-                        own_local,
-                        torch.zeros((n_pad,), dtype=torch.int64, device=self.device),
-                    ]
-                )
+            # Owned pages are [starts[rank], starts[rank] + counts[rank]) of the
+            # owner-major order, padded with the trash page 0 (sync-free).
+            pos = torch.arange(block_pages, dtype=torch.int64, device=self.device)
+            own_pos = starts[self.shard_rank] + pos
+            own_local = torch.where(
+                pos < counts[self.shard_rank],
+                sorted_pages[own_pos.clamp_(max=n_prefix - 1)] // shard_size,
+                0,
+            )
             self._send_pages = own_local
             self._send_rows = (
                 own_local[:, None] * ps
@@ -518,28 +530,46 @@ class PageInterleaveKVPoolMixin:
         key = (layer_id, self._epoch)
         if slot.resident_key == key:
             return
-        # Order the gather after all prior compute-stream work: the
-        # previous tenant's reads (attention of layer_id - 2) and the pool
-        # writes that produced the prefix rows.
-        self.kv_gather_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_gather_stream):
-            if self.layer_transfer_counter is not None:
-                # HiCache loads this layer's rows on its own stream, and the gather
-                # bypasses the waiting base getters.
-                self.layer_transfer_counter.wait_until(local_layer)
+        counter = self.layer_transfer_counter
+        if counter is None:
+            # Pack on the compute stream to order it after earlier reads and writes.
+            pack_stream = nullcontext()
+        else:
+            # HiCache loads this layer's rows on its own stream, and the pack
+            # bypasses the waiting base getters. Pack on the gather stream so
+            # only it, not the compute stream, waits for that load.
+            self.kv_gather_stream.wait_stream(self.device_module.current_stream())
+            pack_stream = self.device_module.stream(self.kv_gather_stream)
+        pairs = []
+        with pack_stream:
+            if counter is not None:
+                counter.wait_until(local_layer)
             for pool_buf, name in self._gather_pairs(local_layer):
-                send_rows = self._gather_send_rows(name)
-                block = send_rows.numel()
-                scratch = slot.tensors[name]
-                send = scratch[self.shard_rank * block : (self.shard_rank + 1) * block]
+                views = self._gather_views.get((layer_id % 2, name))
+                if views is None:
+                    send_rows = self._gather_send_rows(name)
+                    block = send_rows.numel()
+                    scratch = slot.tensors[name]
+                    views = (
+                        send_rows,
+                        scratch[
+                            self.shard_rank * block : (self.shard_rank + 1) * block
+                        ],
+                        scratch[: self.shard_size * block],
+                    )
+                    self._gather_views[(layer_id % 2, name)] = views
+                send_rows, send, out = views
                 torch.index_select(pool_buf, 0, send_rows, out=send)
+                pairs.append((send, out))
+        if counter is None:
+            self._fork_event.record()
+            self.kv_gather_stream.wait_event(self._fork_event)
+        with self.kv_gather_comm.change_state(enable=True):
+            for send, out in pairs:
                 # In-place regular allgather: send is exactly the rank's
                 # block of the output, every rank contributes `block` rows.
-                with self.kv_gather_comm.change_state(enable=True):
-                    self.kv_gather_comm.all_gather(
-                        scratch[: self.shard_size * block], send
-                    )
-            slot.ready.record(self.kv_gather_stream)
+                self.kv_gather_comm.all_gather(out, send, stream=self.kv_gather_stream)
+        slot.ready.record(self.kv_gather_stream)
         slot.resident_key = key
 
     def _acquire_slot_for_read(self, layer_id: int) -> _ScratchSlot:
@@ -557,8 +587,12 @@ class PageInterleaveKVPoolMixin:
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            self.device_module.current_stream().wait_event(slot.ready)
-            self._prefetch_layer(layer_id + 1)
+            stream = self.device_module.current_stream()
+            waited = (slot.resident_key, stream)
+            if slot.waited != waited:
+                stream.wait_event(slot.ready)
+                slot.waited = waited
+                self._prefetch_layer(layer_id + 1)
         return slot
 
     def _translate_loc_cached(self, loc: torch.Tensor) -> torch.Tensor:
@@ -594,6 +628,18 @@ class PageInterleaveKVPoolMixin:
             self._write_plan_key = key
             self._write_plan = (owned_idx, local_rows)
         return self._write_plan
+
+    def _get_skip_write_rows(self, loc: torch.Tensor) -> torch.Tensor:
+        """Owned locs -> local rows, others -> row 0, which the MLA scatter skips."""
+        key = (loc.data_ptr(), loc.numel(), self._epoch)
+        if self._skip_rows_key != key:
+            self._skip_rows = torch.where(
+                self.placement.local_mask(loc, self.shard_rank),
+                self.placement.local_index(loc),
+                0,
+            )
+            self._skip_rows_key = key
+        return self._skip_rows
 
 
 class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool):
@@ -785,6 +831,20 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             self._write_mla_kv_buffer(
                 slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
             )
+        if (
+            cache_k_rope is not None
+            and cache_k_rope.numel() > 0
+            and not (self.use_dsa or self.dsa_kv_cache_store_fp8)
+        ):
+            # The MLA scatter skips slot 0, so non-owned tokens need no filtering.
+            super().set_mla_kv_buffer(
+                layer,
+                self._get_skip_write_rows(loc),
+                cache_k_nope,
+                cache_k_rope,
+                layer_id_override=layer_id_override,
+            )
+            return
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:
             return
