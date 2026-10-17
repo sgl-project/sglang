@@ -7,11 +7,17 @@ explicitly cast before being handed to the grammar matcher.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    generate_token_bitmask,
+    traverse_tree,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -105,6 +111,69 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         # Node 1 accepted+filled; node 2 rejected -> node 2 and node 3 skipped.
         self.assertEqual(accept_calls, [5])
         self.assertEqual(fill_calls, [0, 1])
+
+
+class _StatefulGrammar:
+    """Tracks accepted tokens; rejects any token in ``reject``."""
+
+    def __init__(self, reject=()):
+        self.reject = set(reject)
+        self.accepted = []
+
+    def accept_token(self, token):
+        if token in self.reject:
+            raise ValueError(f"Tokens not accepted: {token}")
+        self.accepted.append(token)
+
+    def rollback(self, k):
+        del self.accepted[len(self.accepted) - k :]
+
+    def is_terminated(self):
+        return False
+
+    def fill_vocab_mask(self, bitmask, idx):
+        pass
+
+    def allocate_vocab_mask(self, vocab_size, batch_size, device):
+        return torch.full((batch_size, (vocab_size + 31) // 32), -1, dtype=torch.int32)
+
+
+class TestTraverseTreeGrammarReject(unittest.TestCase):
+    """The grammar mask allowed a draft token that accept_token then rejects."""
+
+    def test_traverse_tree_restores_grammar_before_raising(self):
+        rnt, rns, draft_tokens = (
+            t[0]
+            for t in GrammarTree.from_linear_chain(
+                torch.tensor([[1, 2, 3, 4]])
+            ).resolve()
+        )
+        bitmask = torch.full((4, 1), -1, dtype=torch.int32)
+        grammar = _StatefulGrammar(reject={4})
+
+        with self.assertRaises(ValueError):
+            traverse_tree(rnt, rns, draft_tokens, grammar, bitmask)
+
+        # 2 and 3 were accepted before 4 was rejected; both must be rolled back.
+        self.assertEqual(grammar.accepted, [])
+
+    def test_generate_token_bitmask_aborts_only_the_rejected_request(self):
+        chain = torch.tensor([[1, 2, 3, 4], [1, 2, 3, 4]])
+        rnt, rns, draft_tokens = GrammarTree.from_linear_chain(chain).resolve()
+        bad = SimpleNamespace(
+            rid="bad", grammar=_StatefulGrammar(reject={3}), to_finish=None
+        )
+        good = SimpleNamespace(rid="good", grammar=_StatefulGrammar(), to_finish=None)
+
+        bitmask, _ = generate_token_bitmask(
+            [bad, good], rnt, rns, draft_tokens, vocab_size=32
+        )
+
+        self.assertIsInstance(bad.to_finish, FINISH_ABORT)
+        self.assertEqual(bad.grammar.accepted, [])
+        self.assertTrue((bitmask[:4] == -1).all())
+        self.assertIsNone(good.to_finish)
+        self.assertEqual(good.grammar.accepted, [])  # rolled back after traversal
 
 
 if __name__ == "__main__":
