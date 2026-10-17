@@ -581,8 +581,17 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             seed_next_logits = seed_output.next_token_logits
             seed_hidden_per_req = seed_output.hidden_states
 
-        probs = torch.softmax(seed_next_logits, dim=-1)
-        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        # A full single-branch chain retains every node, so proposal scores
+        # are unnecessary. Target verification still decides every output token.
+        linear_chain = (
+            self.topk == 1
+            and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        )
+        if linear_chain:
+            topk_index = seed_next_logits.argmax(dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(seed_next_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         maybe_detect_oob(
             topk_index,
             0,
@@ -593,12 +602,16 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+            if linear_chain:
+                input_ids = topk_index.flatten()
+                token_list.append(topk_index)
+            else:
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
             if i == self.speculative_num_steps - 1:
                 break
@@ -621,8 +634,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
             )
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if linear_chain:
+                topk_index = logits_output.next_token_logits.argmax(
+                    dim=-1, keepdim=True
+                )
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -630,6 +648,25 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 "frozen_kv_mtp_draft: topk_index OOB",
             )
             hidden_states = logits_output.hidden_states
+
+        if linear_chain:
+            draft_tokens = torch.cat(token_list, dim=1)
+            bs = draft_tokens.shape[0]
+            device = draft_tokens.device
+            # CUDA tree kernels require contiguous rows; XPU also supports
+            # strided inputs, but keep the shared output contract here.
+            top_scores_index = torch.arange(
+                self.speculative_num_steps, device=device, dtype=torch.long
+            ).repeat(bs, 1)
+            # The generic tree includes the root (-1), then each predecessor.
+            # A one-step tree has no parent entries.
+            num_parents = (
+                self.speculative_num_steps if self.speculative_num_steps > 1 else 0
+            )
+            parent_list = torch.arange(
+                -1, num_parents - 1, device=device, dtype=torch.long
+            ).repeat(bs, 1)
+            return parent_list, top_scores_index, draft_tokens
 
         return organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
