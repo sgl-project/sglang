@@ -135,6 +135,7 @@ class OllamaServing:
         """Generate streaming chat response."""
 
         async def generate_stream() -> AsyncIterator[bytes]:
+            incremental = self.tokenizer_manager.incremental_streaming_output
             previous_text = ""
             async for chunk in self.tokenizer_manager.generate_request(
                 gen_request, raw_request
@@ -142,12 +143,22 @@ class OllamaServing:
                 text = chunk.get("text", "")
                 is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
 
-                # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text) :]
-                previous_text = text
+                if incremental:
+                    delta = text
+                else:
+                    delta = text[len(previous_text) :]
+                    previous_text = text
+
+                if delta or not is_done:
+                    response = OllamaChatStreamResponse(
+                        model=model_name,
+                        created_at=self._get_timestamp(),
+                        message=OllamaMessage(role="assistant", content=delta),
+                        done=False,
+                    )
+                    yield orjson.dumps(response.model_dump()) + b"\n"
 
                 if is_done:
-                    # Final chunk
                     response = OllamaChatStreamResponse(
                         model=model_name,
                         created_at=self._get_timestamp(),
@@ -155,15 +166,7 @@ class OllamaServing:
                         done=True,
                         done_reason="stop",
                     )
-                else:
-                    response = OllamaChatStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        message=OllamaMessage(role="assistant", content=delta),
-                        done=False,
-                    )
-
-                yield orjson.dumps(response.model_dump()) + b"\n"
+                    yield orjson.dumps(response.model_dump()) + b"\n"
 
         return StreamingResponse(
             generate_stream(),
@@ -252,6 +255,7 @@ class OllamaServing:
         """Generate streaming generate response."""
 
         async def generate_stream() -> AsyncIterator[bytes]:
+            incremental = self.tokenizer_manager.incremental_streaming_output
             previous_text = ""
             async for chunk in self.tokenizer_manager.generate_request(
                 gen_request, raw_request
@@ -259,9 +263,20 @@ class OllamaServing:
                 text = chunk.get("text", "")
                 is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
 
-                # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text) :]
-                previous_text = text
+                if incremental:
+                    delta = text
+                else:
+                    delta = text[len(previous_text) :]
+                    previous_text = text
+
+                if delta or not is_done:
+                    response = OllamaGenerateStreamResponse(
+                        model=model_name,
+                        created_at=self._get_timestamp(),
+                        response=delta,
+                        done=False,
+                    )
+                    yield orjson.dumps(response.model_dump()) + b"\n"
 
                 if is_done:
                     response = OllamaGenerateStreamResponse(
@@ -271,15 +286,7 @@ class OllamaServing:
                         done=True,
                         done_reason="stop",
                     )
-                else:
-                    response = OllamaGenerateStreamResponse(
-                        model=model_name,
-                        created_at=self._get_timestamp(),
-                        response=delta,
-                        done=False,
-                    )
-
-                yield orjson.dumps(response.model_dump()) + b"\n"
+                    yield orjson.dumps(response.model_dump()) + b"\n"
 
         return StreamingResponse(
             generate_stream(),
