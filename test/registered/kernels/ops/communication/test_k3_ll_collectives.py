@@ -125,6 +125,128 @@ def _check_gather_tail_read(comm, rank, failures):
                     )
 
 
+def _check_front_gather(comm, rank, failures):
+    """The column-parallel front's gather equals dist.all_gather of the slices; its
+    fused MXFP8 latent, top-k and shared-expert SiTU equal aiter's quant-sort,
+    kimi_k3_route_sort and situ_and_mul on the gathered values."""
+    from aiter.fused_moe import moe_sorting
+    from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_sort, mxfp4_moe_sort_fwd
+
+    from sglang.kernels.ops.activation import situ_and_mul
+    from sglang.kernels.ops.moe import k3_front_gather_hip as fg
+    from sglang.kernels.ops.moe.kimi_k3_route_sort import route_sort
+
+    g = torch.Generator(device="cuda").manual_seed(3 + rank)
+    bias = (torch.randn(fg.NUM_EXPERTS, generator=g, device="cuda") * 0.01).bfloat16()
+    for rows in (1, 16, 64):
+        # the slices sit inside a wider front output, as in the model
+        front = torch.randn(rows, 2096, generator=g, device="cuda").bfloat16()
+        gate_up, slices = front[:, :1536], front[:, 1536:]
+        gathered = _gather(slices)
+        want_logits = torch.cat([x[:, :112] for x in gathered], dim=1)
+        want_latent = torch.cat([x[:, 112:] for x in gathered], dim=1)
+        got = fg.front_gather(
+            slices, comm, quant=True, bias=bias, gate_up=gate_up,
+            situ_beta=4.0, situ_linear_beta=25.0,
+        )  # fmt: skip
+        routes = route_sort(
+            got.logits, bias, topk=16, block_m=32, model_dim=fg.LATENT_SIZE,
+            moe_buf=None, routed_scaling_factor=1.0, renormalize=True,
+        )  # fmt: skip
+        sorted_ids, sorted_w, _, num_valid, _ = moe_sorting(
+            routes.topk_ids, routes.topk_weights, fg.NUM_EXPERTS, fg.LATENT_SIZE,
+            torch.bfloat16, 32,
+        )  # fmt: skip
+        want_a1, want_scale = fused_dynamic_mxfp8_quant_moe_sort(
+            want_latent, sorted_ids=sorted_ids, num_valid_ids=num_valid,
+            token_num=rows, topk=16, block_size=32, sorted_weights=sorted_w,
+            num_experts_upper_bound=fg.NUM_EXPERTS,
+        )  # fmt: skip
+        got_scale = mxfp4_moe_sort_fwd(
+            got.a1_scale, sorted_ids=sorted_ids, num_valid_ids=num_valid,
+            token_num=rows, cols=fg.LATENT_SIZE,
+        )  # fmt: skip
+        # the scales of routed rows only; padding rows of expert blocks are unspecified
+        sid = sorted_ids[: int(num_valid[0])].long()
+        x = torch.nonzero((sid & 0xFFFFFF) < rows).flatten()[:, None]
+        y = torch.arange(112, device="cuda")[None, :]
+        idx = (x // 32 * 112) * 32 + (y // 8) * 256 + (y % 4) * 64 + (x % 16) * 4
+        idx = idx + (y % 8) // 4 * 2 + (x % 32) // 16
+        checks = dict(
+            logits=torch.equal(got.logits, want_logits),
+            latent=torch.equal(got.latent, want_latent),
+            a1=torch.equal(got.a1.view(torch.uint8), want_a1.view(torch.uint8)[:rows]),
+            scales=torch.equal(
+                got_scale.view(torch.uint8).flatten()[idx],
+                want_scale.view(torch.uint8).flatten()[idx],
+            ),
+            topk=torch.equal(got.topk_ids, routes.topk_ids)
+            and torch.equal(got.topk_weights, routes.topk_weights),
+            situ=torch.equal(got.situ, situ_and_mul(gate_up, None, 4.0, 25.0)),
+        )
+        if not all(checks.values()):
+            failures.append(f"front gather rows={rows}: {checks}")
+
+
+def _check_bank_partial_reads(comm, rank, failures):
+    """Reads that take the bank partials the route sort's spare workgroups compute
+    give the reads over the bank rows: the same stream, the output within rounding."""
+    from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+    from sglang.kernels.ops.gemm.kimi_k3_latent_tail_hip import k3_latent_tail_partials
+    from sglang.kernels.ops.moe import kimi_k3_route_sort as rs
+
+    g = torch.Generator(device="cuda").manual_seed(4)
+    gr = torch.Generator(device="cuda").manual_seed(200 + rank)
+    up = (torch.randn(H, L, generator=g, device="cuda") * 0.02).bfloat16()
+    norm_w = (torch.rand(L, generator=g, device="cuda") + 0.5).bfloat16()
+    cw_attn = torch.randn(H, generator=g, device="cuda") * 0.05
+    cw_ffn = torch.randn(H, generator=g, device="cuda") * 0.05
+    ow = (torch.rand(H, generator=g, device="cuda") + 0.5).bfloat16().float()
+    bias = (torch.randn(896, generator=g, device="cuda") * 0.1).float()
+    cols = slice(rank * H // WORLD, (rank + 1) * H // WORLD)
+    for rows in (1, 4, 16):
+        latent = (torch.randn(rows, L, generator=g, device="cuda") * 3).bfloat16()
+        shared = torch.randn(rows, H, generator=g, device="cuda").bfloat16()
+        prefix = (torch.randn(rows, H, generator=g, device="cuda") * 4).bfloat16()
+        bank = (torch.randn(rows, NB, H, generator=g, device="cuda") * 4).bfloat16()
+        logits = torch.randn(rows, 896, generator=g, device="cuda").bfloat16()
+        attn_partial = torch.randn(rows, H, generator=gr, device="cuda").bfloat16()
+        part, sq = k3_latent_tail_partials(latent, norm_w, up[cols])
+        for nvb in (2, 5, 8):
+            rs.route_sort(
+                logits, bias, topk=16, block_m=32, model_dim=L, moe_buf=None,
+                routed_scaling_factor=1.0, renormalize=True,
+                partials=rs.BankPartials(
+                    bank=bank, nvb=nvb, score_weights=(cw_attn, cw_ffn),
+                    score_eps=EPS, acc=comm.bank_acc, ms=comm.bank_ms,
+                ),
+            )  # fmt: skip
+            attn_side = (comm.bank_acc[0], comm.bank_ms[0])
+            ffn_side = (comm.bank_acc[1], comm.bank_ms[1])
+            pairs = {}
+            for side in ("bank", "partial"):
+                pairs[side] = hip.gather_tail_attn_res_read(
+                    part, sq, shared, prefix, EPS, bank.clone(), nvb, cw_attn, ow,
+                    EPS, EPS, comm, bank_partial=attn_side if side == "partial" else None,
+                )  # fmt: skip
+            if rows in hip.AR_READ_ROWS:
+                for side in ("ar_bank", "ar_partial"):
+                    pairs[side] = hip.all_reduce_attn_res_read(
+                        attn_partial, prefix, bank, nvb, cw_ffn, ow, EPS, EPS, comm,
+                        bank_partial=ffn_side if side == "ar_partial" else None,
+                    )  # fmt: skip
+            for read, against in (("partial", "bank"), ("ar_partial", "ar_bank")):
+                if read not in pairs:
+                    continue
+                (out, stream), (want, want_stream) = pairs[read], pairs[against]
+                bad = _beyond_ulp(out, want)
+                if not (torch.equal(stream, want_stream) and bad <= rows * 8):
+                    failures.append(
+                        f"{read} rows={rows} nvb={nvb}: stream_exact="
+                        f"{torch.equal(stream, want_stream)} beyond_ulp={bad}"
+                    )
+
+
 def _worker(rank, port, results):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
@@ -144,6 +266,8 @@ def _worker(rank, port, results):
             with torch.inference_mode():
                 _check_all_reduce_read(comm, rank, failures)
                 _check_gather_tail_read(comm, rank, failures)
+                _check_front_gather(comm, rank, failures)
+                _check_bank_partial_reads(comm, rank, failures)
         torch.cuda.synchronize()
     finally:
         results[rank] = failures

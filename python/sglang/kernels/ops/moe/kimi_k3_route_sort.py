@@ -33,14 +33,28 @@ class RouteSortOutput(NamedTuple):
     a1_scale: Optional[torch.Tensor] = None
 
 
+class BankPartials(NamedTuple):
+    """The next layer's attention-residual bank partials, computed by the route
+    sort's spare workgroups (csrc/kimi_k3/attn_res/bank_partial_hip.cuh)."""
+
+    bank: torch.Tensor  # [T, NB, H] bf16, read over rows [0, nvb)
+    nvb: int
+    # [H] fp32 each, score norm weight * proj weight: side 0's, and side 1's or None
+    score_weights: tuple[torch.Tensor, Optional[torch.Tensor]]
+    score_eps: float
+    acc: torch.Tensor  # [2, >= T, H] fp32, side s in acc[s]
+    ms: torch.Tensor  # [2, >= T, 2] fp32
+
+
 @cache_once
 def _jit_route_sort_module(
     num_experts: int,
     topk: int,
     bias_dtype: torch.dtype,
     fuse_quant: bool,
+    precomputed: bool = False,
 ) -> Module:
-    args = make_cpp_args(num_experts, topk, bias_dtype, fuse_quant)
+    args = make_cpp_args(num_experts, topk, bias_dtype, fuse_quant, precomputed)
     return load_jit(
         "kimi_k3_route_sort",
         *args,
@@ -92,19 +106,28 @@ def route_sort(
     routed_scaling_factor: float,
     renormalize: bool,
     quant_input: Optional[torch.Tensor] = None,
+    topk_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    partials: Optional[BankPartials] = None,
 ) -> RouteSortOutput:
     """Top-k of sigmoid(router_logits) + bias, sorted into aiter's block-padded
     route layout; moe_buf ([M, model_dim], allocated when None) is zeroed.
     With quant_input ([M, D] bf16, the routed activations) the stage-1 MXFP8
-    quant + scale sort is fused in as well."""
+    quant + scale sort is fused in as well. topk_output = (weights [M, topk]
+    fp32, ids [M, topk] int32) from an earlier kernel skips the top-k. partials
+    adds the workgroups that compute them, one per row of partials.bank."""
     num_tokens, num_experts = router_logits.shape
     device = router_logits.device
     # Same sizes as aiter.fused_moe._moe_sorting_impl.
     max_rows = num_tokens * topk + num_experts * block_m - topk
     max_blocks = (max_rows + block_m - 1) // block_m
     max_rows = max_blocks * block_m
-    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
-    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
+    if topk_output is not None:
+        topk_weights, topk_ids = topk_output
+    else:
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=device
+        )
+        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
     sorted_ids = torch.empty(max_rows, dtype=torch.int32, device=device)
     sorted_weights = torch.empty(max_rows, dtype=torch.float32, device=device)
     sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
@@ -126,8 +149,24 @@ def route_sort(
         )
     else:
         quant_input = a1 = a1_scale = sorted_ids  # unread placeholders
+    if partials is None:
+        # unread placeholders; no rows launch no partial workgroups
+        partial_args = (sorted_ids,) * 5 + (0, 0, 0, 0.0)
+    else:
+        cw0, cw1 = partials.score_weights
+        partial_args = (
+            partials.bank,
+            cw0,
+            cw0 if cw1 is None else cw1,
+            partials.acc,
+            partials.ms,
+            partials.nvb,
+            1 if cw1 is None else 2,
+            partials.bank.shape[0],
+            float(partials.score_eps),
+        )
     module = _jit_route_sort_module(
-        num_experts, topk, correction_bias.dtype, fuse_quant
+        num_experts, topk, correction_bias.dtype, fuse_quant, topk_output is not None
     )
     module.run(
         router_logits,
@@ -145,6 +184,7 @@ def route_sort(
         block_m,
         float(routed_scaling_factor),
         renormalize,
+        *partial_args,
     )
     return RouteSortOutput(
         topk_weights,

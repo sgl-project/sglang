@@ -1,7 +1,8 @@
 """The communicator of Kimi-K3's gfx950 TP8 LL collectives: the attention
-output's all-reduce fused with the FFN read (``SGLANG_ROCM_K3_FUSED_ATTN_AR_READ``)
-and the column-parallel latent-MoE tail's gather fused with the next attention
-read (``SGLANG_ROCM_K3_COLUMN_TAIL``).
+output's all-reduce fused with the FFN read (``SGLANG_ROCM_K3_FUSED_ATTN_AR_READ``),
+the column-parallel latent-MoE tail's gather fused with the next attention read
+(``SGLANG_ROCM_K3_COLUMN_TAIL``) and the column-parallel MoE front's gather
+(``SGLANG_ROCM_K3_SPLIT_FRONT``).
 
 ``get_comm()`` is a collective over the TP group on its first call, so the
 model makes it at construction, where every rank builds the same layers in the
@@ -27,6 +28,7 @@ def get_comm() -> Optional[LLComm]:
     if not is_gfx95_supported() or not (
         envs.SGLANG_ROCM_K3_FUSED_ATTN_AR_READ.get()
         or envs.SGLANG_ROCM_K3_COLUMN_TAIL.get()
+        or envs.SGLANG_ROCM_K3_SPLIT_FRONT.get()
     ):
         return None
     from sglang.kernels.ops.communication.k3_ll_comm_hip import (

@@ -96,6 +96,67 @@ class TestKimiK3RouteSort(CustomTestCase):
                 self.assertTrue(bool(((ids >= 0) & (ids < E)).all()))
                 self.assertTrue(all(len(set(row)) == K for row in ids.tolist()))
 
+    @torch.inference_mode()
+    def test_bank_partials(self):
+        """The spare workgroups' partials are the bank's softmax partial sums the
+        fused reads merge: per row and score vector, m = max score, sum =
+        sum exp(score - m), acc = sum exp(score - m) * bank row, score =
+        <bank row, cw> / rms(bank row); a second vector only when given."""
+        from sglang.kernels.ops.moe import kimi_k3_route_sort as rs
+
+        g = torch.Generator(device="cuda").manual_seed(1)
+        bias = torch.randn(E, generator=g, device="cuda") * 0.1
+        acc = torch.zeros(2, 64, H, device="cuda")
+        ms = torch.zeros(2, 64, 2, device="cuda")
+        eps = 1e-6
+        for num_tokens, nvb, sides in ((1, 2, 2), (4, 8, 2), (16, 5, 1)):
+            logits = torch.randn(num_tokens, E, generator=g, device="cuda").bfloat16()
+            bank = (
+                torch.randn(num_tokens, NB, H, generator=g, device="cuda") * 3
+            ).bfloat16()
+            cws = [
+                torch.randn(H, generator=g, device="cuda") * 0.05 for _ in range(sides)
+            ]
+            acc.zero_()
+            ms.zero_()
+            rs.route_sort(
+                logits,
+                bias,
+                topk=K,
+                block_m=BLOCK_M,
+                model_dim=LATENT,
+                moe_buf=None,
+                routed_scaling_factor=1.0,
+                renormalize=True,
+                partials=rs.BankPartials(
+                    bank=bank,
+                    nvb=nvb,
+                    score_weights=(cws[0], cws[1] if sides == 2 else None),
+                    score_eps=eps,
+                    acc=acc,
+                    ms=ms,
+                ),
+            )
+            b = bank[:, :nvb].float()
+            rms = torch.sqrt((b * b).mean(-1) + eps)
+            with self.subTest(num_tokens=num_tokens, nvb=nvb, sides=sides):
+                for side, cw in enumerate(cws):
+                    score = (b * cw).sum(-1) / rms
+                    m = score.max(-1).values
+                    e = torch.exp(score - m[:, None])
+                    want = (e[:, :, None] * b).sum(1)
+                    torch.testing.assert_close(
+                        acc[side, :num_tokens], want, rtol=1e-4, atol=1e-3
+                    )
+                    torch.testing.assert_close(
+                        ms[side, :num_tokens],
+                        torch.stack([m, e.sum(-1)], -1),
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
+                if sides == 1:
+                    self.assertEqual(acc[1].abs().max().item(), 0.0)
+
 
 def _row_scales(scales: torch.Tensor, row: int) -> torch.Tensor:
     """The e8m0 group scales of a sorted row in aiter's shuffled layout."""

@@ -51,19 +51,20 @@ inline constexpr int kSliceThreads = kSlice / kVec;
 // 8 payload bytes per 16-byte line.
 inline constexpr int kAgLinesPerRow = kSlice * 2 / 8;
 inline constexpr int64_t kAgEpochLines = int64_t{kWorld} * kMaxRows * kAgLinesPerRow;
-// The scratch's first region and the row flags are the gather read's.
-inline constexpr int kEpochs = kMaxRows;
+// The first region of the gather scratch (comm/front_gather_hip.cuh owns the second) and the
+// first kMaxRows of its flags.
+inline constexpr int kEpochs = 2 * kMaxRows;
 // The column-parallel latent-MoE tail the all-gather can finish: its GEMM's fp32 partials over
 // kTailSplits chunks of the kTailK latent dim (kimi_k3_latent_tail_hip.k3_latent_tail_partials).
 inline constexpr int kTailK = 3584;
 inline constexpr int kTailSplits = 7;
 // The attention output's one-shot all-reduce fused with the FFN-side read (k3_ar_attn_res_kernel):
 // every rank pushes its whole partial row, two lines per 16-byte vector, into its own slot of
-// each peer's region, which follows the gather read's.
+// each peer's region, which follows the MoE front gather's (comm/front_gather_hip.cuh).
 inline constexpr int kArMaxRows = 16;
 inline constexpr int kArLinesPerRow = 2 * kThreads;
 inline constexpr int64_t kArEpochLines = int64_t{kWorld} * kArMaxRows * kArLinesPerRow;
-inline constexpr int64_t kArRegionLine = 2 * kAgEpochLines;
+inline constexpr int64_t kArRegionLine = 2 * kAgEpochLines + 2 * int64_t{kWorld} * kMaxRows * 144;
 inline constexpr int kArPushers = kWorld - 1;  // pusher workgroups per row, one per peer
 static_assert(kThreads % kWave == 0 && kSlice % kVec == 0, "whole waves and vectors");
 
@@ -80,7 +81,10 @@ struct Params {
   int32_t* __restrict__ epochs;  // [kEpochs], rank-local
   int64_t bank_stride_t;         // elements
   int64_t bank_stride_b;
-  int32_t nvb_write;  // bank row the prefix is snapshotted into, or -1
+  // AttnResRead<0>: the bank's softmax partials for this read (bank_partial_hip.cuh).
+  const float4* __restrict__ bank_acc;  // [T, H] fp32
+  const float2* __restrict__ bank_ms;   // [T] (m, sum)
+  int32_t nvb_write;                    // bank row the prefix is snapshotted into, or -1
   int32_t rank;
   float score_eps;
   float out_eps;
@@ -201,6 +205,85 @@ struct AttnResRead {
       sq += mix[e] * mix[e];
     sq = wave_sum(sq);
     if (lane == 0) s.sq[wave] = sq;
+    lds_barrier();
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w)
+      total += s.sq[w];
+    const float scale = 1.0f / sqrtf(total / kHidden + p.out_eps);
+
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      mix[e] = mix[e] * scale * ow[e];
+    return pack8(mix);
+  }
+};
+
+// The read with the bank's softmax partials computed ahead (bank_acc, bank_ms): only the
+// stream is scored once the collective completes, then merged as one more candidate.
+template <>
+struct AttnResRead<0> {
+  struct Shared {
+    float part[kWaves][2];  // the stream's (dot, sumsq)
+    float weight[2];        // the partial's scale and the stream's weight
+    float sq[kWaves];
+  };
+
+  float acc[kVec];
+  float2 ms;
+  float cw[kVec];
+  float ow[kVec];
+
+  SGL_DEVICE void load(const Params& p, int t, int tid) {
+    load_fp32x8(p.bank_acc + (static_cast<int64_t>(t) * kThreads + tid) * 2, acc);
+    ms = p.bank_ms[t];
+    load_fp32x8(p.cw + 2 * tid, cw);
+    // Loaded up front: a load after the collective's stores would wait for their acks.
+    load_fp32x8(p.ow + 2 * tid, ow);
+  }
+
+  // Nothing to score, but the kernels' push and poll sides must stay apart: a convergent
+  // point keeps a wave's pushing lanes from being held back behind its polling lanes.
+  SGL_DEVICE void score_bank(Shared&, int, int, int) const {
+    __builtin_amdgcn_wave_barrier();
+  }
+
+  SGL_DEVICE uint4 finish(Shared& s, const Params& p, const float (&prefix)[kVec], int tid, int wave, int lane) const {
+    float dot = 0.f, sq = 0.f;
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      dot += prefix[e] * cw[e], sq += prefix[e] * prefix[e];
+    dot = wave_sum(dot);
+    sq = wave_sum(sq);
+    if (lane == 0) s.part[wave][0] = dot, s.part[wave][1] = sq;
+    lds_barrier();
+    if (tid == 0) {
+      float d = 0.f, q = 0.f;
+#pragma unroll
+      for (int w = 0; w < kWaves; ++w)
+        d += s.part[w][0], q += s.part[w][1];
+      const float score = d / sqrtf(q / kHidden + p.score_eps);
+      const float m = fmaxf(ms.x, score);
+      const float bank_scale = __expf(ms.x - m);
+      const float stream = __expf(score - m);
+      const float inv = 1.0f / (ms.y * bank_scale + stream);
+      s.weight[0] = bank_scale * inv;
+      s.weight[1] = stream * inv;
+    }
+    lds_barrier();
+
+    float mix[kVec];
+    const float wb = s.weight[0], wp = s.weight[1];
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      mix[e] = prefix[e] * wp + acc[e] * wb;
+
+    float total_sq = 0.f;
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      total_sq += mix[e] * mix[e];
+    total_sq = wave_sum(total_sq);
+    if (lane == 0) s.sq[wave] = total_sq;
     lds_barrier();
     float total = 0.f;
 #pragma unroll
@@ -414,6 +497,17 @@ void launch(const Params& params, bool has_residual, bool write_bank, int rows, 
   }
 }
 
+// The bank partials a read takes instead of the bank rows: acc [T, H] and ms [T, 2], fp32.
+inline void verify_bank_partial(
+    const tvm::ffi::TensorView acc,
+    const tvm::ffi::TensorView ms,
+    host::SymbolicSize& T,
+    host::SymbolicDevice& device) {
+  using namespace host;
+  TensorMatcher({T, kHidden}).with_dtype<float>().with_device(device).verify(acc);
+  TensorMatcher({T, 2}).with_dtype<float>().with_device(device).verify(ms);
+}
+
 struct K3AttnResReadKernel {
   // The all-gather read over `comm`, the dedicated aiter CustomAllreduce* whose meta buffers
   // hold the LL scratch. Each rank's slice is finished from the column tail's partials:
@@ -432,9 +526,12 @@ struct K3AttnResReadKernel {
       const tvm::ffi::TensorView tail_part,
       const tvm::ffi::TensorView tail_sq,
       const tvm::ffi::TensorView tail_shared,
+      const tvm::ffi::TensorView bank_acc,
+      const tvm::ffi::TensorView bank_ms,
       int64_t nvb,
       bool has_residual,
       bool write_bank,
+      bool bank_partial,
       double score_eps,
       double out_eps,
       double tail_eps) {
@@ -460,6 +557,7 @@ struct K3AttnResReadKernel {
     RuntimeCheck(1 <= nvb && nvb <= kMaxNvb && nvb <= NB.unwrap(), "k3 attn-res read takes 1-8 bank rows");
     RuntimeCheck(!write_bank || nvb < NB.unwrap(), "bank write needs a free row");
     RuntimeCheck(bank.stride(0) % kVec == 0 && bank.stride(1) % kVec == 0, "bank rows must be 16-byte aligned");
+    if (bank_partial) verify_bank_partial(bank_acc, bank_ms, T, device);
 
     Params params{
         .bank = static_cast<bf16_t*>(bank.data_ptr()),
@@ -472,6 +570,8 @@ struct K3AttnResReadKernel {
         .epochs = static_cast<int32_t*>(epochs.data_ptr()),
         .bank_stride_t = bank.stride(0),
         .bank_stride_b = bank.stride(1),
+        .bank_acc = bank_partial ? static_cast<const float4*>(bank_acc.data_ptr()) : nullptr,
+        .bank_ms = bank_partial ? static_cast<const float2*>(bank_ms.data_ptr()) : nullptr,
         .nvb_write = write_bank ? static_cast<int32_t>(nvb) : -1,
         .rank = 0,
         .score_eps = static_cast<float>(score_eps),
@@ -494,6 +594,7 @@ struct K3AttnResReadKernel {
     params.self_scratch = params.scratch[communicator->rank_];
     const DLDevice dev = device.unwrap();
     const int n = static_cast<int>(rows);
+    if (bank_partial) return launch<0>(params, has_residual, write_bank, n, dev);
     switch (nvb) {
       case 1:
         return launch<1>(params, has_residual, write_bank, n, dev);
@@ -539,8 +640,11 @@ struct K3AttnResArReadKernel {
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView ar_epochs,
       const tvm::ffi::TensorView ar_pushed,
+      const tvm::ffi::TensorView bank_acc,
+      const tvm::ffi::TensorView bank_ms,
       int64_t nvb,
       bool has_residual,
+      bool bank_partial,
       double score_eps,
       double out_eps) {
     using namespace host;
@@ -557,6 +661,7 @@ struct K3AttnResArReadKernel {
     RuntimeCheck(rows >= 1 && rows <= kArMaxRows, "the all-reduce read takes 1-", kArMaxRows, " rows");
     RuntimeCheck(1 <= nvb && nvb <= kMaxNvb && nvb <= NB.unwrap(), "k3 attn-res read takes 1-8 bank rows");
     RuntimeCheck(bank.stride(0) % kVec == 0 && bank.stride(1) % kVec == 0, "bank rows must be 16-byte aligned");
+    if (bank_partial) verify_bank_partial(bank_acc, bank_ms, T, device);
     auto* communicator = reinterpret_cast<aiter::CustomAllreduce*>(comm);
     RuntimeCheck(communicator->world_size_ == kWorld, "the all-reduce read requires TP", kWorld);
     Params params{
@@ -570,6 +675,8 @@ struct K3AttnResArReadKernel {
         .epochs = nullptr,
         .bank_stride_t = bank.stride(0),
         .bank_stride_b = bank.stride(1),
+        .bank_acc = bank_partial ? static_cast<const float4*>(bank_acc.data_ptr()) : nullptr,
+        .bank_ms = bank_partial ? static_cast<const float2*>(bank_ms.data_ptr()) : nullptr,
         .nvb_write = -1,
         .rank = communicator->rank_,
         .score_eps = static_cast<float>(score_eps),
@@ -586,6 +693,7 @@ struct K3AttnResArReadKernel {
     params.self_scratch = params.scratch[communicator->rank_];
     const DLDevice dev = device.unwrap();
     const int n = static_cast<int>(rows);
+    if (bank_partial) return launch_ar<0>(params, has_residual, n, dev);
     switch (nvb) {
       case 1:
         return launch_ar<1>(params, has_residual, n, dev);

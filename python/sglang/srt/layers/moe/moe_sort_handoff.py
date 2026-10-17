@@ -28,8 +28,18 @@ class StagedSort(msgspec.Struct, frozen=True):
     a1_scale: Optional[torch.Tensor] = None
 
 
+class StagedQuant(msgspec.Struct, frozen=True):
+    """Stage-1 MXFP8 rows an earlier kernel quantized: aiter then only sorts
+    their scales (mxfp4_moe_sort_fwd) instead of fused_dynamic_mxfp8_quant_moe_sort."""
+
+    quant_input: torch.Tensor  # the bf16 rows aiter would quantize
+    a1: torch.Tensor  # [M, D] fp8 e4m3
+    scales: torch.Tensor  # [M, D / 32] e8m0, token-major
+
+
 class _Handoff(msgspec.Struct):
     staged: Optional[StagedSort] = None
+    quant: Optional[StagedQuant] = None
 
 
 _handoff = _Handoff()
@@ -45,12 +55,22 @@ def stage(sort: StagedSort) -> Iterator[None]:
         _handoff.staged = old
 
 
+@contextlib.contextmanager
+def stage_quant(quant: StagedQuant) -> Iterator[None]:
+    """Publish `quant` for the aiter fused_moe call(s) inside the block."""
+    old, _handoff.quant = _handoff.quant, quant
+    try:
+        yield
+    finally:
+        _handoff.quant = old
+
+
 def sort_staged() -> bool:
     return _handoff.staged is not None
 
 
 def active() -> bool:
-    return _handoff.staged is not None
+    return _handoff.staged is not None or _handoff.quant is not None
 
 
 def take(
@@ -87,8 +107,8 @@ def take_quant(
     num_valid_ids: torch.Tensor,
     token_num: int,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-    """The stage-1 (a1, a1_scale) staged with the sort, when this quant call is
-    the one it was staged for."""
+    """The stage-1 (a1, a1_scale) when this quant call is the staged one: as
+    staged with its sort, or a staged quant whose scales get sorted here."""
     s = _handoff.staged
     if (
         s is not None
@@ -101,4 +121,22 @@ def take_quant(
         and token_num == s.a1.shape[0]
     ):
         return s.a1, s.a1_scale
-    return None
+    q = _handoff.quant
+    if (
+        q is None
+        or input.data_ptr() != q.quant_input.data_ptr()
+        or input.shape != q.quant_input.shape
+        or input.stride() != q.quant_input.stride()
+        or token_num != q.a1.shape[0]
+    ):
+        return None
+    from aiter.ops.quant import mxfp4_moe_sort_fwd
+
+    a1_scale = mxfp4_moe_sort_fwd(
+        q.scales,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        cols=q.a1.shape[1],
+    )
+    return q.a1, a1_scale

@@ -987,6 +987,13 @@ class Envs:
     # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at most 8
     # tokens: past that its single quant workgroup costs more than a launch).
     SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
+    # Split the MoE front's replicated router and latent down-projection by output
+    # columns (each rank reads 1/8 of them) and all-gather logits and latent, up to
+    # 64 tokens.
+    SGLANG_ROCM_K3_SPLIT_FRONT = EnvBool(True)
+    # Let the route sort's spare workgroups compute the next layer's attention-residual
+    # bank partials, so its fused reads only fold in the new stream.
+    SGLANG_ROCM_K3_ATTN_RES_BANK_PARTIALS = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.

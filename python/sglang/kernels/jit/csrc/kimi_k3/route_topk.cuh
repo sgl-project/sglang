@@ -1,5 +1,5 @@
-// Kimi-K3 router top-k of one token on one wave (ROCm, wave64), for the fused route sort
-// (route_sort.cuh).
+// Kimi-K3 router top-k of one token on one wave (ROCm, wave64), shared by the fused route sort
+// (route_sort.cuh) and the column-parallel MoE front's gather (comm/front_gather_hip.cuh).
 //
 // Scores follow aiter's topk_reg_kernel: sig = rcp(1 + 2^(-log2e * x)), the selection key is
 // sig + bias, the weight is the pre-bias sig, renormalized in descending order; exact score ties
