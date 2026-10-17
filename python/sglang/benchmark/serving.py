@@ -1162,6 +1162,13 @@ def calculate_metrics(
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
+            else:
+                # Multi-turn outputs are one per round, so add each round's
+                # prompt_len. If the server returns no usage, prompt_len falls
+                # back to the dataset row value, so the total is an estimate.
+                # Image tokens in multi-turn prompts are counted as text.
+                total_input += outputs[i].prompt_len
+                total_input_text += outputs[i].prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
