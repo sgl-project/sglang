@@ -80,6 +80,14 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         return "All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
+                    if item >= self.tokenizer_manager.model_config.vocab_size and not (
+                        item == request.embed_override_token_id
+                        and request.embed_overrides is not None
+                    ):
+                        return (
+                            f"Token ID at index {i} must be less than the model's "
+                            f"vocabulary size ({self.tokenizer_manager.model_config.vocab_size})"
+                        )
         return None
 
     def _convert_to_internal_request(
