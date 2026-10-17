@@ -25,10 +25,38 @@ def _pad_to_patch_size(latents: torch.Tensor, patch_size: int) -> torch.Tensor:
     return torch.nn.functional.pad(latents, (0, pad_w, 0, pad_h), mode="circular")
 
 
+def _pack_control(control, batch_size: int, seq_len: int) -> dict[str, list] | None:
+    """Validate ComfyUI's {"input": double-block, "output": single-block} residuals.
+
+    None entries are kept so list positions still match the block index.
+    """
+    if not control:
+        return None
+    packed = {}
+    # ComfyUI repeats one residual object across several blocks; keep it one
+    # object so the request pickles it once instead of once per block.
+    detached: dict[int, torch.Tensor] = {}
+    for key in ("input", "output"):
+        residuals = []
+        for index, residual in enumerate(control.get(key) or []):
+            if residual is not None:
+                if residual.ndim != 3 or residual.shape[:2] != (batch_size, seq_len):
+                    raise ValueError(
+                        f"Flux control {key}[{index}] has shape {tuple(residual.shape)}, "
+                        f"expected ({batch_size}, {seq_len}, hidden)"
+                    )
+                residual = detached.setdefault(id(residual), residual.detach())
+            residuals.append(residual)
+        if any(r is not None for r in residuals):
+            packed[key] = residuals
+    return packed or None
+
+
 class FluxAdapter(ComfyUIModelAdapter):
     model_types = ("flux",)
     pipeline_class_name = "FluxPipeline"
     patch_size = 2
+    applied_conditioning = ("control",)
 
     def pack(
         self,
@@ -48,12 +76,6 @@ class FluxAdapter(ComfyUIModelAdapter):
                 "silently drop the reference images and produce a plain "
                 "text-to-image result instead of a Kontext edit."
             )
-        if control is not None:
-            raise ValueError(
-                "FluxAdapter does not support ControlNet conditioning. Running "
-                "the workflow would silently drop the ControlNet and produce an "
-                "unconditioned text-to-image result."
-            )
         if y is None:
             # Native ComfyUI Flux zero-fills a missing pooled vector.
             y = torch.zeros(
@@ -71,6 +93,7 @@ class FluxAdapter(ComfyUIModelAdapter):
             height=padded_height * 8,
             width=padded_width * 8,
             guidance_scale=_flux_guidance_scale(guidance),
+            control=_pack_control(control, packed.shape[0], packed.shape[1]),
             unpack_ctx={
                 "height": padded_height,
                 "width": padded_width,

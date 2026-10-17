@@ -321,6 +321,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
             value = packed.extra_req.get(key)
             if value is not None:
                 extra[key] = value
+        if packed.control:
+            extra["comfyui_control"] = packed.control
         req.extra = extra
         req.generator = [
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
