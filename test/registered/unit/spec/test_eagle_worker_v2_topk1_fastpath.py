@@ -271,7 +271,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            kv_index_translator=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -297,7 +299,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            kv_index_translator=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2

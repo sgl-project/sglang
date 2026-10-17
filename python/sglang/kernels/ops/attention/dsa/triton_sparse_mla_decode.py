@@ -112,6 +112,10 @@ def _sparse_mla_decode_fused_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_I64_PAGE: tl.constexpr = True,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
+    len_ptr=None,  # [N] valid prefix of each idx row; read when USE_LENGTH
+    USE_LENGTH: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -170,7 +174,10 @@ def _sparse_mla_decode_fused_kernel(
         acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
-    num_tiles = tl.cdiv(topk, BLOCK_K)
+    if USE_LENGTH:
+        num_tiles = tl.cdiv(tl.load(len_ptr + t), BLOCK_K)
+    else:
+        num_tiles = tl.cdiv(topk, BLOCK_K)
 
     for j in tl.range(0, num_tiles, num_stages=3):
         k_start = j * BLOCK_K
@@ -259,6 +266,10 @@ def _sparse_mla_decode_fused_kernel(
         acc2 = tl.where(l_i[:, None] > 0.0, acc2 * inv_denom[:, None], 0.0)
     if NUM_GROUPS >= 4:
         acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
+    if STORE_LSE:
+        # Finite floor: the DCP merge weights an empty rank by exp2(lse - max).
+        lse = tl.where(l_i > 0.0, tl.log2(denom) + m_i, -1073741824.0)
+        tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
 
     o_base = out_ptr + t * H * D_V
     tl.store(
@@ -310,6 +321,8 @@ def _sparse_mla_decode_split_kernel(
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    len_ptr=None,  # [N] valid prefix of each idx row; read when USE_LENGTH
+    USE_LENGTH: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -357,12 +370,20 @@ def _sparse_mla_decode_split_kernel(
         other=0.0,
     ).to(input_type)
 
-    tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= topk:
-        return
-    num_tiles = tl.cdiv(topk, BLOCK_K)
-    tile_start = pid_k * tiles_per_segment
-    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+    if USE_LENGTH:
+        # The reduce reads all KV_SPLITS partials: a split left with no tiles
+        # still stores an empty one.
+        row_tiles = tl.cdiv(tl.load(len_ptr + t), BLOCK_K)
+        tiles_per_segment = tl.cdiv(row_tiles, KV_SPLITS)
+        tile_start = pid_k * tiles_per_segment
+        tile_end = tl.minimum(tile_start + tiles_per_segment, row_tiles)
+    else:
+        tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
+        if pid_k * tiles_per_segment * BLOCK_K >= topk:
+            return
+        num_tiles = tl.cdiv(topk, BLOCK_K)
+        tile_start = pid_k * tiles_per_segment
+        tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -505,7 +526,9 @@ def triton_sparse_mla_decode_splitk(
     d_v: int = 512,
     kv_splits: int | None = None,
     workspace: _SplitKWorkspace | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lengths: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
     q_nope:  [bs, H, d_v] fp8/bf16
@@ -513,7 +536,9 @@ def triton_sparse_mla_decode_splitk(
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    returns: [1, bs, H, d_v] bf16
+    lengths: optional [bs] int32; only the first lengths[i] indices of row i are
+             read, so the rest of the row is never scanned
+    returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     use_fp8_dot = is_fp8
@@ -582,6 +607,11 @@ def triton_sparse_mla_decode_splitk(
         kv_splits = min(kv_splits, max_kv_splits)
 
     qk_scale = float(sm_scale) * LOG2E
+    lse = (
+        torch.empty(bs, H, device=q_nope.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
 
     if kv_splits == 1:
         fused_num_warps = 4
@@ -616,16 +646,23 @@ def triton_sparse_mla_decode_splitk(
                     and topk >= 2048
                     and _page_offsets_fit_i32(kv.shape[0], kv_dim)
                 ),
+                lse_out_ptr=lse,
+                STORE_LSE=return_lse,
+                len_ptr=lengths,
+                USE_LENGTH=lengths is not None,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
-        return out.unsqueeze(0)
+        return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
-    tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
-    active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
-        tiles_per_split * BLOCK_K
-    )
-    active_splits = min(active_splits, kv_splits)
+    if lengths is None:
+        tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
+        active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
+            tiles_per_split * BLOCK_K
+        )
+        active_splits = min(active_splits, kv_splits)
+    else:
+        active_splits = kv_splits
     split_num_warps = 4
     if optimize_gfx950_fp8:
         split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
@@ -660,6 +697,8 @@ def triton_sparse_mla_decode_splitk(
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
+            len_ptr=lengths,
+            USE_LENGTH=lengths is not None,
             num_warps=split_num_warps,
             num_stages=2,
         )
@@ -677,9 +716,11 @@ def triton_sparse_mla_decode_splitk(
         ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
+        lse_out_ptr=lse,
+        STORE_LSE=return_lse,
         num_warps=4,
     )
-    return out.unsqueeze(0)
+    return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
