@@ -1231,12 +1231,12 @@ mod tests {
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// `ChunkExtras`. 152 since the matched stop token rides in the frame (#42637).
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 152,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }
