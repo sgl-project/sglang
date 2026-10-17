@@ -2392,8 +2392,11 @@ def apply_fp8_linear_deterministic(
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
     qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    # The regular heuristic changes BLOCK_K with M. Keep the K reduction and
-    # output tiling fixed so cold prefill and prefix-cache hits agree.
+    # Keep K reduction and N tiling fixed so prefill and cache hits agree.
+    # Only the row tile varies, avoiding wasted decode work and small tiles
+    # on long prefills without changing each row's reduction.
+    m = input_2d.shape[0]
+    block_m = 16 if m <= 16 else 32 if m < 128 else 128
     output = triton_scaled_mm(
         qinput,
         weight,
@@ -2401,7 +2404,7 @@ def apply_fp8_linear_deterministic(
         weight_scale,
         input.dtype,
         bias,
-        block_size_m=32,
+        block_size_m=block_m,
         block_size_n=64,
         block_size_k=128,
         use_heuristic=False,

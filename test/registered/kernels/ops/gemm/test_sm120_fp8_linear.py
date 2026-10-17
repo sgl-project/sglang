@@ -132,6 +132,40 @@ def test_deterministic_modelopt_fp8_preserves_cached_suffix(
     assert relative_rmse < 0.005
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_deterministic_fp8_graph_replay_with_bias_and_strided_input(dtype):
+    deterministic_linear = modelopt_quant.apply_fp8_linear_deterministic
+    x, weight, weight_scale, input_scale = _make_inputs(6, 96, 80, seed=17)
+    x = x.to(dtype).view(2, 3, 80).transpose(0, 1)
+    bias = torch.randn(96, dtype=dtype, device="cuda")
+    args = (x, weight, weight_scale, input_scale, bias)
+    deterministic_linear(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = deterministic_linear(*args)
+
+    graph.replay()
+    before = actual.clone()
+    x.copy_(torch.randn_like(x).mul_(2))
+    graph.replay()
+    expected = deterministic_linear(*args)
+    assert actual.shape == (3, 2, 96)
+    assert actual.dtype == dtype
+    assert not torch.equal(actual, before)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    quantized, _ = static_quant_fp8(
+        x.reshape(-1, 80).contiguous(), input_scale, repeat_scale=False
+    )
+    reference = (
+        (quantized.float() @ weight.float()) * input_scale * weight_scale + bias
+    ).view_as(actual)
+    relative_rmse = (actual.float() - reference).square().mean().sqrt() / (
+        reference.square().mean().sqrt().clamp_min(1e-8)
+    )
+    assert relative_rmse < 0.005
+
+
 @pytest.mark.parametrize("seed", [0, 1, 7])
 @pytest.mark.parametrize("m,n,k", SUPPORTED_SHAPES)
 def test_supported_shapes_match_flashinfer(m: int, n: int, k: int, seed: int):
