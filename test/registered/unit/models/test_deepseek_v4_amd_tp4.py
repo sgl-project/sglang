@@ -390,7 +390,9 @@ def _engram_table(rows):
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
         torch.device("cuda"),
     ):
-        embed = EngramEmbedding(rows, 128, layer_id=1)
+        # One hash column per rank, so TP4 takes the column-aligned split.
+        bounds = tuple(rows * c // 4 for c in range(5))
+        embed = EngramEmbedding(rows, 128, layer_id=1, column_bounds=bounds)
     embed.weight.weight_loader(embed.weight, weight)
     embed.scale.weight_loader(embed.scale, scale.view(torch.float8_e8m0fnu))
     embed.finish_load(label="test")
