@@ -651,8 +651,9 @@ class GlmImageAttention(torch.nn.Module):
                 cos=cos,
                 sin=sin,
             )
-            query[:, text_seq_length:, :, :] = q_img
-            key[:, text_seq_length:, :, :] = k_img
+            # rotary outputs may alias the original Q/K storage
+            query = torch.cat([query[:, :text_seq_length], q_img], dim=1)
+            key = torch.cat([key[:, :text_seq_length], k_img], dim=1)
 
         if kv_cache is not None:
             if kv_cache.mode == "write":

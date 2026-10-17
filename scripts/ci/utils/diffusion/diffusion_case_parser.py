@@ -416,7 +416,7 @@ def parse_run_suite_standalone_data(
     run_suite_path: Path,
 ) -> tuple[Dict[str, List[str]], Dict[str, Dict[str, float]]]:
     """
-    Parse run_suite.py to extract standalone file metadata.
+    Parse a suite source file to extract standalone file metadata.
 
     Returns:
         Tuple of:
@@ -469,9 +469,9 @@ def collect_diffusion_suites(
     # Parse case IDs from the single source case config.
     case_lists = parse_testcase_configs(case_config_path)
 
-    # Parse standalone files from run_suite.py
+    # standalone metadata shares the canonical source with the cases
     standalone_files, standalone_est_times = parse_run_suite_standalone_data(
-        run_suite_path
+        case_config_path
     )
     missing_standalone_estimates = validate_standalone_est_times(
         standalone_files, standalone_est_times
