@@ -1,5 +1,6 @@
 ---
 title: "SGLang Simulator"
+description: "Run SGLang scheduling and KV-cache simulations with forward-latency predictors."
 metatags:
     description: "Run SGLang scheduling and KV-cache simulations without loading model weights or executing GPU kernels."
 ---
@@ -16,7 +17,7 @@ The simulator supports:
 
 - synthetic request rates, ShareGPT workloads, and timestamped Autobench traces;
 - OFFLINE logical-time simulation and BLOCKING wall-clock replay;
-- AIConfigurator, ML, and replay latency predictors;
+- AIConfigurator, InferCast, ML, and replay latency predictors;
 - SGLang prefix caching and [HiCache](/docs/advanced_features/hicache); and
 - serving-compatible TTFT, TPOT, ITL, throughput, and cache-hit metrics.
 
@@ -76,6 +77,37 @@ python3 benchmark/simulator/bench_serving.py \
 ```
 
 The benchmark injects logical arrival metadata into each request and displays the server-side simulator metrics. For timestamped traffic, use the simulator-owned Autobench JSONL format and add `--use-trace-timestamps`.
+
+## Use InferCast model costs
+
+InferCast is an optional predictor for `deepseek-ai/DeepSeek-R1`. Install a
+verified SDK source revision compatible with your measured data:
+
+```bash
+python3 -m pip install "/path/to/InferCast[parquet]"
+```
+
+The
+[MI355X eager example](https://github.com/sgl-project/sglang/blob/main/tools/sglang-simulator/examples/sim_configs/infercast_deepseek_r1_mi355x_eager.json)
+models TP8/EP2 on SGLang `0.5.17`, BF16 attention, FP8 KV cache, and page size 1.
+Replace its `systems_root` and `provider_revision`; use a local model directory
+at its pinned model revision. Supply a complete systems tree with exact context
+and decode profiles, matching stack metadata, measured rows, and whole-forward
+anchors. InferCast's checked-in baseline PerfDB alone lacks the matching decode
+calibration required by this example.
+
+Launch the existing simulator server with this configuration and `--page-size 1`,
+then use the same workload and profiling interfaces above. Token-ID clients can
+use `--skip-tokenizer-init --skip-server-warmup` with only a model `config.json`.
+No model weights or GPU are needed for forward execution.
+
+The adapter preserves prepared context lengths, prefix lengths, and decode
+histories, and calls InferCast once per `EXTEND`, `MIXED`, or `DECODE` forward.
+SGLang retains ownership of scheduling, cache reuse, and chunking. InferCast owns
+execution-profile validation, composition, and calibration. Missing coverage and
+unsupported profiles raise errors without fallback costs. Integration tests
+verify CPU execution semantics; experimental inputs are not PerfDB releases or
+evidence of silicon prediction accuracy.
 
 ## Read the results
 

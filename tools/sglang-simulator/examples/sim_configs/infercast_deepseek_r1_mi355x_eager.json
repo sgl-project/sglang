@@ -1,0 +1,63 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "mi355x",
+      "vendor": "AMD",
+      "hbm_capacity_gb": 288
+    },
+    "memory_read_bandwidth_gb": 64,
+    "memory_write_bandwidth_gb": 64,
+    "num_device_per_node": 8
+  },
+  "predictor": {
+    "name": "infercast",
+    "model_id": "deepseek-ai/DeepSeek-R1",
+    "systems_root": "/path/to/complete/systems",
+    "database_mode": "SILICON",
+    "attn_kernel_impl": "eager",
+    "decode_attn_kernel_impl": "eager",
+    "attn_dtype": "bfloat16",
+    "kv_cache_dtype": "fp8",
+    "model_revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
+    "provider_revision": "<full InferCast commit>",
+    "execution_profile": {
+      "schema_version": 2,
+      "prefill_graph_backend": "disabled",
+      "prefill_graph_compiler": "disabled",
+      "prefill_graph_capture_tokens": [],
+      "graph_capture_policy": "disabled",
+      "decode_graph_backend": "disabled",
+      "kv_page_size": 1,
+      "runtime_compatibility_id": "sglang-cb05-realization-aware-prefix-v4",
+      "full_forward_realization": "sglang_model_runner_eager_forward_v1",
+      "component_realization": "sglang_isolated_mla_eager_module_v1",
+      "runtime_compatibility_manifest_sha256": "fb4c0fd7afd9bb22e9864b92ee8205c2aef023d48b938c2d564e6748b9daabce",
+      "profile_id": "bab61b213db990bee3edc73da43786190d24e011dd90ebdc892a9d7a0dc57325"
+    },
+    "decode_execution_profile": {
+      "schema_version": 1,
+      "decode_graph_backend": "disabled",
+      "graph_capture_batches": [],
+      "graph_batch_policy": "disabled",
+      "fallback_policy": "reject",
+      "kv_page_size": 1,
+      "runtime_compatibility_id": "deepseek-r1-mi355x-sglang-cb05-fpm-flush-v1",
+      "full_forward_realization": "sglang-model-runner-eager-decode-v1",
+      "component_realization": "sglang-aiter-mla-eager-v1",
+      "runtime_compatibility_manifest_sha256": "c9ce35d88d5abd3dbc10732cd362f66bffefdb566aebc27bb98df67224b25bdd",
+      "profile_id": "4b2f52f2a2775a7d277732a5a6d9b446644b620702ed7917bcd540767c7e0317"
+    }
+  },
+  "scheduler": {
+    "tp_size": 8,
+    "ep_size": 2,
+    "dp_size": 1,
+    "pp_size": 1,
+    "cp_size": 1,
+    "data_type": "BF16",
+    "kv_cache_data_type": "FP8",
+    "backend_name": "sglang",
+    "backend_version": "0.5.17",
+    "max_total_tokens": 65536
+  }
+}
