@@ -273,6 +273,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     }
 
     // --- TokenizerManager to_scheduler loop ---
+    let direct_ingress;
     {
         // Second TM core when present, else share the first (1-core / API-set
         // fallback) — still off the CPU-bound pool cores either way.
@@ -285,6 +286,12 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_worker_tx,
         };
+        direct_ingress = Some(api_server::grpc::direct::DirectIngress::new(
+            to_scheduler_tx.clone(),
+            senders.clone(),
+            limits.clone(),
+            cfg.rust_server_args.stage_channel_cap,
+        ));
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("to-scheduler", cores, 1, &mut threads, |_| {
@@ -322,8 +329,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let grpc_server = grpc_listener.map(|listener| {
-            let service =
-                api_server::grpc::service::GrpcService::new(core.clone(), &cfg.server_args);
+            let service = api_server::grpc::service::GrpcService::new(
+                core.clone(),
+                &cfg.server_args,
+                direct_ingress.clone(),
+            );
             (listener, service)
         });
         let handle = std::thread::Builder::new()

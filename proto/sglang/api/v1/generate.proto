@@ -74,6 +74,28 @@ message GenerateRequest {
   optional string session_params = 28 [(sglang.json.v1.field_json).raw_json = true];
 }
 
+// One pre-tokenized request for an external frontend (e.g. a Dynamo worker)
+// that already owns templating and tokenization. No batch forms, no text, no
+// multimodal: the server maps it field-for-field onto the scheduler request.
+message GenerateTokensRequest {
+  // Client rid; a uuid is minted when absent.
+  optional string rid = 1;
+  TokenIds input_ids = 2;
+  SamplingParams sampling_params = 3;
+  bool stream = 4;
+  bool return_logprob = 5;
+  optional int64 logprob_start_len = 6;
+  int64 top_logprobs_num = 7;
+  optional string bootstrap_host = 8;
+  optional int64 bootstrap_port = 9;
+  optional int64 bootstrap_room = 10;
+  optional string bootstrap_pair_key = 11;
+  optional int64 decode_tp_size = 12;
+  optional int64 routed_dp_rank = 13;
+  optional int64 disagg_prefill_dp_rank = 14;
+  optional string extra_key = 15;
+}
+
 message SamplingParamsOrList {
   oneof value {
     option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
