@@ -8,10 +8,14 @@ import sys as _sys
 # FlashInfer: those claim these cache dirs early, and the first value set is
 # the one that sticks. Safe here -- environ has no heavy dependency (no torch).
 from sglang.srt.environ import (
+    clear_inherited_rocprofiler_registration as _clear_inherited_rocprofiler_registration,
+)
+from sglang.srt.environ import (
     redirect_third_party_caches as _redirect_third_party_caches,
 )
 
 _redirect_third_party_caches()
+_clear_inherited_rocprofiler_registration()
 
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
