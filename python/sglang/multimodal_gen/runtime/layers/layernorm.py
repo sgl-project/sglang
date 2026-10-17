@@ -1071,6 +1071,7 @@ def apply_qk_norm_with_optional_rope(
     position_offset: int = 0,
     allow_inplace: bool = True,
     allow_strided_qk: bool = False,
+    round_norm_before_rope: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
 
@@ -1097,6 +1098,7 @@ def apply_qk_norm_with_optional_rope(
         position_offset=position_offset,
         allow_inplace=allow_inplace,
         allow_strided_qk=allow_strided_qk,
+        round_norm_before_rope=round_norm_before_rope,
     )
 
 

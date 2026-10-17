@@ -1588,6 +1588,12 @@
                     ]
                   },
                   {
+                    "group": "Ovis",
+                    "pages": [
+                      "cookbook/diffusion/Ovis/Ovis-Image"
+                    ]
+                  },
+                  {
                     "group": "SenseNova",
                     "pages": [
                       "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
