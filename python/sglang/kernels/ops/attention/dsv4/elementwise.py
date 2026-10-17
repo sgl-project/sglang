@@ -38,9 +38,13 @@ def _jit_main_q_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     apply_norm: bool,
+    fp8_out: bool = False,
 ):
-    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head)."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, apply_norm, is_arch_support_pdl())
+    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head).
+    fp8_out stores plain e4m3 (uniform-FP8 trtllm backend) instead of dtype."""
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, apply_norm, is_arch_support_pdl(), fp8_out
+    )
     return load_jit(
         make_name("main_q_norm_rope"),
         *args,
@@ -175,27 +179,26 @@ def fused_q_norm_rope(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
-    # Reuse the BF16 kernel and preserve its rounding before FP8 conversion.
-    # Keep the temporary separate from q_input: callers may reuse the input.
-    fp8_output = q_output if q_output.dtype == torch.float8_e4m3fn else None
-    if fp8_output is not None:
-        assert q_input.dtype == torch.bfloat16
-        assert q_output.shape == q_input.shape
-        assert q_output.device == q_input.device
-        q_output = torch.empty_like(q_input)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
+    # An e4m3 q_output selects the fp8-store variant (bits match dtype store + .to(e4m3)).
+    fp8_out = q_output.dtype == torch.float8_e4m3fn
     if _is_xpu:
         assert eps is not None
+        assert not fp8_out
         fused_q_norm_rope_xpu(q_input, q_output, freqs_real, positions, eps)
     else:
         module = _jit_main_q_norm_rope_module(
-            q_input.dtype, head_dim, rope_dim, eps is not None
+            q_input.dtype, head_dim, rope_dim, eps is not None, fp8_out
         )
-        module.forward(q_input, q_output, freqs_real, positions, eps or 0.0)
-    if fp8_output is not None:
-        fp8_output.copy_(q_output)
+        module.forward(
+            q_input,
+            q_output.view(torch.uint8) if fp8_out else q_output,
+            freqs_real,
+            positions,
+            eps or 0.0,
+        )
 
 
 def fused_q_indexer_rope_hadamard_quant(
