@@ -467,7 +467,7 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                     shard_dim=0,
                     tp_rank=0,
                     tp_size=2,
-                    output_sizes=[4, 4, 4],
+                    packed_sizes=(4, 4, 4),
                 )
                 rank1 = rank_local_checkpoint.read_tp_local_tensor(
                     sources,
@@ -475,7 +475,7 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                     shard_dim=0,
                     tp_rank=1,
                     tp_size=2,
-                    output_sizes=[4, 4, 4],
+                    packed_sizes=(4, 4, 4),
                 )
 
             torch.testing.assert_close(naive, fused[:6])
