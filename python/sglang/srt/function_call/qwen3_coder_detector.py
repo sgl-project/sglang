@@ -19,6 +19,27 @@ from sglang.srt.function_call.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _schema_allows_null(schema: Any) -> bool:
+    """True when the JSON schema explicitly accepts a null value."""
+    if not isinstance(schema, dict):
+        return False
+    type_value = schema.get("type")
+    if type_value == "null":
+        return True
+    if isinstance(type_value, list) and "null" in type_value:
+        return True
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and None in enum_values:
+        return True
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list) and any(
+            _schema_allows_null(variant) for variant in variants
+        ):
+            return True
+    return False
+
+
 class Qwen3CoderDetector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
@@ -102,8 +123,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
         """Convert parameter value based on its type in the schema."""
-        # Handle null value for any type
-        if param_value.lower() == "null":
+        # The text "null" is a real string unless the schema accepts null.
+        schema = (
+            param_config.get(param_name) if isinstance(param_config, dict) else None
+        )
+        if param_value.lower() == "null" and _schema_allows_null(schema):
             return None
 
         if param_name not in param_config:
@@ -147,12 +171,15 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
+            lowered = param_value.lower()
+            if lowered not in ["true", "false"]:
                 logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not "
+                    f"a boolean (`true` or `false`) in tool '{func_name}', keeping "
+                    "the raw string."
                 )
-            return param_value == "true"
+                return param_value
+            return lowered == "true"
         else:
             if (
                 param_type in ["object", "array", "arr"]
