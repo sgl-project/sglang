@@ -58,7 +58,7 @@ RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
 @dataclass(frozen=True)
 class _RadixCacheBackend:
     factory: RadixCacheFactory
-    prepare_worker: Optional[Callable[[Any], None]]
+    prepare_worker: Optional[Callable[[Any, bool], None]]
 
 
 _RADIX_CACHE_REGISTRY: dict[str, _RadixCacheBackend] = {}
@@ -68,14 +68,15 @@ def register_radix_cache_backend(
     name: str,
     factory: RadixCacheFactory,
     *,
-    prepare_worker: Optional[Callable[[Any], None]] = None,
+    prepare_worker: Optional[Callable[[Any, bool], None]] = None,
 ) -> None:
     """Register a radix-cache factory and an optional worker preparation callback.
 
     Registration does not access runtime configuration or invoke the callback.
-    ``prepare_worker(tp_worker)`` runs once per ``TpModelWorker.init_cuda_graphs``
-    call, before any of its model runners initialize graphs, including when
-    decode capture is disabled. Pools and attention backends are initialized
+    ``prepare_worker(tp_worker, capture_decode_cuda_graph)`` runs once per
+    ``TpModelWorker.init_cuda_graphs`` call, before any of its model runners
+    initialize graphs, including when decode capture is disabled. Pools and
+    attention backends are initialized
     by then; the initial tree-cache factory has not run yet. A backend can use
     the worker to register layer-transfer counters needed during graph capture.
 
@@ -83,7 +84,8 @@ def register_radix_cache_backend(
     invoked by ``ensure_decode_cuda_graphs`` or independent runner recaptures.
     Exceptions propagate and prevent that worker's graph initialization.
 
-    Raises ValueError if `name` is empty/whitespace-only or already registered.
+    Raises ValueError if `name` is empty/whitespace-only or already registered,
+    and TypeError if `prepare_worker` is neither callable nor None.
     """
     if not name.strip():
         raise ValueError(
@@ -93,6 +95,10 @@ def register_radix_cache_backend(
         raise ValueError(
             f"register_radix_cache_backend: {name!r} is already registered"
         )
+    if prepare_worker is not None and not callable(prepare_worker):
+        raise TypeError(
+            "register_radix_cache_backend: prepare_worker must be callable or None"
+        )
     _RADIX_CACHE_REGISTRY[name] = _RadixCacheBackend(factory, prepare_worker)
 
 
@@ -101,7 +107,7 @@ def get_radix_cache_factory(name: str) -> Optional[RadixCacheFactory]:
     return backend.factory if backend is not None else None
 
 
-def prepare_radix_cache_worker(tp_worker: Any) -> None:
+def prepare_radix_cache_worker(tp_worker: Any, capture_decode_cuda_graph: bool) -> None:
     """Prepare the selected registered backend before worker graph initialization."""
     name = get_memory().radix_cache_backend
     if not name:
@@ -114,7 +120,7 @@ def prepare_radix_cache_worker(tp_worker: Any) -> None:
             "External backends must call register_radix_cache_backend(...) at import time."
         )
     if backend.prepare_worker is not None:
-        backend.prepare_worker(tp_worker)
+        backend.prepare_worker(tp_worker, capture_decode_cuda_graph)
 
 
 def registered_radix_cache_backends() -> list[str]:
