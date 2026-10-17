@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     EXTRA_TEXT_IDS,
     EXTRA_TEXT_MASK,
     CosmosDreamsGeometry,
+    CosmosDreamsRolloutStage,
     closest_canvas,
     commit_clean_kv,
     iter_ar_chunk_ranges,
@@ -70,7 +71,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resolve_geometry,
     run_fixed_step_sde,
     single_prompt,
-    validate_fixed_step_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -673,10 +673,8 @@ class _TransferRolloutContext(msgspec.Struct):
     dtype: torch.dtype
 
 
-class CosmosDreamsTransferRolloutStage(PipelineStage):
+class CosmosDreamsTransferRolloutStage(CosmosDreamsRolloutStage):
     """Chunked denoising against committed control and clean-RGB K/V history."""
-
-    parallelism_type = StageParallelismType.REPLICATED
 
     def __init__(
         self,
@@ -686,19 +684,14 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
         manifest: CosmosDreamsManifest,
         history_profile: CosmosDreamsTransferHistoryProfile | None = None,
     ) -> None:
-        super().__init__()
-        if not isinstance(transformer, CosmosDreamsTransformer):
-            raise TypeError(
-                f"Cosmos-Dreams requires CosmosDreamsTransformer, got {type(transformer).__name__}."
-            )
+        super().__init__(
+            transformer=transformer, scheduler=scheduler, manifest=manifest
+        )
         if manifest.conditioning_mode != CONTROL_VIDEO_CONDITIONING_MODE:
             raise ValueError(
                 "CosmosDreamsTransferRolloutStage needs a control_video checkpoint, got "
                 f"{manifest.conditioning_mode!r}."
             )
-        self.transformer = transformer
-        self.scheduler = validate_fixed_step_scheduler(scheduler, manifest)
-        self.manifest = manifest
         self.history_profile = history_profile or CosmosDreamsTransferHistoryProfile(
             history_mode="full", window_frames=None, sink_frames=0
         )
@@ -710,28 +703,6 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
             "control_latent", batch.extra.get(EXTRA_CONTROL_LATENT), V.is_tensor
         )
         return result
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [
-            ComponentUse(
-                self._component_stage_name(stage_name),
-                "transformer",
-                phase="denoise",
-                preferred_ready_after_request=True,
-                memory_intensive=True,
-                start_at_stage_entry=False,
-            )
-        ]
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        with self.use_declared_component(
-            component_name="transformer", module=self.transformer, phase="denoise"
-        ):
-            with torch.no_grad():
-                batch.latents = self._rollout(batch)
-        return batch
 
     def _commit(
         self,
