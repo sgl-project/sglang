@@ -32,8 +32,10 @@ on:
         default: false
 
 concurrency:
+  # Only PR runs are superseded. Push/schedule runs on main queue instead, so a newer merge
+  # never kills an in-flight post-merge run (GitHub still collapses multiple pending runs).
   group: pr-test-npu-${{ inputs.coverage_mode == true && 'coverage-' || '' }}${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ==================== Check Changes ==================== #
