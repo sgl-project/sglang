@@ -85,6 +85,11 @@ def monokernel_weights_iterator(
     return watched()
 
 
+def built_monokernels(model: torch.nn.Module) -> Optional[BuiltMonokernels]:
+    """The object the selected spec built for this model, or None."""
+    return model.__dict__.get("_monokernels")
+
+
 def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
     """The graph key of a DECODE or TARGET_VERIFY step, else None."""
     mode = forward_batch.forward_mode
@@ -196,6 +201,8 @@ def install_monokernel_forward(
     )
     build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
     built = spec.build(model, hf_config, build_context)
+    # not setattr: a built object that is an nn.Module must not join the state dict
+    model.__dict__["_monokernels"] = built
     _install_forward(
         model=model, built=built, served=served, spec=spec, backend=backend
     )

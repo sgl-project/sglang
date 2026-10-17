@@ -342,6 +342,8 @@ class TestMonokernelFramework(CustomTestCase):
         self.addCleanup(reset_context)
         lm = install(archs=["Draft"], is_load_observed=True)
         self.assertEqual(lm(torch.zeros(1), None, batch("target_verify", 2, 2)), "mono")
+        # the draft's proposal finds its sampler on the built object
+        self.assertIsInstance(runtime.built_monokernels(lm), FakeBuilt)
 
     def test_every_rank_takes_the_same_lookup_branch(self):
         # every rank refuses together: one returning alone would hang its peers
@@ -355,6 +357,7 @@ class TestMonokernelFramework(CustomTestCase):
         # a model the backend registers no spec for keeps its forward on every rank
         lm = install(archs=["Other"], lookups=[(False, False, "none", None)] * 2)
         self.assertNotIn("forward", vars(lm))
+        self.assertIsNone(runtime.built_monokernels(lm))
 
     def test_the_decode_attention_backend_is_checked(self):
         # the steps a spec serves run on the decode backend, not the base one

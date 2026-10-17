@@ -121,7 +121,18 @@ class Plan(msgspec.Struct, frozen=True):
 
 
 class BuiltMonokernels(Protocol):
-    """The object a spec's build returns; it runs every built width's steps."""
+    """The object a spec's build returns; it runs every built width's steps.
+
+    A DSpark draft's object may also define draft_sampler(*, gamma, max_bs,
+    greedy_draft, noise, draft_tokens, step_logits, step_temperatures), called once on
+    every rank when the folded proposal is built. It returns None, or a function of the
+    batch size that returns None (SGLang's proposal) or the proposal for that size:
+    step(hidden_states, anchor_tokens) -> (tokens, confidence_features). The step
+    replaces compute_base_logits and draft_markov_block: it writes the [bs, gamma]
+    tokens into draft_tokens, the kept logits of rows at a nonzero temperature into
+    step_logits[:bs] (zeroed once by SGLang), advances noise.offset as
+    draft_markov_block does, and is capturable in a CUDA graph.
+    """
 
     def forward(self, plan: Plan, *args: Any, **kwargs: Any) -> Any:
         """Run a routed step in place of the model's forward.

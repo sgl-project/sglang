@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.monokernels.runtime import built_monokernels
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -32,6 +33,7 @@ class DsparkDraftSampler:
         tp_sync: SpecTpSync,
         greedy_draft: bool,
         out=None,
+        monokernel_sampler: Optional[Callable] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -73,6 +75,28 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        self._monokernel_steps = None
+        if monokernel_sampler is not None:
+            self._monokernel_steps = self._build_monokernel_steps(monokernel_sampler)
+
+    def _build_monokernel_steps(self, monokernel_sampler: Callable):
+        if not self.greedy_draft:
+            # The plugin leaves temperature-0 rows' logits unwritten; a mixed accept
+            # still reads them.
+            self.step_logits = torch.zeros(
+                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
+                device=self.out.device,
+            )
+        return monokernel_sampler(
+            gamma=self.gamma,
+            max_bs=self.max_bs,
+            greedy_draft=self.greedy_draft,
+            noise=self._noise,
+            draft_tokens=self.out,
+            step_logits=self.step_logits,
+            step_temperatures=self.params.step_temperatures,
+        )
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -100,10 +124,26 @@ class DsparkDraftSampler:
                 bs=bs,
                 gamma=self.gamma,
             )
+        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+        step = None if self._monokernel_steps is None else self._monokernel_steps(bs)
+        if step is not None:
+            draft_tokens, confidence_features = step(model_hidden, anchor)
+        else:
+            draft_tokens, confidence_features = self._markov_block(
+                model_hidden, sample_hidden, anchor, bs
+            )
+        if self.confidence_out is not None:
+            confidence, confidence_raw = self.model.compute_confidence(
+                anchor_tokens=anchor,
+                draft_tokens=draft_tokens,
+                confidence_features=confidence_features,
+            )
+            self.confidence_out[:bs].copy_(confidence)
+            self.confidence_raw_out[:bs].copy_(confidence_raw)
+
+    def _markov_block(self, model_hidden, sample_hidden, anchor, bs: int):
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.query_token_num)[:, 0]
-
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -118,14 +158,7 @@ class DsparkDraftSampler:
             greedy_draft=self.greedy_draft,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.confidence_out is not None:
-            confidence, confidence_raw = self.model.compute_confidence(
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_features=confidence_features,
-            )
-            self.confidence_out[:bs].copy_(confidence)
-            self.confidence_raw_out[:bs].copy_(confidence_raw)
+        return draft_tokens, confidence_features
 
 
 def _step_logits_width(model) -> int:
@@ -157,10 +190,14 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
+    built = built_monokernels(draft_model)
+    # an optional member of BuiltMonokernels
+    monokernel_sampler = getattr(built, "draft_sampler", None)
     if tp_rank == 0:
         logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+            "DSpark draft proposal (%s) folded into the draft cuda graph%s.",
             "greedy draft" if greedy_draft else "sampling",
+            "; the monokernel plugin may run it" if monokernel_sampler else "",
         )
     return DsparkDraftSampler(
         model=draft_model,
@@ -171,4 +208,5 @@ def maybe_build_draft_sampler(
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
         out=out,
+        monokernel_sampler=monokernel_sampler,
     )
