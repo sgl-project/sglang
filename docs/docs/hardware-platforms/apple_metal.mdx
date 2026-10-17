@@ -73,6 +73,7 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 4. `SGLANG_MLX_USE_CUSTOM_ROPE=1` - Enables the optional custom Metal RoPE kernel. It is disabled by default, so the MLX backend uses the standard RoPE path unless you opt in for A/B testing.
 5. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
 6. `SGLANG_MLX_CLEAR_CACHE_STEPS=256` - Sets the number of decode steps before clearing the MLX cache (256 by default)
+7. `--mlx-enable-sampling` - Enables MLX sampling, output logprobs, grammar masks, custom logit processors, and logit bias. Requests that set `return_logprob` require this flag.
 
 ## Quantization
 
