@@ -254,6 +254,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             forward_batch=forward_batch,
             attention_layers=[object()],
             mha_companion_layers=None,
+            moe_layers=[],
             num_tokens=padded_num_tokens,
             raw_num_tokens=num_tokens,
         )

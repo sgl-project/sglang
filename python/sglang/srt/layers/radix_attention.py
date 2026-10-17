@@ -57,6 +57,12 @@ def force_eager_attention():
 def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
     """Zero the padded tail ``buf`` leaves as torch.empty garbage under PCG
     replay, so NaN/Inf cannot reach residual / MoE routing / allreduce."""
+    # Dense CUDA layers are token-local after attention, so padded rows cannot
+    # affect real-token outputs. Avoid launching a zeroing kernel in every
+    # attention layer for that path. ROCm kernels and CUDA MoE routing may let
+    # uninitialized padded rows contaminate useful work, so retain zeroing there.
+    if not _is_hip and not any(context.moe_layers or ()):
+        return
     pcg_static_tokens = context.num_tokens
     actual_tokens = context.raw_num_tokens
     if (

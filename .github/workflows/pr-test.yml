@@ -342,7 +342,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '15'
+      run_timeout_minutes: '20'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     # No `secrets: inherit`: this stage has no secret consumer, unlike the GPU
     # stages' coredump upload. GITHUB_TOKEN and permissions inherit regardless.
