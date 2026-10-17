@@ -1334,6 +1334,7 @@ class Req(ReqDllmMixin):
 
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
+        self.spec_num_proposed_drafts = 0
 
         self.spec_num_block_accept_tokens = 0
 

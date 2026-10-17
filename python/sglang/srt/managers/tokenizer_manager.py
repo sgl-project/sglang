@@ -3167,43 +3167,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                get_spec().speculative_num_draft_tokens - 1
-            )
+            # The scheduler sums each verify result's actual proposal count.
+            # Reading startup/current config here is wrong for adaptive decoding.
+            num_proposed_drafts = recv_obj.spec_num_proposed_drafts[i]
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
+            meta_info["spec_accept_rate"] = (
+                num_correct_drafts / num_proposed_drafts
+                if num_proposed_drafts > 0
+                else None  # No proposals: acceptance rate is undefined.
+            )
+            meta_info["spec_accept_length"] = (
+                recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+            )
+            meta_info["spec_num_correct_drafts"] = num_correct_drafts
+            meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
+            meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
-            # Calculate per-request acceptance rate and average acceptance length.
-            if num_proposed_drafts > 0:
-                # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
-                # accept_length: completion_tokens / verify_ct (includes bonus token).
-                meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+            if (
+                getattr(recv_obj, "spec_num_cap_tokens", None) is not None
+                and len(recv_obj.spec_num_cap_tokens) > i
+                and recv_obj.spec_num_cap_tokens[i] > 0
+            ):
+                meta_info["spec_cap_length"] = (
+                    recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
-
-                meta_info["spec_num_correct_drafts"] = num_correct_drafts
-                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-
-                if (
-                    getattr(recv_obj, "spec_num_cap_tokens", None) is not None
-                    and len(recv_obj.spec_num_cap_tokens) > i
-                    and recv_obj.spec_num_cap_tokens[i] > 0
-                ):
-                    meta_info["spec_cap_length"] = (
-                        recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
-                    )
-                if (
-                    _ragged_verify_cap_accept()
-                    and getattr(recv_obj, "spec_num_block_accept_tokens", None)
-                    is not None
-                    and len(recv_obj.spec_num_block_accept_tokens) > i
-                ):
-                    meta_info["spec_block_accept_length"] = (
-                        recv_obj.spec_num_block_accept_tokens[i]
-                        / recv_obj.spec_verify_ct[i]
-                    )
+            if (
+                _ragged_verify_cap_accept()
+                and getattr(recv_obj, "spec_num_block_accept_tokens", None) is not None
+                and len(recv_obj.spec_num_block_accept_tokens) > i
+            ):
+                meta_info["spec_block_accept_length"] = (
+                    recv_obj.spec_num_block_accept_tokens[i]
+                    / recv_obj.spec_verify_ct[i]
+                )
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (

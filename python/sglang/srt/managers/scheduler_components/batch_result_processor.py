@@ -824,6 +824,7 @@ class SchedulerBatchResultProcessor:
                 num_accept_tokens = len(accept_tokens)
                 req.kv.kv_committed_len += num_accept_tokens
                 req.spec_verify_ct += 1
+                req.spec_num_proposed_drafts += result.get_num_proposed_drafts(1)
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
@@ -977,6 +978,7 @@ class SchedulerBatchResultProcessor:
                 batch_size,
                 result.num_correct_drafts,
                 num_accept_tokens=num_generated_tokens,
+                num_proposed_drafts=result.get_num_proposed_drafts(batch_size),
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
