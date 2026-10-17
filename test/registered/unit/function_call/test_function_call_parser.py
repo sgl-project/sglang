@@ -3308,6 +3308,17 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_parse_arguments_unquoted_scalar_keeps_raw_text_for_string(self):
+        """A string-typed arg emitted as a bare scalar (123, true, null) must
+        stay the raw text, not the JSON-coerced value."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        for raw in ("123", "true", "null", "0"):
+            value, is_good = parse_arguments(raw, arg_type="string")
+            self.assertTrue(is_good)
+            self.assertIsInstance(value, str)
+            self.assertEqual(value, raw)
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
