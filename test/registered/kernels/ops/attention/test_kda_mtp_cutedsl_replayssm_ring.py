@@ -15,6 +15,8 @@ Tolerance is bf16-bound: production rings store rawk/rawv in conv dtype
 in fp32 registers.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -44,7 +46,7 @@ K = 128
 W = 4  # KERNEL_WIDTH
 
 
-def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
+def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False, kwargs_only=False):
     torch.manual_seed(seed)
     T = N * (1 + num_spec)
     num_slots = N + 2
@@ -113,12 +115,23 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
         )
     if arm == "baseline":
         inter = torch.zeros(N, 1 + num_spec, H, K, K, device=DEV, dtype=torch.float32)
+        if kwargs_only:
+            return dict(intermediate_ssm=inter, **kwargs)
         out = fused_kda_decode_mtp_dspark(intermediate_ssm=inter, **kwargs)
         return out, dict(inter=inter, slots=slots, scratch=scratch, **norm)
     rawv = torch.zeros(num_slots, H, L, K, device=DEV, dtype=torch.bfloat16)
     rawk = torch.zeros_like(rawv)
     gring = torch.zeros(num_slots, H, L, K, device=DEV, dtype=torch.float32)
     betar = torch.zeros(num_slots, H, L, device=DEV, dtype=torch.float32)
+    if kwargs_only:
+        return dict(
+            intermediate_ssm=None,
+            replayssm_rawv=rawv,
+            replayssm_rawk=rawk,
+            replayssm_g=gring,
+            replayssm_beta=betar,
+            **kwargs,
+        )
     out = fused_kda_decode_mtp_dspark(
         intermediate_ssm=None,
         replayssm_rawv=rawv,
@@ -186,6 +199,123 @@ def test_cutedsl_cuda_graph_padding_slot_is_safe(N):
     # is now unused and must remain untouched by all ReplaySSM ring stores.
     for name in ("rawv", "rawk", "gring", "betar"):
         assert torch.count_nonzero(ring[name][N]).item() == 0
+
+
+@pytest.mark.parametrize(
+    "real_requests,padded_requests,width,heads",
+    [
+        (7, 8, 8, 12),
+        (6, 8, 8, 12),
+        (5, 8, 8, 12),
+        (2, 4, 4, 2),
+    ],
+    ids=[
+        "k3-seven-of-eight-block8",
+        "k3-six-of-eight-block8",
+        "k3-five-of-eight-block8",
+        "two-of-four-block4",
+    ],
+)
+@pytest.mark.parametrize("arm", ["baseline", "ring"], ids=["snapshots", "ring"])
+@pytest.mark.parametrize("onorm", [False, True], ids=["raw", "onorm"])
+@pytest.mark.parametrize("use_graph", [False, True], ids=["eager", "graph"])
+def test_cutedsl_multiple_padding_outputs_and_states(
+    real_requests, padded_requests, width, heads, arm, onorm, use_graph
+):
+    kwargs = _run(
+        arm,
+        N=padded_requests,
+        H=heads,
+        num_spec=width - 1,
+        seed=41,
+        onorm=onorm,
+        kwargs_only=True,
+    )
+    real_tokens = real_requests * width
+    kwargs["ssm_state_indices"][real_requests:] = -1
+    # Production graph padding repeats the last real cumulative sequence length.
+    # Input/output storage still has a dense fixed-width block for every request.
+    kwargs["cu_seqlens"][real_requests + 1 :] = real_tokens
+    persistent_names = ("cs_q", "cs_k", "cs_v", "recurrent_state")
+    scratch_names = (
+        "intermediate_conv_q",
+        "intermediate_conv_k",
+        "intermediate_conv_v",
+        "intermediate_ssm",
+    )
+    ring_names = ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta")
+    state_names = [
+        name
+        for name in persistent_names + scratch_names + ring_names
+        if isinstance(kwargs.get(name), torch.Tensor)
+    ]
+    # Nonzero sentinels also detect erroneous writes to unused state slots.
+    for name in scratch_names + ring_names:
+        if isinstance(kwargs.get(name), torch.Tensor):
+            kwargs[name].fill_(3)
+    before = {name: kwargs[name].clone() for name in state_names}
+    control = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in kwargs.items()
+    }
+    for name in ("x_q", "x_k", "x_v", "g", "beta", "onorm_gate"):
+        if name in control:
+            control[name] = control[name][:, :real_tokens].contiguous()
+    for name in ("ssm_state_indices", "intermediate_state_indices"):
+        control[name] = control[name][:real_requests].contiguous()
+    control["cu_seqlens"] = control["cu_seqlens"][: real_requests + 1].contiguous()
+    expected = fused_kda_decode_mtp_dspark(**control)
+
+    original_empty_like = torch.empty_like
+
+    def sentinel_output(tensor, *args, **allocation_kwargs):
+        result = original_empty_like(tensor, *args, **allocation_kwargs)
+        if tensor is kwargs["x_v"]:
+            # Only intercept the wrapper's output allocation. The finite graph
+            # sentinel is refilled by a captured operation on every replay.
+            result.fill_(-77 if use_graph else float("nan"))
+        return result
+
+    with patch.object(torch, "empty_like", sentinel_output):
+        if use_graph:
+            fused_kda_decode_mtp_dspark(**kwargs)
+            torch.cuda.synchronize()
+            for name in state_names:
+                kwargs[name].copy_(before[name])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = fused_kda_decode_mtp_dspark(**kwargs)
+            graph.replay()
+            graph.replay()
+        else:
+            actual = fused_kda_decode_mtp_dspark(**kwargs)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual[:, :real_tokens], expected, rtol=0, atol=0)
+    padding = actual[:, real_tokens:]
+    assert torch.isfinite(padding).all().item()
+    assert torch.count_nonzero(padding).item() == 0
+    # Full-buffer comparison includes untouched padding scratch/ring slots.
+    for name in state_names:
+        torch.testing.assert_close(kwargs[name], control[name], rtol=0, atol=0)
+    for name in persistent_names:
+        torch.testing.assert_close(kwargs[name], before[name], rtol=0, atol=0)
+    for name in scratch_names:
+        if name in before:
+            torch.testing.assert_close(
+                kwargs[name][real_requests:],
+                before[name][real_requests:],
+                rtol=0,
+                atol=0,
+            )
+    for name in ring_names:
+        if name in before:
+            torch.testing.assert_close(
+                kwargs[name][real_requests + 1 :],
+                before[name][real_requests + 1 :],
+                rtol=0,
+                atol=0,
+            )
 
 
 if __name__ == "__main__":
