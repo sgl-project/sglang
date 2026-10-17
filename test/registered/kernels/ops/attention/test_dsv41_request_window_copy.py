@@ -1,11 +1,16 @@
 """Request-window copies preserve data, scales, padding and graph addresses."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.mem_cache.dsv41_request_window import copy_packed_tokens
+from sglang.srt.mem_cache.dsv41_request_window import (
+    RequestWindow,
+    copy_packed_tokens,
+    window_layout,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -87,6 +92,96 @@ class TestRequestWindowCopy(CustomTestCase):
             )
             graph.replay()
             torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
+
+    def test_commit_retained_rows(self):
+        for fmt in KVLayout:
+            for lens in ([1, 17, 257], [16384], [300, 37, 600]):
+                with self.subTest(layout=fmt, lengths=lens):
+                    self._check_commit(fmt, lens, graph=False)
+
+    def test_commit_graph_refreshes_metadata(self):
+        for fmt in KVLayout:
+            self._check_commit(fmt, [300, 37, 600], graph=True)
+
+    def _check_commit(self, fmt, lens, graph):
+        page, capacity = 64, 256
+
+        def factory(size, layers):
+            width = fmt.page_bytes(page)
+            return SimpleNamespace(
+                size=size,
+                kv_layout=fmt,
+                kv_buffer=[
+                    torch.empty(
+                        ((size + page - 1) // page, width + 64),
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )[:, :width]
+                    for _ in range(layers)
+                ],
+            )
+
+        window = RequestWindow(
+            factory,
+            num_slots=8,
+            layers=2,
+            page_size=page,
+            capacity=capacity,
+            workspace_rows=sum(lens) + len(lens) * 128,
+        )
+
+        def metadata(lengths, shift):
+            req = torch.cat(
+                [
+                    torch.full((n,), i + 1, dtype=torch.int64, device="cuda")
+                    for i, n in enumerate(lengths)
+                ]
+            )
+            pos = torch.cat(
+                [torch.arange(n, device="cuda") + 191 + shift for n in lengths]
+            )
+            return window_layout(req, pos, capacity=capacity, num_groups=len(lengths))
+
+        active = metadata(lens, 0)
+        window.activate(active)
+        src = window.workspace.kv_buffer[0]
+        src.random_(0, 256)
+        # History preparation is already complete: test the real commit method.
+        window.prepared = (1, False)
+        window.commit(1)
+        captured = None
+        if graph:
+            captured = torch.cuda.CUDAGraph()
+            window.prepared = (1, True)
+            with torch.cuda.graph(captured):
+                window.commit(1)
+        for iteration in range(3):
+            lengths = [17, 320, 600] if graph and iteration % 2 else lens
+            active.copy_(metadata(lengths, iteration * 137))
+            src.random_(0, 256)
+            window.state.kv_buffer[1].fill_(193)
+            window.tags.fill_(-1)
+            keep = active.commit_mask.cpu()
+            source = active.write_loc.cpu()[keep]
+            positions = active.pos.cpu()[keep]
+            target = active.req.cpu()[keep] * capacity + positions % capacity
+            expected = reference(
+                src.cpu(), window.state.kv_buffer[1].cpu(), source, target, page, fmt
+            )
+            expected_tags = window.tags[1].cpu().clone()
+            expected_tags[target] = positions
+            if captured is None:
+                window.prepared = (1, False)
+                window.commit(1)
+            else:
+                captured.replay()
+            torch.testing.assert_close(
+                window.state.kv_buffer[1].cpu(), expected, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                window.tags[1].cpu(), expected_tags, rtol=0, atol=0
+            )
+            self.assertTrue(torch.all(window.tags[0] == -1).item())
 
 
 if __name__ == "__main__":
