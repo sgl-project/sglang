@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
