@@ -214,7 +214,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniMoeAudioEncoderLayer(config)
+                Qwen3OmniMoeAudioEncoderLayer(config, quant_config=quant_config)
                 for _ in range(config.encoder_layers)
             ]
         )
@@ -264,6 +264,12 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
 
     def set_input_embeddings(self, value: nn.Module):
         self.conv1 = value
+
+    @property
+    def dtype(self) -> torch.dtype:
+        # Conv frontend stays unquantized; PreTrainedModel.dtype would pick up
+        # fp8 from quantized encoder linears and poison mel-feature casts.
+        return self.conv2d1.weight.dtype
 
     def forward(
         self,
