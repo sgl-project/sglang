@@ -775,6 +775,12 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    @property
+    def last_shared_read_runner(self):
+        # Frozen has no draft-extend forward. Target is the last model phase,
+        # including zero-step DECODE; use its read-done event for the WAR fence.
+        return self._target_worker.model_runner
+
     def _target_graph_capture_kwargs(self, speculative_num_steps: int) -> dict:
         if speculative_num_steps == 0 and envs.SGLANG_FROZEN_KV_ZERO_DECODE.get():
             return dict(

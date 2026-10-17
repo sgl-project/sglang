@@ -23,6 +23,18 @@ MODULE = "sglang.srt.speculative.frozen_kv_mtp_worker_v2"
 
 
 class TestFrozenZeroDecode(unittest.TestCase):
+    def test_war_fence_uses_target_for_both_zero_and_positive_steps(self):
+        target = object()
+        for steps in (0, 2):
+            worker = NS(
+                speculative_num_steps=steps,
+                _target_worker=NS(model_runner=target),
+                _draft_worker=NS(draft_runner=object()),
+            )
+            self.assertIs(
+                FrozenKVMTPWorkerV2.last_shared_read_runner.fget(worker), target
+            )
+
     def test_capture_mode_and_fallback_gates(self):
         worker = NS(speculative_num_steps=0)
         batch = NS(
