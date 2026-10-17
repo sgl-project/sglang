@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -40,6 +39,18 @@ class Qwen25Detector(BaseFormatDetector):
         self.tool_call_separator = "\n"
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
 
+    def _iter_tool_call_bodies(self, text: str):
+        # Linear scan on purpose: a `<tool_call>\n(.*?)\n</tool_call>` findall
+        # rescans to the end from every opening tag when the end tag never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            body_start = start + len(self.bot_token)
+            end = text.find(self.eot_token, body_start)
+            if end == -1:
+                return
+            yield text[body_start:end]
+            start = text.find(self.bot_token, end + len(self.eot_token))
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
         return self.bot_token in text
@@ -57,9 +68,7 @@ class Qwen25Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
-        # Find all <tool_call>\n...\n</tool_call> blocks
-        pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
-        match_result_list = re.findall(pattern, text, re.DOTALL)
+        match_result_list = list(self._iter_tool_call_bodies(text))
         calls = []
         for match_result in match_result_list:
             try:
