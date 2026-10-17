@@ -6,6 +6,8 @@ ARG arch
 
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
+SHELL ["/bin/bash", "-c"]
+
 ARG TARGETARCH
 ARG CANN_VERSION
 ARG DEVICE_TYPE
@@ -34,7 +36,10 @@ ARG ZBAL_VERSION_950="1.2.21004.post1"
 ARG ZBAL_VERSION_A3="1.1.3"
 
 
-# Later RUN steps source /etc/environment_new, so make sure it exists
+ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/lib64:/usr/local/Ascend/cann-${CANN_VERSION}/lib:/usr/local/Ascend/cann-${CANN_VERSION}/x86_64-linux/devlib/device:/usr/local/Ascend/driver/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
+ENV ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/custom_transformer:/usr/local/Ascend/cann-${CANN_VERSION}/opp/vendors/customize
+
 RUN touch /etc/environment_new
 
 WORKDIR /workspace
@@ -95,16 +100,14 @@ RUN ${PIP_INSTALL} sglang-router
 
 
 ### Install PyTorch and PTA
-RUN . /etc/environment_new && \
-    (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
+RUN (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
     && (${PIP_INSTALL} torch-npu==${TORCH_NPU_VERSION} --extra-index-url ${TORCH_NPU_INDEX_URL})
 
 
 ### Install ModelScope & EvalScope
 # Installed right after torch/torch-npu so their dependencies resolve against the pinned torch.
 # MODELSCOPE_VERSION / EVALSCOPE_VERSION are empty by default -> latest release.
-RUN . /etc/environment_new && \
-    MS_PKG="modelscope" && \
+RUN MS_PKG="modelscope" && \
     ES_PKG="evalscope" && \
     if [ -n "${MODELSCOPE_VERSION}" ]; then MS_PKG="modelscope==${MODELSCOPE_VERSION}"; fi && \
     if [ -n "${EVALSCOPE_VERSION}" ]; then ES_PKG="evalscope==${EVALSCOPE_VERSION}"; fi && \
@@ -112,8 +115,7 @@ RUN . /etc/environment_new && \
 
 
 ## Install triton-ascend
-RUN . /etc/environment_new && \
-    ${PIP_INSTALL} pybind11 && \
+RUN ${PIP_INSTALL} pybind11 && \
     if [ "$TARGETARCH" = "arm64" ]; then \
         ${PIP_INSTALL} "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com:443/Triton-ascend/3.2.2/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl?AccessKeyId=HPUAAPJN7IAXFCS2GDSQ&Expires=1806290330&Signature=eRq3VKjwgP/tTkObtsho%2BzIsmJM%3D"; \
     elif [ "$TARGETARCH" = "amd64" ]; then \
@@ -127,10 +129,6 @@ RUN . /etc/environment_new && \
 RUN git clone https://github.com/sgl-project/sglang --branch ${SGLANG_TAG} /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
-
-ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
-
-ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann-${CANN_VERSION}/lib64:/usr/local/Ascend/cann-${CANN_VERSION}/lib:/usr/local/Ascend/cann-${CANN_VERSION}/x86_64-linux/devlib/device:/usr/local/Ascend/driver/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
 
 
 RUN mkdir cann-custom-ops && \
@@ -150,6 +148,16 @@ RUN mkdir cann-custom-ops && \
     ${PIP_INSTALL} custom_ops-1.0-cp312-cp312-linux_$(arch).whl && \
     cd .. && rm -rf cann-custom-ops
 
+
+RUN printf '%s\n' \
+    '. /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash' \
+    '. /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash' \
+    '. /usr/local/Ascend/ascend-toolkit/latest/set_env.sh' \
+    '. /usr/local/Ascend/nnal/atb/set_env.sh' \
+    > /etc/profile.d/ascend.sh \
+ && chmod 644 /etc/profile.d/ascend.sh \
+ && printf '%s\n' '. /etc/profile.d/ascend.sh' >> /etc/bash.bashrc
+
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
 RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
@@ -159,6 +167,8 @@ RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
     && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl torch_memory_saver*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
-    && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
+    && PIPDIR="$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" \
+    && [ -n "$PIPDIR" ] \
+    && cd "$PIPDIR" && ln -sf deep_ep/deep_ep_cpp*.so
 
 CMD ["/bin/bash"]
