@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from torch.compiler import assume_constant_result
+
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
@@ -351,6 +353,23 @@ def dual_gemm_swiglu(
     )
 
 
+@assume_constant_result
+def _ensure_sm90_dual_gemm_registered():
+    # The backend is fixed and cached per process. Resolve its lazy import
+    # outside Dynamo tracing; only the registered torch custom op enters FX.
+    get_kernel("gemm.sm90_dual_gemm_swiglu", KernelBackend.CUTE_DSL)
+
+
+def sm90_dual_gemm_swiglu(
+    x: torch.Tensor, gate_up_weight: torch.Tensor, tactic: int = -1
+):
+    """SM90 TMA/WGMMA decode dual GEMM with a fused SwiGLU epilogue."""
+    import torch
+
+    _ensure_sm90_dual_gemm_registered()
+    return torch.ops.sglang.cutedsl_sm90_dual_gemm_swiglu(x, gate_up_weight, tactic)
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -455,6 +474,7 @@ __all__ = [
     "dual_gemm_swiglu",
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
+    "sm90_dual_gemm_swiglu",
     "kimi_k3_tiny_gemm",
     "n128k512_gemm_bf16",
     "n32k5120_gemm_bf16",
@@ -508,6 +528,17 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
         ),
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="gemm.sm90_dual_gemm_swiglu",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.sm90_dual_gemm:sm90_dual_gemm_swiglu",
+        capabilities=_SM90,
+        description="FP16/BF16 TMA warp-specialized WGMMA dual GEMM + SwiGLU on Hopper.",
     )
 )
 register_kernel(
