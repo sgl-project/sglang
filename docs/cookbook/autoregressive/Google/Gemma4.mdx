@@ -105,6 +105,8 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
 
 The **E2B + BMG** configuration serves text on one Intel Arc Pro B70 with the Intel XPU attention backend and decode graphs. Use an [Intel XPU installation](/docs/hardware-platforms/xpu). This configuration uses `--language-model-only` to omit the vision/audio encoders and rejects image, video, and audio requests. For multimodal requests, omit that flag and use `--attention-backend triton` for bidirectional image attention.
 
+For **E2B + BMG**, enable **Speculative Decoding (MTP)** to capture the frozen-KV assistant's recurrent draft loop in XPU graphs. This recipe uses three draft steps, four verification tokens, and a maximum of eight concurrent requests. The target model verifies the assistant's proposals using its original weights.
+
 ### 3.2 Configuration Tips
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
