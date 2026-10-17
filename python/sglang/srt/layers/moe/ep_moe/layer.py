@@ -60,6 +60,14 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 logger = logging.getLogger(__name__)
 
 
+def _uses_fused_moe_for_nixl_bf16_dispatch() -> bool:
+    return (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and get_moe_a2a_backend().is_nixl()
+        and envs.SGLANG_NIXL_EP_BF16_DISPATCH.get()
+    )
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -119,6 +127,8 @@ class DeepEPMoE(FusedMoE):
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
+            self.deprecate_flag = True
+        elif _uses_fused_moe_for_nixl_bf16_dispatch():
             self.deprecate_flag = True
         elif (
             get_moe_runner_backend().is_flashinfer_cutedsl()

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from enum import Enum, auto
 from functools import cache
+from urllib.parse import quote
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed.utils import get_global_tcp_store
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager, RecoveryOperation
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -25,6 +27,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_resources,
 )
@@ -74,6 +77,9 @@ class NixlEPBuffer:
                 connected_ep_size=None,
                 scale_to=None,
                 dispatch_ep_size=None,
+                recovery_operation_id=None,
+                recovery_disconnected_rank=None,
+                recovery_connections_ready=False,
             )
             buffers["nixl_ep_state"] = state
         return state
@@ -92,10 +98,10 @@ class NixlEPBuffer:
         )
 
     @classmethod
-    def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
-        current_store = get_global_tcp_store()
-        if current_store is not None:
-            state.buffer.set_tcp_store_group(current_store)
+    def _connect_ranks(cls, state, ranks: list, *, tag: str, store=None) -> None:
+        connection_store = store or get_global_tcp_store()
+        if connection_store is not None:
+            state.buffer.set_tcp_store_group(connection_store)
 
         state.buffer.connect_ranks(ranks)
         logger.debug(
@@ -104,6 +110,129 @@ class NixlEPBuffer:
             ranks,
             state.buffer.group_size,
         )
+
+    @staticmethod
+    def _recovery_store(operation: RecoveryOperation):
+        store = get_global_tcp_store()
+        if store is None:
+            raise RuntimeError("NIXL recovery requires the global TCPStore.")
+        prefix = (
+            "elastic_ep/nixl_recovery/"
+            f"{quote(operation.runtime_instance_id, safe='')}/"
+            f"{operation.topology_generation}/"
+            f"{quote(operation.operation_id, safe='')}/"
+            f"{quote(operation.allocation_id, safe='')}/"
+        )
+        return dist.PrefixStore(prefix, store)
+
+    @classmethod
+    def prepare_recovery(cls, operation: RecoveryOperation) -> None:
+        state = cls._state()
+        if state.buffer is None:
+            raise RuntimeError("NIXL recovery requires an initialized EP buffer.")
+        if state.recovery_operation_id == operation.operation_id:
+            return
+        if state.recovery_operation_id is not None:
+            raise RuntimeError(
+                "NIXL recovery conflicts with a different pending operation."
+            )
+        state.buffer.disconnect_ranks([operation.rank_offset])
+        state.recovery_operation_id = operation.operation_id
+        state.recovery_disconnected_rank = operation.rank_offset
+        state.recovery_connections_ready = False
+
+    @classmethod
+    def initialize_recovery_joiner(
+        cls, operation: RecoveryOperation, global_rank: int
+    ) -> None:
+        state = cls._state()
+        if state.buffer is None:
+            raise RuntimeError("NIXL recovery requires an initialized EP buffer.")
+        store = cls._recovery_store(operation)
+        cls._connect_ranks(
+            state,
+            [global_rank],
+            tag="recovery-self",
+            store=store,
+        )
+        state.connected_ep_size = 0
+        state.scale_to = 0
+        state.dispatch_ep_size = ElasticEPStateManager.get_effective_ep_size()
+        state.recovery_operation_id = operation.operation_id
+        state.recovery_connections_ready = False
+
+    @classmethod
+    def connect_recovery(
+        cls, operation: RecoveryOperation, *, replacement: bool
+    ) -> None:
+        state = cls._state()
+        if state.buffer is None:
+            raise RuntimeError("NIXL recovery requires an initialized EP buffer.")
+        if state.recovery_connections_ready:
+            if state.recovery_operation_id != operation.operation_id:
+                raise RuntimeError(
+                    "NIXL recovery conflicts with a completed connection operation."
+                )
+            return
+        if not replacement and state.recovery_operation_id != operation.operation_id:
+            raise RuntimeError(
+                "NIXL survivor must disconnect the failed rank before reconnecting it."
+            )
+
+        store = cls._recovery_store(operation)
+        ranks = (
+            list(range(ElasticEPStateManager.get_effective_ep_size()))
+            if replacement
+            else [operation.rank_offset]
+        )
+        if replacement:
+            state.dispatch_ep_size = 0
+        cls._connect_ranks(state, ranks, tag="recovery", store=store)
+
+        global_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
+        store.set(f"connected/{global_rank}", b"1")
+        expected = [
+            f"connected/{rank}"
+            for rank in range(ElasticEPStateManager.get_effective_ep_size())
+        ]
+        store.wait(expected, timedelta(seconds=300))
+        effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
+        state.connected_ep_size = effective_ep_size
+        state.scale_to = effective_ep_size
+        state.dispatch_ep_size = effective_ep_size
+        state.recovery_operation_id = operation.operation_id
+        state.recovery_connections_ready = True
+
+    @classmethod
+    def finish_recovery(cls, operation_id: str) -> None:
+        state = cls._state()
+        if state.recovery_operation_id != operation_id:
+            raise RuntimeError(
+                "NIXL recovery completion does not match the pending operation."
+            )
+        if not state.recovery_connections_ready:
+            raise RuntimeError(
+                "NIXL recovery cannot finish before connections are ready."
+            )
+        state.recovery_operation_id = None
+        state.recovery_disconnected_rank = None
+        state.recovery_connections_ready = False
+
+    @classmethod
+    def abort_recovery(cls, operation_id: str, rank_offset: int) -> None:
+        """Fail closed after a recovery warmup failure."""
+        state = cls._state()
+        if state.recovery_operation_id != operation_id:
+            raise RuntimeError(
+                "NIXL recovery abort does not match the pending operation."
+            )
+        state.buffer.disconnect_ranks([rank_offset])
+        state.connected_ep_size = 0
+        state.scale_to = 0
+        state.dispatch_ep_size = 0
+        state.recovery_operation_id = None
+        state.recovery_disconnected_rank = None
+        state.recovery_connections_ready = False
 
     @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
@@ -184,6 +313,12 @@ class NixlEPBuffer:
             num_experts_per_rank=state.num_local_experts,
             num_rdma_bytes=num_rdma_bytes,
         )
+        if get_exec().moe.ep_join_mode == "recover":
+            cls.initialize_recovery_joiner(
+                ElasticEPStateManager.current_recovery_operation(),
+                global_rank,
+            )
+            return state.buffer
         initial_ep_size = offset + world_size
         scale_to = max(initial_ep_size, state.scale_to or 0)
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
