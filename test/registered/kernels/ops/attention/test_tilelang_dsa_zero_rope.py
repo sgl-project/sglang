@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from unittest import mock
 
 import torch
 
@@ -11,7 +12,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,6 +97,14 @@ class TestTileLangDSAZeroRope(CustomTestCase):
             kv = kv.to(FP8_DTYPE)
         reference_q = q.to(FP8_DTYPE) if use_fp8 else q
 
+        if not is_hip() and not use_fp8:
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                _use_cuda_bf16_split,
+            )
+
+            # These cases cover the single-pass v1/v2 kernels; the split path has its own test.
+            self.assertFalse(_use_cuda_bf16_split(num_tokens=tokens, num_heads=heads))
+
         scale = 1.0 / math.sqrt(dim)
         expected = _torch_sparse_attention(reference_q, kv, indices, scale, d_v)
         # the partial/combine path returns [batch=1, tokens, heads, d_v]
@@ -127,6 +136,69 @@ class TestTileLangDSAZeroRope(CustomTestCase):
         for use_fp8 in (False, True):
             with self.subTest(use_fp8=use_fp8):
                 self._assert_matches_torch(use_fp8=use_fp8, d_v=512, d_tail=64)
+
+    @unittest.skipUnless(is_sm90_supported(), "CUDA BF16 split dispatch is SM90-only")
+    def test_cuda_bf16_split_gate_scales_with_heads(self):
+        """Split cost grows with tokens * padded heads, so 64/128-head ranks must stop splitting at 16/8 tokens, not 64."""
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            _use_cuda_bf16_split,
+        )
+
+        for heads, last_split_tokens in ((64, 16), (128, 8)):
+            with self.subTest(heads=heads):
+                for tokens, expected in (
+                    (last_split_tokens, True),
+                    (last_split_tokens + 1, False),
+                ):
+                    self.assertEqual(
+                        _use_cuda_bf16_split(num_tokens=tokens, num_heads=heads),
+                        expected,
+                        f"{tokens=}",
+                    )
+        # The combine kernel reduces 4 heads per block.
+        self.assertFalse(_use_cuda_bf16_split(num_tokens=1, num_heads=6))
+
+    @unittest.skipUnless(is_sm90_supported(), "CUDA BF16 split dispatch is SM90-only")
+    def test_cuda_bf16_small_batch_split_matches_torch_and_graph(self):
+        """Both sides of the 8-head cutoff must take the expected kernel and match torch, eager and under graph replay."""
+        from sglang.kernels.ops.attention.dsa import tilelang_kernel
+
+        # GLM-5.3-Flash at TP8: 8 heads (padded to 16 in-kernel), 512+0 latent,
+        # k-pool topk 2048 + tail padded to 2112 with masked columns.
+        heads, d_v, topk, kv_len = 8, 512, 2112, 4096
+        torch.manual_seed(7)
+        kv = torch.randn(kv_len, 1, d_v, device="cuda", dtype=torch.bfloat16)
+        scale = 1.0 / math.sqrt(d_v)
+        for tokens, expect_split in ((64, True), (65, False)):
+            with self.subTest(tokens=tokens):
+                q = torch.randn(tokens, heads, d_v, device="cuda", dtype=torch.bfloat16)
+                indices = torch.randint(
+                    0, kv_len, (tokens, 1, topk), device="cuda", dtype=torch.int32
+                )
+                indices[..., 2051:] = -1
+                indices[0, :, 1:] = -1  # a row with one live column
+                expected = _torch_sparse_attention(q, kv, indices, scale, d_v)
+                with mock.patch.object(
+                    tilelang_kernel,
+                    "sparse_mla_fwd_decode_partial",
+                    wraps=tilelang_kernel.sparse_mla_fwd_decode_partial,
+                ) as partial_factory:
+                    actual = tilelang_kernel.tilelang_sparse_fwd(
+                        q, kv, indices, scale, d_v=d_v
+                    )
+                self.assertEqual(partial_factory.called, expect_split)
+                torch.testing.assert_close(
+                    actual.squeeze(0), expected, atol=0.04, rtol=0.04
+                )
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = tilelang_kernel.tilelang_sparse_fwd(
+                        q, kv, indices, scale, d_v=d_v
+                    )
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(captured, actual, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
