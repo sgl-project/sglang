@@ -221,6 +221,8 @@ class IndexerKPool(MultiPlatformOp):
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
+        # [wk | compress gate | weights_proj] in bf16, built by fuse_x_projections().
+        self.x_proj_weight: Optional[torch.Tensor] = None
         if not self.skip_rope:
             self.rotary_emb = get_rope_wrapper(
                 rope_head_dim,
@@ -243,20 +245,60 @@ class IndexerKPool(MultiPlatformOp):
         return weights
 
     @torch.compile(dynamic=True)
-    def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
+    def _project_head_gates(self, x: torch.Tensor) -> torch.Tensor:
         weights, _ = self.weights_proj(x.float())
-        return weights * self.n_heads**-0.5
+        return weights
 
     @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ) -> torch.Tensor:
+        weights = weights * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _resolve_head_gate_weights(self, x, q_scale, head_weights):
+        """head_weights: the unscaled weights_proj output, when already computed."""
         if head_weights is not None:
             return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
         return self._get_logits_head_gate(x, q_scale)
+
+    def fuse_x_projections(self) -> None:
+        """Stack wk, the compress gate and weights_proj into x_proj_weight, so the
+        target-verify path projects x once (fp32 out) instead of three GEMMs."""
+        if not is_hip():
+            return
+        wk = getattr(self.wk, "weight", None)
+        head = self.weights_proj.weight
+        if (
+            (not self.skip_rope and self.rope_head_dim > 0)
+            or wk is None
+            or wk.dtype != torch.bfloat16
+            or self.index_kpool_compress_gate.dtype != torch.bfloat16
+            or not (self.k_norm.elementwise_affine and self.k_norm.use_bias)
+            # weights_proj is held in fp32 but loaded from bf16: stacking it must be exact
+            or not torch.equal(head.bfloat16().float(), head.float())
+        ):
+            return
+        self.x_proj_weight = torch.cat(
+            [wk.data, self.index_kpool_compress_gate.data, head.data.bfloat16()]
+        ).contiguous()
+
+    def _get_q_k_fused_x_proj(self, q_lora: torch.Tensor, x: torch.Tensor):
+        from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+
+        d = self.head_dim
+        proj = torch.mm(x, self.x_proj_weight.t(), out_dtype=torch.float32)
+        key = torch.empty(x.shape[0], d, dtype=torch.bfloat16, device=x.device)
+        _layer_norm_fwd(
+            proj[:, :d],
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.variance_epsilon,
+            out=key,
+        )
+        query, _ = self.wq_b(q_lora)
+        query = rotate_activation(rearrange(query, "l (h d) -> l h d", d=d))
+        return query, key, proj[:, d : 2 * d], proj[:, 2 * d :]
 
     def _can_overlap_prefill(
         self,
@@ -675,7 +717,7 @@ class IndexerKPool(MultiPlatformOp):
                     dim=-1,
                 )
             if precompute_head_gate:
-                head_weights = self._project_and_scale_head_gates(x)
+                head_weights = self._project_head_gates(x)
             if not apply_rope:
                 query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
@@ -1574,17 +1616,23 @@ class IndexerKPool(MultiPlatformOp):
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
 
-        query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
-            q_lora,
-            x,
-            positions,
-            enable_dual_stream=enable_dual_stream,
-            forward_batch=forward_batch,
-            precompute_compress_gate=(
-                enable_dual_stream and self.compress_gate_stream is not None
-            ),
-            precompute_head_gate=enable_dual_stream and return_indices,
-        )
+        fused_x_proj = self.x_proj_weight is not None
+        if fused_x_proj:
+            query, key, gate_score_maybe, head_weights = self._get_q_k_fused_x_proj(
+                q_lora, x
+            )
+        else:
+            query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
+                q_lora,
+                x,
+                positions,
+                enable_dual_stream=enable_dual_stream,
+                forward_batch=forward_batch,
+                precompute_compress_gate=(
+                    enable_dual_stream and self.compress_gate_stream is not None
+                ),
+                precompute_head_gate=enable_dual_stream and return_indices,
+            )
 
         pool = get_token_to_kv_pool()
         tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
@@ -1617,7 +1665,7 @@ class IndexerKPool(MultiPlatformOp):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if gate_score_maybe is not None:
+            if gate_score_maybe is not None and not fused_x_proj:
                 assert self.compress_gate_stream is not None
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
