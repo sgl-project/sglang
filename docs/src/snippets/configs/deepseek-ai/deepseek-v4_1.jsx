@@ -98,7 +98,6 @@ export const config = {
     },
 
     pdDisagg: {
-      incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
