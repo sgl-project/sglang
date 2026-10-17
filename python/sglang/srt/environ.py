@@ -1497,6 +1497,10 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # ACCV-Lab video decode followed by zero-copy GPU resize/crop/normalize.
+    SGLANG_USE_COSMOS3_ACCVLAB_GPU_PREPROCESS = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_ACCVLAB_COSMOS3_VIDEO_DECODER"
+    )
 
     # ===================================================================
     # Multimodal CUDA IPC transport
