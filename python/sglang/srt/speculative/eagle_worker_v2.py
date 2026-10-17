@@ -1708,6 +1708,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     # -- Adaptive speculative decoding protocol --
 
+    def _target_graph_capture_kwargs(self, speculative_num_steps: int) -> dict:
+        return {}
+
     def build_adaptive_runtime_state(
         self,
         speculative_num_steps: int,
@@ -1750,6 +1753,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    **self._target_graph_capture_kwargs(speculative_num_steps),
                 )
                 target_graph_after_mem = get_available_gpu_memory(
                     self.device, self.gpu_id

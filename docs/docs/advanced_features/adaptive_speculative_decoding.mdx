@@ -9,9 +9,11 @@ It is designed for workloads whose accept length changes over time, where one st
 
 ## Current support
 
-- Only `--speculative-algorithm EAGLE` or `EAGLE3`
+- `--speculative-algorithm EAGLE` or `EAGLE3`, plus Gemma 4 assistant models routed from `NEXTN` or `EAGLE` to `FROZEN_KV_MTP`
 - Only `--speculative-eagle-topk 1`
-- If either condition is not met, SGLang falls back to static speculative settings
+- Frozen-KV MTP requires NVIDIA CUDA, pipeline parallel size 1, and Triton attention for target prefill, target decode, and draft
+- Attention DP, two-batch overlap, PDMux, and multi-layer EAGLE are not supported
+- Unsupported configurations fall back to static speculative settings with a warning
 
 ## Why adaptive steps help
 
@@ -36,6 +38,8 @@ The adaptive mechanism has three pieces:
 The controller maintains **independent EMA trackers for each batch size range**, so observations at small BS don't pollute the large BS signal. Each BS range can have its own candidate steps, hysteresis thresholds, and ceiling coefficient.
 
 BS ranges are defined as lower bounds in the config file (e.g., keys `"1"` and `"8"` mean BS 1–7 uses one slot, BS 8+ uses another). `SpecRuntimeState` objects are shared across BS ranges with the same step count — each state owns CUDA graphs captured for the reachable padded batch sizes of that step.
+
+When CUDA graphs are enabled, the policy uses the padded graph batch size. For example, with graph buckets `[1, 4, 8, 16, 24, 32]`, a batch of 17 requests selects the slot for batch size 24. Account for these buckets when choosing slot boundaries.
 
 ```mermaid
 ---
@@ -137,6 +141,51 @@ Example config:
 
 Non-integer keys (`ema_alpha`, `warmup_batches`, `update_interval`) are global overrides applied to every BS slot. Integer keys (`"1"`, `"8"`) define per-BS slots.
 
+### Frozen-KV zero-step decode
+
+For Frozen-KV MTP, you can set `SGLANG_FROZEN_KV_ZERO_DECODE=1` to use the target model's single-token DECODE path when the selected step count is zero. This option is disabled by default. The worker keeps the target hidden state and the next token as the seed for a later return to drafting; each candidate step has its own attention backend and CUDA graph state. Frozen-KV does not run a draft KV-cache catch-up forward.
+
+Requests with a grammar, requested log probabilities, or HiSparse use the width-one verification path instead. A DECODE graph is never replayed for a verification batch. These requests may therefore have different performance from the zero-step DECODE path.
+
+### H20 example for Gemma 4
+
+For Linux with one NVIDIA H20, BF16 Gemma 4 12B, and its matching assistant checkpoint, the repository includes `examples/runtime/frozen_kv_h20_adaptive.json`:
+
+```json
+{
+  "1": {"candidate_steps": [2]},
+  "16": {"candidate_steps": [0]}
+}
+```
+
+Each slot has one candidate, so this example switches by batch size without searching among steps within a slot. With the graph buckets below, batches of 1–8 requests use two steps and batches of 9 or more use zero steps. This is a hardware/model-specific example, not a change to the defaults or a universal crossover point. Benchmark your workload when changing the model, attention implementation, GPU, or graph buckets.
+
+Run from the repository root with local target and assistant model directories:
+
+```bash
+MODEL_PATH=/path/to/gemma-4-12B-it
+ASSISTANT_PATH=/path/to/gemma-4-12B-it-assistant
+SGLANG_FROZEN_KV_ZERO_DECODE=1 python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --speculative-draft-model-path "$ASSISTANT_PATH" \
+    --speculative-algorithm NEXTN \
+    --speculative-eagle-topk 1 \
+    --speculative-num-steps 2 \
+    --speculative-num-draft-tokens 3 \
+    --speculative-adaptive \
+    --speculative-adaptive-config examples/runtime/frozen_kv_h20_adaptive.json \
+    --attention-backend triton \
+    --dtype bfloat16 \
+    --tp-size 1 \
+    --max-running-requests 256 \
+    --cuda-graph-bs-decode 1 4 8 16 24 32 64 128 256 \
+    --context-length 4352 \
+    --chunked-prefill-size 2048 \
+    --mem-fraction-static 0.90 \
+    --max-total-tokens 589824 \
+    --swa-full-tokens-ratio 0.28125
+```
+
 ## Config file reference
 
 The config file is optional. When provided, each integer BS-slot key must specify `candidate_steps`; all other keys fall back to defaults.
@@ -160,7 +209,7 @@ The config file is optional. When provided, each integer BS-slot key must specif
     <tr>
       <td><code>candidate_steps</code></td>
       <td><em>required</em></td>
-      <td>Candidate <code>speculative_num_steps</code> tiers for this BS range. Must be a non-empty list of positive ints; a slot that omits it raises a config error</td>
+      <td>Candidate <code>speculative_num_steps</code> tiers for this BS range. Must be a non-empty list of non-negative ints; zero skips drafting. A slot that omits it raises a config error</td>
     </tr>
     <tr>
       <td><code>down_hysteresis</code></td>

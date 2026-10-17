@@ -235,6 +235,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         record_nolora_graph: bool = False,
+        capture_forward_mode: Optional[ForwardMode] = None,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ):
         super().__init__(model_runner)
         self.record_nolora_graph = record_nolora_graph
@@ -296,9 +298,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else speculative_num_draft_tokens
         )
 
+        # The initial target graph is built before the speculative worker can
+        # supply adaptive-state kwargs. Also handle a zero-only policy at startup.
+        if (
+            capture_forward_mode is None
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+            and not model_runner.is_draft_worker
+            and self.speculative_num_steps == 0
+            and envs.SGLANG_FROZEN_KV_ZERO_DECODE.get()
+        ):
+            capture_forward_mode = ForwardMode.DECODE
+            capture_hidden_mode = CaptureHiddenMode.FULL
+
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = self.return_hidden_states_mode
+        self.capture_hidden_mode = max(
+            self.return_hidden_states_mode,
+            capture_hidden_mode or CaptureHiddenMode.NULL,
+        )
+        self.capture_forward_mode_override = capture_forward_mode
         # Static capture width.
         self.captured_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
@@ -311,6 +329,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+
+        if capture_forward_mode is not None:
+            if (
+                capture_forward_mode != ForwardMode.DECODE
+                or self.captured_req_width != 1
+            ):
+                raise ValueError("capture mode override requires single-token DECODE")
+            self.capture_forward_mode = capture_forward_mode
 
         self.dllm_attention = self.attn_backend.dllm_attention
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
@@ -713,6 +739,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # An adaptive zero-step DECODE graph must never replay a verify batch,
+        # even though both have width one. Unsupported requests use eager verify.
+        if (
+            self.capture_forward_mode_override is not None
+            and forward_batch.forward_mode != self.capture_forward_mode
+        ):
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -1679,6 +1712,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return output
 
     def get_spec_info(self, num_tokens: int):
+        if self.capture_forward_mode_override == ForwardMode.DECODE:
+            return None
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
