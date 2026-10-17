@@ -383,6 +383,22 @@ pub struct GenerateRequest {
     /// validates it against its priority-scheduling mode.
     #[prost(int64, optional, tag = "24")]
     pub priority: ::core::option::Option<i64>,
+    /// Prefix-cache salt: a second namespace beside `extra_key`, normalized the
+    /// same way.
+    #[prost(message, optional, tag = "25")]
+    pub cache_salt: ::core::option::Option<StringOrList>,
+    /// Apply grammar constraints only after the reasoning section, for every
+    /// batch item.
+    #[prost(bool, optional, tag = "26")]
+    pub require_reasoning: ::core::option::Option<bool>,
+    /// Fields this server cannot honour. Unknown keys are ignored, but
+    /// dropping these would silently change the result (base-model output for a
+    /// LoRA request, a stateless answer for a session request), so a non-null
+    /// value is rejected instead.
+    #[prost(string, optional, tag = "27")]
+    pub lora_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "28")]
+    pub session_params: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {
