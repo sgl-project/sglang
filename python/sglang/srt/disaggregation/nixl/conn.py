@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    is_elided_entry,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -71,6 +72,9 @@ except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
 
 logger = logging.getLogger(__name__)
+
+# Arbitrary; bounds how often an unreachable peer's dlists are rebuilt.
+_PEER_RELOAD_MIN_INTERVAL_S = 1.0
 
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
@@ -527,6 +531,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._peer_reload_lock = threading.Lock()
+        self._peer_reload_times: Dict[str, float] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -616,15 +622,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(ptr=0x{ptr:x}, size={size})"
             )
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
         # NOTE: matches mooncake behavior -- staging buffers are now
         # created in __init__ (per-worker), independent of the kv
         # tensors. This setter only stashes the tensor metadata used by
         # send_kvcache_staged().
+        # slot_layer_ids follows the staging slot order (every k_buffer, then
+        # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
+            "slot_layer_ids": list(slot_layer_ids or []),
         }
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
@@ -1225,6 +1240,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             settle_timed_out = False
+            room_transfer_infos = None
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1575,6 +1591,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # drain ACK can follow; discard the target and fall back to
                     # the timeout.
                     self.poison_deferred_ack_room(room)
+                # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
+                # room_transfer_infos survives the sender's clear() of this room.
+                self._reload_invalidated_peers(room_transfer_infos or {})
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1648,6 +1667,45 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
+
+    def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+        # NIXL drops a peer's metadata after a remote-disconnect error and never
+        # restores it; reload it from the registration we already hold.
+        for agent_name in list(room_transfer_infos):
+            peer_info = self.decode_kv_args_table.get(agent_name)
+            if peer_info is None:
+                continue
+            try:
+                if self.agent.check_remote_metadata(agent_name):
+                    continue
+                with self._peer_reload_lock:
+                    if self.agent.check_remote_metadata(agent_name):
+                        continue
+                    now = time.monotonic()
+                    last = self._peer_reload_times.get(agent_name)
+                    if last is not None and now - last < _PEER_RELOAD_MIN_INTERVAL_S:
+                        continue
+                    self._peer_reload_times[agent_name] = now
+                    logger.warning(
+                        "NIXL invalidated remote agent %s; reloading its metadata",
+                        agent_name,
+                    )
+                    # No other thread holds these dlists: every room with this
+                    # peer has the same peer set, so all shard to this worker.
+                    self.prep_handles.pop(agent_name, None)
+                    self.prep_handles_slice_dst.pop(agent_name, None)
+                    peer_info.kv_xfer_segments = None
+                    self.agent.add_remote_agent(peer_info.agent_metadata)
+                    try:
+                        self._prepare_payload_xfer(peer_info)
+                    except Exception:
+                        # Leave the peer invalid so a later failure retries.
+                        self.agent.remove_remote_agent(agent_name)
+                        raise
+            except Exception:
+                logger.exception(
+                    "Failed to reload NIXL metadata for remote agent %s", agent_name
+                )
 
     def _send_kvcache_generic(
         self,
@@ -1740,14 +1798,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the paired entries must have identical layouts.
                 if dst_item_lens is not None:
                     for i, j in pairs:
+                        if is_elided_entry(item_lens[i], dst_item_lens, j):
+                            # A shared-topk layer carries no index-K. One peer
+                            # may elide it while the other does not -- HiSparse
+                            # runs decode-side only -- and neither reads it.
+                            continue
                         if item_lens[i] != dst_item_lens[j]:
                             raise RuntimeError(
                                 f"{state_type} item length mismatch for paired "
                                 f"entries src[{i}]={item_lens[i]} "
                                 f"dst[{j}]={dst_item_lens[j]}"
                             )
+                # DSA index-K elision leaves a 0-row buffer on every shared-topk
+                # layer. Neither side registered it, so a descriptor built from
+                # it would fail in initialize_xfer(); drop it when either peer
+                # elided the entry.
                 layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
+                    for i, j in pairs
+                    if not is_elided_entry(item_lens[i], dst_item_lens, j)
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -1755,6 +1824,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                mapped_dst_lens = None
+                if dst_item_lens is not None:
+                    _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                        item_lens, dst_item_lens, state_type
+                    )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
@@ -1762,6 +1836,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         item_lens[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
+                    if not is_elided_entry(
+                        item_lens[layer_id], mapped_dst_lens, layer_id
+                    )
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
@@ -2462,7 +2539,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes. "
-            f"Prefill attn_tp_size={self.attn_tp_size}, "
+            f"Prefill attn_tp_size={self.state_tp_size}, "
             f"Decode attn_tp_size={decode_tp_size}."
         )
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
@@ -2481,7 +2558,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_layer_ids=dst_layer_ids,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
 
         src_addrs = []
@@ -2524,7 +2601,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
+                src_attn_tp_size=self.state_tp_size,
                 dst_attn_tp_size=decode_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
@@ -2558,6 +2635,63 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post Mamba state slice transfer")
+        return xfer_handle
+
+    def _send_swa_state_slice(
+        self,
+        peer_name: str,
+        prefill_swa_page_indices: List[int],
+        src_state_data_ptrs: List[int],
+        src_state_item_lens: List[int],
+        dst_state_data_ptrs: List[int],
+        dst_swa_page_indices: List[int],
+        dst_state_item_lens: List[int],
+        dst_gpu_id: int,
+        notif: str,
+        decode_tp_size: int,
+        decode_tp_rank: int,
+    ):
+        blocks = self._get_mha_head_slice_blocks(
+            src_ptrs=src_state_data_ptrs,
+            src_item_lens=src_state_item_lens,
+            dst_ptrs=dst_state_data_ptrs,
+            dst_item_lens=dst_state_item_lens,
+            src_page_indices=np.asarray(prefill_swa_page_indices),
+            dst_page_indices=np.asarray(dst_swa_page_indices),
+            dst_attn_tp_size=decode_tp_size,
+            dst_tp_rank=decode_tp_rank,
+        )
+        logger.warning_once(
+            "Using SWA state head-slice transfer for different attention TP sizes: "
+            f"prefill={self.attn_tp_size}, decode={decode_tp_size}."
+        )
+        src_reqs, dst_reqs = [], []
+        for src_addrs, dst_addrs, length in blocks:
+            lengths = np.full(src_addrs.size, length, dtype=np.uint64)
+            src_reqs.append(
+                np.column_stack(
+                    [src_addrs, lengths, np.full_like(lengths, self.kv_args.gpu_id)]
+                )
+            )
+            dst_reqs.append(
+                np.column_stack([dst_addrs, lengths, np.full_like(lengths, dst_gpu_id)])
+            )
+        if not src_reqs:
+            return None
+        src_descs = self.agent.get_xfer_descs(np.vstack(src_reqs), "VRAM")
+        dst_descs = self.agent.get_xfer_descs(np.vstack(dst_reqs), "VRAM")
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE",
+            src_descs,
+            dst_descs,
+            peer_name,
+            notif.encode("ascii"),
+        )
+        if not xfer_handle:
+            raise Exception("Failed to create SWA state slice transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("Failed to post SWA state slice transfer")
         return xfer_handle
 
     def maybe_send_extra(
@@ -2627,7 +2761,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
-                if self.attn_tp_size != decode_tp_size:
+                if self.state_tp_size != decode_tp_size:
                     if 0 in src_dims:
                         raise RuntimeError(
                             "Replicated Mamba PD state transfer currently requires "
@@ -2695,6 +2829,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     state_type=st,
                     force_flat=True,
                 )
+            elif (
+                st == StateType.SWA
+                and not self.is_mla_backend
+                and self.attn_tp_size != decode_tp_size
+            ):
+                h = self._send_swa_state_slice(
+                    peer_name=peer_name,
+                    prefill_swa_page_indices=src_indices,
+                    src_state_data_ptrs=src_ptrs,
+                    src_state_item_lens=src_lens,
+                    dst_state_data_ptrs=dst_ptrs,
+                    dst_swa_page_indices=dst_indices,
+                    dst_state_item_lens=dst_lens,
+                    dst_gpu_id=dst_gpu_id,
+                    notif=comp_notif,
+                    decode_tp_size=decode_tp_size,
+                    decode_tp_rank=decode_tp_rank,
+                )
             elif st in (
                 StateType.SWA,
                 StateType.BLOCK_SCALE,
@@ -2704,7 +2856,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
-                if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
+                # QSA state is whole on every rank, so it pairs by state TP.
+                src_tp_size = (
+                    self.state_tp_size
+                    if st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                    else self.attn_tp_size
+                )
+                if not self.is_mla_backend and src_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -3184,9 +3342,15 @@ class NixlKVSender(CommonKVSender):
             self.has_sent = True
 
     def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
-        status = self.kv_mgr.check_status(self.bootstrap_room)
+        status = check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
             timeout_result = self._check_bootstrap_timeout()
             if timeout_result is not None:

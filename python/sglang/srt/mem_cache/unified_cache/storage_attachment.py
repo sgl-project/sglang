@@ -141,6 +141,9 @@ class StorageAttachment:
                     sidecar_pool_specs=cache.sidecar_pool_specs,
                     host_pool_group=cache.host_pool_group,
                     swa_component=cache.components.get(ComponentType.SWA),
+                    auxiliary_swa_component=cache.components.get(
+                        ComponentType.AUXILIARY_SWA
+                    ),
                     storage_prefetch_threshold=prefetch_threshold,
                 )
             # New workers must see the requested policy from their first operation.
@@ -293,12 +296,14 @@ class StorageAttachment:
     def resolve_prefetch_threshold(self, configured: int) -> int:
         """Use the same complete-window minimum for every buffer-mode anchor."""
         cache = self._cache
-        window = cache.sliding_window_size
-        if not window or cache.host_memory_mode != "buffer_only":
-            return configured
-        page_size = cache.page_size
-        window_tokens = ((window + page_size - 1) // page_size) * page_size
-        return max(configured, window_tokens)
+        if cache.host_memory_mode == "buffer_only":
+            for ct in (ComponentType.SWA, ComponentType.AUXILIARY_SWA):
+                component = cache.components.get(ct)
+                if component is not None:
+                    configured = max(
+                        configured, component.full_window_pages * cache.page_size
+                    )
+        return configured
 
     def _resolve_metrics_collector(
         self,
@@ -421,29 +426,13 @@ class StorageAttachment:
                     cache.revoke_pending_prefetch(handle)
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
-                del cache.ongoing_prefetch[handle]
-                if info.anchor_lock_params is not None:
-                    cache.dec_host_lock_ref(
-                        info.anchor_node_id, info.anchor_lock_params
-                    )
-                if cache.buffer_pipeline is not None:
-                    cache.buffer_pipeline.pop_prefix_ctx(handle)
-                    cache.buffer_pipeline.release_anchor_lock(handle)
-                controller.append_host_mem_release(
-                    host_indices=info.host_indices[:completed_tokens],
-                    extra_pools=(
+                cache._retire_ongoing_prefetch(
+                    handle,
+                    info.host_indices[:completed_tokens],
+                    (
                         [x for xfers in info.comp_xfers.values() for x in xfers]
                         if info.operation.pool_transfers_done
                         else None
-                    ),
-                )
-                controller.prefetch_tokens_occupied = max(
-                    0,
-                    controller.prefetch_tokens_occupied
-                    - cache._prefetch_occupied_span(
-                        info.prefetch_key,
-                        info.host_indices,
-                        operation=info.operation,
                     ),
                 )
             except Exception:
@@ -462,3 +451,4 @@ class StorageAttachment:
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()
+        cache._storage_prefetch_wait.clear()

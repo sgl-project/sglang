@@ -42,7 +42,7 @@ pub struct DetokenizeResponse {
 }
 
 /// Distinguish a served model started with `--tokenizer-path none` from an unknown one.
-fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
+pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
     ctx.tokenizers.get(model).ok_or_else(|| {
         if model == ctx.config.model.id {
             ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
@@ -129,7 +129,10 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 dp_aware: false,
+                dp_rank_policy: Default::default(),
                 bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,

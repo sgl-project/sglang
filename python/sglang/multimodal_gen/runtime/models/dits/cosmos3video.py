@@ -375,7 +375,6 @@ class DomainAwareLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.num_domains = num_domains
         self.fc = nn.Embedding(num_domains, output_size * input_size)
         self.bias = nn.Embedding(num_domains, output_size)
         nn.init.xavier_uniform_(
@@ -552,7 +551,6 @@ class Cosmos3DenseMLP(nn.Module):
             and up.dtype == torch.bfloat16
             and up.is_contiguous()
             and not torch.is_grad_enabled()
-            and not torch.compiler.is_compiling()
         ):
             up = relu2(up, fast_math=False)
         else:
@@ -581,6 +579,27 @@ def _build_mlp(
 # -----------------------------------------------------------------------------
 # Cosmos3 UND Causal Attention
 # -----------------------------------------------------------------------------
+
+
+def _initialize_attention_projections(module, prefix, quant_config):
+    module.q_size = module.num_attention_heads * module.head_dim
+    module.kv_size = module.num_key_value_heads * module.head_dim
+    module.to_qkv = MergedColumnParallelLinear(
+        module.hidden_size,
+        [module.q_size, module.kv_size, module.kv_size],
+        bias=False,
+        gather_output=False,
+        quant_config=quant_config,
+        prefix=add_prefix("to_qkv", prefix),
+    )
+    module.to_out = RowParallelLinear(
+        module.q_size,
+        module.hidden_size,
+        bias=False,
+        input_is_parallel=True,
+        quant_config=quant_config,
+        prefix=add_prefix("to_out", prefix),
+    )
 
 
 class Cosmos3CausalAttention(nn.Module):
@@ -618,24 +637,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         # Per-head QK norm (optional; some backbones omit it on text).
         if qk_norm:
@@ -754,24 +756,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
@@ -832,7 +817,6 @@ class Cosmos3CrossAttention(nn.Module):
         use_fused_kv_pack = (
             use_fused_qk_norm_rope
             and q.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
             and self.norm_q.weight.dtype == q.dtype
@@ -1803,7 +1787,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         use_fused_qk_norm_rope = T > 1 or (
             enable_t1_fused_qk_norm_rope
             and hidden_gen.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,

@@ -45,7 +45,10 @@ fn config_for(_worker_url: &str) -> Config {
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             dp_aware: false,
+            dp_rank_policy: Default::default(),
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -247,7 +250,7 @@ async fn streaming_chunks_pass_through() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         res.headers().get("content-type").unwrap().to_str().unwrap(),
-        "text/event-stream"
+        "text/event-stream; charset=utf-8"
     );
 
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
