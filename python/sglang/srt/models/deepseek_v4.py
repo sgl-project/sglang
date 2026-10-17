@@ -104,8 +104,8 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
@@ -4456,9 +4456,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
-        )
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
