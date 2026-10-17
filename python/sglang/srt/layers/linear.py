@@ -272,6 +272,13 @@ class LinearBase(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                online_linear_method,
+            )
+
+            self.quant_method = online_linear_method(self, prefix)
+
         if self.quant_method is not None:
             wrap_method_with_debug_kernel_once(
                 self.quant_method,

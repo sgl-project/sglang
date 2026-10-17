@@ -557,6 +557,10 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # Parsed --online-quantization TARGET:SCHEME pairs (see
+    # npu.layernorm_quant.parse_online_quantization). Empty when the flag is
+    # off: ordinary checkpoints keep their checkpoint precision semantics.
+    online_quantization: dict | None = None
     # The shared-experts-fusion decision, per runner — the runner_backend /
     # speculative_runner_backend shape. Both leaves are seeded from the config
     # intent by ``initialize_moe_config``; each MoE model's gate

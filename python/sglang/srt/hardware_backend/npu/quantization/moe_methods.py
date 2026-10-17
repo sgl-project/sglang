@@ -5,6 +5,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe.contracts import MXFP4
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -163,7 +164,7 @@ def fused_moe_npu(
     moe_runner_config,
 ):
     logger.warning_once(
-        f"The fused_moe_npu method deprecated and will be removed in future releases"
+        "The fused_moe_npu method deprecated and will be removed in future releases"
     )
     topk_weights, topk_ids, _ = topk_output
     original_dtype = x.dtype
@@ -250,6 +251,26 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
     def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
         """Set dispatcher output dtype if the layer has a dispatcher."""
         if hasattr(layer, "dispatcher"):
+            if dtype == "bf16":
+                from sglang.srt.hardware_backend.npu.moe.contracts import (
+                    INT4,
+                    MXFP4,
+                    moe_input_contract,
+                )
+                from sglang.srt.hardware_backend.npu.moe.init_routing import (
+                    supports_packed_routing,
+                )
+                from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+                    AscendTPDispatcher,
+                )
+
+                contract = moe_input_contract(getattr(layer, "w13_kernel", None))
+                if (
+                    isinstance(layer.dispatcher, AscendTPDispatcher)
+                    and contract in (INT4, MXFP4)
+                    and supports_packed_routing(contract.kind)
+                ):
+                    dtype = contract.kind
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
 
     @staticmethod
@@ -313,6 +334,17 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
         # preserves multi-node prefill when ``deepep-mode=auto``.
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+            from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+                AscendTPDispatcher,
+            )
+
+            if (
+                isinstance(layer.dispatcher, AscendTPDispatcher)
+                and layer.moe_ep_size == 1
+                and self.dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT
+            ):
+                self._set_dispatcher_output_dtype(layer, "mxfp8")
+                return
             layer.dispatcher.set_quant_config(
                 {
                     "normal_dispatcher_output_dtype": "bf16",
@@ -417,6 +449,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
+            contract=MXFP4,
         )
 
     def process_weights_after_loading(
@@ -792,7 +825,19 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         scale_bias_name = f"{weight_prefix}_scale_bias"
         if hasattr(layer, scale_bias_name):
             scale_bias = getattr(layer, scale_bias_name)
-            scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+            bias = scale_bias.data
+            if weight_prefix == "w2":
+                # W2 is K-sharded; each rank owns only its compensation segments.
+                tp_size = layer.moe_tp_size
+                num_segments = bias.shape[-1]
+                if num_segments % tp_size:
+                    raise ValueError(
+                        f"W2 compensation segments ({num_segments}) must be divisible "
+                        f"by MoE TP size ({tp_size})"
+                    )
+                shard_size = num_segments // tp_size
+                bias = bias.narrow(2, layer.moe_tp_rank * shard_size, shard_size)
+            scale_bias.data = bias.transpose(1, 2).contiguous().sum(dim=1)
 
     def _process_scale(
         self,
@@ -1222,12 +1267,11 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        if weight_prefix != "w2":
-            raise ValueError(
-                f"NPUMXFP8MoEMethod.apply only serves the w2 gmm, got "
-                f"'{weight_prefix}'. gmm1 fuses swiglu into a single op and must "
-                f"go through apply_fused_gmm1_swiglu, which returns a scale too."
-            )
+        self._validate_weight_prefix(quant_info, weight_prefix)
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = HiddenStatesDynamicQuant(
+                quant_dtype=torch.float8_e4m3fn
+            )(hidden_states)
 
         e8m0_dtype = _require_e8m0_dtype()
         scale_args: Dict[str, Any] = {
@@ -1238,7 +1282,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             "x_dtype": None,
             "weight_dtype": None,
         }
-        return self.matmul.forward(
+        return GroupedMatmul().forward(
             quant_info,
             weight_prefix,
             hidden_states,

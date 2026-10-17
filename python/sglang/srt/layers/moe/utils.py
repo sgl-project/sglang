@@ -295,6 +295,7 @@ class DispatcherOutputDtype(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
+    INT4 = "int4"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"
@@ -500,6 +501,24 @@ def initialize_moe_config():
     moe.tbo_token_distribution_threshold = overlap.tbo_token_distribution_threshold
     moe.disable_fp4_allgather = exec_moe.disable_flashinfer_cutlass_moe_fp4_allgather
     moe.quantization = get_model().quantization
+    from sglang.srt.hardware_backend.npu.layernorm_quant import (
+        parse_online_quantization,
+    )
+
+    moe.online_quantization = parse_online_quantization(
+        getattr(get_model(), "online_quantization", None)
+    )
+    if moe.online_quantization:
+        from sglang.srt.utils import is_npu
+
+        if not is_npu():
+            raise ValueError("--online-quantization currently requires Ascend NPU")
+        from sglang.srt.hardware_backend.npu.moe.norm_gate import GATE_SCHEME_CONTRACTS
+
+        for target, scheme in moe.online_quantization.items():
+            allowed = ("W8A8_MXFP8",) if target == "moe" else GATE_SCHEME_CONTRACTS
+            if scheme not in allowed:
+                raise ValueError(f"Online {target}:{scheme} conversion is unsupported")
     # Seeded with the user's intent; each model's gate refines the ACTIVE
     # value for its own build (install_shared_experts_fusion_decision).
     moe.disable_shared_experts_fusion = exec_moe.disable_shared_experts_fusion

@@ -449,7 +449,7 @@ python3 -m sglang.launch_server \
 
 > **Implementation Notes:**
 > - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
-> - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP8 dispatch. SGLang dynamically quantizes each expert input to MXFP8 immediately before grouped matmul.
+> - Native TP/EP1 uses MXFP8 routing when the selected W13 method accepts the standard MXFP8 activation contract. Compatible separate shared projections can reuse the same quantized input. Other dispatch paths retain their configured precision and quantize before grouped matmul when needed.
 
 **MXFP4 W4A4 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 
@@ -471,8 +471,9 @@ python3 -m sglang.launch_server \
 > **Implementation Notes:**
 > - **Online** (`NPUDualLevelMXFP4LinearMethod`) uses **dual-level** MXFP4: both weights and activations are quantized with a fine FP8 (E4M3) L0 block scale plus a coarser L1 scale via `npu_dynamic_dual_level_mx_quant`, and the matmul runs via `npu_dual_level_quant_matmul` (weight in FRACTAL_NZ). Dual-level captures per-block dynamic range far better than a single UE8M0 (power-of-2) scale, which is what made an earlier single-level RTN online path degenerate (greedy decoding could loop without emitting EOS).
 > - **Offline** (`ModelSlimMXFP4Scheme` → `NPUSingleLevelMXFP4OfflineLinearMethod`) is **single-level**: msmodelslim's `W4A4_MXFP4` checkpoint ships single-level UE8M0 block scales (block_size = 32), so the matmul runs via `npu_quant_matmul(..., x1_dtype=x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[1, 1, 32])`. The online and offline paths therefore use different matmul kernels — they no longer share the matmul path.
+> - Single-level MXFP4 activations use one contract for dense and MoE projections: E2M1 values packed two per byte, block size 32 along the last axis, paired E8M0 scales, `scale_alg=0`, and explicit `round_mode="rint"` (nearest, ties to even). This avoids a dense/MoE rounding mismatch and systematic tie rounding away from zero. It does not change checkpoint weights or load-time weight rounding. The online dual-level format keeps its separate L0/L1 scale representation.
 > - As with W4A8, the packed-FP4 dtype passed to the NPU ops (`dst_type` / `x2_dtype`) must be resolved from `torch_npu.float4_e2m1fn_x2` (an int enum), not the `torch.float4_e2m1fn_x2` dtype object, which recent op-plugin builds reject.
-> - Validated end-to-end on Ascend 950PR/DT Series hardware.
+> - Validate the exact checkpoint and runtime on Ascend 950PR/DT Series hardware; the unified single-level activation rounding policy requires target accuracy validation.
 
 **ModelSlim W4A4 MXFP4 for LLM MoE models:**
 
@@ -490,6 +491,39 @@ python3 -m sglang.launch_server \
 > **Implementation Notes:**
 > - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
 > - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP4 dispatch. SGLang dynamically quantizes each expert input to MXFP4 immediately before grouped matmul.
+> - MoE and offline dense W4A4 use the same explicit single-level MXFP4 activation contract described above. Integer `W4A4_DYNAMIC` uses different arithmetic, packing and scales and cannot consume this operand. Matching activation contracts alone do not enable packed routing reuse or fused GMM1.
+
+### Native TP MoE optimization eligibility
+
+On native TP (`--moe-a2a-backend none`, EP size 1), shared-expert append requires matching routed/shared projection schemes, compatible intermediate sizes and complete checkpoint metadata. Supported ModelSlim expert descriptors include `FLOAT`, `W8A8_DYNAMIC`, `W4A8_DYNAMIC`, `W4A4_DYNAMIC`, `W8A8_MXFP8`, `W4A8_MXFP` and `W4A4_MXFP4`. W13 and W2 may use different supported schemes; gate and up must agree.
+
+Shared append and a separate shared MLP are alternative executions. Compatible separate projections may use dual streams and shared-output finalization. Dynamic INT8 and MXFP8 inputs can be reused only when their quantization contracts match. Packed MXFP4/INT4 routing modes 9/13 are selected only after an installed-runtime probe matches the existing quantizer. MXFP4 operand passthrough additionally requires a successful payload/scale probe; INT4 passthrough stays disabled. A ModelSlim integer `W4A8_DYNAMIC` shared projection has no dense NPU method; if shared append is unavailable or disabled, initialization reports the unsupported method.
+
+Fused W13 selection checks the W2 input contract, activation/clamp/bias semantics and installed CANN support. Unsupported fusion uses the existing multi-op path. These eligibility checks and CPU regression tests do not establish A5 accuracy or performance: validate the exact checkpoint in eager and decode NPUGraph modes before claiming a gain. `rint` is the accuracy-oriented rounding policy; model-level superiority over other policies has not been measured for this change. See the [native MX quantization API](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_dynamic_mx_quant.md) for its supported parameters.
+
+### Fused norm and scoped online conversion
+
+An offline-quantized router loads its own ModelSlim descriptor, independently of the expert weights. GLM, DeepSeek and Qwen routers retain floating-point weights when their descriptor is `FLOAT` or absent. Correction biases and Qwen's shared sigmoid gate keep their original precision.
+
+GLM and DeepSeek can fuse the FFN input norm with dynamic activation quantization when every input consumer accepts the same contract. GLM also supports its QKV boundary, and both families support dense FFN inputs. Selection checks the installed operator ABI and output layouts. A floating-point router, mismatched consumers, unsupported packed routing, or an unsupported topology keeps the existing norm path. Qwen's shared sigmoid gate and Qwen3.5's GDN dual consumers retain their BF16 input; no approximate reconstruction replaces it.
+
+Online weight conversion is optional and changes model numerics. Use `--online-quantization TARGET:SCHEME[,TARGET:SCHEME...]` on Ascend to convert selected floating-point weights after checkpoint loading:
+
+```bash
+python -m sglang.launch_server --model-path /path/to/model --device npu \
+  --attention-backend ascend --moe-a2a-backend none \
+  --online-quantization gate:w8a8_mxfp8
+```
+
+| Target | Online schemes |
+|---|---|
+| `gate` (routed router), `shared_expert`, `qkv`, `dense` | `w8a8_mxfp8` (alias `w8a8_mxfp`), `w8a8_dynamic` |
+| `moe` | `w8a8_mxfp8` |
+| `all` | Expands to every target; explicit targets override it |
+
+Dense targets cover MLP gate/up/down projections; QKV targets cover standard and MLA input projections. Attention output projections, embeddings and shared sigmoid gates are excluded. Offline-quantized weights retain their checkpoint method. Role-specific MoE/shared conversion keeps shared experts separate. Unsupported online INT4/FP4 schemes fail at startup; offline INT4/FP4 checkpoint methods remain available.
+
+MXFP8 online router matmul requests FP32 logits and verifies the actual projection dimensions after loading. INT8 routers use BF16 matmul output followed by an FP32 cast; this does not provide FP32 accumulation. Original floating-point online weights remain available for comparison. Validate routing accuracy, eager/graph execution and serving performance on the target A5 before deployment; host tests do not establish those results.
 
 ## Diffusion Model Quantization on Ascend NPU
 
