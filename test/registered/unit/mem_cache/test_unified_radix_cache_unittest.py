@@ -154,6 +154,7 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    decoder_swa_bounded_replay: bool = False
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
@@ -741,6 +742,7 @@ def build_fixture(
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
@@ -12427,6 +12429,64 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         release_kv_cache(req, cache, checkpoint=True)
         self.assertNotIn("s", cache.session.slots)
         cache.sanity_check()
+
+    def test_bounded_replay_turn_borrows_record_without_hold_back(self):
+        """A short turn borrows its whole record; holding back a window would end
+        the match inside the published prompt, which the slot cannot rewind."""
+        cache, allocator, pool = build_fixture(
+            replace(self.cfg, decoder_swa_bounded_replay=True)
+        )
+        session = self._session("s")
+        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
+        cache.maybe_hand_to_session(first)
+        cache.checkpoint(first, up_to=8)
+        first.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(first))
+
+        req = self._turn(list(range(1, 11)), session)
+        req.init_next_round_input(cache)
+        self.assertIn("s", cache.session.slots)
+        self.assertEqual(req.prefix_len, 8)
+
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+
+class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
+    def _matched_len(self, cache, tokens) -> int:
+        req = Req(
+            rid="decoder-swa-bounded-replay",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        return req.prefix_len
+
+    def test_match_stops_one_window_short_under_bounded_replay(self):
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=128,
+        )
+        for bounded_replay, matched in ((False, 200), (True, 260 - 128)):
+            with self.subTest(decoder_swa_bounded_replay=bounded_replay):
+                cache, allocator, _ = build_fixture(
+                    replace(cfg, decoder_swa_bounded_replay=bounded_replay)
+                )
+                cached = list(range(1, 201))
+                value = allocator.alloc(len(cached))
+                self.assertIsNotNone(value)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", cached)), value=value[: len(cached)]
+                    )
+                )
+                # 200 of 260 cached: a plain hit would leave a 60-row extend
+                prompt = cached + list(range(1001, 1061))
+                self.assertEqual(
+                    cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
+                )
+                self.assertEqual(self._matched_len(cache, prompt), matched)
 
 
 if __name__ == "__main__":
