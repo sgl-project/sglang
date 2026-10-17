@@ -155,7 +155,7 @@ bag to override at all.
   any more; review new instance reads against the raw-input contract. What
   genuinely stays per-instance is what differs per *worker* within one engine:
   `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
-  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
+  `BaseMultimodalProcessor._platform_mm_preprocessing_device` is the shape to copy).
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
