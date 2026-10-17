@@ -978,6 +978,9 @@ class Envs:
     # and fuse its all-gather with the next layer's attention read, up to 64 tokens
     # (LL collectives, layers/communication/k3_ll_comm_hip.py).
     SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
+    # Complete the attention output's all-reduce, the residual add and the FFN-side
+    # read in one LL kernel for 4-token batches (EAGLE C1 verify).
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.

@@ -100,6 +100,9 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # The communicator of a kernel that completes the attention output's sum
+    # over every row and runs the FFN read with it (K3 on gfx950), or None.
+    attn_all_reduce_comm: Optional[object] = None
     # Whether a batch of this many tokens completes the attention output's sum
     # onto this rank's 1/TP of the rows, reads the FFN input there and gathers
     # it, leaving the written residual on the shard for an FFN that consumes
@@ -147,6 +150,18 @@ class AttnBankState:
             score_proj=self.ffn_score_proj,
             score_norm=self.ffn_score_norm,
             write=False,
+        )
+
+    def all_reduce_and_read_ffn_input(
+        self, hidden_states, residual, forward_batch, norm
+    ):
+        return self.bank.require().forward_all_reduce(
+            hidden_states,
+            residual,
+            self.ffn_score_proj,
+            self.ffn_score_norm,
+            norm,
+            self.attn_all_reduce_comm,
         )
 
     def reduce_scatter_rows_and_read_ffn_input(
@@ -324,6 +339,13 @@ class _FfnReadout(_BankReadout):
                     SumGroup.ATTN_TP,
                     state.reduce_scatter_rows_and_read_ffn_input,
                     reads=True,
+                ),
+                *fusions,
+            )
+        if state.attn_all_reduce_comm is not None:
+            fusions = (
+                ReadoutFusion(
+                    SumGroup.ATTN_TP, state.all_reduce_and_read_ffn_input, reads=True
                 ),
                 *fusions,
             )

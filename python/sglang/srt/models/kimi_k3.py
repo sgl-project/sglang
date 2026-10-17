@@ -2936,6 +2936,7 @@ class KimiK3DecoderLayer(nn.Module):
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
                 reads_slices=_carries_bank_slices(config, sp_collective),
+                attn_all_reduce_comm=self._attn_all_reduce_read_comm(),
                 ffn_row_shards=self._ffn_row_shards(),
             ).residual_ops()
         attn, ffn = _stage_facts(
@@ -2945,6 +2946,15 @@ class KimiK3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
+
+    def _attn_all_reduce_read_comm(self):
+        """gfx950 TP8: the LL communicator of the attention output's all-reduce
+        fused with the FFN-side bank read, or None."""
+        if not (_is_gfx95 and envs.SGLANG_ROCM_K3_FUSED_ATTN_AR_READ.get()):
+            return None
+        if self._sp_moe or self.all_reduce_fusion:
+            return None
+        return k3_ll_comm_hip.get_comm()
 
     def _ffn_row_shards(self):
         """gfx950: the batch-size predicate under which the FFN read completes the
