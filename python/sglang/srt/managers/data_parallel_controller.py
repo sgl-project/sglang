@@ -53,7 +53,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import (
+    is_health_check_generate_req,
+    wait_for_scheduler_ready,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -688,6 +691,10 @@ class DataParallelController:
         )
 
         scheduler_pipe_readers = []
+        # Local to this call. self.scheduler_procs is shared with the threads
+        # that launch the other DP groups, so it cannot be indexed alongside
+        # the readers collected here.
+        launched_procs = []
 
         pp_size_per_node = max(get_parallel().pp_size // get_parallel().nnodes, 1)
         nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
@@ -794,12 +801,18 @@ class DataParallelController:
                         ):
                             proc.start()
                         self.scheduler_procs.append(proc)
+                        launched_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
-        scheduler_info = []
-        for i in range(len(scheduler_pipe_readers)):
-            scheduler_info.append(scheduler_pipe_readers[i].recv())
+        if self.prelaunched_schedulers is not None:
+            # The launcher owns these processes and this side holds no writer,
+            # so a scheduler that dies closes its pipe and recv() raises.
+            scheduler_info = [reader.recv() for reader in scheduler_pipe_readers]
+        else:
+            scheduler_info = wait_for_scheduler_ready(
+                scheduler_pipe_readers, launched_procs
+            )
 
         # Pure-DP TP groups launch concurrently. Their ready replies contain
         # only publishers owned by schedulers on this node.
