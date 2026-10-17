@@ -402,4 +402,4 @@ class FlowRolloutController:
             return
 
         self.step_latents.append(latents.detach())
-        self.step_timesteps.append(timestep_value.detach().cpu())
+        self.step_timesteps.append(timestep_value.detach())

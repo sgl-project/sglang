@@ -4,7 +4,7 @@
 A loop calls ``prepare_rollout_if_enabled`` before SP sharding,
 ``init_rollout_env_if_enabled`` at the loop start and
 ``finalize_rollout_if_enabled`` at the loop end, and passes
-``rollout_transition(batch)`` to ``scheduler.step``. Every hook is a no-op for
+``**rollout_step_kwargs(batch)`` to ``scheduler.step``. Every hook is a no-op for
 serving requests.
 """
 
@@ -30,7 +30,6 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
     gather_stacked_latents_for_sp,
 )
 
-
 # Key of the image/video latent stream in ``Req.rollout_controllers``.
 VISUAL_STREAM = "visual"
 
@@ -47,15 +46,14 @@ def _kwargs_to_cpu(d: Any) -> Any:
     return d
 
 
-def rollout_transition(batch: Req) -> Callable[..., torch.FloatTensor] | None:
-    """The ``transition`` to pass to ``scheduler.step`` for this request: the
-    visual-stream rollout controller, or None to keep the scheduler's own update."""
+def rollout_step_kwargs(batch: Req) -> dict[str, Any]:
+    """The rollout-only keyword arguments of ``scheduler.step`` for this request:
+    the visual-stream controller's ``transition``. Empty for a serving request, so
+    its step call is unchanged and works with any scheduler."""
     current_rollout_controller = batch.rollout_controllers.get(VISUAL_STREAM)
-    return (
-        None
-        if current_rollout_controller is None
-        else current_rollout_controller.transition
-    )
+    if current_rollout_controller is None:
+        return {}
+    return {"transition": current_rollout_controller.transition}
 
 
 def _build_scheduler_rollout_controller(
