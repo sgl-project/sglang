@@ -875,6 +875,7 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if processor.__class__.__name__ in {
+                "AudioFlamingo3Processor",
                 "Gemma3nProcessor",
                 "Gemma4Processor",
                 "Gemma4UnifiedProcessor",
@@ -888,6 +889,11 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audio"] = audios
                 kwargs.setdefault("audio_kwargs", {})
                 kwargs["audio_kwargs"].setdefault("truncation", False)
+                if processor.__class__.__name__ == "AudioFlamingo3Processor":
+                    # AudioFlamingo3's audio tower has a fixed-size learned
+                    # positional embedding, so it needs padding="max_length"
+                    # rather than the dynamic padding=True broadcast below.
+                    kwargs["audio_kwargs"].setdefault("padding", "max_length")
             else:
                 kwargs["audios"] = audios
             if self.audio_config:
@@ -913,11 +919,19 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
+        # text=[input_text] is always a single-item list, so padding=True is a
+        # no-op for text here -- it only exists to broadcast into modality
+        # kwargs that don't set their own padding. Skip it when a modality
+        # (e.g. audio_kwargs above) already sets padding explicitly, since
+        # passing it both ways raises in newer transformers ProcessorMixin.
+        text_padding_kwargs = (
+            {} if "padding" in kwargs.get("audio_kwargs", {}) else {"padding": True}
+        )
         with self._temporary_fast_processor_cuda_pool(processor_device):
             result = processor.__call__(
                 text=[input_text],
-                padding=True,
                 return_tensors="pt",
+                **text_padding_kwargs,
                 **kwargs,
             )
             # Deferred: the hash is computed on the GPU tensor first, and

@@ -163,7 +163,9 @@ class TranscriptionAdapter(ABC):
 
 
 _ADAPTER_REGISTRY: dict[str, type[TranscriptionAdapter]] = {}
-_DEFAULT_ADAPTER_KEY = "Whisper"
+# GenericAdapter is registered under this reserved, non-matchable key and
+# handles any architecture with no dedicated adapter.
+_DEFAULT_ADAPTER_KEY = "__generic_default__"
 
 
 def register_transcription_adapter(
