@@ -21,7 +21,7 @@ checks instead of branching on version numbers.
   same monorepo checkout.
 - A local model directory containing model configuration files. Tokenizer files
   are also required unless tokenizer initialization is disabled.
-- Predictor data for AIConfigurator, ML, or replay mode.
+- Predictor data for AISimulate, ML, or replay mode.
 
 Use an official SGLang image matching the checkout when validating GPU and
 runtime compatibility.
@@ -38,23 +38,86 @@ The simulator does not install or pin a second `sglang` package. Run it from a
 checkout whose `python/sglang` package is available on `PYTHONPATH`, or from a
 matching official SGLang image.
 
-AIConfigurator is optional. Install it separately when using the
-`aiconfigurator` predictor. The `aic` extra pins AIConfigurator to the exact release
-validated with the simulator so upstream API changes cannot silently alter an
-installation. In a clean virtual environment, install the extra with:
+### Estimator SDK
+
+Install the AISimulate estimator SDK through the extra below. The current
+simulator shared import and memory-estimation paths also load this SDK when
+using ML or replay predictors:
 
 ```bash
-pip install -e "tools/sglang-simulator[aic]"
+pip install -e "tools/sglang-simulator[aisimulate]"
 ```
 
-In an existing SGLang image, install the same pin without dependency resolution
-to avoid replacing its NumPy/CUDA stack:
+The extra pins `aisimulate==0.12.1`, the release this integration is
+validated against; other AISimulate versions are not validated. AISimulate
+0.12.1 requires Python 3.11–3.13. The integration uses the estimator SDK
+only — AISimulate Replay and Sweeper are out of scope. Pair this dependency
+with the
+`examples/sim_configs/aisimulate_sol.json` and `aisimulate_silicon.json`
+example configurations, which set `scheduler.backend_version` to `0.5.10`,
+the backend slot the AISimulate performance databases publish for these
+systems. That field selects performance data; it is not the SGLang checkout
+version.
 
-```bash
-pip install --no-deps "aiconfigurator==0.10.0"
-```
+AISimulate is the successor to AIConfigurator and is the current home of its
+estimator SDK, which was originally contributed by the AIConfigurator
+project; see the
+[upstream transition policy](https://github.com/ai-dynamo/aisimulate#aiconfigurator-repository-transition).
+In the pinned 0.12.1 release the SDK is published under the
+`aiconfigurator.sdk` compatibility namespace *inside* the `aisimulate`
+distribution — `aisimulate.sdk` does not exist in that release — so the
+predictor adapter imports from `aiconfigurator.sdk` on purpose. The adapter
+verifies distribution provenance at import time: the namespace must be
+provided by the `aisimulate` distribution and the standalone legacy
+`aiconfigurator` distribution must not be installed. Environments that still
+carry the legacy distribution fail with an actionable error instead of
+silently running unvalidated estimator code.
+[`test/test_aisimulate_import.py`](test/test_aisimulate_import.py)
+covers this provenance contract, and
+[`test/test_aisimulate_predictor.py`](test/test_aisimulate_predictor.py)
+covers the real-SDK predictor behavior.
 
-Upgrade this pin only after rerunning the AIC predictor and compatibility tests.
+### Migrating from the legacy AIConfigurator setup
+
+The legacy `[aic]` extra (`aiconfigurator==0.10.0`), the `aic_sol.json` and
+`aic_silicon.json` examples, and the `aiconfigurator` predictor name have
+been removed; this is a breaking configuration change. Migrate an existing
+setup as follows:
+
+1. Create a fresh environment and install the AISimulate extra:
+
+   ```bash
+   pip install -e "tools/sglang-simulator[aisimulate]"
+   ```
+
+   Do not install `aiconfigurator` into it: the adapter rejects environments
+   where the legacy distribution is present.
+
+2. In the simulator configuration, rename the predictor and switch the
+   database slot to the one the AISimulate databases publish:
+
+   ```json
+   "predictor": {"name": "aiconfigurator", "database_mode": "SILICON"}
+   ```
+
+   becomes
+
+   ```json
+   "predictor": {"name": "aisimulate", "database_mode": "SILICON"}
+   ```
+
+   For the supplied `a100_sxm` / `sglang` examples, move
+   `scheduler.backend_version` from `0.5.9` to `0.5.10`: the pinned SDK
+   provides the latter database slot for this combination. For other
+   hardware or backends, select a slot actually available in their database.
+   A mismatched slot fails at server startup rather than being skipped. The
+   `aisimulate_sol.json` and `aisimulate_silicon.json` examples show the
+   resulting configuration.
+
+3. Re-run the predictor and compatibility tests after migrating.
+
+Upgrade the AISimulate pin only after rerunning the predictor and
+compatibility tests.
 
 ## Quick start
 
@@ -64,12 +127,17 @@ The maintained tests define the supported first-version scope:
   direct Python use of the repository-level
   [`SGLangBenchmarkRunner`](../../benchmark/simulator/bench_runner.py);
 - [`test/test_simulation_sglang_serving.py`](test/test_simulation_sglang_serving.py):
-  server plus benchmark-client use through the HTTP serving path with AIC, ML,
-  and replay predictors and ShareGPT or timestamped traffic;
+  server plus benchmark-client use through the HTTP serving path with the
+  installed estimator SDK, ML, and replay predictors and ShareGPT or
+  timestamped traffic;
 - [`test/test_simulation_offline_blocking.py`](test/test_simulation_offline_blocking.py):
   equivalent logical results in `OFFLINE` and `BLOCKING` modes;
 - [`test/test_simulation_cache_hit_ratio.py`](test/test_simulation_cache_hit_ratio.py):
-  reusable-prefix accounting and cache-tier hit metrics across repeated runs.
+  reusable-prefix accounting and cache-tier hit metrics across repeated runs;
+- [`test/test_aisimulate_import.py`](test/test_aisimulate_import.py):
+  estimator-SDK namespace and distribution-provenance selection;
+- [`test/test_aisimulate_predictor.py`](test/test_aisimulate_predictor.py):
+  real-SDK prefill/decode prediction and predictor configuration registry.
 
 From `tools/sglang-simulator`:
 
@@ -82,6 +150,13 @@ Read these tests as the minimal maintained examples for constructing a dataset,
 running a benchmark, starting a simulator server, sending programmatic, ShareGPT,
 or timestamped traffic, comparing execution modes, and collecting request,
 latency, throughput, and prefix-cache metrics.
+
+The serving and offline-blocking tests use the AISimulate example
+configurations `aisimulate_sol` and `aisimulate_silicon`, which pin the
+`0.5.10` backend slot that the AISimulate performance databases publish. With
+no estimator SDK installed, the SDK-dependent cases fail at server startup;
+it is not skipped. The CPU CI workflow runs the full suite in a single
+AISimulate environment with the real SDK installed.
 
 ## Serving mode
 
@@ -194,11 +269,12 @@ A simulator configuration has three sections:
 - `predictor` selects forward-latency prediction.
 - `scheduler` describes the real target deployment topology and backend metadata.
   `tp_size`, `ep_size`, `dp_size`, `pp_size`, and `cp_size` are modeled values;
-  they do not launch physical workers. For AIConfigurator, `tp_size` is converted
-  to attention TP after removing modeled DP and CP, while `cp_size` is passed as
-  AIConfigurator context parallelism. `cp_style` uses the AIConfigurator values
-  such as `none`, `allgather`, `ulysses`, or `ring`. Decode-only `dcp_size` has no
-  separate AIConfigurator field and is not modeled yet.
+  they do not launch physical workers. For the AISimulate predictor, `tp_size`
+  is converted to attention TP after removing modeled DP and CP, while
+  `cp_size` is passed as AISimulate context parallelism. `cp_style` uses the
+  AISimulate values such as `none`, `allgather`, `ulysses`, or `ring`.
+  Decode-only `dcp_size` has no separate AISimulate field and is not modeled
+  yet.
 
 ### Prefix-cache accuracy
 
@@ -214,7 +290,7 @@ Supported predictors:
 
 | Predictor | Purpose |
 |---|---|
-| `aiconfigurator` | Operator and module performance-database estimation. |
+| `aisimulate` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
 
@@ -234,15 +310,22 @@ benchmark paths.
 
 ## Validation
 
-Run the CPU compatibility and unit tests from the repository root:
+Run the CPU compatibility and unit tests from the repository root, with the
+`python/sglang` package importable from the same checkout (see Installation)
+and one estimator extra installed:
 
 ```bash
-pip install -e tools/sglang-simulator
+pip install -e "tools/sglang-simulator[aisimulate]"
+pip install pytest
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
+python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
+python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
+python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_import.py
+python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
 ```
 
-Run the two files as separate pytest commands because the runner test installs
+Run each file as a separate pytest command because the runner test installs
 process-global simulator hooks and state.
 
 Run repository checks before submitting:
