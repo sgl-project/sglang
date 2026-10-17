@@ -61,6 +61,7 @@ class _FakeLinker(UnifiedCacheLinker):
         self.restorable = []
         self.queued_loads = {}
         self.queued_offloads = []
+        self.offload_sessions = []
         self.load_landed = True
         self.completed_offloads = []
         self.reset_count = 0
@@ -85,8 +86,9 @@ class _FakeLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         return self.load_landed
 
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
+        self.offload_sessions.append(session_id)
         return True
 
     def num_completed_offloads(self):
@@ -276,7 +278,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             self.queued_loads.pop(rid, None)
         return self.load_landed
 
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)
@@ -866,6 +868,28 @@ def test_async_offload_pins_node_until_completion():
     assert not node.external_cache_stored
     assert node.write_through_pending_id is None
     assert unlocks == [(node_id, lock_params)]
+
+
+def test_offload_carries_the_inserting_session():
+    linker = _FakeLinker()
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in (7, 8)
+    }
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: None),
+        insert_session_id="session-a",
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes([7])
+    cache.insert_session_id = None
+    wrapper.offload_nodes([8])
+
+    assert linker.offload_sessions == ["session-a", None]
 
 
 def test_offload_skips_node_already_stored_by_tree_core():
