@@ -150,6 +150,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
+    # The worker's RequestMetrics for the latest DiT call; read by SGLDWorkerStatus.
+    last_metrics = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -328,6 +330,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
         if output_batch.error:
             raise RuntimeError(f"SGLang Diffusion worker failed: {output_batch.error}")
+        self.last_metrics = output_batch.metrics
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):

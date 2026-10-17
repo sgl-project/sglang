@@ -268,6 +268,35 @@ _EXECUTOR_CLASSES = _load_executor_classes()
 
 _SHARED = None
 _ATEXIT_REGISTERED = False
+# SGLDOptions name -> ServerArgs field, read when the worker starts.
+_STATUS_FIELDS = {
+    "num_gpus": "num_gpus",
+    "tp_size": "tp_size",
+    "ulysses_degree": "ulysses_degree",
+    "ring_degree": "ring_degree",
+    "attention_backend": "attention_backend",
+    "quantization": "quantization",
+    "resident_layers": "dit_layerwise_resident_layers",
+    "prefetch_layers": "dit_offload_prefetch_size",
+}
+
+
+def _execution_mode(args) -> str:
+    if getattr(args, "enable_torch_compile", False):
+        return "torch_compile"
+    if getattr(args, "enable_breakable_cuda_graph", False):
+        return "cuda_graph"
+    return "eager"
+
+
+def _cache_mode(executor) -> str:
+    """The cache_mode the next request will use, as set by SGLDOptions."""
+    if getattr(executor, "enable_spectrum", False):
+        return "spectrum"
+    cache_dit = getattr(executor, "enable_cache_dit", None)
+    if cache_dit is None:
+        return "worker default"
+    return "cache_dit" if cache_dit else "off"
 
 
 class SGLDiffusionGenerator:
@@ -388,6 +417,56 @@ class SGLDiffusionGenerator:
         if gen is None:
             return []
         return list(getattr(gen, "local_scheduler_process", None) or [])
+
+    def status_text(self) -> str:
+        """Worker summary from ServerArgs and the worker's RequestMetrics."""
+        if self.generator is None:
+            return "SGLD worker: not started (run the workflow once to load a model)"
+        import torch
+
+        import sglang
+
+        args = self.generator.server_args
+        executor = self.executor
+        pids = [proc.pid for proc in self._worker_processes()]
+        loader = {
+            name: getattr(args, field, None) for name, field in _STATUS_FIELDS.items()
+        }
+        loader["execution_mode"] = _execution_mode(args)
+        loader["memory_mode"] = (
+            "layerwise_offload"
+            if getattr(args, "dit_layerwise_offload", False)
+            else "resident"
+        )
+        lines = [
+            f"model: {args.model_path} pipeline={args.pipeline_class_name}",
+            f"worker: {'live' if self._is_live() else 'NOT live'} pids={pids}",
+            "loader settings (fixed until the worker restarts): "
+            + " ".join(f"{k}={v}" for k, v in loader.items()),
+        ]
+        if executor is None:
+            lines.append("per-run settings: no executor")
+        else:
+            params = getattr(executor, "cache_dit_params", None)
+            lines.append(
+                f"per-run settings (apply to the next request): "
+                f"cache_mode={_cache_mode(executor)}"
+                + (f" cache_dit_params={params}" if params else "")
+            )
+        metrics = getattr(executor, "last_metrics", None)
+        if metrics is None:
+            lines.append("last DiT call: none yet")
+        else:
+            lines.append(f"last DiT call: {metrics.total_duration_ms:.1f} ms")
+            snapshot = metrics.memory_snapshots.get("after_forward")
+            if snapshot is not None:
+                lines.append(
+                    f"vram during that call: peak allocated "
+                    f"{snapshot.peak_allocated_mb:.0f} MiB, peak reserved "
+                    f"{snapshot.peak_reserved_mb:.0f} MiB"
+                )
+        lines.append(f"sglang={sglang.__version__} torch={torch.__version__}")
+        return "\n".join(lines)
 
     def _is_live(self) -> bool:
         """True when this owner still has a usable worker + scheduler client."""
