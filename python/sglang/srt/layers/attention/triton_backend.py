@@ -1649,7 +1649,9 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch,
                     swa_loc=self.forward_metadata.swa_out_cache_loc,
                 )
-                if layer.k_scale is None:
+                if layer.k_scale is None or (
+                    self.use_mla and layer.k_scale_float == 1.0
+                ):
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
@@ -2235,7 +2237,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             if self.use_mla:
-                if layer.k_scale is not None:
+                if layer.k_scale is not None and layer.k_scale_float != 1.0:
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
