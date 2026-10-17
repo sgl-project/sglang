@@ -37,8 +37,10 @@ class TestHiCache(CustomTestCase, MMLUMixin):
                 "--enable-hierarchical-cache",
                 "--mem-fraction-static",
                 0.7,
-                "--hicache-size",
-                100 if not _is_hip else 200,
+                # No fixed host-pool size on CUDA: the default ratio is
+                # reduced to fit the runner's memory (and cgroup limit), where
+                # a fixed 100 GB OOM-killed the server on smaller runners.
+                *(["--hicache-size", 200] if _is_hip else []),
                 "--page-size",
                 "64",
                 "--hicache-storage-backend",
