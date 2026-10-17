@@ -10,6 +10,26 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
+def scatter_row_penalty(
+    target: torch.Tensor,
+    output_ids: torch.Tensor,
+    num_valid: torch.Tensor,
+    penalties: torch.Tensor,
+):
+    """Set `target[i, output_ids[i, j]] = penalties[i]` for `j < num_valid[i]`."""
+    k = output_ids.shape[1]
+    valid = torch.arange(k, device=output_ids.device)[None, :] < num_valid[:, None]
+    # Padded slots repeat the row's first token, so every write in a non-empty
+    # row stores the same value; empty rows write back what they already hold.
+    index = torch.where(valid, output_ids, output_ids[:, :1])
+    src = torch.where(
+        num_valid[:, None] > 0,
+        penalties.expand(-1, k),
+        target.gather(1, index),
+    )
+    target.scatter_(1, index, src)
+
+
 class BatchedPenalizerOrchestrator:
     def __init__(
         self,
@@ -51,6 +71,15 @@ class BatchedPenalizerOrchestrator:
         """
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
+
+    def cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        """Feed multiple committed output tokens per request to the penalizers."""
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_output_tokens_multi(
+                output_ids=output_ids, num_valid=num_valid
+            )
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -215,6 +244,14 @@ class _BatchedPenalizer(abc.ABC):
 
         self._cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_output_tokens_multi(output_ids=output_ids, num_valid=num_valid)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return
@@ -255,6 +292,16 @@ class _BatchedPenalizer(abc.ABC):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _cumulate_output_tokens_multi(
+        self, output_ids: torch.Tensor, num_valid: torch.Tensor
+    ):
+        """
+        Cumulate up to `output_ids.shape[1]` output tokens per request; only the
+        first `num_valid[i]` tokens of row i are real.
         """
         pass
 
