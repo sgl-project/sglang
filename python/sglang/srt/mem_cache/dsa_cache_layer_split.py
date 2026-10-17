@@ -156,8 +156,10 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         return data_ptrs, data_lens, item_lens
 
     def cpu_copy(self, indices):
+        from sglang.srt.platforms import current_platform
+
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
@@ -171,12 +173,14 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                     "cpu", non_blocking=True
                 )
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
+        from sglang.srt.platforms import current_platform
+
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
@@ -188,7 +192,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
                 idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
                 self.buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
 
 class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
@@ -296,8 +300,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             with comm.change_state(enable=True):
                 comm.broadcast(tensor, src=owner_rank)
         else:
+            # Fallback (e.g. NPU, where pynccl is disabled): broadcast over the
+            # HCCL device group. torch.distributed expects the *global* source
+            # rank, so map the owner's group-relative rank through cp_group.ranks
+            # (same pattern as GroupCoordinator.broadcast).
             torch.distributed.broadcast(
-                tensor, src=owner_rank, group=cp_group.cpu_group
+                tensor, src=cp_group.ranks[owner_rank], group=cp_group.device_group
             )
         return tensor
 
