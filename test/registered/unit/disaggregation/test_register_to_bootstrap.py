@@ -27,17 +27,36 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.addCleanup(override.restore)
 
     def test_sender_dp_rank_registration(self):
-        from sglang.srt.disaggregation.base.conn import KVPoll
-        from sglang.srt.disaggregation.common.conn import CommonKVSender
+        from itertools import product
 
-        for force_query in (False, True):
-            for dp_rank in (0, 1):
-                with self.subTest(force_query=force_query, dp_rank=dp_rank):
-                    mgr = MagicMock(
-                        is_dummy_cp_rank=False,
-                        attn_dp_rank=dp_rank,
-                        deferred_bootstrap=None,
-                    )
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+
+        for system_dp_size, attn_dp_size in ((4, 1), (1, 4)):
+            for method, force_query, dp_rank, room, explicit_rank in product(
+                ("follow_bootstrap_room", "round_robin"),
+                (False, True),
+                (0, 1),
+                (4, 5),
+                (False, True),
+            ):
+                with self.subTest(
+                    system_dp_size=system_dp_size,
+                    attn_dp_size=attn_dp_size,
+                    method=method,
+                    force_query=force_query,
+                    dp_rank=dp_rank,
+                    room=room,
+                    explicit_rank=explicit_rank,
+                ):
+                    mgr = CommonKVManager.__new__(CommonKVManager)
+                    mgr.is_dummy_cp_rank = False
+                    mgr.deferred_bootstrap = None
+                    mgr.system_dp_size = system_dp_size
+                    mgr.system_dp_rank = dp_rank if system_dp_size > 1 else 0
+                    mgr.attn_dp_rank = dp_rank if attn_dp_size > 1 else 0
+                    mgr.update_status = MagicMock()
+                    mgr.record_failure = MagicMock()
                     sender = MagicMock(spec=CommonKVSender)
                     sender._register_prefill_dp_rank = (
                         CommonKVSender._register_prefill_dp_rank.__get__(sender)
@@ -47,7 +66,10 @@ class TestRegisterToBootstrap(CustomTestCase):
                             "sglang.srt.disaggregation.common.conn.requests.post"
                         ) as mock_post,
                         get_context().override_server_args(
-                            dp_size=4, load_balance_method="follow_bootstrap_room"
+                            dp_size=system_dp_size,
+                            attn_dp_size=attn_dp_size,
+                            tp_size=attn_dp_size,
+                            load_balance_method=method,
                         ),
                         envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(
                             force_query
@@ -58,25 +80,31 @@ class TestRegisterToBootstrap(CustomTestCase):
                             sender,
                             mgr=mgr,
                             bootstrap_addr="127.0.0.1:8765",
-                            bootstrap_room=4,
+                            bootstrap_room=room,
+                            req_has_disagg_prefill_dp_rank=explicit_rank,
                         )
 
+                    register = not explicit_rank and (
+                        method != "follow_bootstrap_room" or force_query
+                    )
                     self.assertEqual(
                         mock_post.call_args_list,
                         [
                             call(
                                 "http://127.0.0.1:8765/register_dp_rank",
-                                json={"bootstrap_room": 4, "dp_rank": dp_rank},
+                                json={"bootstrap_room": room, "dp_rank": dp_rank},
                                 timeout=5,
                             )
                         ]
-                        if force_query
+                        if register
                         else [],
                     )
-                    conflict = not force_query and dp_rank != 0
+                    conflict = (
+                        not explicit_rank and not register and room % 4 != dp_rank
+                    )
                     self.assertEqual(mgr.record_failure.call_count, int(conflict))
                     mgr.update_status.assert_called_with(
-                        4, KVPoll.Failed if conflict else KVPoll.Bootstrapping
+                        room, KVPoll.Failed if conflict else KVPoll.Bootstrapping
                     )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
