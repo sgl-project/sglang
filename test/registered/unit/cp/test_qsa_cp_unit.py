@@ -1,6 +1,7 @@
 """CPU checks for QSA's zigzag-only context parallel entrypoints."""
 
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -50,7 +51,7 @@ def test_qsa_cp_rejects_unsupported_strategy_before_metadata_or_collectives(
 
 
 def test_cuda_indexer_forwards_global_rope_to_cp_path():
-    hidden, local_rope, metadata, global_rope = (object() for _ in range(4))
+    hidden, local_rope, metadata, global_rope, hook = (object() for _ in range(5))
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
     expected = object()
     indexer = SimpleNamespace(forward_cuda_cp=Mock(return_value=expected))
@@ -63,11 +64,12 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
         batch,
         metadata,
         cp_global_rope_positions=global_rope,
+        cp_on_key_gather_issued=hook,
     )
 
     assert actual is expected
     indexer.forward_cuda_cp.assert_called_once_with(
-        hidden, local_rope, batch, metadata, global_rope
+        hidden, local_rope, batch, metadata, global_rope, on_key_gather_issued=hook
     )
 
 
@@ -104,9 +106,11 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     for name in ("cp_shard_position_ids", "cp_shard_hidden_states"):
         monkeypatch.setattr(qsa_indexer, name, lambda value, batch: value[local_rows])
+    events = []
 
     def gather_raw_keys(local, batch):
         torch.testing.assert_close(local, hidden[local_rows])
+        events.append("key_gather")
         return hidden
 
     monkeypatch.setattr(
@@ -126,19 +130,30 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         index_head_dim=4,
         index_qk_proj=lambda value: (torch.cat([value, value], dim=-1), None),
         q_layernorm=lambda value: value,
-        apply_rope=lambda positions, value: value,
+        apply_rope=Mock(side_effect=lambda positions, value, **kwargs: value),
         _use_fused_prep=Mock(
             side_effect=AssertionError("local keys must not be stored")
         ),
-        update_key_state_and_compress=Mock(),
+        update_key_state_and_compress=Mock(
+            side_effect=lambda *args, **kwargs: events.append("compress")
+        ),
         select_prefill_tokens=score_queries,
     )
     indexer.project_qk = lambda *args, **kwargs: QSAIndexer.project_qk(
         indexer, *args, **kwargs
     )
     actual = QSAIndexer.forward_cuda_cp(
-        indexer, hidden[local_rows], positions[local_rows], batch, metadata, positions
+        indexer,
+        hidden[local_rows],
+        positions[local_rows],
+        batch,
+        metadata,
+        positions,
+        on_key_gather_issued=lambda: events.append("hook"),
     )
+    # The hook issues the next CP-group collective (the attention's K/V gather):
+    # it must follow the key gather on every rank, and precede the work it overlaps.
+    assert events == ["key_gather", "hook", "compress"]
     expected = torch_qsa_mqa_prefill(
         hidden[local_rows].unsqueeze(1).to(compressed_dtype),
         compressed_keys,
@@ -147,6 +162,8 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     )
     torch.testing.assert_close(actual, expected)
     indexer._use_fused_prep.assert_not_called()
+    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
+    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
@@ -181,8 +198,9 @@ def _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
     "query_dtype,cache_dtype",
     [(torch.float32, torch.float32), (torch.bfloat16, torch.float8_e4m3fn)],
 )
+@pytest.mark.parametrize("prefetched", [False, True])
 def test_qsa_cp_cached_prefix_matches_full_context_attention(
-    monkeypatch, prefix_lens, rank, save_kv_cache, query_dtype, cache_dtype
+    monkeypatch, prefix_lens, rank, save_kv_cache, query_dtype, cache_dtype, prefetched
 ):
     # Unequal request lengths exercise both zigzag halves and uneven rank sizes.
     extend_lens = [8, 5]
@@ -233,7 +251,10 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     out_cache_loc = torch.cat(out_cache_locs)
     initial_k, initial_v = k_cache.clone(), v_cache.clone()
 
+    events = []
+
     def store_kv(layer, locations, k, v):
+        events.append("store")
         k_cache[locations.long()] = k.to(cache_dtype)
         v_cache[locations.long()] = v.to(cache_dtype)
 
@@ -251,15 +272,20 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         )
     backend = SimpleNamespace(
         token_to_kv_pool=pool,
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
+        # Per-forward metadata: row i of the slot table is request i's row.
+        _resolve_metadata=lambda forward_batch: SimpleNamespace(
+            token_slot_table=req_to_token[req_indices],
+            sequence_lengths=torch.tensor(seq_lens, dtype=torch.int32),
+        ),
+        _cp_kv_pending=None,
     )
+    # No req_pool_indices: reading them on the host would sync every layer.
     batch = SimpleNamespace(
         attn_cp_metadata=meta,
         seq_lens_cpu=seq_lens,
         extend_seq_lens_cpu=extend_lens,
         extend_prefix_lens_cpu=list(prefix_lens),
-        req_pool_indices=torch.tensor(req_indices),
         out_cache_loc=out_cache_loc,
     )
     local_q = strategy.shard_hidden_states(queries, batch)
@@ -275,6 +301,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     local_positions = logical_positions.index_select(0, local_rows)
 
     def gather_new_kv(local_kv, forward_batch):
+        events.append("gather")
         assert forward_batch is batch
         torch.testing.assert_close(
             local_kv, torch.cat([local_k.flatten(1), local_v.flatten(1)], dim=-1)
@@ -285,11 +312,14 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         qwen_sparse_attn_backend, "cp_materialize_global_token_order", gather_new_kv
     )
 
-    def sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+    def sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q):
         # The last local query in each block identifies its absolute causal end.
         expected_ends = local_positions[cu_q[1:].long() - 1] + 1
         torch.testing.assert_close(kv_lens.long(), expected_ends)
         assert k.dtype == v.dtype == q.dtype
+        # The host max_q sizes the kernel grid; a short one would skip query rows.
+        assert max_q == int((cu_q[1:] - cu_q[:-1]).max())
+        events.append("attention")
         return _cpu_sparse_chunk_attention(q, k, v, indices, cu_q, cu_k, kv_lens, scale)
 
     monkeypatch.setattr(
@@ -310,9 +340,42 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
     # The indexer supplies causal logical positions and marks other slots invalid.
     candidates = torch.arange(max(seq_lens), dtype=torch.int32).expand(num_local, -1)
     topk = torch.where(candidates <= local_positions[:, None], candidates, -1)
+    side, main = Mock(), Mock()
+    side.wait_stream.side_effect = lambda stream: events.append(("side_waits", stream))
+    main.wait_stream.side_effect = lambda stream: events.append(("main_waits", stream))
+
+    @contextmanager
+    def on_stream(stream):
+        events.append(("enter", stream))
+        yield
+        events.append(("exit", stream))
+
+    monkeypatch.setattr(qwen_sparse_attn_backend, "get_stream", lambda name: side)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", on_stream)
+    if prefetched:
+        QwenSparseAttnBackend.prefetch_cp_kv(backend, layer, local_k, local_v, batch)
     actual = QwenSparseAttnBackend._forward_extend_cp(
         backend, local_q, local_k, local_v, layer, batch, topk, save_kv_cache
     )
+    assert backend._cp_kv_pending is None
+    store = ["store"] if save_kv_cache else []
+    if prefetched:
+        # The side stream starts after the main stream's prior work (the key
+        # gather); the main stream joins before using the gathered K/V; the
+        # side stream, which owns their memory, then waits for those reads.
+        assert events == [
+            ("side_waits", main),
+            ("enter", side),
+            "gather",
+            ("exit", side),
+            ("main_waits", side),
+            *store,
+            "attention",
+            ("side_waits", main),
+        ]
+    else:
+        assert events == ["gather", *store, "attention"]
 
     expected = []
     row = 0
@@ -335,6 +398,39 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         pool.set_kv_buffer.assert_not_called()
     torch.testing.assert_close(k_cache.float(), initial_k.float(), equal_nan=True)
     torch.testing.assert_close(v_cache.float(), initial_v.float(), equal_nan=True)
+
+
+@pytest.mark.parametrize("ensure_cos_sin_cache", [False, True])
+def test_qsa_apply_rope_cache_sizing_is_optional(ensure_cos_sin_cache):
+    class Sized(Exception):
+        pass
+
+    rotary_emb = SimpleNamespace(
+        _ensure_cos_sin_cache_length=Mock(),
+        get_cos_sin_with_position=Mock(side_effect=Sized),
+    )
+    with pytest.raises(Sized):
+        QSAIndexer.apply_rope(
+            SimpleNamespace(rotary_emb=rotary_emb),
+            torch.arange(4),
+            torch.zeros(4, 1, 4),
+            ensure_cos_sin_cache=ensure_cos_sin_cache,
+        )
+    # Sizing reads positions.max() on the host: the CP path must skip it.
+    assert rotary_emb._ensure_cos_sin_cache_length.called is ensure_cos_sin_cache
+
+
+def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
+    side, main = Mock(), Mock()
+    monkeypatch.setattr(qwen_sparse_attn_backend, "get_stream", lambda name: side)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    backend = SimpleNamespace(_cp_kv_pending=(0, None, None))
+    QwenSparseAttnBackend.init_forward_metadata(
+        backend, SimpleNamespace(forward_mode=ForwardMode.IDLE)
+    )
+    # Later CP collectives on the main stream must not overlap the gather.
+    main.wait_stream.assert_called_once_with(side)
+    assert backend._cp_kv_pending is None
 
 
 if __name__ == "__main__":
