@@ -87,6 +87,11 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     make_candidate_indexer,
     make_full_topk_indexer,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+    SparseTableBackend,
+    _SparsePrefillTable,
+    _SparseTable,
+)
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
@@ -106,6 +111,13 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -253,10 +265,6 @@ def _maybe_precompute_flashmla_sched_meta(
 def _low_ratio_source_projections(
     layer, x, q_lora, positions, bufs, project_index: bool = True
 ):
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
-
     real = (
         get_tc_piecewise_forward_context().forward_batch.global_num_token_non_padded_cpu
     )
@@ -294,11 +302,6 @@ _bcg_prefill_flat_indexer_fn = None
 
 
 def _prefill_graph_flat_indexer(layer, x, q_lora, pos):
-    from sglang.srt.model_executor.forward_context import get_attn_backend
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
-
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     return get_attn_backend()._prefill_graph_flat_indexer_break(
         layer, x, q_lora, pos, forward_batch
@@ -306,10 +309,6 @@ def _prefill_graph_flat_indexer(layer, x, q_lora, pos):
 
 
 def _bcg_prefill_flat_indexer(*args):
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-        eager_on_graph,
-    )
-
     global _bcg_prefill_flat_indexer_fn
     if _bcg_prefill_flat_indexer_fn is None:
         _bcg_prefill_flat_indexer_fn = eager_on_graph(True)(_prefill_graph_flat_indexer)
@@ -3103,7 +3102,7 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            two_level = hasattr(self.prefill_candidates, "consume_prefill_captured")
+            two_level = not self._prefill_graph_low_ratio_index_captured()
             captured_index = (
                 run_indexer
                 and layer.indexer is not None
@@ -3582,13 +3581,17 @@ class DeepseekV4AttnBackend(
         # itself: the source publishes a static block table from its flat
         # scores and the consumers score only those blocks (the decode graph's
         # candidate variant, captured for prefill).
-        consume = getattr(self.prefill_candidates, "consume_prefill_captured", None)
-        if indexer.uses_candidates and consume is not None:
+        if (
+            indexer.uses_candidates
+            and not self._prefill_graph_low_ratio_index_captured()
+        ):
             # Always the two-level path: inside the candidate window the published
             # table is the identity, so this equals the plain top-k; past it the
             # flat path would be wrong. The candidate source runs as an eager
             # break (see forward_low_ratio_sources).
-            consume(inputs, self.forward_metadata.candidate_metadata)
+            self.prefill_candidates.consume_prefill_captured(
+                inputs, self.forward_metadata.candidate_metadata
+            )
             return
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
@@ -3691,9 +3694,7 @@ class DeepseekV4AttnBackend(
         address: without two-level candidates the full-top-k fallback is captured
         with its lengths and page tables (see forward_low_ratio_sources), so the
         replay has to refresh them in place."""
-        return not hasattr(
-            getattr(self, "prefill_candidates", None), "consume_prefill_captured"
-        )
+        return not isinstance(self.prefill_candidates, SparseTableBackend)
 
     def _prefill_graph_context_unbounded(self) -> bool:
         """Whether a prefill graph replay admits any context length: the flat
@@ -3702,7 +3703,7 @@ class DeepseekV4AttnBackend(
         captured at a context width."""
         return (
             self.low_ratio_prefill_graph
-            and hasattr(self.prefill_candidates, "consume_prefill_captured")
+            and not self._prefill_graph_low_ratio_index_captured()
             and not self.has_c4
             and not self.has_c128
         )
@@ -3731,12 +3732,12 @@ class DeepseekV4AttnBackend(
             forward_batch,
             None,
         )
-        two_level = hasattr(self.prefill_candidates, "consume_prefill_captured")
+        two_level = not self._prefill_graph_low_ratio_index_captured()
         if not (indexer.is_candidate_source and two_level):
             self.full_topk_indexer.topk_prefill(inputs)
             return ()
         published = self.prefill_candidates.publish_prefill(inputs)
-        assert published is not None and hasattr(published, "tail_rows"), (
+        assert isinstance(published, _SparsePrefillTable), (
             "candidate source published no sparse table"
         )
         tail_meta = self.tail_forward_metadata
@@ -3752,10 +3753,6 @@ class DeepseekV4AttnBackend(
     def _prefill_graph_set_candidate_table(self, table_tensors) -> None:
         """Capture time: bind the consumers' metadata to the bridge tensors the
         flat-indexer break refreshes at every replay."""
-        from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
-            _SparseTable,
-        )
-
         blocks, schedule, phys_blocks, valid_lens = table_tensors
         ready = torch.cuda.Event()
         ready.record()

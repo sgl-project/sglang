@@ -19,6 +19,14 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DeepseekV4AttnBackend,
+    DSV4Metadata,
+)
+from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
+from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import DenseBlocksBackend
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import CapturedPrefillInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -680,11 +688,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
     def test_backend_replay_keeps_captured_metadata_active(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-            DSV4Metadata,
-        )
-
         capture_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -695,6 +698,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.prefill_candidates = object.__new__(DenseBlocksBackend)
         calls = []
 
         def fake_build_forward_metadata(
@@ -742,8 +746,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self.page_table.copy_(other.page_table)
 
     def _make_low_ratio_metadata(self, base: int):
-        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
-
         return DSV4Metadata(
             self._make_core_metadata(base),
             indexer_metadata=None,
@@ -787,13 +789,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_backend_replay_refreshes_low_ratio_index_in_place_unless_two_level(
         self,
     ):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-        )
-
         for candidates, in_place in (
-            (SimpleNamespace(), True),  # DenseBlocksBackend: captured full top-k
-            (SimpleNamespace(consume_prefill_captured=lambda *_: None), False),
+            (object.__new__(DenseBlocksBackend), True),
+            (object.__new__(SparseTableBackend), False),
         ):
             capture = self._make_low_ratio_metadata(0)
             replay = self._make_low_ratio_metadata(1000)
@@ -926,11 +924,6 @@ class TestDSV4FullTopKCapturedFallback(CustomTestCase):
     """CPU-only: the captured full-top-k fallback keeps every configured k."""
 
     def _topk_calls(self, index_topk: int, width: int, use_topk_v2: bool = False):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
-        from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
-            CapturedPrefillInputs,
-        )
-
         rows = 2
         metadata = SimpleNamespace(
             compressed_page_size=64,
