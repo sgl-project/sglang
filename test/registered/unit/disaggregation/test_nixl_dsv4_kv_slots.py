@@ -79,7 +79,7 @@ class FakeAgent:
     def prep_xfer_dlist(self, peer_name, descs, mem_kind):
         return NixlKVManager._expand_stride_descs(np.asarray(descs))
 
-    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif):
+    def make_prepped_xfer(self, op, src, src_indices, dst, dst_indices, notif=b""):
         self.posted.append((src[src_indices], dst[dst_indices]))
         return len(self.posted)
 
