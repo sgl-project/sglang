@@ -43,7 +43,6 @@ FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.j
 PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
-        "cache_salt",
         "conversation_id",
         "custom_labels",
         "custom_logit_processor",
@@ -57,20 +56,18 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "kv_hints",
         "log_metrics",
         "lora_id",
-        "lora_path",
         "max_dynamic_patch",
         "max_thinking_tokens",
         "min_dynamic_patch",
         "mm_content_hashes",
+        "mm_processor_kwargs",
         "modalities",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
         "num_items_assigned",
         "positional_embed_overrides",
-        "priority",
         "received_time",
-        "require_reasoning",
         "return_bytes",
         "return_entropy",
         "return_flat_raw_output_top_logprobs",
@@ -84,7 +81,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "routing_key",
         "sampling_logprobs_mode",
         "session_id",
-        "session_params",
         "token_indices_to_pool",
         "use_audio_in_video",
         "video_config",
@@ -225,6 +221,8 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens",
                 "finish_reason",
                 "e2e_latency",
+                "cached_tokens",
+                "reasoning_tokens",
             ],
         )
         self.assertEqual(
@@ -244,7 +242,10 @@ class TestResponseParity(CustomTestCase):
             list(GenerateMetaInfo.__struct_fields__)[:4],
             ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
         )
-        self.assertEqual(list(GenerateMetaInfo.__struct_fields__)[-1], "e2e_latency")
+        self.assertEqual(
+            list(GenerateMetaInfo.__struct_fields__)[-3:],
+            ["e2e_latency", "cached_tokens", "reasoning_tokens"],
+        )
 
 
 if __name__ == "__main__":
