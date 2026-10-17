@@ -645,6 +645,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+            if (
+                envs.SGLANG_DISAGGREGATION_NIXL_LOCAL_SHM.get()
+                and self.scheduler.enable_hisparse
+            ):
+                kv_args.local_shm_pool = transfer_kv_pool
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -1761,10 +1766,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     full_kv_indices,
                     page_size,
                 ).astype(np.int32)
-                if self.transfer_backend != TransferBackend.MOONCAKE:
+                nixl_draft_transfer = (
+                    self.transfer_backend == TransferBackend.NIXL
+                    and self.draft_token_to_kv_pool is not None
+                    and not isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    and get_parallel().attn_dcp_size == 1
+                )
+                if (
+                    self.transfer_backend != TransferBackend.MOONCAKE
+                    and not nixl_draft_transfer
+                ):
                     raise NotImplementedError(
-                        "HiSparse device-only PD transfer currently requires the "
-                        "Mooncake backend"
+                        "HiSparse device-only PD transfer requires Mooncake, or "
+                        "NIXL with DSA draft KV and DCP1"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:
@@ -2725,7 +2739,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _requires_host_drain(self, decode_req: DecodeRequest) -> bool:
+        # HiSparse receives KV directly into its own host pool, independently
+        # of the HiCache host-staging path.
+        return self.scheduler.enable_hisparse or (
+            self.enable_host_receive and decode_req.host_staged
+        )
+
     def _release_request(self, decode_req: DecodeRequest) -> None:
+        if self.scheduler.enable_hisparse:
+            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
         if self.enable_host_receive:
             discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
             if decode_req.host_staged:
@@ -2800,11 +2823,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                requires_host_drain = (
-                    self.enable_host_receive and decode_req.host_staged
-                )
+                requires_host_drain = self._requires_host_drain(decode_req)
                 deferrable = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
@@ -2820,10 +2839,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if requires_host_drain or (
                     deferrable and decode_req.kv_receiver.abort_notified
                 ):
-                    # Host pages always await a drain ack. A receiver that could
-                    # not notify (metadata never published, so no prefill holds
-                    # its destination info) has nothing in flight and releases
-                    # immediately below.
+                    # Host pages always await proof of drain, including when
+                    # the backend cannot supply an ACK. A timeout must not
+                    # make a potentially live remote destination reusable.
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
@@ -2858,10 +2876,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                    if self.scheduler.enable_hisparse:
-                        self.scheduler.hisparse_coordinator.request_finished(
-                            decode_req.req
-                        )
                     self._clean_hicache_prefetch_resources(decode_req)
                     self._release_request(decode_req)
                     self._record_transfer_failure(
@@ -2904,8 +2918,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
-        # Host-capable receivers own their drain tracking. Device destinations
-        # snapshot the number of prefill acknowledgements required by the manager.
+        # HiCache host-staging receivers own their drain tracking. Other paths,
+        # including HiSparse, snapshot the manager's required prefill ACK count.
         required_acks = (
             0
             if self.enable_host_receive and decode_req.host_staged
@@ -2955,9 +2969,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
         host_ready = torch.tensor(
             [
-                req.kv_receiver.is_abort_release_safe()
-                for req, _, _, _, _ in self._deferred_releases
-                if self.enable_host_receive and req.host_staged
+                (
+                    req.kv_receiver.kv_mgr.is_abort_release_safe(
+                        req.req.bootstrap_room, required_acks
+                    )
+                    if self.scheduler.enable_hisparse
+                    else req.kv_receiver.is_abort_release_safe()
+                )
+                for req, _, _, _, required_acks in self._deferred_releases
+                if self._requires_host_drain(req)
             ],
             dtype=torch.int32,
         )
@@ -2978,7 +2998,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             required_acks,
         ) in self._deferred_releases:
             room = decode_req.req.bootstrap_room
-            if self.enable_host_receive and decode_req.host_staged:
+            if self._requires_host_drain(decode_req):
                 if next(host_ready):
                     to_release.append((decode_req, start_time, idx, room, True))
                 else:

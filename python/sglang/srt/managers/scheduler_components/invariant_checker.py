@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -114,6 +115,8 @@ class SchedulerInvariantChecker:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
+        if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+            total = self.token_to_kv_pool_allocator.logical_attn_allocator.size
         full_evictable_size = ps.full_evictable_size
         full_available = ps.full_available_size
         class_watermark_msg = ""

@@ -727,6 +727,9 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
+    # Enable same-node shared-memory D2H for HiSparse CPU KV pools.
+    # Other transfers continue through NIXL.
+    SGLANG_DISAGGREGATION_NIXL_LOCAL_SHM = EnvBool(False)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)

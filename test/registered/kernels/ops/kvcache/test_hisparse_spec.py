@@ -97,7 +97,7 @@ def _make_state(
     device_buffer[hot_locs] = host_cache[:hot_buffer_size].to(DEVICE)
 
     scratch_state = torch.full(
-        (num_reqs + 1, max(4 * num_reqs, 5 * metadata_occurrences)),
+        (num_reqs + 1, (max(4 * num_reqs, 5 * metadata_occurrences) + 1) // 2 * 2),
         -1,
         dtype=torch.int32,
         device=DEVICE,
@@ -134,11 +134,10 @@ def _run_swap(
     miss_src: torch.Tensor | None = None,
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
+    num_tail_slots: int = 0,
 ) -> torch.Tensor:
     if out is None:
         out = torch.full_like(top_k_tokens, -1)
-    else:
-        out.fill_(-1)
     num_reqs = top_k_tokens.size(0)
     if req_pool_indices is None:
         req_pool_indices = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
@@ -159,6 +158,7 @@ def _run_swap(
         miss_src=miss_src,
         miss_dst=miss_dst,
         miss_count=miss_count,
+        num_tail_slots=num_tail_slots,
     )
     return out
 
@@ -389,8 +389,13 @@ class TestHiSparseSpec(CustomTestCase):
         self.assertEqual(int(miss_count[1].item()), 0)
 
     def test_resolves_all_speculative_extra_page_slots_without_host_io(self) -> None:
+        for num_steps in (4, 6, 8):
+            with self.subTest(num_steps=num_steps):
+                self._check_speculative_extra_page(num_steps)
+
+    def _check_speculative_extra_page(self, num_steps: int) -> None:
         hot_size, page_size = 4096, 64
-        num_steps, top_k = 4, 2048
+        top_k = 2048
         total_occurrences = num_steps * top_k
         seq_len = 8192
         state = _make_state(
@@ -406,7 +411,7 @@ class TestHiSparseSpec(CustomTestCase):
         draft_tokens = torch.arange(
             seq_len - num_steps, seq_len, dtype=torch.int32, device=DEVICE
         )
-        extra_offsets = torch.tensor([0, 7, 31, 63], device=DEVICE)
+        extra_offsets = torch.linspace(0, 63, num_steps, device=DEVICE).to(torch.long)
         extra_locs = state.device_buffer_locs[0, hot_size + extra_offsets].to(
             torch.long
         )
@@ -418,7 +423,10 @@ class TestHiSparseSpec(CustomTestCase):
 
         hits = torch.arange(top_k - 1, dtype=torch.int32, device=DEVICE)
         top_k_tokens = torch.stack(
-            [torch.cat((hits, draft_tokens[step : step + 1])) for step in range(4)]
+            [
+                torch.cat((hits, draft_tokens[step : step + 1]))
+                for step in range(num_steps)
+            ]
         ).unsqueeze(0)
         seq_lens = draft_tokens + 1
 
@@ -560,6 +568,118 @@ class TestHiSparseSpec(CustomTestCase):
         _assert_output_matches_tokens(state, graph_out, top_k_tokens)
         self.assertTrue(graph_out.ge(0).all().item())
 
+    def test_wide_union_with_tail_columns(self) -> None:
+        for steps, width, tails in (
+            (4, 2051, 3),
+            (6, 2051, 3),
+            (7, 2051, 3),
+            (8, 2051, 3),
+            (8, 2048, 0),
+        ):
+            with self.subTest(steps=steps, width=width):
+                capacity = steps * width
+                state = _make_state(
+                    num_reqs=1,
+                    hot_buffer_size=4096,
+                    page_size=64,
+                    scratch_size=capacity - 4096,
+                    seq_len=32768,
+                    item_words=72,
+                    metadata_occurrences=capacity,
+                )
+                tokens = (
+                    4096 + torch.arange(capacity, dtype=torch.int32, device=DEVICE)
+                ).view(1, steps, width)
+                seq_lens = torch.full((steps,), 32768, dtype=torch.int32, device=DEVICE)
+                miss_src = torch.full(
+                    (1, capacity), -1, dtype=torch.int64, device=DEVICE
+                )
+                miss_dst = torch.full(
+                    (1, capacity), -1, dtype=torch.int32, device=DEVICE
+                )
+                miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+                for offset in (0, 4096):
+                    if offset:
+                        tokens.add_(offset)
+                    out = _run_swap(
+                        top_k_tokens=tokens,
+                        seq_lens=seq_lens,
+                        state=state,
+                        num_tail_slots=tails,
+                        miss_src=miss_src,
+                        miss_dst=miss_dst,
+                        miss_count=miss_count,
+                    )
+                    torch.cuda.synchronize()
+                    _assert_output_matches_tokens(state, out, tokens)
+                    self.assertEqual(torch.unique(out).numel(), capacity)
+                    count = int(miss_count.item())
+                    self.assertGreaterEqual(count, 0)
+                    self.assertLessEqual(count, capacity)
+                    if offset == 0:
+                        self.assertEqual(count, capacity)
+                    self.assertTrue(miss_src[0, :count].ge(0).all().item())
+                    self.assertTrue(miss_dst[0, :count].ge(0).all().item())
+
+    def test_short_sequence_tail_graph_replay(self) -> None:
+        for steps in (4, 6, 8):
+            with self.subTest(steps=steps):
+                self._check_short_sequence_tail_graph_replay(steps)
+
+    def _check_short_sequence_tail_graph_replay(self, steps: int) -> None:
+        width = 2051
+        state = _make_state(
+            num_reqs=2,
+            hot_buffer_size=4096,
+            page_size=64,
+            scratch_size=4096,
+            seq_len=8192,
+            item_words=72,
+            metadata_occurrences=steps * width,
+        )
+        # Stale in-range IDs outside the short-sequence prefix must be ignored.
+        tokens = torch.full((1, steps, width), 3, dtype=torch.int32, device=DEVICE)
+        seq_lens = torch.full((steps,), 127, dtype=torch.int32, device=DEVICE)
+        tokens[:, :, :127] = torch.arange(127, dtype=torch.int32, device=DEVICE)
+        tokens[:, :, -3:] = torch.tensor([124, 125, 126], device=DEVICE)
+        out = torch.full_like(tokens, -1)
+        req_indices = torch.tensor([0], dtype=torch.int64, device=DEVICE)
+        num_real = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+
+        def swap():
+            return _run_swap(
+                top_k_tokens=tokens,
+                seq_lens=seq_lens,
+                state=state,
+                out=out,
+                req_pool_indices=req_indices,
+                num_real_reqs=num_real,
+                num_tail_slots=3,
+            )
+
+        swap()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            swap()
+        for request, length in ((0, 127), (1, 63), (0, 95)):
+            req_indices.fill_(request)
+            seq_lens.fill_(length)
+            tokens.fill_(3)
+            tokens[:, :, :length] = torch.arange(
+                length, dtype=torch.int32, device=DEVICE
+            )
+            tokens[:, :, -3:] = torch.tensor(
+                [length - 2, length - 1, -1], device=DEVICE
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(out[:, :, length:-3].eq(-1).all().item())
+            self.assertTrue(out[:, :, -1].eq(-1).all().item())
+            valid = out >= 0
+            self.assertEqual(int(valid.sum().item()), steps * (length + 2))
+            _assert_output_matches_tokens(state, out[valid], tokens[valid])
+
     def test_rejects_invalid_step_shape_before_compilation(self) -> None:
         state = _make_state(
             num_reqs=1,
@@ -570,7 +690,7 @@ class TestHiSparseSpec(CustomTestCase):
             item_words=1,
             metadata_occurrences=8192,
         )
-        with self.assertRaisesRegex(ValueError, "2-4 steps"):
+        with self.assertRaisesRegex(ValueError, "2-8 steps"):
             _run_swap(
                 top_k_tokens=torch.zeros(
                     (1, 1, 2048), dtype=torch.int32, device=DEVICE

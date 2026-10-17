@@ -25,7 +25,9 @@ using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int64_t HASH_DELETED = -2;
-constexpr int32_t COMPACT_HASH_BITS = 13;
+// Eight speculative rows with KPool tail columns can exceed 16384
+// occurrences. This bit width encodes positions, not workspace allocation size.
+constexpr int32_t COMPACT_HASH_BITS = 15;
 constexpr int32_t COMPACT_HASH_MASK = (1 << COMPACT_HASH_BITS) - 1;
 constexpr int32_t COMPACT_APPROX_CLAIM_FLAG = int32_t{1} << 29;
 constexpr int32_t COMPACT_APPROX_ADMIT_FLAG = int32_t{1} << 30;
@@ -411,9 +413,24 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
   return true;
 }
 
+template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int NUM_TAIL_SLOTS>
+__device__ __forceinline__ int32_t valid_spec_token(int32_t token, int64_t column, int32_t seq_len) {
+  // Match the single-step kernel: unused short-sequence top-k columns can
+  // contain stale values, but explicit tail columns are independently valid.
+  const bool valid_column = seq_len > HOT_BUFFER_SIZE || column < seq_len || column >= NUM_TOP_K - NUM_TAIL_SLOTS;
+  return valid_column && token >= 0 && token < seq_len ? token : -1;
+}
+
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    int NUM_TAIL_SLOTS>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -492,9 +509,10 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   bool needs_cache_lookup = false;
   if (occ < total_occurrences) {
     const int64_t step = occ / NUM_TOP_K;
-    token = req_top_k_tokens[occ];
     const int64_t seq_len = static_cast<int64_t>(seq_lens[bid * NUM_STEPS + step]);
-    if (token >= 0 && token < seq_len) {
+    token =
+        valid_spec_token<NUM_TOP_K, HOT_BUFFER_SIZE, NUM_TAIL_SLOTS>(req_top_k_tokens[occ], occ % NUM_TOP_K, seq_len);
+    if (token >= 0) {
       int32_t direct_loc = -1;
       if (try_get_extra_page_device_loc<HOT_BUFFER_SIZE>(
               token, seq_len, req_device_buffer_tokens, req_device_buffer_locs, page_size, &direct_loc)) {
@@ -606,7 +624,14 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
+template <
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool USE_PDL,
+    int NUM_TAIL_SLOTS>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -616,6 +641,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const void* __restrict__ host_cache_k,
     void* __restrict__ device_buffer_k,
     const int64_t* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ seq_lens,
     SpecCacheState cache_state,
     SpecMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
@@ -686,7 +712,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   if (!s_use_union_clock) {
     // The complete union is already available from hot + scratch for this
     // attention call. Only the cache update is approximate: keep the most
-    // recent speculative working set and avoid replaying four LRU passes.
+    // recent speculative working set and avoid replaying per-step LRU passes.
     if (!scratch_overflow) {
       for (int32_t slot = threadIdx.x; slot < HOT_BUFFER_SIZE; slot += blockDim.x) {
         req_cache_ref_bits[slot] = 0;
@@ -700,7 +726,8 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     constexpr int64_t admission_step = NUM_STEPS > APPROX_ADMISSION_STEPS ? NUM_STEPS - APPROX_ADMISSION_STEPS : 0;
     const int64_t admission_start = admission_step * NUM_TOP_K;
     for (int64_t occ = admission_start + threadIdx.x; occ < total_occurrences; occ += blockDim.x) {
-      const int32_t token = req_top_k_tokens[occ];
+      const int32_t token = valid_spec_token<NUM_TOP_K, HOT_BUFFER_SIZE, NUM_TAIL_SLOTS>(
+          req_top_k_tokens[occ], occ % NUM_TOP_K, seq_lens[bid * NUM_STEPS + occ / NUM_TOP_K]);
       if (token < 0) {
         continue;
       }
@@ -886,7 +913,8 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
       if (req_top_k_device_locs[occ] >= 0) {
         continue;
       }
-      const int32_t token = req_top_k_tokens[occ];
+      const int32_t token = valid_spec_token<NUM_TOP_K, HOT_BUFFER_SIZE, NUM_TAIL_SLOTS>(
+          req_top_k_tokens[occ], occ % NUM_TOP_K, seq_lens[bid * NUM_STEPS + occ / NUM_TOP_K]);
       if (token < 0) {
         continue;
       }
@@ -935,7 +963,8 @@ template <
     int ITEM_SIZE_BYTES,
     int NUM_STEPS,
     bool RecordMissPlan,
-    bool USE_PDL>
+    bool USE_PDL,
+    int NUM_TAIL_SLOTS = 0>
 void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -957,9 +986,12 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
+  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 8, "HiSparse speculative swap requires 2-8 steps.");
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
-  static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
+  static_assert(
+      NUM_STEPS * NUM_TOP_K <= (1 << COMPACT_HASH_BITS),
+      "HiSparse speculative swap supports at most 32768 occurrences.");
+  static_assert(NUM_TAIL_SLOTS >= 0 && NUM_TAIL_SLOTS < NUM_TOP_K, "Invalid top-k tail column count.");
 
   const int64_t bs = top_k_tokens.shape()[0];
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
@@ -1057,7 +1089,8 @@ void load_cache_to_device_buffer_spec(
           HOT_BUFFER_SIZE,
           ITEM_SIZE_BYTES,
           NUM_STEPS,
-          RecordMissPlan>,
+          RecordMissPlan,
+          NUM_TAIL_SLOTS>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
@@ -1088,7 +1121,8 @@ void load_cache_to_device_buffer_spec(
               ITEM_SIZE_BYTES,
               NUM_STEPS,
               RecordMissPlan,
-              USE_PDL>,
+              USE_PDL,
+              NUM_TAIL_SLOTS>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
           static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
@@ -1097,6 +1131,7 @@ void load_cache_to_device_buffer_spec(
           host_cache_k.data_ptr(),
           device_buffer_k.data_ptr(),
           static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
           cache_state,
           miss_workspace,
           static_cast<const int32_t*>(num_real_reqs.data_ptr()),
