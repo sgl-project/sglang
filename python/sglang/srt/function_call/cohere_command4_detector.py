@@ -111,11 +111,11 @@ class CohereCommand4Detector(BaseFormatDetector):
 
         # ``bot_token`` is somewhere in the buffer. Stream out anything before
         # it as normal text exactly once.
+        head = ""
         if bot_pos > 0:
             head = current[:bot_pos]
             self._buffer = current[bot_pos:]
             current = self._buffer
-            return StreamingParseResult(normal_text=head)
 
         # Buffer starts with bot_token. Wait for the closing token, then
         # parse and emit the full call list. Anything past <|END_ACTION|>
@@ -123,10 +123,11 @@ class CohereCommand4Detector(BaseFormatDetector):
         # increment to handle.
         eot_pos = current.find(self.eot_token, len(self.bot_token))
         if eot_pos == -1:
-            return StreamingParseResult()
+            return StreamingParseResult(normal_text=head)
 
         block_end = eot_pos + len(self.eot_token)
         result = self.detect_and_parse(current[:block_end], tools)
+        result.normal_text = head + result.normal_text
         self._buffer = current[block_end:]
         return result
 
