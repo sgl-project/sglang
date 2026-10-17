@@ -123,6 +123,8 @@ def _copy_dense_page_tables(
 class MiniCPMSparseBackend(AttentionBackend):
     """MiniCPM sparse dispatch layered on the standard FlashAttention backend."""
 
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,

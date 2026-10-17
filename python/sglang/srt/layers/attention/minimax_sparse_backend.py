@@ -113,6 +113,8 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()

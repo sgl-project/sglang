@@ -138,6 +138,9 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
     def __init__(self, backend: AttentionBackend):
         self.backend = backend
         self._active_backend = backend
+        self.extend_dummy_seqs_capped_by_req_pool = (
+            backend.extend_dummy_seqs_capped_by_req_pool
+        )
         self.token_to_kv_pool = backend.token_to_kv_pool
         self.req_to_token_pool = backend.req_to_token_pool
         self.kv_index_translator = backend.kv_index_translator
@@ -403,6 +406,10 @@ class DotsHybridAttnBackend(AttentionBackend):
         # Keep DSA on its radix-aware MLA path.
         self.dsa_backend.supports_mha_one_shot = False
         self.swa_backend = swa_backend
+        self.extend_dummy_seqs_capped_by_req_pool = (
+            dsa_backend.extend_dummy_seqs_capped_by_req_pool
+            or swa_backend.extend_dummy_seqs_capped_by_req_pool
+        )
         self.token_to_kv_pool = swa_backend.token_to_kv_pool
         self.req_to_token_pool = swa_backend.req_to_token_pool
         self.kv_index_translator = swa_backend.kv_index_translator

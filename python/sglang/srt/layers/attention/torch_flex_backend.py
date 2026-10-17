@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 class TorchFlexAttnBackend(AttentionBackend):
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.forward_metadata = None
