@@ -8,6 +8,7 @@ from unittest import mock
 import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
+    _ordered_layers,
     _storage_suffix,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +90,46 @@ class TestEveryRankWrites(CustomTestCase):
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
         self.assertEqual(linker._offload_queue.qsize(), 0)
+
+
+class TestPackedDraftLayers(CustomTestCase):
+    def test_draft_buffer_moves_with_its_target_layer(self):
+        """A (target, draft) layer mapping used to be rejected at startup."""
+        import torch
+
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            DevicePoolEntry,
+        )
+
+        entry = DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=None,
+            components=[
+                [
+                    torch.zeros((4, 3), dtype=torch.uint8),
+                    torch.zeros((4, 3), dtype=torch.uint8),
+                    torch.zeros((4, 5), dtype=torch.uint8),
+                ]
+            ],
+            layer_mapping={0: (0, 2), 1: 1},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.pools = {entry.name: entry}
+        linker.pool_layers = {entry.name: _ordered_layers(entry)}
+        plan = SimpleNamespace(
+            name=entry.name, keys=["a"], locations=[0], entries_per_page=1
+        )
+
+        # Offload writes every buffer once, in object-offset order.
+        _, sizes, offsets = linker._all_layer_ranges(plan)
+        self.assertEqual((sizes, offsets), ([[3, 3, 5]], [[0, 3, 6]]))
+        # Loading layer 0 also restores its draft buffer.
+        _, sizes, offsets = linker._layer_group_ranges(plan, [0])
+        self.assertEqual((sizes, offsets), ([[3, 5]], [[0, 6]]))
 
 
 if __name__ == "__main__":
