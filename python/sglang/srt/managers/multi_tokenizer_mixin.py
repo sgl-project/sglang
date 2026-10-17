@@ -380,6 +380,12 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             indexer_topk_num_layers=getattr(output, "indexer_topk_num_layers", None),
+            routed_experts_raw=_extract_field_by_index(
+                output, "routed_experts_raw", i, check_length=False
+            ),
+            indexer_topk_raw=_extract_field_by_index(
+                output, "indexer_topk_raw", i, check_length=False
+            ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
@@ -469,6 +475,8 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "output_hidden_states",
         "routed_experts",
         "indexer_topk",
+        "routed_experts_raw",
+        "indexer_topk_raw",
         "token_steps",
         "customized_info",
         "dp_ranks",
