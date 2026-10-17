@@ -343,7 +343,7 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         prefix = f"{module_name}." if module_name else ""
         own = dict(module.named_parameters(recurse=False))
         for name, parameter in own.items():
-            scale = name.replace("weight", "weight_scale_inv")
+            scale = name.replace("weight", comparable_cls.SCALE_SUFFIX)
             if name.endswith("weight") and scale in own:
                 quantized_set[prefix + name] = QuantizedWeight(
                     comparable_cls,
@@ -371,7 +371,7 @@ def _build_check_entries(
             qw = quantized_set[name]
             yield CheckEntry(
                 name,
-                True,
+                name not in skip_compare_names,
                 qw.comparable_cls(
                     tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
                 ),
