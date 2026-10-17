@@ -1170,6 +1170,20 @@ class DeepseekV4HipRadixBackend(
             cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
+            if (
+                swa_replay_start is not None
+                and swa_replay_start.shape[0] < padded_num_tokens
+            ):
+                swa_replay_start = torch.nn.functional.pad(
+                    swa_replay_start,
+                    (0, padded_num_tokens - swa_replay_start.shape[0]),
+                )
+
+        # CP breakable prefill graphs keep the bucket-sized out_cache_loc so the
+        # global KV write fields have the same shape at capture and replay.
+        num_write_tokens = (
+            out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
+        )
 
         from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
             ExpandPrefillCausally,
@@ -1197,7 +1211,7 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             is_prefill=True,
-            num_tokens=num_tokens if cp_active else None,
+            num_tokens=num_write_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
             num_groups=len(req_pool_indices),
         )
@@ -1221,7 +1235,9 @@ class DeepseekV4HipRadixBackend(
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
         )
         if cp_active:
-            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            core_attn_metadata.apply_cp_reindex(
+                num_tokens=num_write_tokens, local_index=cp_metadata.local_index
+            )
             if need_compress:
                 core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
