@@ -164,7 +164,7 @@ class TestFoldedExtendRows(CustomTestCase):
 
 
 class TestFoldWithDecoderSwaTail(CustomTestCase):
-    """--enable-encoder-swa-bounded-replay with --enable-decoder-swa-bounded-replay:
+    """Encoder SWA bounded replay combined with decoder SWA bounded replay:
     the late layers run only each request's last SWA_WINDOW folded rows."""
 
     def _backend(self, fx):

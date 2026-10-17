@@ -13,8 +13,9 @@
 //! pyo3 enforces it at construction: every field is a required, typed
 //! constructor argument, so a drifted caller fails at boot rather than running
 //! on a silently-defaulted knob. The `#[pyo3::pymethods]` constructors below
-//! each struct — plus the one hand-written extraction,
-//! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
+//! each struct — plus the hand-written extractions,
+//! [`PreferredSamplingParams`] and [`LaunchServerInfo`] — are the only
+//! Python-facing code in this file;
 //! the rest is pure Rust.
 
 use std::collections::BTreeMap;
@@ -173,6 +174,9 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// Python's `/server_info` fields that are fixed at launch, which
+    /// `/server_info` reports beneath its runtime fields.
+    pub launch_server_info: LaunchServerInfo,
     /// The scheduler's shared-memory load snapshot file, its DP rank count and
     /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
     /// go over ZMQ instead), plus the accelerator name and per-rank count that
@@ -222,6 +226,7 @@ impl ServerArgs {
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        launch_server_info,
         load_snapshot_path,
         load_snapshot_dp_size,
         load_snapshot_dp_rank,
@@ -264,6 +269,7 @@ impl ServerArgs {
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        launch_server_info: LaunchServerInfo,
         load_snapshot_path: Option<String>,
         load_snapshot_dp_size: usize,
         load_snapshot_dp_rank: usize,
@@ -304,6 +310,7 @@ impl ServerArgs {
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            launch_server_info,
             load_snapshot_path,
             load_snapshot_dp_size,
             load_snapshot_dp_rank,
@@ -352,6 +359,7 @@ impl Default for ServerArgs {
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            launch_server_info: LaunchServerInfo::default(),
             load_snapshot_path: None,
             load_snapshot_dp_size: 0,
             load_snapshot_dp_rank: 0,
@@ -397,6 +405,30 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
                 "preferred_sampling_params is not valid JSON: {e}"
             ))
         })
+    }
+}
+
+/// Python's launch-time `/server_info` fields (`rust_server/config.py`'s
+/// `_launch_server_info`: the resolved `server_args`, `launch_command`, the
+/// scheduler's init info, `kv_events`), carried verbatim as one JSON object.
+/// `Arc` because every `/server_info` response starts from a copy.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchServerInfo(pub Arc<serde_json::Map<String, serde_json::Value>>);
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for LaunchServerInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        match serde_json::from_str(&text) {
+            Ok(serde_json::Value::Object(fields)) => Ok(Self(Arc::new(fields))),
+            Ok(_) => Err(pyo3::exceptions::PyValueError::new_err(
+                "launch_server_info must be a JSON object",
+            )),
+            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "launch_server_info is not valid JSON: {e}"
+            ))),
+        }
     }
 }
 
