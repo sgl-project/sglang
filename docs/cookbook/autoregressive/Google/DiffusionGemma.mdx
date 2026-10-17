@@ -72,10 +72,10 @@ The checkpoint ships its own modeling code, so `--trust-remote-code` is required
 
 ### 3.1 Basic Configuration
 
-The required runtime settings are applied automatically for `Gemma4Renoise` (the Triton attention backend, eager mode, and unchunked prefill, needed because the full-attention head_dim is 512 and the canvas uses bidirectional attention), so a default launch works:
+The required runtime settings are applied automatically for `Gemma4Renoise` (the Triton attention backend, eager prefill, and unchunked prefill, needed because the full-attention head_dim is 512 and the canvas uses bidirectional attention). `--model-type llm` selects the language-model server because the checkpoint also contains a diffusion pipeline manifest:
 
 ```bash Command
-sglang serve \
+sglang serve --model-type llm \
   --model-path google/diffusiongemma-26B-A4B-it \
   --dllm-algorithm Gemma4Renoise \
   --trust-remote-code \
@@ -114,9 +114,9 @@ sglang serve \
   </tbody>
 </table>
 
-The attention backend, eager mode, and unchunked prefill are selected automatically for `Gemma4Renoise`, so they do not need to be passed on the command line.
+The attention backend, eager prefill, and unchunked prefill are selected automatically for `Gemma4Renoise`. Decode CUDA graphs remain available.
 
-Sampling is governed by the renoise schedule. Request-level `logprobs`, penalties, `logit_bias`, and grammar / structured output (`json_schema` / `regex` / `ebnf` / `structural_tag`) are not applied and are rejected with a 400. Core sampling controls (`temperature`, `top_k`, `top_p`) are accepted but have no effect. Streaming is block-level: one fully-denoised canvas per chunk.
+Sampling is governed by the renoise schedule. Prompt logprobs, top-k logprobs, penalties, `logit_bias`, and grammar / structured output (`json_schema` / `regex` / `ebnf` / `structural_tag`) are rejected with a 400. Output logprobs expose full-vocabulary denoiser scores from each request's final active step, rather than causal sequence likelihoods. The [decision API](/docs/supported-models/decision_models#diffusiongemma-decisions) compares candidate labels after validating the decoder's empty thought prefix. Core generation sampling controls (`temperature`, `top_k`, `top_p`) are accepted but have no effect. Streaming is block-level: one fully-denoised canvas per chunk.
 
 **Gemma4Renoise Config** (defaults follow the checkpoint's `generation_config.json`):
 
