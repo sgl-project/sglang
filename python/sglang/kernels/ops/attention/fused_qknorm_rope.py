@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -187,4 +192,37 @@ def fused_qk_norm_rope(
         high,
         attention_factor,
         rotary_dim,
+    )
+
+
+@cache_once
+def _mrope_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        "fused_qk_norm_mrope",
+        args,
+        cuda_files=["elementwise/fused_qknorm_rope.cuh"],
+        extra_cuda_cflags=["-DJIT_HEAD_DIM=128", "-DJIT_INTERLEAVE=0", "-DJIT_YARN=0"],
+        cuda_wrappers=[("run", f"FusedQKNormMRoPE<{args}>::run")],
+    )
+
+
+def fused_qk_norm_mrope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    axis_map: torch.Tensor,
+    eps: float,
+) -> None:
+    """Normalize and rotate Q/K in place; BF16, head size 128, NeoX layout.
+
+    ``axis_map`` maps each of the 64 rotary pairs to one of three position
+    rows, supporting both contiguous and interleaved multimodal sections.
+    The normalization rounds to BF16 before the BF16 rotary operations.
+    """
+    _mrope_module().run(
+        q, k, q_weight, k_weight, cos_sin_cache, positions, axis_map, eps
     )
