@@ -21,7 +21,7 @@ class LowConfidence(DllmAlgorithm):
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         batch_size = forward_batch.batch_size
         vocab_size = full_logits.shape[-1]
         logits = full_logits.view(batch_size, self.block_size, vocab_size)
@@ -37,9 +37,9 @@ class LowConfidence(DllmAlgorithm):
         transfer_index = confidence > self.threshold
         has_transfer = transfer_index.sum(dim=1) > 0
         top1_indices = torch.argmax(confidence, dim=1)
-        batch_indices = torch.arange(batch_size, device=top1_indices.device)
-        top1_mask = torch.zeros_like(transfer_index, dtype=torch.bool)
-        top1_mask[batch_indices, top1_indices] = True
+        top1_mask = torch.arange(self.block_size, device=confidence.device) == (
+            top1_indices.unsqueeze(1)
+        )
         transfer_index = torch.where(
             has_transfer.unsqueeze(-1), transfer_index, top1_mask
         )
@@ -49,7 +49,7 @@ class LowConfidence(DllmAlgorithm):
         # In-place to preserve the input_ids tensor identity (CUDA graph safe).
         forward_batch.input_ids.copy_(new_input_ids.view(-1))
 
-        return done.tolist()
+        return done
 
 
 Algorithm = LowConfidence
