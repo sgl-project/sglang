@@ -25,7 +25,36 @@ Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 
-<Deployment config={config} />
+<Deployment config={config} agenticLink="agentic-long-context-deployment" />
+
+### SWA ratio calculator
+
+Enter the total **input + output tokens per request** to estimate `--swa-full-tokens-ratio` for Muse Spark Open's 2,048-token sliding window. Copy the flag into your launch command to balance the request capacity of the SWA and full-attention KV pools.
+
+import { museSparkSwaRatio } from "/src/snippets/_muse_spark_swa_ratio.jsx";
+import { MuseSparkSwaRatioCalculator } from "/src/snippets/_muse_spark_swa_ratio_calculator.jsx";
+
+<MuseSparkSwaRatioCalculator calculator={museSparkSwaRatio} />
+
+This is a **steady-state capacity estimate** for equal-length requests. Prefill peaks, page rounding, speculative decoding, and retained prefix caches can require additional capacity. Benchmark your workload before treating this value as a throughput optimum.
+
+<Accordion title="Formula and assumptions">
+
+For context length `L` and concurrency `C`, full attention retains `C × L` tokens, while SWA retains `C × min(L, 2048)` tokens. Balancing the two pools gives:
+
+```text Formula
+swa_full_tokens_ratio = min(1, 2048 / L)
+```
+
+Concurrency cancels when requests have the same length. For example, **100,000 tokens → 0.02048**; contexts up to 2,048 tokens use **1**. At zero tokens, the ratio is undefined, so the calculator does not emit a flag. The upper bound is **1,048,576 tokens (1M)**.
+
+The flag is the ratio of **SWA token capacity to full-attention token capacity**, independent of the number of layers. It is not the SWA share of KV memory: the 46 SWA layers and 16 full-attention layers have different aggregate bytes per token.
+
+For a mix of request lengths, size the pools for the aggregate retained tokens rather than a single representative request. The formula also excludes transient prefill allocations, cache retention, page alignment, and draft-model KV memory.
+
+When using **HiCache with DFLASH**, lowering the ratio increases the full-attention token capacity within a fixed cache budget. The draft cache can grow with it. Recheck host RAM usage and `--hicache-size` when applying the flag.
+
+</Accordion>
 
 ## Playground
 
@@ -34,6 +63,19 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
+- **Container image.** Run the commands inside the image listed for each configuration; flag names follow that image.
+
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/meta-models/muse-spark-open.jsx";
+
+<AgentX data={agentx} />
 
 ## 1. Model introduction
 
