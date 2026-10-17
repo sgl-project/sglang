@@ -3771,7 +3771,8 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
-            and (forward_batch.is_extend_in_batch or _is_hip)
+            # The prefill graph's capture batch leaves is_extend_in_batch unset.
+            and (forward_batch.is_extend_in_batch or tail_in_graph or _is_hip)
         ):
             late_dp_counts = late_layer_dp_counts(
                 forward_batch,
