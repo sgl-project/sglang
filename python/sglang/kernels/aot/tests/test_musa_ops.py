@@ -176,7 +176,7 @@ def test_musa_batched_rotary_embedding_contiguous(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("scale", [-0.5, 0.0, 1.25])
-@pytest.mark.parametrize("shape", [(16,), (4, 128), (4608,)])
+@pytest.mark.parametrize("shape", [(16,), (4, 128), (4608,), (3, 17)])
 def test_musa_fused_mul_add(dtype: torch.dtype, scale: float, shape: tuple[int, ...]):
     self_tensor = torch.randn(shape, dtype=dtype, device=DEVICE)
     bias = torch.randn(shape, dtype=dtype, device=DEVICE)
