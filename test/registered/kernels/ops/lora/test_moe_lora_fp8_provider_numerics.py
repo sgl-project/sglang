@@ -115,6 +115,8 @@ def _rel_l2(a, b):
     "vendor,rows",
     [
         ("triton", "route_major"),
+        ("cutedsl", "expert_major"),
+        ("cutedsl", "route_major"),
     ],
 )
 def test_fp8_gateup_and_down_match_reference(vendor, rows, hidden_size):
@@ -176,5 +178,49 @@ def test_fp8_admission_rejects_bad_geometry():
         _admit_fp8_block_weights(bad)
 
 
+def test_fp8_kernel_rejects_tiles_the_scale_epilogue_cannot_index():
+    """The SM100 FP8 epilogue indexes weight scales per 128-wide output tile and
+    stages one column scale per epilogue thread (128 threads)."""
+    cutlass = pytest.importorskip("cutlass")
+    from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm100_fp8 import (
+        GroupedGemmKernelSm100Fp8,
+    )
+
+    def build(mma_tiler_mn):
+        return GroupedGemmKernelSm100Fp8(
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=False,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=(1, 1),
+            swap_ab=True,
+        )
+
+    build((128, 8))
+    build((128, 128))
+    for mma_tiler_mn in ((64, 128), (128, 256)):
+        with pytest.raises(ValueError, match="mma_tiler_mn"):
+            build(mma_tiler_mn)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_fp8_sm90_heuristic_stops_at_the_64_wide_tile():
+    """SM90 caps the fallback token tile at 64; SM100 may widen it to 128."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    w13, w2, _, _ = _case(device)
+    quant_info, _, _ = _quant_info(w13, w2)
+    provider = select_provider_cls("route_major", "fp8", "cutedsl")(quant_info)
+    provider._config_table = None
+    width = provider._token_width_for(_T, provider.XWIDE_EXPECTED_M_THRESHOLD)
+    if torch.cuda.get_device_capability(device) < (10, 0):
+        assert width == provider.WIDE_TOKEN_WIDTH
+    else:
+        assert width == provider.XWIDE_TOKEN_WIDTH
+    # Below the threshold nothing changes on either architecture.
+    assert (
+        provider._token_width_for(_T, provider.WIDE_EXPECTED_M_THRESHOLD)
+        == provider.WIDE_TOKEN_WIDTH
+    )
