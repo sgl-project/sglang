@@ -177,6 +177,7 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 | Phase | Backend | Mechanism | Default |
 |---|---|---|---|
 | Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
+| Prefill | `full` | One `torch.xpu.XPUGraph` per token-length bucket, capturing the whole prefill forward | **Off** (opt-in) |
 | Prefill | `breakable` | Segmented `torch.xpu.XPUGraph` capture/replay (no `torch.compile`); eager break points at attention / MoE boundaries | **Off** (opt-in) |
 
 ### Enable Decode Graph
@@ -191,7 +192,28 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
 ### Enable Prefill Graph
 
 Prefill graph capture is **opt-in** on XPU and must be enabled explicitly.
-Use the `breakable` backend. The former `tc_piecewise` backend has been removed.
+The available backends are `full` and `breakable`.
+
+#### full
+
+Captures the full prefill forward as one `torch.xpu.XPUGraph` per
+token-length bucket. For `full` prefill, the graph also fixes the
+number of request slots baked into each capture. If you do not set that
+explicitly, SGLang derives it from `chunked_prefill_size // 512` and
+clamps it by the phase-level `max_bs`.
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-backend-prefill full
+```
+
+To override the request-slot cap for `full` prefill, pass it through
+`--cuda-graph-config`, for example:
+
+```bash
+python -m sglang.launch_server --model-path <MODEL> --device xpu \
+    --cuda-graph-config '{"prefill":{"backend":"full","bs":[64,128,256],"full_prefill_max_req":8}}'
+```
 
 #### breakable
 
@@ -266,10 +288,10 @@ python -m sglang.launch_server \
 | Argument | XPU allowed values | Default | Description |
 |---|---|---|---|
 | `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
-| `--cuda-graph-backend-prefill` | `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `breakable` explicitly to enable. |
+| `--cuda-graph-backend-prefill` | `full`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `full` or `breakable` explicitly to enable. |
 | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
 | `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
-| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}'`. Overrides all per-phase flags. |
+| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"full"}}'` or `'{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}'`. Overrides all per-phase flags. |
 | `--disable-decode-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-decode=disabled`. |
 | `--disable-prefill-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-prefill=disabled`. |
 | `--enable-torch-compile` | — | `False` | Apply `torch.compile` on top of the decode XPU graph for further kernel optimization. |
