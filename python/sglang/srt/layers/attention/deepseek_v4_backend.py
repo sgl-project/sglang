@@ -950,19 +950,6 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
-def _pad_folded_replay_rows(
-    out_cache_loc: torch.Tensor, keep_rows: Optional[torch.Tensor], num_rows: int
-) -> torch.Tensor:
-    """Slot 0 marks folded replay rows as padding for the compressors: their main
-    KV, compressed groups and index keys are cached, so only the window is rebuilt."""
-    if keep_rows is None:
-        return out_cache_loc
-    replayed = torch.zeros_like(out_cache_loc, dtype=torch.bool)
-    replayed[:num_rows] = True
-    replayed[keep_rows] = False
-    return out_cache_loc.masked_fill(replayed, 0)
-
-
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -1156,7 +1143,6 @@ class DeepseekV4AttnBackend(
         self.model_runner = model_runner
         self.encoder_replay = False
         self.encoder_row_floor = None
-        self.encoder_keep_rows = None
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -1632,17 +1618,6 @@ class DeepseekV4AttnBackend(
             )
         return self._bcg_tail_buffers
 
-    def _cache_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """The compressors' write locations for this extend, with folded replay rows
-        on the padding slot."""
-        if self.token_to_kv_pool.request_window is None:
-            return forward_batch.out_cache_loc
-        return _pad_folded_replay_rows(
-            forward_batch.out_cache_loc,
-            self.encoder_keep_rows,
-            sum(forward_batch.extend_seq_lens_cpu),
-        )
-
     def _build_late_layer_tail_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1654,7 +1629,6 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
         device = forward_batch.out_cache_loc.device
-        write_loc = self._cache_write_loc(forward_batch)
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
             seq_lens_cpu=seq_lens_cpu.tolist(),
@@ -1704,7 +1678,7 @@ class DeepseekV4AttnBackend(
             scatter_buf[real_rows:].fill_(int(forward_batch.out_cache_loc.shape[0]))
             pos_buf[:real_rows].copy_(forward_batch.positions[real_idx])
             pos_buf[real_rows:].zero_()
-            loc_buf[:real_rows].copy_(write_loc[real_idx])
+            loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[real_idx])
             loc_buf[real_rows:].zero_()
             # The window floor is combined with the block-sized causal positions.
             swa_replay_start = torch.nn.functional.pad(
@@ -1720,7 +1694,7 @@ class DeepseekV4AttnBackend(
             out_cache_loc = loc_buf
         else:
             out_cache_loc = _tail_rows(
-                write_loc,
+                forward_batch.out_cache_loc,
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
@@ -2602,7 +2576,6 @@ class DeepseekV4AttnBackend(
 
         self.encoder_replay = forward_batch.encoder_swa_replay
         self.encoder_row_floor = forward_batch.encoder_swa_row_floor
-        self.encoder_keep_rows = forward_batch.encoder_swa_compress_rows
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2731,6 +2704,16 @@ class DeepseekV4AttnBackend(
             request_window_layout=request_layout,
         )
 
+    @staticmethod
+    def _compressor_out_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Slot 0 for folded replay rows: their main KV, compressed groups and index
+        keys are cached, so the compressors write only the new rows."""
+        loc = forward_batch.out_cache_loc
+        keep = forward_batch.encoder_swa_compress_rows
+        if keep is None:
+            return loc
+        return torch.zeros_like(loc).index_copy_(0, keep, loc[keep])
+
     def _build_forward_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -2831,7 +2814,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=self._cache_write_loc(forward_batch),
+                out_cache_loc=self._compressor_out_loc(forward_batch),
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
