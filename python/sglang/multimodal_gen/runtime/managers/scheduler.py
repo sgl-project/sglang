@@ -144,8 +144,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if gpu_id % gpus_per_replica == 0:
             endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
+            # Clients connect to the configured endpoint, so never move to another port.
             self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.ROUTER, endpoint, True
+                self.context, zmq.ROUTER, endpoint, True, same_port=True
             )
             logger.info(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
