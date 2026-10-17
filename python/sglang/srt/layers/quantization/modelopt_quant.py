@@ -1458,6 +1458,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     - Serialized + per-tensor FP32 activation scales: load packed NVFP4 weights
       and checkpoint-provided scales.
     - Serialized + per-token FP32 activation scales: set
+      checkpoint metadata `use_per_token_activation=true` or
       `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1`; use
       `flashinfer_trtllm`, `flashinfer_trtllm_routed`, or `flashinfer_cutedsl`
       v2 with no A2A or FlashInfer A2A.
@@ -1483,6 +1484,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             logger.info("Detected nvfp4 checkpoint.")
         self.is_awq = is_awq
         self.is_w4a16 = False
+        self.quantized_mtp = False
         self.group_size = group_size
         if not is_checkpoint_nvfp4_serialized:
             if use_per_token_activation:
@@ -1675,6 +1677,16 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             use_per_token_activation=(False if quant_method == "W4A16_NVFP4" else None),
         )
         quant_config.is_w4a16 = quant_method == "W4A16_NVFP4"
+        if "use_per_token_activation" in config:
+            if not is_checkpoint_nvfp4_serialized or quant_config.is_w4a16:
+                raise ValueError(
+                    "Per-token activation metadata requires serialized W4A4 NVFP4"
+                )
+            quant_config.use_per_token_activation = config["use_per_token_activation"]
+        # Legacy ModelOpt exports bundle an unquantized MTP layer with the target.
+        quant_config.quantized_mtp = config.get("quantized_mtp", False)
+        if quant_config.quantized_mtp and not is_checkpoint_nvfp4_serialized:
+            raise ValueError("quantized_mtp requires serialized NVFP4 weights")
         return quant_config
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):

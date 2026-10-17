@@ -71,7 +71,12 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        # Bundled legacy MTP is BF16; separately packed MTP must retain its quantizer.
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not getattr(quant_config, "quantized_mtp", False)
+        ):
             logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
