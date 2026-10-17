@@ -18,8 +18,12 @@ AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
 point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
 """
 
+from types import SimpleNamespace
+
 import torch
 from torch import nn
+
+from sglang.srt.environ import envs
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
@@ -43,3 +47,86 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
     return (weight.to(torch.float32) * weight_scale.to(torch.float32)).to(
         torch.bfloat16
     )
+
+
+def _k3_channel_fp8_to_tensor_fp8(
+    module: nn.Module, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(per-tensor FP8, scalar scale) for the AITER absorb BMMs; must run before
+    the kv_b head split, while dim 0 is still the channel axis."""
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.srt.layers.quantization.fp8_utils import (
+        channel_quant_to_tensor_quant,
+        normalize_e4m3fn_to_e4m3fnuz,
+    )
+
+    weight_scale = module.weight_scale
+    if is_fp8_fnuz():
+        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+            weight=weight, weight_scale=weight_scale, input_scale=None
+        )
+    if weight_scale.dim() == 1:
+        weight_scale = weight_scale.view(-1, 1)
+    return channel_quant_to_tensor_quant(weight, weight_scale)
+
+
+def _k3_is_raw_quark_channel_fp8(module: nn.Module) -> bool:
+    """Quark per-channel FP8 with dynamic activations, not yet post-processed."""
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    if not (
+        isinstance(module.quant_method, QuarkLinearMethod)
+        and isinstance(module.scheme, QuarkW8A8Fp8)
+    ):
+        return False
+    scheme = module.scheme
+    weight = module.weight
+    scale = module.weight_scale
+    return (
+        scheme.weight_qscheme == "per_channel"
+        and not scheme.is_static_input_scheme
+        and weight.dim() == 2
+        and weight.dtype == torch.float8_e4m3fn
+        and isinstance(scale, torch.Tensor)
+        and scale.numel() == weight.shape[0]
+    )
+
+
+def _k3_merge_kda_inproj_fp8(self_attn: nn.Module) -> bool:
+    """Merge Quark FP8 [q,k,v,g | f_a | b] into one per-channel FP8 linear for
+    decode up to the token limit; the original linears serve larger batches."""
+    # Runs before process_weights_after_loading: weights are [out, in], scales [out].
+    if not (envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get() and self_attn.use_full_rank_gate):
+        return False
+    mods = (self_attn.fused_qkvg_proj, self_attn.f_a_proj, self_attn.b_proj)
+    if not all(_k3_is_raw_quark_channel_fp8(m) for m in (*mods, self_attn.f_b_proj)):
+        return False
+    weights = [m.weight.data for m in mods]
+    if len({w.shape[1] for w in weights}) != 1:
+        return False
+    scales = [m.weight_scale.data.reshape(-1).float() for m in mods]
+    sizes = [w.shape[0] for w in weights]
+    # N % 64 == 0 keeps aiter's preshuffled FP8 GEMM (use_aiter_bpreshuffle_gemm).
+    pad = (-sum(sizes)) % 64
+    if pad:
+        weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
+        scales.append(scales[0].new_ones(pad))
+    scheme = self_attn.fused_qkvg_proj.scheme
+    layer = SimpleNamespace(
+        weight=torch.cat(weights).contiguous(),
+        weight_scale=torch.cat(scales),
+        input_scale=None,
+        scheme=scheme,
+    )
+    scheme.process_weights_after_loading(layer)
+
+    self_attn._qkvgbfa_layer = layer
+    self_attn._bfa_fa_size, self_attn._bfa_b_size = sizes[1], sizes[2]
+    self_attn._qkvgbfa_sizes = [*self_attn.split_sizes, sizes[1], sizes[2], pad]
+    # f_b is [heads * head_dim, head_dim]; BF16 lets it use the tiny GEMM and
+    # the fused KDA decode.
+    self_attn._bfa_f_b_w = _k3_channel_fp8_to_bf16(
+        self_attn.f_b_proj, self_attn.f_b_proj.weight.data
+    ).contiguous()
+    return True

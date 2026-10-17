@@ -1907,6 +1907,44 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: backend for the fused KDA decode. Empty keeps the unfused chain; <code>aiter</code> selects the gfx950 FlyDSL kernel.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm with Quark per-channel FP8 attention: requantize <code>kv_b</code> to per-tensor FP8 so the MLA absorb BMMs run the AITER a8w8 kernel. Adds about 2.3% weight error compared with dequantizing to BF16.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950: write the MLA decode Q (identity RoPE plus concat) and the latent KV cache in one AITER launch. Falls back to the split chain when AITER, the chip or the shapes do not match.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MOE_PREROUTE_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950: for 1 to 4 decode tokens, compute the router logits, the latent down-projection and the shared gate-up in one FlyDSL FP8 launch, and the shared down-projection in another.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_PREROUTE_PREACTIVATED_SHARED</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>SGLANG_OPT_HIP_K3_MOE_PREROUTE_FP8</code>, route two- and four-token decode through the cooperative kernel, which returns the shared expert already SiTU-activated.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_LATENT_TAIL_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950: fuse the latent RMSNorm, the FP8 latent up-projection and the residual add into one launch for batches up to <code>SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS</code> tokens, decode and speculative verify alike.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_FLYDSL_SOURCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where the Kimi-K3 FlyDSL kernels come from: <code>auto</code> prefers the SGLang copy and falls back to AITER; <code>sglang</code> or <code>aiter</code> pins one.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_LATENT_TAIL_MAX_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Largest batch, in tokens, that runs the fused latent MoE tail; larger batches keep the separate RMSNorm, up-projection and add. Must be between 1 and 256.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4</code></td>
+    </tr>
   </tbody>
 </table>
 
