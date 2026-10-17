@@ -85,31 +85,32 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
 
         return result
 
+    def _build_transcription_prompt(self, input_text) -> str:
+        """Normalize ``input_text`` for the ``/v1/audio/transcriptions`` endpoint.
+
+        That endpoint sends empty text, which the tokenizer manager turns into
+        empty ``input_ids`` (a list) rather than an empty string when a
+        multimodal processor is attached -- ``AUDIO_TOKEN_REGEX.search``
+        requires a str, so this must be normalized before use. Same pattern as
+        ``qwen_audio.py``'s ``_build_transcription_prompt``.
+        """
+        if isinstance(input_text, list):
+            input_text = (
+                self._processor.tokenizer.decode(input_text) if input_text else ""
+            )
+        return input_text
+
     async def process_mm_data_async(
         self,
         audio_data,
         input_text,
         **kwargs,
     ):
-        """Process audio data for MiDashengLM model.
-
-        Args:
-            audio_data: Audio input data
-            input_text: Text prompt
-            **kwargs: Additional arguments
-
-        Returns:
-            Dictionary containing processed multimodal data
-        """
-        logger.info("=" * 80)
-        logger.info("process_mm_data_async called")
-        logger.info(f"audio_data is not None: {audio_data is not None}")
-        logger.info(f"input_text: {input_text}")
-        logger.info("=" * 80)
+        """Process audio data for MiDashengLM model."""
+        input_text = self._build_transcription_prompt(input_text)
 
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
-            logger.info("Auto-prepended audio token")
 
         base_output = await self.load_mm_data(
             prompt=input_text,
@@ -117,30 +118,11 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
         if base_output is None:
-            logger.info("base_output is None")
             return None
 
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
-        logger.info(f"mm_items count: {len(mm_items)}")
-        logger.info(f"ret keys: {list(ret.keys())}")
-        logger.info(f"input_ids shape: {input_ids.shape}")
-        logger.info(
-            f"audio_token_id={self.audio_token_id}, audio_start_id={self.audio_start_id}, audio_end_id={self.audio_end_id}"
-        )
-        logger.info(
-            f"Count of audio_token_id in input_ids: {(input_ids == self.audio_token_id).sum().item()}"
-        )
-        for i, item in enumerate(mm_items):
-            logger.info(f"mm_item[{i}] modality: {item.modality}")
-            logger.info(
-                f"mm_item[{i}] pad_value: {getattr(item, 'pad_value', 'NOT SET')}"
-            )
-            logger.info(f"mm_item[{i}] offsets: {getattr(item, 'offsets', 'NOT SET')}")
-            logger.info(f"mm_item[{i}] has feature: {hasattr(item, 'feature')}")
-            if hasattr(item, "feature") and item.feature is not None:
-                logger.info(f"mm_item[{i}] feature shape: {item.feature.shape}")
 
         if "audio_length" in ret and len(mm_items) > 0:
             audio_length = ret["audio_length"]
@@ -151,9 +133,6 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
                     else audio_length[0].item()
                 )
             mm_items[0].audio_length = audio_length
-            logger.info(
-                f"Set audio_length={audio_length} (from processor, mel frame count)"
-            )
         elif "input_values" in ret and len(mm_items) > 0:
             input_values = ret["input_values"]
             audio_length = (
@@ -162,14 +141,11 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
                 else input_values.shape[0]
             )
             mm_items[0].audio_length = audio_length
-            logger.info(f"Set audio_length={audio_length} (fallback, waveform length)")
 
-        result = MultimodalProcessorOutput(
+        return MultimodalProcessorOutput(
             mm_items=mm_items,
             input_ids=input_ids.tolist(),
             audio_start_id=self.audio_start_id,
             audio_token_id=self.audio_token_id,
             audio_end_id=self.audio_end_id,
         )
-        logger.info(f"Returning {len(result.mm_items)} mm_items")
-        return result

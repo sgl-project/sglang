@@ -1559,7 +1559,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compute all requests together to avoid per-request Python loops.
             deltas_list = [0] * batch_size
             for i, mm in enumerate(mm_inputs):
-                deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
+                deltas_list[i] = (
+                    mm.mrope_position_delta.item()
+                    if mm is not None and mm.mrope_position_delta is not None
+                    else 0
+                )
             deltas = torch.tensor(
                 deltas_list, dtype=torch.int64, device=model_runner.device
             )
@@ -1610,8 +1614,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_input = mm_inputs[batch_idx]
             extend_seq_len = extend_lens[batch_idx]
             extend_prefix_len = prefix_lens[batch_idx]
-            if mm_input is None or rl_on_policy_target is not None:
-                # text only
+            if (
+                mm_input is None
+                or mm_input.mrope_positions is None
+                or rl_on_policy_target is not None
+            ):
+                # Text only, or a multimodal item with no precomputed mrope grid
+                # positions (e.g. an audio-only item on a model whose text
+                # backbone declares mrope_section for a vision-capable sibling
+                # architecture it doesn't itself use).
                 mrope_positions = (
                     torch.arange(
                         extend_prefix_len,

@@ -483,6 +483,14 @@ class MiDashengLMModel(nn.Module):
                 # Remove mrope_section from rope_parameters so downstream
                 # code treats this as standard rotary embedding.
                 del rope_scaling["mrope_section"]
+        # The checkpoint ships a distinct, untied lm_head.weight (verified:
+        # its values differ from embed_tokens.weight), but text_config never
+        # sets tie_word_embeddings explicitly, so it inherits
+        # Qwen2_5OmniTextConfig's default of True. Qwen2ForCausalLM then
+        # discards the checkpoint's real lm_head and reuses the (wrong) tied
+        # embeddings as the output head, which produces degenerate repeated-
+        # token generations regardless of prompt or audio input.
+        config.text_config.tie_word_embeddings = False
         self.audio_encoder = DashengAudioTransformer(
             config.audio_encoder_config,
             quant_config=quant_config,
