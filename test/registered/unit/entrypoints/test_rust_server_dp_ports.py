@@ -63,6 +63,7 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         get_context().override_server_args(grpc_port=50051, **overrides),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
         assert (
             rust_config._build_server_args(_scheduler_for_typed_config())
@@ -80,6 +81,7 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
         rust_config._build_server_args(_scheduler_for_typed_config())
 
