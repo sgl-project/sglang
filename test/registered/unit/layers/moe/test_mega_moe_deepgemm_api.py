@@ -414,6 +414,41 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     )[:, None].expand_as(hidden)
                     torch.testing.assert_close(text_out, text_expected)
 
+    def test_fp8_megamoe_scales_routed_weights_in_topk(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        method = Fp8MoEMethod.__new__(Fp8MoEMethod)
+        with (
+            patch.object(
+                fused_moe_layer_module,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+            patch.object(
+                fused_moe_layer_module,
+                "get_moe_a2a_backend",
+                return_value=MoeA2ABackend.MEGAMOE,
+            ),
+        ):
+            self.assertTrue(
+                fused_moe_layer_module._fuses_routed_scaling_factor_in_topk(method)
+            )
+        with (
+            patch.object(
+                fused_moe_layer_module,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+            patch.object(
+                fused_moe_layer_module,
+                "get_moe_a2a_backend",
+                return_value=MoeA2ABackend.NONE,
+            ),
+        ):
+            self.assertFalse(
+                fused_moe_layer_module._fuses_routed_scaling_factor_in_topk(method)
+            )
+
     def test_v41_megamoe_empty_rank_still_participates(self):
         """An idle DP rank must reach A2A combine without running its router."""
         moe = self._v41_moe(0, False)
