@@ -45,6 +45,7 @@ class SchedulerLoadInquirer:
     get_recent_cache_hit_rate: Callable
     get_stats: Callable
     get_chunked_req: Callable
+    get_grammar_queue: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
@@ -124,6 +125,12 @@ class SchedulerLoadInquirer:
                 for req in queue
             )
 
+        # Requests waiting for their grammar to compile reach the queues above
+        # only once it is ready, but they are already this rank's work.
+        grammar_queue = self.get_grammar_queue()
+        waiting_queues.append(grammar_queue)
+        pending_token_queues.append(grammar_queue)
+
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
@@ -131,6 +138,10 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None and chunked_req.extend_end is not None:
+            # KV covers only the chunks run so far; the rest is still pending.
+            num_total_tokens += max(0, chunked_req.seqlen - chunked_req.extend_end)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
