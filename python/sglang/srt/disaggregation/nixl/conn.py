@@ -430,6 +430,7 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    supports_role_switch = True
     # The decode control socket multiplexes tagged messages, so the status
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
@@ -448,6 +449,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._stop_event = threading.Event()
+        self._worker_threads: List[threading.Thread] = []
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
         )
@@ -556,11 +559,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_staging and self._staging_ctx.buffers
                     else None
                 )
-                threading.Thread(
+                worker = threading.Thread(
                     target=self.transfer_worker,
                     args=(queue, staging_buffer, i),
                     daemon=True,
-                ).start()
+                )
+                worker.start()
+                self._worker_threads.append(worker)
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
@@ -569,11 +574,89 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
             self._start_decode_listener_thread()
-            self._start_heartbeat_checker_thread()
+            self._worker_threads.append(self._start_heartbeat_checker_thread())
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def teardown(self) -> None:
+        """Release an idle role's transport resources, retaining scheduler KV pools."""
+        if self.agent is None:
+            return
+        if self.enable_staging:
+            raise RuntimeError("NIXL role switching does not support staging buffers")
+        self._stop_event.set()
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for queue in self.transfer_queues:
+                queue.put(None)
+        else:
+            self._heartbeat_shutdown.set()
+            if self._prefill_recompute_executor is not None:
+                self._prefill_recompute_executor.shutdown(
+                    wait=True, cancel_futures=True
+                )
+                self._prefill_recompute_executor = None
+
+        # Never close a ZMQ socket or deregister memory while a worker uses it.
+        deadline = time.monotonic() + 5.0
+        for worker in self._worker_threads:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(worker.is_alive() for worker in self._worker_threads):
+            raise RuntimeError(
+                "NIXL workers did not stop; retaining transport resources"
+            )
+        if any(self._staging_outstanding.values()):
+            raise RuntimeError(
+                "NIXL transfers are not quiescent; retaining registered memory"
+            )
+
+        handles = list(self.prep_handles.values())
+        handles.extend(self.prep_handles_segment_src.values())
+        handles.extend(value[0] for value in self.prep_handles_slice_dst.values())
+        if self.prep_handle_slice_src is not None:
+            handles.append(self.prep_handle_slice_src[0])
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for peer in self.decode_kv_args_table.values():
+                for segment in peer.kv_xfer_segments or ():
+                    handles.extend((segment.src_handle, segment.dst_handle))
+        # Mixed-memory segments share source handles across peers.
+        for handle in {id(handle): handle for handle in handles}.values():
+            self.agent.release_dlist_handle(handle)
+        self.prep_handles.clear()
+        self.prep_handles_segment_src.clear()
+        self.prep_handles_slice_dst.clear()
+        self.prep_handle_slice_src = None
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.decode_kv_args_table.clear()
+            self.transfer_infos.clear()
+            self.transfer_queues.clear()
+        else:
+            with self.session_pool_lock:
+                for session in self.session_pool.values():
+                    session.close()
+                self.session_pool.clear()
+
+        for descs in self.kv_descs:
+            self.agent.deregister_memory(descs)
+        self.agent.deregister_memory(self.aux_descs)
+        if self.state_descs is not None:
+            self.agent.deregister_memory(self.state_descs)
+        self.kv_descs.clear()
+        self.aux_descs = self.state_descs = None
+
+        with self._socket_lock:
+            for sock in self._socket_cache.values():
+                sock.close(linger=0)
+            for monitor in self._monitor_cache.values():
+                monitor.close(linger=0)
+            self._socket_cache.clear()
+            self._monitor_cache.clear()
+            self._socket_send_locks.clear()
+        self.server_socket.close(linger=0)
+        self._zmq_ctx.term()
+        self._worker_threads.clear()
+        self.agent = None
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -655,7 +738,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         which are independent of staging and deferred KV release."""
 
         def decode_listener_thread():
-            while True:
+            while not self._stop_event.is_set():
+                if (
+                    self.server_args.enable_pd_role_switch
+                    and not self.server_socket.poll(timeout=100)
+                ):
+                    continue
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == b"STAGING_REQ":
                     if self.enable_staging:
@@ -678,7 +766,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     msg[0][:20],
                 )
 
-        threading.Thread(target=decode_listener_thread, daemon=True).start()
+        worker = threading.Thread(target=decode_listener_thread, daemon=True)
+        worker.start()
+        self._worker_threads.append(worker)
 
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
@@ -1237,6 +1327,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
+            if kv_chunk is None:
+                return
             room = kv_chunk.room
             handles: List[Any] = []
             settle_timed_out = False
@@ -1634,6 +1726,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
+        self.state_descs = None
         state_addrs = []
         for comp_ptrs, comp_lens in zip(
             self.kv_args.state_data_ptrs or [],
@@ -3214,7 +3307,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
-            while True:
+            while not self._stop_event.is_set():
+                if (
+                    self.server_args.enable_pd_role_switch
+                    and not self.server_socket.poll(timeout=100)
+                ):
+                    continue
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
@@ -3282,7 +3380,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 raise
 
-        threading.Thread(target=bootstrap_thread_guarded).start()
+        worker = threading.Thread(target=bootstrap_thread_guarded)
+        worker.start()
+        self._worker_threads.append(worker)
 
 
 class NixlKVSender(CommonKVSender):

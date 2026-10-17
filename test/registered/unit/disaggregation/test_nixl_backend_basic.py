@@ -10,11 +10,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
-from sglang.srt.disaggregation.common.utils import pack_int_lists
+from sglang.srt.disaggregation.common.utils import FastQueue, pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -38,6 +39,137 @@ class NotificationFakeAgent:
 
     def get_new_notifs(self):
         return {"peer": [msg.encode("ascii") for msg in self.messages]}
+
+
+class TestNixlRoleSwitchLifecycle(CustomTestCase):
+    """Role changes must stop transport users before releasing their resources."""
+
+    def _manager(self, mode, port=None):
+        mgr = NixlKVManager.__new__(NixlKVManager)
+        mgr.disaggregation_mode = mode
+        mgr.server_args = SimpleNamespace(enable_pd_role_switch=True)
+        mgr.enable_staging = False
+        mgr._stop_event = threading.Event()
+        mgr._worker_threads = []
+        mgr._staging_outstanding = {}
+        mgr._zmq_ctx = zmq.Context()
+        mgr.server_socket = mgr._zmq_ctx.socket(zmq.PULL)
+        if port is None:
+            port = mgr.server_socket.bind_to_random_port("tcp://127.0.0.1")
+        else:
+            mgr.server_socket.bind(f"tcp://127.0.0.1:{port}")
+        mgr.rank_port = port
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {"peer": mgr._zmq_ctx.socket(zmq.PUSH)}
+        mgr._monitor_cache = {}
+        mgr._socket_send_locks = {}
+        mgr.prep_handles = {"": object(), "peer": object()}
+        shared = mgr.prep_handles[""]
+        mgr.prep_handles_segment_src = {(0, 1, "VRAM"): shared}
+        mgr.prep_handles_slice_dst = {}
+        mgr.prep_handle_slice_src = None
+        mgr.kv_descs = ["kv"]
+        mgr.aux_descs = "aux"
+        mgr.state_descs = "state"
+        registered = {"kv", "aux", "state"}
+        prepared = set(mgr.prep_handles.values())
+
+        def deregister(desc):
+            self.assertTrue(all(not t.is_alive() for t in mgr._worker_threads))
+            self.assertFalse(prepared, "prepared handles still reference registrations")
+            registered.remove(desc)
+
+        # Only the external SDK boundary is replaced; sockets and threads are real.
+        mgr.agent = SimpleNamespace(
+            deregister_memory=deregister,
+            release_dlist_handle=prepared.remove,
+        )
+        mgr.transfer_queues = [FastQueue()]
+        mgr.decode_kv_args_table = {
+            "peer": SimpleNamespace(
+                kv_xfer_segments=[
+                    SimpleNamespace(
+                        src_handle=shared, dst_handle=mgr.prep_handles["peer"]
+                    )
+                ]
+            )
+        }
+        mgr.transfer_infos = {}
+        mgr._heartbeat_shutdown = threading.Event()
+        mgr._prefill_recompute_executor = None
+        mgr.session_pool_lock = threading.Lock()
+        mgr.session_pool = {}
+
+        def cleanup():
+            mgr._stop_event.set()
+            mgr._heartbeat_shutdown.set()
+            for queue in mgr.transfer_queues:
+                queue.put(None)
+            for worker in mgr._worker_threads:
+                worker.join(timeout=1)
+            if not mgr._zmq_ctx.closed:
+                mgr._zmq_ctx.destroy(linger=0)
+
+        self.addCleanup(cleanup)
+        return mgr, registered
+
+    def test_repeated_role_teardown_releases_threads_and_rebinds_control_port(self):
+        port = None
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE) * 2:
+            with self.subTest(mode=mode):
+                mgr, registered = self._manager(mode, port)
+                port = mgr.rank_port
+                if mode == DisaggregationMode.PREFILL:
+                    mgr._start_bootstrap_thread()
+                    worker = threading.Thread(
+                        target=mgr.transfer_worker, args=(mgr.transfer_queues[0],)
+                    )
+                    worker.start()
+                    mgr._worker_threads.append(worker)
+                else:
+                    mgr._start_decode_listener_thread()
+                    worker = threading.Thread(target=mgr._heartbeat_shutdown.wait)
+                    worker.start()
+                    mgr._worker_threads.append(worker)
+                workers = list(mgr._worker_threads)
+                mgr.teardown()
+                mgr.teardown()
+                self.assertTrue(all(not worker.is_alive() for worker in workers))
+                self.assertFalse(registered)
+                self.assertTrue(mgr._zmq_ctx.closed)
+                self.assertTrue(mgr.server_socket.closed)
+
+    def test_live_worker_prevents_memory_and_socket_release(self):
+        mgr, registered = self._manager(DisaggregationMode.PREFILL)
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait)
+        worker.start()
+        mgr._worker_threads.append(worker)
+        self.addCleanup(release.set)
+        try:
+            with patch(
+                "sglang.srt.disaggregation.nixl.conn.time.monotonic",
+                side_effect=[0.0, 6.0],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "workers did not stop"):
+                    mgr.teardown()
+            self.assertEqual(registered, {"kv", "aux", "state"})
+            self.assertFalse(mgr.server_socket.closed)
+            self.assertTrue(worker.is_alive())
+        finally:
+            release.set()
+            worker.join(timeout=1)
+        mgr.teardown()
+
+    def test_unsettled_transfer_prevents_memory_release_after_workers_exit(self):
+        mgr, registered = self._manager(DisaggregationMode.PREFILL)
+        mgr._staging_outstanding[7] = 1
+        with self.assertRaisesRegex(RuntimeError, "transfers are not quiescent"):
+            mgr.teardown()
+        self.assertEqual(registered, {"kv", "aux", "state"})
+        self.assertFalse(mgr.server_socket.closed)
+        mgr._staging_outstanding[7] = 0
+        mgr.teardown()
 
 
 class StagingFakeAgent:
