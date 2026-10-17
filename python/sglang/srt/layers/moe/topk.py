@@ -285,6 +285,8 @@ class TopKConfig:
 
         # Weight loaders update parameters in place. Including the version in
         # the key prevents an early access from retaining pre-load contents.
+        # Writes through `param.data` (RL weight sync, dummy-load warmup) do
+        # not bump `_version`, so a matching key still has to refresh the copy.
         cache_key = (
             correction_bias.data_ptr(),
             correction_bias._version,
@@ -295,6 +297,9 @@ class TopKConfig:
         if self._correction_bias_cache_key != cache_key:
             self._correction_bias_dtype_cache = correction_bias.to(dtype=dtype)
             self._correction_bias_cache_key = cache_key
+        else:
+            # In-place refresh keeps the CUDA-graph address of the cached bias.
+            self._correction_bias_dtype_cache.copy_(correction_bias)
         return self._correction_bias_dtype_cache
 
 
