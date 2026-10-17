@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import ceil_align, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,17 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
 def mega_moe_decode_tokens_per_rank(cfg) -> int:
     cg_config = cfg.cuda_graph_config
     decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    # The runner clamps graph buckets to the per-rank request pool.
+    if cfg.max_running_requests is not None:
+        per_rank_requests = cfg.max_running_requests
+        if attn_dp_enabled_of(cfg):
+            per_rank_requests //= cfg.attn_dp_size
+        # Capture may round the pool limit up to TP/CP alignment. The TP
+        # width within one DP group conservatively covers that alignment.
+        per_rank_requests = ceil_align(
+            per_rank_requests, cfg.tp_size // cfg.attn_dp_size
+        )
+        decode_max_bs = min(decode_max_bs, per_rank_requests)
     num_tokens_per_req = (
         (cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
     )

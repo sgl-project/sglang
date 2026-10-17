@@ -355,6 +355,10 @@ class TestPrepareServerArgs(CustomTestCase):
                 ),
                 speculative_algorithm=algorithm,
                 speculative_num_draft_tokens=draft_tokens,
+                max_running_requests=None,
+                attn_dp_size=1,
+                ep_join_mode=None,
+                tp_size=1,
             )
 
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
@@ -363,6 +367,61 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, None, 4)), 256)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(None)), 0)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(0, cg=False)), 0)
+
+    def test_megamoe_decode_budget_clamps_to_request_pool(self):
+        from sglang.srt.arg_groups.mega_moe_hook import (
+            mega_moe_decode_tokens_per_rank,
+            validate_mega_moe_token_budget,
+        )
+
+        for tp_size, dp_size, requests, graph_bs, algorithm, expected_tokens in (
+            (16, 16, 4096, 4096, "DSPARK", 1536),
+            (1, 1, 256, 4096, "DSPARK", 1536),
+            (16, 16, 4096, 128, "DSPARK", 768),
+            (16, 16, None, 4096, "DSPARK", 24576),
+            (16, 16, 4096, 4096, None, 256),
+            # Capture pads small request pools to its TP alignment.
+            (8, 1, 1, 4096, "DSPARK", 48),
+            (16, 4, 36, 4096, "DSPARK", 72),
+        ):
+            cfg = SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(max_bs=graph_bs)
+                ),
+                max_running_requests=requests,
+                attn_dp_size=dp_size,
+                ep_join_mode=None,
+                tp_size=tp_size,
+                speculative_algorithm=algorithm,
+                speculative_num_draft_tokens=6,
+                moe_a2a_backend="megamoe",
+                disaggregation_mode="decode",
+            )
+            with (
+                self.subTest(
+                    tp_size=tp_size,
+                    dp_size=dp_size,
+                    requests=requests,
+                    graph_bs=graph_bs,
+                ),
+                override_platform(is_hip=False),
+                patch(
+                    "sglang.srt.arg_groups.mega_moe_hook.resolving_view",
+                    return_value=cfg,
+                ),
+            ):
+                self.assertEqual(mega_moe_decode_tokens_per_rank(cfg), expected_tokens)
+                with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    expected_tokens
+                ):
+                    validate_mega_moe_token_budget(None, "DeepseekV4ForCausalLM")
+                with (
+                    envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                        expected_tokens - 1
+                    ),
+                    self.assertRaisesRegex(ValueError, "largest decode / verify"),
+                ):
+                    validate_mega_moe_token_budget(None, "DeepseekV4ForCausalLM")
 
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
