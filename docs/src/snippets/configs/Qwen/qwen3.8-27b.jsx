@@ -15,7 +15,7 @@
 export const config = {
   modelName: "Qwen3.8-27B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300"],
+  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300", "xeon"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs, so they are not in the shared catalog.
@@ -25,6 +25,7 @@ export const config = {
   hardware: [
     { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
   ],
 
   // Every cell pins `--kv-cache-dtype fp8_e4m3` at the maintainers' direction
@@ -78,9 +79,11 @@ export const config = {
           id: "eagle", label: "EAGLE",
           // In-checkpoint MTP head; the only availability constraint is the
           // 32GB RTX 5090, where it needs the NVFP4 weights to leave room.
-          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
-          disableReason:
-            "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
+          disabled: (sel) => sel.hw === "xeon" ||
+            (sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4")),
+          disableReason: (sel) => sel.hw === "xeon"
+            ? "Xeon only supports no speculative decoding"
+            : "On the 32GB RTX 5090 the MTP head only fits on top of the NVFP4 weights",
           // EAGLE and DSPARK need opposite mem-fraction corrections on the
           // 5090 (EAGLE starves the state pool at boot and wants it UP;
           // DSpark starves runtime activations and wants it DOWN), so each
@@ -134,9 +137,11 @@ export const config = {
           // EAGLE. No --min-free-slots-delay: at --max-running-requests 1 it
           // is a strict no-op, and its real semantic (disable the delayer)
           // would silently bite anyone raising concurrency to 8+.
-          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
-          disableReason:
-            "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
+          disabled: (sel) => sel.hw === "xeon" ||
+            (sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4")),
+          disableReason: (sel) => sel.hw === "xeon"
+            ? "Xeon only supports no speculative decoding"
+            : "On the 32GB RTX 5090 the DSpark draft model only fits on top of the NVFP4 weights",
           stripPrefixes: (sel) =>
             sel.hw === "rtx5090"
               ? ["--mem-fraction-static", "--mamba-full-memory-ratio",
@@ -192,9 +197,11 @@ export const config = {
           // RTX PRO 6000 BF16/FP8 cells boot-and-serve). The platforms where
           // it has not been exercised carry verificationStatus "in-progress"
           // on their cells.
-          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
-          disableReason:
-            "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
+          disabled: (sel) => sel.hw === "xeon" ||
+            (sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4")),
+          disableReason: (sel) => sel.hw === "xeon"
+            ? "Xeon only supports no speculative decoding"
+            : "On the 32GB RTX 5090 the DFlash2 draft model only fits on top of the NVFP4 weights",
           // fp32 needs the balanced ratio overridden, so that family is
           // stripped as well and re-emitted below.
           stripPrefixes: (sel) =>
@@ -253,8 +260,12 @@ export const config = {
       stripPrefixes: ["--mamba-radix-cache-strategy"],
       options: [
         { id: "low-latency", label: "Low-Latency",
+          disabled: (sel) => sel.hw === "xeon",
+          disableReason: "Xeon does not support the GDN radix-cache serving strategy",
           flags: ["--mamba-radix-cache-strategy extra_buffer"] },
         { id: "high-throughput", label: "High-Throughput",
+          disabled: (sel) => sel.hw === "xeon",
+          disableReason: "Xeon does not support the GDN radix-cache serving strategy",
           flags: ["--mamba-radix-cache-strategy extra_buffer_lazy"] },
       ],
     },
@@ -302,22 +313,25 @@ export const config = {
           //     request's KV never coexist -- buying the fifth slot cuts KV to
           //     7,752 tokens against the 9,216 one 8192/1024 request needs, and
           //     generation stops after a single token.
-          disabled: (sel) =>
-            sel.hw === "rtx5090" &&
+          disabled: (sel) => sel.hw === "xeon" ||
+            (sel.hw === "rtx5090" &&
             (sel.quant === "nvfp4-bf16-head"
               ? sel.spec === "dflash" || sel.spec === "dspark"
-              : sel.spec === "dflash" && sel.tier === "low-latency"),
-          disableReason:
-            "On the 32GB RTX 5090 this combination has no fp32 GDN state pool that " +
-            "also leaves room for prefill graph capture — use bfloat16",
+              : sel.spec === "dflash" && sel.tier === "low-latency")),
+          disableReason: (sel) => sel.hw === "xeon"
+            ? "Xeon does not support selecting the Mamba SSM dtype"
+            : "On the 32GB RTX 5090 this combination has no fp32 GDN state pool that " +
+              "also leaves room for prefill graph capture — use bfloat16",
           flags: ["--mamba-ssm-dtype float32"],
         },
         {
           id: "bfloat16", label: "bfloat16",
-          disabled: (sel) => sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4"),
-          disableReason:
-            "On the 32GB RTX 5090 the bf16 GDN state pool is only a live choice for NVFP4; " +
-            "the BF16 and FP8 checkpoints have no serviceable cell on this card",
+          disabled: (sel) => sel.hw === "xeon" ||
+            (sel.hw === "rtx5090" && !String(sel.quant).startsWith("nvfp4")),
+          disableReason: (sel) => sel.hw === "xeon"
+            ? "Xeon does not support selecting the Mamba SSM dtype"
+            : "On the 32GB RTX 5090 the bf16 GDN state pool is only a live choice for NVFP4; " +
+              "the BF16 and FP8 checkpoints have no serviceable cell on this card",
           flags: ["--mamba-ssm-dtype bfloat16"],
         },
       ],
@@ -377,6 +391,7 @@ export const config = {
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
+    xeon:    "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -996,6 +1011,26 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 2048",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Xeon CPU: reference recipe only, not benchmarked on this page. No
+      // NVFP4/FP8 cell — those checkpoints have no verified CPU recipe.
+      match: { hw: "xeon", variant: "default", quant: "bf16", nodes: "single" },
+      verified: false,
+      verificationStatus: "unverified",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--mem-fraction-static 0.8",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",

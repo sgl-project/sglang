@@ -20,6 +20,7 @@ export const config = (() => {
       flags,
       gpus,
       topology: { tp_size: tp, ulysses_degree: 1, ring_degree: 1 },
+      env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
       errors: [
         ...(![1, 2, 4].includes(gpus) ? ["Choose 1, 2 or 4 GPUs."] : []),
         ...(s.model === "ltx2" && s.pipeline === "two-stage-hq" ? ["HQ requires LTX-2.3."] : []),
@@ -41,8 +42,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "LTX-2 / LTX-2.3",
-    supportedHardware: ["h200", "cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["h200", "cuda", "xeon"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -53,7 +57,12 @@ export const config = (() => {
         default: "ltx23",
         options: [
           { id: "ltx23", label: "LTX-2.3" },
-          { id: "ltx2", label: "LTX-2" },
+          {
+            id: "ltx2",
+            label: "LTX-2",
+            disabled: (s) => s.hw === "xeon",
+            disableReason: "LTX-2 is not yet supported on Intel Xeon CPUs.",
+          },
         ],
       },
       {
@@ -73,7 +82,12 @@ export const config = (() => {
         scope: "serve",
         default: "resident",
         options: [
-          { id: "resident", label: "Resident" },
+          {
+            id: "resident",
+            label: "Resident",
+            disabled: (s) => s.hw === "xeon",
+            disableReason: "Intel Xeon CPUs use the original device mode.",
+          },
           { id: "original", label: "Original" },
         ],
       },
@@ -96,8 +110,8 @@ export const config = (() => {
       defaultSelection: defaults,
       resource: {
         limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
-        verifiedRecipes: ["h200", "cuda"].map((hw) => {
-          const s = { ...defaults, hw, device: hw === "cuda" ? "original" : "resident" };
+        verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
+          const s = { ...defaults, hw, device: hw === "h200" ? "resident" : "original" };
           const p = plan(s);
           return {
             ...s,

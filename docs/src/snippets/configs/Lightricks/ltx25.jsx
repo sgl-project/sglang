@@ -24,6 +24,7 @@ export const config = (() => {
         ulysses_degree: gpus === 2 && s.parallel === "sp" ? 2 : 1,
         ring_degree: 1,
       },
+      env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
       warnings: [
         ...(s.parallel === "cfg" && gpus === 2 && s.weights !== "dev"
           ? ["Distilled weights run unguided; CFG parallelism does not accelerate them."]
@@ -55,8 +56,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "LTX-2.5",
-    supportedHardware: ["h200", "cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["h200", "cuda", "xeon"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -146,7 +150,7 @@ export const config = (() => {
       defaultSelection: defaults,
       resource: {
         limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
-        verifiedRecipes: ["h200", "cuda"].map((hw) => {
+        verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
