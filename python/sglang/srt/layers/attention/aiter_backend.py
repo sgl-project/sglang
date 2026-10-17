@@ -27,6 +27,10 @@ from sglang.kernels.ops.kvcache.aiter_unified_attention import (
     scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -509,6 +513,7 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_index_translator = model_runner.kv_index_translator
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
 
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
@@ -2600,6 +2605,19 @@ class AiterAttnBackend(AttentionBackend):
                     swa_out_cache_loc=swa_out_cache_loc,
                     paged_kv_view=paged_kv_view,
                 )
+
+        # Logical-page KV sharding: a sharded extend reads the assembled
+        # [prefix | chunk] scratch, never the striped pool rows, so its token
+        # indices must address scratch rows.
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool, self.req_to_token, forward_batch
+        ):
+            kv_indices = self.forward_metadata.kv_indices
+            self.forward_metadata.kv_indices = (
+                self._kv_shard_pool.translate_loc_to_scratch(kv_indices).to(
+                    kv_indices.dtype
+                )
+            )
 
     def _plan_dcp_decode_metadata(
         self,
