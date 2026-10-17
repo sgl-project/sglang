@@ -10,12 +10,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
-    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
+    AttachHiCacheStorageReqInput, CheckWeightsReqInput, ClearHiCacheReqInput, ControlRequest,
+    DetachHiCacheStorageReqInput, FlushCacheReqInput, GetInternalStateReq,
 };
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
@@ -40,6 +41,27 @@ pub(crate) struct CoreConfig {
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: BTreeMap<String, usize>,
     pub(crate) metadata: CoreMetadata,
+    pub(crate) hicache: HiCacheStatus,
+}
+
+/// HiCache configuration returned by `GET /hicache/storage-backend`.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct HiCacheStatus {
+    hicache_storage_backend: Option<String>,
+    hicache_storage_backend_extra_config: Option<String>,
+    hicache_storage_prefetch_policy: Option<String>,
+    hicache_write_policy: Option<String>,
+}
+
+impl From<&ServerArgs> for HiCacheStatus {
+    fn from(args: &ServerArgs) -> Self {
+        Self {
+            hicache_storage_backend: args.hicache_storage_backend.clone(),
+            hicache_storage_backend_extra_config: args.hicache_storage_backend_extra_config.clone(),
+            hicache_storage_prefetch_policy: args.hicache_storage_prefetch_policy.clone(),
+            hicache_write_policy: args.hicache_write_policy.clone(),
+        }
+    }
 }
 
 /// Immutable, transport-independent metadata retained by the core.
@@ -100,6 +122,7 @@ struct CoreInner {
     is_disaggregation: bool,
     mm_limits: BTreeMap<String, usize>,
     metadata: CoreMetadata,
+    hicache: Mutex<HiCacheStatus>,
 }
 
 impl CoreHandle {
@@ -117,6 +140,7 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
+                hicache: Mutex::new(config.hicache),
                 metadata: config.metadata,
             }),
         }
@@ -262,6 +286,75 @@ impl CoreHandle {
         rmp_serde::from_slice::<CheckWeightsOutcome>(&bytes).map_err(|error| {
             CoreError::InvalidResponse(format!("invalid weights-check response: {error}"))
         })
+    }
+
+    pub(crate) async fn hicache_status(&self) -> HiCacheStatus {
+        self.inner.hicache.lock().await.clone()
+    }
+
+    pub(crate) async fn clear_hicache_storage(&self) -> Result<ClearHiCacheOutput, CoreError> {
+        let bytes = self
+            .control(ControlRequest::ClearHiCacheReqInput(
+                ClearHiCacheReqInput::new(Rid::new().to_string()),
+            ))
+            .await?;
+        rmp_serde::from_slice::<ClearHiCacheOutput>(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid HiCache clear response: {error}"))
+        })
+    }
+
+    pub(crate) async fn detach_hicache_storage(&self) -> Result<DetachHiCacheOutput, CoreError> {
+        let mut config = self.inner.hicache.lock().await;
+        let bytes = self
+            .control(ControlRequest::DetachHiCacheStorageReqInput(
+                DetachHiCacheStorageReqInput::new(Rid::new().to_string()),
+            ))
+            .await?;
+        let output: DetachHiCacheOutput = rmp_serde::from_slice(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid HiCache detach response: {error}"))
+        })?;
+        if output.success {
+            config.hicache_storage_backend = None;
+            config.hicache_storage_backend_extra_config = None;
+        }
+        Ok(output)
+    }
+
+    pub(crate) async fn attach_hicache_storage(
+        &self,
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+    ) -> Result<AttachHiCacheOutput, CoreError> {
+        let mut config = self.inner.hicache.lock().await;
+        let bytes = self
+            .control(ControlRequest::AttachHiCacheStorageReqInput(
+                AttachHiCacheStorageReqInput::new(
+                    Rid::new().to_string(),
+                    hicache_storage_backend.clone(),
+                    hicache_storage_backend_extra_config_json.clone(),
+                    hicache_storage_prefetch_policy.clone(),
+                    hicache_write_policy.clone(),
+                ),
+            ))
+            .await?;
+        let output: AttachHiCacheOutput = rmp_serde::from_slice(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid HiCache attach response: {error}"))
+        })?;
+        if output.success {
+            config.hicache_storage_backend = Some(hicache_storage_backend);
+            if let Some(value) = hicache_storage_backend_extra_config_json {
+                config.hicache_storage_backend_extra_config = Some(value);
+            }
+            if let Some(value) = hicache_storage_prefetch_policy {
+                config.hicache_storage_prefetch_policy = Some(value);
+            }
+            if let Some(value) = hicache_write_policy {
+                config.hicache_write_policy = Some(value);
+            }
+        }
+        Ok(output)
     }
 
     async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
@@ -617,6 +710,28 @@ struct InternalStateEnvelope {
     internal_state: InternalState,
 }
 
+/// Scheduler response for clearing HiCache storage.
+#[derive(serde::Deserialize)]
+pub(crate) struct ClearHiCacheOutput {
+    pub(crate) success: bool,
+}
+
+/// Scheduler response for detaching HiCache storage.
+#[derive(serde::Deserialize)]
+pub(crate) struct DetachHiCacheOutput {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+}
+
+/// Scheduler response for attaching HiCache storage.
+#[derive(serde::Deserialize)]
+pub(crate) struct AttachHiCacheOutput {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+}
+
 /// Runtime-facing request guard kept private behind [`CoreCall`].
 ///
 /// This type is the only owner of the raw response channel and admission/abort
@@ -779,6 +894,7 @@ mod tests {
                 is_disaggregation,
                 mm_limits,
                 metadata: CoreMetadata::default(),
+                hicache: Default::default(),
             },
         )
     }

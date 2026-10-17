@@ -474,6 +474,7 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: crate::api_server::core::CoreMetadata::default(),
+                    hicache: Default::default(),
                 },
             ),
             server_args: Arc::new(server_args),
