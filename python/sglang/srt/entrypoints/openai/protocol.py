@@ -442,7 +442,7 @@ class CompletionRequest(PDRoutingFields):
 class SpecTokensDetails(BaseModel):
     """Per-request speculative decoding statistics."""
 
-    spec_accept_rate: float = 0.0
+    spec_accept_rate: Optional[float] = 0.0
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0

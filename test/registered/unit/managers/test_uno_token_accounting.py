@@ -20,6 +20,7 @@ class TestUnoTokenAccounting(CustomTestCase):
         self.result = GenerationBatchResult(
             num_correct_drafts=3,
             num_non_draft_tokens_per_req=2,
+            speculative_num_draft_tokens=4,
         )
 
     def test_generated_token_count_includes_both_non_draft_tokens(self):
@@ -35,6 +36,7 @@ class TestUnoTokenAccounting(CustomTestCase):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.spec_num_accept_tokens = 0
         reporter.spec_num_correct_drafts = 0
+        reporter.spec_num_proposed_drafts = 0
         reporter.spec_num_forward_ct = 0
         reporter.spec_num_block_accept_tokens = 0
         reporter.spec_num_cap_tokens = 0
@@ -43,10 +45,12 @@ class TestUnoTokenAccounting(CustomTestCase):
             self.batch_size,
             self.result.num_correct_drafts,
             num_accept_tokens=self.result.get_num_generated_tokens(self.batch_size),
+            num_proposed_drafts=self.result.get_num_proposed_drafts(self.batch_size),
         )
 
         self.assertEqual(reporter.spec_num_accept_tokens, 7)
         self.assertEqual(reporter.spec_num_correct_drafts, 3)
+        self.assertEqual(reporter.spec_num_proposed_drafts, 6)
         self.assertEqual(reporter.spec_num_forward_ct, 2)
 
     def test_decode_moment_receives_full_generated_token_count(self):

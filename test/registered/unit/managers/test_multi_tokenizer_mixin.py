@@ -263,6 +263,19 @@ class TestMultiTokenizerMixin(CustomTestCase):
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
                 )
 
+    def test_spec_proposal_counts_survive_single_and_grouped_routing(self):
+        for factory in (_make_batch_str_output, _make_batch_token_id_output):
+            with self.subTest(factory=factory.__name__):
+                output = factory()
+                output.spec_num_proposed_drafts = [4, 0]
+                self.assertEqual(
+                    _handle_output_by_index(output, 1).spec_num_proposed_drafts, [0]
+                )
+                self.assertEqual(
+                    _handle_output_by_indices(output, [1, 0]).spec_num_proposed_drafts,
+                    [0, 4],
+                )
+
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 

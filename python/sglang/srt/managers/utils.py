@@ -157,6 +157,17 @@ class GenerationBatchResult:
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
+    def get_num_proposed_drafts(self, batch_size: int) -> int:
+        """Count proposals using this result's captured width, not current config.
+
+        The verify width includes the root token. UNO's additional non-draft
+        output is reflected in output_stride, not in this verify width.
+        """
+        width = self.speculative_num_draft_tokens
+        if width is None or width < 1:
+            raise RuntimeError("speculative result is missing a positive verify width")
+        return batch_size * (width - 1)
+
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
