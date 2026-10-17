@@ -21,6 +21,37 @@ if _is_cuda or _is_musa:
 
 import triton.language as tl
 
+# The MXFP4 coding primitives below are duplicated from the standalone
+# quantizer (mxfp4_group_quant._fp4_code_hw / fp4_indexer._ceil_ue8m0_exp) on
+# purpose: importing those modules drags the whole
+# sglang.kernels.ops.attention.dsv4 package into every process that imports
+# these EP kernels. Keep the two copies in sync -- the fused scatter below is
+# required to emit exactly what quant_mxfp4_group32_v2 + ep_scatter would.
+
+
+@triton.jit
+def _ceil_ue8m0_exp(x):
+    bits = x.to(tl.int32, bitcast=True)
+    exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    exp += mantissa != 0
+    return tl.minimum(tl.maximum(exp, 1), 254)
+
+
+@triton.jit
+def _fp4_code_hw(x):
+    # One fp32 -> one e2m1 nibble via the hardware converter (both cvt inputs
+    # are the same value, so the low nibble holds the signed code).
+    r = tl.inline_asm_elementwise(
+        asm="{\n.reg .b8 byte0;\ncvt.rn.satfinite.e2m1x2.f32 byte0, $1, $1;\ncvt.u32.u8 $0, byte0;\n}",
+        constraints="=r,f",
+        args=[x],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    return (r & 0x0F).to(tl.uint8)
+
 
 def _get_launch_config_1d(device, numel):
     MAX_THREADS_PER_BLOCK = 1024
@@ -1338,6 +1369,426 @@ def ep_scatter_from_psum(
 
 
 @triton.jit
+def _fwd_kernel_ep_scatter_quant_mxfp4(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_x_stride1,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    expert_start,
+    topk_num: tl.constexpr,
+    TOPK_PAD: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ATOMIC_ADD_SEM: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+):
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+
+    NUM_CHUNKS: tl.constexpr = HIDDEN_SIZE // BLOCK_K
+    NG: tl.constexpr = BLOCK_K // 32
+    off_c = tl.arange(0, BLOCK_K)
+    off_q = tl.arange(0, BLOCK_K // 2)
+    off_w = tl.arange(0, NG // 4)
+    sh = tl.arange(0, 4) * 8
+
+    for token_id_int32 in range(start_token_id, total_token_num, grid_num):
+        token_id = token_id_int32.to(tl.int64)
+        off_t = tl.arange(0, TOPK_PAD)
+        t_mask = off_t < topk_num
+        expert_ids = tl.load(
+            recv_topk + token_id * recv_topk_stride0 + off_t * recv_topk_stride1,
+            mask=t_mask,
+            other=-1,
+        )
+        # Global -> local expert id, exactly as _fwd_kernel_ep_scatter_2 does:
+        # the compact layout's expert_start_loc is indexed by local expert, and
+        # callers with EP rank > 0 hand over global ids (the expert_start of
+        # pre_permute_standard_to_deep_gemm). Masked lanes carry -1, which the
+        # subtraction keeps negative, so they stay invalid.
+        expert_ids = expert_ids - expert_start
+        # 上界防护：脏 expert id（>= NUM_EXPERTS）不得参与 atomic_add，
+        # 否则 expert_start_loc + id 越界写 → IMA。
+        dst_valid = (expert_ids >= 0) & (expert_ids < NUM_EXPERTS)
+        dst_rows_i32 = tl.atomic_add(
+            expert_start_loc + expert_ids,
+            1,
+            mask=dst_valid,
+            sem=ATOMIC_ADD_SEM,
+        )
+        # The -1 sentinel must be written for unrouted slots as well (matching
+        # _fwd_kernel_ep_scatter_2): consumers of src2dst decide for themselves
+        # whether they mask on topk_ids or on `dst_idx >= 0`, and the latter
+        # reads a value left behind by `torch.empty_like` for any slot this
+        # kernel skipped - a dirty id >= NUM_EXPERTS included, which the
+        # topk_ids-based guard above does let through.
+        tl.store(
+            output_index
+            + token_id * output_index_stride0
+            + off_t * output_index_stride1,
+            tl.where(dst_valid, dst_rows_i32, -1),
+            mask=t_mask,
+        )
+        dst_rows = dst_rows_i32.to(tl.int64)
+
+        for chunk in tl.range(0, NUM_CHUNKS):
+            base = chunk * BLOCK_K
+            x = tl.load(
+                recv_x + token_id * recv_x_stride0 + (base + off_c) * recv_x_stride1
+            ).to(tl.float32)
+            y2d = tl.reshape(x, (NG, 32))
+            amax = tl.max(tl.abs(y2d), axis=1)
+            exp = _ceil_ue8m0_exp(tl.maximum(amax / 6.0, 1.0e-4))
+            scale = (exp << 23).to(tl.float32, bitcast=True)
+            scale_b = tl.reshape(tl.broadcast_to(scale[:, None], (NG, 32)), (BLOCK_K,))
+            code = _fp4_code_hw(x / scale_b)
+            c2 = tl.reshape(code, (BLOCK_K // 2, 2))
+            lo, hi = tl.split(c2)
+            packed = (lo & 0x0F) | ((hi & 0x0F) << 4)
+            e2d = tl.reshape(exp, (NG // 4, 4))
+            words = tl.sum(e2d << sh[None, :], axis=1)
+            q_offs = base // 2 + off_q
+            w_offs = base // 128 + off_w
+            tl.store(
+                output_tensor
+                + dst_rows[:, None] * output_tensor_stride0
+                + q_offs[None, :],
+                tl.broadcast_to(packed.to(tl.int8)[None, :], (TOPK_PAD, BLOCK_K // 2)),
+                mask=dst_valid[:, None],
+            )
+            tl.store(
+                output_tensor_scale
+                + dst_rows[:, None] * output_tensor_scale_stride0
+                + w_offs[None, :] * output_tensor_scale_stride1,
+                tl.broadcast_to(words[None, :], (TOPK_PAD, NG // 4)),
+                mask=dst_valid[:, None],
+            )
+
+
+@torch.no_grad()
+def ep_scatter_quant_mxfp4(
+    recv_x: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    num_valid_tokens_per_expert: torch.Tensor,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    expert_alignment: int = 128,
+    expert_start: int = 0,
+):
+    if recv_x.ndim != 2 or recv_topk.ndim != 2:
+        raise ValueError("recv_x and recv_topk must be 2D tensors")
+    if recv_x.dtype != torch.bfloat16:
+        raise ValueError(f"recv_x must have dtype=torch.bfloat16, got {recv_x.dtype}")
+    if output_tensor.dtype != torch.int8:
+        raise ValueError(
+            f"output_tensor must have dtype=torch.int8, got {output_tensor.dtype}"
+        )
+    if not all(
+        tensor.is_cuda
+        for tensor in (
+            recv_x,
+            recv_topk,
+            expert_start_loc,
+            output_tensor,
+            output_tensor_scale,
+            m_indices,
+            output_index,
+        )
+    ):
+        raise ValueError("fused MXFP4 scatter operands must be CUDA tensors")
+    # recv_x / recv_topk / output_index are indexed through their strides, and
+    # output_tensor_scale is deliberately an mn-major transposed view, so only
+    # the packed q rows must be dense along their last dimension.
+    if output_tensor.stride(1) != 1:
+        raise ValueError("output_tensor packed rows must have stride 1")
+    if recv_x.shape[1] <= 0 or recv_x.shape[1] % 128 != 0:
+        raise ValueError("recv_x hidden size must be a positive multiple of 128")
+    if recv_topk.shape[0] != recv_x.shape[0]:
+        raise ValueError("recv_topk and recv_x must have the same token count")
+    if recv_topk.shape[1] <= 0:
+        raise ValueError("topk must be positive")
+    if output_tensor.shape[1] != recv_x.shape[1] // 2:
+        raise ValueError("output_tensor has an incompatible packed hidden size")
+    if output_tensor_scale.dtype != torch.int32 or output_tensor_scale.shape != (
+        output_tensor.shape[0],
+        recv_x.shape[1] // 128,
+    ):
+        raise ValueError("output_tensor_scale has an incompatible MXFP4 shape")
+    if output_index.shape != recv_topk.shape:
+        raise ValueError("output_index must have the same shape as recv_topk")
+    # The compact layout's block_e comes from DeepGEMM
+    # (get_contiguous_layout_alignment) and can be smaller than 128, while
+    # _fwd_kernel_ep_scatter_1 stores in unmasked BLOCK_E blocks -- so the guard
+    # and the launch both have to use it. Mirrors ep_scatter's own
+    # expert_alignment handling.
+    BLOCK_E = expert_alignment & -expert_alignment
+    if m_indices.shape[0] % BLOCK_E != 0:
+        raise ValueError("m_indices must be aligned to the EP block size")
+    if recv_x.shape[0] == 0:
+        return
+    major, _ = torch.cuda.get_device_capability(recv_x.device)
+    if major < 10:
+        raise RuntimeError("MXFP4 hardware conversion requires SM100 or newer")
+
+    num_experts = expert_start_loc.shape[0]
+    _fwd_kernel_ep_scatter_1[(num_experts,)](
+        num_recv_tokens_per_expert,
+        num_valid_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=4,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = min(recv_x.shape[0], 8192)
+    _fwd_kernel_ep_scatter_quant_mxfp4[(grid,)](
+        recv_x.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor_scale,
+        output_tensor_scale.stride(0),
+        output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        expert_start,
+        topk_num=recv_topk.shape[1],
+        TOPK_PAD=triton.next_power_of_2(recv_topk.shape[1]),
+        num_warps=4,
+        HIDDEN_SIZE=recv_x.shape[1],
+        BLOCK_K=next(
+            (b for b in (2048, 1024, 512, 256, 128) if recv_x.shape[1] % b == 0),
+            128,
+        ),
+        ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
+        NUM_EXPERTS=num_experts,
+    )
+
+
+@triton.jit
+def _fwd_kernel_quant_scatter_mxfp4_masked(
+    hidden_states,
+    hidden_states_stride0,
+    hidden_states_stride1,
+    topk_ids,  # (T, topk) int32; <0 = slot not routed
+    topk_ids_stride0,
+    src2dst,  # flat (T * topk,) int32; dst row = expert * m_max + slot
+    gateup_input,  # (E, m_max, HIDDEN_SIZE // 2) int8
+    # The stride of ONE packed row. `dst` is expert * m_max + m over the
+    # flattened (E, m_max), so it has to be scaled by the m_max dim's stride
+    # (== K // 2 for a dense buffer), not by the expert dim's.
+    gateup_input_row_stride,
+    gateup_input_scale,  # (E, HIDDEN_SIZE // 128, m_max) int32, MN-major
+    scale_stride_e,
+    scale_stride_w,
+    scale_stride_m,
+    num_tokens,
+    m_max,
+    topk_num: tl.constexpr,
+    TOPK_PAD: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+):
+    # Masked twin of _fwd_kernel_ep_scatter_quant_mxfp4: same per-token group-32
+    # quantization, but the destinations come from src2dst and are addressed as
+    # two dimensions (expert, m) instead of one flat row, because the masked
+    # grouped GEMM keeps every expert's tokens in its own padded slab. The
+    # scale therefore also lands in MN-major order rather than per-token rows.
+    start_token_id = tl.program_id(0)
+    grid_num = tl.num_programs(0)
+
+    NUM_CHUNKS: tl.constexpr = HIDDEN_SIZE // BLOCK_K
+    NG: tl.constexpr = BLOCK_K // 32
+    off_c = tl.arange(0, BLOCK_K)
+    off_q = tl.arange(0, BLOCK_K // 2)
+    off_w = tl.arange(0, NG // 4)
+    sh = tl.arange(0, 4) * 8
+
+    for token_id_int32 in range(start_token_id, num_tokens, grid_num):
+        token_id = token_id_int32.to(tl.int64)
+        off_t = tl.arange(0, TOPK_PAD)
+        t_mask = off_t < topk_num
+        expert_ids = tl.load(
+            topk_ids + token_id * topk_ids_stride0 + off_t, mask=t_mask, other=-1
+        )
+        # 与 compact 版同款上界防护：脏 id 不参与目标行寻址，避免越界写。
+        dst_valid = (expert_ids >= 0) & (expert_ids < NUM_EXPERTS)
+        # src2dst is the flat (T * topk,) row index fused_moe_dispatch_index emits.
+        dst_rows = tl.load(
+            src2dst + token_id * topk_num + off_t, mask=dst_valid, other=0
+        ).to(tl.int64)
+        # Every valid slot's row index already encodes its expert, so derive the
+        # MN-major coordinates from it rather than trusting topk_ids to be local.
+        dst_expert = dst_rows // m_max
+        dst_m = dst_rows - dst_expert * m_max
+
+        for chunk in tl.range(0, NUM_CHUNKS):
+            base = chunk * BLOCK_K
+            x = tl.load(
+                hidden_states
+                + token_id * hidden_states_stride0
+                + (base + off_c) * hidden_states_stride1
+            ).to(tl.float32)
+            y2d = tl.reshape(x, (NG, 32))
+            amax = tl.max(tl.abs(y2d), axis=1)
+            exp = _ceil_ue8m0_exp(tl.maximum(amax / 6.0, 1.0e-4))
+            scale = (exp << 23).to(tl.float32, bitcast=True)
+            scale_b = tl.reshape(tl.broadcast_to(scale[:, None], (NG, 32)), (BLOCK_K,))
+            code = _fp4_code_hw(x / scale_b)
+
+            c2 = tl.reshape(code, (BLOCK_K // 2, 2))
+            lo, hi = tl.split(c2)
+            packed = (lo & 0x0F) | ((hi & 0x0F) << 4)
+            e2d = tl.reshape(exp, (NG // 4, 4))
+            words = tl.sum(e2d << sh[None, :], axis=1)
+
+            q_offs = base // 2 + off_q
+            w_offs = base // 128 + off_w
+            tl.store(
+                gateup_input
+                + dst_rows[:, None] * gateup_input_row_stride
+                + q_offs[None, :],
+                tl.broadcast_to(packed.to(tl.int8)[None, :], (TOPK_PAD, BLOCK_K // 2)),
+                mask=dst_valid[:, None],
+            )
+            tl.store(
+                gateup_input_scale
+                + dst_expert[:, None] * scale_stride_e
+                + w_offs[None, :] * scale_stride_w
+                + dst_m[:, None] * scale_stride_m,
+                tl.broadcast_to(words[None, :], (TOPK_PAD, NG // 4)),
+                mask=dst_valid[:, None],
+            )
+
+
+@torch.no_grad()
+def quant_scatter_mxfp4_masked(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    src2dst: torch.Tensor,
+    gateup_input: torch.Tensor,
+    gateup_input_scale: torch.Tensor,
+    m_max: int,
+) -> None:
+    """Fused per-token MXFP4 quant + scatter into the masked grouped-GEMM input.
+
+    One kernel replacing ``quant_mxfp4_group32_v2`` + the SCALE_MN_MAJOR
+    ``fill_gateup_input_triton_kernel``. Besides halving the launch count it also
+    drops the two (T, K//2) / (T, K//128) per-token intermediates and the
+    zero-filled scale storage, which is most of what the two-step form costs at
+    the small batches the masked layout is chosen for.
+
+    ``gateup_input`` is int8 ``(E, m_max, K//2)`` and ``gateup_input_scale`` is
+    the int32 ``(E, K//128, m_max)`` MN-major storage (its transposed view is
+    what the GEMM takes). ``src2dst`` is the flat ``fused_moe_dispatch_index``
+    output. Byte-identical to the two-step form.
+    """
+    if hidden_states.dim() != 2 or topk_ids.dim() != 2 or src2dst.dim() != 1:
+        raise ValueError(
+            "hidden_states and topk_ids must be 2D, src2dst flat (T * topk)"
+        )
+    if hidden_states.dtype != torch.bfloat16:
+        raise ValueError(
+            f"hidden_states must have dtype=torch.bfloat16, got {hidden_states.dtype}"
+        )
+    if topk_ids.dtype != torch.int32 or src2dst.dtype != torch.int32:
+        raise ValueError("topk_ids and src2dst must have dtype=torch.int32")
+    if src2dst.numel() != topk_ids.numel():
+        raise ValueError("src2dst must have one entry per (token, topk) slot")
+    if topk_ids.stride(1) != 1:
+        raise ValueError("topk_ids must be contiguous in its inner dim")
+    # The kernel addresses src2dst as a flat buffer with a row stride of topk
+    # (token_id * topk_num + slot), so anything but a dense buffer reads the
+    # wrong row for every token after the first.
+    if src2dst.stride(0) != 1:
+        raise ValueError("src2dst must be a dense flat buffer")
+    if gateup_input.dtype != torch.int8 or gateup_input.dim() != 3:
+        raise ValueError("gateup_input must be a 3D int8 tensor")
+    if gateup_input_scale.dtype != torch.int32 or gateup_input_scale.dim() != 3:
+        raise ValueError("gateup_input_scale must be a 3D int32 tensor")
+    if not all(
+        t.is_cuda
+        for t in (hidden_states, topk_ids, src2dst, gateup_input, gateup_input_scale)
+    ):
+        raise ValueError("fused MXFP4 masked scatter operands must be CUDA tensors")
+    hidden = hidden_states.shape[1]
+    if hidden <= 0 or hidden % 128 != 0:
+        raise ValueError(
+            f"hidden size must be a positive multiple of 128, got {hidden}"
+        )
+    if hidden_states.shape[0] != topk_ids.shape[0]:
+        raise ValueError("topk_ids and hidden_states must have the same token count")
+    if gateup_input.shape[2] * 2 != hidden:
+        raise ValueError("gateup_input has an incompatible packed hidden size")
+    if gateup_input_scale.shape[1] * 128 != hidden:
+        raise ValueError("gateup_input_scale has an incompatible MXFP4 shape")
+    if gateup_input.stride(2) != 1:
+        raise ValueError("gateup_input packed rows must have stride 1")
+    # `dst = expert * m_max + m` is turned back into an offset with a single
+    # stride, which only works while the expert slabs are dense too.
+    if gateup_input.stride(1) != gateup_input.shape[2] or gateup_input.stride(
+        0
+    ) != gateup_input.shape[1] * gateup_input.stride(1):
+        raise ValueError("gateup_input expert slabs must be dense")
+    if hidden_states.shape[0] == 0:
+        return
+    major, _ = torch.cuda.get_device_capability(hidden_states.device)
+    if major < 10:
+        raise RuntimeError("MXFP4 hardware conversion requires SM100 or newer")
+
+    topk = topk_ids.shape[1]
+    grid = min(hidden_states.shape[0], 8192)
+    _fwd_kernel_quant_scatter_mxfp4_masked[(grid,)](
+        hidden_states,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        topk_ids,
+        topk_ids.stride(0),
+        src2dst,
+        gateup_input,
+        gateup_input.stride(1),
+        gateup_input_scale,
+        gateup_input_scale.stride(0),
+        gateup_input_scale.stride(1),
+        gateup_input_scale.stride(2),
+        hidden_states.shape[0],
+        m_max,
+        topk_num=topk,
+        TOPK_PAD=triton.next_power_of_2(topk),
+        num_warps=4,
+        HIDDEN_SIZE=hidden,
+        BLOCK_K=next((b for b in (2048, 1024, 512, 256, 128) if hidden % b == 0), 128),
+        NUM_EXPERTS=gateup_input.shape[0],
+    )
+
+
+@triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
     input_tensor,
@@ -1695,8 +2146,14 @@ def moe_ep_deepgemm_preprocess(
         topk_ids, num_local_experts, m_max, expert_start=expert_start
     )
 
+    # W4A4 (output_dtype=torch.int8) packs two e2m1 activations per byte, so the
+    # packed rows are half the width of the fp8 / bf16 ones.
+    is_mxfp4 = output_dtype == torch.int8
+    packed_hidden_size = (
+        hidden_states.size(1) // 2 if is_mxfp4 else hidden_states.size(1)
+    )
     gateup_input = torch.empty(
-        (num_local_experts, m_max, hidden_states.size(1)),
+        (num_local_experts, m_max, packed_hidden_size),
         device=hidden_states.device,
         dtype=output_dtype,
     )
@@ -1710,7 +2167,53 @@ def moe_ep_deepgemm_preprocess(
     # scale afterward can change the represented activation by up to 2x.
     from sglang.srt.layers import deep_gemm_wrapper
 
-    if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
+    if is_mxfp4:
+        # Group-32 ue8m0 values, packed e2m1, scattered into the per-expert
+        # padded slab. The scale is written straight into the MN-major backing,
+        # so no transpose of an (E, m_max, G) view is needed.
+        scale_words = hidden_states.size(1) // 128
+        gateup_input_scale = torch.empty(
+            (gateup_input.size(0), scale_words, m_max),
+            device=hidden_states.device,
+            dtype=torch.int32,
+        )
+        if envs.SGLANG_USE_DEEPGEMM_W4A4_FUSED_SCATTER.get():
+            # One launch instead of two, and no (T, K//2)/(T, K//128)
+            # intermediates: the masked layout is picked for the small batches
+            # where the two-step form's launch and allocation overhead dominates.
+            quant_scatter_mxfp4_masked(
+                hidden_states,
+                topk_ids,
+                src2dst,
+                gateup_input,
+                gateup_input_scale,
+                m_max,
+            )
+        else:
+            from sglang.kernels.ops.quantization.mxfp4_group_quant import (
+                quant_mxfp4_group32_v2,
+            )
+
+            packed, packed_scale = quant_mxfp4_group32_v2(hidden_states)
+            fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
+                packed,
+                packed_scale,
+                gateup_input,
+                gateup_input_scale,
+                src2dst,
+                topk_ids,
+                top_k,
+                packed_hidden_size,
+                scale_words,
+                m_max,
+                packed_scale.stride(0),
+                packed_scale.stride(1),
+                BLOCK_SIZE=1024,
+                IS_FP8=True,
+                SCALE_MN_MAJOR=True,
+            )
+        gateup_input_scale = gateup_input_scale.transpose(1, 2)
+    elif is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
         from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
