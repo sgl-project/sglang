@@ -95,6 +95,15 @@ class Spec(msgspec.Struct):
         "scheduler consumes. Omit to use identity (no calibration); losslessness is "
         "unaffected either way.",
     ] = None
+    speculative_dspark_confidence_source: A[
+        Literal["auto", "head", "online"],
+        "DSPARK ragged-verify only. Where the per-position acceptance confidences "
+        "the scheduler trims verification with come from. 'head': the checkpoint's "
+        "trained confidence head. 'online': an estimator fitted while serving, "
+        "sigmoid(slope * logit(q_max) + intercept[position]) over the draft "
+        "distribution, for checkpoints without a head. 'auto': the head when the "
+        "checkpoint ships one, else online. Losslessness is unaffected either way.",
+    ] = "auto"
     speculative_dspark_align_verify_tokens_to_graph_tier: A[
         bool,
         "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "

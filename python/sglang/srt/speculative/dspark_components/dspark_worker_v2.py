@@ -70,6 +70,14 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
 )
@@ -283,6 +291,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._target_hidden_projection_enabled = False
 
+        self._acceptance_estimator = self._build_acceptance_estimator()
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -291,6 +300,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=get_parallel().tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
+            online_confidence=self._acceptance_estimator is not None,
         )
         if (
             get_parallel().attn_dp_enabled
@@ -427,6 +437,59 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _build_acceptance_estimator(self) -> Optional[OnlineAcceptanceEstimator]:
+        if (
+            read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+            or self.draft_model.confidence_head is not None
+        ):
+            return None
+        if envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get():
+            raise ValueError(
+                "The online acceptance estimator scores the draft step logits, "
+                "which SGLANG_DSPARK_USE_GREEDY_DRAFT does not keep. Use a draft "
+                "checkpoint with a confidence head, or unset "
+                "SGLANG_DSPARK_USE_GREEDY_DRAFT."
+            )
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DSpark ragged-verify confidences come from the online acceptance "
+                "estimator (gamma=%d, refit every %d steps).",
+                self.gamma,
+                OnlineAcceptanceEstimator.REFIT_INTERVAL,
+            )
+        return OnlineAcceptanceEstimator(
+            gamma=self.gamma,
+            device=self.device,
+            log_rank=get_parallel().tp_rank == 0,
+        )
+
+    def _predict_acceptance(self, draft_block) -> Optional[torch.Tensor]:
+        if draft_block.draft_tokens.shape[0] == 0:
+            return None
+        return self._acceptance_estimator.predict(
+            step_logits=draft_block.corrected_logits,
+            temperatures=draft_block.temperatures,
+            greedy_mask=draft_block.greedy_mask,
+        )
+
+    def _observe_acceptance(
+        self, *, accept, layout: Optional[RaggedVerifyLayout], run_compact: bool
+    ) -> None:
+        estimator = self._acceptance_estimator
+        if self._simulate_acc_len > 0:
+            estimator.skip_observe()
+            return
+        if run_compact:
+            # Rows past a request's verify window are padding; draft j is
+            # checked against row j, so only the first verify_lens are graded.
+            num_graded = torch.clamp(layout.verify_lens, max=self.gamma)
+        else:
+            num_graded = torch.full_like(accept.correct_len, self.gamma)
+        estimator.observe(
+            num_correct_drafts=accept.correct_len + accept.cap_trim_lens,
+            num_graded_drafts=num_graded,
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -904,6 +967,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
         confidence = proposal.confidence
+        if self._acceptance_estimator is not None:
+            confidence = self._predict_acceptance(draft_block)
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -1022,6 +1087,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
+        if self._acceptance_estimator is not None and confidence is not None:
+            self._observe_acceptance(
+                accept=accept, layout=layout, run_compact=run_compact
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
