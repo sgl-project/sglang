@@ -65,6 +65,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
+    _as_int_list,
     _prefill_graph_max_seq_len,
     _tail_rows,
 )
@@ -120,6 +121,8 @@ if TYPE_CHECKING:
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
         FP4PrefillWorkspace,
+        FP4RowgroupDecodeWorkspace,
+        FP4RowgroupPrefillWorkspace,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -684,15 +687,17 @@ class DSV4Metadata:
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
     # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
-    fp4_low_ratio_decode_workspaces: Dict[int, FP4DecodeWorkspace] = field(
-        default_factory=dict, repr=False
-    )
-    fp4_low_ratio_prefill_workspaces: Dict[int, FP4PrefillWorkspace] = field(
-        default_factory=dict, repr=False
-    )
+    fp4_low_ratio_decode_workspaces: Dict[
+        int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = field(default_factory=dict, repr=False)
+    fp4_low_ratio_prefill_workspaces: Dict[
+        int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]
+    ] = field(default_factory=dict, repr=False)
     # Captured kernels bind these FP4 indexer buffers by address; absent from copy_
     # so addresses stay pinned across replays (the builders refresh contents).
-    fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
+    fp4_decode_workspace: Optional[
+        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = field(default=None, repr=False)
     fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
         default=None, repr=False
     )
@@ -1015,6 +1020,36 @@ class DeepseekV4HipRadixBackend(
             )
 
             self._fp4_graph_row_limit = MAX_FUSED_ROWS
+        # DSv4 C4 decode / target-verify indexer on AITER's row-group kernel: no schedule,
+        # its workspace built in the graph, a request's verify rows sharing each key load.
+        # Every launch reads a table of one width (its compiled variant) for the server's life.
+        self._fp4_c4_rowgroup_columns: Optional[int] = None
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and self.speculative_num_steps == 0
+            and self.has_c4
+            and envs.SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP.get()
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                aiter_has_fp4_rowgroup,
+                rowgroup_table_columns,
+            )
+
+            if aiter_has_fp4_rowgroup():
+                self._fp4_c4_rowgroup_columns = rowgroup_table_columns(
+                    max(self.max_context_len, self.MAX_SEQ_LEN_FOR_CAPTURE), 4
+                )
+                logger.info(
+                    "DSv4 C4 indexer: decode / target-verify on the row-group FP4 "
+                    "MQA logits kernel (%d table columns)",
+                    self._fp4_c4_rowgroup_columns,
+                )
+            else:
+                logger.warning(
+                    "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP is set but the installed AITER "
+                    "has no row-group FP4 MQA logits kernel (#6145); keeping the "
+                    "schedule-based C4 indexer."
+                )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -1728,13 +1763,29 @@ class DeepseekV4HipRadixBackend(
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
                         )
-                    }
+                    },
+                    max_context_len=self.max_context_len,
+                    num_requests=forward_batch.batch_size,
+                    page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
             )
 
         # Decode's schedule builder is capture-safe (the workspace pins its scratch);
-        # prefill/target-verify's is not, see _refresh_fp4_prefill_workspace.
-        if self._fp4_workspaces_enabled(metadata) and (
+        # prefill/target-verify's is not, see _refresh_fp4_prefill_workspace. The
+        # row-group workspace has no schedule, so target-verify builds it here too.
+        rowgroup_rows = self._fp4_c4_rowgroup_rows(metadata, forward_batch)
+        if rowgroup_rows is not None:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                prepare_fp4_rowgroup_decode_workspace,
+            )
+
+            metadata.fp4_decode_workspace = prepare_fp4_rowgroup_decode_workspace(
+                metadata.indexer_metadata.page_table,
+                rowgroup_rows,
+                table_columns=self._fp4_c4_rowgroup_columns,
+                min_grouped_seqs=1,
+            )
+        elif self._fp4_workspaces_enabled(metadata) and (
             forward_batch.forward_mode.is_decode()
         ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -1758,6 +1809,40 @@ class DeepseekV4HipRadixBackend(
             and metadata.c4_compress_metadata is not None
         )
 
+    def _fp4_c4_rowgroup_rows(
+        self, metadata, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        """Rows a request scores as one sequence on the row-group kernel this step: 1 for
+        decode, the draft rows for a target-verify of at least C4_ROWGROUP_MIN_VERIFY_ROWS
+        rows (below it the prefill kernel's schedule spreads a few requests' keys wider).
+        None keeps the schedule kernels, as does a verify whose logits outgrow the prefill
+        budget (the row-group launch is unchunked).
+        """
+        if self._fp4_c4_rowgroup_columns is None or not self._fp4_workspaces_enabled(
+            metadata
+        ):
+            return None
+        mode = forward_batch.forward_mode
+        if mode.is_decode():
+            return 1
+        if not mode.is_target_verify():
+            return None
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            C4_ROWGROUP_MIN_VERIFY_ROWS,
+            logits_rows_per_chunk,
+        )
+
+        page_table = metadata.indexer_metadata.page_table
+        rows, num_draft = page_table.shape[0], self.target_verify_num_draft_tokens
+        if (
+            num_draft < 2
+            or rows != num_draft * forward_batch.batch_size
+            or rows < C4_ROWGROUP_MIN_VERIFY_ROWS
+            or rows > logits_rows_per_chunk(page_table)
+        ):
+            return None
+        return num_draft
+
     def _refresh_fp4_prefill_workspace(
         self, forward_batch: ForwardBatch, metadata: Optional[DSV4Metadata] = None
     ) -> None:
@@ -1775,6 +1860,13 @@ class DeepseekV4HipRadixBackend(
                 refresh_low_ratio_prefill_workspaces(
                     metadata.low_ratio_indexer_metadata_by_ratio(),
                     metadata.fp4_low_ratio_prefill_workspaces,
+                    extend_lens=(
+                        metadata.late_layer_tail.extend_seq_lens_cpu
+                        if metadata.late_layer_tail is not None
+                        else _as_int_list(forward_batch.extend_seq_lens_cpu)
+                    ),
+                    max_context_len=self.max_context_len,
+                    page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
             )
         if not self._fp4_workspaces_enabled(metadata):
@@ -1784,6 +1876,9 @@ class DeepseekV4HipRadixBackend(
             ForwardMode.MIXED,
             ForwardMode.TARGET_VERIFY,
         ):
+            return
+        if self._fp4_c4_rowgroup_rows(metadata, forward_batch) is not None:
+            # scored on the row-group kernel, its workspace built with the metadata
             return
         if (
             get_parallel().attn_cp_size != 1
