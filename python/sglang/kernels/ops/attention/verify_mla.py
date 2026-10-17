@@ -34,6 +34,32 @@ _BLOCK_CONFIG = {
 }
 
 
+# (local KV group, head dimension, padded query width, CUDA capability).
+# SM90: H20 shared-KV sweep, 2026-10-13. SM89: correctness/graph replay
+# validated on RTX 4090; the H20 tile has not been performance-tuned on Ada.
+_CUDA_SHARED_KV_TILES = {
+    (16, 512, l_pad, arch): (16, 16, 8)
+    for arch in ((8, 9), (9, 0))
+    for l_pad in (1, 2, 4)
+}
+
+
+def cuda_shared_kv_tile(
+    kv_group_num: int, head_dim: int, max_len_extend: int, arch: tuple[int, int]
+) -> tuple[int, int, int] | None:
+    """Return a validated CUDA tile, or None for an unvalidated shape."""
+    if not isinstance(max_len_extend, int) or max_len_extend < 1:
+        return None
+    l_pad = triton.next_power_of_2(max_len_extend)
+    tile = _CUDA_SHARED_KV_TILES.get((kv_group_num, head_dim, l_pad, arch))
+    if tile is None:
+        return None
+    block_h, _, _ = tile
+    if kv_group_num % block_h or block_h * l_pad < 16:
+        return None
+    return tile
+
+
 def block_config(head_dim):
     """
     Return (BLOCK_H, BLOCK_N, num_warps) for a head_dim; default for untuned
@@ -64,7 +90,7 @@ def _verify_mla_prefix_stage1(
     qo_indptr,
     kv_indptr,
     kv_indices,
-    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] bf16
+    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] fp32
     Att_Lse,  # [BS, H_Q, MAX_N_SPLITS, L_EXT]     fp32
     num_splits,  # launched split count
     stride_qbs,
@@ -363,6 +389,8 @@ def _verify_mla_combine_stage2(
     wp = tl.exp(lse_prefix - mm)
     wd = tl.exp(lse_draft - mm)
     o = (o_prefix * wp[:, None] + o_draft * wd[:, None]) / (wp + wd)[:, None]
+    # An empty prefix has no finite LSE to normalize; only draft keys exist.
+    o = tl.where(seqlen > 0, o, o_draft)
 
     offs_oo = (
         (cur_q_start + offs_l)[:, None] * stride_oobs
@@ -415,10 +443,10 @@ class VerifyMLA:
 
     def _alloc(self, max_bs):
         self.max_bs = max_bs
-        # bf16 partials (halves scratch traffic vs fp32); lse stays fp32.
+        # Preserve cancellation residuals until the final prefix/draft merge.
         self.att_out = torch.empty(
             (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad, self.v_head_dim),
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             device=self.device,
         )
         self.att_lse = torch.empty(
@@ -607,6 +635,12 @@ def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=Non
     vk = _VMLA_CACHE.get(key)
     if vk is None:
         block_h, block_n, num_warps = block_config(head_dim)
+        if torch.version.hip is None and torch.device(device).type == "cuda":
+            tile = cuda_shared_kv_tile(
+                kv_group_num, head_dim, l_ext, torch.cuda.get_device_capability(device)
+            )
+            if h_q == kv_group_num and head_dim == v_head_dim and tile is not None:
+                block_h, block_n, num_warps = tile
         if (
             kv_group_num is not None
             and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live

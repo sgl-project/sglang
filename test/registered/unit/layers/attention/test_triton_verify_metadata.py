@@ -241,3 +241,133 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("arch", [(8, 9), (9, 0)])
+def test_cuda_verify_tile_coverage(arch):
+    from sglang.kernels.ops.attention.verify_mla import cuda_shared_kv_tile
+    from sglang.kernels.ops.attention.verify_splitkv import cuda_splitkv_tile
+
+    for width in range(1, 5):
+        assert cuda_shared_kv_tile(16, 512, width, arch) == (16, 16, 8)
+    for width in range(1, 6):
+        assert cuda_splitkv_tile(16, 8, 256, width, arch) is not None
+    for width in (None, 0, -1, 6, 7, 8, 9):
+        assert cuda_shared_kv_tile(16, 512, width, arch) is None
+        assert cuda_splitkv_tile(16, 8, 256, width, arch) is None
+    assert cuda_shared_kv_tile(16, 512, 5, arch) is None
+    # TP2/group-8 and other unvalidated shapes remain opt-out.
+    assert cuda_shared_kv_tile(8, 512, 3, arch) is None
+    assert cuda_shared_kv_tile(16, 256, 3, arch) is None
+    assert cuda_splitkv_tile(8, 4, 256, 3, arch) is None
+    assert cuda_splitkv_tile(16, 8, 128, 3, arch) is None
+
+
+@pytest.mark.parametrize("arch", [(8, 0), (8, 6), (10, 0), (12, 0)])
+def test_cuda_verify_untuned_architecture(arch):
+    from sglang.kernels.ops.attention.verify_mla import cuda_shared_kv_tile
+    from sglang.kernels.ops.attention.verify_splitkv import cuda_splitkv_tile
+
+    assert cuda_shared_kv_tile(16, 512, 3, arch) is None
+    assert cuda_splitkv_tile(16, 8, 256, 3, arch) is None
+
+
+def test_cuda_verify_backend_routing_and_fallback():
+    from types import SimpleNamespace
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from sglang.srt.layers.radix_attention import AttentionType
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    for sliding_window, h_kv, dim in ((-1, 1, 512), (1023, 8, 256)):
+        with FakeTensorMode():
+            q = torch.empty(3, 16, dim, dtype=torch.bfloat16, device="cuda:0")
+            k = torch.empty(3, h_kv, dim, dtype=q.dtype, device=q.device)
+            pool = torch.empty(32, h_kv, dim, dtype=q.dtype, device=q.device)
+            backend = TritonAttnBackend.__new__(TritonAttnBackend)
+            backend._can_run_dense_fp8_chunked_mha = lambda *args: False
+            backend.dcp_size = 1
+            backend.enable_deterministic = False
+            backend.use_cuda_verify = True
+            backend.cuda_verify_arch = (9, 0)
+            backend.use_verify_shared_kv = backend.use_verify_splitkv = False
+            backend.token_to_kv_pool = SimpleNamespace(
+                get_key_buffer=lambda _: pool, get_value_buffer=lambda _: pool
+            )
+            backend.req_to_token_pool = SimpleNamespace(size=1)
+            backend.dllm_attention = None
+            backend.page_size = 1
+            backend.forward_metadata = SimpleNamespace(
+                kv_indptr=None,
+                kv_indices=None,
+                window_kv_indptr=None,
+                window_kv_indices=None,
+                window_kv_offsets=object(),
+                qo_indptr=None,
+                custom_mask=None,
+                mask_indptr=None,
+                max_extend_len=3,
+            )
+            layer = SimpleNamespace(
+                layer_id=0,
+                tp_q_head_num=16,
+                qk_head_dim=dim,
+                v_head_dim=dim,
+                k_scale=None,
+                v_scale=None,
+                logit_capping_method="tanh",
+                logit_cap=0.0,
+                is_cross_attention=False,
+                attn_type=AttentionType.DECODER,
+                sliding_window_size=sliding_window,
+                scaling=dim**-0.5,
+                xai_temperature_len=-1,
+            )
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                mha_one_shot=False,
+                extend_seq_lens_cpu=None,
+            )
+            calls = []
+
+            def record(name):
+                def run(*args, **kwargs):
+                    calls.append(name)
+                    return True
+
+                return run
+
+            backend.verify_shared_kv_fwd = record("shared")
+            backend.verify_splitkv_fwd = record("split")
+            backend._forward_extend_kernel = record("extend")
+
+            def invoke(expected, **kwargs):
+                calls.clear()
+                backend.forward_extend(
+                    q, k, k, layer, batch, save_kv_cache=False, **kwargs
+                )
+                assert calls == [expected]
+
+            expected = "split" if sliding_window > 0 else "shared"
+            invoke(expected)
+            backend.use_cuda_verify = False
+            invoke("extend")
+            backend.use_cuda_verify = True
+            # Even a unit-valued scale is outside the CUDA BF16 contract.
+            layer.k_scale = 1.0
+            invoke("extend")
+            layer.k_scale = None
+            invoke("extend", score_mod=lambda *args: None)
+            layer.is_cross_attention = True
+            invoke("extend")
+            layer.is_cross_attention = False
+            batch.forward_mode = ForwardMode.EXTEND
+            invoke("extend")
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+            backend.forward_metadata.max_extend_len = 6
+            invoke("extend")
+            backend.forward_metadata.max_extend_len = 3
+            backend.cuda_verify_arch = (10, 0)
+            invoke("extend")

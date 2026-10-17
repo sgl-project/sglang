@@ -24,11 +24,12 @@ Two Triton kernels:
     small causal draft-draft block and writes the output.
 
 ``verify_splitkv_fwd(...)`` takes the SAME positional args as
-``extend_attention_fwd``; it runs the split-KV path when it can serve the case
-bit-equivalently and returns True, otherwise returns False (doing nothing) so
-the caller falls back to ``extend_attention_fwd``. Supported case: causal
+``extend_attention_fwd``; it returns True after running a supported case,
+otherwise returns False without writing output so the caller falls back to
+``extend_attention_fwd``. Different reduction orders can change floating-point
+results. Supported case: causal
 (topk=1) verify with a constant per-sequence extend length, no sinks /
-sliding-window / logit-cap / xai-temperature. Correctness is never violated.
+logit-cap / xai-temperature. Sliding windows use a per-query left bound.
 """
 
 import torch
@@ -41,8 +42,7 @@ _MIN_BLOCK_KV = 32
 
 # AMD/CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim); NVIDIA's
 # Triton rejects these kwargs, so only pass them on ROCm. In production this kernel
-# is dispatched only on AMD (see TritonAttnBackend); keeping it NV-safe lets the
-# numerics test run on the CUDA CI lane.
+# also serves opt-in CUDA shapes with validated tiles (see TritonAttnBackend).
 _IS_HIP = is_hip()
 _AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if _IS_HIP else {}
 
@@ -59,6 +59,31 @@ _BLOCK_CONFIG = {
     # head_dim: (BLOCK_N, num_warps)
     256: (32, 4),
 }
+
+
+# (query heads, KV heads, head dimension, query width, CUDA capability).
+# Preserve the previously validated widths exactly, including width 5 only
+# (padding it to 8 must not implicitly enable widths 6--8).
+# SM90/SM89: correctness and graph replay validated. The (32, 4) tile and
+# adaptive split policy originate on MI350X. Width 3 was swept on an H20 and
+# RTX 4090D (2026-10-16), including forward/reverse finalist checks. Retain
+# this tile: H20 favors it across the six cases in aggregate; alternatives
+# on RTX 4090D trade small gains for regressions. Other query widths have
+# not been performance-tuned.
+_CUDA_SPLITKV_TILES = {
+    (16, 8, 256, width, arch): (32, 4)
+    for arch in ((8, 9), (9, 0))
+    for width in range(1, 6)
+}
+
+
+def cuda_splitkv_tile(
+    h_q: int, h_kv: int, head_dim: int, max_len_extend: int, arch: tuple[int, int]
+) -> tuple[int, int] | None:
+    """Return a validated per-head CUDA tile, or None."""
+    if not isinstance(max_len_extend, int) or max_len_extend < 1:
+        return None
+    return _CUDA_SPLITKV_TILES.get((h_q, h_kv, head_dim, max_len_extend, arch))
 
 
 def block_config(head_dim):
@@ -155,6 +180,7 @@ def _verify_prefix_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -219,8 +245,15 @@ def _verify_prefix_stage1(
             )
             qk = tl.dot(q_k, k)  # [L_EXT, BLOCK_N]
             qk *= sm_scale * k_scale  # fp8 dequant of prefix K (k_scale==1 if bf16)
-            # NO causal mask: full prefix is visible to all draft tokens.
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+            visible = n_mask[None, :]
+            if SLIDING_WINDOW > 0:
+                # Prefix indices already address the retained SWA pool tail.
+                # Absolute offsets cancel, but each query drops another old key.
+                visible = visible & (
+                    offs_n[None, :] + SLIDING_WINDOW
+                    >= cur_batch_seq_len + offs_l[:, None]
+                )
+            qk = tl.where(visible, qk, float("-inf"))
 
             # V block: [BLOCK_N, Dv]
             offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
@@ -231,8 +264,9 @@ def _verify_prefix_stage1(
             )
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            safe_max = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+            re_scale = tl.exp(e_max - safe_max)
+            p = tl.exp(qk - safe_max[:, None])
             acc *= re_scale[:, None]
             acc += tl.dot(p.to(v.dtype), v)
             e_sum = e_sum * re_scale + tl.sum(p, 1)
@@ -250,7 +284,7 @@ def _verify_prefix_stage1(
         )
         tl.store(
             Att_Out + offs_o,
-            acc / e_sum[:, None],
+            acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None],
             mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
 
@@ -308,6 +342,7 @@ def _verify_combine_stage2(
     V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -336,7 +371,8 @@ def _verify_combine_stage2(
         other=float("-inf"),
     )  # [N_SPLITS, L_EXT]
     m_p = tl.max(lse, 0)  # [L_EXT]
-    w = tl.exp(lse - m_p[None, :])  # [N_SPLITS, L_EXT]; -inf->0
+    safe_max = tl.where(m_p == float("-inf"), 0.0, m_p)
+    w = tl.exp(lse - safe_max[None, :])  # Empty splits contribute zero.
     denom_p = tl.sum(w, 0)  # [L_EXT]
 
     # weighted-sum of partial outputs: o_prefix[L_EXT, Dv]
@@ -350,11 +386,13 @@ def _verify_combine_stage2(
     )
     ao = tl.load(
         offs_ao + Att_Out,
-        mask=mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
+        mask=mask_l[None, :, None]
+        & (offs_dv[None, None, :] < V_HEAD_DIM)
+        & (lse[:, :, None] != float("-inf")),
         other=0.0,
     )  # [N_SPLITS, L_EXT, Dv]
     o_prefix = tl.sum(ao * w[:, :, None], 0)  # [L_EXT, Dv]
-    o_prefix = o_prefix / denom_p[:, None]
+    o_prefix = o_prefix / tl.where(denom_p > 0, denom_p, 1.0)[:, None]
     lse_prefix = m_p + tl.log(denom_p)  # [L_EXT]
 
     # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------
@@ -395,6 +433,8 @@ def _verify_combine_stage2(
     qk = tl.sum(q[:, None, :] * ke[None, :, :], 2) * sm_scale
     # causal among drafts: query i sees key j iff j <= i, and both valid
     causal = (offs_l[None, :] <= offs_l[:, None]) & mask_l[None, :] & mask_l[:, None]
+    if SLIDING_WINDOW > 0:
+        causal = causal & (offs_l[None, :] + SLIDING_WINDOW >= offs_l[:, None])
     qk = tl.where(causal, qk, float("-inf"))
     m_d = tl.max(qk, 1)  # [L_EXT]
     pd = tl.exp(qk - m_d[:, None])  # [L_EXT, L_EXT]
@@ -447,7 +487,7 @@ class VerifySplitKV:
         self.group = h_q // h_kv
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim
-        self.l_ext = l_ext  # real draft tokens per seq (fixed == 4)
+        self.l_ext = l_ext  # Query count is constant within a captured graph.
         self.l_pad = triton.next_power_of_2(l_ext)
         self.device = device
         self.n_splits = n_splits
@@ -485,6 +525,7 @@ class VerifySplitKV:
         sm_scale,
         k_scale,
         v_scale,
+        sliding_window_size,
     ):
         grid = (bs, self.h_q, self.n_splits)
         _verify_prefix_stage1[grid](
@@ -521,13 +562,22 @@ class VerifySplitKV:
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            SLIDING_WINDOW=sliding_window_size,
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,
         )
 
     def _run_combine_kernel(
-        self, bs, q_extend, k_extend, v_extend, o_out, qo_indptr, sm_scale
+        self,
+        bs,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_out,
+        qo_indptr,
+        sm_scale,
+        sliding_window_size,
     ):
         grid = (bs, self.h_q)
         _verify_combine_stage2[grid](
@@ -561,6 +611,7 @@ class VerifySplitKV:
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            SLIDING_WINDOW=sliding_window_size,
             num_warps=1,
             num_stages=1,
         )
@@ -579,6 +630,7 @@ class VerifySplitKV:
         o_out=None,
         k_scale=1.0,
         v_scale=1.0,
+        sliding_window_size=-1,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -601,6 +653,7 @@ class VerifySplitKV:
             sm_scale,
             k_scale,
             v_scale,
+            sliding_window_size,
         )
         # 2+3+4. fused combine + draft-draft + merge
         self._run_combine_kernel(
@@ -611,6 +664,7 @@ class VerifySplitKV:
             o_out,
             qo_indptr,
             sm_scale,
+            sliding_window_size,
         )
         return o_out
 
@@ -633,6 +687,13 @@ def _get_vk(
     vk = _VK_CACHE.get(key)
     if vk is None:
         block_n, num_warps = block_config(head_dim)
+        if not _IS_HIP and torch.device(device).type == "cuda":
+            tile = cuda_splitkv_tile(
+                h_q, h_kv, head_dim, l_ext, torch.cuda.get_device_capability(device)
+            )
+            if head_dim == v_head_dim and tile is not None:
+                block_n, num_warps = tile
+
         vk = VerifySplitKV(
             max_bs,
             h_q,
@@ -682,7 +743,7 @@ def can_handle(
     # No exotic features.
     if sinks is not None:
         return False
-    if sliding_window_size is not None and sliding_window_size > 0:
+    if sliding_window_size is not None and not isinstance(sliding_window_size, int):
         return False
     if logit_cap and logit_cap > 0:
         return False
@@ -773,6 +834,12 @@ def verify_splitkv_fwd(
     cached scratch buffers; the backend passes its req_to_token_pool size. If
     omitted it defaults to this call's bs.
 
+    For a sliding window, kv_indices must already contain physical SWA-pool
+    addresses in chronological order (possibly only the retained prefix tail).
+    window_kv_offsets is the absolute position of that tail; it cancels from
+    the causal-chain window predicate. Never translate pool indices here.
+    Custom tree masks remain supported only when topk=1 makes them causal.
+
     Arg order mirrors extend_attention_fwd exactly so the call site is a
     one-line swap.
     """
@@ -852,6 +919,7 @@ def verify_splitkv_fwd(
         o_out=o_extend,
         k_scale=k_scale,
         v_scale=v_scale,
+        sliding_window_size=sliding_window_size or -1,
     )
 
     return True
