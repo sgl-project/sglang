@@ -234,41 +234,11 @@ class DSANPUIndexerMixin:
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
-            if (
-                self.dsa_enable_prefill_cp
-                and forward_batch.attn_cp_metadata is not None
-            ):
-                get_attn_backend().forward_metadata.actual_seq_lengths_q = (
-                    forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
-                    forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
-                )
-                if sum(forward_batch.extend_prefix_lens_cpu) > 0:
-                    total_kv_len_prev_tensor = (
-                        forward_batch.attn_cp_metadata.kv_len_prev_tensor
-                        + forward_batch.extend_prefix_lens.squeeze()
-                    )
-                    total_kv_len_next_tensor = (
-                        forward_batch.attn_cp_metadata.kv_len_next_tensor
-                        + forward_batch.extend_prefix_lens.squeeze()
-                    )
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
-                        total_kv_len_prev_tensor,
-                        total_kv_len_next_tensor,
-                    )
-                else:
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
-                        forward_batch.attn_cp_metadata.kv_len_prev_tensor,
-                        forward_batch.attn_cp_metadata.kv_len_next_tensor,
-                    )
-                actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
-                )
-                actual_seq_lengths_kv = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
-                )
-            else:
-                actual_seq_lengths_kv = forward_batch.seq_lens
-                actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
+            # Prefill CP shares the non-CP bounds verbatim: the redundant
+            # full-sequence indexer below runs the exact contiguous-causal
+            # call, so seq_lens / extend cumsum are semantically exact.
+            actual_seq_lengths_kv = forward_batch.seq_lens
+            actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
             if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -303,54 +273,58 @@ class DSANPUIndexerMixin:
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
+        if is_prefill:
+            block_table = block_table[: actual_seq_lengths_q.size()[0]]
+
+        # Redundant full-sequence indexer for prefill CP: interleave local
+        # rows sit cp_size apart, so no single shared TND bound can reproduce
+        # every row's true causal bound (the kernel ramps bounds one row at a
+        # time). Gather the full sequence and run the same contiguous-causal
+        # call as the non-CP path instead, then keep only the local rows'
+        # top-k.
+        cp_local_rows = q.size(0)
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            block_table = block_table[: actual_seq_lengths_q[0].numel()]
-            topk_indices = self.do_npu_cp_balance_indexer(
+            q = cp_gather_full_sequence_states(
+                q.contiguous().view(cp_local_rows, -1),
+                forward_batch,
+                torch.npu.current_stream(),
+            )
+            weights = cp_gather_full_sequence_states(
+                weights.contiguous().view(weights.size(0), -1),
+                forward_batch,
+                torch.npu.current_stream(),
+            )
+
+        if use_quant_indexer:
+            query, query_scale = _quantize_npu_indexer_activation(
                 q.view(-1, self.n_heads, self.head_dim),
-                past_key_states,
-                weights,
-                actual_seq_lengths_q,
-                actual_seq_lengths_kv,
-                block_table,
+                pool.indexer_hadamard_128,
+                pool.dtype,
             )
-            return topk_indices
+            topk_indices = torch_npu.npu_quant_lightning_indexer(
+                query=query,
+                key=past_key_states,
+                weights=weights,
+                query_dequant_scale=query_scale,
+                key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                    device=k.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                query_quant_mode=0,
+                key_quant_mode=0,
+            )
+            topk_indices = topk_indices.squeeze(1)
         else:
-            block_table = (
-                block_table[: actual_seq_lengths_q.size()[0]]
-                if is_prefill
-                else block_table
-            )
-
-            if use_quant_indexer:
-                query, query_scale = _quantize_npu_indexer_activation(
-                    q.view(-1, self.n_heads, self.head_dim),
-                    pool.indexer_hadamard_128,
-                    pool.dtype,
-                )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                )
-                return topk_indices.squeeze(1)
-
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
@@ -366,62 +340,37 @@ class DSANPUIndexerMixin:
                 sparse_mode=3,
             )
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            topk_indices = topk_indices[0].squeeze(1)
 
-    def do_npu_cp_balance_indexer(
-        self,
-        q,
-        past_key_states,
-        indexer_weights,
-        actual_seq_lengths_q,
-        actual_seq_lengths_kv,
-        block_table,
-    ):
-        q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
-        weights_prev, weights_next = None, None
-        if indexer_weights is not None:
-            weights_prev, weights_next = torch.split(
-                indexer_weights, (indexer_weights.size(0) + 1) // 2, dim=0
+        if (
+            is_prefill
+            and self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            topk_indices = self.slice_cp_local_topk(
+                topk_indices, forward_batch, cp_local_rows
             )
-            weights_prev = weights_prev.contiguous().view(-1, weights_prev.shape[-1])
-            weights_next = weights_next.contiguous().view(-1, weights_next.shape[-1])
+        return topk_indices
 
-        actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+    def slice_cp_local_topk(self, topk_indices, forward_batch, num_rows):
+        """Keep this rank's interleaved rows from the full-sequence top-k.
 
-        topk_indices_prev = torch_npu.npu_lightning_indexer(
-            query=q_prev,
-            key=past_key_states,
-            weights=weights_prev,
-            actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
+        Interleave shards the concatenated extend rows by global stride
+        (``offset % cp_size == cp_rank``), so the local logical rows are
+        exactly the full-order rows ``cp_rank, cp_rank + cp_size, ...`` in
+        the same ascending order as the sharded q rows. Physical padding
+        rows trail afterwards and stay zero.
+        """
+        parallel = get_parallel()
+        local = torch.arange(
+            parallel.attn_cp_rank,
+            topk_indices.size(0),
+            parallel.attn_cp_size,
+            device=topk_indices.device,
         )
-        topk_indices_next = torch_npu.npu_lightning_indexer(
-            query=q_next,
-            key=past_key_states,
-            weights=weights_next,
-            actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
-        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
+        full = topk_indices.new_zeros((num_rows, topk_indices.shape[-1]))
+        full[: local.size(0)] = topk_indices.index_select(0, local)
+        return full
 
 
 def scattered_to_tp_attn_full(

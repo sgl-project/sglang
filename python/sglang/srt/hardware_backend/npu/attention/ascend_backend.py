@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.cp.interleave import interleave_rows_per_request
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
@@ -1188,70 +1189,80 @@ class AscendAttnBackend(AttentionBackend):
         k_pe,
         topk_indices,
         layer,
-        actual_seq_qlen,
-        actual_seq_lengths_kv,
+        forward_batch,
     ):
-        seq_len = q_nope.shape[0]
-        split_len = (seq_len + 1) // 2
-        q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
-        q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
-        q_nope_prev = q_nope_prev.contiguous()
-        q_nope_next = q_nope_next.contiguous()
-        q_rope_prev = q_rope_prev.contiguous()
-        q_rope_next = q_rope_next.contiguous()
-        topk_indices = _expand_dsa_sparse_indices(topk_indices)
-        topk_indices_prev, topk_indices_next = torch.split(
-            topk_indices, split_len, dim=0
-        )
+        """Half-split sparse attention for prefill CP (interleave).
 
-        actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
-        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
-
-        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_prev,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_prev,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_prev,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
+        The redundant full-sequence indexer produced causally exact top-k
+        candidates, so the aligned-causal TND bounds below only need to be
+        >= each row's true bound: inside a batch the kernel bound ramps one
+        row at a time while interleave true bounds ramp ``cp_size`` rows
+        apart, so a bound tight for the half's last row is loose (safe) for
+        every earlier row. ``seq_lens`` is exactly that bound for both
+        halves. Per-request counts are recomputed from the live batch, so
+        every TND input shares the same dim 0 even when the cached CP
+        metadata describes a different batch.
+        """
+        parallel = get_parallel()
+        counts = interleave_rows_per_request(
+            [int(x) for x in forward_batch.extend_seq_lens_cpu],
+            parallel.attn_cp_rank,
+            parallel.attn_cp_size,
         )
-        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
-            query=q_nope_next,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_rope_next,
-            key_rope=k_pe,
-            sparse_indices=topk_indices_next,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen_next.to(
-                device=q_nope.device, dtype=torch.int32
+        counts = torch.tensor(counts, dtype=torch.int64, device=q_nope.device)
+        total = int(counts.sum())
+        total = min(total, q_nope.shape[0])
+        if total == 0:
+            return torch.zeros_like(q_nope)
+        prev_total = (total + 1) // 2
+        starts = torch.cumsum(counts, dim=0) - counts
+        prev_counts = torch.minimum((prev_total - starts).clamp(min=0), counts)
+        next_counts = counts - prev_counts
+        block_table = self.forward_metadata.block_tables[: counts.numel()]
+        kv_bound = forward_batch.seq_lens.to(q_nope.device, torch.int32)
+        out = torch.zeros_like(q_nope).to(q_nope.dtype)
+        filled = 0
+        halves = (
+            (
+                int(prev_counts.sum()),
+                torch.cumsum(prev_counts, dim=0).to(torch.int32),
+                q_nope[:prev_total],
+                q_pe[:prev_total],
+                topk_indices[:prev_total],
             ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
-                device=q_nope.device, dtype=torch.int32
+            (
+                int(next_counts.sum()),
+                torch.cumsum(next_counts, dim=0).to(torch.int32),
+                q_nope[prev_total:total],
+                q_pe[prev_total:total],
+                topk_indices[prev_total:total],
             ),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=False,
         )
-        return torch.cat([attn_out_prev, attn_out_next], dim=0)
+        for rows, seq_q, q_half, q_pe_half, topk_half in halves:
+            if rows == 0:
+                # Warmup prompts can leave one half empty on this rank.
+                continue
+            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_half.contiguous(),
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_pe_half.contiguous(),
+                key_rope=k_pe,
+                sparse_indices=_expand_dsa_sparse_indices(topk_half),
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=seq_q,
+                actual_seq_lengths_kv=kv_bound,
+                block_table=block_table,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+            out[filled : filled + rows] = attn_out
+            filled += rows
+        return out
 
     def do_cp_attn_fia(
         self,
@@ -1409,8 +1420,7 @@ class AscendAttnBackend(AttentionBackend):
                 k_pe,
                 topk_indices,
                 layer,
-                actual_seq_qlen,
-                actual_seq_lengths_kv,
+                forward_batch,
             )
         else:
             if topk_indices is not None:

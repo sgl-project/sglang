@@ -337,6 +337,20 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
+            elif get_platform().is_npu:
+                # NPU DSA: prefill CP attention has no cuda-graph support;
+                # mirror the CUDA branch and disable the prefill graph phase.
+                if cfg.enable_prefill_cp:
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.PREFILL,
+                            backend=Backend.DISABLED,
+                        ),
+                    )
+
             elif get_platform().is_xpu:
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
@@ -379,16 +393,18 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-dsa-cache-layer-split requires "
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
-            # Layer split relies on the mooncake all-CP-rank KV/indexer
-            # transfer path. mori/nixl support is a temporary limitation
-            # and will be added later by the community.
+            # Layer split relies on the all-CP-rank KV/indexer transfer path
+            # (mooncake, or the Ascend transfer engine whose common conn
+            # layer inherits the same all-CP-rank send path).
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend != "mooncake"
+                and cfg.disaggregation_transfer_backend
+                not in ("mooncake", "ascend")
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "
-                    "the mooncake transfer backend (mooncake / mooncake_tcp). "
+                    "the mooncake transfer backend (mooncake / mooncake_tcp) "
+                    "or the ascend transfer backend. "
                     f"Got --disaggregation-transfer-backend "
                     f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
                     "support will be added later by the community."

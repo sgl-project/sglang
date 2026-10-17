@@ -1934,10 +1934,14 @@ class KVCacheConfigurator:
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+            NPULayerSplitMLATokenToKVPool,
+        )
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
@@ -1964,7 +1968,16 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
-        token_to_kv_pool = NPUMLATokenToKVPool(
+        layer_shard_rank, layer_shard_size = get_glm_dsa_cp_layer_shard_info(self)
+        pool_kwargs = {}
+        PoolCls = NPUMLATokenToKVPool
+        if is_dsa_model and layer_shard_rank is not None:
+            # DSA cache layer split: shard KV/indexer layers across CP ranks;
+            # non-owned layers are read via owner-broadcast (HCCL).
+            PoolCls = NPULayerSplitMLATokenToKVPool
+            pool_kwargs["layer_shard_rank"] = layer_shard_rank
+            pool_kwargs["layer_shard_size"] = layer_shard_size
+        token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
@@ -1987,6 +2000,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
