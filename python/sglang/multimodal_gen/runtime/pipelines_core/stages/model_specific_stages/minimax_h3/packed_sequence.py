@@ -231,6 +231,10 @@ def minimax_h3_packed_sequence(
         "token_tags": token_tags,
         "cu_seqlens": cu,
         "stream_layout": stream_layout,
+        "txt_len": text_len,
+        # Only video grids may be rearranged/sparsified. Text, audio, and
+        # keyframe conditions remain outside these spans and stay dense.
+        "video_spans": [{"start": video_sl.start, "latent_shape": [latent_t, ph, pw]}],
     }
     if include_video_pos:
         # Conditioning keyframes are images. Only generated video rows are
@@ -539,6 +543,21 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     token_tags[audio_pos] = 2  # AUDIO (refs + target)
     token_tags[img_pos] = 0  # VISUAL (reference images/videos + target video)
 
+    # Keep each reference video's own grid and absolute packed offset.
+    # Image references and all audio rows are deliberately left dense.
+    video_spans = [
+        {
+            "start": item["visual_sl"].start,
+            "latent_shape": [
+                int(item["latent_t"]),
+                int(item["latent_h"]) // _PATCH_H,
+                int(item["latent_w"]) // _PATCH_W,
+            ],
+        }
+        for item in block_slices
+        if item["kind"] in ("video", "video_audio")
+    ]
+    video_spans.append({"start": video_sl.start, "latent_shape": [latent_t, ph, pw]})
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
     # Cube-sparse-attention segment shapes; streams listed in ref-block order,
     # matching the img_pos/audio_pos concatenation above (audio rows precede
@@ -592,6 +611,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "token_tags": token_tags,
         "cu_seqlens": cu,
         "stream_layout": stream_layout,
+        "txt_len": text_len,
+        "video_spans": video_spans,
     }
     if ref_video_pos_parts is not None:
         # Reference image blocks remain dense; reference videos and the

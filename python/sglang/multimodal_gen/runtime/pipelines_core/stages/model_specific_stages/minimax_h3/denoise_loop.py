@@ -172,7 +172,7 @@ class MiniMaxH3DenoiseBranch:
     def __init__(
         self,
         *,
-        packed: dict[str, torch.Tensor],
+        packed: dict[str, Any],
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
@@ -299,6 +299,12 @@ class MiniMaxH3DenoiseBranch:
                 "cu_seqlens_q": cu.to(device),
                 "cu_seqlens_q_host": tuple(int(value) for value in cu.tolist()),
                 "max_seqlen_q": int(cu[1]),
+                # Host metadata describes the global sequence reconstructed
+                # by Ulysses, not this rank's token shard. Keep text length
+                # for layout provenance; MindIE's video_spans mode uses
+                # txt_len=0 and treats everything outside spans as dense.
+                "txt_len": text_len,
+                "video_spans": packed.get("video_spans"),
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor(
