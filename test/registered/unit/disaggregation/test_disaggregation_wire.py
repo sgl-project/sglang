@@ -864,6 +864,61 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
             )
 
 
+class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
+    """KV sharding on a CP-TP group sharing prefill: every decode rank pulls
+    its KV pages from all prefill ranks, its state from the rank-matched one."""
+
+    @staticmethod
+    def _resolve(prefill_tp, decode_tp, dst_rank):
+        decode = object.__new__(CommonKVManager)
+        decode.attn_tp_size = decode_tp
+        decode.kv_args = SimpleNamespace(engine_rank=dst_rank)
+        decode.is_mla_backend = decode.is_hybrid_mla_backend = False
+        decode.attn_cp_size, decode.attn_cp_rank = 1, 0
+        decode.pp_size, decode.pp_rank = 1, 0
+        # register_to_bootstrap advertises CP rank r as TP rank r of a CP-1
+        # prefill.
+        info = SimpleNamespace(
+            attn_tp_size=prefill_tp,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_kv_cache_sharding=True,
+        )
+        decode._resolve_rank_mapping(info)
+        return info
+
+    def test_decode_pulls_kv_from_every_prefill_rank(self):
+        for dst_rank in range(4):
+            with self.subTest(dst_rank=dst_rank):
+                info = self._resolve(prefill_tp=4, decode_tp=4, dst_rank=dst_rank)
+                self.assertIsNone(info.target_tp_rank)
+                self.assertEqual(info.target_tp_ranks, [0, 1, 2, 3])
+                self.assertEqual(info.target_cp_ranks, [0])
+                self.assertEqual(info.required_dst_info_num, 4)
+                self.assertEqual(info.required_prefill_response_num, 4)
+
+    def test_unequal_tp_sizes_are_rejected(self):
+        # The GDN head shard pairs prefill rank r with decode rank r.
+        with self.assertRaisesRegex(AssertionError, "equal prefill/decode attn TP"):
+            self._resolve(prefill_tp=4, decode_tp=2, dst_rank=0)
+
+    def test_state_goes_to_the_rank_matched_decode_rank_only(self):
+        prefill = object.__new__(MooncakeKVManager)
+        prefill.attn_cp_size, prefill.attn_cp_rank = 4, 1
+        prefill.is_hybrid_mla_backend = False
+        prefill.kv_args = SimpleNamespace(engine_rank=1)
+        prefill.state_tp_size = 4
+        prefill.kv_shard_state_peer_only = True
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            for dst_rank in range(4):
+                with self.subTest(dst_rank=dst_rank):
+                    info = SimpleNamespace(dst_tp_rank=dst_rank, dst_attn_tp_size=4)
+                    self.assertEqual(
+                        prefill._get_dsa_cache_transfer_skip_flags(info),
+                        (False, dst_rank != 1),
+                    )
+
+
 class TestQwen4StateWire(unittest.TestCase):
     @staticmethod
     def _qsa_pool(layer_id: int):
@@ -1231,7 +1286,12 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         decode.is_mla_backend = decode.is_hybrid_mla_backend = False
         decode.attn_cp_size, decode.attn_cp_rank = 1, 0
         decode.pp_size, decode.pp_rank = 1, 0
-        info = SimpleNamespace(attn_tp_size=prefill_tp, attn_cp_size=1, pp_size=1)
+        info = SimpleNamespace(
+            attn_tp_size=prefill_tp,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_kv_cache_sharding=False,
+        )
         decode._resolve_rank_mapping(info)
         return info.target_tp_ranks
 
