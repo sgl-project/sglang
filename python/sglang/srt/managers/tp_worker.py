@@ -424,7 +424,10 @@ class TpModelWorker(BaseTpWorker):
             mr.init_attention_backends()
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-        """Capture cuda graphs for all model runners."""
+        """Prepare the selected cache backend and initialize all runner graphs."""
+        from sglang.srt.mem_cache.registry import prepare_radix_cache_worker
+
+        prepare_radix_cache_worker(self, capture_decode_cuda_graph)
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
