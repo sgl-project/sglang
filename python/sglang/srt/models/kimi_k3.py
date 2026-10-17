@@ -3457,6 +3457,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                 pass
             elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            self_attn.fused_q_norm_proj = (
+                _is_gfx95
+                and envs.SGLANG_ROCM_K3_MLA_Q_NORM_PROJ.get()
+                and self_attn.q_lora_rank is not None
+                and self_attn.q_b_proj.weight.dtype == torch.bfloat16
+                and self_attn.q_b_proj.weight.is_contiguous()
+            )
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the

@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.attention.mla_decode_epilogue import mla_decode_epilogue
 from sglang.kernels.ops.attention.mla_decode_prep import mla_qk_prep
+from sglang.kernels.ops.attention.mla_q_norm_proj import covered, mla_q_norm_proj
 from sglang.kernels.ops.attention.mla_split_reduce import mla_split_reduce
 from sglang.kernels.ops.attention.mla_v_up_gate import mla_v_up_gate
 from sglang.test.ci.ci_register import register_amd_ci
@@ -178,6 +179,36 @@ class TestMlaDecodeGfx950(CustomTestCase):
                     self.assertLessEqual(
                         _beyond_ulp(got, want), max(got.numel() // 1000, 1)
                     )
+
+    @torch.inference_mode()
+    def test_q_norm_proj_matches_norms_then_projection(self):
+        """One launch equals RMSNorm of q_a and kv_a (fp32, one bf16 rounding, as
+        aiter's fused_qk_rmsnorm) followed by the q_b projection with fp32
+        accumulation, within one bf16 rounding, on strided inputs."""
+        # q_lora 1536, kv_lora 512, 12 heads x 192 q_b outputs; the merged
+        # a-projection rows are [q_a 1536 | kv_a 576 | gate 1536].
+        qa, kv_dim, n, row = 1536, 512, 2304, 3648
+        g = torch.Generator(device="cuda").manual_seed(0)
+        weight = (torch.randn(n, qa, generator=g, device="cuda") * 0.03).bfloat16()
+        q_w = (torch.rand(qa, generator=g, device="cuda") + 0.5).bfloat16()
+        kv_w = (torch.rand(kv_dim, generator=g, device="cuda") + 0.5).bfloat16()
+        eps = 1e-6
+
+        def rmsnorm(x, w):
+            x = x.float()
+            return (
+                x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w.float()
+            ).bfloat16()
+
+        for rows in (1, 4, 16):
+            a = (torch.randn(rows, row, generator=g, device="cuda") * 2).bfloat16()
+            q_a, kv_a = a[:, :qa], a[:, qa : qa + kv_dim]
+            self.assertTrue(covered(q_a, kv_a, weight))
+            q, kv = mla_q_norm_proj(q_a, q_w, eps, kv_a, kv_w, eps, weight)
+            want_q = (rmsnorm(q_a, q_w).float() @ weight.float().t()).bfloat16()
+            with self.subTest(rows=rows):
+                self.assertEqual(_beyond_ulp(kv, rmsnorm(kv_a, kv_w)), 0)
+                self.assertEqual(_beyond_ulp(q, want_q), 0)
 
 
 if __name__ == "__main__":

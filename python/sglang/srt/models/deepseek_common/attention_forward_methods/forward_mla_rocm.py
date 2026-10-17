@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention import mla_q_norm_proj
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -512,6 +513,7 @@ class DeepseekMLARocmForwardMixin:
         )
         q_lora = None
         topk_indices = None
+        q_projected = False
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -584,6 +586,22 @@ class DeepseekMLARocmForwardMixin:
                         q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
                     elif _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+            elif (
+                self.fused_q_norm_proj
+                and not q_replicate_active
+                and mla_q_norm_proj.covered(q, k_nope, self.q_b_proj.weight)
+            ):
+                q, k_nope = mla_q_norm_proj.mla_q_norm_proj(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    k_nope,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                    self.q_b_proj.weight,
+                )
+                q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+                q_projected = True
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,
@@ -609,6 +627,7 @@ class DeepseekMLARocmForwardMixin:
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
                 and not q_replicate_active
+                and not q_projected
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -638,7 +657,7 @@ class DeepseekMLARocmForwardMixin:
                         self.num_local_heads * self.dcp_size,
                         self.qk_head_dim,
                     )
-                else:
+                elif not q_projected:
                     q = self.q_b_proj_forward(q)
 
                 if q_lora is not None:

@@ -2221,6 +2221,9 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        # One launch for the q_a / kv_a RMSNorms and q_b_proj on gfx950 decode-sized
+        # batches (kernels/ops/attention/mla_q_norm_proj.py); a model sets it after loading.
+        self.fused_q_norm_proj = False
 
         self.w_scale_k = None
         self.w_scale_v = None

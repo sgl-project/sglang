@@ -1020,6 +1020,9 @@ class Envs:
     # Kimi-K3 on gfx950: combine the split MLA decode/verify partials, the W_vc
     # up-projection and the output gate in one kernel for up to 64 query rows.
     SGLANG_ROCM_K3_FUSED_MLA_EPILOGUE = EnvBool(True)
+    # Kimi-K3 on gfx950: run the MLA q_a / kv_a RMSNorms and the q_b projection of
+    # decode-sized batches as one launch.
+    SGLANG_ROCM_K3_MLA_Q_NORM_PROJ = EnvBool(True)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
