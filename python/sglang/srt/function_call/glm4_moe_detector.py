@@ -305,16 +305,22 @@ class Glm4MoeDetector(BaseFormatDetector):
         if value_type == "string":
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
-        elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip())
+        elif value_type in ("number", "integer"):
+            # _convert_to_number never raises; it hands back text that did
+            # not parse as str, so check the result type instead of catching.
+            num = _convert_to_number(value.strip())
+            if isinstance(num, (int, float)):
                 return str(num)
-            except (ValueError, AttributeError):
-                # Fallback to string if not a valid number
-                logger.warning(
-                    f"Failed to parse '{value}' as number, treating as string"
-                )
-                return json.dumps(str(value), ensure_ascii=False)
+            # Fallback to string if not a valid number
+            logger.warning(
+                f"Failed to parse '{value}' as {value_type}, treating as string"
+            )
+            return json.dumps(value, ensure_ascii=False)
+        elif value_type == "boolean":
+            stripped = value.strip()
+            if stripped in ("true", "false"):
+                return stripped
+            return json.dumps(value, ensure_ascii=False)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
@@ -377,20 +383,22 @@ class Glm4MoeDetector(BaseFormatDetector):
                     # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
 
-                    if self._value_started:
-                        # Output any remaining content
-                        if final_value:
-                            if value_type == "string":
+                    if value_type == "string":
+                        if self._value_started:
+                            # Output any remaining content, then close the quote
+                            if final_value:
                                 json_output += json.dumps(
                                     final_value, ensure_ascii=False
                                 )[1:-1]
-                            else:
-                                json_output += final_value
-                        # Always output closing quote for string type when value was started
-                        if value_type == "string":
                             json_output += '"'
+                        else:
+                            # Value was never started (empty or complete in one chunk)
+                            json_output += self._format_value_complete(
+                                self._current_value, value_type
+                            )
                     else:
-                        # Value was never started (empty or complete in one chunk)
+                        # Non-string values arrive buffered whole; format now that
+                        # the value is complete, mirroring detect_and_parse
                         json_output += self._format_value_complete(
                             self._current_value, value_type
                         )
@@ -421,19 +429,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 ]
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
-                        elif value_type == "number":
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
                         else:
-                            # For object/array types, output as-is
+                            # Buffer non-string values and emit them at the closing
+                            # tag; streaming them raw would leak invalid JSON
                             if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
 

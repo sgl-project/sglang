@@ -2974,6 +2974,58 @@ class TestGlm4MoeDetector(unittest.TestCase):
             tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
         )
 
+    def test_streaming_non_string_values_match_one_shot(self):
+        """Non-string args must stay valid JSON in streaming, same as one-shot (#42132)."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="record_weather",
+                    description="Record weather data",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "temperature": {"type": "number"},
+                            "samples": {"type": "integer"},
+                            "sunny": {"type": "boolean"},
+                            "city": {"type": "string"},
+                        },
+                    },
+                ),
+            ),
+        ]
+        text = (
+            "<tool_call>record_weather\n"
+            "<arg_key>temperature</arg_key>\n<arg_value>abc</arg_value>\n"
+            "<arg_key>samples</arg_key>\n<arg_value>3</arg_value>\n"
+            "<arg_key>sunny</arg_key>\n<arg_value>true</arg_value>\n"
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n"
+            "</tool_call>"
+        )
+        expected = Glm4MoeDetector().detect_and_parse(text, tools).calls[0].parameters
+
+        for chunk_size in (1, 3, len(text)):
+            detector = Glm4MoeDetector()
+            streamed = ""
+            for i in range(0, len(text), chunk_size):
+                result = detector.parse_streaming_increment(
+                    text[i : i + chunk_size], tools
+                )
+                for call in result.calls:
+                    if call.parameters:
+                        streamed += call.parameters
+            # invalid number falls back to a quoted string instead of raw text
+            self.assertEqual(streamed, expected)
+            self.assertEqual(
+                json.loads(streamed),
+                {
+                    "temperature": "abc",
+                    "samples": 3,
+                    "sunny": True,
+                    "city": "Beijing",
+                },
+            )
+
     def test_streaming_tool_call_without_arguments(self):
         chunks = [
             "<tool_call>get_weather\n",
