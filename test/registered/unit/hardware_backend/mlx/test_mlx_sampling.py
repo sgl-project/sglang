@@ -344,6 +344,58 @@ class TestSampleTokens(CustomTestCase):
 class TestSanitizeAndLogprobs(CustomTestCase):
     VOCAB = 16
 
+    def test_logprobs_are_invariant_to_large_common_offsets(self):
+        """Common logit offsets must not change any reported logprobs."""
+        import math
+
+        for temperature in (1.0, 1e-5):
+            for offset in (0.0, 10.0, 1e6, -1e6):
+                with self.subTest(temperature=temperature, offset=offset):
+                    logits = mx.array([[offset, offset], [0.0, 0.0]])
+                    params = [_params(temperature=temperature), _params()]
+                    spec = MlxLogprobSpec(top_ks=(2, 1), token_ids=((0, 1), (1,)))
+                    lp = compute_logprobs(logits, params, mx.array([0, 1]), spec)
+                    mx.eval(lp.chosen, lp.top_val, *lp.token_ids_val)
+                    for row in range(2):
+                        values = [lp.chosen[row].item()]
+                        values += lp.top_val[row, : spec.top_ks[row]].tolist()
+                        values += lp.token_ids_val[row].tolist()
+                        for value in values:
+                            self.assertAlmostEqual(value, -math.log(2), places=6)
+
+    def test_shifted_logprobs_match_nonuniform_distribution(self):
+        """Centering must preserve relative logits, including cached scaling."""
+        import math
+
+        values = [4.0, 3.0, 1.0, -1.0]
+        for temperature in (1.0, 2.0):
+            weights = [
+                math.exp((value - max(values)) / temperature) for value in values
+            ]
+            expected = [math.log(weight / sum(weights)) for weight in weights]
+            for offset in (0.0, 1e6, -1e6):
+                for use_scaled in (False, True):
+                    with self.subTest(
+                        temperature=temperature, offset=offset, scaled=use_scaled
+                    ):
+                        logits = mx.array([[value + offset for value in values]])
+                        scaled = logits / temperature if use_scaled else None
+                        lp = compute_logprobs(
+                            logits,
+                            [_params(temperature=temperature)],
+                            mx.array([3]),
+                            MlxLogprobSpec(top_ks=(4,), token_ids=((3, 1),)),
+                            scaled=scaled,
+                        )
+                        mx.eval(lp.chosen, lp.top_val, *lp.token_ids_val)
+                        self.assertAlmostEqual(
+                            lp.chosen[0].item(), expected[3], places=6
+                        )
+                        for actual, reference in zip(lp.top_val[0].tolist(), expected):
+                            self.assertAlmostEqual(actual, reference, places=6)
+                        for actual, index in zip(lp.token_ids_val[0].tolist(), (3, 1)):
+                            self.assertAlmostEqual(actual, expected[index], places=6)
+
     def test_sanitize_matches_nan_to_num_semantics(self):
         """Guards the port of sanitize_nan_logits' exact replacement values
         (+-1e30, not dtype extremes — temperature division would overflow
