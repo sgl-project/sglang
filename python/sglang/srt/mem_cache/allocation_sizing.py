@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -17,6 +19,16 @@ def get_mamba_tracking_slots(
     if lazy:
         return 1
     return 2 if overlap else 1
+
+
+def uses_pd_decode_kv_only_mamba_cache() -> bool:
+    """Built-in PD decode cache policy; callers must also check for SSM layers."""
+    return (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_radix_cache
+        and not get_memory().disable_radix_cache
+        and get_memory().radix_cache_backend is None
+    )
 
 
 def get_alloc_page_size() -> int:

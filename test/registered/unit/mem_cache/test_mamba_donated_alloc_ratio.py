@@ -11,7 +11,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -111,7 +111,8 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-        fake = SimpleNamespace(server_args=SimpleNamespace())
+        fake = object.__new__(KVCacheConfigurator)
+        fake.mambaish_config = object()
         # Every input is a published leaf now: the extra-buffer predicates read
         # the radix-cache strategy off the bags, so the fixture publishes the
         # strategy that produces the combination under test.
@@ -354,6 +355,12 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
             pp_size=pp_size,
             model_config=SimpleNamespace(num_hidden_layers=4),
             _calculate_mamba_ratio=lambda: 2,
+        )
+        fake._mamba_prealloc_requests = MethodType(
+            KVCacheConfigurator._mamba_prealloc_requests, fake
+        )
+        fake._mamba_running_request_capacity = MethodType(
+            KVCacheConfigurator._mamba_running_request_capacity, fake
         )
         args = dict(
             disable_radix_cache=False,
