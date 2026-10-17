@@ -57,11 +57,23 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
     cfg = resolving_view(server_args)
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/FROZEN_KV_MTP are supported)"
         )
+    if cfg.speculative_algorithm == "FROZEN_KV_MTP":
+        # Frozen states bind one backend for both the seed and recurrent draft.
+        # Hybrid backends, other devices and PP need their own state-swap audit.
+        if (
+            cfg.device != "cuda"
+            or cfg.pp_size != 1
+            or cfg.attention_backend != "triton"
+            or cfg.prefill_attention_backend not in (None, "triton")
+            or cfg.decode_attention_backend not in (None, "triton")
+            or cfg.speculative_draft_attention_backend not in (None, "triton")
+        ):
+            return "Frozen-KV adaptive requires CUDA, PP=1 and Triton attention"
     if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (
             f"speculative_eagle_topk={cfg.speculative_eagle_topk} "

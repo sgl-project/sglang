@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import fields
 from typing import Optional
 
 import torch
@@ -49,6 +50,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -224,6 +230,23 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             TpModelWorker.init_cuda_graphs(self, capture_decode_cuda_graph=False)
             self._capture_cuda_graphs()
 
+    def init_attention_backend(self):
+        """Build a fresh Frozen draft backend for an adaptive runtime state.
+
+        The shared EAGLE state builder calls this singular hook. Frozen has no
+        draft KV or draft-extend backend; its forwards use runner.attn_backend.
+        The state builder restores these bindings after capture.
+        """
+        runner = self.draft_model_runner
+        previous = runner.init_new_workspace
+        try:
+            backend = runner._get_attention_backend(init_new_workspace=True)
+        finally:
+            runner.init_new_workspace = previous
+        self.draft_attn_backend = backend
+        runner.attn_backend = backend
+        runner.draft_attn_backend = backend
+
     @property
     def draft_model_runner(self):
         return self.model_runner
@@ -373,6 +396,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _capture_cuda_graphs(self) -> None:
+        # Adaptive capture reuses this worker. An eager/zero-step state must
+        # never inherit the previous state's multi-step graph.
+        self.cuda_graph_runner = None
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
@@ -725,11 +751,15 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             target_worker,
         )
 
-        # Frozen MTP does not wire the adaptive controller yet.
-        assert not get_spec().speculative_adaptive, (
-            "Frozen-KV MTP does not support adaptive speculative decoding yet."
-        )
         self.adaptive_controller = None
+        if get_spec().speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                worker=self,
+                policy=AdaptiveSpeculativeParams(
+                    initial_steps=self.speculative_num_steps,
+                    cfg_path=get_spec().speculative_adaptive_config,
+                ),
+            )
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
         self.num_new_pages_per_topk = torch.empty(
@@ -738,6 +768,21 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        super().apply_runtime_state(state)
+        # EAGLE binds this through its draft-extend backend. Frozen has no
+        # draft-extend forward, so bind the selected seed/recurrent backend.
+        self._draft_worker.draft_runner.attn_backend = state.draft_attn_backend
+
+    def _build_trivial_verify_input(self, batch: ScheduleBatch):
+        verify_input = super()._build_trivial_verify_input(batch)
+        return FrozenKVMTPVerifyInput(
+            **{
+                field.name: getattr(verify_input, field.name)
+                for field in fields(verify_input)
+            }
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -786,13 +831,16 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
             if batch.spec_info is None:
                 batch.spec_info = self.draft_worker._idle_seed()
-            with (
-                draft_tp_context(self.draft_worker.draft_owns_attention),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft"),
-            ):
-                verify_input = self.draft_worker.draft(batch)
+            if self.speculative_num_steps == 0:
+                verify_input = self._build_trivial_verify_input(batch)
+            else:
+                with (
+                    draft_tp_context(self.draft_worker.draft_owns_attention),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
