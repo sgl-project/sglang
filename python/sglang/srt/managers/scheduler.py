@@ -4202,7 +4202,8 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if self.enable_lora:
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if self.enable_lora and added:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
@@ -4215,7 +4216,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.

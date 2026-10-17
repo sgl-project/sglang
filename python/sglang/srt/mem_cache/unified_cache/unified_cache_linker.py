@@ -151,7 +151,10 @@ class UnifiedCacheLinker(ABC):
 
         Async backends must bound their wait or raise on failure, validate the
         current lookup inputs on each call, and implement cancel_lookup. A
-        pending lookup does not authorize writes into engine-owned pages.
+        resolved result must stay available for identical rid/transfer inputs
+        while peers are pending, until load, cancellation or input replacement.
+        Rematches must not reset the original deadline. A pending lookup does
+        not authorize writes into engine-owned pages.
         """
 
     def cancel_lookup(self, rid: str) -> None:
