@@ -477,6 +477,11 @@ class AttnResidual:
         bank[:, self.num_valid_blocks, :].copy_(prefix_sum)
         self._count_write(rows)
 
+    def aggregates_unnormed(self, hidden_size: int) -> bool:
+        """Whether forward() can take out_norm=None at this depth."""
+        nvb = self.num_valid_blocks
+        return nvb == 0 or _use_hip_fused(hidden_size, nvb)
+
     def _count_write(self, rows: Optional[slice]) -> None:
         self.num_valid_blocks += 1
         self.written_on_slice |= rows is not None
@@ -487,14 +492,17 @@ class AttnResidual:
         prefix_sum: Optional[torch.Tensor],
         score_proj: ReplicatedLinear,
         score_norm: RMSNorm,
-        out_norm: RMSNorm,
+        out_norm: Optional[RMSNorm],
         rows: Optional[slice] = None,
         write: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate; with write=True also snapshot the aggregated prefix
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
-        standalone .write() copy on every other path."""
+        standalone .write() copy on every other path.
+
+        out_norm=None leaves the mixture unnormalized; only the ROCm fused
+        kernel supports it."""
         if rows is None and self.written_on_slice:
             raise RuntimeError(
                 "a read of every row after a write of this rank's slice of "
@@ -506,6 +514,8 @@ class AttnResidual:
             assert prefix_sum is None
             if write:
                 self.write(hidden_states, rows)
+            if out_norm is None:
+                return hidden_states, hidden_states
             return out_norm(hidden_states), hidden_states
 
         # SP-MoE: the caller holds only its token shard; align the banked

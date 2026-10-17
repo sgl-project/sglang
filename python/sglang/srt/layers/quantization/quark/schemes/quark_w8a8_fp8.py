@@ -29,8 +29,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
-    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import smallm_fp8_gemm_enabled
-
 
 class QuarkW8A8Fp8(QuarkLinearScheme):
     def __init__(
@@ -48,6 +46,11 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             not self.is_static_input_scheme and self.input_qscheme == "per_channel"
         )
         self.out_dtype = torch.get_default_dtype()
+
+    @property
+    def takes_per_token_fp8_input(self) -> bool:
+        """Whether apply_weights takes a producer's (fp8, per-token scale) tuple."""
+        return _use_aiter and self.per_token and self.weight_qscheme == "per_channel"
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -194,15 +197,15 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         # Activations must be a plain bf16 tensor: per-channel FP8 (weight_scale
         # [N, 1]) is gated off the aiter fused RMSNorm+quant kernel upstream by
         # _is_block_scale_fp8, so the per-token quant happens in apply_fp8_linear.
-        # The one exception is the per-token (fp8, scale [M, 1]) pair that the
-        # Qwen3.5 SGLANG_ROCM_SMALLM_FP8_PROJ producers send on gfx950.
+        # The one exception is a per-token (fp8, scale [M, 1]) pair from an AITER
+        # producer that checked takes_per_token_fp8_input.
         input_scale = layer.input_scale
-        if isinstance(x, tuple) and _use_aiter and smallm_fp8_gemm_enabled():
+        if isinstance(x, tuple) and _use_aiter:
             x, input_scale = x
             assert (
                 self.per_token
                 and layer.weight_scale is not None
-                and x.dtype == torch.float8_e4m3fn
+                and x.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                 and input_scale.dtype == torch.float32
                 and input_scale.numel() == x.shape[0]
             ), "quark W8A8 FP8 only accepts a per-token (fp8, scale) tuple"

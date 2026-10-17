@@ -256,7 +256,7 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
-def _norm_quant_kernel(quant_format: str):
+def norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
@@ -351,7 +351,7 @@ class NormQuantReadout:
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         if residual.shape[0] == 0:
             return residual, residual
-        return _norm_quant_kernel(quant_format)(norm, residual, None, None)
+        return norm_quant_kernel(quant_format)(norm, residual, None, None)
 
     def update_and_read(
         self,
@@ -366,7 +366,7 @@ class NormQuantReadout:
             return self.read(update.update(hidden_states, residual), norm, quant_format)
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        return _norm_quant_kernel(quant_format)(
+        return norm_quant_kernel(quant_format)(
             norm, hidden_states, residual, post_residual_addition
         )
 
