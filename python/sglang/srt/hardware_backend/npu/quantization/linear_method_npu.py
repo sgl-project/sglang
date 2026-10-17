@@ -4,6 +4,14 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+    W4A4,
+    W4A8,
+    W8A8,
+    get_mxfp_capability,
+    require_mxfp_operators,
+    validate_mxfp_configuration,
+)
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
@@ -218,6 +226,9 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             del layer.weight_scale
         else:
             # Online path: quantise FP16/BF16 weights to MXFP8 at load time.
+            cap = get_mxfp_capability("srt", "dense", W8A8, "online")
+            validate_mxfp_configuration(cap, input_size=weight.shape[-1])
+            require_mxfp_operators(cap)
             if weight.dtype not in (torch.float16, torch.bfloat16):
                 logger.warning(
                     "NPUMXFP8LinearMethod: weight dtype %s is not float16/bfloat16; "
@@ -475,6 +486,9 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        cap = get_mxfp_capability("srt", "dense", W4A8, "online")
+        validate_mxfp_configuration(cap, input_size=layer.weight.shape[-1])
+        require_mxfp_operators(cap)
         # Online single-level MXFP4 weight quant, then lay the weight out exactly
         # like the offline W4A8 path so the same npu_quant_matmul(x2_dtype=fp4)
         # kernel accepts it. All NPU ops go through torch.ops.npu.* (no torch_npu).
@@ -690,7 +704,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """NPU W4A4 online quantization: single-level MXFP4.
+    """Single-level NPU W4A4 base used by the offline ModelSlim path.
 
     True W4(weight) A4(activation): both weights and activations are quantised to
     single-level MXFP4 (``float4_e2m1fn_x2``), unlike the W4A8 path which keeps FP8
@@ -706,8 +720,9 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
 
-    Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
-    torch_npu exposing ``float4_e2m1fn_x2``.
+    The public online ``--quantization mxfp4`` config selects the dual-level
+    subclass instead. This single-level base is retained for offline checkpoints.
+    Hardware: an NPU runtime exposing ``float4_e2m1fn_x2``.
     """
 
     def create_weights(
@@ -863,8 +878,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
     """NPU W4A4 online quantization: dual-level MXFP4 (higher accuracy).
 
     This is the sole online ``--quantization mxfp4`` linear path. Instead of a single
-    UE8M0 (power-of-2) block scale, dual-level MX quant produces a finer L0 (FP8 E4M3)
-    block scale plus a coarser L1 scale, so per-block dynamic range is captured far
+    UE8M0 (power-of-2) block scale, dual-level MX quant produces L0 FLOAT32 scales
+    for 512-element blocks and L1 UE8M0 scales for 32-element blocks, so per-block dynamic range is captured far
     more accurately — this fixed the online-RTN degradation that made single-level
     decoding loop (never emitting EOS) under greedy sampling. (The single-level
     :class:`NPUSingleLevelMXFP4LinearMethod` is retained only as the offline path's
@@ -877,7 +892,7 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Weight quantization (process_weights_after_loading):
         BF16/FP16 weight → npu_dynamic_dual_level_mx_quant
         → (packed FP4 weight, L0 scale, L1 scale); weight cast to FRACTAL_NZ,
-          L0 scale transposed to [in//l0_block, out].
+          L0 scale transposed to [ceil(in/l0_block), out].
 
     Inference (apply):
         BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
@@ -888,6 +903,9 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        cap = get_mxfp_capability("srt", "dense", W4A4, "online")
+        validate_mxfp_configuration(cap, input_size=layer.weight.shape[-1])
+        require_mxfp_operators(cap)
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
@@ -895,8 +913,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
-        # Dual-level MXFP4 weight quant: packed FP4 weight + L0 (fine, FP8 E4M3)
-        # and L1 (coarse) block scales.
+        # Dual-level MXFP4 weight quant: packed FP4 + L0 FLOAT32 (block=512)
+        # and L1 UE8M0 (block=32) scales.
         qw, w_l0_scale, w_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
             weight_fp, smooth_scale=None
         )
