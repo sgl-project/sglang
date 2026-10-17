@@ -237,6 +237,82 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
     return value
 
 
+# Model types served by QwenVLImageProcessor. Its `image_token_regex` also accepts the
+# legacy bare "<image>" sentinel (see multimodal/processors/qwen_vl.py), and the
+# multimodal processor reuses that regex to split and count the rendered prompt. The chat
+# template only ever emits the native "<|vision_start|><|image_pad|><|vision_end|>"
+# placeholder, so in the chat path a bare "<image>" in message text (e.g. fetched web
+# content, GitHub renders screenshots as "<image>") is counted as an extra image
+# placeholder and aborts the request with "Mismatch: More 'IMAGE' tokens found than
+# corresponding data provided" (HTTP 500). Neutralize it in message text before
+# rendering, like the Kimi K3 handling above.
+QWEN_VL_MODEL_TYPES = (
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "qwen4_exp",
+    "qwen3_omni_moe",
+    "intern_s2_preview",
+    "interns2_mobius",
+    "cosmos3",
+)
+QWEN_VL_IMAGE_SENTINEL = "<image>"
+QWEN_VL_IMAGE_SENTINEL_NEUTRALIZED = "< image >"
+
+
+def neutralize_qwen_vl_image_sentinel(text: str) -> str:
+    return text.replace(QWEN_VL_IMAGE_SENTINEL, QWEN_VL_IMAGE_SENTINEL_NEUTRALIZED)
+
+
+def neutralize_qwen_vl_image_sentinel_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return neutralize_qwen_vl_image_sentinel(value)
+    if isinstance(value, list):
+        return [neutralize_qwen_vl_image_sentinel_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: neutralize_qwen_vl_image_sentinel_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def neutralize_qwen_vl_image_sentinel_in_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Neutralize the bare legacy "<image>" sentinel in message *text* only.
+
+    Structured media parts (``{"type": "image_url", ...}``) are left untouched, so real
+    media still renders as the template's native placeholder and pairing is unaffected.
+    """
+    neutralized: list[dict[str, Any]] = []
+    for message in messages:
+        message = dict(message)
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = neutralize_qwen_vl_image_sentinel(content)
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "text",
+                    "input_text",
+                ):
+                    part = dict(part)
+                    if isinstance(part.get("text"), str):
+                        part["text"] = neutralize_qwen_vl_image_sentinel(part["text"])
+                parts.append(part)
+            message["content"] = parts
+        for key in ("reasoning_content", "reasoning"):
+            if key in message:
+                message[key] = neutralize_qwen_vl_image_sentinel_value(message[key])
+        neutralized.append(message)
+    return neutralized
+
+
 def _extract_video_question(request: ChatCompletionRequest) -> str | None:
     """Return text paired with a video in the last user turn."""
     for message in reversed(request.messages or []):
@@ -327,6 +403,15 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
+        )
+        # Qwen-VL family: its processor also accepts the legacy bare "<image>" sentinel,
+        # so literal occurrences in message text must be neutralized before the chat
+        # template is rendered (see QWEN_VL_MODEL_TYPES).
+        self.is_qwen_vl = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            in QWEN_VL_MODEL_TYPES
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
@@ -1546,6 +1631,13 @@ class OpenAIServingChat(OpenAIServingBase):
             normalize_assistant_tool_call_arguments(
                 message, strict=self.chat_encoding_spec != "kimi_k3"
             )
+
+        # Qwen-VL family only: the multimodal processor also treats a bare "<image>" in
+        # the rendered prompt as an image placeholder, so a literal occurrence in message
+        # text would be miscounted against the real media and fail the request. Text and
+        # structured media parts are still unambiguous here, so neutralize text only.
+        if self.is_qwen_vl:
+            messages = neutralize_qwen_vl_image_sentinel_in_messages(messages)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),

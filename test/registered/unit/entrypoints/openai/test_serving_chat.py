@@ -35,7 +35,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
+    QWEN_VL_MODEL_TYPES,
     OpenAIServingChat,
+    neutralize_qwen_vl_image_sentinel,
+    neutralize_qwen_vl_image_sentinel_in_messages,
+    neutralize_qwen_vl_image_sentinel_value,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -5305,6 +5309,73 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                         self._request(chat_template_kwargs=kwargs)
                     )
                 )
+
+
+class TestNeutralizeQwenVlImageSentinel(unittest.TestCase):
+    """Unit tests for the Qwen-VL legacy "<image>" sentinel neutralization.
+
+    A bare "<image>" in message text must not reach the chat template: the Qwen-VL
+    multimodal processor also accepts it as a placeholder when splitting the rendered
+    prompt, so a literal occurrence would be counted against the real media and fail the
+    request with "Mismatch: More 'IMAGE' tokens found than corresponding data provided".
+    """
+
+    def test_text_replacement(self):
+        self.assertEqual(
+            neutralize_qwen_vl_image_sentinel("see <image> here"), "see < image > here"
+        )
+        self.assertEqual(neutralize_qwen_vl_image_sentinel("plain text"), "plain text")
+
+    def test_native_placeholder_untouched(self):
+        native = "<|vision_start|><|image_pad|><|vision_end|>"
+        self.assertEqual(neutralize_qwen_vl_image_sentinel(native), native)
+
+    def test_string_content_neutralized_without_mutating_input(self):
+        messages = [{"role": "user", "content": "a <image> b"}]
+        out = neutralize_qwen_vl_image_sentinel_in_messages(messages)
+        self.assertEqual(out[0]["content"], "a < image > b")
+        self.assertEqual(messages[0]["content"], "a <image> b")
+
+    def test_text_parts_neutralized_media_parts_preserved(self):
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "look at <image>"}, image_part],
+            }
+        ]
+        out = neutralize_qwen_vl_image_sentinel_in_messages(messages)
+        content = out[0]["content"]
+        self.assertEqual(content[0]["text"], "look at < image >")
+        self.assertEqual(content[1], image_part)
+
+    def test_reasoning_content_neutralized(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "reasoning_content": "about <image>",
+            }
+        ]
+        out = neutralize_qwen_vl_image_sentinel_in_messages(messages)
+        self.assertEqual(out[0]["reasoning_content"], "about < image >")
+
+    def test_value_helper_walks_nested_structures(self):
+        value = {"a": ["<image>", {"b": "<image>"}]}
+        self.assertEqual(
+            neutralize_qwen_vl_image_sentinel_value(value),
+            {"a": ["< image >", {"b": "< image >"}]},
+        )
+
+    def test_gate_covers_qwen_vl_family_only(self):
+        self.assertIn("qwen4_exp", QWEN_VL_MODEL_TYPES)
+        self.assertIn("qwen3_vl", QWEN_VL_MODEL_TYPES)
+        # LLaVA-style models legitimately use "<image>" as a client-written placeholder.
+        self.assertNotIn("llava", QWEN_VL_MODEL_TYPES)
+        self.assertNotIn("internvl", QWEN_VL_MODEL_TYPES)
 
 
 if __name__ == "__main__":
