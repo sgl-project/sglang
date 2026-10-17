@@ -245,6 +245,11 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
 
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
+    return parallel_prompt_encode_batch(tokenizer, [text], encode_kwargs)[0]
+
+
+def parallel_prompt_encode_batch(tokenizer, texts, encode_kwargs=None):
+    """Encode a list of texts, applying the parallel threshold to their total length."""
     global _parallel_ok, _parallel_pid
     pid = os.getpid()
     if pid != _parallel_pid:
@@ -254,26 +259,28 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     if (
         _parallel_ok is False
         or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
-        or not isinstance(text, str)
-        or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        or not all(isinstance(text, str) for text in texts)
+        or sum(len(text) for text in texts)
+        < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         or set(encode_kwargs) - {"add_special_tokens"}
     ):
-        return tokenizer.encode(text, **encode_kwargs)
+        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
     plan = _plan_for(tokenizer)
     if plan is None:
-        return tokenizer.encode(text, **encode_kwargs)
+        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
     backend, specials_added, pattern, npattern, intra = plan
     if encode_kwargs.get("add_special_tokens", True) and specials_added:
-        return tokenizer.encode(text, **encode_kwargs)
+        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
     if (
         backend.truncation is not None
         or backend.padding is not None
         or backend.encode_special_tokens
     ):
-        return tokenizer.encode(text, **encode_kwargs)
-    chunks = split_prompt(text, pattern, npattern, intra)
+        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
+    chunks_by_text = [split_prompt(text, pattern, npattern, intra) for text in texts]
+    chunks = list(chain.from_iterable(chunks_by_text))
     if len(chunks) < 2:
-        return tokenizer.encode(text, **encode_kwargs)
+        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
 
     check = _parallel_ok is None
     if check:
@@ -290,4 +297,11 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
                 "this process (TOKENIZERS_PARALLELISM off or process forked after "
                 "tokenizers used its pool); using the original encode."
             )
-    return list(chain.from_iterable(e.ids for e in encodings))
+    ids_by_text, start = [], 0
+    for text_chunks in chunks_by_text:
+        end = start + len(text_chunks)
+        ids_by_text.append(
+            list(chain.from_iterable(e.ids for e in encodings[start:end]))
+        )
+        start = end
+    return ids_by_text
