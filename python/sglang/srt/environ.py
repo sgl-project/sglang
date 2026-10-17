@@ -1957,6 +1957,9 @@ class Envs:
     # With the pre-route on, run 2- and 4-token decode through the cooperative
     # kernel, which returns the shared expert already SiTU-activated.
     SGLANG_OPT_HIP_K3_PREROUTE_PREACTIVATED_SHARED = EnvBool(False)
+    # Fuse the latent RMSNorm, the FP8 up-projection and the residual add for 1,
+    # 2 or 4 decode tokens.
+    SGLANG_OPT_HIP_K3_LATENT_TAIL_FP8 = EnvBool(False)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(

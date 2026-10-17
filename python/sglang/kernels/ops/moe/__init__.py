@@ -314,3 +314,11 @@ for _fn in ("run_tri", "run_tri_cooperative_preactivated", "run_shared_down"):
         )
     )
 del _fn
+register_kernel(
+    KernelSpec(
+        op="moe.kimi_k3_latent_tail_fp8",
+        backend=KernelBackend.FLYDSL,
+        target="sglang.kernels.ops.moe.latent_tail_aiter_hip:run",
+        capabilities=_HIP,
+    )
+)
