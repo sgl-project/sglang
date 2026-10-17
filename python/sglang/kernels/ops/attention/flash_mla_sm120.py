@@ -685,30 +685,33 @@ def _validate_flashinfer_sparse_mla_backend(
 ) -> bool:
     selected = {prefill_impl, decode_impl}
     uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
-    is_glm_sm12_fp8 = (
+    is_glm_sm12_quantized = (
         model_arch in _GLM_DSA_MODEL_ARCHS
         and device_sm_major == 12
-        and kv_cache_dtype == torch.float8_e4m3fn
+        and kv_cache_dtype
+        in (torch.float8_e4m3fn, getattr(torch, "float4_e2m1fn_x2", None))
         and not _is_hip
     )
-    if uses_flashinfer_sparse_mla and not is_glm_sm12_fp8:
+    if uses_flashinfer_sparse_mla and not is_glm_sm12_quantized:
         raise ValueError(
-            "flashinfer_sparse_mla supports only GLM DSA with FP8 KV cache "
+            "flashinfer_sparse_mla supports only GLM DSA with FP8 or NVFP4 KV cache "
             "on NVIDIA SM120/SM121; "
             f"got model_arch={model_arch!r}, sm_major={device_sm_major}, "
             f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
             f"decode_impl={decode_impl!r}."
         )
-    if is_glm_sm12_fp8:
-        # flashinfer_sparse_mla stays the auto-selected default on this
-        # platform; triton_sparse_mla is a validated alternative prefill
-        # implementation that the user may select explicitly.
-        unsupported = selected - {"flashinfer_sparse_mla", "triton_sparse_mla"}
+    if is_glm_sm12_quantized:
+        allowed = {"flashinfer_sparse_mla"}
+        if kv_cache_dtype == torch.float8_e4m3fn:
+            allowed.add("triton_sparse_mla")
+        unsupported = selected - allowed
         if unsupported:
+            choices = "flashinfer_sparse_mla"
+            if kv_cache_dtype == torch.float8_e4m3fn:
+                choices += " (default) or triton_sparse_mla (prefill)"
             raise ValueError(
-                "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
-                "only flashinfer_sparse_mla (default) or triton_sparse_mla "
-                f"(prefill), but got {sorted(unsupported)}."
+                f"GLM DSA with {kv_cache_dtype} KV cache on NVIDIA SM120/SM121 "
+                f"supports only {choices}, but got {sorted(unsupported)}."
             )
     return uses_flashinfer_sparse_mla
 
@@ -727,8 +730,29 @@ def flashinfer_sparse_mla_forward(
     qk_rope_head_dim: int,
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
+    nvfp4_global_scale: torch.Tensor | None = None,
+    nvfp4_runner=None,
 ) -> torch.Tensor:
     """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
+    if nvfp4_global_scale is not None:
+        if (kv_cache_dim, kv_lora_rank, qk_rope_head_dim) != (416, 512, 64):
+            raise ValueError("GLM NVFP4 sparse MLA requires a 416-byte cache row")
+        if nvfp4_runner is None:
+            raise ValueError("NVFP4 sparse MLA requires a persistent FlashInfer runner")
+        output = torch.empty(
+            (*q.shape[:-1], kv_lora_rank), dtype=q.dtype, device=q.device
+        )
+        nvfp4_runner.run(
+            q,
+            kv_cache.view(-1, page_size, 1, kv_cache_dim),
+            indices,
+            output,
+            float(sm_scale),
+            kv_global_scale=nvfp4_global_scale,
+            topk_length=seq_lens,
+        )
+        return output
+
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]

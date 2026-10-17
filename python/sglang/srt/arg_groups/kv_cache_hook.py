@@ -299,6 +299,26 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         "flashinfer",
                         "trtllm_mla",
                     ]
+                    if (
+                        cfg.kv_cache_dtype == "nvfp4"
+                        and get_platform().is_sm120
+                        and attention_backend
+                        == prefill_backend
+                        == decode_backend
+                        == "dsa"
+                        and cfg.dsa_prefill_backend == "flashinfer_sparse_mla"
+                        and cfg.dsa_decode_backend == "flashinfer_sparse_mla"
+                    ):
+                        hf_config = model_config_of(server_args).hf_config
+                        # The DSA overrides validate this packed 416-byte GLM
+                        # cache separately from the generic MLA KV4 backends.
+                        if (
+                            hf_config.architectures[0] == "GlmMoeDsaForCausalLM"
+                            and getattr(hf_config, "kv_lora_rank", None) == 512
+                            and getattr(hf_config, "qk_rope_head_dim", None) == 64
+                            and not getattr(hf_config, "learnable_sink", False)
+                        ):
+                            KV4_ATTENTION_MLA_BACKEND_CHOICES.append("dsa")
                     assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                         f"KV4 MLA expects attention_backend to be one of "
                         f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {attention_backend}"
@@ -523,7 +543,6 @@ def _assert_spec_verify_backends(
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
-
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return

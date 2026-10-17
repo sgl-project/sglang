@@ -15,6 +15,45 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestFlashInferSparseMLAAdapter(unittest.TestCase):
+    def test_nvfp4_preserves_packed_cache_and_scale_tensor(self):
+        captured = {}
+
+        class FakeRunner:
+            def run(self, q, kv, indices, output, sm_scale, **kwargs):
+                captured.update(
+                    q=q, kv=kv, indices=indices, sm_scale=sm_scale, **kwargs
+                )
+                output.fill_(3)
+
+        cache = torch.zeros((128, 1, 416), dtype=torch.uint8)
+        scale = torch.tensor([0.003], dtype=torch.float32)
+        lengths = torch.tensor([2, 3], dtype=torch.int32)
+        indices = torch.tensor([[7, 9, -1, -1], [4, 6, 8, -1]], dtype=torch.int32)
+        output = flashinfer_sparse_mla_forward(
+            q=torch.zeros((2, 8, 576), dtype=torch.bfloat16),
+            kv_cache=cache,
+            indices=indices,
+            seq_lens=lengths,
+            workspace_buffer=torch.zeros(1024, dtype=torch.uint8),
+            page_size=64,
+            kv_cache_dim=416,
+            qk_nope_head_dim=192,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            sm_scale=0.125,
+            skip_softmax_threshold_scale_factor=None,
+            nvfp4_global_scale=scale,
+            nvfp4_runner=FakeRunner(),
+        )
+        self.assertEqual(tuple(captured["kv"].shape), (2, 64, 1, 416))
+        self.assertEqual(captured["kv"].data_ptr(), cache.data_ptr())
+        self.assertIs(captured["kv_global_scale"], scale)
+        self.assertIs(captured["topk_length"], lengths)
+        self.assertIs(captured["indices"], indices)
+        self.assertEqual(captured["sm_scale"], 0.125)
+        self.assertEqual(tuple(output.shape), (2, 8, 512))
+        self.assertTrue(torch.all(output == 3))
+
     def _mock_flashinfer(self, op):
         flashinfer = ModuleType("flashinfer")
         flashinfer.__path__ = []
@@ -73,6 +112,24 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
 
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):
+    @unittest.skipUnless(hasattr(torch, "float4_e2m1fn_x2"), "Requires FP4 dtype")
+    def test_accepts_nvfp4_only_for_glm_sm12(self):
+        kwargs = dict(
+            model_arch="GlmMoeDsaForCausalLM",
+            device_sm_major=12,
+            kv_cache_dtype=torch.float4_e2m1fn_x2,
+            prefill_impl="flashinfer_sparse_mla",
+            decode_impl="flashinfer_sparse_mla",
+        )
+        self.assertTrue(_validate_flashinfer_sparse_mla_backend(**kwargs))
+        for change in (
+            {"device_sm_major": 10},
+            {"model_arch": "DeepseekV3ForCausalLM"},
+            {"decode_impl": "trtllm"},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                _validate_flashinfer_sparse_mla_backend(**(kwargs | change))
+
     def _validate(self, prefill, decode, model_arch="GlmMoeDsaForCausalLM"):
         return _validate_flashinfer_sparse_mla_backend(
             model_arch=model_arch,
