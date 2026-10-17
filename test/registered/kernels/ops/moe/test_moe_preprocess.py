@@ -6,6 +6,7 @@ configs (the block schedule and kernel config are chosen together).
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import inkling_moe
 from sglang.kernels.ops.moe.inkling_moe import (
     SMALL_M_BLOCK_SIZE_M,
     compute_grouped_gemm_metadata,
@@ -21,6 +22,12 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA o
 
 E = 256
 TOPK = 6
+
+
+@pytest.mark.parametrize("is_sm12x, expected", [(True, 3), (False, 4)])
+def test_small_grouped_gemm_stage_policy(monkeypatch, is_sm12x: bool, expected: int):
+    monkeypatch.setattr(inkling_moe, "is_sm120_supported", lambda: is_sm12x)
+    assert inkling_moe._small_m_grouped_gemm_num_stages() == expected
 
 
 def _reference(topk_ids_flat: torch.Tensor):
