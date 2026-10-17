@@ -78,10 +78,12 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.decoder import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.encoder import (
     Cosmos3LidarEncoder,
-    _natten_backend_cache,
     _SpaceToDepth,
     pad_lidar_sweeps,
     required_lidar_sweeps,
+)
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.layers import (
+    _natten_backend_cache,
     resolve_natten_backend,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (

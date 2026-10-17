@@ -23,14 +23,18 @@ from torch import nn
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     validate_lidar_config,
 )
-from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.encoder import (
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar import (
     COSMOS3_LIDAR_VALIDITY_THRESHOLD,
+)
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.layers import (
     LidarBottleneckBlock,
     LidarRMSNorm,
     LidarSpatialBlock,
     LidarSpatialPE,
     LidarTemporalBlock,
     _ChannelsLast,
+)
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.loading import (
     _load_lidar_component,
 )
 
