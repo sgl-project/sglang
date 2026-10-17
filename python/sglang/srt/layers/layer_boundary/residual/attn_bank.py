@@ -100,6 +100,9 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # The communicator of a kernel that completes the attention output's sum
+    # over every row and runs the FFN read with it (K3 on gfx950), or None.
+    attn_all_reduce_comm: Optional[object] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -142,6 +145,18 @@ class AttnBankState:
             score_proj=self.ffn_score_proj,
             score_norm=self.ffn_score_norm,
             write=False,
+        )
+
+    def all_reduce_and_read_ffn_input(
+        self, hidden_states, residual, forward_batch, norm
+    ):
+        return self.bank.require().forward_all_reduce(
+            hidden_states,
+            residual,
+            self.ffn_score_proj,
+            self.ffn_score_norm,
+            norm,
+            self.attn_all_reduce_comm,
         )
 
     def reduce_scatter_and_read_ffn_input(
@@ -274,15 +289,23 @@ class _FfnReadout(_BankReadout):
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
+        fusions = state.ffn_input_fusions
+        if state.attn_all_reduce_comm is not None:
+            fusions = (
+                ReadoutFusion(
+                    SumGroup.ATTN_TP, state.all_reduce_and_read_ffn_input, reads=True
+                ),
+                *fusions,
+            )
         if not state.fuses_slice_collectives:
-            return state.ffn_input_fusions
+            return fusions
         reads = ReadoutFusion(
             SumGroup.ATTN_TP,
             state.reduce_scatter_and_read_ffn_input,
             scatters=True,
             reads=True,
         )
-        return (reads, *state.ffn_input_fusions)
+        return (reads, *fusions)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the
