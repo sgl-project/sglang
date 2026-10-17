@@ -553,7 +553,6 @@ class SchedulerWeightUpdaterManager:
                         queue.release_memory_occupation()
             # flush_cache is a no-op once KV is tagged as offloaded, so flush before tagging
             self.flush_cache()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
         for tag in tags:
             self.offload_tags.add(tag)
