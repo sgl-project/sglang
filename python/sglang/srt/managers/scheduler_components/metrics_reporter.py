@@ -1228,23 +1228,21 @@ class SchedulerMetricsReporter:
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
 
-        mamba_host_pool = self._hicache_host_mamba_pool()
+        mamba_host_pool = None
+        if (
+            isinstance(self.scheduler.tree_cache, UnifiedRadixCache)
+            and self.scheduler.tree_cache.host_pool_group is not None
+        ):
+            entry = self.scheduler.tree_cache.host_pool_group.entry_map.get(
+                PoolName.MAMBA
+            )
+            mamba_host_pool = None if entry is None else entry.host_pool
         if mamba_host_pool is not None:
             mamba_total = mamba_host_pool.logical_size
             self.stats.hicache_host_mamba_used_states = (
                 mamba_total - mamba_host_pool.available_size()
             )
             self.stats.hicache_host_mamba_total_states = mamba_total
-
-    def _hicache_host_mamba_pool(self):
-        tree_cache = self.scheduler.tree_cache
-        if (
-            not isinstance(tree_cache, UnifiedRadixCache)
-            or tree_cache.host_pool_group is None
-        ):
-            return None
-        entry = tree_cache.host_pool_group.entry_map.get(PoolName.MAMBA)
-        return None if entry is None else entry.host_pool
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
@@ -1497,4 +1495,7 @@ class SchedulerMetricsReporter:
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)
+        # Host pools change without a batch (e.g. /flush_cache); refresh before
+        # publishing so the gauges do not hold the last batch's values.
+        self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)

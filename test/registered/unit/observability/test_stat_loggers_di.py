@@ -284,6 +284,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=False,
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(queue=[]),
@@ -357,6 +358,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         )
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=False,
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
@@ -483,10 +485,6 @@ class TestRequestTimePerOutputToken(CustomTestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestHiCacheHostMambaStats(CustomTestCase):
     """Regression for sgl-project/sglang#33713: on hybrid-SSM models the host
     Mamba pool fills long before host KV and its LRU drops the states that make
@@ -562,3 +560,48 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         SchedulerMetricsCollector.log_stats(collector, reporter.stats)
         self.assertEqual(collector.hicache_host_mamba_used_states.sets, [])
         self.assertEqual(collector.hicache_host_mamba_total_states.sets, [])
+
+    def test_idle_report_refreshes_the_host_pools(self):
+        # /flush_cache empties the host pools while no batch runs; the idle
+        # publisher must re-read them instead of republishing the last batch's
+        # values.
+        mamba_pool = SimpleNamespace(logical_size=138, available_size=lambda: 138)
+        reporter = self._reporter(
+            {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
+        )
+        reporter.scheduler.tree_cache.token_to_kv_pool_host = SimpleNamespace(
+            logical_size=1000, available_size=lambda: 1000
+        )
+        reporter.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        reporter.scheduler.running_batch = SimpleNamespace(reqs=[])
+        reporter.scheduler.waiting_queue = []
+        reporter.scheduler.grammar_manager = []
+        reporter.scheduler.enable_priority_scheduling = False
+        reporter.scheduler.pool_stats_observer = SimpleNamespace(
+            get_pool_stats=lambda: SimpleNamespace(
+                update_scheduler_stats=lambda stats: None
+            ),
+            streaming_session_count=lambda: 0,
+            session_held_tokens=lambda: 0,
+        )
+        reporter.current_scheduler_metrics_enabled = True
+        reporter.stats.hicache_host_used_tokens = 600  # the last batch's report
+        reporter.stats.hicache_host_mamba_used_states = 128
+        collector = MagicMock()
+        collector.last_log_time = -1e9  # past the 30 s window
+        reporter.metrics_collector = collector
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+            False,
+        ):
+            reporter._maybe_log_idle_metrics()
+
+        self.assertEqual(reporter.stats.hicache_host_used_tokens, 0)
+        self.assertEqual(reporter.stats.hicache_host_mamba_used_states, 0)
+        self.assertEqual(reporter.stats.hicache_host_mamba_total_states, 138)
+        collector.log_stats.assert_called_once_with(reporter.stats)
+
+
+if __name__ == "__main__":
+    unittest.main()
