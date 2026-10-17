@@ -12,8 +12,22 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _check_v2_lora_modes(cfg: Any, option: str):
+    for unsupported, mode in (
+        (cfg.attn_dp_size > 1, "DP-attention with --attn-dp-size > 1"),
+        (cfg.enable_pdmux, "PD-multiplexing"),
+        (cfg.enable_two_batch_overlap, "two-batch overlap"),
+        # Both reach the legacy kv_b correction kernels with V2 batch metadata.
+        (envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get(), "SGLANG_EXPERIMENTAL_LORA_OPTI"),
+        (get_platform().is_hip, "ROCm"),
+    ):
+        if unsupported:
+            raise ValueError(f"{option} does not yet support {mode}")
 
 
 def check_lora_server_args(server_args: Any):
@@ -34,6 +48,11 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
+        if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
+            "lora"
+        ):
+            _check_v2_lora_modes(cfg, "--lora-backend triton_v2")
+
         if cfg.enable_lora_overlap_loading is None:
             declare_resolution(
                 server_args, "check_lora_server_args", enable_lora_overlap_loading=False
