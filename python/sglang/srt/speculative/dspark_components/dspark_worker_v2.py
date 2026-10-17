@@ -1003,6 +1003,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
+        target_logits, watermark_rows = self._force_watermark(
+            batch=batch,
+            logits_output=logits_output,
+            verify_ids_2d=verify_ids_2d,
+            positions_2d=verify_window.positions_2d,
+            sampling_info=sampling_info,
+        )
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
@@ -1013,7 +1020,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             folded_accept=folded_accept,
             bs=bs,
             verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
+            target_logits=target_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
@@ -1022,6 +1029,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
+        if watermark_rows is not None:
+            self.target_worker.model_runner.watermark_state.commit_speculative_chain(
+                req_pool_indices=batch.req_pool_indices,
+                context_hashes=watermark_rows[0],
+                selected=watermark_rows[1],
+                accept_tokens=accept.out_tokens,
+                accept_lens=accept.commit_lens,
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
@@ -1118,6 +1133,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _force_watermark(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        verify_ids_2d: torch.Tensor,
+        positions_2d: torch.Tensor,
+        sampling_info,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        target_logits = logits_output.next_token_logits
+        watermark_state = self.target_worker.model_runner.watermark_state
+        if (
+            watermark_state is None
+            or sampling_info is None
+            or not sampling_info.has_watermark_candidates
+        ):
+            return target_logits, None
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after acceptance.
+            target_logits = target_logits.clone()
+        watermark_rows = watermark_state.force_speculative_chain(
+            logits=target_logits,
+            req_pool_indices=batch.req_pool_indices,
+            chain_tokens=verify_ids_2d,
+            positions=positions_2d,
+            sampling_info=sampling_info,
+        )
+        return target_logits, watermark_rows
 
     def _commit_target_mamba_states_after_verify(
         self,
