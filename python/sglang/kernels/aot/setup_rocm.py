@@ -74,22 +74,25 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1100", "gfx1250"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', 'gfx1100', or 'gfx1250'."
     )
     sys.exit(1)
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)  # gfx950 and gfx1250 use E4M3
+)  # gfx950, gfx1100, and gfx1250 use E4M3
 
 # Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
+# - gfx942 (MI300/MI325) and gfx1100 (RDNA3): LDS is typically 64KB per workgroup
+#   -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
+topk_dynamic_smem_bytes = (
+    48 * 1024 if amdgpu_target in {"gfx942", "gfx1100"} else 40 * 1024
+)
 
 hipcc_flags = [
     "-DNDEBUG",
