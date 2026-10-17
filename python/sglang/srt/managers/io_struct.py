@@ -2555,6 +2555,21 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
         )
 
 
+class MergeLoRAWeightsReqInput(BaseReq, kw_only=True):
+    lora_name: str
+    lora_id: Optional[str] = None
+
+
+class UnmergeLoRAWeightsReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class LoRAMergeOutput(BaseReq, kw_only=True):
+    success: bool
+    error_message: Optional[str] = None
+    merged_lora_name: Optional[str] = None
+
+
 class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None

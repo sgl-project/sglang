@@ -27,6 +27,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+from sglang.srt.model_executor.runner_utils.capture_mode import get_capture_lora_variant
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -70,6 +71,7 @@ class BaseLayerWithLoRA(nn.Module):
         batch_info = self.lora_backend.get_batch_info()
         return (
             self.set_lora
+            and get_capture_lora_variant() != "nolora"
             and batch_info is not None
             and (
                 not self.lora_backend.skip_inactive_lora_batches

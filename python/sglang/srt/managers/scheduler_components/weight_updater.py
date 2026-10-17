@@ -137,6 +137,13 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        manager = self.tp_worker.model_runner.lora_manager
+        if manager is not None and manager.merged_lora_id is not None:
+            return UpdateWeightFromDiskReqOutput(
+                success=False,
+                message="Unmerge before updating base weights",
+                num_paused_requests=0,
+            )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -264,6 +271,11 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        manager = self.tp_worker.model_runner.lora_manager
+        if manager is not None and manager.merged_lora_id is not None:
+            return UpdateWeightsFromIPCReqOutput(
+                success=False, message="Unmerge before updating base weights"
+            )
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -308,6 +320,11 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
+        manager = self.tp_worker.model_runner.lora_manager
+        if manager is not None and manager.merged_lora_id is not None:
+            return BeginWeightUpdateReqOutput(
+                success=False, message="Unmerge before updating base weights"
+            )
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,
