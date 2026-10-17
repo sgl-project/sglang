@@ -6,8 +6,8 @@ causal (target-verify) path. These tests check:
       (the operative case at topk=1), across head dims / GQA ratios / prefix
       lengths / extend lengths / KV scales / attention sinks / fp8 KV buffers /
       splits left without keys / an empty prefix;
-  (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
-      (non-causal, sliding-window, logit-cap, ragged extend, mis-shaped
+  (b) ``can_handle()`` rejects cases the kernel cannot serve
+      (non-causal, logit-cap, ragged extend, mis-shaped
       sinks), so the backend falls back to ``extend_attention_fwd``.
 
 The topk>1 case is gated off in the backend (TritonAttnBackend enables this path
@@ -337,26 +337,15 @@ class TestVerifySplitKV(CustomTestCase):
         q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
         self.assertFalse(
             can_handle(
-                q,
-                k,
-                v,
-                kb,
-                vb,
-                qo,
-                kvp,
-                kvi,
-                None,
-                True,
-                None,
-                mle,
-                sliding_window_size=128,
-            )
-        )
-        self.assertFalse(
-            can_handle(
                 q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle, logit_cap=30.0
             )
         )
+
+    def test_sliding_window_eligibility(self):
+        q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
+        args = (q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle)
+        self.assertTrue(can_handle(*args, sliding_window_size=128))
+        self.assertFalse(can_handle(*args, sliding_window_size="128"))
 
     def test_fallback_ragged_extend(self):
         # q rows (bs*l_ext) inconsistent with the claimed max_len_extend -> reject.
