@@ -428,6 +428,7 @@ class LingBotWorldTransformerBlock(nn.Module):
 
         self.attn1 = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.dim_head,
             causal=False,
             supported_attention_backends=supported_attention_backends,
