@@ -1,6 +1,4 @@
-"""Step5 FFN reductions: a dense MLP owns its TP reduction, so the last decoder layer's
-output is summed; an MoE layer's routed + shared partial is summed unless the layer
-exit moved the sum to the next layer."""
+"""Step5 FFN reductions follow stage-boundary ownership."""
 
 import unittest
 from types import SimpleNamespace
@@ -36,10 +34,13 @@ def _down_proj_kwargs(role: str, use_dp_attention_reduce: bool = False) -> dict:
 
 
 class TestStep5MlpReduction(CustomTestCase):
-    def test_dense_mlp_reduces_unless_the_boundary_defers_it(self):
-        # RowParallelLinear skips the all-reduce only under the decoder's
-        # fuse_mlp_allreduce scope; the terminal layer never sets it.
-        self.assertTrue(_down_proj_kwargs("dense")["reduce_results"])
+    def test_dense_mlp_leaves_its_partial_to_the_stage_boundary(self):
+        self.assertFalse(_down_proj_kwargs("dense")["reduce_results"])
+
+    def test_attention_dp_dense_mlp_reduces_without_stage_boundaries(self):
+        self.assertTrue(
+            _down_proj_kwargs("dense", use_dp_attention_reduce=True)["reduce_results"]
+        )
 
     def test_shared_expert_leaves_its_partial_to_the_moe_sum(self):
         self.assertFalse(_down_proj_kwargs("shared")["reduce_results"])
