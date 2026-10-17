@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
     host_memory_budget_bytes,
+    resolve_storage_dtype,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -188,6 +189,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.device_k_buffers = tuple(b for pool in pools for b in pool.k_buffer)
         self.device_v_buffers = tuple(b for pool in pools for b in pool.v_buffer)
         self._initialize_transfer_views()
+
+    def get_storage_dtype(self) -> torch.dtype:
+        return resolve_storage_dtype(self.dtype, self.device_pool.dtype)
 
     def _initialize_transfer_views(self) -> None:
         self.element_dim = self.head_num * self.head_dim

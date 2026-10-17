@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    resolve_storage_dtype,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -160,6 +161,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
         )
         self._initialize_transfer_views()
+
+    def get_storage_dtype(self) -> torch.dtype:
+        return resolve_storage_dtype(self.dtype, self.device_pool.dtype)
 
     def _initialize_transfer_views(self) -> None:
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
