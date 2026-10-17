@@ -291,6 +291,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 and not get_platform().is_cuda,
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
+            # ROCm replays hits in a forward of their own, which only the hitting
+            # attention-DP ranks would enter; CUDA folds them into the extend.
+            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
@@ -417,6 +420,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         (get_platform().is_cuda or get_platform().is_hip)
         and cfg.disaggregation_mode == "null"
         and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
+        # Returning every hidden state runs every prompt row: nothing to trim.
+        and not cfg.enable_return_hidden_states
         and not any(enabled for _, enabled in incompatible)
     )
     declare_resolution(
