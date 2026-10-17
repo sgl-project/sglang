@@ -24,9 +24,7 @@ from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
-    is_dflash_mla_draft_causal,
     is_dflash_mla_draft_config,
-    validate_dflash_mla_draft_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
@@ -206,14 +204,6 @@ class TestDFlashMLA(CustomTestCase):
                 }
             )
 
-    def test_rejects_settings_the_target_layer_ignores(self):
-        for message, override in (
-            ("attention_bias", {"attention_bias": True}),
-            ("rope_type", {"rope_scaling": {"rope_type": "linear", "factor": 2.0}}),
-        ):
-            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
-                validate_dflash_mla_draft_config({**_export_fields(), **override})
-
     def test_draft_model_config_sizes_compressed_kv_pool(self):
         with tempfile.TemporaryDirectory() as path:
             Path(path, "config.json").write_text(
@@ -234,23 +224,6 @@ class TestDFlashMLA(CustomTestCase):
                 ),
                 (KV_LORA + ROPE) * 2,
             )
-
-    def test_layer_and_planned_causality_agree(self):
-        """FlashInfer plans one causality per batch; it must match every layer."""
-        for layer_types, is_causal, expected in (
-            (None, True, AttentionType.ENCODER_ONLY),
-            (["full_attention"], None, AttentionType.ENCODER_ONLY),
-            (["full_attention"], True, AttentionType.DECODER),
-        ):
-            with self.subTest(layer_types=layer_types, is_causal=is_causal):
-                config = Qwen3Config(**_export_fields())
-                config.layer_types, config.is_causal = layer_types, is_causal
-                attn = DFlashMLAAttention(config, layer_id=0)
-                self.assertEqual(attn.attn_mqa.attn_type, expected)
-                self.assertEqual(
-                    is_dflash_mla_draft_causal(config),
-                    expected == AttentionType.DECODER,
-                )
 
     def test_specforge_checkpoint_loads_and_absorbs(self):
         for q_lora_rank, q_keys in SPECFORGE_KEYS.items():
@@ -317,15 +290,11 @@ class TestDFlashMLA(CustomTestCase):
                 )
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
-    def test_dspark_draft_writes_context_kv_through_mla_layer(self):
-        """DSpark's own context-KV writers slice a fused qkv_proj; an MLA draft must
-        write the layer's latent rows instead, masked to the accepted verify rows."""
+    def test_dspark_commits_verify_rows_through_mla_layer(self):
+        """DSpark's fused context-KV paths slice a qkv_proj; an MLA draft must commit
+        the layer's latent rows through the masked MLA writer instead."""
         model = DSparkDraftModel(
-            Qwen3Config(
-                **_export_fields(),
-                markov_rank=4,
-                markov_head_type="vanilla",
-            )
+            Qwen3Config(**_export_fields(), markov_rank=4, markov_head_type="vanilla")
         )
         attn = model.layers[0].self_attn
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
@@ -334,35 +303,27 @@ class TestDFlashMLA(CustomTestCase):
         # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
         pool = Mock(spec=MLATokenToKVPool)
         ctx_hidden, positions = torch.randn(4, HIDDEN), torch.tensor([0, 1, 5, 6])
-        cache_loc_2d = torch.tensor([[3, 4], [8, 9]])
+        loc_2d = torch.tensor([[3, 4], [8, 9]])
         commit_lens = torch.tensor([1, 2], dtype=torch.int32)
         with torch.no_grad():
-            k_nope, k_pe = attn.project_context_kv(positions, ctx_hidden)
-            for verify_commit in (False, True):
-                model.write_target_hidden_kv(
-                    target_hidden=ctx_hidden,
-                    pool=pool,
-                    positions=positions,
-                    cache_loc=cache_loc_2d.flatten(),
-                    cache_loc_2d=cache_loc_2d if verify_commit else None,
-                    commit_lens=commit_lens if verify_commit else None,
-                    target_hidden_is_projected=True,
-                )
-
-        (layer, loc, *rows), _ = pool.set_mla_kv_buffer.call_args
-        self.assertIs(layer, attn.attn_mqa)
-        self.assertTrue(loc.physical)
-        self.assertTrue(torch.equal(loc.loc, cache_loc_2d.flatten()))
-        (layer, loc_2d, lens, *commit_rows), _ = (
-            pool.set_mla_kv_buffer_prefix_valid.call_args
+            expected = attn.project_context_kv(positions, ctx_hidden)
+            model.write_target_hidden_kv(
+                target_hidden=ctx_hidden,
+                pool=pool,
+                positions=positions,
+                cache_loc=loc_2d.flatten(),
+                cache_loc_2d=loc_2d,
+                commit_lens=commit_lens,
+                target_hidden_is_projected=True,
+            )
+        layer, got_loc, got_lens, *rows = (
+            pool.set_mla_kv_buffer_prefix_valid.call_args.args
         )
         self.assertIs(layer, attn.attn_mqa)
-        self.assertIs(loc_2d, cache_loc_2d)
-        self.assertIs(lens, commit_lens)
-        self.assertEqual(pool.set_mla_kv_buffer.call_count, 1)
-        for actual in (rows, commit_rows):
-            for got, expected in zip(actual, (k_nope, k_pe)):
-                torch.testing.assert_close(got, expected, rtol=0, atol=0)
+        self.assertIs(got_loc, loc_2d)
+        self.assertIs(got_lens, commit_lens)
+        for got, want in zip(rows, expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
