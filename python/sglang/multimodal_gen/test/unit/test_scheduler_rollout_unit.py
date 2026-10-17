@@ -77,6 +77,21 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             latents=torch.zeros(2, 4, 8, 8, dtype=torch.float32),
         )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_trajectory_timestep_stays_on_device(self):
+        """The transition records the step's timestep without a per-step copy to
+        the host; finalization stacks them and moves them to the CPU once."""
+        batch = self._build_batch(debug_mode=False)
+        batch.rollout_return_dit_trajectory = True
+        current_rollout_controller = _make_rollout_controller(batch)
+        timestep = torch.tensor(500.0, device="cuda")
+        current_rollout_controller._maybe_append_dit_trajectory_step(
+            latents=batch.latents, timestep_value=timestep, step_index=0
+        )
+        self.assertEqual(
+            current_rollout_controller.step_timesteps[0].device, timestep.device
+        )
+
     def test_ode_step_does_not_call_variance_noise_sampler(self):
         batch = self._build_batch(debug_mode=False)
         current_rollout_controller = _make_rollout_controller(batch)

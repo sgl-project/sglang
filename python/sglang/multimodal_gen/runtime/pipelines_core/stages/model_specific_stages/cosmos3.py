@@ -63,7 +63,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
-    rollout_transition,
+    rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
@@ -1520,7 +1520,6 @@ class Cosmos3DenoisingStage(PipelineStage):
             },
             guidance=None,
         )
-        transition = rollout_transition(batch)
 
         do_cfg = guidance_scale > 1.0
         # Control-CFG runs even when text guidance is off (its own extra
@@ -1786,7 +1785,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 t,
                 latents,
                 generator=generator,
-                transition=transition,
+                **rollout_step_kwargs(batch),
                 return_dict=False,
             )[0]
 
@@ -1841,7 +1840,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             batch=batch,
             latents=latents,
             num_inference_steps=len(timesteps),
-            final_timestep=timesteps.new_zeros(()).cpu(),
+            final_timestep=timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,
         )
 
