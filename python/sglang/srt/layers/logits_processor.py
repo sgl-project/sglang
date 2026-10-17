@@ -29,6 +29,12 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    maybe_skinny_gemm as _maybe_skinny_gemm,
+)
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    sm121_skinny_enabled as _sm121_skinny_enabled,
+)
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -1014,9 +1020,16 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                logits = None
+                if (
+                    _sm121_skinny_enabled()
+                    and hidden_states.dtype == lm_head.weight.dtype
+                ):
+                    logits = _maybe_skinny_gemm(hidden_states, lm_head.weight)
+                if logits is None:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
