@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
@@ -133,6 +132,7 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    pools: dict[PoolName, object]
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -191,7 +191,7 @@ class UnifiedCacheLinker(ABC):
 
     def restores_swa(self) -> bool:
         """Whether the store carries SWA pages; False tombstones restored tails."""
-        return True
+        return PoolName.SWA in self.pools
 
 
 class ExternalCacheHitMarker(NamedTuple):
@@ -232,10 +232,7 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and (
-            is_swa_req_ring(cache.token_to_kv_pool_allocator)
-            or not cache_linker.restores_swa()
-        )
+        self._skip_swa = swa is not None and not cache_linker.restores_swa()
         self._components = tuple(
             component
             for component in cache._components_tuple
