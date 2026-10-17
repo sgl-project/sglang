@@ -3,6 +3,7 @@ import types
 from functools import partial
 from unittest import mock
 
+import pytest
 import torch
 
 from sglang.srt.distributed.device_communicators import custom_all_reduce
@@ -127,3 +128,7 @@ def test_policy_is_forwarded_to_aiter_custom_allreduce():
     assert isinstance(factory, partial)
     assert factory.func is FakeAiterCustomAllreduce
     assert factory.keywords["enable_register_for_capturing"] is False
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
