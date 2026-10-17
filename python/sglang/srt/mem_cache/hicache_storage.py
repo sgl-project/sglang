@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -402,6 +403,11 @@ class HiCacheFile(HiCacheStorage):
             storage_config.model_name,
             storage_config.is_mla_model,
         )
+        self._storage_config = storage_config
+        self._is_mla_model = is_mla_model
+        self._tp_rank = tp_rank
+        self._tp_size = tp_size
+        self._rank_sharded_pools = {PoolName.MAMBA}
         attn_cp_rank = storage_config.attn_cp_rank
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
@@ -444,21 +450,30 @@ class HiCacheFile(HiCacheStorage):
         else:
             self.metadata_cache = None
 
-        # All LRU / size accounting and disk eviction lives in the evictor so
-        # this backend stays a thin raw-bytes store. Imported lazily: the storage
-        # package __init__ pulls in the backend factory, which imports this
-        # module, so a top-level import here would be circular.
+        self._evictor = self._create_evictor(is_mla_model=is_mla_model)
+
+    def _owns_file_key(self, suffixed_key: str) -> bool:
+        key = suffixed_key.removesuffix(self.config_suffix)
+        shard = re.search(r"\.tp(\d+)_(\d+)$", key)
+        if shard is not None:
+            return (int(shard[1]), int(shard[2])) == (self._tp_rank, self._tp_size)
+        return self._tp_rank == 0
+
+    def _create_evictor(self, *, is_mla_model: bool):
+        # A rank's cap covers all files it owns: its shards, plus shared MLA
+        # pages on rank 0. Never adopt or evict a peer's files on reads/scans.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        self._evictor = LRUFileEvictor(
+        return LRUFileEvictor(
             self.file_path,
             self.config_suffix,
-            tp_rank=tp_rank,
+            tp_rank=self._tp_rank,
             is_mla_model=is_mla_model,
-            extra_config=storage_config.extra_config,
+            extra_config=self._storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
+            owns_key=self._owns_file_key if self._is_mla_model else None,
         )
 
     def _get_suffixed_key(self, key: str) -> str:
@@ -467,7 +482,7 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -667,8 +682,33 @@ class HiCacheFile(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+        if host_pool_name != PoolName.KV and isinstance(
+            host_pool, MHATokenToKVPoolHost
+        ):
+            self._rank_sharded_pools.add(host_pool_name)
+        if (
+            self._is_mla_model
+            and host_pool_name in self._rank_sharded_pools
+            and not self._evictor.is_storage_owner
+        ):
+            # Pure MLA peers remain read-only. Registering a sharded sidecar
+            # enables a local LRU, scoped to this rank's shard keys.
+            self._evictor = self._create_evictor(is_mla_model=False)
+
     def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        if pool_name == PoolName.KV:
+            return key
+        key = f"{key}.{pool_name}"
+        # The primary MLA pool is replicated, but hybrid state and MHA draft
+        # pools contain different shards on each TP rank. Use the same key
+        # mapping for existence queries and reads/writes of those sidecars.
+        if self._is_mla_model and pool_name in self._rank_sharded_pools:
+            key += f".tp{self._tp_rank}_{self._tp_size}"
+        return key
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
