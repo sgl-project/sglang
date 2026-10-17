@@ -623,6 +623,9 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        # The fused path accumulates into out_hidden_states and never reads
+        # intermediate_cache3, so a hooks.after_down delta would be dropped.
+        and (not (hooks and hooks.after_down is not None))
     )
 
     if fuse_swiglu_interleaved:
@@ -940,12 +943,14 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
+    elif use_fused_moe_sum_all_reduce:
+        # The down kernel already summed the experts. Scale as the combine would:
+        # aiter's moe_sum does not, since aiter routing folds the factor into topk_weights.
+        if routed_scaling_factor != 1.0 and not _use_aiter:
+            assert out_slice is not None
+            out_slice.mul_(routed_scaling_factor)
     elif _is_cuda or _is_musa:
-        if use_fused_moe_sum_all_reduce:
-            if routed_scaling_factor != 1.0:
-                assert out_slice is not None
-                out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
             pass  # we wrote directly into out_hidden_states
         elif topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
