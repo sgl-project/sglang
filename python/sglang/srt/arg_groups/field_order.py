@@ -450,6 +450,7 @@ POSITIONAL_FIELD_ORDER = (
     "weight_loader_disable_mmap",
     "weight_loader_prefetch_checkpoints",
     "weight_loader_prefetch_num_threads",
+    "weight_loader_copy_num_threads",
     "weight_loader_drop_cache_after_load",
     "remote_instance_weight_loader_seed_instance_ip",
     "remote_instance_weight_loader_seed_instance_service_port",
