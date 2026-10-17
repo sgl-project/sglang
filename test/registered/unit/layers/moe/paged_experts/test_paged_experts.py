@@ -1,8 +1,5 @@
-import os
-import tempfile
 import unittest
 from types import SimpleNamespace
-from typing import NamedTuple, Optional
 from unittest.mock import patch
 
 import torch
@@ -18,31 +15,16 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     LRUPolicy,
     plan_waves,
 )
-from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, TritonContract
-from sglang.srt.layers.moe.paged_experts.sizing import (
-    _checkpoint_bytes,
-    num_resident_for_budget,
-)
+from sglang.srt.layers.moe.paged_experts.runners import MarlinContract, TritonContract
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 E, K, H, TOP_K = 16, 4, 8, 2
-
-
-class _TopK(NamedTuple):
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
-    router_logits: Optional[torch.Tensor] = None
-
-
-class _Dispatch(NamedTuple):
-    hidden_states: torch.Tensor
-    topk_output: _TopK
-    hidden_states_scale: Optional[torch.Tensor] = None
-    hidden_states_pre_quant: Optional[tuple] = None
 
 
 class _LinearMoE:
@@ -80,7 +62,7 @@ def _sum_top_k(self, entries, out, routed_scaling_factor):
     out.copy_(entries.sum(1) * routed_scaling_factor)
 
 
-class _CompactingContract(RunnerContract):
+class _CompactingContract(MarlinContract):
     _sum_top_k = _sum_top_k
 
 
@@ -99,7 +81,13 @@ def _step(num_tokens):
     ids = torch.stack([torch.randperm(E)[:TOP_K] for _ in range(num_tokens)]).int()
     weights = torch.rand(num_tokens, TOP_K, dtype=torch.float32)
     x = torch.randn(num_tokens, H, dtype=torch.float32)
-    return _Dispatch(x, _TopK(ids, weights))
+    return StandardDispatchOutput(
+        hidden_states=x,
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=weights, topk_ids=ids, router_logits=None
+        ),
+    )
 
 
 def _paged_layer(contract=CONTRACTS[0]):
@@ -166,7 +154,11 @@ class TestPagedForward(CustomTestCase):
                 out = method.apply(layer=layer, dispatch_output=d).hidden_states
                 weights = d.topk_output.topk_weights.clone()
                 weights[1] = 0
-                masked = d._replace(topk_output=_TopK(ids.clamp(min=0), weights))
+                masked = d._replace(
+                    topk_output=d.topk_output._replace(
+                        topk_ids=ids.clamp(min=0), topk_weights=weights
+                    )
+                )
                 torch.testing.assert_close(out, _reference(full, masked))
 
     def test_slots_hold_the_resident_experts(self):
@@ -295,15 +287,12 @@ class TestLoading(CustomTestCase):
         )
         staged.host["raw_weight"].copy_(torch.arange((E + 1) * 6.0).reshape(E + 1, 6))
 
-        packed = fmt.after_loading(
-            layer=layer,
-            base_method=_Repacking(),
-            store=staged,
-            num_slots=K,
-            new_store=lambda names: _CpuStore(
-                layer=layer, names=names, num_experts=E + 1
-            ),
-        )
+        with patch(
+            "sglang.srt.layers.moe.paged_experts.formats.HostExpertStore", _CpuStore
+        ):
+            packed = fmt.after_loading(
+                layer=layer, base_method=_Repacking(), store=staged, num_slots=K
+            )
 
         expected = (staged.host["raw_weight"] * 10 + 1).reshape(E + 1, 2, 3)
         self.assertTrue(torch.equal(packed.host["packed_weight"], expected))
@@ -379,11 +368,11 @@ class TestDecodeCaptureCap(CustomTestCase):
 
 
 class TestCompat(CustomTestCase):
-    def test_rejects_speculative_decoding(self):
+    def _check(self, num_resident=K, speculative_algorithm=None):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
-            paged_experts_num_resident=None,
+            paged_experts_num_resident=num_resident,
             enable_fused_moe_sum_all_reduce=False,
         )
         layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
@@ -397,94 +386,27 @@ class TestCompat(CustomTestCase):
             patch(method + "get_exec", return_value=SimpleNamespace(moe=moe)),
             patch(
                 method + "get_spec",
-                return_value=SimpleNamespace(speculative_algorithm="EAGLE"),
+                return_value=SimpleNamespace(
+                    speculative_algorithm=speculative_algorithm
+                ),
             ),
             patch(
                 method + "get_model", return_value=SimpleNamespace(load_format="auto")
             ),
             patch(method + "check_cuda_graph_backend", return_value=True),
         ):
-            with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
-                check_paged_experts_compat(layer=layer, expert_format=object())
+            check_paged_experts_compat(layer=layer, expert_format=object())
 
+    def test_accepts_a_supported_config(self):
+        self._check()
 
-class TestSizing(CustomTestCase):
-    def test_budget_is_clamped_to_top_k_and_num_experts(self):
-        kwargs = dict(
-            mem_fraction=0.5,
-            nonexpert_bytes=10,
-            reserve_bytes=10,
-            per_expert_bytes=4,
-            top_k=TOP_K,
-            num_experts=E,
-        )
-        # (100 * 0.5 - 20) // 4 = 7
-        self.assertEqual(num_resident_for_budget(free_bytes=100, **kwargs), 7)
-        self.assertEqual(num_resident_for_budget(free_bytes=10, **kwargs), TOP_K)
-        self.assertEqual(num_resident_for_budget(free_bytes=1e6, **kwargs), E)
+    def test_rejects_speculative_decoding(self):
+        with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
+            self._check(speculative_algorithm="EAGLE")
 
-    def test_checkpoint_bytes_split_routed_experts(self):
-        from safetensors.torch import save_file
-
-        with tempfile.TemporaryDirectory() as folder:
-            save_file(
-                {
-                    "model.layers.0.mlp.experts.3.down_proj.weight": torch.zeros(4, 8),
-                    # A draft (MTP) layer past num_layers is not served.
-                    "model.layers.1.mlp.experts.3.down_proj.weight": torch.zeros(4, 8),
-                    "model.layers.1.self_attn.o_proj.weight": torch.zeros(4, 8),
-                    "model.layers.0.mlp.shared_experts.down_proj.weight": torch.zeros(
-                        2
-                    ),
-                    "model.embed_tokens.weight": torch.zeros(3, dtype=torch.bfloat16),
-                },
-                os.path.join(folder, "model.safetensors"),
-            )
-            self.assertEqual(
-                _checkpoint_bytes(
-                    files=[os.path.join(folder, "model.safetensors")], num_layers=1
-                ),
-                (128, 14),
-            )
-
-    def test_loader_resolves_the_checkpoint_before_building_the_model(self):
-        from sglang.srt.layers.moe.paged_experts import sizing
-        from sglang.srt.model_loader.loader import DefaultModelLoader
-
-        loader = DefaultModelLoader.__new__(DefaultModelLoader)
-        model_config = SimpleNamespace(
-            model_path="org/model", revision=None, hf_config=None
-        )
-        model_class = type("Model", (), {"fall_back_to_pt_during_load": False})
-        prepared = ("/cache/org/model", ["/cache/org/model/a.safetensors"], True)
-        loader_module = "sglang.srt.model_loader.loader."
-        with (
-            patch.object(sizing, "needs_checkpoint", return_value=True),
-            patch.object(sizing, "_checkpoint_files", ()),
-            patch(
-                loader_module + "get_model_architecture",
-                return_value=(model_class, "Model"),
-            ),
-            patch(
-                loader_module + "maybe_add_mtp_safetensors", side_effect=lambda f, *_: f
-            ),
-            patch.object(
-                DefaultModelLoader,
-                "_prepare_weights",
-                return_value=prepared,
-                create=True,
-            ) as prepare,
-        ):
-            resolved = loader._resolve_before_init(model_config)
-            self.assertEqual(
-                sizing._checkpoint_files, ("/cache/org/model/a.safetensors",)
-            )
-        prepare.assert_called_once_with("org/model", None, False, None)
-        # The load after the model is built reuses it instead of preparing again.
-        self.assertEqual(
-            resolved.source,
-            DefaultModelLoader.Source.init_new(model_config, model_class),
-        )
+    def test_requires_num_resident(self):
+        with self.assertRaisesRegex(RuntimeError, "--paged-experts-num-resident"):
+            self._check(num_resident=None)
 
 
 if __name__ == "__main__":

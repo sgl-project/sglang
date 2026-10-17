@@ -14,7 +14,7 @@ Adding a quantization method means adding a subclass to ``FORMATS``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.paged_experts.runners import (
     TRITON,
     RunnerContract,
 )
+from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
 # Prefixes of FusedMoE's per-expert parameters.
 _EXPERT_PARAM_PREFIXES = ("w13_", "w2_")
@@ -58,19 +59,15 @@ class ExpertFormat(ABC):
                 f"{sorted(self.checkpoint_params)}, the layer has {sorted(per_expert)}"
             )
 
-    def after_loading(
-        self, layer, base_method, store, num_slots: int, new_store: Callable
-    ):
+    def after_loading(self, layer, base_method, store, num_slots: int):
         """Run the base post-load step; return the store to page from, whose experts 0..K-1
-        the GPU slots then hold. ``new_store(names)`` builds an empty pinned store shaped
-        like the layer's current ``names`` tensors."""
+        the GPU slots then hold."""
         if self.repacks_after_loading:
             return self._repack(
                 layer=layer,
                 base_method=base_method,
                 staged=store,
                 num_slots=num_slots,
-                new_store=new_store,
             )
         for name, host in store.host.items():
             getattr(layer, name).data.copy_(host[:num_slots])
@@ -86,7 +83,7 @@ class ExpertFormat(ABC):
                 )
         return store
 
-    def _repack(self, layer, base_method, staged, num_slots: int, new_store: Callable):
+    def _repack(self, layer, base_method, staged, num_slots: int):
         """Run the base post-load step over the staged checkpoint layout, K experts at a time,
         collecting its per-expert output into a new store. Only valid for steps that treat
         every expert independently."""
@@ -105,7 +102,9 @@ class ExpertFormat(ABC):
                 layer.register_parameter(name, fresh)
             base_method.process_weights_after_loading(layer)
             if packed is None:
-                packed = new_store(self.paged_params)
+                packed = HostExpertStore(
+                    layer=layer, names=self.paged_params, num_experts=num_experts
+                )
             for name, host in packed.host.items():
                 host[start : start + n].copy_(getattr(layer, name).data[:n])
         for name, host in packed.host.items():

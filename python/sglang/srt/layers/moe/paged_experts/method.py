@@ -9,7 +9,6 @@ import torch
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
 from sglang.srt.layers.moe.paged_experts.formats import ExpertFormat, format_for
 from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
-from sglang.srt.layers.moe.paged_experts.sizing import auto_num_resident
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -139,9 +138,6 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             base_method=self.base_method,
             store=self.store,
             num_slots=self.num_resident,
-            new_store=lambda names: HostExpertStore(
-                layer=layer, names=names, num_experts=self.num_experts
-            ),
         )
         residency = None
         if self.graphs:
@@ -231,12 +227,7 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
     expert_format = format_for(base_method)
     check_paged_experts_compat(layer=layer, expert_format=expert_format)
     num_experts = layer.num_local_experts
-    num_resident = get_exec().moe.paged_experts_num_resident
-    if num_resident is None:
-        num_resident = auto_num_resident(
-            num_experts=num_experts, top_k=_router_top_k(layer)
-        )
-    num_resident = min(num_resident, num_experts)
+    num_resident = min(get_exec().moe.paged_experts_num_resident, num_experts)
     if check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
         # A full decode graph cannot break out for host-planned waves.
         _cap_decode_capture_batch_sizes(max(1, num_resident // _router_top_k(layer)))
@@ -301,7 +292,9 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         )
     num_resident = get_exec().moe.paged_experts_num_resident
     top_k = _router_top_k(layer)
-    if num_resident is not None and num_resident < top_k:
+    if num_resident is None:
+        problems.append("--paged-experts-num-resident is required")
+    elif num_resident < top_k:
         problems.append(
             f"--paged-experts-num-resident must be at least the router's top-k ({top_k})"
         )

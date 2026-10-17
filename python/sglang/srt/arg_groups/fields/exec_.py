@@ -892,9 +892,8 @@ class ExecMoe(msgspec.Struct):
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
-        "Number of routed experts per MoE layer kept resident on the GPU with --enable-paged-experts. "
-        "Unset: the most that fit --mem-fraction-static next to the other weights and a KV "
-        "reserve for --max-running-requests at full context.",
+        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
+        "--enable-paged-experts; at least the router's top-k.",
     ] = None
 
     # -------------------------------------------------------------------------

@@ -47,40 +47,7 @@ class RunnerContract:
     def run_wave(self, base_method, layer, dispatch_output, slots, merged):
         """Compute the routed entries of one wave (``slots`` >= 0) into ``merged``, the step's
         ``[tokens, top_k, hidden]`` entries (None before its first wave), and return it."""
-        hidden_states = dispatch_output.hidden_states
-        assert (
-            dispatch_output.hidden_states_scale is None
-            and dispatch_output.hidden_states_pre_quant is None
-        ), "Paged experts: compacted waves need unquantized MoE inputs"
-        if merged is None:
-            merged = hidden_states.new_zeros(*slots.shape, hidden_states.shape[-1])
-        entries = (slots >= 0).flatten().nonzero().squeeze(1)
-        num = entries.numel()
-        if num == 0:
-            return merged
-        # Padded to a few sizes per power of two, so the runner sees few distinct batch
-        # shapes; padding rows go to slot 0 with weight 0 and are dropped.
-        step = max(16, 1 << max(0, num.bit_length() - 4))
-        pad = -num % step
-        tokens = F.pad(entries // slots.shape[1], (0, pad))
-        topk = dispatch_output.topk_output
-        compact = dispatch_output._replace(
-            hidden_states=hidden_states[tokens],
-            topk_output=topk._replace(
-                topk_ids=F.pad(slots.flatten()[entries], (0, pad)).unsqueeze(1),
-                topk_weights=F.pad(
-                    topk.topk_weights.flatten()[entries], (0, pad)
-                ).unsqueeze(1),
-                router_logits=(
-                    None if topk.router_logits is None else topk.router_logits[tokens]
-                ),
-            ),
-        )
-        out = base_method.apply(layer=layer, dispatch_output=compact).hidden_states
-        merged.view(-1, merged.shape[-1])[entries] = out.view(-1, merged.shape[-1])[
-            :num
-        ]
-        return merged
+        raise NotImplementedError
 
     def finish(self, merged, hidden_states, routed_scaling_factor: float):
         """The layer output: the top-k sum of the merged entries."""
@@ -128,6 +95,43 @@ class TritonContract(RunnerContract):
 
 class MarlinContract(RunnerContract):
     # The Marlin MoE methods build a Marlin runner unconditionally, so there is nothing to check.
+
+    def run_wave(self, base_method, layer, dispatch_output, slots, merged):
+        # Only the wave's entries, compacted: the runner sees no masked rows.
+        hidden_states = dispatch_output.hidden_states
+        assert (
+            dispatch_output.hidden_states_scale is None
+            and dispatch_output.hidden_states_pre_quant is None
+        ), "Paged experts: compacted waves need unquantized MoE inputs"
+        if merged is None:
+            merged = hidden_states.new_zeros(*slots.shape, hidden_states.shape[-1])
+        entries = (slots >= 0).flatten().nonzero().squeeze(1)
+        num = entries.numel()
+        if num == 0:
+            return merged
+        # Padded to a few sizes per power of two, so the runner sees few distinct batch
+        # shapes; padding rows go to slot 0 with weight 0 and are dropped.
+        step = max(16, 1 << max(0, num.bit_length() - 4))
+        pad = -num % step
+        tokens = F.pad(entries // slots.shape[1], (0, pad))
+        topk = dispatch_output.topk_output
+        compact = dispatch_output._replace(
+            hidden_states=hidden_states[tokens],
+            topk_output=topk._replace(
+                topk_ids=F.pad(slots.flatten()[entries], (0, pad)).unsqueeze(1),
+                topk_weights=F.pad(
+                    topk.topk_weights.flatten()[entries], (0, pad)
+                ).unsqueeze(1),
+                router_logits=(
+                    None if topk.router_logits is None else topk.router_logits[tokens]
+                ),
+            ),
+        )
+        out = base_method.apply(layer=layer, dispatch_output=compact).hidden_states
+        merged.view(-1, merged.shape[-1])[entries] = out.view(-1, merged.shape[-1])[
+            :num
+        ]
+        return merged
 
     def _sum_top_k(self, entries, out, routed_scaling_factor: float) -> None:
         # The reduce fused_marlin_moe itself ends with.

@@ -2224,7 +2224,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--paged-experts-num-resident`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of routed experts per MoE layer kept resident on the GPU with `--enable-paged-experts`. Unset: the most that fit `--mem-fraction-static` next to the other weights and a KV reserve for `--max-running-requests` at full context.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of routed experts per MoE layer kept resident on the GPU. Required with `--enable-paged-experts`; at least the router's top-k.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
