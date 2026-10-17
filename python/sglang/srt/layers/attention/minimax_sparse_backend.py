@@ -35,6 +35,56 @@ if is_npu():
         topk_index_reduce,
     )
 
+
+def _index_topk_groups(
+    layer_ids: list[int], freq: int, pattern: tuple[str, ...]
+) -> tuple[dict[int, int], dict[int, bool], bool]:
+    """Decide which sparse layers share one top-k search.
+
+    pattern is a list of group sizes, such as ("2", "3"), ("3", "4"), or
+    ("4", "5"). The first layer in a group runs the search. The other layers
+    in that group reuse it. Any longer list works the same way. An empty
+    pattern uses a fixed group size of freq.
+    """
+    groups: dict[int, int] = {}
+    sources: dict[int, bool] = {}
+    if pattern:
+        sizes = []
+        for part in pattern:
+            try:
+                size = int(part)
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_MINIMAX_M3_INDEX_TOPK_PATTERN must be comma-separated "
+                    f"positive integers, got {pattern!r}"
+                ) from exc
+            if size < 1:
+                raise ValueError(
+                    "SGLANG_MINIMAX_M3_INDEX_TOPK_PATTERN entries must be >= 1, "
+                    f"got {size}"
+                )
+            sizes.append(size)
+        group = 0
+        offset = 0
+        pattern_index = 0
+        group_size = sizes[0]
+        for lid in layer_ids:
+            groups[lid] = group
+            sources[lid] = offset == 0
+            offset += 1
+            if offset == group_size:
+                group += 1
+                offset = 0
+                pattern_index = (pattern_index + 1) % len(sizes)
+                group_size = sizes[pattern_index]
+    else:
+        for ordinal, lid in enumerate(layer_ids):
+            groups[lid] = ordinal // freq
+            sources[lid] = (ordinal % freq) == 0
+    reuse = any(not is_source for is_source in sources.values())
+    return groups, sources, reuse
+
+
 # Adaptive block_size_q thresholds (cut K-cache traffic; affects only the serial loop).
 _BSQ_THRESHOLD_64 = 4096  # max_seqlen_k >= 4K  -> BSQ=64
 _BSQ_THRESHOLD_32 = 1024  # max_seqlen_k >= 1K  -> BSQ=32
@@ -307,15 +357,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
-        self.index_topk_freq = (
-            max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
-            if is_hip() and is_gfx95_supported() and not is_tbo_enabled()
-            else 1
-        )
-        self.index_cache_enabled = self.index_topk_freq > 1
+        if is_hip() and is_gfx95_supported() and not is_tbo_enabled():
+            self.index_topk_freq = max(
+                int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1
+            )
+            index_topk_pattern = envs.SGLANG_MINIMAX_M3_INDEX_TOPK_PATTERN.get()
+        else:
+            self.index_topk_freq = 1
+            index_topk_pattern = tuple()
+        self.index_topk_pattern = index_topk_pattern
         # topk_index_reduce widens the last dim to idx_group_size * topk_blocks
         # (union of the group's selections), so the shared decode buffer must be
         # that wide. Head split mirrors MiniMaxM3 sparse attention's.
+        (
+            self._topk_group_of_layer,
+            self._topk_is_source,
+            self.index_cache_enabled,
+        ) = _index_topk_groups(
+            [
+                lid
+                for lid in self.sparse_layer_ids
+                if lid in self.disable_value_layer_ids
+            ],
+            self.index_topk_freq,
+            self.index_topk_pattern,
+        )
         self._idx_group_size = 1
         if self.index_cache_enabled:
             _num_idx_heads = max(
@@ -328,14 +394,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # outside CUDA-graph capture; the captured graph only copies into and reads
         # from a fixed address.
         self._decode_topk_buf: dict = {}
-        self._topk_group_of_layer: dict[int, int] = {}
-        self._topk_is_source: dict[int, bool] = {}
-        for ordinal, lid in enumerate(
-            lid for lid in self.sparse_layer_ids if lid in self.disable_value_layer_ids
-        ):
-            group = ordinal // self.index_topk_freq
-            self._topk_group_of_layer[lid] = group
-            self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
         self._topk_cache: dict = {}
         self._topk_cache_owner: Optional[ForwardBatch] = None
 
@@ -350,6 +408,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
             f"index_topk_freq={self.index_topk_freq}, "
+            f"index_topk_pattern={','.join(self.index_topk_pattern) or '-'}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
