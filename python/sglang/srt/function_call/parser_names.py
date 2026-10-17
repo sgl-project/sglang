@@ -26,6 +26,7 @@ TOOL_CALL_PARSER_NAMES = [
     "lfm2",
     "ling3",
     "llama3",
+    "llm-jp-harmony",
     "mimo",
     "minicpm5",
     "mistral",
