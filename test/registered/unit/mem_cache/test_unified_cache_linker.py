@@ -199,6 +199,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
 
     def __init__(self, stored_keys=None):
         self.layer_done_counter = object()
+        self.pools = dict.fromkeys(PoolName)
         self.stored_keys = defaultdict(set) if stored_keys is None else stored_keys
         self.lookup_calls = []
         self.offload_calls = []
