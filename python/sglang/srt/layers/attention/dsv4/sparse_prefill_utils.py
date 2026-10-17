@@ -337,6 +337,9 @@ class SparsePrefillChunkCache:
     # Compressed caches keyed by compress ratio: c128 (every block, combined once
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
+    # Per-layer scratch only: combine overwrites all entries before attention.
+    # c0/c128 are cached across layers and must retain separate storage.
+    low_ratio_combined: dict = field(default_factory=dict)
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
     # Host lengths avoid a device synchronization when sizing ragged gathers.
@@ -602,6 +605,11 @@ class SparsePrefillChunkCache:
         """
         gather = self.compressed[compress_ratio]
         topk = sparse_raw_indices.shape[-1]
+        width = combined_topk_width(topk, self.swa_window_size)
+        if compress_ratio in (1, 2) and width in self.low_ratio_combined:
+            gather.combined_indices, gather.combined_lens = self.low_ratio_combined[
+                width
+            ]
         if gather.combined_indices is None:
             device = self.seq_lens.device
             gather.combined_indices = torch.full(
@@ -612,6 +620,11 @@ class SparsePrefillChunkCache:
             )
             gather.combined_lens = torch.zeros(
                 self.num_qo_tokens, dtype=torch.int32, device=device
+            )
+        if compress_ratio in (1, 2):
+            self.low_ratio_combined[width] = (
+                gather.combined_indices,
+                gather.combined_lens,
             )
         return combine_topk_swa_indices(
             topk_indices=sparse_raw_indices,
