@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import enter_override, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -486,6 +486,69 @@ class ServingCompletionTestCase(unittest.TestCase):
                 self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
                 for choice in choices[1:]:
                     self.assertNotIn("prompt_token_ids", choice)
+
+    def _collect_continuous_usage(self, cached_tokens, enable_cache_report):
+        async def _mock_generate(*args, **kwargs):
+            yield {
+                "text": "response",
+                "meta_info": {
+                    "id": "cmpl-continuous-usage",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": cached_tokens,
+                    "finish_reason": {"type": "stop", "matched": None},
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+        enter_override(
+            self,
+            get_context().override_server_args(
+                enable_cache_report=enable_cache_report,
+                stream_response_default_include_usage=False,
+                incremental_streaming_output=False,
+            ),
+        )
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            stream=True,
+            stream_options={"continuous_usage_stats": True},
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def _collect():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        return [
+            json.loads(chunk[len("data: ") :])["usage"]
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+
+    def test_continuous_usage_cache_reporting_for_text_requests(self):
+        for enable_cache_report, cached_tokens, expected in (
+            (False, 0, None),
+            (False, 7, None),
+            (True, 0, {"cached_tokens": 0}),
+            (True, 7, {"cached_tokens": 7}),
+        ):
+            with self.subTest(
+                enable_cache_report=enable_cache_report,
+                cached_tokens=cached_tokens,
+            ):
+                usages = self._collect_continuous_usage(
+                    cached_tokens, enable_cache_report
+                )
+                self.assertEqual(len(usages), 1)
+                self.assertEqual(usages[0]["prompt_tokens_details"], expected)
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""
