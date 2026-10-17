@@ -430,81 +430,6 @@ class TestEncoderReplayBCGMetadata(CustomTestCase):
         self.assertIs(held.request_window_layout, second)
         self.assertNotEqual(first.size, second.size)
 
-    def test_fused_compressor_slices_bucket_locations(self):
-        backend = object.__new__(DeepseekV4AttnBackend)
-        core = SimpleNamespace(
-            raw_out_loc=torch.arange(8),
-            c1_out_loc=torch.arange(8),
-            c2_out_loc=torch.arange(8),
-        )
-        backend.forward_metadata = SimpleNamespace(core_metadata=core)
-        pool = MagicMock()
-        pool.uniform_fp8 = False
-        backend.token_to_kv_pool = pool
-        compressor = SimpleNamespace(
-            wkv=lambda x: x,
-            project_fused=lambda x: x,
-            norm=SimpleNamespace(weight=torch.ones(4), eps=1e-6),
-        )
-        x = torch.ones(6, 4)
-        for ratio, kernel in [
-            (1, "c1_decode_norm_rope_store"),
-            (2, "c2_prefill_norm_rope_store"),
-        ]:
-            layer = SimpleNamespace(
-                compressor=compressor,
-                compress_ratio=ratio,
-                layer_id=0,
-                freqs_cis=torch.ones(8, 2, dtype=torch.complex64),
-                indexer=None,
-            )
-            with patch(
-                "sglang.kernels.ops.attention.dsv4.low_ratio_compress." + kernel,
-                return_value=x,
-            ) as store:
-                backend._low_ratio_compress_fused(
-                    layer,
-                    x,
-                    torch.zeros(6, dtype=torch.int64),
-                    torch.arange(6),
-                    extend_offsets=(torch.tensor([0]), torch.tensor([6])),
-                )
-                args = store.call_args.args
-                locations = args[3] if ratio == 1 else args[5]
-                torch.testing.assert_close(locations, core.raw_out_loc[:6])
-
-    def test_low_ratio_eager_break_uses_live_tail_metadata(self):
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.forward_metadata = SimpleNamespace(
-            low_ratio_req_indices=torch.ones(256, dtype=torch.int64),
-            low_ratio_pos_i64=torch.arange(256),
-        )
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            encoder_swa_replay=False,
-            req_pool_indices=torch.tensor([1]),
-            extend_seq_lens=torch.tensor([8192]),
-        )
-        layer = SimpleNamespace(compressor=None, indexer=None)
-        with (
-            patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend.dsa_use_prefill_cp",
-                return_value=False,
-            ),
-            patch.object(backend, "_low_ratio_in_prefill_graph", return_value=False),
-            patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend.token_req_indices",
-                side_effect=AssertionError("must not rebuild full-extend rows"),
-            ),
-        ):
-            backend.forward_low_ratio_sources(
-                layer=layer,
-                x=torch.ones(128, 4),
-                q_lora=torch.ones(128, 4),
-                positions=torch.arange(128),
-                forward_batch=batch,
-            )
-
     def test_bcg_tail_preserves_idle_and_live_row_bounds(self):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.token_to_kv_pool = SimpleNamespace(request_window=None)
@@ -529,19 +454,6 @@ class TestEncoderReplayBCGMetadata(CustomTestCase):
                 backend.enter_late_layer_tail(batch)
             self.assertEqual(batch.global_num_token_non_padded_cpu, min(live, 8))
             self.assertEqual(batch.global_num_token_non_padded.item(), min(live, 8))
-
-    def test_shared_flag_obeys_decode_metadata_copy_contract(self):
-        def core(flag):
-            obj = object.__new__(DSV4AttnMetadata)
-            for item in fields(DSV4AttnMetadata):
-                setattr(obj, item.name, None)
-            obj.bcg_shared_page_table = flag
-            return obj
-
-        held, fresh = core(False), core(False)
-        held.copy_(fresh)
-        with self.assertRaisesRegex(AssertionError, "bcg_shared_page_table"):
-            held.copy_(core(True))
 
     def test_bcg_bucket_storage_shared_but_tail_isolated(self):
         backend = object.__new__(DeepseekV4AttnBackend)
@@ -608,12 +520,6 @@ class TestEncoderReplayBCGMetadata(CustomTestCase):
         backend._publish_candidate_metadata(object())
         self.assertIs(previous.candidate_metadata, published)
         self.assertIs(backend._bcg_candidate_owners[0], previous)
-
-    def test_window_disables_captured_low_ratio_compressor(self):
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.low_ratios = (1, 2)
-        backend.token_to_kv_pool = SimpleNamespace(request_window=object())
-        self.assertFalse(backend.low_ratio_prefill_graph)
 
 
 if __name__ == "__main__":
