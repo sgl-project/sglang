@@ -10,7 +10,7 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import spec as spe
 _MARKER = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
 
 
-def _load(monkeypatch, spec, h3_markers=None):
+def _load(monkeypatch, spec, h3_markers=None, quantization=None, local_device="cpu"):
     """Run load_comfyui_transformer with a dummy spec; return the load kwargs."""
     seen = {}
 
@@ -37,7 +37,7 @@ def _load(monkeypatch, spec, h3_markers=None):
         "resolve_minimax_h3_checkpoint_quantization",
         lambda markers: ("quant-config", dict(markers)),
     )
-    monkeypatch.setattr(spec_mod, "get_local_torch_device", lambda: "cpu")
+    monkeypatch.setattr(spec_mod, "get_local_torch_device", lambda: local_device)
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils."
         "resolve_transformer_gguf_to_load",
@@ -45,7 +45,7 @@ def _load(monkeypatch, spec, h3_markers=None):
     )
     server_args = SimpleNamespace(
         model_paths={},
-        quantization=None,
+        quantization=quantization,
         nunchaku_config=None,
         hsdp_replicate_dim=1,
         hsdp_shard_dim=1,
@@ -101,3 +101,43 @@ def test_h3_spec_still_rejects_non_int8_markers(monkeypatch):
     )
     with pytest.raises(ValueError, match="INT8 ConvRot"):
         _load(monkeypatch, h3, h3_markers={"x": {"format": "nvfp4"}})
+
+
+@pytest.mark.parametrize("quantization", ["fp8", "convrot_int8"])
+def test_bf16_file_is_quantized_online(monkeypatch, quantization):
+    """A BF16 file with --quantization used to load with no quant config, so the
+    flag was silently ignored and the DiT stayed in BF16."""
+    hook_calls = []
+    quant_spec = SimpleNamespace(
+        quant_config="online-config",
+        param_dtype=None,
+        post_load_hooks=[hook_calls.append],
+        is_convrot_int8=quantization == "convrot_int8",
+        needs_device_weight_postprocess=True,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils."
+        "resolve_transformer_quant_load_spec",
+        lambda **kwargs: quant_spec,
+    )
+    seen = _load(
+        monkeypatch,
+        _spec(quant_markers=lambda paths: {}),
+        quantization=quantization,
+        local_device="gpu",
+    )
+    assert seen["init_params"]["quant_config"] == "online-config"
+    assert seen["param_dtype"] is None
+    assert len(hook_calls) == 1
+    # Online FP8 quantizes on the GPU; only ConvRot INT8 can start from host weights.
+    expected = "cpu" if quantization == "convrot_int8" else "gpu"
+    assert str(seen["weight_load_plan"].checkpoint_load_device) == expected
+
+
+def test_bf16_file_rejects_methods_that_need_serialized_weights(monkeypatch):
+    with pytest.raises(ValueError, match="pre-quantized"):
+        _load(
+            monkeypatch,
+            _spec(quant_markers=lambda paths: {}),
+            quantization="mxfp8",
+        )

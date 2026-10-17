@@ -55,7 +55,8 @@ _FIELDS = {
         "quantization",
         ["none", "fp8", "convrot_int8", "mxfp8"],
         "none",
-        "Online quantization; native model directories only.",
+        "Online quantization: native model directories, or a BF16 Qwen-Image 2.1 "
+        "file (convrot_int8).",
     ),
     "int8_gemm": _field(
         "quantization",

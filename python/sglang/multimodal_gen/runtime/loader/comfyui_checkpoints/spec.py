@@ -77,6 +77,9 @@ class ComfyUICheckpointSpec:
     checkpoint_key_filter: Callable[[str], bool] | None = None
 
 
+# Methods whose no-arg config quantizes BF16 weights after loading.
+_ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "convrot_int8"})
+
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
 _SPECS_DISCOVERED = False
 
@@ -189,6 +192,51 @@ def _load_comfyui_gguf_transformer(
         )
     finally:
         model_cls.param_names_mapping = original_mapping
+
+
+def _resolve_online_quant_spec(
+    *,
+    server_args: ServerArgs,
+    model_cls,
+    cls_name: str,
+    model_path: str,
+    dit_config,
+):
+    from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+        resolve_transformer_quant_load_spec,
+    )
+
+    if server_args.quantization not in _ONLINE_QUANTIZATIONS:
+        raise ValueError(
+            f"--quantization {server_args.quantization} needs a pre-quantized "
+            "checkpoint; a BF16 ComfyUI file can only be quantized online with "
+            f"one of {sorted(_ONLINE_QUANTIZATIONS)}"
+        )
+    return resolve_transformer_quant_load_spec(
+        hf_config={},
+        server_args=server_args,
+        safetensors_list=[model_path],
+        component_model_path=os.path.dirname(model_path) or ".",
+        model_cls=model_cls,
+        cls_name=cls_name,
+        component_name="transformer",
+        arch_config=dit_config.arch_config,
+    )
+
+
+def _online_quant_load_plan(*, server_args: ServerArgs, quant_spec) -> WeightLoadPlan:
+    starts_on_cpu = server_args.should_start_component_on_cpu("transformer")
+    # Matches the native loader: only ConvRot INT8 quantizes from host weights.
+    checkpoint_load_device = (
+        torch.device("cpu")
+        if starts_on_cpu and quant_spec.is_convrot_int8
+        else get_local_torch_device()
+    )
+    return WeightLoadPlan.for_component(
+        checkpoint_load_device=checkpoint_load_device,
+        needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+        component_starts_on_cpu=starts_on_cpu,
+    )
 
 
 def load_comfyui_transformer(
@@ -312,6 +360,23 @@ def load_comfyui_transformer(
                     adaln_curve_shape,
                 )
 
+        post_load_hooks = []
+        if quant_config is None and server_args.quantization is not None:
+            # A BF16 file has no markers; quantize it online like a native directory.
+            quant_spec = _resolve_online_quant_spec(
+                server_args=server_args,
+                model_cls=model_cls,
+                cls_name=spec.dit_cls_name,
+                model_path=model_path,
+                dit_config=dit_config,
+            )
+            quant_config = quant_spec.quant_config
+            param_dtype = quant_spec.param_dtype
+            post_load_hooks = quant_spec.post_load_hooks
+            weight_load_plan = _online_quant_load_plan(
+                server_args=server_args, quant_spec=quant_spec
+            )
+
         logger.info(
             "Loading %s from ComfyUI checkpoint %s, param_dtype: %s",
             spec.dit_cls_name,
@@ -349,6 +414,8 @@ def load_comfyui_transformer(
             )
         finally:
             model_cls.param_names_mapping = original_mapping
+        for post_load_hook in post_load_hooks:
+            post_load_hook(model)
 
     for param in model.parameters():
         param.requires_grad = False

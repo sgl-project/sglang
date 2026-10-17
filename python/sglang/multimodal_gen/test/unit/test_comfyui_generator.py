@@ -299,7 +299,7 @@ def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
         (
             "blocks.0.attn.to_q.weight",
             {"quantization": "convrot_int8"},
-            "native model directories",
+            "native model directory",
         ),
     ],
 )
