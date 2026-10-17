@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch, sentinel
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
+    _keep_mla_dspark_draft_off_trtllm_mha,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -162,6 +163,58 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
         )
         self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
         self.assertEqual(self._resolve("trtllm_mha", mla=True), "flashinfer")
+
+    def test_mla_dspark_draft_leaves_trtllm_mha(self):
+        """DSpark resolves its draft backend outside the DFLASH hook."""
+        for mla, expected in ((True, "flashinfer"), (False, None)):
+            args = _make_dflash_args(None)
+            config = SimpleNamespace(
+                num_hidden_layers=1,
+                dflash_config={"attention_mode": "mla" if mla else "gqa"},
+            )
+            with (
+                patch(
+                    f"{HOOK_MODULE}.attention_backends_of",
+                    return_value=("trtllm_mha", "trtllm_mha"),
+                ),
+                patch(
+                    "sglang.srt.utils.hf_transformers_utils.get_config",
+                    return_value=config,
+                ),
+            ):
+                _keep_mla_dspark_draft_off_trtllm_mha(args)
+            self.assertEqual(
+                resolution_result(args, "speculative_draft_attention_backend"),
+                expected,
+            )
+
+    def test_draft_workers_never_inherit_tokenspeed_mla(self):
+        """A DSpark draft inherits the target backend in its worker, where a GQA
+        draft must not pick up an MLA target's tokenspeed_mla."""
+        from sglang.srt.speculative import draft_worker_common as common
+
+        for named, expected in ((None, "flashinfer"), ("tokenspeed_mla",) * 2):
+            with (
+                patch.object(
+                    common,
+                    "get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_draft_attention_backend=named
+                    ),
+                ),
+                patch.object(
+                    common,
+                    "attention_backends",
+                    return_value=("tokenspeed_mla", "tokenspeed_mla"),
+                ),
+                patch.object(
+                    common, "get_platform", return_value=SimpleNamespace(is_xpu=False)
+                ),
+                patch.object(common.torch.version, "hip", None),
+            ):
+                self.assertEqual(
+                    common.resolve_draft_worker_attention_backend(), expected
+                )
 
 
 if __name__ == "__main__":
