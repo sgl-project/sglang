@@ -234,17 +234,13 @@ class TestKVCRStorage(CustomTestCase):
             self.backend.batch_get_v1(self.keys[:1], torch.arange(12, 14)), [False]
         )
 
-    def test_invalid_optional_settings_are_rejected_before_registration(self):
-        """Invalid deployment settings must not reach native registration."""
-        for name, values in (
-            ("startup_timeout_seconds", (0, -1, True, 1.5, "30000", None)),
-            ("min_hint_blocks", (-1, True, 1.5, "4", None)),
-        ):
-            for value in values:
-                with self.subTest(name=name, value=value):
-                    self.config.extra_config = {name: value}
-                    with self.assertRaisesRegex(ValueError, name):
-                        KVCRStore(self.config, self.pool)
+    def test_invalid_startup_budget_is_rejected_before_registration(self):
+        """An invalid optional deadline must not reach native registration."""
+        for budget in (0, -1, True, 1.5, "30000", None):
+            with self.subTest(budget=budget):
+                self.config.extra_config = {"startup_timeout_seconds": budget}
+                with self.assertRaisesRegex(ValueError, "startup_timeout_seconds"):
+                    KVCRStore(self.config, self.pool)
 
     def test_logical_anchor_queries_intersect_physical_all_page_pools(self):
         """A DSv4 logical anchor proves nothing without its physical sidecars."""
@@ -287,8 +283,8 @@ class TestKVCRStorage(CustomTestCase):
         """A startup error cannot leave wait_complete behind a dead IO thread.
 
         A quiescent failure may unwind mappings, but a nonquiescent failure
-        must retain them until process exit. Optional deployment settings must
-        reach KVCR without passing new fields to older constructors when disabled.
+        must retain them until process exit. The unset optional deadline must
+        also work with older KVCR configuration constructors.
         """
 
         class StartupError(RuntimeError):
@@ -296,20 +292,16 @@ class TestKVCRStorage(CustomTestCase):
 
         original_mmap = mmap.mmap
         for error_type in (RuntimeError, StartupError):
-            for budget, minimum in ((None, None), (180, 4), (None, 0)):
-                with self.subTest(
-                    error_type=error_type, budget=budget, minimum=minimum
-                ):
+            for budget in (None, 180):
+                with self.subTest(error_type=error_type, budget=budget):
                     self.config.extra_config = {"local_dram_bytes": 128}
                     if budget is not None:
                         self.config.extra_config["startup_timeout_seconds"] = budget
-                    if minimum is not None:
-                        self.config.extra_config["min_hint_blocks"] = minimum
                     backend = KVCRStore(self.config, self.pool)
                     captured, mappings = [], []
 
                     def construct(captured=captured, error_type=error_type, **kwargs):
-                        captured.append(kwargs)
+                        captured.append(vars(kwargs["config"]))
                         raise error_type("registration failed")
 
                     def allocate(*args, mappings=mappings, **kwargs):
@@ -325,7 +317,6 @@ class TestKVCRStorage(CustomTestCase):
                             KVCRBackendConfigs=SimpleNamespace,
                             KVCRConfig=SimpleNamespace,
                             LocalDramOptions=SimpleNamespace,
-                            RemoteFWDramOptions=SimpleNamespace,
                         ),
                         "kvcr.control_channels": SimpleNamespace(
                             ZmqPeerControlChannel=lambda **kwargs: SimpleNamespace(
@@ -364,17 +355,11 @@ class TestKVCRStorage(CustomTestCase):
                             [error_type is RuntimeError] * len(mappings),
                         )
                         if budget is None:
-                            self.assertNotIn(
-                                "startup_timeout_seconds", vars(captured[0]["config"])
-                            )
+                            self.assertNotIn("startup_timeout_seconds", captured[0])
                         else:
                             self.assertEqual(
-                                captured[0]["config"].startup_timeout_seconds, budget
+                                captured[0]["startup_timeout_seconds"], budget
                             )
-                        self.assertEqual(
-                            vars(captured[0]["backend_configs"].remote_fw_dram),
-                            {"min_hint_blocks": minimum} if minimum else {},
-                        )
                     finally:
                         for allocation in mappings:
                             allocation.close()
