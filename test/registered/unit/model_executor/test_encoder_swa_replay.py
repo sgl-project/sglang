@@ -495,5 +495,64 @@ class TestFoldMlpSync(CustomTestCase):
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
 
 
+class _PastEncoderReplayChecks(Exception):
+    """Validation read a field the encoder replay checks do not need."""
+
+
+class _View(SimpleNamespace):
+    def __getattr__(self, name):
+        raise _PastEncoderReplayChecks(name)
+
+
+class TestEncoderReplayDpStartupCheck(CustomTestCase):
+    """ROCm replays hits in a forward of their own, so it must refuse attention DP."""
+
+    def _validate(self, *, is_hip, attn_dp_size):
+        from sglang.srt.arg_groups import deepseek_v4_hook
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from sglang.srt.runtime_context import override_platform
+
+        view = _View(
+            dsv4_attn_backend="dsv4",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED)
+            ),
+            enable_encoder_swa_bounded_replay=True,
+            attn_cp_size=1,
+            attn_dp_size=attn_dp_size,
+            ep_join_mode=None,
+            enable_unified_cache_external_linker=False,
+            enable_unified_memory=False,
+            disaggregation_mode="null",
+            enable_mixed_chunk=False,
+            enable_lora=False,
+            enable_session_radix_cache=False,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        with (
+            override_platform(
+                is_cuda=not is_hip, is_hip=is_hip, is_npu=False, is_musa=False
+            ),
+            patch.object(deepseek_v4_hook, "is_gfx95_supported", return_value=True),
+            patch.object(deepseek_v4_hook, "resolving_view", return_value=view),
+            patch.object(
+                deepseek_v4_hook, "model_config_of", return_value=model_config
+            ),
+        ):
+            deepseek_v4_hook.validate_deepseek_v41_features(object())
+
+    def test_rocm_rejects_attention_dp(self):
+        with self.assertRaisesRegex(ValueError, "DP attention on ROCm"):
+            self._validate(is_hip=True, attn_dp_size=4)
+
+    def test_rocm_without_dp_and_cuda_with_dp_pass(self):
+        for is_hip, attn_dp_size in ((True, 1), (False, 4)):
+            with self.subTest(is_hip=is_hip, attn_dp_size=attn_dp_size):
+                with self.assertRaises(_PastEncoderReplayChecks):
+                    self._validate(is_hip=is_hip, attn_dp_size=attn_dp_size)
+
+
 if __name__ == "__main__":
     unittest.main()
