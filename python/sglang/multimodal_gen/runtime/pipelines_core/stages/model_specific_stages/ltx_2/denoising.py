@@ -1473,6 +1473,13 @@ class LTX2DenoisingStage(DenoisingStage):
         tokenizes prompts to a fixed max length, so every serving request
         shares the warmup signatures and no text bucketing is needed.
         """
+        # Dense LTX attention can be captured, so a request that switches its
+        # backend must not replay graphs recorded with the server default.
+        if (
+            self._attention_backend_active_override is not None
+            or self._skip_softmax_forced_fa
+        ):
+            return step.current_model(**model_kwargs)
         runner = self._maybe_get_bcg_runner(step.current_model)
         if runner is None:
             return step.current_model(**model_kwargs)
@@ -2134,8 +2141,8 @@ class LTX2DenoisingStage(DenoisingStage):
                                 model_kwargs_chunk["perturbation_configs"] = (
                                     split_perturbation_configs[index],
                                 )
-                            video_chunk, audio_chunk = step.current_model(
-                                **model_kwargs_chunk
+                            video_chunk, audio_chunk = self._ltx2_call_current_model(
+                                ctx, step, model_kwargs_chunk
                             )
                             batched_video_chunks.append(video_chunk)
                             batched_audio_chunks.append(audio_chunk)
@@ -2148,10 +2155,10 @@ class LTX2DenoisingStage(DenoisingStage):
                             execution_pass_specs, batch_size_local
                         )
                     )
+                    batched_model_kwargs["perturbation_configs"] = perturbation_configs
                     with self._ltx2_model_forward_context(ctx, step):
-                        batched_video, batched_audio = step.current_model(
-                            **batched_model_kwargs,
-                            perturbation_configs=perturbation_configs,
+                        batched_video, batched_audio = self._ltx2_call_current_model(
+                            ctx, step, batched_model_kwargs
                         )
 
                 batched_video = batched_video.float()
