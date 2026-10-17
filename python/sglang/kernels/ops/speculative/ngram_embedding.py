@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
+
+# XPU has no nvcc for the CUDA JIT path; the four kernels are ported to SYCL in
+# sgl-kernel-xpu and registered under torch.ops.sgl_kernel. Dispatch there when
+# the tensors live on XPU.
 
 
 @cache_once
@@ -62,6 +67,22 @@ def compute_n_gram_ids(
         n_gram_ids: output tensor for n-gram ids
         eos_token_id: tokens before an eos are excluded from the n-gram context
     """
+    if ne_weights.is_xpu:
+        torch.ops.sgl_kernel.compute_n_gram_ids(
+            ne_n,
+            ne_k,
+            ne_weights,
+            ne_mods,
+            exclusive_ne_embedder_size_sums,
+            tokens,
+            exclusive_req_len_sums,
+            ne_token_table,
+            row_indices,
+            column_starts,
+            n_gram_ids,
+            eos_token_id,
+        )
+        return
     module = _jit_ngram_embedding_module()
     module.compute_n_gram_ids(
         ne_n,
@@ -95,6 +116,20 @@ def compute_n_gram_ids_decode(
     """
     Compute n-gram IDs for decode, where each request contributes one token.
     """
+    if ne_weights.is_xpu:
+        torch.ops.sgl_kernel.compute_n_gram_ids_decode(
+            ne_n,
+            ne_k,
+            ne_weights,
+            ne_mods,
+            exclusive_ne_embedder_size_sums,
+            ne_token_table,
+            row_indices,
+            column_starts,
+            n_gram_ids,
+            eos_token_id,
+        )
+        return
     module = _jit_ngram_embedding_module()
     module.compute_n_gram_ids_decode(
         ne_n,
@@ -130,10 +165,20 @@ def update_token_table(
         req_lens: request lengths
         ignore_tokens: tokens to be ignored (marked as negative in table)
     """
-    module = _jit_ngram_embedding_module()
     if ignore_tokens is None:
         # Create an empty tensor for ignore_tokens
         ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
+    if tokens.is_xpu:
+        torch.ops.sgl_kernel.update_token_table(
+            tokens,
+            ne_token_table,
+            row_indices,
+            column_starts,
+            req_lens,
+            ignore_tokens,
+        )
+        return
+    module = _jit_ngram_embedding_module()
     module.update_token_table(
         tokens,
         ne_token_table,
@@ -156,6 +201,14 @@ def update_token_table_decode(
 
     This is the decode-only fast path for req_lens == 1 and no ignored tokens.
     """
+    if tokens.is_xpu:
+        torch.ops.sgl_kernel.update_token_table_decode(
+            tokens,
+            ne_token_table,
+            row_indices,
+            column_starts,
+        )
+        return
     module = _jit_ngram_embedding_module()
     module.update_token_table_decode(
         tokens,
