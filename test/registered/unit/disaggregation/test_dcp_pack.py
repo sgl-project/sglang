@@ -202,6 +202,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             gpu_id=0,
             state_types=[StateType.MAMBA],
         )
+        mgr.state_item_lens_sums = [0]
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
         mgr.transfer_queues = [None]
