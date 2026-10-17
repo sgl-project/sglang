@@ -1,7 +1,6 @@
 import json
 import logging
-import re
-from typing import List
+from typing import List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -14,6 +13,56 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
+
+
+_CALL_BEGIN = "<｜tool▁call▁begin｜>"
+_CALL_END = "<｜tool▁call▁end｜>"
+_SEP = "<｜tool▁sep｜>"
+
+
+# The helpers below are linear equivalents of re.search over the regexes they
+# name; those backtrack over every begin/sep token when the end never arrives.
+def _iter_call_blocks(text: str):
+    # `begin.*?end` spans, as (start, end).
+    start = text.find(_CALL_BEGIN)
+    while start != -1:
+        end = text.find(_CALL_END, start + len(_CALL_BEGIN))
+        if end == -1:
+            return
+        end += len(_CALL_END)
+        yield start, end
+        start = text.find(_CALL_BEGIN, end)
+
+
+def _search_complete_call(text: str) -> Optional[Tuple[str, str]]:
+    # `begin(.*)sep(.*)end` -> (name, args).
+    start = text.find(_CALL_BEGIN)
+    end = text.rfind(_CALL_END)
+    if start == -1 or end == -1:
+        return None
+    sep = text.rfind(_SEP, start + len(_CALL_BEGIN), end)
+    if sep == -1:
+        return None
+    return text[start + len(_CALL_BEGIN) : sep], text[sep + len(_SEP) : end]
+
+
+def _search_partial_call(text: str) -> Optional[Tuple[str, str, str, int]]:
+    # `begin(.*)sep(.*?)(end|$)` -> (name, args, end token or "", match end).
+    start = text.find(_CALL_BEGIN)
+    if start == -1:
+        return None
+    sep = text.rfind(_SEP, start + len(_CALL_BEGIN))
+    if sep == -1:
+        return None
+    name, args_start = text[start + len(_CALL_BEGIN) : sep], sep + len(_SEP)
+    end = text.find(_CALL_END, args_start)
+    if end != -1:
+        return name, text[args_start:end], _CALL_END, end + len(_CALL_END)
+    # `$` also matches just before a trailing newline.
+    stop = (
+        len(text) - 1 if text.endswith("\n") and len(text) > args_start else len(text)
+    )
+    return name, text[args_start:stop], "", stop
 
 
 class DeepSeekV31Detector(BaseFormatDetector):
@@ -46,10 +95,6 @@ class DeepSeekV31Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜tool▁calls▁begin｜>"
         self.eot_token = "<｜tool▁calls▁end｜>"
-        self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = (
-            r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)<｜tool▁call▁end｜>"
-        )
         self._last_arguments = ""
         self.current_tool_id = -1
 
@@ -69,14 +114,14 @@ class DeepSeekV31Detector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        match_result_list = [text[s:e] for s, e in _iter_call_blocks(text)]
         calls = []
         try:
             for match_result in match_result_list:
                 # Get function name
-                func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
-                func_name = func_detail.group(1)
-                func_args = func_detail.group(2)
+                func_detail = _search_complete_call(match_result)
+                func_name = func_detail[0]
+                func_args = func_detail[1]
                 func_args = json.loads(func_args)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": func_args}
@@ -113,15 +158,11 @@ class DeepSeekV31Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
-                string=current_text,
-                flags=re.DOTALL,
-            )
+            partial_match = _search_partial_call(current_text)
             if partial_match:
-                func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
-                is_tool_end = partial_match.group(3)
+                func_name = partial_match[0].strip()
+                func_args_raw = partial_match[1].strip()
+                is_tool_end = partial_match[2]
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -182,7 +223,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         # Find the end of the current tool call and remove only that part from buffer
                         if is_tool_end:
                             # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[partial_match.end(3) :]
+                            self._buffer = current_text[partial_match[3] :]
                         else:
                             self._buffer = ""
 

@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -15,6 +16,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
@@ -1561,6 +1563,38 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         params2 = json.loads(tool_calls_parameters[1])
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
+
+
+class TestDeepSeekV31Detector(unittest.TestCase):
+    def test_unclosed_tool_call_tags_parse_in_linear_time(self):
+        """Repeated call-begin tokens without a closing one must not stall the
+        parser (it runs on the event loop); a complete call still parses."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            ),
+        ]
+        begin = "<｜tool▁call▁begin｜>"
+        complete = (
+            "<｜tool▁calls▁begin｜>" + begin + "get_weather<｜tool▁sep｜>"
+            '{"city": "Paris"}<｜tool▁call▁end｜>'
+        )
+
+        start = time.perf_counter()
+        result = DeepSeekV31Detector().detect_and_parse(complete + begin * 8000, tools)
+        DeepSeekV31Detector().parse_streaming_increment(begin * 8000, tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Paris"})
 
 
 class TestDeepSeekV32Detector(unittest.TestCase):
