@@ -716,6 +716,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
             kv_item_lens=[self.SRC_KV_ITEM_LEN, self.SRC_KV_ITEM_LEN],
             kv_data_ptrs=list(self.SRC_PTRS),
             kv_data_lens=[self.REGION_LEN, self.REGION_LEN],
+            kv_layer_ids=[],
         )
         return mgr
 
@@ -726,6 +727,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
             decode_tp_rank=decode_tp_rank,
             dst_kv_item_len=self.DST_KV_ITEM_LEN,
             dst_kv_ptrs=[0x30000, 0x40000],
+            dst_kv_layer_ids=[],
             dst_num_slots=self.NUM_SLOTS,
             gpu_id=0,
         )
