@@ -60,7 +60,6 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
-    is_glm_moe_dsa,
 )
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
@@ -511,18 +510,11 @@ class MoEGate(nn.Module):
             )
         )
         if config.topk_method == "noaux_tc" and not is_hash_moe:
-            correction_bias_dtype = torch.float32
-            # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
-            # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not is_glm_moe_dsa(config):
-                if _use_aiter and quant_config.get_name() in (
-                    "fp8",
-                    "compressed_tensors",
-                    "quark",
-                ):
-                    correction_bias_dtype = torch.bfloat16
+            # Always fp32: checkpoints store this in fp32, and every router-gemm
+            # branch (CUDA and aiter) now returns fp32 logits, so a bf16 copy here
+            # only loses precision without unblocking any downstream dtype match.
             correction_bias = torch.empty(
-                (config.n_routed_experts), dtype=correction_bias_dtype
+                (config.n_routed_experts), dtype=torch.float32
             )
             if quant_config is not None and quant_config.get_name() == "expert_pack":
                 correction_bias.zero_()
