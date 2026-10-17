@@ -38,6 +38,13 @@ class SanaVideo2PipelineConfig(SanaVideoPipelineConfig):
     def supports_sequential_multi_output_inference(self):
         return True
 
+    def validate_server_args(self, server_args):
+        if server_args.enable_breakable_cuda_graph:
+            server_args.require_component_resident(
+                "transformer", feature_name="SANA-Video 2.0 breakable CUDA graphs"
+            )
+        super().validate_server_args(server_args)
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         mean = vae.latents_mean.to(device=device, dtype=dtype).view(1, -1, 1, 1, 1)
         std = vae.latents_std.to(device=device, dtype=dtype).view(1, -1, 1, 1, 1)
