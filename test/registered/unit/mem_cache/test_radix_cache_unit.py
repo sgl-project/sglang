@@ -27,6 +27,7 @@ import random
 import unittest
 import unittest.mock
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -863,6 +864,52 @@ class TestRadixCache(CustomTestCase):
             )
         first, branch = [e for e in cache.take_events() if isinstance(e, BlockStored)]
         self.assertEqual(branch.parent_block_hash, first.block_hashes[0])
+
+    def test_base_request_with_empty_lora_path_keeps_base_hashes(self):
+        """lora_path="" resolves to no adapter; it must not namespace the
+        base-model blocks published after it."""
+        published = []
+        for register_empty in (False, True):
+            cache = RadixCache.create_simulated(
+                page_size=2, enable_kv_cache_events=True
+            )
+            if register_empty:
+                base_req = SimpleNamespace(extra_key=None, lora_id=None)
+                cache.kv_events.lora_names.register(base_req, "")
+            cache.insert(InsertParams(key=RadixKey(array("q", [1, 2, 3, 4]))))
+            published.append(
+                [
+                    (event.lora_name, tuple(event.block_hashes))
+                    for event in cache.take_events()
+                    if isinstance(event, BlockStored)
+                ]
+            )
+        self.assertEqual(published[0], published[1])
+
+    def test_loaded_adapter_id_does_not_namespace_a_base_request(self):
+        """A base request's user extra_key cannot borrow a loaded adapter's hashes."""
+        extra_key = "0123456789abcdef0123456789abcdef"
+        published = []
+        for namespace in (None, extra_key):
+            cache = RadixCache.create_simulated(
+                page_size=2, enable_kv_cache_events=True
+            )
+            cache.kv_events.lora_names.register(
+                lora_id=extra_key, lora_name="adapter-a"
+            )
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [1, 2, 3, 4]), extra_key=namespace)
+                )
+            )
+            published.append(
+                [
+                    (event.lora_name, tuple(event.block_hashes))
+                    for event in cache.take_events()
+                    if isinstance(event, BlockStored)
+                ]
+            )
+        self.assertEqual(published[0], published[1])
 
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
