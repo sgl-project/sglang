@@ -42,6 +42,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildPageTablePositions,
     ExpandPrefillCausally,
     late_layer_tail_layout,
+    late_layer_tail_lens,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
@@ -107,7 +108,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -129,6 +135,7 @@ if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -943,6 +950,41 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _late_layer_whole_extend(
+    *,
+    extend_lens: List[int],
+    logprob_start_lens: Optional[List[int]],
+    full_hidden_states: bool,
+) -> Optional[List[bool]]:
+    """Requests that run their whole extend with plain windows under decoder SWA
+    bounded replay: those that read prompt rows (prompt logprobs, or every hidden
+    state outside DSpark, whose draft reads tail rows only). None when no request
+    in the batch does."""
+    if full_hidden_states:
+        return [True] * len(extend_lens)
+    if logprob_start_lens is None:
+        return None
+    whole = [start < n for start, n in zip(logprob_start_lens, extend_lens)]
+    return whole if any(whole) else None
+
+
+def late_layer_whole_extend(
+    forward_batch: ForwardBatch, *, dspark: bool
+) -> Optional[List[bool]]:
+    """`_late_layer_whole_extend` of a forward batch. dspark comes from the server:
+    a capture batch carries DSpark's FULL capture mode without its spec_algorithm."""
+    return _late_layer_whole_extend(
+        extend_lens=forward_batch.extend_seq_lens_cpu,
+        logprob_start_lens=(
+            forward_batch.extend_logprob_start_lens_cpu
+            if forward_batch.return_logprob
+            else None
+        ),
+        full_hidden_states=forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+        and not dspark,
+    )
+
+
 def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
     if t.shape[0] == num_rows:
@@ -1573,11 +1615,44 @@ class DeepseekV4AttnBackend(
             return False
         if self.enable_decoder_swa_bounded_replay:
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-            if extend_lens_cpu is not None:
-                tail_rows = sum(min(SWA_WINDOW, int(n)) for n in extend_lens_cpu)
-                if tail_rows > self._prefill_graph_tail_capacity():
-                    return False
+            if extend_lens_cpu is not None and not self._prefill_graph_fits_late_tail(
+                extend_lens_cpu,
+                late_layer_whole_extend(
+                    forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+                ),
+            ):
+                return False
         return True
+
+    def vote_prefill_cuda_graph(self, batch: ScheduleBatch) -> bool:
+        """`can_run_prefill_cuda_graph`'s late-layer tail check judged from the
+        schedule batch, for the DP prefill-graph vote: no rank replays the graph
+        while another runs the step eagerly."""
+        if not self.enable_decoder_swa_bounded_replay:
+            return True
+        full_hidden_states = (
+            get_server_return_hidden_states_mode() == CaptureHiddenMode.FULL
+            or any(
+                req.return_hidden_states_mode == CaptureHiddenMode.FULL
+                for req in batch.reqs
+            )
+        ) and not self.model_runner.spec_algorithm.is_dspark()
+        whole_extend = _late_layer_whole_extend(
+            extend_lens=batch.extend_lens,
+            logprob_start_lens=(
+                batch.extend_logprob_start_lens if batch.return_logprob else None
+            ),
+            full_hidden_states=full_hidden_states,
+        )
+        return self._prefill_graph_fits_late_tail(batch.extend_lens, whole_extend)
+
+    def _prefill_graph_fits_late_tail(
+        self, extend_lens: List[int], whole_extend: Optional[List[bool]]
+    ) -> bool:
+        tail_lens = late_layer_tail_lens(
+            [int(n) for n in extend_lens], SWA_WINDOW, whole_extend
+        )
+        return sum(tail_lens) <= self._prefill_graph_tail_capacity()
 
     def _prefill_graph_tail_capacity(self) -> int:
         """Rows the late layers run over inside the prefill CUDA graph: every
@@ -1634,6 +1709,9 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu.tolist(),
             tail_len=SWA_WINDOW,
             device=device,
+            whole_extend=late_layer_whole_extend(
+                forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+            ),
         )
         if self.encoder_row_floor is not None:
             # Folded hits: a tail row never reads below its request's replay start.

@@ -411,6 +411,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         (get_platform().is_cuda or get_platform().is_hip)
         and cfg.disaggregation_mode == "null"
         and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
+        # Returning every hidden state runs every prompt row: nothing to trim.
+        and not cfg.enable_return_hidden_states
         and not any(enabled for _, enabled in incompatible)
     )
     declare_resolution(

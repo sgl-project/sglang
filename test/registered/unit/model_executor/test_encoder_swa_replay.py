@@ -25,8 +25,13 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     drop_folded_rows,
     folded_replay_rows,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -120,6 +125,7 @@ def _backend(fx):
     backend.low_ratios = ()
     backend.has_c4 = backend.has_c128 = False
     backend.trtllm_attn = False
+    backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
     backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
     backend.token_to_kv_pool = SimpleNamespace(
         request_window=SimpleNamespace(capacity=2 * SWA_WINDOW)
@@ -198,6 +204,8 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             req_pool_indices=fb.req_pool_indices,
             out_cache_loc=fb.out_cache_loc,
             positions=fx.folded_positions(),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=False,
         )
         with (
             patch.object(DSV4AttnMetadata, "init_compression_metadata"),
