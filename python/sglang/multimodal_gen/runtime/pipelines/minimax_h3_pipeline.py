@@ -180,6 +180,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     if release_metadata is not None
                     else None
                 ),
+                sampling_preset=(
+                    release_metadata.sampling_preset
+                    if release_metadata is not None
+                    else None
+                ),
             )
         )
         self.add_stage(

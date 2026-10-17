@@ -874,6 +874,35 @@ The nine sigma grid points give eight denoiser evaluations. These settings
 must match the fused heads; the server rejects a different step count or
 shift. Use `quality: "lossless"` in requests.
 
+### Opt-in SMD4 release sampling preset
+
+When packaging a native Ref2VA release with the matching four-step SMD student
+weights, retain the existing component entries in `model_index.json` and declare
+the sampling contract in its `_minimax_h3` block:
+
+```json
+{
+  "_minimax_h3": {
+    "schema_version": 1,
+    "partition": "ref2va",
+    "tasks": ["ref2va"],
+    "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+    "sampling_preset": "smd-ref2va-4step"
+  }
+}
+```
+
+You must supply the correct four-step student LoRA through the existing LoRA
+loading mechanism, preserving its rank, alpha, and scale, or supply matching
+merged student weights. This declaration does not detect, download, or apply a
+LoRA; do not enable it for base weights or a style adapter alone. Requests must
+use `task: "ref2va"`, `num_inference_steps: 4`, `flow_shift: 12.0`, and
+`audio_flow_shift: 3.0`. The preset builds five sigma boundaries with a final
+half-sized raw interval before the modality shifts; warmup takes a prefix of
+that grid. PDD heads and DMD schedules cannot be stacked with this preset.
+Existing LoRA loading and default H3 recipes are unchanged. GPU end-to-end and
+media-quality validation of this public preset are pending.
+
 ## 6. FastH3: 8-step distilled
 
 [FastVideo/FastVideo-FastH3-8-Step-V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2)
