@@ -268,9 +268,10 @@ class _DeepEPv2Impl:
     def prebuild_buffer(self) -> None:
         """Build the ElasticBuffer now instead of lazily on the first dispatch.
 
-        Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request
-        when decode CUDA-graph capture did not already build it. Needs only
-        host-known config already on this impl; key-cached so dispatch reuses it.
+        Avoids the ~2GB alloc + cross-rank NCCL barrier stalling the first request,
+        and must run before CUDA graph capture: the constructor is illegal inside
+        torch.cuda.graph(). Needs only host-known config already on this impl;
+        key-cached so dispatch reuses it.
         """
         self._get_buffer()
 

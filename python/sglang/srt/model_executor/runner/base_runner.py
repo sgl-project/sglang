@@ -256,6 +256,7 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_pcie_ipc_workspace()
+        self._pre_initialize_deepep_v2_elastic_buffer()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -335,6 +336,21 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_deepep_v2_elastic_buffer(self):
+        """Build the DeepEP v2 ElasticBuffer before graph capture.
+
+        Left to the first dispatch, the build lands inside the decode graph's
+        torch.cuda.graph(); ElasticBuffer's constructor reaches ncclDevCommCreate,
+        which allocates and syncs, so the capture is invalidated and NCCL reports
+        "GIN: DevComm setup failed on all available backends". The post-capture
+        prebuild in ModelRunner is then a cache hit.
+        """
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            prebuild_deepep_v2_buffer,
+        )
+
+        prebuild_deepep_v2_buffer(model=self.model_runner.model)
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.
