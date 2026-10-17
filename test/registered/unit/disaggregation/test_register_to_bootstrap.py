@@ -231,6 +231,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Decode pulls from every shard-group rank when this is set.
+            "enable_kv_cache_sharding",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
