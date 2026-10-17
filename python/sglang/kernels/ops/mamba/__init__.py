@@ -46,6 +46,16 @@ register_kernel(
         description="Causal conv1d update (sglang.kernels.jit).",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_fn",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.mamba.causal_conv1d_triton:"
+            "_CAUSAL_CONV1D_OP.forward_triton"
+        ),
+    )
+)
 
 
 def causal_conv1d_fwd(
@@ -103,7 +113,6 @@ __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
 for _mod, _fn in [
     ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
     ("triton_ops.mamba_ssm", "selective_state_update"),
-    ("causal_conv1d_triton", "causal_conv1d_fn"),
     ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
 ]:
     register_kernel(
