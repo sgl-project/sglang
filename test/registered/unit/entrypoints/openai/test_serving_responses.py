@@ -298,6 +298,71 @@ class InputMessageConstructionTestCase(CustomTestCase):
         self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
         self.assertEqual([m["content"] for m in messages], ["working", "answer"])
 
+    def test_replay_merges_codex_turn_with_missing_phases(self):
+        # Codex CLI replays one assistant turn as reasoning + commentary
+        # message + function_call; only the message carries a phase.
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [
+                        {"type": "reasoning_text", "text": "I should list the files."}
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [
+                        {"type": "output_text", "text": "Let me list the files."}
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": '{"cmd": "ls"}',
+                    "call_id": "call_1",
+                },
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual(len(messages), 1)
+        (msg,) = messages
+        self.assertEqual(msg["role"], "assistant")
+        self.assertEqual(msg["phase"], "commentary")
+        self.assertEqual(msg["reasoning_content"], "I should list the files.")
+        self.assertEqual(
+            msg["content"], [{"type": "text", "text": "Let me list the files."}]
+        )
+        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "exec_command")
+
+    def test_replay_keeps_final_answer_after_merged_commentary_run(self):
+        # A phase-less run that adopts "commentary" must still not absorb a
+        # following final_answer message.
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "plan"}],
+                },
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {"role": "assistant", "content": "answer", "phase": "final_answer"},
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
+        self.assertEqual(messages[0]["reasoning_content"], "plan")
+        self.assertEqual(messages[0]["content"], "working")
+        self.assertEqual(messages[1]["content"], "answer")
+
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
         request = ResponsesRequest(
