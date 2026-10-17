@@ -29,6 +29,7 @@ class FluxAdapter(ComfyUIModelAdapter):
     model_types = ("flux",)
     pipeline_class_name = "FluxPipeline"
     patch_size = 2
+    supports_native_batching = True
 
     def pack(
         self,
@@ -54,6 +55,17 @@ class FluxAdapter(ComfyUIModelAdapter):
                 "the workflow would silently drop the ControlNet and produce an "
                 "unconditioned text-to-image result."
             )
+        if (
+            torch.is_tensor(guidance)
+            and guidance.numel() > 1
+            and not bool((guidance == guidance.reshape(-1)[0]).all())
+        ):
+            # The worker takes one guidance value per request.
+            raise ValueError(
+                "native_batching cannot batch Flux rows with different guidance "
+                f"values ({guidance.reshape(-1).tolist()}); set native_batching "
+                "to off"
+            )
         if y is None:
             # Native ComfyUI Flux zero-fills a missing pooled vector.
             y = torch.zeros(
@@ -61,12 +73,13 @@ class FluxAdapter(ComfyUIModelAdapter):
             )
         packed, padded_height, padded_width = self._pack_latents(x)
         t5_seq = int(context.shape[-2]) if context.ndim >= 2 else int(context.shape[0])
-        clip_batch = int(y.shape[0])
+        rows = int(packed.shape[0])
         return PackedForward(
             latents=packed,
             timesteps=timestep * 1000.0,
             prompt_embeds=[y, context],
-            prompt_seq_lens=[[clip_batch], [t5_seq]],
+            # One length per row: a pooled CLIP vector and the T5 tokens.
+            prompt_seq_lens=[[1] * rows, [t5_seq] * rows],
             pooled_embeds=[y],
             height=padded_height * 8,
             width=padded_width * 8,

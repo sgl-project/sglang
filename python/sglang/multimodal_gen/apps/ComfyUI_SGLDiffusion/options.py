@@ -6,7 +6,13 @@ PLUGIN_KEYS, which core/generator.py pops before building ServerArgs. Checks tha
 need the resolved model live in core/preflight.py.
 """
 
-PLUGIN_KEYS = ("model_type", "cache_mode", "cache_dit_params", "int8_kernel")
+PLUGIN_KEYS = (
+    "model_type",
+    "cache_mode",
+    "cache_dit_params",
+    "int8_kernel",
+    "native_batching",
+)
 
 # Display names -> SGLang backend names; the rest are passed through unchanged.
 _ATTENTION_IDS = {
@@ -82,6 +88,12 @@ _FIELDS = {
         "execution", ["eager", "torch_compile", "cuda_graph"], "eager"
     ),
     "regional_compile": _field("execution", "BOOLEAN", False, "torch_compile only."),
+    "native_batching": _field(
+        "execution",
+        ["off", "cfg_only", "full"],
+        "off",
+        "Batch the sampler's rows in one worker call; verified models only.",
+    ),
     "memory_mode": _field(
         "memory",
         ["resident", "layerwise_offload"],
@@ -122,6 +134,8 @@ class SGLDOptions:
             "int8_kernel": _INT8_GEMMS[v["int8_gemm"]],
             "cache_mode": v["cache_mode"],
         }
+        if v["native_batching"] != "off":
+            options["native_batching"] = v["native_batching"]
         if v["model_type"] != "auto-detect":
             options["model_type"] = v["model_type"]
         if v["parallel_mode"] == "manual":

@@ -11,6 +11,7 @@ import sys
 
 import torch
 
+from ..executors.base import NATIVE_BATCHING_MODES
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import (
     FastH3Executor,
@@ -144,6 +145,29 @@ def _h3_detect_companion(gguf_ref: str) -> str:
         f"(looked for {prefer}). Keep --model-path / unet_name on the "
         "BF16 file and pass the GGUF via transformer_weights_path."
     )
+
+
+def _check_native_batching(mode: str, adapter, sgld_options: dict) -> None:
+    """Allow native batching only where it was checked against the per-row path."""
+    if mode not in NATIVE_BATCHING_MODES:
+        raise ValueError(
+            f"native_batching must be one of {list(NATIVE_BATCHING_MODES)}, got {mode!r}"
+        )
+    if mode == "off":
+        return
+    if not adapter.supports_native_batching:
+        verified = sorted(
+            model_type
+            for cls in _EXECUTOR_CLASSES
+            if cls.adapter_cls.supports_native_batching
+            for model_type in cls.adapter_cls.model_types
+        )
+        raise ValueError(
+            f"native_batching is only verified for model types {verified}; "
+            f"turn it off for {adapter.model_types[0]!r}"
+        )
+    if (sgld_options.get("num_gpus") or 1) > 1:
+        raise ValueError("native_batching is only verified on one GPU (num_gpus=1)")
 
 
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
@@ -576,6 +600,7 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
+        native_batching = plugin.get("native_batching", "off")
         set_model_type = plugin.get("model_type")
         if set_model_type in NATIVE_MODEL_TYPES:
             raise ValueError(
@@ -610,7 +635,9 @@ class SGLDiffusionGenerator:
             check_model_options(
                 self.model_type, {**sgld_options, **plugin}, native_dir=native_dir
             )
+            _check_native_batching(native_batching, self.executor.adapter, sgld_options)
             _apply_cache_mode(self.executor, plugin)
+            self.executor.native_batching = native_batching
             return self._patcher
 
         comfyui_model, model_config, model_type = self.get_comfyui_model(
@@ -628,6 +655,11 @@ class SGLDiffusionGenerator:
             load_fasth3_release(runtime_model_path)
         if model_type == "minimax_h3":
             _check_h3_single_file(detect_path, sgld_options)
+
+        executor_class = self.executor_class_dict[model_type]
+        _check_native_batching(
+            native_batching, executor_class.adapter_cls, sgld_options
+        )
 
         # Checks above run first so a rejected config keeps the current worker.
         self.close_generator()
@@ -649,11 +681,11 @@ class SGLDiffusionGenerator:
             )
         self.model_type = model_type
 
-        executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, worker_model_path, comfyui_model, model_config
         )
         _apply_cache_mode(self.executor, plugin)
+        self.executor.native_batching = native_batching
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor
