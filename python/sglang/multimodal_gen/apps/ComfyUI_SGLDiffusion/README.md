@@ -34,9 +34,12 @@ Connect to a standalone SGLang Diffusion server.
 2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect (default: `http://localhost:3000/v1`).
 3. **Generate Content**:
    - `SGLDiffusion Generate Image`: For text-to-image and image editing. Set `num_images` (1 to 10) to get several images from one request as one `IMAGE` batch, in order. Image `i` uses `seed + i`, so the same settings and seed reproduce the same batch; a seed of `-1` lets the server pick a random seed.
-   - `SGLDiffusion Generate Video`: For text-to-video and image-to-video.
+   - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO` to restyle or extend a clip).
+   - `SGLDiffusion Generate Audio-Video`: One node for any model that muxes audio into its MP4 (MiniMax-H3, LTX-2, MOVA, Kandinsky-6). Returns `VIDEO` plus the soundtrack as `AUDIO` for ComfyUI's audio nodes; model-specific request fields go in `extra_request_json`. Needs PyAV, which ComfyUI already ships. There is no `AUDIO` input yet because `/v1/videos` has no audio-conditioning field.
+   - `SGLDiffusion Checkpoint Sweep`: Renders one prompt and seed across training checkpoints (e.g. `checkpoint-{step}` for steps 500 to 5000) and tiles the results into a grid. Weights are swapped in place with `/update_weights_from_disk`, so no restart is needed, and the server's original weights are restored at the end. Each checkpoint directory must be readable by the server and laid out like the served model. Image models only.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
-4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
+4. **Prompt Enhancement**: Turn on `enhance_prompt` on the image, video, or audio-video node to have the server rewrite the prompt (the server must run with `--prompt-enhancer-config`). The rewrite comes out as the `revised_prompt` STRING, so you can show it, edit it, or feed it into another node.
+5. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` (now with `strength` and `merge_mode`) and `SGLDiffusion Server Unset LoRA`. `SGLDiffusion Server List LoRAs` shows what is loaded. `SGLDiffusion Server LoRA Stack` applies up to four LoRAs, each with its own strength, under one merge mode; its dropdowns list the adapters loaded on the server you last connected to (press `r` to refresh), and a path field loads one the server does not have yet. Stacking needs `merge_mode` merge or auto, because the server's dynamic mode takes one adapter per target.
 
 ### Mode 2: Integrated Mode (Tight Integration)
 ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only the DiT and

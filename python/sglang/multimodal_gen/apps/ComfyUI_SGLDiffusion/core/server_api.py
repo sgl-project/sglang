@@ -3,24 +3,75 @@ SGLang Diffusion Server API client.
 Provides a low-level interface for interacting with SGLang Diffusion HTTP server.
 """
 
+import contextlib
+import json
+import logging
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import requests
+
+logger = logging.getLogger(__name__)
+
+_LOG_VALUE_LIMIT = 200
+
+
+def _log_request(url: str, body: Dict[str, Any]) -> None:
+    """Log the endpoint and JSON body of a generation request, so it can be
+    copied into a script. The auth header is not logged; long values (base64
+    images, long paths) are shortened."""
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    shown = {
+        k: (
+            f"{v[:_LOG_VALUE_LIMIT]}...<{len(v)} chars>"
+            if isinstance(v, str) and len(v) > _LOG_VALUE_LIMIT
+            else v
+        )
+        for k, v in body.items()
+    }
+    logger.info("SGLDiffusion request: POST %s %s", url, json.dumps(shown, default=str))
+
+
+def _error_detail(error: requests.exceptions.RequestException) -> str:
+    """Append the server's `detail` to an HTTP error, e.g. why a request was a 400."""
+    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+        try:
+            body = error.response.json()
+        except ValueError:
+            body = None
+        detail = (
+            (body.get("detail") or body.get("message"))
+            if isinstance(body, dict)
+            else None
+        )
+        if detail:
+            return f"{error} ({detail})"
+    return str(error)
 
 
 class SGLDiffusionServerAPI:
     """Client for SGLang Diffusion HTTP server API."""
 
-    def __init__(self, base_url: str, api_key: str = "sk-proj-1234567890"):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "sk-proj-1234567890",
+        image_timeout: int = 300,
+    ):
         """
         Initialize the API client.
 
         Args:
             base_url: Base URL of the SGLang Diffusion server (e.g., "http://localhost:30010/v1")
             api_key: API key for authentication (default: "sk-proj-1234567890")
+            image_timeout: Seconds to wait for an image generate/edit request
+                before timing out. A large job (big size, or a first request
+                that triggers torch.compile/warmup) can need more than the
+                previous hardcoded 300s.
         """
+        self.image_timeout = image_timeout
         # Ensure base_url doesn't end with /v1 if it's already there
         if base_url.endswith("/v1"):
             self.base_url = base_url
@@ -60,6 +111,39 @@ class SGLDiffusionServerAPI:
         except (KeyError, IndexError) as e:
             raise RuntimeError(f"Unexpected response shape from /models: {str(e)}")
 
+    def get_model_path(self) -> str:
+        """Return the model path the server was launched with."""
+        try:
+            response = requests.get(
+                f"{self.base_url}/model_info", headers=self.headers, timeout=30
+            )
+            response.raise_for_status()
+            return response.json()["model_path"]
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to get model path: {_error_detail(e)}")
+
+    def update_weights_from_disk(
+        self, model_path: str, flush_cache: bool = True
+    ) -> Dict[str, Any]:
+        """Swap the served weights in place from `model_path`, without a restart."""
+        if not model_path:
+            raise ValueError("model_path cannot be empty")
+
+        try:
+            response = requests.post(
+                f"{self.base_url.removesuffix('/v1')}/update_weights_from_disk",
+                json={"model_path": model_path, "flush_cache": flush_cache},
+                headers=self.headers,
+                timeout=600,
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to update weights: {_error_detail(e)}")
+        result = response.json()
+        if not result.get("success"):
+            raise RuntimeError(f"Failed to update weights: {result.get('message')}")
+        return result
+
     def generate_image(
         self,
         prompt: str,
@@ -80,6 +164,7 @@ class SGLDiffusionServerAPI:
         background: Optional[str] = "auto",
         output_format: Optional[str] = None,
         generator_device: Optional[str] = "cuda",
+        enhance_prompt: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate or edit an image using SGLang Diffusion API.
@@ -105,6 +190,8 @@ class SGLDiffusionServerAPI:
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")
             generator_device: Device for random generator ("cuda" or "cpu")
+            enhance_prompt: Rewrite the prompt server-side; the rewrite comes
+                back as `revised_prompt` on each result
 
         Returns:
             Dictionary containing the API response with generated/edited image data
@@ -133,6 +220,7 @@ class SGLDiffusionServerAPI:
             background=background,
             output_format=output_format,
             generator_device=generator_device,
+            enhance_prompt=enhance_prompt,
         )
 
         # If image_path is provided, use edit endpoint
@@ -166,18 +254,19 @@ class SGLDiffusionServerAPI:
                 "Authorization": f"Bearer {self.api_key}",
             }
 
+            _log_request(f"{self.base_url}/images/edits", data)
             try:
                 response = requests.post(
                     f"{self.base_url}/images/edits",
                     files=files,
                     data=data,
                     headers=headers,
-                    timeout=300,  # 5 minutes timeout for generation
+                    timeout=self.image_timeout,
                 )
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                raise RuntimeError(f"Failed to edit image: {str(e)}")
+                raise RuntimeError(f"Failed to edit image: {_error_detail(e)}")
             finally:
                 # Close file handles
                 for file_tuple in files.values():
@@ -191,17 +280,18 @@ class SGLDiffusionServerAPI:
             if style:
                 payload["style"] = style
 
+            _log_request(f"{self.base_url}/images/generations", payload)
             try:
                 response = requests.post(
                     f"{self.base_url}/images/generations",
                     json=payload,
                     headers=self.headers,
-                    timeout=300,  # 5 minutes timeout for generation
+                    timeout=self.image_timeout,
                 )
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                raise RuntimeError(f"Failed to generate image: {str(e)}")
+                raise RuntimeError(f"Failed to generate image: {_error_detail(e)}")
 
     def generate_video(
         self,
@@ -219,11 +309,19 @@ class SGLDiffusionServerAPI:
         enable_teacache: bool = False,
         generator_device: Optional[str] = "cuda",
         input_reference: Optional[str] = None,
+        video_path: Optional[str] = None,
         output_path: Optional[str] = None,
+        enhance_prompt: bool = False,
         extra_fields: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        check_interrupt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a video using SGLang Diffusion API and wait for completion.
+
+        ``progress_callback`` gets the job's ``progress`` (0-100) on each poll.
+        ``check_interrupt`` is called between polls and may raise to stop
+        waiting; the server has no abort yet, so the job itself keeps running.
 
         Args:
             prompt: Text prompt for video generation
@@ -240,6 +338,10 @@ class SGLDiffusionServerAPI:
             enable_teacache: Enable TEA cache acceleration
             generator_device: Device for random generator ("cuda" or "cpu")
             input_reference: Path to input reference image for image-to-video
+            video_path: Source clip for video-to-video. A local file is
+                uploaded; a URL or server-side path is sent as is
+            enhance_prompt: Rewrite the prompt server-side; the rewrite comes
+                back as `revised_prompt` on the completed job
             extra_fields: Model-specific request fields merged into the payload
                 last, so a caller can reach a model's own request surface
                 (MiniMax-H3's `task`/`conditions`/`target`, per-model flow
@@ -258,48 +360,93 @@ class SGLDiffusionServerAPI:
             else:
                 size = "720x1280"
 
-        # Prepare request payload
-        payload: Dict[str, Any] = {
+        # Prepare request fields shared by the JSON and multipart paths.
+        # `output_path` is deliberately never sent: it used to be the
+        # ComfyUI node's own temp directory, which only exists on this
+        # machine and breaks as soon as the server runs elsewhere. Letting
+        # the server pick its own output location and fetching the result
+        # (see below) works for both the local and remote case.
+        fields: Dict[str, Any] = {
             "prompt": prompt,
             "size": size,
         }
-
-        # Add optional parameters
         if seconds is not None:
-            payload["seconds"] = seconds
+            fields["seconds"] = seconds
         if fps is not None:
-            payload["fps"] = fps
+            fields["fps"] = fps
         if num_frames is not None:
-            payload["num_frames"] = num_frames
+            fields["num_frames"] = num_frames
         if negative_prompt:
-            payload["negative_prompt"] = negative_prompt
+            fields["negative_prompt"] = negative_prompt
         if guidance_scale is not None:
-            payload["guidance_scale"] = guidance_scale
+            fields["guidance_scale"] = guidance_scale
         if num_inference_steps is not None:
-            payload["num_inference_steps"] = num_inference_steps
+            fields["num_inference_steps"] = num_inference_steps
         if seed is not None and seed >= 0:
-            payload["seed"] = seed
+            fields["seed"] = seed
         if enable_teacache:
-            payload["enable_teacache"] = True
+            fields["enable_teacache"] = True
+        if enhance_prompt:
+            fields["enhance_prompt"] = True
         if generator_device:
-            payload["generator_device"] = generator_device
-        if input_reference:
-            payload["input_reference"] = input_reference
-        if output_path:
-            payload["output_path"] = output_path
+            fields["generator_device"] = generator_device
         # merged last so a model-specific field wins over a generic default of
         # the same name (H3 sizes its output from `target`, not `size`)
         if extra_fields:
-            payload.update(extra_fields)
+            fields.update(extra_fields)
+
+        # Upload local files instead of sending their paths: a server on
+        # another machine cannot read this machine's filesystem (the images
+        # endpoint already does this for image_path). The server takes an
+        # uploaded source clip as `video_reference`.
+        string_fields: Dict[str, Any] = {}
+        uploads: Dict[str, str] = {}
+        for form_key, json_key, path in (
+            ("input_reference", "input_reference", input_reference),
+            ("video_reference", "video_path", video_path),
+        ):
+            if not path:
+                continue
+            if self._is_local_file(path):
+                uploads[form_key] = path
+            else:
+                string_fields[json_key] = path
 
         try:
-            # Create video generation job
-            response = requests.post(
-                f"{self.base_url}/videos",
-                json=payload,
-                headers=self.headers,
-                timeout=30,
-            )
+            if uploads:
+                data = {
+                    key: (value if isinstance(value, (str, bytes)) else str(value))
+                    for key, value in {**fields, **string_fields}.items()
+                }
+                with contextlib.ExitStack() as stack:
+                    files = {
+                        form_key: (
+                            os.path.basename(path),
+                            stack.enter_context(open(path, "rb")),
+                            self._get_content_type(path),
+                        )
+                        for form_key, path in uploads.items()
+                    }
+                    _log_request(
+                        f"{self.base_url}/videos",
+                        {**data, **uploads},
+                    )
+                    response = requests.post(
+                        f"{self.base_url}/videos",
+                        files=files,
+                        data=data,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        timeout=30,
+                    )
+            else:
+                payload = {**fields, **string_fields}
+                _log_request(f"{self.base_url}/videos", payload)
+                response = requests.post(
+                    f"{self.base_url}/videos",
+                    json=payload,
+                    headers=self.headers,
+                    timeout=30,
+                )
             response.raise_for_status()
             video_job = response.json()
             video_id = video_job.get("id")
@@ -312,6 +459,8 @@ class SGLDiffusionServerAPI:
             start_time = time.time()
 
             while time.time() - start_time < max_wait_time:
+                if check_interrupt:
+                    check_interrupt()
                 try:
                     status_response = requests.get(
                         f"{self.base_url}/videos/{video_id}",
@@ -324,8 +473,13 @@ class SGLDiffusionServerAPI:
                     # Reset error counter on successful request
                     consecutive_errors = 0
 
+                    if progress_callback and status.get("progress") is not None:
+                        progress_callback(int(status["progress"]))
+
                     if status.get("status") == "completed":
-                        return status
+                        return self._localize_video_result(
+                            status, video_id, output_path
+                        )
                     elif status.get("status") == "failed":
                         error = status.get("error", {})
                         error_msg = (
@@ -350,13 +504,48 @@ class SGLDiffusionServerAPI:
                             f"Network error after {consecutive_errors} consecutive failures: {str(e)}"
                         )
 
-                time.sleep(poll_interval)
+                # Sleep in short slices so Cancel is honoured within ~1s.
+                for _ in range(poll_interval):
+                    if check_interrupt:
+                        check_interrupt()
+                    time.sleep(1)
 
             raise TimeoutError(
                 f"Video generation timed out after {max_wait_time} seconds"
             )
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to generate video: {str(e)}")
+            raise RuntimeError(f"Failed to generate video: {_error_detail(e)}")
+
+    def _localize_video_result(
+        self, status: Dict[str, Any], video_id: str, output_path: Optional[str]
+    ) -> Dict[str, Any]:
+        """Make sure ``file_path`` in a completed job points at a local file.
+
+        The server's own ``file_path`` is only readable when the server runs
+        on this machine. When it isn't (no such local file), download the
+        result through ``GET /videos/{id}/content`` instead of trusting a
+        path that belongs to a different filesystem.
+        """
+        file_path = status.get("file_path")
+        if file_path and os.path.exists(file_path):
+            return status
+        target_dir = output_path or os.getcwd()
+        os.makedirs(target_dir, exist_ok=True)
+        ext = os.path.splitext(file_path or "")[1] or ".mp4"
+        local_path = os.path.join(target_dir, f"{video_id}{ext}")
+        response = requests.get(
+            f"{self.base_url}/videos/{video_id}/content",
+            headers=self.headers,
+            timeout=300,
+            stream=True,
+        )
+        response.raise_for_status()
+        with open(local_path, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                fh.write(chunk)
+        status = dict(status)
+        status["file_path"] = local_path
+        return status
 
     def _build_image_common_params(
         self,
@@ -372,6 +561,7 @@ class SGLDiffusionServerAPI:
         background: Optional[str] = None,
         output_format: Optional[str] = None,
         generator_device: Optional[str] = None,
+        enhance_prompt: bool = False,
     ) -> Dict[str, Any]:
         """
         Build common parameters for both image generation and editing.
@@ -403,8 +593,16 @@ class SGLDiffusionServerAPI:
             params["output_format"] = output_format
         if generator_device:
             params["generator_device"] = generator_device
+        if enhance_prompt:
+            params["enhance_prompt"] = True
 
         return params
+
+    @staticmethod
+    def _is_local_file(path: str) -> bool:
+        return not path.startswith(("http://", "https://", "data:")) and os.path.isfile(
+            path
+        )
 
     def _get_content_type(self, file_path: str) -> str:
         """Get content type based on file extension."""
@@ -414,27 +612,56 @@ class SGLDiffusionServerAPI:
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".webp": "image/webp",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mov": "video/quicktime",
+            ".mkv": "video/x-matroska",
         }
         return content_types.get(ext, "image/png")
 
+    def list_loras(self, timeout: float = 30) -> Dict[str, Any]:
+        """
+        List loaded LoRA adapters and what is currently applied per module.
+
+        Returns:
+            {"loaded_adapters": [{"nickname", "path"}, ...], "active": {...}}
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}/list_loras", headers=self.headers, timeout=timeout
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to list LoRA adapters: {_error_detail(e)}")
+
     def set_lora(
         self,
-        lora_nickname: str,
-        lora_path: Optional[str] = None,
+        lora_nickname: Union[str, List[str]],
+        lora_path: Optional[Union[str, List[Optional[str]]]] = None,
         target: str = "all",
+        strength: Optional[Union[float, List[float]]] = None,
+        merge_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Set a LoRA adapter for the specified transformer(s).
+        Set one or several LoRA adapters for the specified transformer(s).
 
         Args:
-            lora_nickname: The nickname of the adapter (required).
-            lora_path: Path to the LoRA adapter (local path or HF repo id).
-                      Required for the first load; optional if re-activating a cached nickname.
+            lora_nickname: The nickname of the adapter, or a list of nicknames to
+                stack (required).
+            lora_path: Path to the LoRA adapter (local path or HF repo id); a list
+                matching lora_nickname when stacking. Required for the first load;
+                optional (None) if re-activating a cached nickname.
             target: Which transformer(s) to apply the LoRA to. One of:
                 - "all": Apply to all transformers (default)
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
+            strength: LoRA strength, or one per adapter when stacking. The server
+                uses 1.0 when omitted.
+            merge_mode: "auto", "merge" or "dynamic". The server's own
+                --lora-merge-mode applies when omitted. Stacking several adapters
+                on one target needs "merge".
 
         Returns:
             Dictionary containing the API response with status and message
@@ -451,6 +678,10 @@ class SGLDiffusionServerAPI:
         # Add optional lora_path if provided
         if lora_path:
             payload["lora_path"] = lora_path
+        if strength is not None:
+            payload["strength"] = strength
+        if merge_mode:
+            payload["merge_mode"] = merge_mode
 
         try:
             response = requests.post(
@@ -462,7 +693,7 @@ class SGLDiffusionServerAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to set LoRA adapter: {str(e)}")
+            raise RuntimeError(f"Failed to set LoRA adapter: {_error_detail(e)}")
 
     def unset_lora(
         self,
@@ -492,7 +723,7 @@ class SGLDiffusionServerAPI:
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
+            raise RuntimeError(f"Failed to unset LoRA adapter: {_error_detail(e)}")
 
 
 if __name__ == "__main__":

@@ -79,10 +79,53 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
     return max_diff.item() <= tolerance
 
 
+def parse_step_list(text: str, limit: int = 64) -> list:
+    """Parse "500, 1000, 1500" into [500, 1000, 1500], dropping repeats."""
+    steps = []
+    for part in text.replace("\n", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            raise ValueError(f"Not a checkpoint step: {part!r}")
+        if int(part) not in steps:
+            steps.append(int(part))
+    if not steps:
+        raise ValueError("No checkpoint steps given")
+    if len(steps) > limit:
+        raise ValueError(f"At most {limit} checkpoints per sweep, got {len(steps)}")
+    return steps
+
+
+def make_image_grid(images: torch.Tensor, columns: int) -> torch.Tensor:
+    """Tile a [N, H, W, C] batch into one [1, rows * H, columns * W, C] image."""
+    count, height, width, channels = images.shape
+    columns = max(1, min(columns, count))
+    rows = -(-count // columns)
+    grid = torch.zeros(rows * height, columns * width, channels, dtype=images.dtype)
+    for index in range(count):
+        row, col = divmod(index, columns)
+        grid[row * height : (row + 1) * height, col * width : (col + 1) * width] = (
+            images[index]
+        )
+    return grid.unsqueeze(0)
+
+
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.
+
+    Raises if given a batch of more than one image: the node (and the
+    server request it builds) only has a single image slot here, and
+    silently keeping just image[0] would drop the rest of the batch with
+    no indication to the user.
     """
+    if image.dim() == 4 and image.shape[0] > 1:
+        raise ValueError(
+            f"get_image_path received a batch of {image.shape[0]} images but "
+            "this input only accepts one; use a node like 'Image From Batch' "
+            "to select a single image first."
+        )
     temp_dir = folder_paths.get_temp_directory()
 
     # Build file name
@@ -97,6 +140,52 @@ def get_image_path(image: torch.Tensor) -> str:
     img.save(file_path, format="PNG")
 
     return file_path
+
+
+def get_video_path(video: VideoInput) -> str:
+    """Return a file path for a VIDEO value, writing an MP4 temp file if needed."""
+    if isinstance(video, SGLDVideoInput) and os.path.exists(video.video_path):
+        return video.video_path
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    file_path = os.path.join(
+        folder_paths.get_temp_directory(),
+        f"sgl_input_{ts}_{uuid.uuid4().hex[:8]}.mp4",
+    )
+    video.save_to(file_path)
+    return file_path
+
+
+def extract_audio(video_path: str) -> dict:
+    """
+    Decode the audio track of a video file into a ComfyUI AUDIO value.
+
+    Returns {"waveform": [1, channels, samples] float32, "sample_rate": int}.
+    A clip with no audio stream yields one silent sample so downstream audio
+    nodes still receive a valid value.
+    """
+    import av
+
+    with av.open(video_path) as container:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            return {"waveform": torch.zeros(1, 1, 1), "sample_rate": 44100}
+
+        sample_rate = stream.rate
+        resampler = av.AudioResampler(format="fltp", rate=sample_rate)
+        chunks = []
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                chunks.append(torch.from_numpy(resampled.to_ndarray()))
+        for resampled in resampler.resample(None):
+            chunks.append(torch.from_numpy(resampled.to_ndarray()))
+
+    if not chunks:
+        return {"waveform": torch.zeros(1, 1, 1), "sample_rate": sample_rate}
+    return {
+        "waveform": torch.cat(chunks, dim=1).unsqueeze(0),
+        "sample_rate": sample_rate,
+    }
 
 
 def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
@@ -131,6 +220,14 @@ def convert_b64_to_tensor_image(b64_image: str) -> torch.Tensor:
 
 
 class SGLDVideoInput(VideoInput):
+    """Minimal fallback used only when ComfyUI's own file-backed VideoInput
+    isn't importable. It cannot decode frames/audio or re-encode on save, so
+    it fails loudly on those rather than silently returning wrong data (the
+    previous ``get_components`` returned ``[video_path]`` instead of a
+    ``VideoComponents``, and ``save_to`` dropped ``format``/``codec``/
+    ``metadata`` without telling the caller).
+    """
+
     def __init__(self, video_path: str, height: int, width: int):
         super().__init__()
 
@@ -148,16 +245,19 @@ class SGLDVideoInput(VideoInput):
         return self.width, self.height
 
     def get_components(self):
-        """
-        Returns the components of the video input.
-        This is required by the VideoInput abstract base class.
-        """
-        return [self.video_path]
+        raise NotImplementedError(
+            "SGLDVideoInput cannot decode frames/audio (no ComfyUI "
+            "VideoFromFile available in this environment); pass the file "
+            "at video_path to a node that reads files directly instead."
+        )
 
     def save_to(self, path: str, format=None, codec=None, metadata=None):
-        """
-        Abstract method to save the video input to a file.
-        """
+        if format is not None or codec is not None or metadata is not None:
+            raise NotImplementedError(
+                "SGLDVideoInput can only copy the file as-is; format/codec/"
+                "metadata conversion needs ComfyUI's own VideoFromFile, "
+                "which is unavailable in this environment."
+            )
         if not os.path.exists(self.video_path):
             raise FileNotFoundError(
                 f"Video not found at '{self.video_path}'. This file must be "
@@ -236,7 +336,18 @@ def convert_video_to_comfy_video(
     video_path: str, height: int, width: int
 ) -> VideoInput:
     """
-    Convert video to ComfyUI VIDEO format (VideoInput).
+    Convert a video file on disk to ComfyUI's VIDEO type.
+
+    Prefers ComfyUI's own file-backed ``VideoFromFile``: it probes the real
+    file for dimensions/frames/audio, so it is also immune to the
+    width/height we were told (which can be wrong, e.g. when the server
+    picked a different size than requested to match an image-to-video
+    input). ``height``/``width`` are only used by the ``SGLDVideoInput``
+    fallback below.
     """
-    video_input = SGLDVideoInput(video_path, height, width)
-    return video_input
+    try:
+        from comfy_api.input_impl import VideoFromFile
+
+        return VideoFromFile(video_path)
+    except ImportError:
+        return SGLDVideoInput(video_path, height, width)
