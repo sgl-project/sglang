@@ -528,7 +528,21 @@ class Glm4vVisionModel(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        # Prepare the CPU cumulative lengths once per vision forward: every
+        # ViT block reuses the same list for Ascend FIA instead of copying
+        # cu_seqlens back from the device per block.
+        actual_seq_lengths_cpu = None
+        metadata_max_seqlen = None
+        if is_npu():
+            # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+            cu_seqlens = cu_seqlens.to(device="cpu", dtype=torch.int32)
+            cu_cpu = cu_seqlens.tolist()
+            actual_seq_lengths_cpu = cu_cpu[1:]
+            seqlens = [end - start for start, end in zip(cu_cpu[:-1], cu_cpu[1:])]
+            metadata_max_seqlen = max(seqlens)
+        else:
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
         x = self.embeddings(
             x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
         )
@@ -536,12 +550,11 @@ class Glm4vVisionModel(nn.Module):
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
 
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if is_npu():
-            cu_seqlens = cu_seqlens.to("cpu")
-
         forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=self.device
+            cu_seqlens,
+            device=self.device,
+            max_seqlen=metadata_max_seqlen,
+            actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         )
 
         # x.shape: (s, b, d) where b=1 for vision processing
