@@ -18,6 +18,18 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
+def _apply_ungated_activation(x: torch.Tensor, activation: str) -> torch.Tensor:
+    if activation == "relu2":
+        x = F.relu(x)
+        return x * x
+    elif activation == "silu":
+        return F.silu(x)
+    elif activation == "gelu":
+        return F.gelu(x)
+    else:
+        raise ValueError(f"Unsupported activation for non-gated MoE: {activation=}")
+
+
 def fused_moe_forward_native(
     layer: torch.nn.Module,
     dispatch_output: StandardDispatchOutput,
@@ -33,8 +45,18 @@ def fused_moe_forward_native(
     topk_weights, topk_ids, _ = topk_output
 
     w13_weights = layer.w13_weight[topk_ids]
-    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = layer.w2_weight[topk_ids]
+
+    if not moe_runner_config.is_gated:
+        x1 = torch.einsum("ti,taoi -> tao", x, w13_weights)
+        x1 = _apply_ungated_activation(x1, moe_runner_config.activation)
+        expert_outs = torch.einsum("tao, taio -> tai", x1, w2_weights)
+        expert_outs = torch.einsum(
+            "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
+        )
+        return StandardCombineInput(hidden_states=expert_outs)
+
+    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
     if moe_runner_config.activation == "silu":
         x1 = F.silu(x1)
@@ -81,7 +103,9 @@ def moe_forward_native(
     sorted_tokens = x[idxs // topk_ids.shape[1]]
     tokens_per_expert = tokens_per_expert.cpu().numpy()
 
-    if moe_runner_config.activation == "silu":
+    if not moe_runner_config.is_gated:
+        act = None
+    elif moe_runner_config.activation == "silu":
         act = SiluAndMul()
     elif moe_runner_config.activation == "gelu":
         act = GeluAndMul()
@@ -126,7 +150,9 @@ def moe_forward_native(
             gate_up = gate_up_fp32.to(original_dtype)
 
         # Apply activation
-        if (
+        if act is None:
+            gate_up = _apply_ungated_activation(gate_up, moe_runner_config.activation)
+        elif (
             moe_runner_config.activation == "silu"
             and moe_runner_config.gemm1_alpha is not None
         ):
