@@ -591,11 +591,12 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
-    reason="Hopper paged indexer dispatch",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (9, 12),
+    reason="Paged indexer dispatch of SM90 and SM12x",
 )
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_hopper_indexer_backends_replay(ratio):
+def test_paged_indexer_backends_replay(ratio):
     from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         DenseBlocksBackend,
