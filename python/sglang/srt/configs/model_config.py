@@ -2035,6 +2035,19 @@ class ModelConfig:
                         f"({self.quantization})."
                     )
 
+        # An unquantized draft/MTP checkpoint must not inherit the target's
+        # quantization. Keep explicit draft quantization, including online modes.
+        if (
+            self.is_draft_model
+            and not self.is_draft_quantization_explicit
+            and quant_cfg is None
+            and self.quantization is not None
+        ):
+            logger.info(
+                f"Draft model has no quantization config in its checkpoint; "
+                f"loading it unquantized instead of '{self.quantization}'."
+            )
+            self.quantization = None
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
