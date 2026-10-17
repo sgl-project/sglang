@@ -189,10 +189,19 @@ def test_kda_prefill_checkpoints(state_dtype, layout, prefix_len):
 
 
 @pytest.mark.parametrize(
-    "extend_lens", [(130, 128), (1,)], ids=["tracked_prefill", "single_token"]
+    "extend_lens",
+    [(130, 128), (1,), (1, 1), (1, 1, 1, 1), (2, 0), (1, 2)],
+    ids=[
+        "tracked_prefill",
+        "single_token",
+        "packed_single_token",
+        "packed_four_single_tokens",
+        "padded_two_tokens",
+        "mixed_prefill",
+    ],
 )
 def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
-    """Raw beta works in FlashInfer and the single-token Triton fallback."""
+    """Raw beta and state updates survive FlashInfer's packed-token fallback."""
     with get_parallel().override(attn_dcp_rank=0, attn_dcp_size=1):
         case = KDAAttentionCase(
             name="flashinfer_kda_tracked_extend",
@@ -210,7 +219,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
             head_k_dim=128,
             head_v_dim=128,
             max_context_len=256,
-            runner_batch_size=6,
+            runner_batch_size=max(6, 4 + len(extend_lens)),
         )
         batch = fixture.forward_batch
         tracked = [n >= 64 for n in extend_lens]
