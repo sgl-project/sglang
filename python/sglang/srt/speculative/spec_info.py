@@ -187,6 +187,7 @@ class SpeculativeAlgorithm(Enum):
         req_to_token_pool,
         needs_cpu_seq_lens: bool = True,
         needs_confidence_relay: bool = False,
+        same_queue_publish: bool = False,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
@@ -196,6 +197,7 @@ class SpeculativeAlgorithm(Enum):
             req_to_token_pool,
             needs_cpu_seq_lens,
             needs_confidence_relay,
+            same_queue_publish=same_queue_publish,
         )
 
     def build_disagg_draft_input(

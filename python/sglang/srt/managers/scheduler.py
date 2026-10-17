@@ -1638,11 +1638,21 @@ class Scheduler(
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay()
+        # A backend that keeps the CPU seq_lens mirror pulls it with .cpu(),
+        # which on the forward stream waits for the whole forward, not the publish.
+        self.schedule_on_forward_stream = (
+            _is_hip
+            and self.enable_overlap
+            and self.spec_algorithm.is_some()
+            and not needs_cpu_seq_lens
+            and get_parallel().pp_size == 1
+        )
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
+            same_queue_publish=self.schedule_on_forward_stream,
         )
 
         self._confidence_budget_prepare = None
@@ -1930,6 +1940,10 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif self.schedule_on_forward_stream:
+            # A publish wait pending in another HIP queue slows the running graph;
+            # on the forward stream, stream order carries the publish dependency.
+            self.schedule_stream = self.forward_stream
         elif (is_cuda() or _is_hip) and (
             self.enable_overlap or get_parallel().pp_size > 1
         ):
