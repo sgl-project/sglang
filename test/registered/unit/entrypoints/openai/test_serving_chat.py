@@ -25,6 +25,7 @@ from unittest.mock import Mock, patch
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
+from sglang.srt.entrypoints.openai import serving_inkling
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -3394,6 +3395,49 @@ class ServingChatTestCase(CustomTestCase):
         return parsed
 
     def test_streaming_created_is_stable_across_chunks(self):
+        for spec in (None, "inkling"):
+            with self.subTest(spec=spec):
+                if spec == "inkling":
+                    self._stream_inkling_output_in_two_chunks()
+                self._assert_streaming_created_is_stable()
+
+    def _stream_inkling_output_in_two_chunks(self):
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        output_ids = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+            *tokenizer.encode_ordinary("Hello there"),
+            tokenizer.encode_special("end_message"),
+        ]
+
+        async def generate():
+            for count, finish in (
+                (len(output_ids) - 1, None),
+                (len(output_ids), {"type": "stop", "matched": None}),
+            ):
+                yield {
+                    "text": "",
+                    "output_ids": output_ids[:count],
+                    "index": 0,
+                    "meta_info": {
+                        "id": "chatcmpl-inkling",
+                        "prompt_tokens": 2,
+                        "completion_tokens": count,
+                        "cached_tokens": 0,
+                        "finish_reason": finish,
+                    },
+                }
+
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat.reasoning_parser = "inkling"
+        self.chat.tool_call_parser = "inkling"
+        self.tm.tokenizer = None
+        self.chat._spec_adapter = self.chat._build_spec_adapter()
+        self.tm.generate_request.return_value = generate()
+
+    def _assert_streaming_created_is_stable(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
@@ -5095,11 +5139,21 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
+def _inkling_serving() -> OpenAIServingChat:
+    serving = object.__new__(OpenAIServingChat)
+    serving.chat_encoding_spec = "inkling"
+    serving.reasoning_parser = "inkling"
+    serving.tool_call_parser = "inkling"
+    serving.tokenizer_manager = Mock(tokenizer=None)
+    serving._spec_adapter = serving._build_spec_adapter()
+    return serving
+
+
 class InklingReasoningEffortTest(unittest.TestCase):
     """Inkling reasoning-effort mapping and validation."""
 
     def test_named_levels(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = serving_inkling.parse_reasoning_effort
         self.assertEqual(parse("none"), 0.0)
         self.assertEqual(parse("minimal"), 0.1)
         self.assertEqual(parse("low"), 0.2)
@@ -5111,7 +5165,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         self.assertEqual(parse("max"), parse("xhigh"))
 
     def test_scalar_range_is_validated(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = serving_inkling.parse_reasoning_effort
         self.assertEqual(parse(0.5), 0.5)
         self.assertEqual(parse(0.99), 0.99)
         for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
@@ -5119,7 +5173,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
                 parse(value)
 
     def test_invalid_and_none(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        parse = serving_inkling.parse_reasoning_effort
         self.assertIsNone(parse(None))
         with self.assertRaises(ValueError):
             parse("garbage")
@@ -5127,7 +5181,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_env_default(self):
         from sglang.srt.environ import envs
 
-        get = OpenAIServingChat._get_inkling_default_reasoning_effort
+        get = serving_inkling.get_default_reasoning_effort
         env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
         try:
             env.clear()  # unset -> EnvStr default "0.9"
@@ -5166,13 +5220,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving = _inkling_serving()
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "hello"}],
@@ -5193,13 +5241,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         render as an OPEN model text block."""
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving = _inkling_serving()
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -5214,10 +5256,12 @@ class InklingReasoningEffortTest(unittest.TestCase):
             request,
             thinking_mode=None,
         )
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
         open_block = [
             INKLING_SPECIAL_TOKEN_IDS["<|message_model|>"],
             INKLING_SPECIAL_TOKEN_IDS["<|content_text|>"],
-            *list(b"The answer"),
+            *load_tml_renderers().tokenizer.encode_ordinary("The answer"),
         ]
         self.assertEqual(prompt_ids[-len(open_block) :], open_block)
         self.assertNotIn(
@@ -5229,13 +5273,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         it must keep rendering as a closed historical turn."""
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving = _inkling_serving()
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -5264,6 +5302,660 @@ class InklingReasoningEffortTest(unittest.TestCase):
             prompt_ids[-1],
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
+
+    def test_reasoning_content_history_renders_as_thinking(self):
+        """Prior thinking sent as reasoning_content (Chat Completions, and the
+        Anthropic and Responses converters) must render like a thinking part."""
+        serving = _inkling_serving()
+
+        def encode(assistant):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    assistant,
+                    {"role": "user", "content": "again"},
+                ],
+                reasoning_effort=0.5,
+            )
+            return serving._encode_messages(
+                [message.model_dump() for message in request.messages],
+                request,
+                thinking_mode=None,
+            )
+
+        self.assertEqual(
+            encode(
+                {"role": "assistant", "reasoning_content": "ponder", "content": "ok"}
+            ),
+            encode(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "ok"},
+                    ],
+                }
+            ),
+        )
+
+
+class InklingTokenOutputTest(CustomTestCase):
+    """Inkling chat responses are parsed from output token IDs, not text."""
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.inkling = _inkling_serving()._spec_adapter
+        self.request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "weather", "parameters": {"type": "object"}},
+                }
+            ],
+        )
+
+    @staticmethod
+    def _output_ids() -> list[int]:
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        special = tokenizer.encode_special
+        return [
+            special("message_model"),
+            special("content_thinking"),
+            *tokenizer.encode_ordinary("plan"),
+            special("end_message"),
+            special("message_model"),
+            *tokenizer.encode_ordinary("weather"),
+            special("content_invoke_tool_json"),
+            *tokenizer.encode_ordinary('{"name":"weather","args":{"city":"SF"}}'),
+            special("end_message"),
+            special("content_model_end_sampling"),
+        ]
+
+    def test_request_switches_gate_the_token_parser(self):
+        """tool_choice="none" leaves a sampled call as text, and
+        separate_reasoning=False keeps thinking in content."""
+        payload = '{"name":"weather","args":{"city":"SF"}}'
+        cases = [
+            ({"tool_choice": "none"}, ("plan", payload), "stop"),
+            ({"separate_reasoning": False}, ("", "plan"), "tool_calls"),
+        ]
+        for update, expected, finish_type in cases:
+            request = self.request.model_copy(update=update)
+            _, _, tool_calls, finish_reason = self.inkling.parse_chat_response(
+                request=request,
+                output_ids=self._output_ids(),
+                finish_reason={"type": "stop", "matched": 200006},
+            )
+            results = self._reasoning_and_content(
+                request,
+                self._output_ids(),
+                {"type": "stop", "matched": 200006},
+            )
+            with self.subTest(update=update):
+                self.assertEqual(finish_reason["type"], finish_type)
+                self.assertEqual(tool_calls is None, finish_type == "stop")
+                for mode, result in results.items():
+                    with self.subTest(mode=mode):
+                        self.assertEqual(result, expected)
+
+    def test_non_stream_maps_calls_and_finish_reason(self):
+        reasoning, content, tool_calls, finish_reason = (
+            self.inkling.parse_chat_response(
+                request=self.request,
+                output_ids=self._output_ids(),
+                finish_reason={"type": "stop", "matched": 200006},
+            )
+        )
+        self.assertEqual(reasoning, "plan")
+        self.assertEqual(content, "")
+        self.assertEqual(finish_reason, {"type": "tool_calls", "matched": None})
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].index, 0)
+        self.assertEqual(tool_calls[0].function.name, "weather")
+        self.assertEqual(json.loads(tool_calls[0].function.arguments), {"city": "SF"})
+        self.assertTrue(tool_calls[0].id.startswith("call_"))
+
+    def test_continued_final_message_output_is_content(self):
+        """Bug regression: with continue_final_message the prompt ends inside
+        an open model text block, so the sampled tokens carry no header; they
+        were silently dropped and the response content came back empty."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "First five primes?"},
+                {"role": "assistant", "content": "2, 3,"},
+            ],
+            continue_final_message=True,
+        )
+        output_ids = [
+            *tokenizer.encode_ordinary(" 5, 7, 11"),
+            tokenizer.encode_special("end_message"),
+            tokenizer.encode_special("content_model_end_sampling"),
+        ]
+        _, content, tool_calls, _ = self.inkling.parse_chat_response(
+            request=request,
+            output_ids=output_ids,
+            finish_reason={"type": "stop", "matched": 200006},
+        )
+        self.assertEqual(content, " 5, 7, 11")
+        self.assertIsNone(tool_calls)
+
+    def test_stream_reads_only_its_chunk_of_the_live_output_list(self):
+        """Non-incremental chunks share the live output list; tokens appended after
+        a chunk was built (here the matched stop) must wait for their own chunk."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        special = tokenizer.encode_special
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Yes?"}],
+            stop=["."],
+        )
+        live = [
+            special("message_model"),
+            special("content_text"),
+            *tokenizer.encode_ordinary("Yes"),
+        ]
+        first = {"completion_tokens": len(live), "finish_reason": None}
+        live.extend(tokenizer.encode_ordinary(" ."))
+        finish = {"type": "stop", "matched": "."}
+        final = {"completion_tokens": len(live), "finish_reason": finish}
+        chunks, parser_dict = [], {}
+        with get_context().override_server_args(incremental_streaming_output=False):
+            for meta_info, ids in ((first, live), (final, list(live))):
+                chunks += self.inkling.stream_chat_chunks(
+                    content={
+                        "output_ids": ids,
+                        "meta_info": {"id": "chatcmpl-1", **meta_info},
+                    },
+                    index=0,
+                    request=request,
+                    created=0,
+                    parser_dict=parser_dict,
+                    has_tool_calls={},
+                    choice_logprobs=None,
+                    finish_reason_type=meta_info["finish_reason"]
+                    and meta_info["finish_reason"]["type"],
+                    usage=None,
+                )
+        streamed = "".join(
+            json.loads(chunk[len("data: ") :])["choices"][0]["delta"].get("content")
+            or ""
+            for chunk in chunks
+        )
+        _, content, _, _ = self.inkling.parse_chat_response(
+            request=request, output_ids=list(live), finish_reason=finish
+        )
+        self.assertEqual(content, "Yes ")
+        self.assertEqual(streamed, content)
+
+    def test_each_output_token_is_parsed_once(self):
+        """Non-incremental chunks carry the cumulative ids and an incremental
+        abort chunk re-sends the last id, streamed or not; either way a token
+        parsed twice would duplicate text."""
+        new_ids = serving_inkling.select_new_output_ids
+        self.assertEqual(
+            new_ids(
+                output_ids=[1, 2, 3, 4],
+                num_consumed_tokens=3,
+                completion_tokens=4,
+                finish_reason_type=None,
+                incremental=False,
+            ),
+            [4],
+        )
+        self.assertEqual(
+            new_ids(
+                output_ids=[3, 4],
+                num_consumed_tokens=3,
+                completion_tokens=4,
+                finish_reason_type=None,
+                incremental=True,
+            ),
+            [3, 4],
+        )
+        for completion_tokens, expected in ((3, []), (4, [4])):
+            with self.subTest(completion_tokens=completion_tokens):
+                self.assertEqual(
+                    new_ids(
+                        output_ids=[4],
+                        num_consumed_tokens=3,
+                        completion_tokens=completion_tokens,
+                        finish_reason_type="abort",
+                        incremental=True,
+                    ),
+                    expected,
+                )
+
+    def _stream_deltas(
+        self,
+        request,
+        output_ids,
+        finish_reason,
+        *,
+        incremental=False,
+        split=4,
+        has_tool_calls=None,
+    ) -> list[dict]:
+        parser_dict, chunks = {}, []
+        steps = (
+            (output_ids[:split], None),
+            (output_ids[split:] if incremental else output_ids, finish_reason),
+        )
+        with get_context().override_server_args(
+            incremental_streaming_output=incremental
+        ):
+            for ids, finish in steps:
+                chunks += self.inkling.stream_chat_chunks(
+                    content={
+                        "output_ids": ids,
+                        "meta_info": {
+                            "id": "chatcmpl-1",
+                            "completion_tokens": len(output_ids),
+                            "finish_reason": finish,
+                        },
+                    },
+                    index=0,
+                    request=request,
+                    created=0,
+                    parser_dict=parser_dict,
+                    has_tool_calls={} if has_tool_calls is None else has_tool_calls,
+                    choice_logprobs=None,
+                    finish_reason_type=finish and finish["type"],
+                    usage=None,
+                )
+        return [
+            json.loads(chunk[len("data: ") :])["choices"][0]["delta"]
+            for chunk in chunks
+        ]
+
+    def _reasoning_and_content(
+        self, request, output_ids, finish_reason, *, split=2
+    ) -> dict:
+        reasoning, content, _, _ = self.inkling.parse_chat_response(
+            request=request,
+            output_ids=output_ids,
+            finish_reason=finish_reason,
+        )
+        results = {"non-stream": (reasoning or "", content)}
+        for incremental in (False, True):
+            deltas = self._stream_deltas(
+                request,
+                output_ids,
+                finish_reason,
+                incremental=incremental,
+                split=split,
+            )
+            results[f"stream incremental={incremental}"] = (
+                "".join(d.get("reasoning_content") or "" for d in deltas),
+                "".join(d.get("content") or "" for d in deltas),
+            )
+        return results
+
+    def test_stream_emits_reasoning_then_one_complete_tool_call(self):
+        has_tool_calls = {}
+        deltas = self._stream_deltas(
+            self.request,
+            self._output_ids(),
+            {"type": "stop", "matched": 200006},
+            has_tool_calls=has_tool_calls,
+        )
+        self.assertEqual(
+            "".join(d.get("reasoning_content") or "" for d in deltas), "plan"
+        )
+        calls = [call for d in deltas for call in d.get("tool_calls") or []]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "SF"})
+        self.assertEqual(has_tool_calls, {0: True})
+
+    def test_matched_stop_is_trimmed_from_visible_text(self):
+        """Bug regression: output ids include the matched stop, which only the
+        detokenized text had trimmed; the token-ID parse returned it verbatim."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        text_block = [special("message_model"), special("content_text")]
+        thinking_block = [special("message_model"), special("content_thinking")]
+        bang = encode("!")
+        self.assertEqual(len(encode(" hello")), 1)
+        cases = [
+            (
+                "string spanning tokens",
+                text_block,
+                encode("hello") + encode("EN") + encode("D"),
+                "END",
+                False,
+                ("", "hello"),
+            ),
+            (
+                "string inside a token",
+                text_block,
+                encode("say") + encode(" hello"),
+                "hel",
+                False,
+                ("", "say "),
+            ),
+            (
+                "kept string inside a token",
+                text_block,
+                encode("say") + encode(" hello"),
+                "hel",
+                True,
+                ("", "say hel"),
+            ),
+            (
+                "string in reasoning",
+                thinking_block,
+                encode("plan") + encode("END"),
+                "END",
+                False,
+                ("plan", ""),
+            ),
+            (
+                "ordinary stop token",
+                text_block,
+                encode("hello") + bang,
+                bang[0],
+                False,
+                ("", "hello"),
+            ),
+            (
+                "kept ordinary stop token",
+                text_block,
+                encode("hello") + bang,
+                bang[0],
+                True,
+                ("", "hello!"),
+            ),
+        ]
+        for name, header, payload, matched, no_stop_trim, expected in cases:
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                no_stop_trim=no_stop_trim,
+            )
+            results = self._reasoning_and_content(
+                request, header + payload, {"type": "stop", "matched": matched}
+            )
+            for mode, result in results.items():
+                with self.subTest(case=name, mode=mode):
+                    self.assertEqual(result, expected)
+
+    def test_stop_string_is_cut_where_the_sampler_matched(self):
+        """Bug regression: the stop string was searched in the merged content,
+        where two text blocks can spell it although framing separated them in
+        the sampled stream; the answer was truncated at that false match."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        first_block = [
+            special("message_model"),
+            special("content_text"),
+            *encode("EN"),
+            special("end_message"),
+        ]
+        output_ids = [
+            *first_block,
+            special("message_model"),
+            special("content_text"),
+            *encode("D and actual END"),
+        ]
+        for no_stop_trim, expected in (
+            (False, ("", "END and actual ")),
+            (True, ("", "END and actual END")),
+        ):
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                no_stop_trim=no_stop_trim,
+            )
+            results = self._reasoning_and_content(
+                request,
+                output_ids,
+                {"type": "stop", "matched": "END"},
+                split=len(first_block),
+            )
+            for mode, result in results.items():
+                with self.subTest(no_stop_trim=no_stop_trim, mode=mode):
+                    self.assertEqual(result, expected)
+
+    def test_overlapping_stop_is_cut_at_its_earliest_start(self):
+        """Bug regression: the backward search stopped at the first suffix
+        holding any match, so a stop that began in the previous token and
+        overlapped a later match in the final token was cut too late."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        header = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+        ]
+        cases = [("\n", "\n\n", "\n\n"), ("ab", "aba", "aba")]
+        for previous, final, stop in cases:
+            sampled = [
+                *tokenizer.encode_ordinary(previous),
+                *tokenizer.encode_ordinary(final),
+            ]
+            self.assertEqual(len(sampled), 2)
+            for no_stop_trim, expected in ((False, ("", "")), (True, ("", stop))):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                    no_stop_trim=no_stop_trim,
+                )
+                results = self._reasoning_and_content(
+                    request, header + sampled, {"type": "stop", "matched": stop}
+                )
+                for mode, result in results.items():
+                    with self.subTest(stop=stop, no_stop_trim=no_stop_trim, mode=mode):
+                        self.assertEqual(result, expected)
+
+    def test_special_stop_inside_open_text_block_is_not_visible(self):
+        """Bug regression: inside an open text block TML renders a special token
+        as text, so a custom special stop id leaked unless trimmed by id."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        stop_id = tokenizer.encode_special("content_thinking")
+        text_block = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+        ]
+        continued = [
+            {"role": "user", "content": "First five primes?"},
+            {"role": "assistant", "content": "2, 3,"},
+        ]
+        cases = [
+            ("explicit block", [{"role": "user", "content": "hi"}], text_block),
+            ("continued block", continued, []),
+        ]
+        for name, messages, header in cases:
+            for no_stop_trim, expected in (
+                (False, ("", " 5, 7")),
+                (True, ("", " 5, 7<|content_thinking|>")),
+            ):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    continue_final_message=name == "continued block",
+                    no_stop_trim=no_stop_trim,
+                )
+                results = self._reasoning_and_content(
+                    request,
+                    [*header, *encode(" 5, 7"), stop_id],
+                    {"type": "stop", "matched": stop_id},
+                    split=len(header) + 1,
+                )
+                for mode, result in results.items():
+                    with self.subTest(case=name, no_stop_trim=no_stop_trim, mode=mode):
+                        self.assertEqual(result, expected)
+
+    def test_unframed_prefix_keeps_the_following_marker_kind(self):
+        """Bug regression: stray text before a header-less thinking or tool-call
+        marker erased the marker, so reasoning became content and the call text."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        eos = special("content_model_end_sampling")
+        thinking = [
+            *encode("\n\n"),
+            special("content_thinking"),
+            *encode("plan"),
+            special("end_message"),
+            special("message_model"),
+            special("content_text"),
+            *encode("answer"),
+            special("end_message"),
+            eos,
+        ]
+        results = self._reasoning_and_content(
+            self.request, thinking, {"type": "stop", "matched": eos}
+        )
+        for mode, result in results.items():
+            with self.subTest(case="thinking", mode=mode):
+                self.assertEqual(result, ("plan", "\n\nanswer"))
+
+        call = [
+            *encode(" "),
+            special("content_invoke_tool_json"),
+            *encode('{"name":"weather","args":{"city":"SF"}}'),
+            special("end_message"),
+            eos,
+        ]
+        _, _, tool_calls, finish_reason = self.inkling.parse_chat_response(
+            request=self.request,
+            output_ids=call,
+            finish_reason={"type": "stop", "matched": eos},
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
+        self.assertEqual(
+            [(c.function.name, json.loads(c.function.arguments)) for c in tool_calls],
+            [("weather", {"city": "SF"})],
+        )
+
+    def test_constrained_output_without_header_is_content(self):
+        """Bug regression: response_format grammars sample bare JSON where a
+        message header belongs (after the reasoning terminator, or from the
+        first token), and the parser dropped that unframed text."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        encode = tokenizer.encode_ordinary
+        special = tokenizer.encode_special
+        payload = '{"marker": "<|end_message|>", "ok": true}'
+        thinking = [
+            special("message_model"),
+            special("content_thinking"),
+            *encode("plan"),
+            special("end_message"),
+        ]
+        eos = special("content_model_end_sampling")
+        # Grammars can sample a content-kind token inside the payload; the EOS
+        # then lands in a reopened text block and must still not render.
+        with_kind_token = [
+            *encode('{"a": "'),
+            special("content_text"),
+            *encode('x"}'),
+        ]
+        cases = [
+            ("after thinking", thinking, encode(payload), ("plan", payload)),
+            ("from first token", [], encode(payload), ("", payload)),
+            ("content kind in payload", [], with_kind_token, ("", '{"a": "x"}')),
+        ]
+        for name, prefix, sampled, expected in cases:
+            results = self._reasoning_and_content(
+                self.request,
+                [*prefix, *sampled, eos],
+                {"type": "stop", "matched": eos},
+            )
+            for mode, result in results.items():
+                with self.subTest(case=name, mode=mode):
+                    self.assertEqual(result, expected)
+
+    def test_constrained_continuation_stays_in_the_open_text_block(self):
+        """Bug regression: a constrained continue_final_message request had to open
+        a new message header inside the prompt's text block, which leaked as text."""
+        from types import SimpleNamespace
+
+        from xgrammar import TokenizerInfo, VocabType
+
+        from sglang.srt.constrained.reasoner_grammar_backend import (
+            ReasonerGrammarBackend,
+        )
+        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+        from sglang.srt.parser.reasoning_parser import InklingDetector
+
+        tokenizer = load_tml_renderers().tokenizer
+        special = tokenizer.encode_special
+        eos = special("content_model_end_sampling")
+        vocab = []
+        for token_id in range(201088):
+            try:
+                vocab.append(tokenizer.decode_bytes([token_id]))
+            except ValueError:
+                vocab.append(b"")
+        info = TokenizerInfo(vocab, VocabType.RAW, stop_token_ids=[eos])
+        backend = XGrammarGrammarBackend(
+            SimpleNamespace(init_xgrammar=lambda: (info, None)), len(vocab)
+        )
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), None
+        )
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Answer yes."},
+                {"role": "assistant", "content": "Answer: "},
+            ],
+            continue_final_message=True,
+            regex="yes",
+        )
+        prompt_ids = self.inkling.encode_messages(
+            messages=[message.model_dump() for message in request.messages],
+            request=request,
+            tools=None,
+        )
+        key = reasoner.get_request_grammar_key(
+            ("regex", "yes"), input_ids=prompt_ids, thinking_budget=None
+        )
+        grammar = reasoner._init_value_dispatch(key, reasoning=True)
+        output_ids = [*tokenizer.encode_ordinary("yes"), special("end_message"), eos]
+        mask = backend.allocate_vocab_mask(len(vocab), 1, "cpu")
+        for token_id in [special("message_model"), *output_ids]:
+            grammar.fill_vocab_mask(mask, 0)
+            allowed = bool(int(mask[0, token_id // 32]) >> (token_id % 32) & 1)
+            self.assertEqual(allowed, token_id != special("message_model"))
+            if allowed:
+                grammar.accept_token(token_id)
+        self.assertTrue(grammar.is_terminated())
+
+        results = self._reasoning_and_content(
+            request, output_ids, {"type": "stop", "matched": eos}, split=1
+        )
+        for mode, result in results.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(result, ("", "yes"))
 
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):
