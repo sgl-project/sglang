@@ -13,6 +13,7 @@ import torch
 _SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -46,6 +47,105 @@ logger = logging.getLogger(__name__)
 _MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
 
 
+@functools.lru_cache(maxsize=1)
+def install_moe_sorting_handoff() -> None:
+    """Let aiter's fused_moe take a sort staged in moe_sort_handoff.
+
+    aiter has no argument for precomputed routes, so its module-level
+    moe_sorting (looked up by name inside fused_moe) is wrapped once."""
+    import aiter.fused_moe as aiter_fused_moe
+
+    from sglang.srt.layers.moe import moe_sort_handoff
+
+    orig = aiter_fused_moe.moe_sorting
+
+    @functools.wraps(orig)
+    def moe_sorting(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size=aiter_fused_moe.BLOCK_SIZE_M,
+        expert_mask=None,
+        num_local_tokens=None,
+        dispatch_policy=0,
+        return_local_topk_ids=False,
+        accumulate=True,
+        flat=False,
+        output_aux=False,
+        output=None,
+    ):
+        if (
+            moe_sort_handoff.sort_staged()
+            and expert_mask is None
+            and num_local_tokens is None
+            and not return_local_topk_ids
+            and accumulate
+            and not flat
+            and not output_aux
+        ):
+            staged = moe_sort_handoff.take(topk_ids, block_size, output, moebuf_dtype)
+            if staged is not None:
+                return staged
+        return orig(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            dispatch_policy,
+            return_local_topk_ids,
+            accumulate,
+            flat,
+            output_aux,
+            output,
+        )
+
+    aiter_fused_moe.moe_sorting = moe_sorting
+
+    orig_quant = aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort
+
+    @functools.wraps(orig_quant)
+    def fused_dynamic_mxfp8_quant_moe_sort(
+        input,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        topk,
+        block_size,
+        num_rows=None,
+        group_size=32,
+        sorted_weights=None,
+        num_experts_upper_bound=None,
+    ):
+        if moe_sort_handoff.active() and num_rows is None and group_size == 32:
+            staged = moe_sort_handoff.take_quant(
+                input, sorted_ids, num_valid_ids, token_num
+            )
+            if staged is not None:
+                return staged
+        return orig_quant(
+            input,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+            topk,
+            block_size,
+            num_rows=num_rows,
+            group_size=group_size,
+            sorted_weights=sorted_weights,
+            num_experts_upper_bound=num_experts_upper_bound,
+        )
+
+    aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort = (
+        fused_dynamic_mxfp8_quant_moe_sort
+    )
+
+
 class AiterQuantType(str, Enum):
     NONE = "No"
     PER_TOKEN = "per_Token"
@@ -70,6 +170,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    # w13 preshuffled gate/up-interleaved (shuffle_weight_a16w4(w13, 16, True)).
+    gate_up_interleaved: bool = False
 
 
 @dataclass
@@ -164,6 +266,91 @@ def _aiter_fused_moe_supports_output() -> bool:
     return "output" in inspect.signature(fused_moe).parameters
 
 
+@functools.lru_cache(maxsize=64)
+def _situ_a4w4_interleave_resolves(
+    padded_m: int,
+    model_dim: int,
+    inter_dim: int,
+    num_experts: int,
+    topk: int,
+    beta: float,
+    linear_beta: float,
+) -> bool:
+    """Whether aiter's a4w4 config for this bucket runs the mxmoe stage 1, the one
+    stage-1 family that honors a runtime INTERLEAVE layout; other FlyDSL a4w4
+    stage-1 kernels bake in the separated layout and would misread the weights."""
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import get_2stage_cfgs
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    metadata = get_2stage_cfgs(
+        padded_m,
+        model_dim,
+        inter_dim,
+        num_experts,
+        topk,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Situv2,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+        opus_weights_shuffled=True,
+        input_dtype=torch.bfloat16,
+    )
+    stage1 = metadata.stage1
+    return (
+        isinstance(stage1, functools.partial)
+        and stage1.keywords.get("interleave") is True
+    )
+
+
+def _use_situ_a4w4(
+    runner_input: AiterRunnerInput,
+    quant_info: AiterMoeQuantInfo,
+    beta: float,
+    linear_beta: float,
+) -> bool:
+    """MXFP4 activations for a prefill-sized SiTU batch over a8w4-layout weights."""
+    x = runner_input.hidden_states
+    min_tokens = envs.SGLANG_ROCM_K3_PREFILL_MOE_A4W4_MIN_TOKENS.get()
+    if not (
+        0 < min_tokens <= x.shape[0]
+        and quant_info.gate_up_interleaved
+        and quant_info.quant_type == AiterQuantType.PER_1X32
+        and x.dtype == torch.bfloat16
+        and runner_input.a1_scale is None
+        and runner_input.num_local_tokens is None
+        and quant_info.expert_mask is None
+        and quant_info.b13 is None
+        and quant_info.b2 is None
+        and quant_info.hidden_pad == 0
+        and quant_info.intermediate_pad == 0
+        and not quant_info.doweight_stage1
+        and is_gfx95_supported()
+    ):
+        return False
+    from aiter.fused_moe import get_padded_M
+
+    w13, w2 = quant_info.w13_weight, quant_info.w2_weight
+    return _situ_a4w4_interleave_resolves(
+        get_padded_M(x.shape[0]),
+        w2.shape[1],
+        w13.shape[1] // 2,
+        w13.shape[0],
+        runner_input.topk_ids.shape[1],
+        beta,
+        linear_beta,
+    )
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -222,6 +409,18 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+            if _use_situ_a4w4(
+                runner_input,
+                quant_info,
+                extra.get("beta", 1.0),
+                extra.get("linear_beta", 1.0),
+            ):
+                from aiter import dtypes
+
+                # The a8w4 stage-1 kernels carry the layout in their names; the
+                # a4w4 mxmoe stage 1 takes it from gate_mode.
+                extra["gate_mode"] = GateMode.INTERLEAVE.value
+                extra["quant_dtype_a"] = dtypes.fp4x2
         elif is_gfx95 and quant_info.swiglu_limit > 0 and "gate_mode" in extra:
             extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:
@@ -352,6 +551,13 @@ def pre_permute_standard_to_aiter(
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        # A caller-published destination (e.g. K3's joint all-reduce buffer)
+        # saves the copy out of fused_moe's own output.
+        output=(
+            zero_copy_context.get_moe_output(hidden_states)
+            if is_gfx95_supported()
+            else None
+        ),
     )
 
 
