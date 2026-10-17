@@ -467,6 +467,12 @@ class DllmManager:
         """Check if there are requests in staging queue."""
         return self.dllm_config is not None and len(self.staging_queue) > 0
 
+    def any_context_in_progress(self) -> bool:
+        return any(
+            req.dllm_phase == DllmReqPhase.STAGING_PREFILL and req.prefix_len > 0
+            for req in (*self.waiting_queue, *self.staging_queue)
+        )
+
     def is_empty(self) -> bool:
         """Check if both queues are empty or DLLM is not configured."""
         if self.dllm_config is None:

@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -108,7 +109,7 @@ def _run_by_item_chunks(encoder):
     return [
         torch.cat(
             mm_schedule._get_chunked_embedding_by_item(
-                encoder, items, prefix_len, extend_len, _CPU
+                encoder, items, prefix_len, extend_len, _CPU, owner="req"
             ),
             dim=0,
         )
@@ -123,7 +124,14 @@ def _run_full_chunks(encoder):
     outs = []
     for prefix_len, extend_len in CHUNKS:
         chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder, items, ITEM_OFFSETS, prefix_len, extend_len, input_ids, _CPU
+            encoder,
+            items,
+            ITEM_OFFSETS,
+            prefix_len,
+            extend_len,
+            input_ids,
+            _CPU,
+            owner="req",
         )
         outs.append(chunk)
     return outs
@@ -161,7 +169,9 @@ def test_full_matches_by_item():
 def test_list_cache_entries_own_storage():
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
-    mm_schedule._get_chunked_embedding_by_item(_encoder_list, items, 0, TOTAL_LEN, _CPU)
+    mm_schedule._get_chunked_embedding_by_item(
+        _encoder_list, items, 0, TOTAL_LEN, _CPU, owner="req"
+    )
     for item in items:
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
         own_bytes = emb.numel() * emb.element_size()
@@ -174,7 +184,7 @@ def test_tensor_cache_entries_own_storage(per_request):
     items = _make_items()
     if per_request:
         chunks = mm_schedule._get_chunked_embedding_by_item(
-            _encoder_tensor, items, 0, TOTAL_LEN, _CPU
+            _encoder_tensor, items, 0, TOTAL_LEN, _CPU, owner="req"
         )
     else:
         request = mm_schedule.PerImageRequestInfo(
@@ -183,12 +193,13 @@ def test_tensor_cache_entries_own_storage(per_request):
             items_offset=ITEM_OFFSETS,
             extend_prefix_len=0,
             extend_seq_len=TOTAL_LEN,
+            owner="req",
         )
         embeddings = mm_schedule._batch_encode_per_image_misses(
             _encoder_tensor, [request], _CPU
         )
         chunks = mm_schedule._assemble_per_image_chunk(
-            request.overlapping, embeddings, 0, TOTAL_LEN
+            req_info=request, hash_to_embedding=embeddings
         )
     for item, chunk in zip(items, chunks):
         emb = mm_schedule.embedding_cache.get_single(item.hash).embedding
@@ -212,9 +223,32 @@ def test_tensor_encoder_chunks_survive_cache_pressure(
         [TOTAL_LEN],
         [ITEM_OFFSETS],
         torch.zeros(TOTAL_LEN, dtype=torch.long),
+        rids=["req"],
     )
     assert torch.equal(chunk, _encoder_tensor(items))
     assert mm_schedule.embedding_cache.current_size <= cache_bytes
+
+
+def test_oversize_entry_leaves_the_cache_alone():
+    row_bytes = HIDDEN * 4
+    cache = mm_schedule.MultiModalStaticCache(max_size=4 * row_bytes)
+    kept = {
+        mm_hash: mm_schedule.EmbeddingResult(embedding=torch.ones(2, HIDDEN))
+        for mm_hash in (1, 2)
+    }
+    for mm_hash, entry in kept.items():
+        assert cache.set(mm_hash=mm_hash, embedding=entry)
+
+    oversize = mm_schedule.EmbeddingResult(embedding=torch.ones(5, HIDDEN))
+    assert not cache.set(mm_hash=3, embedding=oversize)
+    assert list(cache.mm_cache) == [1, 2]
+    assert all(cache.peek(mm_hash) is entry for mm_hash, entry in kept.items())
+    assert cache.current_size == 4 * row_bytes
+
+    # An entry that fills the cache exactly is still admitted.
+    exact = mm_schedule.EmbeddingResult(embedding=torch.ones(4, HIDDEN))
+    assert cache.set(mm_hash=4, embedding=exact)
+    assert list(cache.mm_cache) == [4]
 
 
 def test_by_item_mismatched_cache_entry_is_reencoded():
@@ -228,7 +262,7 @@ def test_by_item_mismatched_cache_entry_is_reencoded():
     encoder = Mock(side_effect=_encoder_list)
 
     chunks = mm_schedule._get_chunked_embedding_by_item(
-        encoder, items, 0, TOTAL_LEN, _CPU
+        encoder, items, 0, TOTAL_LEN, _CPU, owner="req"
     )
 
     assert sum(chunk.shape[0] for chunk in chunks) == sum(
@@ -254,6 +288,7 @@ def test_batched_mismatched_cache_entry_is_reencoded():
         items_offset=ITEM_OFFSETS,
         extend_prefix_len=0,
         extend_seq_len=TOTAL_LEN,
+        owner="req",
     )
     encoder = Mock(side_effect=_encoder_list)
 
@@ -283,6 +318,7 @@ def test_full_deferred_ipc_item_is_marked_for_borrow():
         items_offset=[ITEM_OFFSETS[0]],
         extend_prefix_len=0,
         extend_seq_len=TOTAL_LEN,
+        owner="req",
     )
 
     mm_schedule._batch_encode_per_image_misses(_encoder_list, [request], _CPU)
@@ -302,6 +338,7 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
             items_offset=ITEM_OFFSETS[:2],
             extend_prefix_len=0,
             extend_seq_len=TOTAL_LEN,
+            owner="req",
         )
     ]
     encoder = Mock(side_effect=_encoder_list)
@@ -330,7 +367,7 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
 
     with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
         chunk, _ = mm_schedule._get_chunked_embedding_full(
-            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU, owner="req"
         )
 
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
@@ -370,6 +407,7 @@ def test_multi_offset_audio_item_is_chunked_and_cached_per_item(
             [extend_len],
             [[offset for item in items for offset in item.offsets]],
             input_ids,
+            rids=["req"],
         )
         return chunk
 
@@ -433,6 +471,7 @@ def test_cached_audio_items_concatenate_once_in_request_order(
         [[offset for item_offsets in offsets_per_item for offset in item_offsets]]
         * num_requests,
         input_ids,
+        rids=[f"req{i}" for i in range(num_requests)],
     )
 
     assert torch.equal(chunk, expected)
@@ -480,6 +519,402 @@ def test_precomputed_audio_slices_concatenate_once(monkeypatch, prefix, length, 
         == embeddings.untyped_storage().data_ptr()
     )
     concat.assert_called_once()
+
+
+# One video: four 4-token frames with separators; the chunks split frames 2 and 4.
+VIDEO_RUNS = [(2, 5), (7, 10), (12, 15), (17, 20)]
+VIDEO_LEN = 24
+VIDEO_CHUNKS = [(0, 9), (9, 9), (18, 6)]
+VIDEO_TOKENS = sum(end - start + 1 for start, end in VIDEO_RUNS)
+# The embedding paths: full (a multi-run video), batched (a single-run item),
+# and per-request on HIP, NPU and XPU (a multi-run audio item).
+PATHS = ["full", "batched", "per_request"]
+
+
+def _video_item(hash_=77):
+    return MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=hash_,
+        feature=torch.zeros(1),
+        offsets=list(VIDEO_RUNS),
+    )
+
+
+def _video_embedding(item):
+    return torch.randn(
+        VIDEO_TOKENS, HIDDEN, generator=torch.Generator().manual_seed(item.hash)
+    )
+
+
+def _video_encoder():
+    return Mock(
+        side_effect=lambda items: torch.cat([_video_embedding(i) for i in items])
+    )
+
+
+def _prefill_chunk(encoder, item, prefix_len, extend_len, rid="req"):
+    chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [item],
+        [0, 1],
+        [prefix_len],
+        [extend_len],
+        [item.offsets],
+        torch.zeros(VIDEO_LEN, dtype=torch.long),
+        rids=[rid],
+    )
+    return chunk
+
+
+def _run_item(hash_=88, modality=Modality.VIDEO, offsets=((3, 18),)):
+    return MultimodalDataItem(
+        modality=modality, hash=hash_, feature=torch.zeros(1), offsets=list(offsets)
+    )
+
+
+def _path_item(monkeypatch, path):
+    monkeypatch.setattr(mm_schedule, "_is_hip", path == "per_request")
+    if path == "full":
+        return _video_item()
+    if path == "batched":
+        return _run_item()
+    return _run_item(modality=Modality.AUDIO, offsets=VIDEO_RUNS)
+
+
+# A pruned video: EVS kept 1, 4 and 2 of the frames' tokens.
+PRUNED_PROMPT = [1, 0, 0, 4, 5, 0, 0, 0, 9, 10, 0, 0, 12, 13]
+PRUNED_CHUNKS = [(0, 4), (4, 5), (9, 5)]
+
+
+def _pruned_video():
+    item = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=5,
+        pad_value=0,
+        feature=torch.zeros(1),
+        offsets=[(1, 2), (5, 7), (10, 11)],
+        model_specific_data={"pre_chunked_input_ids": PRUNED_PROMPT},
+    )
+    rows = torch.arange(7 * HIDDEN, dtype=torch.float32).reshape(7, HIDDEN)
+    encoder = Mock(
+        return_value=EVSEmbeddingResult(embedding=rows, num_tokens_per_frame=[1, 4, 2])
+    )
+    return item, rows, encoder
+
+
+def _prefill_pruned(encoder, item, prefix_len, extend_len):
+    return mm_schedule._get_chunked_embedding_full(
+        encoder,
+        [item],
+        item.offsets,
+        prefix_len,
+        extend_len,
+        torch.tensor(PRUNED_PROMPT[prefix_len : prefix_len + extend_len]),
+        _CPU,
+        owner="req",
+    )
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_item_is_encoded_once_per_request(monkeypatch, path):
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _path_item(monkeypatch, path)
+    expected = _video_embedding(item)
+    # The full path also takes encoder output shaped [frames, tokens, hidden].
+    encoder = Mock(
+        return_value=expected.reshape(4, 4, HIDDEN) if path == "full" else expected
+    )
+
+    chunks, entries = [], []
+    for prefix_len, extend_len in VIDEO_CHUNKS:
+        chunks.append(_prefill_chunk(encoder, item, prefix_len, extend_len))
+        entries.append(len(mm_schedule._prefill_rows))
+
+    encoder.assert_called_once()
+    sizes = [6, 9, 1] if path == "batched" else [6, 7, 3]
+    assert [chunk.shape[0] for chunk in chunks] == sizes
+    assert torch.equal(torch.cat(chunks), expected)
+    assert entries == [1, 1, 0]
+    assert not any(
+        isinstance(value, mm_schedule._PrefillRows)
+        for value in item.model_specific_data.values()
+    )
+
+
+def test_rows_are_kept_only_while_a_later_chunk_needs_them():
+    mm_schedule.init_mm_embedding_cache(0)
+    encoder = _video_encoder()
+
+    _prefill_chunk(encoder, _video_item(), 0, VIDEO_LEN)
+    assert not mm_schedule._prefill_rows
+
+    # The video ends inside the first chunk of a longer prompt.
+    ends_early = _video_item()
+    _prefill_chunk(encoder, ends_early, 0, 21)
+    assert not mm_schedule._prefill_rows
+    assert _prefill_chunk(encoder, ends_early, 21, 3) is None
+
+    _prefill_chunk(encoder, _video_item(), 0, 9)
+    assert len(mm_schedule._prefill_rows) == 1
+    assert encoder.call_count == 3
+
+
+def test_pruned_video_is_encoded_once_per_request():
+    mm_schedule.init_mm_embedding_cache(0)
+    item, rows, encoder = _pruned_video()
+
+    outs = [_prefill_pruned(encoder, item, *window) for window in PRUNED_CHUNKS]
+
+    encoder.assert_called_once()
+    assert [chunk.shape[0] for chunk, _ in outs] == [1, 4, 2]
+    assert torch.equal(torch.cat([chunk for chunk, _ in outs]), rows)
+    # Pruning moved the placeholders: [1, 0, 4, 5, 0, 0, 0, 0, 9, 10, 0, 0, 12, 13].
+    assert outs[0][1].tolist() == [1, 0, 4, 5]
+    assert outs[1][1].tolist() == [0, 0, 0, 0, 9]
+    assert outs[2][1].tolist() == [10, 0, 0, 12, 13]
+    assert not mm_schedule._prefill_rows
+
+
+@pytest.mark.parametrize("path", ["full", "batched"])
+def test_embedding_evicted_between_chunks_is_not_encoded_again(monkeypatch, path):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _path_item(monkeypatch, path)
+    encoder = _video_encoder()
+
+    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
+    # The cache holds the encoder output, so the rows are kept without a copy.
+    (kept,) = mm_schedule._prefill_rows.values()
+    (cached,) = mm_schedule.embedding_cache.mm_cache.values()
+    assert kept.first_row == 0
+    assert kept.result.embedding is cached.embedding
+    mm_schedule.embedding_cache.clear()
+    chunks += [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert not mm_schedule._prefill_rows
+
+
+def test_rows_in_a_buffer_the_encoder_reuses_are_copied():
+    # The next encoder call overwrites the encoder's slice; the cache holds a clone.
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    buffer = torch.empty(2 * VIDEO_TOKENS, HIDDEN)
+
+    def encode(items):
+        buffer[:VIDEO_TOKENS] = _video_embedding(items[0])
+        return buffer[:VIDEO_TOKENS]
+
+    item, other = _video_item(), _video_item(78)
+    chunks = [_prefill_chunk(encode, item, *VIDEO_CHUNKS[0]).clone()]
+    (kept,) = mm_schedule._prefill_rows.values()
+    (cached,) = mm_schedule.embedding_cache.mm_cache.values()
+    assert kept.result.embedding is cached.embedding
+    _prefill_chunk(encode, other, 0, VIDEO_LEN)
+    chunks += [
+        _prefill_chunk(encode, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+
+
+def test_request_that_starts_over_is_encoded_again():
+    # A prefill restarted at token 0 needs rows the kept ones no longer hold.
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _video_item()
+    encoder = _video_encoder()
+
+    _prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])
+    chunks = [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS
+    ]
+
+    assert encoder.call_count == 2
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert not mm_schedule._prefill_rows
+
+
+def test_item_shared_by_two_requests_in_one_batch():
+    # Session requests share item objects, but only the request that kept the
+    # rows reads them; the other encodes the item for itself.
+    mm_schedule.init_mm_embedding_cache(0)
+    item = _run_item()
+    encoder = _video_encoder()
+    _prefill_chunk(encoder, item, 0, 9)
+
+    chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+        encoder,
+        [item, item],
+        [0, 1, 2],
+        [9, 9],
+        [VIDEO_LEN - 9, VIDEO_LEN - 9],
+        [item.offsets, item.offsets],
+        torch.zeros(1, dtype=torch.long),
+        rids=["req", "other"],
+    )
+
+    unread = _video_embedding(item)[6:]
+    assert torch.equal(chunk, torch.cat([unread, unread]))
+    assert encoder.call_count == 2
+    assert not mm_schedule._prefill_rows
+
+
+def test_same_image_twice_in_a_request_reads_its_own_rows():
+    # The second copy has the first's hash but other positions.
+    mm_schedule.init_mm_embedding_cache(0)
+    first, second = _run_item(), _run_item(offsets=((22, 37),))
+    encoder = _video_encoder()
+
+    chunks = []
+    for prefix_len, extend_len in ((0, 9), (9, 20), (29, 11)):
+        chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            [first, second],
+            [0, 2],
+            [prefix_len],
+            [extend_len],
+            [first.offsets + second.offsets],
+            torch.zeros(1, dtype=torch.long),
+            rids=["req"],
+        )
+        chunks.append(chunk)
+        if prefix_len == 0:
+            (kept,) = mm_schedule._prefill_rows.values()
+            assert kept.first_row > 0
+
+    expected = _video_embedding(first)
+    assert torch.equal(torch.cat(chunks), torch.cat([expected, expected]))
+    assert encoder.call_count == 2
+    assert not mm_schedule._prefill_rows
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_kept_rows_are_not_served_to_another_request(monkeypatch, path):
+    # B has A's item at A's positions but is further along, e.g. after a longer
+    # prefix hit: it must neither read A's rows nor drop them when it finishes.
+    mm_schedule.init_mm_embedding_cache(0)
+    continuing, other = _path_item(monkeypatch, path), _path_item(monkeypatch, path)
+    passes = []
+
+    def encode(items):
+        # Each encoder call adds its own offset, so rows show which call made them.
+        rows = torch.cat([_video_embedding(item) for item in items])
+        passes.append(rows + len(passes))
+        return passes[-1]
+
+    chunks = [_prefill_chunk(encode, continuing, *VIDEO_CHUNKS[0])]
+    _prefill_chunk(encode, other, 12, VIDEO_LEN - 12, rid="other")
+    chunks += [
+        _prefill_chunk(encode, continuing, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    assert len(passes) == 2
+    assert torch.equal(torch.cat(chunks), passes[0])
+    assert not mm_schedule._prefill_rows
+
+
+def test_several_multi_run_items_are_encoded_once_per_request():
+    # The full path keeps the rows of both videos in one entry.
+    mm_schedule.init_mm_embedding_cache(0)
+    first = _video_item(71)
+    second = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=72,
+        feature=torch.zeros(1),
+        offsets=[(start + 22, end + 22) for start, end in VIDEO_RUNS],
+    )
+    items = [first, second]
+    offsets = first.offsets + second.offsets
+    encoder = _video_encoder()
+    expected = torch.cat([_video_embedding(first), _video_embedding(second)])
+
+    chunks = []
+    for prefix_len in range(0, 44, 11):
+        chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            [0, 2],
+            [prefix_len],
+            [11],
+            [offsets],
+            torch.zeros(1, dtype=torch.long),
+            rids=["req"],
+        )
+        chunks.append(chunk)
+        assert len(mm_schedule._prefill_rows) == (prefix_len < 33)
+
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), expected)
+
+
+def test_kept_rows_hit_skips_the_cache():
+    # Kept rows are read before the cache, so a colliding entry there stays untouched.
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    item = _video_item()
+    encoder = _video_encoder()
+    cache = mm_schedule.embedding_cache
+
+    chunks = [_prefill_chunk(encoder, item, *VIDEO_CHUNKS[0])]
+    (cache_hash,) = cache.mm_cache
+    cache.clear()
+    colliding = mm_schedule.EmbeddingResult(embedding=torch.zeros(3, HIDDEN))
+    cache.set(cache_hash, colliding)
+    cache.get = Mock(wraps=cache.get)
+    chunks += [
+        _prefill_chunk(encoder, item, prefix_len, extend_len)
+        for prefix_len, extend_len in VIDEO_CHUNKS[1:]
+    ]
+
+    cache.get.assert_not_called()
+    assert cache.mm_cache[cache_hash] is colliding
+    encoder.assert_called_once()
+    assert torch.equal(torch.cat(chunks), _video_embedding(item))
+    assert not mm_schedule._prefill_rows
+
+
+def test_keeping_rows_leaves_the_cache_order_alone():
+    # Keeping the first item's rows must not move it in the cache's LRU order.
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [
+        MultimodalDataItem(
+            modality=Modality.AUDIO, hash=hash_, feature=torch.zeros(1), offsets=offsets
+        )
+        for hash_, offsets in ((11, [(2, 3), (10, 11)]), (12, [(6, 7)]))
+    ]
+
+    def encode(batch):
+        return [
+            torch.ones(sum(e - s + 1 for s, e in item.offsets), HIDDEN)
+            for item in batch
+        ]
+
+    mm_schedule._get_chunked_prefill_embedding(
+        encode,
+        items,
+        [0, 2],
+        [0],
+        [9],
+        [[(2, 3), (6, 7), (10, 11)]],
+        torch.zeros(1, dtype=torch.long),
+        rids=["req"],
+    )
+
+    assert list(mm_schedule.embedding_cache.mm_cache) == [11, 12]
+    assert len(mm_schedule._prefill_rows) == 1
+
+
+def test_first_row_out_of_range_is_an_error():
+    # Kept rows start at row 12, but the chunk needs rows from row 0 on.
+    rows = torch.zeros(4, HIDDEN)
+    with pytest.raises(AssertionError):
+        mm_schedule.get_embedding_chunk(rows, 0, 9, VIDEO_RUNS, first_row=12)
+    with pytest.raises(AssertionError):
+        mm_schedule._slice_item_chunk(rows, _run_item(), 3, 9, first_row=12)
 
 
 if __name__ == "__main__":
