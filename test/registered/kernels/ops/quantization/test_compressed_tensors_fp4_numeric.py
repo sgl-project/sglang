@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW4A16Nvfp4MoE,
 )
 from sglang.srt.utils.common import (
@@ -32,6 +33,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
+    make_mxfp4_weight_and_ref,
     make_nvfp4_weight_and_ref,
 )
 
@@ -68,7 +70,12 @@ def _make_weight(fmt, rows, cols, dtype):
         )
         # compressed-tensors stores the global scale as a divisor.
         return fp4, scales, (1 / global_scale).item(), ref
-    raise ValueError(fmt)
+    # E8M0 exponents, no global scale. The packed bytes do not depend on the
+    # activation dtype, and the helper builds its reference in bf16 only.
+    fp4, scales, ref = make_mxfp4_weight_and_ref(
+        rows, cols, torch.bfloat16, group_size=32
+    )
+    return fp4, scales, None, ref.to(dtype)
 
 
 def _build_linear(fmt, dtype, w4a4):
@@ -76,6 +83,8 @@ def _build_linear(fmt, dtype, w4a4):
     dropped, not applied, so it must match the a16 numbers."""
     if fmt == "nvfp4":
         scheme = CompressedTensorsW4A16Fp4(has_input_global_scale=w4a4)
+    else:
+        scheme = CompressedTensorsW4A16Mxfp4(has_input_activations=w4a4)
     layer = torch.nn.Module()
     scheme.create_weights(
         layer=layer,
@@ -100,6 +109,9 @@ LINEAR_CASES = [
     ("nvfp4", torch.float16, True),
     ("nvfp4", torch.bfloat16, False),
     ("nvfp4", torch.bfloat16, True),
+    # MXFP4 Marlin decodes E8M0 scales for bf16 only.
+    ("mxfp4", torch.bfloat16, False),
+    ("mxfp4", torch.bfloat16, True),
 ]
 
 
@@ -116,6 +128,15 @@ def test_linear_matches_dequant_reference(fmt, dtype, w4a4):
     assert torch.isfinite(out).all()
     rel = _rel_err(out, x @ weight_ref.T)
     assert rel < 0.02, f"relative error {rel:.4f} too large"
+
+
+@requires_fp4_marlin
+def test_mxfp4_linear_rejects_fp16():
+    """No fp16 MXFP4 kernel is instantiated, and dispatch would fall through to
+    a no-op returning garbage, so loading must fail instead."""
+    scheme, layer, _ = _build_linear("mxfp4", torch.float16, False)
+    with pytest.raises(RuntimeError, match="BF16"):
+        scheme.process_weights_after_loading(layer)
 
 
 @pytest.mark.skipif(
