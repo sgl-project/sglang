@@ -3705,11 +3705,19 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
             max_threads=1,
         )
 
-    def _compile(self, parameters=None, choice="auto", parallel=True, thinking=False):
-        tools = [
-            Tool(type="function", function=Function(name=name, parameters=parameters))
-            for name in ("alpha", "beta")
-        ]
+    def _compile(
+        self, parameters=None, choice="auto", parallel=True, thinking=False, tools=True
+    ):
+        tools = (
+            [
+                Tool(
+                    type="function", function=Function(name=name, parameters=parameters)
+                )
+                for name in ("alpha", "beta")
+            ]
+            if tools
+            else []
+        )
         parser = FunctionCallParser(tools, "glm47")
         constraint = parser.get_structure_constraint(
             choice, parallel_tool_calls=parallel, thinking_mode=thinking
@@ -3739,6 +3747,15 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                             self._accepts(grammar, prefix + "Hello"),
                             choice in ("auto", "none"),
                         )
+                        matcher = xgr.GrammarMatcher(grammar)
+                        self.assertEqual(
+                            matcher.accept_string(prefix + "Hello"),
+                            choice in ("auto", "none"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + "Hello" + alpha),
+                            choice == "auto",
+                        )
                         self.assertEqual(
                             self._accepts(grammar, prefix + alpha), choice != "none"
                         )
@@ -3750,6 +3767,16 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                             self._accepts(grammar, prefix + alpha * 2),
                             parallel and choice != "none",
                         )
+
+    def test_no_tools_allows_text(self):
+        for thinking in (False, True):
+            with self.subTest(thinking=thinking):
+                grammar = self._compile(choice="auto", thinking=thinking, tools=False)
+                prefix = "analysis</think>" if thinking else ""
+                self.assertTrue(self._accepts(grammar, prefix + "Hello"))
+                self.assertFalse(
+                    self._accepts(grammar, prefix + "<tool_call>alpha</tool_call>")
+                )
 
     def test_enum_json_types_and_boolean_schemas(self):
         cases = [
