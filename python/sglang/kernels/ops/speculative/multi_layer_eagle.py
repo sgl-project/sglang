@@ -17,12 +17,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_cpu, is_npu
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 if _is_cpu:
-    from sgl_kernel import rotate_input_ids_cpu
+    rotate_input_ids_cpu = LazyImport("sgl_kernel", "rotate_input_ids_cpu")
 
 
 @triton.jit

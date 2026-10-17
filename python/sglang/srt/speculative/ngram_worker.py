@@ -33,6 +33,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 
@@ -42,6 +43,10 @@ if is_xpu():
     )
 elif is_cuda() or is_hip():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+elif _is_cpu:
+    reconstruct_indices_from_tree_mask = LazyImport(
+        "sgl_kernel.speculative", "reconstruct_indices_from_tree_mask"
+    )
 else:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 

@@ -15,6 +15,7 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -24,7 +25,9 @@ _is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+    assign_extend_cache_locs_cpu = LazyImport(
+        "sgl_kernel", "assign_extend_cache_locs_cpu"
+    )
 
 
 def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:

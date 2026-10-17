@@ -3,11 +3,15 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 
 if _is_cpu:
-    from sgl_kernel import fill_accept_out_cache_loc_cpu, fill_bonus_tokens_cpu
+    fill_accept_out_cache_loc_cpu = LazyImport(
+        "sgl_kernel", "fill_accept_out_cache_loc_cpu"
+    )
+    fill_bonus_tokens_cpu = LazyImport("sgl_kernel", "fill_bonus_tokens_cpu")
 
 
 @triton.jit

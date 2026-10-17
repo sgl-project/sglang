@@ -3,11 +3,15 @@ import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_cpu
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 
 if _is_cpu:
-    from sgl_kernel import copy_all_layer_kv_cache_cpu
+    # torch_native startup must not load extensions for optional AOT features.
+    copy_all_layer_kv_cache_cpu = LazyImport(
+        "sgl_kernel", "copy_all_layer_kv_cache_cpu"
+    )
 
 
 @triton.jit
