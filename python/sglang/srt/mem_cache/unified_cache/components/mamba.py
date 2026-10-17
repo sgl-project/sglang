@@ -148,7 +148,10 @@ class MambaComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
-        if match_device_only:
+        # Host-only checkpoints never occupy a GPU slot. Counting the host
+        # value as a device-prefix match keeps Full KV indices reachable.
+        host_counts_as_device = self._mamba_host_only_checkpoint()
+        if match_device_only and not host_counts_as_device:
             return lambda node: node.component_data[ct].value is not None
 
         # HiCache: evicted + backuped (host_value present) is also a valid match
@@ -220,6 +223,75 @@ class MambaComponent(TreeComponent):
         req.kv.mamba_needs_clear = False
         return result
 
+    def _mamba_host_only_checkpoint(self) -> bool:
+        from sglang.srt.runtime_context import get_context, get_exec
+
+        # Default off. Callers that have not published exec (unit fixtures)
+        # stay on the existing GPU-donate path.
+        if not get_context().is_config_namespace_published("exec"):
+            return False
+        return bool(
+            getattr(get_exec().mamba, "enable_mamba_host_only_checkpoint", False)
+        )
+
+    def _copy_mamba_slot_to_host(
+        self, insert_params: InsertParams, slot: torch.Tensor
+    ) -> None:
+        """Copy one GPU mamba slot into the hicache host pool.
+
+        The radix node stores the host index only. The source GPU slot stays
+        with the request (or is freed by cleanup on finish).
+        """
+        host_pool = self._mamba_pool_host
+        if host_pool is None:
+            raise RuntimeError(
+                "--enable-mamba-host-only-checkpoint requires "
+                "--enable-hierarchical-cache"
+            )
+        host_indices = host_pool.alloc(1)
+        if host_indices is None:
+            raise RuntimeError(
+                "Not enough host memory for a mamba host-only checkpoint"
+            )
+        device_indices = slot.reshape(-1).to(dtype=torch.int64)
+        device_pool = self.cache.req_to_token_pool.mamba_pool
+        host_pool.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices
+        )
+        insert_params.mamba_host_value = host_indices
+
+    def _release_unused_host_checkpoint(
+        self,
+        insert_result: Optional[InsertResult],
+        insert_params: Optional[InsertParams],
+    ) -> None:
+        if insert_params is None or insert_params.mamba_host_value is None:
+            return
+        inserted = insert_result is not None and not insert_result.mamba_exist
+        if not inserted:
+            self.free_host_values([insert_params.mamba_host_value])
+
+    def _commit_host_only_checkpoint(
+        self,
+        node: UnifiedTreeNode,
+        params: InsertParams,
+        result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        ct = self.component_type
+        cd = node.component_data[ct]
+        if cd.host_value is not None or cd.value is not None:
+            result.mamba_exist = True
+            return
+        cd.host_value = params.mamba_host_value.clone()
+        cd.value = None
+        host_lru = self.tree_core.host_lru_lists[ct]
+        if not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+        node.last_access_time = get_and_increase_time_counter()
+        result.mamba_exist = False
+        self._emit_excess_path_states_eviction(node, cache_actions)
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
@@ -228,6 +300,10 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        if params.mamba_host_value is not None:
+            assert params.mamba_value is None
+            self._commit_host_only_checkpoint(node, params, result, cache_actions)
+            return
         assert params.mamba_value is not None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
@@ -593,12 +669,16 @@ class MambaComponent(TreeComponent):
                 if checkpoint is None:
                     return 0
                 cache_len, keep_idx = checkpoint
-                insert_params.mamba_keep_idx = keep_idx
+                if not self._mamba_host_only_checkpoint():
+                    insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
             else:
                 active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
+            if self._mamba_host_only_checkpoint():
+                self._copy_mamba_slot_to_host(insert_params, active_value)
+                return cache_len
             if self.int8_ckpt_pool is not None:
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
             else:
@@ -607,6 +687,18 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
+            if self._mamba_host_only_checkpoint():
+                if self.cache.enable_mamba_extra_buffer:
+                    keep_idx = (
+                        self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+                    )
+                    src_slot = req.kv.mamba_ping_pong_track_buffer[keep_idx]
+                else:
+                    src_slot = req.kv.mamba_pool_idx
+                if int(src_slot.reshape(-1)[0].item()) < 0:
+                    return 0
+                self._copy_mamba_slot_to_host(insert_params, src_slot)
+                return cache_len
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
@@ -648,6 +740,7 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        self._release_unused_host_checkpoint(insert_result, insert_params)
         if is_finished:
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
