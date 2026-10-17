@@ -16,11 +16,8 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.speculative.dflash_utils import (
-    can_dflash_slice_qkv_weight,
-    is_dflash_mla_draft_config,
-)
+from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
+from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
@@ -385,9 +382,6 @@ class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        # The DSpark context-KV writers slice a fused qkv_proj.
-        if is_dflash_mla_draft_config(config):
-            raise ValueError("DSpark drafts do not support mla draft attention.")
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None
@@ -550,7 +544,7 @@ class DSparkDraftMixin:
 
     def _build_fused_kv_write_bundle(self, pool):
         layers = list(self.layers)
-        if not layers:
+        if not layers or not self.supports_fused_context_kv:
             return None
         if not (hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")):
             return None
@@ -617,7 +611,10 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
-        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get():
+        if (
+            not envs.SGLANG_DSPARK_STACKED_CTX_KV.get()
+            or not self.supports_fused_context_kv
+        ):
             return None
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
@@ -706,6 +703,16 @@ class DSparkDraftMixin:
             )
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=pool,
+                    positions=positions,
+                    hidden_states=ctx_hidden,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                continue
             if stacked is not None:
                 k = k_all[i]
                 v = v_all[i]

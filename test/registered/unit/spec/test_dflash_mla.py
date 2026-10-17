@@ -1,4 +1,5 @@
-"""DFlash MLA drafts on the target MLA layer against SpecForge's expanded math."""
+"""DFlash and DSpark MLA drafts on the target MLA layer against SpecForge's
+expanded math."""
 
 import copy
 import itertools
@@ -7,16 +8,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from transformers import Qwen3Config
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
+from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
@@ -313,6 +316,53 @@ class TestDFlashMLA(CustomTestCase):
                     attn, ctx_hidden, ctx_positions, hidden, positions
                 )
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_dspark_draft_writes_context_kv_through_mla_layer(self):
+        """DSpark's own context-KV writers slice a fused qkv_proj; an MLA draft must
+        write the layer's latent rows instead, masked to the accepted verify rows."""
+        model = DSparkDraftModel(
+            Qwen3Config(
+                **_export_fields(),
+                markov_rank=4,
+                markov_head_type="vanilla",
+            )
+        )
+        attn = model.layers[0].self_attn
+        attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
+        for module in (attn.rotary_emb, attn.kv_a_layernorm):
+            module.forward = module.forward_native
+        # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
+        pool = Mock(spec=MLATokenToKVPool)
+        ctx_hidden, positions = torch.randn(4, HIDDEN), torch.tensor([0, 1, 5, 6])
+        cache_loc_2d = torch.tensor([[3, 4], [8, 9]])
+        commit_lens = torch.tensor([1, 2], dtype=torch.int32)
+        with torch.no_grad():
+            k_nope, k_pe = attn.project_context_kv(positions, ctx_hidden)
+            for verify_commit in (False, True):
+                model.write_target_hidden_kv(
+                    target_hidden=ctx_hidden,
+                    pool=pool,
+                    positions=positions,
+                    cache_loc=cache_loc_2d.flatten(),
+                    cache_loc_2d=cache_loc_2d if verify_commit else None,
+                    commit_lens=commit_lens if verify_commit else None,
+                    target_hidden_is_projected=True,
+                )
+
+        (layer, loc, *rows), _ = pool.set_mla_kv_buffer.call_args
+        self.assertIs(layer, attn.attn_mqa)
+        self.assertTrue(loc.physical)
+        self.assertTrue(torch.equal(loc.loc, cache_loc_2d.flatten()))
+        (layer, loc_2d, lens, *commit_rows), _ = (
+            pool.set_mla_kv_buffer_prefix_valid.call_args
+        )
+        self.assertIs(layer, attn.attn_mqa)
+        self.assertIs(loc_2d, cache_loc_2d)
+        self.assertIs(lens, commit_lens)
+        self.assertEqual(pool.set_mla_kv_buffer.call_count, 1)
+        for actual in (rows, commit_rows):
+            for got, expected in zip(actual, (k_nope, k_pe)):
+                torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
