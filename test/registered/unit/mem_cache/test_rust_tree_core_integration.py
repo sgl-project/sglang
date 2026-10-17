@@ -2190,7 +2190,14 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
 
 
 def _swa_transfer_core(
-    backend, unified=False, mamba=False, page_size=1, window=16, is_eagle=False
+    backend,
+    unified=False,
+    mamba=False,
+    page_size=1,
+    window=16,
+    is_eagle=False,
+    request_window=False,
+    has_swa_host_pool=True,
 ):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -2216,6 +2223,7 @@ def _swa_transfer_core(
         tree_components=(ComponentType.FULL, ComponentType.SWA)
         + ((ComponentType.MAMBA,) if mamba else ()),
         sliding_window_size=window,
+        swa_gates_prefix_match=not request_window,
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -2235,7 +2243,7 @@ def _swa_transfer_core(
             core = UnifiedTreeCore(params, components)
             cache.tree_core = core
     core.set_hicache_enabled()
-    core.has_swa_host_pool = True
+    core.has_swa_host_pool = has_swa_host_pool
     return core, allocator
 
 
@@ -2615,7 +2623,13 @@ def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
     core.sanity_check([], [])
 
 
-def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
+def _swa_cache(
+    window: int = 8,
+    page_size: int = 1,
+    backend="rust",
+    ring=False,
+    request_window=False,
+):
     """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -2642,6 +2656,9 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
     )
     if ring:
         kv_pool.swa_req_ring_size = window
+    if request_window:
+        # Stand-in for DeepSeek-V4.1's encoder-replay request window.
+        kv_pool.request_window = object()
     allocator = SWATokenToKVPoolAllocator(
         size=64,
         size_swa=64,
@@ -2660,6 +2677,7 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
                 page_size=page_size,
                 disable=False,
                 sliding_window_size=window,
+                swa_gates_prefix_match=not (ring or request_window),
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
             )
         )
@@ -3696,10 +3714,14 @@ def test_write_back_swa_repair_backup_leaves_the_unbacked_parent_to_eviction(bac
         return device + 40000
 
     cache._execute_kv_backup = write
+    # An SWA eviction floor of 4 means the request's window already slid past
+    # its first 4 slots and released their SWA peers.
+    value = allocator.alloc(8)
+    allocator.free_swa(value[:4])
     cache.insert(
         InsertParams(
             key=_key(list(range(8))),
-            value=allocator.alloc(8),
+            value=value,
             component_evicted_seqlens={ComponentType.SWA: 4},
         )
     )
@@ -3997,6 +4019,50 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     assert cache.path_device_indices(matched.last_device_node).tolist() == (
         indices[:8].tolist() if ring else []
     )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("hicache", [False, True])
+def test_swa_match_ignores_tombstones_with_a_request_window(backend, hicache):
+    # Encoder SWA replay keeps SWA in a per-request window and rebuilds it on a
+    # hit, so an SWA tombstone must not cut the Full-KV match short.
+    cache, allocator = _swa_cache(backend=backend, request_window=True)
+    indices = allocator.alloc(12)
+    cache.insert(
+        InsertParams(
+            key=_key(list(range(12))),
+            value=indices,
+            component_evicted_seqlens={ComponentType.SWA: 8},
+        )
+    )
+    if hicache:
+        cache.tree_core.set_hicache_enabled()
+    matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.full_kv_hit_length == 8
+    assert matched.device_prefix_len == 8
+    assert (
+        cache.path_device_indices(matched.last_device_node)[:8].tolist()
+        == indices[:8].tolist()
+    )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("request_window", [False, True])
+def test_swa_host_only_prefix_matches_with_a_request_window(backend, request_window):
+    # Without an SWA host pool, a prefix demoted to host keeps no SWA value.
+    # Replay rebuilds a request window, so the prefix stays a host hit; paged
+    # SWA still requires resident SWA state.
+    core, _ = _swa_transfer_core(
+        backend, request_window=request_window, has_swa_host_pool=False
+    )
+    leaf = _insert(core, list(range(8)), list(range(10, 18))).last_device_node
+    core.commit_backup(leaf, torch.arange(100, 108), {})
+    core.mark_write_through_pending([leaf], leaf)
+    core.finish_write_through([leaf], leaf)
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    assert core.component_has_host_value_only(leaf, ComponentType.FULL)
+    matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.host_hit_length == (8 if request_window else 0)
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():

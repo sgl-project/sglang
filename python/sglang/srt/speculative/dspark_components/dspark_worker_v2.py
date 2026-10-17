@@ -3,9 +3,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -698,12 +695,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
-        # thread the per-token state_slot + the req's final position so the
-        # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
+        # A SWA ring is keyed by (draft req slot, position); thread the per-token
+        # state_slot + the req's final position so the injector keeps only the
+        # last SWA window (older prefill tokens share a ring slot and would race).
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        if self._kv_injector.swa_ring_size is not None:
             repeats = ctx_lens.to(torch.int64)
             num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
@@ -716,6 +712,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
+        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
+        if getattr(draft_pool, "swa_req_ring_valid_from", None) is not None:
+            # A newly placed request's ring holds nothing below its cached prefix.
+            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+            if placed:
+                draft_pool.reset_swa_req_ring(
+                    batch.req_pool_indices[placed],
+                    torch.tensor(
+                        [batch.prefix_lens[i] for i in placed],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                )
         # The draft KV goes to the slots the target prefill just wrote.
         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
         batch_output.kv_loc_plan = None
