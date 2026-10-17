@@ -13,16 +13,15 @@ import pytest
 import requests
 import torch
 import torch.distributed as dist
-
 from sglang.srt.debug_utils.dumper import (
     DumperConfig,
     _collect_parallel_rank_tags,
-    _evaluate_filter,
     _collective_with_timeout,
     _compare_tensors_quick,
     _deepcopy_or_clone,
     _detect_recompute_status,
     _Dumper,
+    _evaluate_filter,
     _format_tags,
     _get_default_exp_name,
     _Grafter,
