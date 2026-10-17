@@ -173,8 +173,12 @@ class SchedulerRequestReceiver:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)
             else:
-                work_reqs = None
-                control_reqs = None
+                # Non-leader ranks contribute no data; [] not None because the
+                # attn-TP-0/CP-nonzero ranks become the src of the tp-hop
+                # broadcast in attn_cp_tp_broadcast_pyobj, whose pickling path
+                # calls len() on the value.
+                work_reqs = []
+                control_reqs = []
 
             work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
 

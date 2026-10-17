@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress
 
 try:
@@ -21,6 +22,12 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROTOCOL = "sdma"
+
+# MemFabric derives its data-plane port from the worker nic base port, so each
+# worker owns a stride of ports. Decode and Prefill get disjoint strides so
+# both roles can run on the same host.
+_WORKER_PORT_STRIDE = 8
+_ROLE_PORT_STRIDE = 128
 
 
 class AscendTransferEngine(MooncakeTransferEngine):
@@ -60,6 +67,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
         from sglang.srt.runtime_context import get_parallel
 
         transfer_protocol = self._get_transfer_protocol()
+        nic = ""
         if transfer_protocol == "device_rdma":
             # with device RDMA for PD transfer: initialize hccl in advance
             # through all_gather to avoid conflicts with rdma initialization.
@@ -73,11 +81,28 @@ class AscendTransferEngine(MooncakeTransferEngine):
                 tmp_tensor,
                 group=get_parallel().world_group.device_group,
             )
-
+        elif transfer_protocol == "host_rdma":
+            # host_rdma binds its data plane on the nic endpoint; memfabric
+            # would otherwise fall back to a loopback port peers cannot reach.
+            nic = self._resolve_worker_hcom_url(
+                envs.ASCEND_MF_HCOM_URL.get(),
+                self.role,
+                get_parallel().world_group.rank_in_group,
+            )
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
         """Initialize the ascend transfer instance."""
+        initialize_kwargs = {}
+        if nic:
+            # The nic argument exists only in memfabric_hybrid > v1.2.1
+            # (added with host rdma); older engines reject the keyword.
+            initialize_kwargs["nic"] = nic
         ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            self.store_url,
+            self.session_id,
+            self.role,
+            self.npu_id,
+            trans_op_type,
+            **initialize_kwargs,
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
@@ -92,10 +117,81 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
+    # Diagnostic kill-switch funnel: every mf data-plane copy (main KV send,
+    # DSV4 state payloads, staged sends) goes through batch_transfer_sync, so
+    # guarding here blocks them all regardless of caller. Decode will time
+    # out; watch only whether prefill still faults.
+    _skip_send_logged = False
+
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        if envs.SGLANG_DEBUG_SKIP_KV_SEND.get():
+            if not AscendTransferEngine._skip_send_logged:
+                AscendTransferEngine._skip_send_logged = True
+                logger.info("SGLANG_DEBUG_SKIP_KV_SEND=1: every mf transfer is skipped")
+            return 0
+        if envs.SGLANG_DEBUG_MTE_TRACE.get():
+            import time
+
+            print(
+                f"[mte.send] t={time.time():.3f} blocks={len(lengths)} "
+                f"bytes={sum(lengths)}",
+                flush=True,
+            )
+        return super().batch_transfer_sync(
+            session_id, buffers, peer_buffer_addresses, lengths
+        )
+
     @staticmethod
     def _get_transfer_protocol() -> str:
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
         return protocol.strip().lower() if protocol else _DEFAULT_PROTOCOL
+
+    @staticmethod
+    def _resolve_worker_hcom_url(hcom_url: str, role: str, world_rank: int) -> str:
+        if not hcom_url:
+            raise ValueError(
+                "ASCEND_MF_HCOM_URL (tcp://<rdma-nic-ip>:<port>) is required "
+                "for host_rdma; memfabric would otherwise bind a loopback "
+                "endpoint that peers cannot reach."
+            )
+
+        address, separator, port_str = hcom_url.rpartition(":")
+        if not separator or not address.startswith("tcp://"):
+            raise ValueError(f"Invalid port in ASCEND_MF_HCOM_URL: {hcom_url!r}")
+
+        try:
+            base_port = int(port_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid port in ASCEND_MF_HCOM_URL: {hcom_url!r}"
+            ) from exc
+
+        role_offset = 0 if role == "Decode" else _ROLE_PORT_STRIDE
+        worker_port = base_port + role_offset + world_rank * _WORKER_PORT_STRIDE
+        if not (1024 <= worker_port and worker_port + _WORKER_PORT_STRIDE - 1 <= 65535):
+            raise ValueError(
+                "Resolved ASCEND_MF_HCOM_URL port is out of range: "
+                f"base_port={base_port}, world_rank={world_rank}, "
+                f"role={role}, "
+                f"resolved_port_range={worker_port}-{worker_port + _WORKER_PORT_STRIDE - 1}"
+            )
+
+        worker_hcom_url = f"{address}:{worker_port}"
+        logger.info(
+            "Resolved Ascend Host RDMA endpoint: role=%s, world_rank=%d, "
+            "base=%s, endpoint=%s",
+            role,
+            world_rank,
+            hcom_url,
+            worker_hcom_url,
+        )
+        return worker_hcom_url
 
     @staticmethod
     def _resolve_trans_op_type(protocol: str):
