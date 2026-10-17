@@ -25,10 +25,10 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_defer_flux2_gated_residual,
+    can_defer_xpu_gated_residual,
     can_use_flux2_gated_resnorm,
     can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
-    can_use_xpu_gated_resnorm,
     can_use_xpu_layernorm_modulate,
     flux2_gated_resnorm_raw,
     flux2_nvfp4_swiglu_quant_active,
@@ -283,13 +283,10 @@ def _defer_gated_residual(
 def _can_defer_xpu(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
-    # The consuming norm's scale/shift are not known yet; the gate row stands in
-    # for their layout, and _flux2_gated_resnorm falls back if they differ.
     return (
         residual.is_xpu
-        and not torch.compiler.is_compiling()
         and not _FLUX2_XPU_GATED_RESNORM.disabled
-        and can_use_xpu_gated_resnorm(residual, update, gate, gate, gate)
+        and can_defer_xpu_gated_residual(residual, update, gate)
     )
 
 
@@ -353,7 +350,7 @@ def _xpu_gated_resnorm(
     if (
         torch.compiler.is_compiling()
         or _FLUX2_XPU_GATED_RESNORM.disabled
-        or not can_use_xpu_gated_resnorm(residual, update, gate, scale, shift)
+        or not can_use_xpu_layernorm_modulate(residual.dtype, residual.shape[-1])
     ):
         return None
     # Exactness depends on the reduction width and row layouts, not on row count.
@@ -443,7 +440,7 @@ def _flux2_norm_modulate(
 
     scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
-    use_xpu = x.is_xpu and can_use_xpu_layernorm_modulate(x, scale_row, shift_row)
+    use_xpu = x.is_xpu and can_use_xpu_layernorm_modulate(x.dtype, x.shape[-1])
     use_cuda = x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     if (
         _FLUX2_LN_MOD.disabled

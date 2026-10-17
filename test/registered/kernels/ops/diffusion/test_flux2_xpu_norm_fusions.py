@@ -15,7 +15,7 @@ import torch.nn as nn
 
 import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 from sglang.kernels.ops.diffusion import (
-    can_use_xpu_gated_resnorm,
+    can_defer_xpu_gated_residual,
     can_use_xpu_layernorm_modulate,
     residual_gate_add,
     xpu_gated_resnorm,
@@ -34,29 +34,27 @@ def _has_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
-def _inputs(rows: int, magnitude: float, seed: int):
+def _inputs(rows: int, magnitude: float, seed: int, batch: int = 1):
     torch.manual_seed(seed)
-    shape = (1, rows, _HIDDEN)
+    shape = (batch, rows, _HIDDEN)
     x = (
         torch.randn(shape, device="xpu") * magnitude
-        + torch.randn(1, rows, 1, device="xpu") * magnitude
+        + torch.randn(batch, rows, 1, device="xpu") * magnitude
     ).bfloat16()
     update = (torch.randn(shape, device="xpu") * magnitude).bfloat16()
-    params = (torch.randn(1, 1, 3 * _HIDDEN, device="xpu") * 0.5).bfloat16()
+    # Per-batch modulation rows as strided chunks of one adaLN projection.
+    params = (torch.randn(batch, 1, 3 * _HIDDEN, device="xpu") * 0.5).bfloat16()
     gate, scale, shift = params.chunk(3, dim=-1)
-    return x, update, gate.contiguous(), scale.contiguous(), shift.contiguous()
+    return x, update, gate, scale, shift
+
+
+_CASES = ((512, 1.0, 0, 1), (17, 30.0, 1, 1), (64, 0.05, 2, 1), (64, 1.0, 3, 2))
 
 
 class TestFlux2ImportWithoutIntelTriton(CustomTestCase):
-    # Runs on any device: the subprocess only imports flux_2.
     def test_flux2_imports_without_intel_triton(self):
-        # Regression: the kernel module imported `triton.language.extra.intel`
-        # at module scope. The package facade resolves `_EXPORTS` eagerly on
-        # attribute access, so flux_2.py's top-level import of the XPU entry
-        # points made Intel Triton an import-time requirement on *every*
-        # platform -- `import flux_2` then raised ModuleNotFoundError on CUDA,
-        # taking out FLUX.2 there entirely. Run in a subprocess so blocking the
-        # module cannot leak into this interpreter's import state.
+        # Importing flux_2 must not need Intel Triton; a subprocess keeps the
+        # blocked import from leaking into this interpreter.
         script = textwrap.dedent(
             """
             import importlib.abc
@@ -94,26 +92,24 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         )
 
     def test_layernorm_modulate_is_bit_exact(self):
-        for rows, magnitude, seed in ((512, 1.0, 0), (17, 30.0, 1), (64, 0.05, 2)):
-            x, _, _, scale, shift = _inputs(rows, magnitude, seed)
-            self.assertTrue(can_use_xpu_layernorm_modulate(x, scale, shift))
+        for rows, magnitude, seed, batch in _CASES:
+            x, _, _, scale, shift = _inputs(rows, magnitude, seed, batch)
+            self.assertTrue(can_use_xpu_layernorm_modulate(x.dtype, x.shape[-1]))
             expected = self.norm(x) * (1 + scale) + shift
             actual = xpu_layernorm_modulate(x, scale, shift, self.norm.eps)
-            self.assertTrue(torch.equal(actual, expected), (rows, magnitude))
+            self.assertTrue(torch.equal(actual, expected), (rows, magnitude, batch))
 
     def test_gated_resnorm_is_bit_exact(self):
-        for rows, magnitude, seed in ((512, 1.0, 0), (17, 30.0, 1), (64, 0.05, 2)):
-            residual, update, gate, scale, shift = _inputs(rows, magnitude, seed)
-            self.assertTrue(
-                can_use_xpu_gated_resnorm(residual, update, gate, scale, shift)
-            )
+        for rows, magnitude, seed, batch in _CASES:
+            residual, update, gate, scale, shift = _inputs(rows, magnitude, seed, batch)
+            self.assertTrue(can_defer_xpu_gated_residual(residual, update, gate))
             expected_residual = residual_gate_add(residual, update, gate)
             expected = self.norm(expected_residual) * (1 + scale) + shift
             actual, actual_residual = xpu_gated_resnorm(
                 residual, update, gate, scale, shift, self.norm.eps
             )
             self.assertTrue(torch.equal(actual_residual, expected_residual))
-            self.assertTrue(torch.equal(actual, expected), (rows, magnitude))
+            self.assertTrue(torch.equal(actual, expected), (rows, magnitude, batch))
 
     def test_flux2_dispatch_uses_xpu_kernels(self):
         residual, update, gate, scale, shift = _inputs(32, 1.0, 3)
@@ -137,10 +133,11 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         self.assertTrue(torch.equal(out, self.norm(residual) * (1 + scale) + shift))
 
     def test_unsupported_inputs_stay_eager(self):
-        for batch, dtype in ((1, torch.float16), (2, torch.bfloat16)):
-            residual = torch.randn(batch, 17, _HIDDEN, device="xpu", dtype=dtype)
-            update = torch.randn_like(residual)
-            gate = torch.randn(batch, 1, _HIDDEN, device="xpu", dtype=dtype)
+        fp16 = torch.randn(1, 17, _HIDDEN, device="xpu", dtype=torch.float16)
+        strided = torch.randn(1, _HIDDEN, 17, device="xpu").bfloat16().transpose(1, 2)
+        for residual in (fp16, strided):
+            update = torch.randn(residual.shape, device="xpu", dtype=residual.dtype)
+            gate = torch.randn(1, 1, _HIDDEN, device="xpu", dtype=residual.dtype)
             actual = flux2._defer_gated_residual(residual, update, gate)
             self.assertIsInstance(actual, torch.Tensor)
             self.assertTrue(
@@ -148,9 +145,17 @@ class TestFlux2XpuNormFusions(CustomTestCase):
             )
 
         # Rows narrower than torch-xpu's 1024-wide work-group take another dispatch.
-        x = torch.randn(1, 8, 3072, device="xpu", dtype=torch.bfloat16)
-        row = torch.randn(3072, device="xpu", dtype=torch.bfloat16)
-        self.assertFalse(can_use_xpu_layernorm_modulate(x, row, row))
+        self.assertFalse(can_use_xpu_layernorm_modulate(torch.bfloat16, 3072))
+
+    def test_launchers_reject_layouts_they_do_not_replicate(self):
+        x, update, gate, scale, shift = _inputs(16, 1.0, 4)
+        strided = x.transpose(1, 2).contiguous().transpose(1, 2)
+        with self.assertRaises(RuntimeError):
+            xpu_layernorm_modulate(strided, scale, shift, self.norm.eps)
+        with self.assertRaises(RuntimeError):
+            xpu_layernorm_modulate(x, scale.expand(2, 1, _HIDDEN), shift, 1e-6)
+        with self.assertRaises(RuntimeError):
+            xpu_gated_resnorm(x, update[:, :8], gate, scale, shift, self.norm.eps)
 
 
 if __name__ == "__main__":
