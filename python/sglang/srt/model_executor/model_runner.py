@@ -1953,13 +1953,33 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            load_counter = getattr(
+                self.token_to_kv_pool, "layer_transfer_counter", None
+            )
+            load_handle = (
+                load_counter.bind_forward_load()
+                if load_counter is not None
+                and hasattr(load_counter, "bind_forward_load")
+                else None
+            )
+            pending_mla = load_handle is not None
+            if pending_mla and (
+                forward_batch.can_run_tbo
+                or forward_batch.forward_mode.is_split_prefill()
+                or not getattr(self.model, "supports_mla_forward_load", False)
+            ):
+                raise RuntimeError(
+                    "Forward MLA load requires a supported model without TBO or split prefill"
+                )
+            forward_batch.mla_forward_load_counter = load_handle
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                not pending_mla
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -2004,7 +2024,8 @@ class ModelRunner:
                     forward_count=split_forward_count,
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                not pending_mla
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

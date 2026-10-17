@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -80,17 +81,45 @@ class LayerLoadingEvent:
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        self.forward_pending = False
+        self.generation = 0
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
+        if layer_index == self._num_layers - 1:
+            self.forward_pending = False
 
     def wait(self, layer_index: int):
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
+        if self.forward_pending:
+            return self
         return self.load_events[-1]
+
+    def query(self):
+        return not self.forward_pending and self.load_events[-1].query()
+
+    def synchronize(self):
+        if self.forward_pending:
+            raise RuntimeError("MLA load must be consumed by forward before waiting")
+        self.load_events[-1].synchronize()
+
+
+class ForwardLayerLoad:
+    """Bind layer hooks to one batch's event slot, including its generation."""
+
+    def __init__(self, counter: LayerDoneCounter, consumer_index: int):
+        self.counter = counter
+        self.consumer_index = consumer_index
+        self.generation = counter.events[consumer_index].generation
+
+    def before_layer(self, layer_index: int):
+        if self.counter.events[self.consumer_index].generation != self.generation:
+            raise RuntimeError("Forward MLA load handle refers to a recycled slot")
+        self.counter.before_layer(layer_index, self.consumer_index)
 
 
 class LayerDoneCounter:
@@ -101,12 +130,15 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self.on_layer_ready = None
 
     def update_producer(self):
-        self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index].finish_event.query(), (
+        next_index = (self.producer_index + 1) % self.num_counters
+        assert self.events[next_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
+        self.producer_index = next_index
+        self.events[next_index].generation += 1
         return self.producer_index
 
     def set_consumer(self, index: int):
@@ -115,9 +147,25 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        self.before_layer(threshold)
         self.events[self.consumer_index].wait(threshold)
 
+    def before_layer(self, layer_index: int, consumer_index: Optional[int] = None):
+        index = self.consumer_index if consumer_index is None else consumer_index
+        if index >= 0 and self.on_layer_ready is not None:
+            self.on_layer_ready(index, layer_index)
+
+    def bind_forward_load(self) -> Optional[ForwardLayerLoad]:
+        if (
+            self.consumer_index >= 0
+            and self.events[self.consumer_index].forward_pending
+        ):
+            return ForwardLayerLoad(self, self.consumer_index)
+        return None
+
     def reset(self):
+        if any(event.forward_pending for event in self.events):
+            raise RuntimeError("Cannot reset an unfinished forward MLA load")
         self.producer_index = -1
         self.consumer_index = -1
 
@@ -816,6 +864,8 @@ class HiCacheController:
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
+        if getattr(self, "_mla_forward_loads", None):
+            raise RuntimeError("Cannot reset pending forward MLA loads")
         self._stop_storage_threads()
 
         self.write_queue.clear()
@@ -1136,6 +1186,12 @@ class HiCacheController:
                 "target MLA layer count."
             )
 
+        mode = envs.SGLANG_MLA_DEDUP_LOAD_MODE.get()
+        if mode == "forward":
+            return self._start_loading_mla_forward(producer_id, op)
+        if mode != "sync":
+            raise ValueError(f"Unknown SGLANG_MLA_DEDUP_LOAD_MODE: {mode}")
+
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
         load_stream = self.l2_transfer_engine.host_to_device_stream
@@ -1188,6 +1244,109 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def _start_loading_mla_forward(self, producer_id: int, op: CacheOperation) -> int:
+        """Prefetch local H2D; forward submits each layer's broadcast."""
+        from sglang.srt.runtime_context import get_server_args
+
+        args = get_server_args()
+        if (
+            self.enable_storage
+            or args.disaggregation_mode != "null"
+            or args.pp_size != 1
+        ):
+            raise ValueError(
+                "Forward MLA load currently requires non-PD, PP1, L2-only serving"
+            )
+        if args.enable_unified_memory:
+            raise ValueError(
+                "Forward MLA load does not yet support movable device pages"
+            )
+        if not hasattr(self, "_mla_forward_loads"):
+            self._mla_forward_loads = {}
+        if producer_id in self._mla_forward_loads:
+            raise RuntimeError("MLA load slot already has unsubmitted broadcasts")
+
+        broadcaster = self.mla_dedup.broadcaster
+        producer = self.layer_done_counter.events[producer_id]
+        producer.forward_pending = True
+        producer.start_event.record()
+        load_stream = self.l2_transfer_engine.host_to_device_stream
+        if self.load_fence_stream is not None:
+            load_stream.wait_stream(self.load_fence_stream)
+        copy_ready = [device_module.Event() for _ in range(self.transfer_layer_id_max)]
+        with device_module.stream(load_stream):
+            producer.start_event.wait(load_stream)
+            source = self._prepare_mla_source_load(op) if broadcaster.is_src else []
+            draft = self._prepare_draft_load(op) or []
+            with self.l2_transfer_engine.host_to_device_submission(
+                source + draft, start_event=producer.start_event
+            ) as (prepared, completion):
+                indices = self.l2_transfer_engine.resolve_device_indices(
+                    self._mla_broadcast_transfer(op)
+                )
+                plan = broadcaster.prepare_broadcast(indices, load_stream)
+                prepared_source = prepared[: len(source)]
+                prepared_draft = prepared[len(source) :]
+                for layer in range(self.transfer_layer_id_max):
+                    self._load_mla_transfers_layer(prepared_source, layer)
+                    self._load_mla_transfers_layer(prepared_draft, layer)
+                    copy_ready[layer].record()
+
+        finish = device_module.Event(
+            **({"enable_timing": True} if completion.timing_enabled else {})
+        )
+        self._mla_forward_loads[producer_id] = {
+            "op": op,
+            "plan": plan,
+            "copy_ready": copy_ready,
+            "completion": completion,
+            "finish": finish,
+            "next_layer": 0,
+        }
+        self.layer_done_counter.on_layer_ready = self._broadcast_mla_forward_layer
+        return producer_id
+
+    def _broadcast_mla_forward_layer(self, producer_id: int, layer_id: int) -> None:
+        state = self._mla_forward_loads.get(producer_id)
+        if state is None:
+            return
+        if producer_id != next(iter(self._mla_forward_loads)):
+            raise RuntimeError("Forward MLA loads must be consumed in submission order")
+        if not 0 <= layer_id < self.transfer_layer_id_max:
+            raise ValueError(f"Invalid MLA consumer layer: {layer_id}")
+        if device_module.is_current_stream_capturing():
+            raise RuntimeError("Pending MLA broadcasts require an eager forward")
+        stream = device_module.current_stream()
+        for layer in range(state["next_layer"], layer_id + 1):
+            stream.wait_event(state["copy_ready"][layer])
+            self.mla_dedup.broadcaster.broadcast_loaded_layer(layer, state["plan"])
+            self.layer_done_counter.events[producer_id].complete(layer)
+            state["next_layer"] = layer + 1
+        if state["next_layer"] != self.transfer_layer_id_max:
+            return
+
+        # H2D completion alone does not make the peer KV ready.
+        state["finish"].record()
+        for indices in state["plan"]:
+            if indices is not None and indices.is_cuda:
+                indices.record_stream(stream)
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "load"), state["finish"]
+        )
+        op, completion = state["op"], state["completion"]
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=state["finish"],
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._mla_transfer_num_bytes(op),
+            )
+        )
+        del self._mla_forward_loads[producer_id]
 
     def _mla_broadcast_transfer(self, op: CacheOperation) -> L2Transfer:
         return L2Transfer(
