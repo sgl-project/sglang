@@ -316,6 +316,7 @@ def adjust_config_with_unaligned_cpu_tp(
             "llama4_vision_model",
             "num_attention_heads",
         ],
+        [model_config.hf_config, "vision_config", "pixtral", "num_attention_heads"],
     ]
     if hasattr(model_config.hf_config, "thinker_config"):
         multimodal_config.append(
