@@ -441,6 +441,37 @@ def try_sm120_fp8_linear(
     )
 
 
+def bf16_dense_gelu_tanh_mul_lut_xe20(
+    x: torch.Tensor, weight: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """Xe2 BF16 gate/up GEMM with explicit native BF16 activation lookup."""
+    import torch
+
+    if torch.compiler.is_compiling():
+        return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20(x, weight, table)
+    return get_kernel("gemm.bf16_dense_gelu_tanh_mul_lut_xe20", KernelBackend.AOT)(
+        x, weight, table
+    )
+
+
+register_kernel(
+    KernelSpec(
+        op="gemm.bf16_dense_gelu_tanh_mul_lut_xe20",
+        backend=KernelBackend.AOT,
+        target="sgl_kernel:bf16_dense_gelu_tanh_mul_lut_xe20",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description=(
+                "BF16 gate/up GEMM, BF16 projection rounding, table[gate_bits] * up; "
+                "contiguous [M,K], [2N,K], [65536]; K%32=N%32=0"
+            ),
+        ),
+        description="Native Xe2 dense gate/up GEMM with explicit BF16 GELU lookup.",
+    )
+)
+
+
 def kimi_k3_tiny_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Shape-tuned tiny GEMM for Kimi-K3, with the existing torch fallback."""
     from .kimi_k3 import kimi_k3_tiny_gemm as impl
@@ -450,6 +481,7 @@ def kimi_k3_tiny_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 __all__ = [
     "Fp8ScaledMMOp",
+    "bf16_dense_gelu_tanh_mul_lut_xe20",
     "bmm_fp8",
     "dsv3_fused_a_gemm",
     "dual_gemm_swiglu",
