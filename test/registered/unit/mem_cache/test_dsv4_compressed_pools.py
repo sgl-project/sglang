@@ -9,11 +9,16 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+    BuildDsparkSwaRingIndices,
+    build_block_seq_lens_causal,
+    build_dspark_swa_page_indices,
+    compute_dspark_window_gather,
+)
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
@@ -23,6 +28,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+    TargetHiddenKvInjector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -382,7 +390,9 @@ class TestV41KVPoolLayouts(CustomTestCase):
         self.assertEqual(min(rows), c4_kv_rows)
 
 
-class TestPagedDSparkWithEncoderReplay(CustomTestCase):
+class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
+    RING = 128 + 6  # sliding window + the largest draft token count
+
     def setUp(self):
         super().setUp()
         override = get_context().override_server_args(
@@ -423,19 +433,99 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
             is_draft_worker=draft,
         )
 
-    def test_target_window_and_draft_paged_storage_share_allocator_mapping(self):
+    def test_no_swa_state_needs_the_paged_allocator(self):
         target = self.make_pool(draft=False)
         draft = self.make_pool(draft=True)
-        allocator = SWATokenToKVPoolAllocator(
-            2048, 1024, 256, torch.float8_e4m3fn, "cpu", target, False
+        self.assertFalse(target.needs_paged_swa_allocator)
+        self.assertFalse(draft.needs_paged_swa_allocator)
+        self.assertEqual(draft.swa_req_ring_size, self.RING)
+        self.assertGreaterEqual(draft.swa_kv_pool.size, 3 * self.RING)
+
+    def _block_inputs(self, prefix_lens, slots, block_size=5):
+        seq_lens_casual = build_block_seq_lens_causal(
+            seq_lens=torch.tensor(prefix_lens),
+            block_size=block_size,
+            device="cpu",
         )
-        draft.register_mapping(allocator.full_to_swa_index_mapping)
-        allocator.full_to_swa_index_mapping[256:512] = torch.arange(768, 1024)
+        req_pool_indices_repeated = torch.tensor(slots).repeat_interleave(block_size)
+        return seq_lens_casual, req_pool_indices_repeated
+
+    def test_ring_indices_match_paged_indices_over_ring_rows(self):
+        prefix_lens, slots, block_size = [5, 200, 300], [2, 0, 1], 5
+        seq_lens_casual, req_rep = self._block_inputs(prefix_lens, slots)
+        # A paged mapping that sends every (slot, position) to its ring row.
+        positions = torch.arange(512)
+        req_to_token = torch.arange(3).view(-1, 1) * 1000 + positions
+        mapping = torch.full((3000,), -1, dtype=torch.int64)
+        for slot in range(3):
+            mapping[req_to_token[slot]] = slot * self.RING + positions % self.RING
+        gather = compute_dspark_window_gather(
+            seq_lens_casual=seq_lens_casual,
+            req_pool_indices_repeated=req_rep,
+            block_size=block_size,
+            swa_window=128,
+        )
+        out_loc = torch.cat(
+            [req_to_token[s, p : p + block_size] for s, p in zip(slots, prefix_lens)]
+        )
+        paged = build_dspark_swa_page_indices(
+            req_to_token=req_to_token,
+            full_to_swa_mapping=mapping,
+            req_pool_indices_per_request=gather.req_pool_indices_per_request,
+            offsets=gather.offsets,
+            invalid=gather.invalid,
+            out_loc=out_loc,
+            context_lens=gather.context_lens,
+            block_size=block_size,
+            swa_window=128,
+            page_index_aligned_size=64,
+        )
+        ring = BuildDsparkSwaRingIndices.torch(
+            seq_lens_casual=seq_lens_casual,
+            req_pool_indices_repeated=req_rep,
+            valid_from=torch.zeros(3, dtype=torch.int64),
+            ring_size=self.RING,
+            block_size=block_size,
+            swa_window=128,
+            page_index_aligned_size=64,
+        )
+        for got, want in zip(ring, paged):
+            torch.testing.assert_close(got, want)
+
+    def test_ring_window_starts_at_valid_from(self):
+        draft = self.make_pool(draft=True)
+        # Slot 1 was placed at a 290-token prefix hit; 10 positions are its own.
+        draft.reset_swa_req_ring(torch.tensor([1]), torch.tensor([290]))
+        seq_lens_casual, req_rep = self._block_inputs([300], [1])
+        indices, lengths = BuildDsparkSwaRingIndices.torch(
+            seq_lens_casual=seq_lens_casual,
+            req_pool_indices_repeated=req_rep,
+            valid_from=draft.swa_req_ring_valid_from,
+            ring_size=self.RING,
+            block_size=5,
+            swa_window=128,
+            page_index_aligned_size=64,
+        )
+        self.assertEqual(lengths.tolist(), [15] * 5)
+        rows = [self.RING + p % self.RING for p in range(290, 305)]
+        self.assertEqual(indices[0, :15].tolist(), rows)
+        self.assertTrue((indices[:, 15:] == -1).all())
+
+    def test_injection_writes_only_the_last_window(self):
+        pool = SimpleNamespace(swa_req_ring_size=self.RING, sliding_window=128)
+        positions = torch.arange(300)
+        loc = TargetHiddenKvInjector._ring_inject_loc(
+            None,
+            pool=pool,
+            positions=positions,
+            cache_loc_2d=None,
+            commit_lens=None,
+            state_slot=torch.full((300,), 2),
+            final_pos=torch.full((300,), 299),
+        )
+        self.assertTrue((loc[:172] == -1).all())
         self.assertEqual(
-            draft.translate_loc_from_full_to_swa(
-                torch.tensor([256, 300, 511])
-            ).tolist(),
-            [768, 812, 1023],
+            loc[172:].tolist(), (2 * self.RING + positions[172:] % self.RING).tolist()
         )
 
 

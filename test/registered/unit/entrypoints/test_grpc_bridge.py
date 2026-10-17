@@ -114,6 +114,29 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
 
 
+class TestNativeGrpcOpenAIResponses(CustomTestCase):
+    def test_rerank_list_of_models_is_serialized_as_over_http(self):
+        from sglang.srt.entrypoints.openai.protocol import RerankResponse
+
+        class _Rerank:
+            async def handle_request(self, request, raw_request):
+                return [RerankResponse(score=0.5, document="d", index=0)]
+
+        calls = []
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle._get_openai_serving = lambda: {"rerank": _Rerank()}
+        body = b'{"query": "q", "documents": ["d"]}'
+        callback = lambda payload, **kwargs: calls.append((payload, kwargs))
+
+        asyncio.run(
+            handle._run_openai_request("rerank", body, callback, streaming=False)
+        )
+
+        payload, kwargs = calls[-1]
+        self.assertEqual(kwargs["status_code"], 200)
+        self.assertEqual(json.loads(payload)[0]["score"], 0.5)
+
+
 class TestEngineStateNotifications(CustomTestCase):
     def setUp(self):
         self.manager = TokenizerManager.__new__(TokenizerManager)
