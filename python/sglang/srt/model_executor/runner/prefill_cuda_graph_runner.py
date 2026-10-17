@@ -332,6 +332,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.is_dsv41_model = (
+            model_runner.model_config.hf_config.model_type == "deepseek_v41"
+        )
         self.enable_lora = model_runner.lora_manager is not None
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
@@ -2115,6 +2118,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
+            prepared_ids = layer_kwargs.get("input_ids", args[0] if args else None)
+            # TODO: Add general multimodal replay tests before enabling for other models.
+            if self.is_dsv41_model and prepared_ids is not None:
+                static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
+                    prepared_ids
+                )
             # The captured body graph reads activations from the static
             # input_embeds slot. The outer model.forward (run eagerly)
             # passes the live embeddings into layer_model.forward as the
