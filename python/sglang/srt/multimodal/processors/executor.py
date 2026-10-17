@@ -1,10 +1,12 @@
 import asyncio
 import concurrent.futures
 import copy
+import logging
 import threading
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class _WorkerState(threading.local):
@@ -30,11 +32,32 @@ class MultimodalProcessorExecutor:
         self._worker_state = _WorkerState()
         self._clone_lock = threading.Lock()
 
-    async def run(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._run, function, args, kwargs
-        )
+    async def run(
+        self,
+        function: Callable[..., T],
+        *args: Any,
+        on_cancel: Optional[Callable[[T], None]] = None,
+        **kwargs: Any,
+    ) -> T:
+        future = self._executor.submit(self._run, function, args, kwargs)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # Running threads cannot be cancelled. Keep cleanup attached to the
+            # concurrent future, even if the event loop has already shut down.
+            future.cancel()
+            future.add_done_callback(lambda done: self._discard_result(done, on_cancel))
+            raise
+
+    @staticmethod
+    def _discard_result(future, on_cancel) -> None:
+        if future.cancelled() or future.exception() is not None:
+            return
+        if on_cancel is not None:
+            try:
+                on_cancel(future.result())
+            except Exception:
+                logger.exception("Failed to release abandoned multimodal features")
 
     def _run(
         self,
