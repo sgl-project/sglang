@@ -44,6 +44,16 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
             )
         return
 
+    if cfg.attention_backend == "dsa":
+        # GLM-5.2 DSA has its own packed 416-byte cache and FlashMLA prefill;
+        # the GenMHA native/FP8 prefill selection below is a different ABI.
+        if requested_dtype != "auto":
+            raise ValueError(
+                "DSA NVFP4 does not support --prefill-kv-cache-dequant-dtype; "
+                "FlashMLA sparse prefill uses a BF16 compatibility workspace"
+            )
+        return
+
     if requested_dtype == "auto":
         explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
         if explicit_backend in _NVFP4_PREFILL_DEQUANT_DTYPE:
@@ -299,6 +309,10 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         "flashinfer",
                         "trtllm_mla",
                     ]
+                    if cfg.kv_cache_dtype == "nvfp4":
+                        # GLM-5.2 DSA uses FlashMLA's distinct 416-byte row.
+                        # The DSA resolver validates architecture and split backends.
+                        KV4_ATTENTION_MLA_BACKEND_CHOICES.append("dsa")
                     assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                         f"KV4 MLA expects attention_backend to be one of "
                         f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {attention_backend}"
