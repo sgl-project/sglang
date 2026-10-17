@@ -955,6 +955,13 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
+def swa_recompute_floor(forward_batch: ForwardBatch) -> torch.Tensor:
+    """Per-token replay start: window rows below it were never rebuilt."""
+    extend_lens = forward_batch.extend_seq_lens.to(torch.int64)
+    prefix_lens = forward_batch.seq_lens.to(torch.int64) - extend_lens
+    return torch.repeat_interleave(prefix_lens, extend_lens).to(torch.int32)
+
+
 def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
@@ -1567,6 +1574,8 @@ class DeepseekV4AttnBackend(
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        if forward_batch.swa_recompute:
+            return False
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
         if int(seq_lens_cpu.max().item()) > max_seq_len:
@@ -2812,6 +2821,11 @@ class DeepseekV4AttnBackend(
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
+                swa_replay_start=(
+                    swa_recompute_floor(forward_batch)
+                    if forward_batch.swa_recompute
+                    else None
+                ),
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
