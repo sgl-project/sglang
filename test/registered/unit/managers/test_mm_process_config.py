@@ -1,3 +1,4 @@
+import asyncio
 import os
 import threading
 import unittest
@@ -142,6 +143,74 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         if proc.mm_processor_executor is not None:
             self.addCleanup(proc.mm_processor_executor.shutdown)
         return proc
+
+    def test_tokenizer_manager_routes_ids_and_rejects_legacy_partial_expansion(self):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        class Dispatched(Exception):
+            pass
+
+        input_ids = [10, 101, 11]
+
+        async def tokenize_texts(*args):
+            return input_ids, None
+
+        disagg = SimpleNamespace(
+            language_model_only=False,
+            language_only=False,
+            encoder_transfer_backend="zmq_to_scheduler",
+        )
+        # token-space processor: gets the request IDs, even with a prefix boundary
+        # legacy processor: keeps its text input, rejects a prefix boundary
+        for token_space, text, boundary, expected_input in (
+            (True, None, 1, input_ids),
+            (False, "image prompt", None, "image prompt"),
+            (False, None, 1, None),
+        ):
+            calls = []
+
+            async def capture(**kwargs):
+                calls.append(kwargs)
+                raise Dispatched
+
+            manager = object.__new__(TokenizerManager)
+            manager.mm_processor = SimpleNamespace(
+                use_token_space_processor=token_space,
+                prefer_tokenized_input=token_space,
+                process_mm_data_async=capture,
+            )
+            manager.tokenizer = object()
+            manager._tokenize_texts = tokenize_texts
+            manager.model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["test"])
+            )
+            manager.max_req_input_len = 4096
+            manager._validate_mm_limits = lambda request: None
+            manager._normalize_mm_content_hashes = lambda request: None
+            request = GenerateReqInput(
+                text=text,
+                input_ids=None if text else input_ids,
+                image_data=["image"],
+                mm_token_expansion_start_len=boundary,
+            )
+            with (
+                self.subTest(token_space=token_space, text=text, boundary=boundary),
+                patch(
+                    "sglang.srt.managers.tokenizer_manager.get_disagg",
+                    return_value=disagg,
+                ),
+            ):
+                if expected_input is None:
+                    with self.assertRaisesRegex(
+                        ValueError, "--enable-token-space-processor"
+                    ):
+                        asyncio.run(manager._tokenize_one_request(request))
+                    continue
+                with self.assertRaises(Dispatched):
+                    asyncio.run(manager._tokenize_one_request(request))
+                self.assertEqual(calls[-1]["input_text"], expected_input)
+                self.assertIs(calls[-1]["request_obj"], request)
 
     def test_configs_extracted(self):
         config = {
