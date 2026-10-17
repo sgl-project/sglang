@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
     count_pool_hits,
+    pool_transfer_misses,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
@@ -41,6 +42,7 @@ from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_call_guard import HostSpan, StorageCallKind
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -292,6 +294,30 @@ class HybridCacheController(BaseHiCacheController):
     def _stop_storage_threads(self):
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
+
+    def _transfer_host_spans(
+        self,
+        transfers: list[PoolTransfer],
+        kv_host_indices: Optional[torch.Tensor] = None,
+    ) -> List[HostSpan]:
+        """Host spans a batch v2 call touches, one per transfer: the KV span for
+        KV-derived pools, else the indices in the pool that allocated them."""
+        spans: List[HostSpan] = []
+        for transfer in transfers:
+            if transfer.host_indices is None or transfer.host_indices.numel() == 0:
+                continue
+            if transfer.indices_from_pool == PoolName.KV:
+                if kv_host_indices is not None:
+                    spans.append(HostSpan(self.storage_host_pool, kv_host_indices))
+                continue
+            owner = transfer.indices_from_pool or transfer.name
+            entry = self.mem_pool_host.entry_map.get(owner)
+            if entry is not None:
+                spans.append(HostSpan(entry.host_pool, transfer.host_indices))
+        return spans
+
+    def _storage_io_lease(self):
+        return self.mem_pool_host.layout_lease()
 
     @staticmethod
     def supports_page_envelope_host(storage_backend: str | None) -> bool:
@@ -1105,7 +1131,9 @@ class HybridCacheController(BaseHiCacheController):
         try:
             config = self.storage_config
             for pp_rank in range(config.tp_rank, config.pp_size, config.tp_size):
-                _, rank_hit_count = self._storage_hit_query(operation, pp_rank=pp_rank)
+                _, rank_hit_count = self._storage_hit_query(
+                    operation, pp_rank=pp_rank, call_kind=StorageCallKind.PROBE
+                )
                 storage_hit_count = min(storage_hit_count, rank_hit_count)
         except Exception:
             logger.exception("PP HiCache hit query failed for req=%s.", rid)
@@ -1366,7 +1394,10 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(
-        self, operation, pp_rank: Optional[int] = None
+        self,
+        operation,
+        pp_rank: Optional[int] = None,
+        call_kind: StorageCallKind = StorageCallKind.QUERY,
     ) -> tuple[list[str], int]:
         hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
@@ -1387,11 +1418,23 @@ class HybridCacheController(BaseHiCacheController):
             extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
         )
         if operation.pool_transfers:
-            hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+            hit_result = self._bounded_storage_call(
+                call_kind,
+                lambda: self.storage_backend.batch_exists_v2(
+                    hash_value, operation.pool_transfers, extra_info
+                ),
+                miss=PoolTransferResult.empty,
+                op="batch_exists_v2",
+                num_keys=len(hash_value),
             )
         else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+            kv_hit_count = self._bounded_storage_call(
+                call_kind,
+                lambda: self.storage_backend.batch_exists(hash_value, extra_info),
+                miss=lambda: 0,
+                op="batch_exists",
+                num_keys=len(hash_value),
+            )
             hit_result = PoolTransferResult(
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
             )
@@ -1526,8 +1569,15 @@ class HybridCacheController(BaseHiCacheController):
                     transfers_nonkv,
                 ):
                     results.update(
-                        self.storage_backend.batch_get_v2(
-                            transfers, extra_info=extra_info
+                        self._bounded_storage_call(
+                            StorageCallKind.GET,
+                            lambda: self.storage_backend.batch_get_v2(
+                                transfers, extra_info=extra_info
+                            ),
+                            miss=lambda: pool_transfer_misses(transfers),
+                            op="batch_get_v2",
+                            num_keys=sum(len(t.keys or ()) for t in transfers),
+                            spans=lambda: self._transfer_host_spans(transfers),
                         )
                     )
                 pool_hits = count_pool_hits(results)
@@ -1586,7 +1636,18 @@ class HybridCacheController(BaseHiCacheController):
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
                 results.update(
-                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
+                    self._bounded_storage_call(
+                        StorageCallKind.SET,
+                        lambda: self.storage_backend.batch_set_v2(
+                            transfers, extra_info=extra_info
+                        ),
+                        miss=lambda: pool_transfer_misses(transfers),
+                        op="batch_set_v2",
+                        num_keys=sum(len(t.keys or ()) for t in transfers),
+                        spans=lambda: self._transfer_host_spans(
+                            transfers, kv_host_indices=operation.host_indices
+                        ),
+                    )
                 )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
