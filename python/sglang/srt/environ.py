@@ -968,6 +968,36 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    # Kimi-K3 TP8 on gfx950, LL collectives fused with the attention-residual reads
+    # (layers/communication/k3_ll_comm_hip.py). Complete the attention output's
+    # all-reduce, the residual add and the FFN-side read in one kernel for 4-token
+    # batches (EAGLE C1 verify).
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ = EnvBool(True)
+    # With it, batches of 5 up to this many rows (<= 64) take the two-shot variant;
+    # slower than aiter's all-reduce + the Triton read on MI350X, so 4 (off) by default.
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ_MAX_ROWS = EnvInt(4)
+    # Run the latent-MoE tail (latent RMSNorm, up-projection, shared + residual add)
+    # as one kernel for decode-sized batches.
+    SGLANG_ROCM_K3_FUSED_LATENT_TAIL = EnvBool(True)
+    # Run that tail column-parallel (each rank reads 1/8 of the replicated up_proj)
+    # and fuse its all-gather with the next layer's attention read, up to 64 tokens.
+    SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
+    # Fuse the router top-k with aiter's MoE route sort for decode batches up to this
+    # many tokens; 0 disables.
+    SGLANG_ROCM_K3_FUSED_ROUTE_SORT_MAX_TOKENS = EnvInt(16)
+    # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at most 8
+    # tokens: past that its single quant workgroup costs more than a launch).
+    SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
+    # Split the MoE front's replicated router and latent down-projection by output
+    # columns (each rank reads 1/8 of them) and all-gather logits and latent, up to
+    # 64 tokens.
+    SGLANG_ROCM_K3_SPLIT_FRONT = EnvBool(True)
+    # Let the route sort's spare workgroups compute the next layer's attention-residual
+    # bank partials, so its fused reads only fold in the new stream.
+    SGLANG_ROCM_K3_ATTN_RES_BANK_PARTIALS = EnvBool(True)
+    # Batches up to this many tokens hand the A8W4 experts their routes in selection
+    # order, one block each, instead of grouped by expert; 0 disables (slower on MI350X).
+    SGLANG_ROCM_K3_MOE_ROUTE_DIRECT_MAX_TOKENS = EnvInt(0)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
