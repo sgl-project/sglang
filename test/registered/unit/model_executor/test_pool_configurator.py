@@ -1,6 +1,7 @@
 """CPU-only tests for pool_configurator.py: available_bytes -> MemoryPoolConfig."""
 
 import contextlib
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,8 @@ from sglang.srt.mem_cache.page_interleave import (
 )
 from sglang.srt.runtime_context import (
     get_context,
+    get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     get_schedule,
@@ -345,6 +348,100 @@ class TestDefaultConfigurator(CustomTestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+    def test_sparse_kv_manager_fixed_memory_is_reserved(self):
+        available = 1_000_000
+        memory_per_request = 100_000
+        cell_size = 256
+        page_size = 128
+        for attn_dp_size in (1, 2, 4):
+            mr = _make_model_runner(
+                self,
+                use_mla_backend=True,
+                max_running_requests=8,
+                page_size=page_size,
+            )
+            mr.attn_dp_size = attn_dp_size
+            # Match KVCacheConfigurator: placement is no longer stored in ps.
+            del mr.ps
+            fixed_memory = (8 // attn_dp_size + 1) * memory_per_request
+
+            with (
+                self.subTest(attn_dp_size=attn_dp_size),
+                mock_cpu_env(),
+                patch.dict(os.environ, {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"}),
+                patch(
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_fixed_memory_size",
+                    side_effect=lambda **kwargs: (
+                        (kwargs["max_running_requests_per_worker"] + 1)
+                        * memory_per_request
+                    ),
+                ),
+                patch(
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_cell_size",
+                    return_value=cell_size,
+                ),
+            ):
+                from sglang.srt.model_executor.pool_configurator import (
+                    DefaultPoolConfigurator,
+                )
+
+                configurator = DefaultPoolConfigurator(mr)
+                config = configurator.calculate_pool_sizes(available, page_size)
+                with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                    configurator.calculate_pool_sizes(fixed_memory - 1, page_size)
+
+                expected_tokens = ((available - fixed_memory) // cell_size) // page_size
+                self.assertEqual(
+                    config.max_total_num_tokens, expected_tokens * page_size
+                )
+
+    def test_sparse_pd_staging_is_reserved_before_index_pool(self):
+        """128K PD staging must not consume HBM already assigned to index KV."""
+        mr = _make_model_runner(
+            self,
+            num_layers=78,
+            use_mla_backend=True,
+            max_running_requests=6,
+            page_size=128,
+            disaggregation_mode="decode",
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.context_len = 131072
+        # Reported allocation: 131072 context + 4 headroom, aligned to 128.
+        staging_bytes = 131200 * (512 + 64) * 2 * 78
+        device_kv_bytes = 7 * 4096 * (512 + 64) * 2 * 78
+        index_bytes = 1024 * 128 * 2 * 78
+        with (
+            mock_cpu_env(),
+            get_exec().kernel.override(attention_backend="ascend"),
+            get_disagg().override(disaggregation_transfer_backend="ascend"),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1",
+                    "SGLANG_NPU_SPARSE_KV_ENABLE_LRU": "1",
+                    "SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR": "2",
+                },
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            result = configurator.calculate_pool_sizes(
+                device_kv_bytes + staging_bytes + index_bytes, 128
+            )
+            self.assertEqual(result.max_total_num_tokens, 1024)
+            with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
+                configurator.calculate_pool_sizes(
+                    device_kv_bytes + staging_bytes - 1, 128
+                )
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
