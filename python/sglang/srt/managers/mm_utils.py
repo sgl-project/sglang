@@ -296,7 +296,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         This function will replace the data-tokens in between with pad_values accordingly
         """
         assert_int64_array(input_ids, "input_ids")
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+        pad_items = mm_inputs.mm_items
         data_token_pairs = self.data_token_id_pairs
         mm_inputs.data_offsets = []
         if data_token_pairs is None:
@@ -326,13 +326,12 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
                 data_idx += 1
                 mm_inputs.data_offsets += [start_idx]
 
-            if data_idx >= len(pad_values):
-                data_idx = len(pad_values) - 1
+            if data_idx >= len(pad_items):
+                data_idx = len(pad_items) - 1
 
             num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[data_idx]
             if num_tokens > 0:
-                padded_ids.extend(array("q", [pad_value]) * num_tokens)
+                padded_ids.extend(pad_items[data_idx].padding_sequence(num_tokens))
 
             last_idx = end_idx
 
@@ -380,7 +379,10 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
             for i, item in enumerate(items):
                 for offset in items[i].offsets:
-                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
+                    input_ids_tensor[offset[0] : offset[1] + 1] = torch.as_tensor(
+                        item.padding_sequence(offset[1] - offset[0] + 1),
+                        dtype=input_ids_tensor.dtype,
+                    )
 
         return padded_input_ids
 
@@ -461,7 +463,7 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [item.pad_value for item in items]
+            pad_values = [value for item in items for value in item.padding_values()]
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(
@@ -1157,6 +1159,8 @@ def get_new_expanded_mm_items(original_mm_items):
                 # explicit None check, not `a or b`: the value is a multi-element
                 # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("grid_thws")
                 if image_grid_thw is None:
                     image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
