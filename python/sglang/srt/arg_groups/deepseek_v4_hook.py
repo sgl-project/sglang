@@ -280,9 +280,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     or (get_platform().is_hip and is_gfx95_supported())
                 ),
             ),
+            # Breakable is admitted: the fold's floor, replay-row skip and window
+            # layout are bucket-sized metadata the replay refreshes in place.
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),

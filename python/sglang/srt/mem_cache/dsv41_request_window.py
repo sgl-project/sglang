@@ -65,6 +65,7 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    pad: Optional[torch.Tensor] = None,
 ):
     n = pos.numel()
     if n == 0:
@@ -72,9 +73,12 @@ def window_layout(
     req = req.to(torch.int64)
     pos = pos.to(torch.int64)
     device = pos.device
-    groups = n if num_groups is None else int(num_groups)
+    # Padding rows (DP or graph-bucket fill) take a spare group behind the live
+    # requests, so they never shorten a request's commit range or commit themselves.
+    groups = n if num_groups is None else int(num_groups) + (pad is not None)
     offset = torch.arange(n, device=device)
-    group, group_first, group_last = _first_row_offsets(req)
+    group_req = req if pad is None else torch.where(pad, -1, req)
+    group, group_first, group_last = _first_row_offsets(group_req)
     first_pos = pos - (offset - group_first)
     history_rows = groups * window
 
@@ -111,6 +115,8 @@ def window_layout(
     history_loc = torch.arange(history_rows, device=device)
 
     commit_mask = (group_last - offset) < capacity
+    if pad is not None:
+        commit_mask &= ~pad
     return WindowLayout(
         req,
         pos,
@@ -175,6 +181,10 @@ class RequestWindow:
         assert not _capturing(), "request-window workspace must be sized before capture"
         size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
         self.workspace = self.pool_factory(size, 1)
+
+    def reserve_workspace(self, rows: int) -> None:
+        """Grow the workspace for a graph layout; only before any graph holds it."""
+        self._ensure_workspace(rows)
 
     def reset(self, slots):
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(

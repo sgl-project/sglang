@@ -1994,6 +1994,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # Encoder-SWA fold fields: eager breaks read them off this batch view.
+        static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay
+        static_forward_batch.encoder_swa_row_floor = forward_batch.encoder_swa_row_floor
+        static_forward_batch.encoder_swa_compress_skip = (
+            forward_batch.encoder_swa_compress_skip
+        )
+        static_forward_batch.encoder_swa_compress_rows = (
+            forward_batch.encoder_swa_compress_rows
+        )
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )

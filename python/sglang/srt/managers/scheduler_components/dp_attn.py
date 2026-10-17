@@ -389,6 +389,7 @@ def _local_prefill_cuda_graph_vote(
     breakable_prefill: bool,
     spec_algorithm: SpeculativeAlgorithm,
     model_config,
+    folds_encoder_swa_replay: bool = False,
 ) -> bool:
     """This rank's vote for the prefill graph (min-reduced across dp
     ranks). Extend and mixed batches share the runner's rank-local replay
@@ -402,6 +403,9 @@ def _local_prefill_cuda_graph_vote(
     mode = local_batch.forward_mode
     if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
         num_tokens = local_batch.extend_num_tokens
+        if folds_encoder_swa_replay:
+            # The forward replays the folded rows, so the bucket vote counts them.
+            num_tokens += folded_replay_rows(local_batch)
         input_embeds = local_batch.input_embeds
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
@@ -577,6 +581,12 @@ def prepare_mlp_sync_batch_raw(
         breakable_prefill=breakable_prefill,
         spec_algorithm=model_runner.spec_algorithm,
         model_config=model_runner.model_config,
+        folds_encoder_swa_replay=(
+            local_batch is not None
+            and local_batch.forward_mode.is_extend()
+            and local_batch.encoder_swa_reset is not None
+            and model_runner.attn_backend.folds_encoder_swa_replay
+        ),
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
