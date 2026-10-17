@@ -150,6 +150,47 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "per-rank buffer capacity"):
             impl._validate_common(torch.empty(5, 128), torch.zeros(5, 2))
 
+    def test_default_timeouts_passed_to_elastic_buffer(self):
+        group = _FakeGroup()
+        self._get(group)
+        self.assertEqual(len(_FakeBuffer.instances), 1)
+        instance = _FakeBuffer.instances[0]
+        self.assertEqual(instance.kwargs.get("num_cpu_timeout_secs"), 300)
+        self.assertEqual(instance.kwargs.get("num_gpu_timeout_secs"), 100)
+
+    def test_timeout_overrides_participate_in_key(self):
+        group = _FakeGroup()
+        first = self._get(group)
+        second = self._get(group, num_gpu_timeout_secs=600)
+        third = self._get(group, num_gpu_timeout_secs=600, num_cpu_timeout_secs=900)
+        self.assertIsNot(first, second)
+        self.assertIsNot(second, third)
+        self.assertEqual(len(_FakeBuffer.instances), 3)
+        self.assertEqual(
+            _FakeBuffer.instances[1].kwargs.get("num_gpu_timeout_secs"), 600
+        )
+        self.assertEqual(
+            _FakeBuffer.instances[2].kwargs.get("num_cpu_timeout_secs"), 900
+        )
+
+    def test_env_vars_override_default_timeouts(self):
+        from sglang.srt.environ import envs
+
+        group = _FakeGroup()
+        with (
+            patch.object(
+                envs.SGLANG_DEEPEP_V2_CPU_TIMEOUT_SECS, "get", return_value=600
+            ),
+            patch.object(
+                envs.SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS, "get", return_value=500
+            ),
+        ):
+            self._get(group)
+        self.assertEqual(len(_FakeBuffer.instances), 1)
+        instance = _FakeBuffer.instances[0]
+        self.assertEqual(instance.kwargs.get("num_cpu_timeout_secs"), 600)
+        self.assertEqual(instance.kwargs.get("num_gpu_timeout_secs"), 500)
+
 
 if __name__ == "__main__":
     unittest.main()
