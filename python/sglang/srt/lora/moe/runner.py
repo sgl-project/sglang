@@ -178,8 +178,24 @@ class MoeLoraRunner:
                     "MoE LoRA on an unquantized layer requires resident BF16 weights"
                 )
             return "bf16"
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        if isinstance(quant_method, Fp8MoEMethod):
+            if not quant_method.block_quant or getattr(
+                quant_method, "use_mxfp8", False
+            ):
+                raise NotImplementedError(
+                    "MoE LoRA on FP8 requires 128-block weight quantization; "
+                    "per-tensor and MXFP8 layers are unsupported"
+                )
+            if base_layer.w13_weight.dtype != torch.float8_e4m3fn:
+                raise NotImplementedError(
+                    "MoE LoRA on FP8 requires resident float8_e4m3fn weights; "
+                    "a Marlin-repacked FP8 layer is unsupported"
+                )
+            return "fp8"
         raise NotImplementedError(
-            "MoE LoRA supports unquantized BF16 MoE; "
+            "MoE LoRA supports unquantized BF16 and 128-block FP8 MoE; "
             f"this layer's quant method is {type(quant_method).__name__}"
         )
 
