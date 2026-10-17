@@ -76,6 +76,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_transformer,
     resolve_cache_dit_request_overrides,
 )
+from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -662,6 +663,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if batch.enable_teacache and hasattr(transformer, "reset_teacache_state"):
                 transformer.reset_teacache_state()
             if batch.enable_spectrum and hasattr(transformer, "reset_spectrum_state"):
+                transformer.reset_spectrum_state(batch.spectrum_params)
+
+    def _release_spectrum_history(self, batch: Req) -> None:
+        """Free every DiT's Spectrum history (a feature copy per real step and CFG
+        branch); nothing reads it again this request, and it would sit through decode."""
+        if not batch.enable_spectrum:
+            return
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if isinstance(transformer, SpectrumMixin):
                 transformer.reset_spectrum_state(batch.spectrum_params)
 
     def _maybe_override_attention_backend(
@@ -2008,6 +2018,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_model = self.transformer_2
             current_guidance_scale = batch.guidance_scale_2
             current_phase = "transformer_2"
+            if batch.enable_spectrum and isinstance(self.transformer, SpectrumMixin):
+                # Timesteps only decrease, so the high-noise expert is done for this
+                # request; free its per-branch full-sequence feature history.
+                self.transformer.reset_spectrum_state(batch.spectrum_params)
 
         self._manage_dit_use_site(current_model, current_phase, batch)
 
@@ -2112,6 +2126,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 guidance=ctx.guidance,
             )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
+        self._release_spectrum_history(batch)
 
         # collect rollout outputs before finalization gathers or replaces latents
         if batch.rollout:
