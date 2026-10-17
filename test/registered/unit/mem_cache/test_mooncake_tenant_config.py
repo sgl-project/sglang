@@ -3,7 +3,7 @@ import tempfile
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -193,6 +193,74 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                     ),
                 ):
                     MooncakeStore(_make_storage_config(tenant, dtype))
+
+    def test_legacy_fallback_uses_original_tenant_and_read_only_client(self):
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        pool.layout, pool.page_size = "page_first", 16
+        cfg = _make_storage_config("tenant-a", "bfloat16")
+        cfg.extra_config["legacy_cache_fallback"] = dict(
+            kv_cache_dtype="bfloat16",
+            layout="page_first",
+            page_size=16,
+            verified_compatible=True,
+        )
+        with patch.dict(
+            "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+        ):
+            store = MooncakeStore(cfg, pool)
+        legacy = store._legacy_fallback.legacy
+        self.assertEqual(store.config.tenant_id, "tenant-a_dtype_bfloat16")
+        self.assertEqual(legacy.setup_calls[0][1], {"tenant_id": "tenant-a"})
+        self.assertEqual(legacy.setup_calls[0][0][2], 0)
+        self.assertIsNone(legacy.setup_calls[0][0][7])
+        self.assertEqual(legacy.objects, {})
+        with self.assertRaisesRegex(ValueError, "hybrid/side"):
+            store.register_mem_host_pool_v2(pool, "swa")
+        for flag in ("standalone_storage", "enable_group_semantics"):
+            with (
+                self.subTest(flag=flag),
+                patch.dict(
+                    "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+                ),
+            ):
+                cfg.extra_config[flag] = True
+                with self.assertRaisesRegex(ValueError, "embedded MHA/MLA"):
+                    MooncakeStore(cfg, pool)
+                del cfg.extra_config[flag]
+
+    def test_legacy_fallback_hooks_and_clear(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.legacy_fallback import (
+            LegacyCacheFallback,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.store = Mock()
+        legacy = Mock()
+        store._legacy_fallback = LegacyCacheFallback(store.store, legacy)
+        store.store.batch_is_exist.return_value = [0]
+        legacy.batch_is_exist.return_value = [1]
+        self.assertEqual(store._batch_exist(["key"]), [1])
+        legacy.batch_is_exist.assert_called_once_with(["key"])
+        store.store.batch_get_into.return_value = [4]
+        self.assertEqual(store._get_batch_zero_copy_impl(["key"], [0], [4]), [4])
+        legacy.get.assert_not_called()
+        store.store.batch_get_into_multi_buffers.return_value = [4]
+        self.assertEqual(
+            store._get_batch_zero_copy_impl(["key"], [[0, 0]], [[2, 2]]), [4]
+        )
+        store.clear()
+        self.assertIsNone(store._legacy_fallback)
+        store.store.remove_all.assert_called_once_with()
+        legacy.remove_all.assert_not_called()
+        self.assertEqual(store._batch_exist(["key"]), [0])
 
     def test_embedding_store_forwards_tenant_id(self):
         FakeMooncakeDistributedStore.instances = []
