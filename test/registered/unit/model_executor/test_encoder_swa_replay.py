@@ -18,7 +18,11 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4AttnMetadata,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
     _fold_batch,
@@ -361,6 +365,145 @@ class TestFoldedReplayCompressorWrites(CustomTestCase):
         ((kv, slots),) = written
         torch.testing.assert_close(kv, rows)
         torch.testing.assert_close(slots, out_loc)
+
+
+class TestFoldedReplayUnderPrefillGraph(CustomTestCase):
+    """The breakable prefill graph replays a folded batch padded to its captured
+    bucket and refreshes the captured metadata in place before each replay."""
+
+    PAD = 32
+
+    def _graph_batch(self, fx, *, compress_rows):
+        """The static batch a replay builds metadata from: the live rows, then
+        padding rows on slot 0."""
+        fb = TestFoldedReplayCompressorWrites._forward_batch(self, fx)
+        pad = torch.zeros(self.PAD, dtype=fb.out_cache_loc.dtype)
+        fb.out_cache_loc = torch.cat([fb.out_cache_loc, pad])
+        fb.positions = torch.cat([fb.positions, pad])
+        fb.encoder_swa_compress_rows = compress_rows
+        return fb
+
+    def _metadata(self, fx, fb, *, use_prefill_cuda_graph):
+        backend = _backend(fx)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=fx.req_to_token)
+        backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *_, **__: 0)
+        backend.is_dspark_draft = False
+        backend.topk = backend.speculative_num_steps = 0
+        with (
+            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+        ):
+            return backend._build_forward_metadata(
+                fb, use_prefill_cuda_graph=use_prefill_cuda_graph
+            )
+
+    def test_padding_rows_get_no_window_and_commit_nowhere(self):
+        fx = _Fixture()
+        live = sum(fx.folded.batch.extend_lens)
+        graph = self._metadata(
+            fx,
+            self._graph_batch(fx, compress_rows=fx.folded.keep_rows),
+            use_prefill_cuda_graph=True,
+        ).core_attn_metadata.request_window_layout
+        eager = self._metadata(
+            fx,
+            TestFoldedReplayCompressorWrites._forward_batch(self, fx),
+            use_prefill_cuda_graph=False,
+        ).core_attn_metadata.request_window_layout
+
+        self.assertEqual(graph.pos.numel(), live + self.PAD)
+        # The graph fixes its window groups, so workspace offsets differ from
+        # eager; each live row still sees the same window and commits the same.
+        live_rows = graph.leading_rows(live)
+        torch.testing.assert_close(live_rows.lengths, eager.lengths)
+        torch.testing.assert_close(live_rows.commit_mask, eager.commit_mask)
+        torch.testing.assert_close(
+            (live_rows.indices >= 0).sum(-1), (eager.indices >= 0).sum(-1)
+        )
+        self.assertEqual(live_rows.write_loc.unique().numel(), live)
+        self.assertFalse(bool(graph.commit_mask[live:].any()))
+        self.assertTrue(bool((graph.lengths[live:] == 0).all()))
+        self.assertTrue(bool((graph.indices[live:] == -1).all()))
+        # Padding rows write past the live rows, never onto a live row's slot.
+        self.assertTrue(
+            bool((graph.write_loc[live:] > graph.write_loc[:live].max()).all())
+        )
+
+    def test_graph_slots_do_not_alias_the_static_out_cache_loc(self):
+        """A capture has no replay rows; the replay that has them refreshes the
+        captured slots in place, which must leave the batch's input untouched."""
+        fx = _Fixture()
+        fb = self._graph_batch(fx, compress_rows=None)
+        raw = self._metadata(
+            fx, fb, use_prefill_cuda_graph=True
+        ).core_attn_metadata.raw_out_loc
+        self.assertNotEqual(
+            raw.untyped_storage().data_ptr(),
+            fb.out_cache_loc.untyped_storage().data_ptr(),
+        )
+        torch.testing.assert_close(raw, fb.out_cache_loc)
+
+        eager = TestFoldedReplayCompressorWrites._forward_batch(self, fx)
+        eager.encoder_swa_compress_rows = None
+        raw = self._metadata(
+            fx, eager, use_prefill_cuda_graph=False
+        ).core_attn_metadata.raw_out_loc
+        self.assertIs(raw, eager.out_cache_loc)
+
+
+class TestEncoderReplayPrefillGraphGate(CustomTestCase):
+    def _validate(self, backend, *, hip=False):
+        from sglang.srt.arg_groups import deepseek_v4_hook
+
+        cfg = SimpleNamespace(
+            enable_encoder_swa_bounded_replay=True,
+            dsv4_attn_backend="flashmla",
+            cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend=backend)),
+            attn_cp_size=1,
+            enable_unified_cache_external_linker=False,
+            enable_unified_memory=False,
+            disaggregation_mode="null",
+            enable_mixed_chunk=False,
+            enable_lora=False,
+            enable_session_radix_cache=False,
+            speculative_algorithm=None,
+            enable_hisparse=False,
+            enable_two_batch_overlap=False,
+            # Rejected right after the encoder replay checks: reaching it means
+            # they passed.
+            pp_size=2,
+        )
+        model = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
+        with (
+            patch.object(deepseek_v4_hook, "resolving_view", return_value=cfg),
+            patch.object(deepseek_v4_hook, "model_config_of", return_value=model),
+            patch.object(
+                deepseek_v4_hook,
+                "get_platform",
+                return_value=SimpleNamespace(is_cuda=not hip, is_hip=hip),
+            ),
+            patch.object(deepseek_v4_hook, "is_gfx95_supported", return_value=True),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+                "is_unified_kv_triton",
+                return_value=False,
+            ),
+        ):
+            deepseek_v4_hook.validate_deepseek_v41_features(None)
+
+    def test_breakable_prefill_graph_is_accepted(self):
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            self._validate(Backend.BREAKABLE)
+
+    def test_other_prefill_graph_backends_are_rejected(self):
+        for backend in (Backend.FULL, Backend.TC_PIECEWISE):
+            with self.assertRaisesRegex(ValueError, "other than breakable"):
+                self._validate(backend)
+
+    def test_prefill_graph_on_rocm_is_rejected(self):
+        """ROCm replays hits in a forward of their own, outside the graph."""
+        with self.assertRaisesRegex(ValueError, "prefill CUDA graph on ROCm"):
+            self._validate(Backend.BREAKABLE, hip=True)
 
 
 class TestFoldMlpSync(CustomTestCase):

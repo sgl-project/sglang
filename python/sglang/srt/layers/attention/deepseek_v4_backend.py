@@ -698,6 +698,8 @@ class DSV4AttnMetadata:
             "trtllm_prefill_c4_indices",
             "trtllm_prefill_c128",
         ]
+        if self.request_window_layout is not None:
+            self.request_window_layout.copy_(other.request_window_layout)
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
         for field_name in tensor_copy_fields:
@@ -1476,6 +1478,9 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_tensor=extend_seq_lens,
             extend_start_loc=extend_start_loc,
         )
+        graph_window = (
+            use_prefill_cuda_graph and self.token_to_kv_pool.request_window is not None
+        )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1488,7 +1493,13 @@ class DeepseekV4AttnBackend(
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
-            num_groups=len(extend_seq_lens_cpu),
+            # A graph fixes its window groups: each request has a live row.
+            num_groups=(
+                min(self.req_to_token.shape[0], padded_num_tokens)
+                if graph_window
+                else len(extend_seq_lens_cpu)
+            ),
+            request_window_live_rows=num_tokens if graph_window else None,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -2663,6 +2674,9 @@ class DeepseekV4AttnBackend(
             else None
         )
 
+        self._activate_request_window()
+
+    def _activate_request_window(self) -> None:
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
                 self.forward_metadata.core_attn_metadata.request_window_layout
@@ -2739,6 +2753,8 @@ class DeepseekV4AttnBackend(
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
+        if request_layout is not None:
+            request_layout = request_layout.leading_rows(num_qo_tokens)
         seq_lens_cpu_list = seq_lens_cpu.tolist()
         total_swa = sum(
             min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
@@ -2783,13 +2799,17 @@ class DeepseekV4AttnBackend(
         )
 
     @staticmethod
-    def _compressor_out_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+    def _compressor_out_loc(
+        forward_batch: ForwardBatch, *, own_buffer: bool = False
+    ) -> torch.Tensor:
         """Slot 0 for folded replay rows: their main KV, compressed groups and index
-        keys are cached, so the compressors write only the new rows."""
+        keys are cached, so the compressors write only the new rows. A prefill graph
+        refreshes the captured slots in place, so it takes its own buffer rather
+        than the static out_cache_loc."""
         loc = forward_batch.out_cache_loc
         keep = forward_batch.encoder_swa_compress_rows
         if keep is None:
-            return loc
+            return loc.clone() if own_buffer else loc
         return torch.zeros_like(loc).index_copy_(0, keep, loc[keep])
 
     def _build_forward_metadata(
@@ -2892,7 +2912,9 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=self._compressor_out_loc(forward_batch),
+                out_cache_loc=self._compressor_out_loc(
+                    forward_batch, own_buffer=use_prefill_cuda_graph
+                ),
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -2910,11 +2932,14 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        self._activate_request_window()
         with_tail = (
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -2974,6 +2999,8 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        self.encoder_replay = metadata_batch.encoder_swa_replay
+        self.encoder_row_floor = metadata_batch.encoder_swa_row_floor
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2982,6 +3009,7 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
+        self._activate_request_window()
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(metadata_batch, max_seq_len)
             if capture_metadata.prefill_graph_tail
@@ -4335,6 +4363,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        request_window_live_rows: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -4388,12 +4417,15 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
+            # A prefill CUDA graph pads the queries; only the live rows have a window.
+            live = request_window_live_rows
             request_layout = window_layout(
-                req_pool_indices_repeated,
-                raw_positions,
+                req_pool_indices_repeated[:live],
+                raw_positions[:live],
                 capacity=self.token_to_kv_pool.request_window.capacity,
-                floor=swa_replay_start,
+                floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,
+                padded_rows=None if live is None else raw_positions.numel(),
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
