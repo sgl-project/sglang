@@ -45,7 +45,6 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
-    InClosedRange,
     Invariant,
     IsTrue,
     expect,
@@ -54,10 +53,6 @@ from sglang.srt.utils.invariants import (
 
 logger = logging.getLogger(__name__)
 
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.planner.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
 # Scheduled verify lengths must not exceed the per-step token budget.
 _VERIFY_LEN_BUDGET = Invariant("dspark.verify_len_budget", Bucket.GUARD, IsTrue())
 
@@ -215,12 +210,6 @@ class DSparkVerifyPlanner:
         return self._confidence_head is not None
 
     @property
-    def last_confidence_raw(self) -> Optional[torch.Tensor]:
-        if self._confidence_head is None:
-            return None
-        return self._confidence_head._last_confidence_raw
-
-    @property
     def schedules_verify_budget(self) -> bool:
         return self._budget_planner is not None
 
@@ -250,37 +239,6 @@ class DSparkVerifyPlanner:
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
-        )
-
-    def compute_confidence_tensor(
-        self,
-        *,
-        draft_hidden: Optional[torch.Tensor],
-        anchor_tokens: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        confidence_tap: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if self._confidence_head is None:
-            return None
-        compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
-        if compute_confidence_hook is not None:
-            assert confidence_tap is not None, (
-                "dsv4 compute_confidence needs the compute_base_logits tap"
-            )
-            with torch.inference_mode():
-                return compute_confidence_hook(
-                    anchor_tokens=anchor_tokens,
-                    sampled_tokens=draft_tokens,
-                    x_post_hc=confidence_tap,
-                )
-        assert draft_hidden is not None
-        return compute_confidence(
-            draft_hidden=draft_hidden,
-            anchor_tokens=anchor_tokens,
-            draft_tokens=draft_tokens,
-            confidence_head=self._confidence_head,
-            markov_head=self.draft_model.markov_head,
-            gamma=self.gamma,
         )
 
     def prepare_verify_budget(
@@ -875,44 +833,6 @@ def apply_logits_adjustments_strided(
         sampling_info=sampling_info,
         draft_token_num=verify_num_draft_tokens,
     )
-
-
-def build_markov_embed_stack(
-    *,
-    anchor_tokens: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    markov_head,
-    gamma: int,
-) -> torch.Tensor:
-    prev_seq = torch.cat(
-        [anchor_tokens.view(-1, 1), draft_tokens[:, : gamma - 1]], dim=1
-    )
-    return markov_head.get_prev_embeddings(prev_seq)
-
-
-def compute_confidence(
-    *,
-    draft_hidden: torch.Tensor,
-    anchor_tokens: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    confidence_head,
-    markov_head,
-    gamma: int,
-) -> torch.Tensor:
-    assert confidence_head is not None
-    if confidence_head.with_markov:
-        markov_embed_stack = build_markov_embed_stack(
-            anchor_tokens=anchor_tokens,
-            draft_tokens=draft_tokens,
-            markov_head=markov_head,
-            gamma=gamma,
-        )
-    else:
-        markov_embed_stack = None
-    confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
-    confidence = confidence_head.apply_sts(confidence_raw)
-    expect(_CONFIDENCE, confidence)
-    return confidence
 
 
 class DSparkScheduleConfig(msgspec.Struct):
