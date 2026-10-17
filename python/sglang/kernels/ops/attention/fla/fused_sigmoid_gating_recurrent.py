@@ -620,7 +620,14 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    # Each program writes only the rows in its own [bos, eos) range. A padded
+    # cuda-graph request has an empty cu_seqlens segment, so no program writes
+    # its rows of `o`. The caller would then read uninitialized memory. Zero
+    # the output for a varlen launch. A non-varlen launch covers every row.
+    if cu_seqlens is not None:
+        o = q.new_zeros(NK, *v.shape)
+    else:
+        o = q.new_empty(NK, *v.shape)
 
     # Prepare retrieve_parent_token strides
     if retrieve_parent_token is not None:
