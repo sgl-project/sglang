@@ -7315,6 +7315,9 @@ class UnifiedRadixCacheSuite:
         # The backed parent stops the Full backup chain, while the SWA window
         # reaches the unbacked grandparent and marks it under the anchor's ack.
         insert(3 * page)
+        # Queue the asynchronous window backup explicitly: write-back insertion
+        # no longer publishes it, but Mamba eviction must still respect its ack.
+        cache._execute_and_commit_kv_backup(BackupKV(node_ids=[anchor]))
         self.assertEqual(
             cache.ongoing_write_through[anchor].publish_node_ids, nodes[:3]
         )
@@ -9564,11 +9567,8 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
-    def test_write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone(
-        self,
-    ):
-        """Write-back builds the insert backup as [target] only, so a second SWA
-        window publish never re-marks an ancestor another ack still holds."""
+    def test_write_back_defers_swa_window_backup_until_eviction(self):
+        """Reinserting backed Full nodes must not publish freshly recovered SWA."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
         if self._skip_unsupported_hicache_test():
@@ -9612,16 +9612,14 @@ class UnifiedRadixCacheSuite:
             "_execute_and_commit_kv_backup",
             wraps=cache._execute_and_commit_kv_backup,
         ) as backups:
-            for seq, target in ((t1_seq, t1), (t2_seq, t2)):
-                backups.reset_mock()
+            for seq in (t1_seq, t2_seq):
                 self._insert(cache, allocator, req_to_token_pool, seq)
-                self.assertEqual(
-                    [call.args[0].node_ids for call in backups.call_args_list],
-                    [[target]],
-                )
+            backups.assert_not_called()
 
-        for node, ack in ((c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)):
-            self.assertEqual(cache.tree_core.get_write_through_pending_id(node), ack)
+        for node in (c, b, t1, d, t2):
+            self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
+            self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+        self.assertEqual(cache.cache_controller.write_queue, [])
         # Write-back defers the unbacked Full prefix to eviction.
         self.assertFalse(cache.tree_core.is_backuped(c))
         self.assertFalse(cache.tree_core.is_backuped(d))
