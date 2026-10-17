@@ -5,16 +5,20 @@ This module contains runtime execution functions for block-sparse attention kern
 These utilities are used by CUTE DSL kernels to produce and consume block-sparse loads.
 """
 
-from typing import Callable, Optional
-from functools import partial
 import math
+from functools import partial
+from typing import Callable, Optional
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-# Import data structures from block_sparsity
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.block_sparsity import BlockSparseTensors
 from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import utils
+
+# Import data structures from block_sparsity
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.block_sparsity import (
+    BlockSparseTensors,
+)
 
 
 @cute.jit
@@ -51,7 +55,11 @@ def load_block_list(
             # Peel first iteration: the first block may need to load Q alongside K,
             # Parameters are already Constexpr, so no need to wrap in const_expr()
             n_block_first = block_indices[block_count - 1]
-            extra_tx = tma_q_bytes if const_expr(load_q_with_first) and const_expr(use_tma_q) else 0
+            extra_tx = (
+                tma_q_bytes
+                if const_expr(load_q_with_first) and const_expr(use_tma_q)
+                else 0
+            )
             pipeline_k.producer_acquire(kv_producer_state, extra_tx_count=extra_tx)
 
             if const_expr(load_q_with_first and use_tma_q):
@@ -73,12 +81,16 @@ def load_block_list(
             n_block_first = block_indices[block_count - 1]
             if const_expr(not first_block_preloaded):
                 extra_tx = (
-                    tma_q_bytes if const_expr(load_q_with_first) and const_expr(use_tma_q) else 0
+                    tma_q_bytes
+                    if const_expr(load_q_with_first) and const_expr(use_tma_q)
+                    else 0
                 )
                 pipeline_k.producer_acquire(kv_producer_state, extra_tx_count=extra_tx)
 
                 if const_expr(load_q_with_first and use_tma_q):
-                    load_Q(tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
+                    load_Q(
+                        tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state)
+                    )
 
                 load_K(src_idx=n_block_first, producer_state=kv_producer_state)
 
@@ -314,7 +326,9 @@ def consume_block_sparse_loads(
                     mask_fn,
                     mask_mod=mask_mod,
                     mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+                    fastdiv_mods=fastdiv_mods
+                    if cutlass.const_expr(mask_mod is not None)
+                    else None,
                 ),
                 is_first_n_block=True,
             )
@@ -384,7 +398,9 @@ def consume_block_sparse_loads(
                     mask_fn,
                     mask_mod=mask_mod,
                     mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+                    fastdiv_mods=fastdiv_mods
+                    if cutlass.const_expr(mask_mod is not None)
+                    else None,
                 ),
                 score_mod_fn=score_mod_fn,
                 is_first_block=True,
@@ -631,7 +647,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
         row_max_value = (
-            -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None
+            -Float32.inf
+            if const_expr(mLSE is not None or learnable_sink is not None)
+            else None
         )
         if const_expr(learnable_sink is not None):
             sink_val = -Float32.inf
@@ -642,7 +660,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     (q_stage * m_block + stage) * m_block_size + tidx
                 ) % qhead_per_kvhead + head_idx * qhead_per_kvhead
                 sink_val = Float32(learnable_sink[q_head_idx])
-            if sink_val != -Float32.inf and (const_expr(not is_split_kv) or split_idx == 0):
+            if sink_val != -Float32.inf and (
+                const_expr(not is_split_kv) or split_idx == 0
+            ):
                 if row_max_value == -Float32.inf:
                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
                     row_sum_value = Float32(1.0)
@@ -676,7 +696,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
             stage,
             m_block,
             seqlen.seqlen_q,
-            Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
+            Float32(
+                0.0
+            ),  # zero scale ensures empty tile writes zeros into staged outputs
             sO[None, None, stage],
             mO_cur,
             gO,

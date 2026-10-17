@@ -17,7 +17,7 @@
 +    xLinear = fmaxf(fminf(xLinear, limit), -limit);
 +    return act * (xLinear + beta);
 +  }
- 
+
    if (params.gatedActClampLimitPtr != nullptr) {
      float const limit = params.gatedActClampLimitPtr[localExpertIdx];
 --- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
@@ -49,7 +49,7 @@
      args->output_scale = nullptr;
      set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 +    args->silu_clamp_mode = silu_clamp_mode;
- 
+
      // Create and initialize launcher for this tile size
      auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
 --- a/data/csrc/trtllm_fused_moe_runner.cu
@@ -59,7 +59,7 @@
    activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
    activationData.tileTokensDim = workspace.ProjUpTileN;
 +  activationData.siluClampMode = args.silu_clamp_mode;
- 
+
    // Setup finalize data
    if (args.do_finalize) {
 --- a/data/include/flashinfer/trtllm/fused_moe/DevKernel.h
@@ -71,14 +71,14 @@
 +  // 0 = legacy pre-SiLU clamp; 1 = post-SiLU clamp (clamp the SiLU output instead).
 +  int32_t siluClampMode{0};
  };
- 
+
  template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
 @@ -216,6 +218,7 @@
    float const* gatedActClampLimitPtr = nullptr;
    int32_t const* ctaIdxXyToBatchIdx = nullptr;
    int32_t tileTokensDim{0};
 +  int32_t siluClampMode{0};
- 
+
    static KernelParams setKernelParams(Data const& data) {
      KernelParams params;
 @@ -237,6 +240,7 @@
@@ -86,7 +86,7 @@
      params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
      params.tileTokensDim = data.tileTokensDim;
 +    params.siluClampMode = data.siluClampMode;
- 
+
      return params;
    }
 --- a/data/include/flashinfer/trtllm/fused_moe/runner.h
@@ -98,7 +98,7 @@
 +  // 0 = legacy pre-SiLU clamp, 1 = post-SiLU clamp (DeepSeekFp8 unfused activation only).
 +  int64_t silu_clamp_mode{0};
    float* gemm2_bias = nullptr;
- 
+
    ActivationType activation_type = ActivationType::Swiglu;
 --- a/fused_moe/backends/trtllm/sm100_runner.py
 +++ b/fused_moe/backends/trtllm/sm100_runner.py
@@ -132,7 +132,7 @@
 +            activation_type,
              gemm1_clamp_limit,
          )
- 
+
 @@ -3173,6 +3180,7 @@
              "routing_replay_out": routing_replay_out,
              "valid_hidden_size": valid_hidden_size,
@@ -219,8 +219,8 @@
 +            )
 +        if gemm1_clamp_limit is None:
 +            raise ValueError("silu_clamp_mode=1 (post-SiLU clamp) requires gemm1_clamp_limit.")
- 
- 
+
+
  @flashinfer_api(trace=trtllm_bf16_moe_trace)
 @@ -5723,6 +5791,7 @@
      *,
@@ -229,7 +229,7 @@
 +    silu_clamp_mode: Optional[str] = None,
  ) -> Union[List[torch.Tensor], torch.Tensor]:
      r"""FP8 block-scaled MoE operation.
- 
+
 @@ -5898,6 +5967,9 @@
          gemm1_beta,
          gemm1_clamp_limit,
@@ -246,7 +246,7 @@
          valid_intermediate_size,
 +        silu_clamp_mode_int,
      )
- 
+
      if do_finalize:
 @@ -5982,6 +6055,7 @@
      gemm1_clamp_limit: Optional[torch.Tensor] = None,
@@ -255,7 +255,7 @@
 +    silu_clamp_mode: Optional[str] = None,
  ) -> Union[List[torch.Tensor], torch.Tensor]:
      r"""Pre-routed FP8 block-scaled MoE operation.
- 
+
 @@ -6142,6 +6216,9 @@
          gemm1_beta,
          gemm1_clamp_limit,
@@ -264,7 +264,7 @@
 +        silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
 +    )
      topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
- 
+
      result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
 @@ -6184,6 +6261,7 @@
          None,  # routing_replay_out is not exposed by this routed wrapper
@@ -272,5 +272,5 @@
          valid_intermediate_size,
 +        silu_clamp_mode_int,
      )
- 
+
      if do_finalize and gemm1_lora_delta is None:

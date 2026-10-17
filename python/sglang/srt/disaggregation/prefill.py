@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -100,7 +101,6 @@ from sglang.srt.utils import is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
-    from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 

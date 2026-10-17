@@ -1,5 +1,5 @@
 /*
-TopK select kernel fp32 variant. 
+TopK select kernel fp32 variant.
 
 Usage caveats:
   - vocab_size must be < 2^23.
@@ -64,7 +64,7 @@ public:
     static constexpr bool HAS_PARTIAL_ROUNDS = NUM_SEGS_PER_ROUND > NUM_TAIL_SEGS;
 
     struct SharedMemoryPlanFP32 : SharedMemoryPlanBase {};
-    
+
     static __device__ __forceinline__
     void append_pair_at(uint32_t &dst_ptr, uint32_t index, uint32_t val_bits) {
         *(uint64_t*)__cvta_shared_to_generic(dst_ptr) = (uint64_t)val_bits << 32 | index;
@@ -138,9 +138,9 @@ public:
             }
         };
         struct PivotAndQuota {
-            uint32_t pivot_value_bits;     
-            uint32_t start_pos_in_collector;            
-            uint32_t eq_quota;              
+            uint32_t pivot_value_bits;
+            uint32_t start_pos_in_collector;
+            uint32_t eq_quota;
             uint32_t cnt_nan;
         };
 
@@ -377,7 +377,7 @@ public:
             __syncthreads();    // publish the round-1 histogram; also the last read of init_buf
 
             static_assert(NUM_ELEMS_IN_INIT_WINDOW <= 0xFFFF);
-            
+
             auto for_each_init_value = [&](const auto &fn) {
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < NUM_UINT32_IN_INIT_WINDOW_PER_THREAD; i++) {

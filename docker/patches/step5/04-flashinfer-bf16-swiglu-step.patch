@@ -2,11 +2,11 @@
 +++ b/data/csrc/trtllm_fused_moe_runner.cu
 @@ -15,6 +15,7 @@
   */
- 
+
  #include <algorithm>
 +#include <cuda_bf16.h>
  #include <iostream>
- 
+
  #include "flashinfer/exception.h"
 @@ -150,6 +151,13 @@
    FLASHINFER_CHECK(
@@ -33,7 +33,7 @@
          .tileSize = tileTokensDim,
 @@ -421,6 +429,26 @@
  namespace MoE {
- 
+
  namespace {
 +
 +// FC1 is deliberately materialized in BF16 before applying the Step activation.
@@ -55,7 +55,7 @@
 +  }
 +}
 +
- 
+
  // GEMM2's N dimension, i.e. the row width of the gemm2_output workspace.
  //
 @@ -704,18 +732,20 @@
@@ -124,7 +124,7 @@
                                    gemm1_bias_type, norm_topk_prob);
 +    this->args->activation_type = activation_type;
    }
- 
+
    void check_routing() const override {
 @@ -1865,9 +1866,15 @@
      check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
@@ -141,7 +141,7 @@
 +      TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
 +          << "SwigluStep does not accept alpha or beta";
      }
- 
+
      TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
 @@ -1891,7 +1898,9 @@
      int32_t max_num_padded_tokens_gemm2 =
@@ -199,7 +199,7 @@
 +  Tensor step_activation_output;
 +  Tensor step_permuted_input;
  };
- 
+
  // Staged MoE: routing + external GEMM workspace + finalize (no cubin BMM).
 --- a/fused_moe/core.py
 +++ b/fused_moe/core.py
@@ -218,8 +218,8 @@
          Whether to normalize the top-k probabilities (default ``True``).
 @@ -5076,6 +5080,9 @@
      return topk_ids, None, RoutingInputMode.PackedPrecomputed
- 
- 
+
+
 +TRTLLM_BF16_SWIGLU_STEP_SUPPORTED = True
 +
 +
@@ -275,7 +275,7 @@
 +        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
 +        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
 +        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.
- 
+
      Returns
      -------
 @@ -5975,7 +5998,11 @@

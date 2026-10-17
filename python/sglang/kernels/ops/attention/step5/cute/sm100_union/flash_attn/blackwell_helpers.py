@@ -3,12 +3,14 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr
-from cutlass.cute.nvgpu import tcgen05
+from cutlass import Boolean, Int32, const_expr
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import tcgen05
 
 import sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.mma_sm100_desc as sm100_desc
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.utils import parse_swizzle_from_pointer
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.utils import (
+    parse_swizzle_from_pointer,
+)
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
@@ -69,7 +71,14 @@ def gemm_ptx_w_idx(
     mma_atom = cute.make_mma_atom(tiled_mma.op)
     acc_tmem_addr = acc.iterator.toint()
     gemm_ptx_partial(
-        mma_atom.op, acc_tmem_addr, rA, rB, sA_cur, sB_cur, zero_init=zero_init, **kwargs
+        mma_atom.op,
+        acc_tmem_addr,
+        rA,
+        rB,
+        sA_cur,
+        sB_cur,
+        zero_init=zero_init,
+        **kwargs,
     )
 
 
@@ -115,7 +124,9 @@ def gemm_ptx(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(
+                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+                )
                 else sm100_desc.Major.MN,
             )
         )
@@ -140,14 +151,14 @@ def gemm_ptx(
     smem_desc_b_hi = const_expr(smem_desc_b_hi)
 
     if const_expr(not is_ts):
-        smem_desc_start_a_lo = Int32(smem_desc_base_a_lo) | sm100_desc.make_smem_desc_start_addr(
-            sA[None, None, 0].iterator
-        )
+        smem_desc_start_a_lo = Int32(
+            smem_desc_base_a_lo
+        ) | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
     else:
         smem_desc_start_a_lo = None
-    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo) | sm100_desc.make_smem_desc_start_addr(
-        sB[None, None, 0].iterator
-    )
+    smem_desc_start_b_lo = Int32(
+        smem_desc_base_b_lo
+    ) | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
     for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
         if const_expr(not is_ts):
             smem_desc_a_lo = smem_desc_start_a_lo + (
@@ -230,7 +241,9 @@ def gemm_ptx_loop(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(
+                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+                )
                 else sm100_desc.Major.MN,
             )
         )
@@ -265,24 +278,28 @@ def gemm_ptx_loop(
             for k in cutlass.range_constexpr(cute.size(tCrA.shape[2]))
         ]
     offset_a_diff = [
-        offset_a[k] - offset_a[k - 1] for k in cutlass.range_constexpr(1, cute.size(tCrA.shape[2]))
+        offset_a[k] - offset_a[k - 1]
+        for k in cutlass.range_constexpr(1, cute.size(tCrA.shape[2]))
     ]
     offset_b = [
         (cute.crd2idx((0, 0, k), sB_layout) * sB.element_type.width // 8) >> 4
         for k in cutlass.range_constexpr(cute.size(tCrB.shape[2]))
     ]
     offset_b_diff = [
-        offset_b[k] - offset_b[k - 1] for k in cutlass.range_constexpr(1, cute.size(tCrB.shape[2]))
+        offset_b[k] - offset_b[k - 1]
+        for k in cutlass.range_constexpr(1, cute.size(tCrB.shape[2]))
     ]
 
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
-            smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
+            smem_desc_base_a_lo
+            | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
         )
     else:
         smem_desc_start_a_lo = None
     smem_desc_start_b_lo = Int32(
-        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+        smem_desc_base_b_lo
+        | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
     )
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
     if const_expr(not is_ts):
@@ -401,7 +418,9 @@ def gemm_ptx_partial(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(
+                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+                )
                 else sm100_desc.Major.MN,
             )
         )
@@ -429,10 +448,7 @@ def gemm_ptx_partial(
     rank_b = cute.rank(tCrB)
     if cutlass.const_expr(rank_a == 4):
         k_fragments = cute.size(tCrA.shape[3])
-        offset_a = [
-            cute.crd2idx((0, 0, 0, k), tCrA.layout)
-            for k in range(k_fragments)
-        ]
+        offset_a = [cute.crd2idx((0, 0, 0, k), tCrA.layout) for k in range(k_fragments)]
     else:
         tCrA_layout = (
             tCrA.layout
@@ -440,27 +456,18 @@ def gemm_ptx_partial(
             else cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
         )
         k_fragments = cute.size(tCrA.shape[2])
-        offset_a = [
-            cute.crd2idx((0, 0, k), tCrA_layout)
-            for k in range(k_fragments)
-        ]
+        offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(k_fragments)]
     if cutlass.const_expr(rank_b == 4):
         k_fragments_b = cute.size(tCrB.shape[3])
         offset_b = [
-            cute.crd2idx((0, 0, 0, k), tCrB.layout)
-            for k in range(k_fragments_b)
+            cute.crd2idx((0, 0, 0, k), tCrB.layout) for k in range(k_fragments_b)
         ]
     else:
         k_fragments_b = cute.size(tCrB.shape[2])
-        offset_b = [
-            cute.crd2idx((0, 0, k), tCrB.layout)
-            for k in range(k_fragments_b)
-        ]
+        offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(k_fragments_b)]
     if cutlass.const_expr(k_fragments != k_fragments_b):
         raise ValueError("SM100 operand fragments must have the same K extent")
-    offset_b_diff = [
-        offset_b[k] - offset_b[k - 1] for k in range(1, k_fragments)
-    ]
+    offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, k_fragments)]
     if const_expr(tiles_before_mbar_wait is None):
         tiles_before_mbar_wait = const_expr(k_fragments // 4 * 3)
     else:
@@ -469,13 +476,15 @@ def gemm_ptx_partial(
 
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
-            smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
+            smem_desc_base_a_lo
+            | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
         )
         # ) + sA_offset
     else:
         smem_desc_start_a_lo = None
     smem_desc_start_b_lo = Int32(
-        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+        smem_desc_base_b_lo
+        | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
     )
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
     if const_expr(not is_ts):
@@ -541,7 +550,9 @@ def gemm_ptx_partial(
             Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
         ]
         if const_expr(mbar_ptr is not None):
-            assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
+            assert mbar_phase is not None, (
+                "mbar_phase must be provided when mbar_ptr is not None"
+            )
             input_args.append(mbar_ptr.toint().ir_value())
             input_args.append(Int32(mbar_phase).ir_value())
             mbar_wait_str = (
@@ -640,8 +651,12 @@ def gemm_ptx_partial1(
 ) -> None:
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
-        assert sA_layout is not None, "sA_layout must be provided when a_src is not TMEM"
-        assert sA_swizzle is not None, "sA_swizzle must be provided when a_src is not TMEM"
+        assert sA_layout is not None, (
+            "sA_layout must be provided when a_src is not TMEM"
+        )
+        assert sA_swizzle is not None, (
+            "sA_swizzle must be provided when a_src is not TMEM"
+        )
     idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
     if const_expr(not is_ts):
         smem_desc_base_a: int = const_expr(
@@ -649,7 +664,9 @@ def gemm_ptx_partial1(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
                 sm100_desc.Major.K
-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
+                if const_expr(
+                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+                )
                 else sm100_desc.Major.MN,
             )
         )
@@ -683,12 +700,16 @@ def gemm_ptx_partial1(
             cute.crd2idx((0, 0, k), sA_layout) * op.a_dtype.width // 32
             for k in range(cute.size(tCrA.shape[2]))
         ]
-    offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
+    offset_a_diff = [
+        offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))
+    ]
     offset_b = [
         (cute.crd2idx((0, 0, k), sB_layout) * op.b_dtype.width // 8) >> 4
         for k in range(cute.size(tCrB.shape[2]))
     ]
-    offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
+    offset_b_diff = [
+        offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))
+    ]
 
     # smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
     smem_desc_start_b_lo = const_expr(smem_desc_base_b_lo)

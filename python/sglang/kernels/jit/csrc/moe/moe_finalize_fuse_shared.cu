@@ -370,8 +370,7 @@ void moe_finalize_fuse_shared(
   auto const* inPtr = static_cast<BF16 const*>(gemm2_out.data_ptr());
   auto const* expandedIdxPtr = static_cast<int const*>(expanded_idx_to_permuted_idx.data_ptr());
   auto const* sharedPtr = hasShared ? static_cast<BF16 const*>(shared_output.data_ptr()) : nullptr;
-  TVM_FFI_ICHECK(out.dtype() == (DLDataType{kDLBfloat, 16, 1}) ||
-                 out.dtype() == (DLDataType{kDLFloat, 32, 1}));
+  TVM_FFI_ICHECK(out.dtype() == (DLDataType{kDLBfloat, 16, 1}) || out.dtype() == (DLDataType{kDLFloat, 32, 1}));
 
   cudaSetDevice(out.device().device_id);
   cudaStream_t const stream = get_stream(out.device());
@@ -394,17 +393,31 @@ void moe_finalize_fuse_shared(
     using Weight = decltype(weight_tag);
     using Output = decltype(output_tag);
     dispatchFinalize<Weight, Output, decltype(round_tag)::value>(
-        numTokens, hiddenDim, hiddenDimPadded, int(top_k), inPtr, expandedIdxPtr,
-        expert_weights.data_ptr(), sharedPtr, static_cast<Output*>(out.data_ptr()),
-        useVecLoad, stream, attrs, 1);
+        numTokens,
+        hiddenDim,
+        hiddenDimPadded,
+        int(top_k),
+        inPtr,
+        expandedIdxPtr,
+        expert_weights.data_ptr(),
+        sharedPtr,
+        static_cast<Output*>(out.data_ptr()),
+        useVecLoad,
+        stream,
+        attrs,
+        1);
   };
   auto dispatchOutput = [&](auto weight_tag) {
     if (out.dtype() == (DLDataType{kDLFloat, 32, 1})) {
-      if (round_routed) launch(weight_tag, float{}, std::true_type{});
-      else launch(weight_tag, float{}, std::false_type{});
+      if (round_routed)
+        launch(weight_tag, float{}, std::true_type{});
+      else
+        launch(weight_tag, float{}, std::false_type{});
     } else {
-      if (round_routed) launch(weight_tag, BF16{}, std::true_type{});
-      else launch(weight_tag, BF16{}, std::false_type{});
+      if (round_routed)
+        launch(weight_tag, BF16{}, std::true_type{});
+      else
+        launch(weight_tag, BF16{}, std::false_type{});
     }
   };
   auto ew_dtype = expert_weights.dtype();

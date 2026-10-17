@@ -2,16 +2,17 @@
 
 import inspect
 import math
-from typing import Optional, Type, Tuple, Callable
+from typing import Callable, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Boolean, const_expr
-from cutlass.cute.nvgpu import cpasync
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm, nvvm as _nvvm
 import cutlass.pipeline
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass import Boolean, Float32, Int32, const_expr
+from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import nvvm as _nvvm
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
@@ -25,7 +26,10 @@ def cvt_copy(
     ip=None,
     **kwargs,
 ) -> None:
-    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    assert (
+        isinstance(src.iterator, cute.Pointer)
+        and src.memspace == cute.AddressSpace.rmem
+    )
     if const_expr(src.element_type != dst.element_type):
         src_cvt = cute.make_fragment_like(src, dst.element_type, loc=loc, ip=ip)
         src_cvt.store(src.load().to(dst.element_type))
@@ -42,7 +46,12 @@ def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
 
 @dsl_user_op
 def get_copy_atom(
-    dtype: Type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None
+    dtype: Type[cutlass.Numeric],
+    num_copy_elems: int,
+    is_async: bool = False,
+    *,
+    loc=None,
+    ip=None,
 ) -> cute.CopyAtom:
     num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
@@ -58,7 +67,8 @@ def make_tmem_copy(
     assert num_bits == 32
     tiler_mn = (cute.make_layout((128 * num_rep * num_wg // 32, 32), stride=(32, 1)),)
     layout_tv = cute.make_layout(
-        ((32, 4, num_wg), (num_rep, 32)), stride=((0, 1, 4 * num_rep), (4, 4 * num_rep * num_wg))
+        ((32, 4, num_wg), (num_rep, 32)),
+        stride=((0, 1, 4 * num_rep), (4, 4 * num_rep * num_wg)),
     )
     return cute.make_tiled_copy(tmem_copy_atom, layout_tv, tiler_mn)
 
@@ -80,7 +90,10 @@ def copy(
 
 
 def tiled_copy_1d(
-    dtype: Type[cutlass.Numeric], num_threads: int, num_copy_elems: int = 1, is_async: bool = False
+    dtype: Type[cutlass.Numeric],
+    num_threads: int,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
 ) -> cute.TiledCopy:
     num_copy_bits = num_copy_elems * dtype.width
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
@@ -91,7 +104,10 @@ def tiled_copy_1d(
 
 
 def tiled_copy_2d(
-    dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = False
+    dtype: Type[cutlass.Numeric],
+    major_mode_size: int,
+    num_threads: int,
+    is_async: bool = False,
 ) -> cute.TiledCopy:
     num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
     copy_elems = num_copy_bits // dtype.width
@@ -109,7 +125,14 @@ def tiled_copy_2d(
 
 @dsl_user_op
 def atomic_add_fp32x4(
-    a: Float32, b: Float32, c: Float32, d: Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+    a: Float32,
+    b: Float32,
+    c: Float32,
+    d: Float32,
+    gmem_ptr: cute.Pointer,
+    *,
+    loc=None,
+    ip=None,
 ) -> None:
     gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     # cache_hint = cutlass.Int64(0x12F0000000000000)
@@ -307,7 +330,11 @@ def mbarrier_try_wait_parity_acquire_cluster(
 
     # CuTeDSL has shipped explicit, inferred, and keyword-only result types for
     # this generated operation; keep the accepted signatures fail-closed.
-    if tuple(param.name for param in positional_params) == ("addr", "phase", "time_limit"):
+    if tuple(param.name for param in positional_params) == (
+        "addr",
+        "phase",
+        "time_limit",
+    ):
         if "results" in signature.parameters:
             ready = _nvvm.mbarrier_try_wait_parity_timelimit(
                 addr,
@@ -330,7 +357,12 @@ def mbarrier_try_wait_parity_acquire_cluster(
                 ip=ip,
             )
         return Boolean(ready)
-    if tuple(param.name for param in positional_params) == ("res", "addr", "phase", "time_limit"):
+    if tuple(param.name for param in positional_params) == (
+        "res",
+        "addr",
+        "phase",
+        "time_limit",
+    ):
         ready = _nvvm.mbarrier_try_wait_parity_timelimit(
             T.bool(),
             addr,
@@ -516,7 +548,7 @@ def cpasync_bulk_get_copy_fn(
             dst[None, dst_idx].iterator,
             size=size,
             **new_kwargs,
-            **kwargs
+            **kwargs,
         )
 
     def copy_bulk_single_stage(**new_kwargs):
@@ -540,9 +572,15 @@ def tma_get_copy_fn(
         isinstance(src_tensor.iterator, cute.Pointer)
         and src_tensor.memspace == cute.AddressSpace.smem
     )
-    smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
-    group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
-    group_rank_gmem = const_expr(cute.rank(gmem_tensor) - (1 if not single_stage else 0))
+    smem_tensor, gmem_tensor = (
+        (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
+    )
+    group_rank_smem = const_expr(
+        cute.rank(smem_tensor) - (1 if not single_stage else 0)
+    )
+    group_rank_gmem = const_expr(
+        cute.rank(gmem_tensor) - (1 if not single_stage else 0)
+    )
     # ((atom_v, rest_v), STAGE), ((atom_v, rest_v), RestK)
     s, g = cpasync.tma_partition(
         atom,

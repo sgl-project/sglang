@@ -614,6 +614,8 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
         recipe=(128, 32),
         disable_ue8m0_cast=False,
     )
+
+
 def build_mega_moe_fp8_block_experts_weights(experts, chunk: int = 16) -> None:
     from deep_gemm import transform_sf_into_required_layout
     from deep_gemm.utils import per_token_cast_to_fp8

@@ -197,11 +197,12 @@ class TestBoundaryKvFixKernels(CustomTestCase):
                 torch.testing.assert_close(actual, ref, atol=0, rtol=0)
 
     def test_request_alloc_resets_stash_and_preserves_other_hooks(self):
+        from types import SimpleNamespace
+
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
             MultiLayerEagleDraftWorker,
         )
-        from types import SimpleNamespace
 
         pool = ReqToTokenPool(2, 64, DEV, enable_memory_saver=False)
         valid = torch.full((3,), 2, device=DEV, dtype=torch.int32)

@@ -30,5 +30,5 @@
 +    }
 +  }
    __syncthreads();
- 
+
    // Write CTA configs for each expert this thread handles

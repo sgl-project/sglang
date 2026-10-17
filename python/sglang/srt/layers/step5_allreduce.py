@@ -4,6 +4,7 @@ from functools import partial
 from typing import Optional
 
 import torch
+
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import all_reduce_fusion
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -24,6 +25,8 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+)
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
     flashinfer_ar_fusion_applies as apply_flashinfer_allreduce_fusion,
 )
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

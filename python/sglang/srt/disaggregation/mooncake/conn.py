@@ -14,6 +14,7 @@ import numpy as np
 import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
+
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
@@ -53,8 +54,8 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    is_elided_entry,
     encode_step5_pd_layout,
+    is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,

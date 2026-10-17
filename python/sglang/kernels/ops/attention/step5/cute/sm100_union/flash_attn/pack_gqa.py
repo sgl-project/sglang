@@ -6,8 +6,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import layout_utils
 import sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.utils as utils
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import layout_utils
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
@@ -24,7 +24,9 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
         head_stride * qhead_per_kvhead,
         *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
     )
-    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+    return cute.make_tensor(
+        T.iterator, cute.make_layout(shape_packed, stride=stride_packed)
+    )
 
 
 def pack_gqa_flat_tma_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
@@ -41,7 +43,9 @@ def pack_gqa_flat_tma_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
         head_stride * qhead_per_kvhead,
         *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
     )
-    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+    return cute.make_tensor(
+        T.iterator, cute.make_layout(shape_packed, stride=stride_packed)
+    )
 
 
 def make_packgqa_tiled_tma_atom(
@@ -53,7 +57,8 @@ def make_packgqa_tiled_tma_atom(
     head_idx: int,
 ):
     gmem_tensor = layout_utils.select(
-        gmem_tensor, [head_idx, *range(head_idx), *range(head_idx + 1, cute.rank(gmem_tensor))]
+        gmem_tensor,
+        [head_idx, *range(head_idx), *range(head_idx + 1, cute.rank(gmem_tensor))],
     )
     gmem_tensor = cute.group_modes(gmem_tensor, 0, 2)
     assert cta_tiler[0] % qhead_per_kvhead == 0, (
@@ -77,7 +82,9 @@ def make_packgqa_tiled_tma_atom(
         T.stride[0][0] * qhead_per_kvhead,
         *[T.stride[i] for i in range(head_idx, len(T.shape))],
     )
-    tma_tensor = cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+    tma_tensor = cute.make_tensor(
+        T.iterator, cute.make_layout(shape_packed, stride=stride_packed)
+    )
     return tma_atom, tma_tensor
 
 
@@ -161,14 +168,18 @@ class PackGQA:
         tQpQ = utils.predicate_k(tQcQ, limit=mQ.shape[1])
         tQcQ_row = tQcQ[0, None, 0]
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
-        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, (
+            "threads_per_row must divide WARP_SIZE"
+        )
         num_threads = gmem_tiled_copy.size
         tPrQRow = self.compute_row_indices(
             tQcQ_row, tidx, block, threads_per_row, num_threads
         )
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             q_row = utils.shuffle_sync(
-                tPrQRow[m // threads_per_row], m % threads_per_row, width=threads_per_row
+                tPrQRow[m // threads_per_row],
+                m % threads_per_row,
+                width=threads_per_row,
             )
             q_ptr_i64 = self.pointer_from_row(mQ[None, 0], q_row)
             q_gmem_ptr = cute.make_ptr(
@@ -176,7 +187,9 @@ class PackGQA:
             )
             if (
                 t0QcQ[0, m, 0][0]
-                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]
+                < seqlen * self.qhead_per_kvhead
+                - block * self.m_block_size
+                - tQcQ_row[0][0]
             ):
                 mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tQsQ.shape[0][0])
@@ -187,7 +200,9 @@ class PackGQA:
                         gmem_thr_copy,
                         mQ_cur_copy[None, ki],
                         tQsQ[None, m, k],
-                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=tQpQ[None, m, k]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None,
                     )
             # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
 
@@ -207,7 +222,9 @@ class PackGQA:
         taccOcO_row = utils.make_acc_tensor_mn_view(taccOcO)[None, 0]
         assert cute.size(tLSErLSE) == cute.size(taccOcO_row)
         threads_per_row = tiled_mma.tv_layout_C.shape[0][0]
-        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, (
+            "threads_per_row must divide WARP_SIZE"
+        )
         assert cute.size(tLSErLSE) <= threads_per_row
         num_threads = tiled_mma.size
         tPrLSERow = self.compute_row_indices(
@@ -246,7 +263,9 @@ class PackGQA:
         tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
         tOcO_row = tOcO[0, None, 0]
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
-        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, (
+            "threads_per_row must divide WARP_SIZE"
+        )
         num_threads = gmem_tiled_copy.size
         total_rows = seqlen * self.qhead_per_kvhead
         tPrORow = self.compute_bounded_row_indices(
@@ -259,7 +278,9 @@ class PackGQA:
         )
         for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
             o_row = utils.shuffle_sync(
-                tPrORow[m // threads_per_row], m % threads_per_row, width=threads_per_row
+                tPrORow[m // threads_per_row],
+                m % threads_per_row,
+                width=threads_per_row,
             )
             o_ptr_i64 = self.pointer_from_row(mO[None, 0], o_row)
             o_gmem_ptr = cute.make_ptr(
@@ -267,7 +288,9 @@ class PackGQA:
             )
             if (
                 t0OcO[0, m, 0][0]
-                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tOcO_row[0][0]
+                < seqlen * self.qhead_per_kvhead
+                - block * self.m_block_size
+                - tOcO_row[0][0]
             ):
                 mO_cur = cute.make_tensor(o_gmem_ptr, (self.head_dim_padded,))
                 elems_per_load = cute.size(tOrO.shape[0][0])
@@ -278,5 +301,7 @@ class PackGQA:
                         gmem_thr_copy,
                         tOrO[None, m, k],
                         mO_cur_copy[None, ki],
-                        pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=tOpO[None, m, k]
+                        if cutlass.const_expr(self.check_hdim_oob)
+                        else None,
                     )

@@ -15,8 +15,8 @@ void tma_gather4(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, 
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
         :
-        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx), 
-          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx),
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w),
           "r"(mbar_addr), "l"(cache_hint)
         : "memory"
     );
@@ -29,8 +29,8 @@ void tma_gather4_prefetch(const void* desc_ptr, int col_idx, int4 row_idxs, int6
     asm volatile(
         "cp.async.bulk.prefetch.tensor.2d.L2.global.tile::gather4.L2::cache_hint [%0, {%1, %2, %3, %4, %5}], %6;\n"
         :
-        : "l"(desc_ptr), "r"(col_idx), 
-          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+        : "l"(desc_ptr), "r"(col_idx),
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w),
           "l"(cache_hint)
     );
 }
@@ -46,8 +46,8 @@ CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mb
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
         :
-        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx), 
-          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w), 
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx),
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w),
           "r"(mbar_addr), "l"(cache_hint)
         : "memory"
     );
