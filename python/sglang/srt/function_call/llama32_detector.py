@@ -8,11 +8,16 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
+    ToolCallItem,
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for the end-of-stream drain: each round releases at most one
+# pending unit (a tool name or one argument diff).
+_MAX_FINISH_DRAIN_ROUNDS = 1024
 
 
 class Llama32Detector(BaseFormatDetector):
@@ -135,6 +140,35 @@ class Llama32Detector(BaseFormatDetector):
             # Fall back to original buffer
             self._buffer = original_buffer
             return super().parse_streaming_increment(new_text, tools)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release tool-call state that the last delta left pending.
+
+        parse_streaming_increment emits at most one unit per call: a tool name
+        with empty parameters, then that call's argument diff, then the next
+        call. A delta that contains one or more complete tool calls therefore
+        leaves work pending for the following delta -- and when that delta was
+        the last one (multi-token deltas from speculative decoding / MTP,
+        ``stream_interval > 1``, or a call short enough to be generated in a
+        single step) nothing ever picks it up. Before this override the client
+        received the call with empty arguments, and a second call in the same
+        delta was dropped entirely, while detect_and_parse returned both.
+
+        Re-running the parser with an empty delta drains that queue. The loop
+        stops as soon as a round yields neither calls nor text, so a stream
+        that was already flushed returns nothing.
+        """
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        for _ in range(_MAX_FINISH_DRAIN_ROUNDS):
+            result = self.parse_streaming_increment("", tools)
+            if not result.calls and not result.normal_text:
+                break
+            if result.normal_text:
+                normal_parts.append(result.normal_text)
+            if result.calls:
+                calls.extend(result.calls)
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
