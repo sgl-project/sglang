@@ -1,0 +1,4 @@
+# Vendored from llama.cpp (see LLAMA_CPP_COMMIT, SHA256SUMS); keep the sources byte-identical
+# to upstream so re-syncing stays a plain copy.
+DisableFormat: true
+SortIncludes: Never
