@@ -236,6 +236,8 @@ def _randn_with_seed(shape, *, device, dtype, seed: int | list[int]) -> torch.Te
 
 class NEOChatModel(PreTrainedModel):
     config_class = NEOChatConfig
+    param_names_mapping: dict = {}
+    lora_param_names_mapping: dict = {}
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
