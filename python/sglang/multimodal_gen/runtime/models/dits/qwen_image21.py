@@ -61,6 +61,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+# The Triton fast paths below are bit-exact on Ascend NPU as well (verified
+# against the NPU eager chain); CUDA-only kernels stay behind _is_cuda.
+_is_npu = current_platform.is_npu()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -137,7 +140,9 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
 
 def apply_rope(x, rope):
     fused = None
-    if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
+    if (
+        (_is_cuda and x.is_cuda) or (_is_npu and x.is_npu)
+    ) and _ROPE_FUSION.can_attempt_once():
         fused = fused_complex_rope(x, rope)
         if _ROPE_FUSION.verified:
             return fused
@@ -180,8 +185,7 @@ def apply_qk_norm_rope(x, norm, rope):
         out = apply_rope(norm(x), rope)
         return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
     if (
-        _is_cuda
-        and x.is_cuda
+        ((_is_cuda and x.is_cuda) or (_is_npu and x.is_npu))
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.shape[-1] == 128
         and _QK_ROPE_FUSION.can_attempt_once()
@@ -347,7 +351,7 @@ class QwenImage21FeedForward(nn.Module):
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
         if (
-            _is_cuda
+            ((_is_cuda and gate.is_cuda) or (_is_npu and gate.is_npu))
             and gate.dtype is torch.bfloat16
             and _SILU_MUL_FUSION.can_attempt_once()
         ):
