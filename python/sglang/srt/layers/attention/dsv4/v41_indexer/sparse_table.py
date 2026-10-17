@@ -123,7 +123,7 @@ class SparseTableBackend:
         self._retired_cached_row_ids: list = []
 
     def publish_prefill(self, inputs: PrefillInputs):
-        inputs.reset_outputs()
+        inputs.reset_outputs(page_indices=False)
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
@@ -153,7 +153,7 @@ class SparseTableBackend:
         inputs: PrefillInputs,
         published: Optional[_SparsePrefillTable],
     ) -> None:
-        inputs.reset_outputs()
+        inputs.reset_outputs(page_indices=False)
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
