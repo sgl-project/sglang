@@ -684,14 +684,7 @@ def _chunk_cumsum_fwd(
 
 
 def _chunk_state_fwd(
-    B,
-    x,
-    dt,
-    dA_cumsum,
-    seq_idx=None,
-    states=None,
-    states_in_fp32=True,
-    sm120_tiles=False,
+    B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_fp32=True
 ):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
@@ -718,9 +711,7 @@ def _chunk_state_fwd(
         nheads,
     )
     with torch.get_device_module(x.device).device(x.device.index):
-        # Preserve upstream autotuning outside the explicit SM120 specialization.
-        kernel = _chunk_state_fwd_kernel.fn if sm120_tiles else _chunk_state_fwd_kernel
-        kernel[grid](
+        _chunk_state_fwd_kernel[grid](
             x,
             B,
             states,
@@ -760,11 +751,6 @@ def _chunk_state_fwd(
                 else (0, 0)
             ),
             HAS_SEQ_IDX=seq_idx is not None,
-            **(
-                {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 16}
-                if sm120_tiles
-                else {}
-            ),
         )
     return states
 

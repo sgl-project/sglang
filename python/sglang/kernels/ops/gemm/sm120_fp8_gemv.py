@@ -67,30 +67,3 @@ def sm120_fp8_gemv(
     module = _jit_sm120_fp8_gemv_module(w_fp8.shape[0], w_fp8.shape[1])
     module.run(x_fp8, w_fp8, alpha, out)
     return out
-
-
-@cache_once
-def _jit_sm120_fp8_gemv_bf16in_module(n: int, k: int) -> Module:
-    rows, unroll, warps = _config(n)
-    args = make_cpp_args(n, k, rows, unroll, warps, is_arch_support_pdl())
-    return load_jit(
-        "sm120_fp8_gemv_bf16in",
-        *args,
-        cuda_files=["gemm/sm120_fp8_gemv.cuh"],
-        cuda_wrappers=[("run", f"sglang::Sm120Fp8GemvBf16InKernel<{args}>::run")],
-        extra_cuda_cflags=["-O3"],
-    )
-
-
-def sm120_fp8_gemv_bf16in(
-    x_bf16: torch.Tensor,
-    w_fp8: torch.Tensor,
-    alpha: torch.Tensor,
-    input_scale: torch.Tensor,
-) -> torch.Tensor:
-    """y[1, N] = (quant_fp8(x/s)[1, K] @ w[N, K]^T) * alpha; the activation is
-    quantized in-kernel with the same clamp+rn semantics as static_quant_fp8."""
-    out = torch.empty((1, w_fp8.shape[0]), dtype=torch.bfloat16, device=x_bf16.device)
-    module = _jit_sm120_fp8_gemv_bf16in_module(w_fp8.shape[0], w_fp8.shape[1])
-    module.run(x_bf16, w_fp8, alpha, input_scale.reshape(1), out)
-    return out

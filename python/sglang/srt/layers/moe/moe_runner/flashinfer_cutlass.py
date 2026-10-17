@@ -59,10 +59,6 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
     apply_routed_scaling_factor: bool = True
-    # Plain (non-swizzled) NVFP4 block scales for the SM120 decode GEMV
-    # fast path; None keeps the CUTLASS-only behavior.
-    w13_blockscale_plain: Optional[torch.Tensor] = None
-    w2_blockscale_plain: Optional[torch.Tensor] = None
     pair_w2_weight: Optional[torch.Tensor] = None
 
 
@@ -255,12 +251,6 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
-def _sm120_moe_gemv_enabled() -> bool:
-    import os
-
-    return os.environ.get("SGLANG_NEMOTRON_MOE_GEMV", "1") == "1"
-
-
 def _sm120_mtp_mma_supported() -> bool:
     import os
 
@@ -320,11 +310,8 @@ def _run_flashinfer_cutlass(
             output_dtype=output_dtype,
             out=output,
             pair_w2_weight=quant_info.pair_w2_weight,
-            w13_blockscale_plain=quant_info.w13_blockscale_plain,
-            w2_blockscale_plain=quant_info.w2_blockscale_plain,
             # Preserve FlashInfer target/draft tactic discovery during autotuning.
             use_mtp=_sm120_mtp_mma_supported() and not _flashinfer_autotune_active(),
-            use_gemv=_sm120_moe_gemv_enabled(),
         )
         if result is not None:
             return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)

@@ -219,29 +219,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
-        self._lm_head_initialized_early = self._init_shared_lm_head_early()
-
-    def _init_shared_lm_head_early(self) -> bool:
-        draft_model = self.draft_runner.model
-        target_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
-        source = getattr(target_head, "_lossless_bf16_source", None)
-        if (
-            getattr(draft_model, "_owns_lm_head", True)
-            or draft_model.config.tie_word_embeddings
-            or self.speculative_algorithm.is_eagle3()
-            or get_spec().speculative_token_map is not None
-            or get_model().is_startup_weight_load_overlap
-            or source is None
-            or source() is not target_head.weight
-        ):
-            return False
-        # These loaded embedded-MTP weights already share the target head.
-        # Release the duplicate head/cache before sizing the Mamba state pool.
-        self.init_token_map()
-        self.init_lm_head()
-        torch.cuda.empty_cache()
-        logger.info("Shared lossless BF16 MTP head before allocating state pools")
-        return True
 
     def alloc_memory_pool(
         self,
@@ -257,9 +234,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        if not self._lm_head_initialized_early:
-            self.init_token_map()
-            self.init_lm_head()
+        self.init_token_map()
+        self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size

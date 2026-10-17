@@ -1121,10 +1121,7 @@ class Envs:
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
-    SGLANG_SM120_LOSSLESS_BF16_HEAD = EnvBool(False)
-    SGLANG_SM120_MAMBA_PREFILL_TILES = EnvBool(False)
     SGLANG_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
-    SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

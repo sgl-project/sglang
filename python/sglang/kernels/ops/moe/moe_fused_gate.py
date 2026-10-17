@@ -404,49 +404,11 @@ def moe_fused_gate(
         assert input_ids.shape == (scores.size(0),)
     if packed_out is not None:
         assert packed_out.dtype == torch.int32, "packed_out must be int32"
-        assert packed_out.shape == (
-            scores.size(0),
-            topk,
-        ), "packed_out must be [M, topk]"
+        assert packed_out.shape == (scores.size(0), topk), (
+            "packed_out must be [M, topk]"
+        )
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
-
-    from sglang.srt.environ import envs
-
-    if (
-        envs.SGLANG_SM120_MTP_ROUTER_TOP22.get()
-        and scores.is_cuda
-        and torch.cuda.get_device_capability(scores.device) == (12, 0)
-        and 2 <= scores.shape[0] <= 16
-        and scores.shape[1] == 512
-        and scores.dtype == torch.float32
-        and scores.stride(1) == 1
-        and bias is not None
-        and bias.dtype == torch.float32
-        and bias.is_contiguous()
-        and topk == 22
-        and scoring_func.lower() == "sigmoid"
-        and num_fused_shared_experts == 0
-        and num_expert_group <= 1
-        and moe_softcapping == 0.0
-        and input_ids is None
-        and num_token_non_padded is None
-        and renormalize_epsilon == 0.0
-        and packed_out is None
-        and not sqrtsoftplus_log1p
-    ):
-        from sglang.kernels.ops.moe.sm120_topk_gate import (
-            topk_gate_small_m,
-        )
-
-        return topk_gate_small_m(
-            scores,
-            bias,
-            topk=topk,
-            renormalize=renormalize,
-            routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-        )
 
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
     # dependent argmax rounds (single CTA per token; ids bit-identical to this

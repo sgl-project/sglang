@@ -1530,33 +1530,6 @@ def biased_topk_jit_kernel_impl(
         assert router_logits_partials is None
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
-        if (
-            gating_output.shape[0] == 1
-            and gating_output.is_cuda
-            and gating_output.dtype == torch.float32
-            and correction_bias.dtype == torch.float32
-            and scoring_func == "sigmoid"
-            and num_fused_shared_experts == 0
-            and num_token_non_padded is None
-            and expert_location_dispatch_info is None
-            and packed_out is None
-            and not sqrtsoftplus_log1p
-        ):
-            from sglang.kernels.ops.moe.sm120_topk_gate import (
-                topk_gate_m1,
-                use_topk_gate_m1,
-            )
-
-            if use_topk_gate_m1(1, gating_output.shape[1], topk):
-                return topk_gate_m1(
-                    gating_output,
-                    correction_bias,
-                    topk,
-                    renormalize,
-                    routed_scaling_factor,
-                    bool(apply_routed_scaling_factor_on_output),
-                )
-
         # DeepSeek-V4 stores e_score_correction_bias in bf16 (for the aiter
         # sqrtsoftplus topk path). moe_fused_gate upcasts the bias to fp32
         # in-register, so pass it through directly rather than allocating a fresh

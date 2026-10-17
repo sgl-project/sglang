@@ -13,8 +13,6 @@ import triton
 from einops import rearrange
 from packaging import version
 
-from sglang.srt.environ import envs
-
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd, chunk_state_varlen
@@ -115,20 +113,6 @@ def _mamba_chunk_scan_combined_fwd(
                 dstate,
             )
 
-    # Keep the original kernels, K tiles and accumulation order. These output
-    # tiles avoid excessive tiny CTAs for the SM120 Nemotron prefill shape.
-    sm120_tiles = (
-        envs.SGLANG_SM120_MAMBA_PREFILL_TILES.get()
-        and batch == 1
-        and 1 <= seqlen <= 1024
-        and (nheads, headdim, ngroups, dstate, chunk_size) == (128, 64, 8, 128, 128)
-        and x.dtype == B.dtype == C.dtype == torch.bfloat16
-        and state_dtype == torch.bfloat16
-        and z is None
-        and x.is_cuda
-        and torch.cuda.get_device_capability(x.device) == (12, 0)
-    )
-
     # This function executes 5 sub-functions for computing mamba
     # - a good resource is the blog https://goombalab.github.io/blog/2024/mamba2-part3-algorithm/
     #   which has a minimal implementation to understand the below operations
@@ -146,15 +130,7 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    states = _chunk_state_fwd(
-        B,
-        x,
-        dt,
-        dA_cumsum,
-        seq_idx=seq_idx,
-        states_in_fp32=True,
-        sm120_tiles=sm120_tiles,
-    )
+    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
@@ -180,7 +156,6 @@ def _mamba_chunk_scan_combined_fwd(
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
         is_cont_batched=cu_seqlens is not None,
         chunk_offsets=chunk_offsets,
-        sm120_tiles=sm120_tiles,
     )
     states, final_states = (
         rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
@@ -213,7 +188,6 @@ def _mamba_chunk_scan_combined_fwd(
         chunk_offsets=chunk_offsets,
         initial_states=initial_states,
         out=out,
-        sm120_tiles=sm120_tiles,
     )
     if cu_seqlens is None:
         return out_x, dt, dA_cumsum, states, final_states
