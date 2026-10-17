@@ -1,7 +1,7 @@
 """Unit tests for FlowRolloutController, whose ``transition`` the rollout passes
 to ``scheduler.step()``.
 
-    scheduler.step(model_output, t, x_t, transition=current_rollout_controller.transition)
+    scheduler.step(model_output, t, x_t, **rollout_step_kwargs(batch))
         |  upcast x_t to fp32, look up sigma_t / sigma_next, dt = sigma_next - sigma_t
         v
     current_rollout_controller.transition(...)
@@ -25,17 +25,25 @@ TestSchedulerFlowGRPOStepAlignmentUnit
     return_step_indices filters latents while timesteps cover every step.
 """
 
+import functools
+import gc
 import math
 import types
 import unittest
+import weakref
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    prepare_rollout_if_enabled,
 )
 
 _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
@@ -54,14 +62,40 @@ def _make_rollout_controller(
         generator=torch.Generator().manual_seed(0),
         return_dit_trajectory=batch.rollout_return_dit_trajectory,
         return_step_indices=batch.rollout_return_step_indices,
-        shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
+        shard_for_sp=lambda batch, latents: pipeline_config.shard_latents_for_sp(
             batch=batch, latents=latents
         )[0],
-        gather_for_sp=lambda stacked_latents: stacked_latents,
+        gather_for_sp=lambda batch, stacked_latents: stacked_latents,
         sigmas=_SIGMAS,
         latents_shape=tuple(batch.latents.shape),
         ode_transition=ode_transition,
     )
+
+
+class TestRolloutControllerOwnership(unittest.TestCase):
+    def test_controller_does_not_keep_the_request_alive(self):
+        """batch -> rollout controller must not point back to the batch: a request
+        dropped mid-denoise (e.g. on an exception) is freed by refcounting, without
+        waiting for a gc pass.
+
+            batch --rollout_controllers--> controller --x--> batch
+        """
+        batch = Req(sampling_params=SamplingParams(prompt="test", rollout=True))
+        batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        batch.scheduler.set_timesteps(5)
+        batch.latents = torch.zeros(1, 4, 8, 8)
+        prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
+        self.assertTrue(batch.rollout_controllers)
+
+        batch_ref = weakref.ref(batch)
+        gc.disable()
+        try:
+            del batch
+            self.assertTrue(
+                batch_ref() is None, "the rollout controller keeps the request alive"
+            )
+        finally:
+            gc.enable()
 
 
 class TestSchedulerRolloutOdeUnit(unittest.TestCase):
@@ -105,6 +139,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
 
         prev_sample = current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
@@ -147,6 +182,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         dt = next_sigma - current_sigma
 
         rollout_prev = current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
@@ -190,9 +226,8 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         for scheduler in (serving, rollout_scheduler):
             scheduler.set_timesteps(5)
             scheduler.set_begin_index(0)
-        current_rollout_controller = _make_rollout_controller(
-            self._build_batch(debug_mode=False)
-        )
+        batch = self._build_batch(debug_mode=False)
+        current_rollout_controller = _make_rollout_controller(batch)
 
         g = torch.Generator().manual_seed(0)
         sample = torch.randn(2, 4, 8, 8)
@@ -204,7 +239,9 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
                 model_output,
                 t,
                 actual,
-                transition=current_rollout_controller.transition,
+                transition=functools.partial(
+                    current_rollout_controller.transition, batch=batch
+                ),
                 return_dict=False,
             )[0]
             self.assertTrue(torch.equal(actual, expected))
@@ -228,7 +265,9 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             model_output,
             scheduler.timesteps[0],
             sample,
-            transition=current_rollout_controller.transition,
+            transition=functools.partial(
+                current_rollout_controller.transition, batch=batch
+            ),
             return_dict=False,
         )[0]
         self.assertTrue(torch.equal(current_rollout_controller.step_latents[0], sample))
@@ -259,6 +298,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
 
         # step 0 is outside the window: the model's update, zero log-prob
         prev_0 = current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=torch.tensor(0.6),
@@ -269,6 +309,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         self.assertTrue(torch.equal(prev_0, sample * 2))
         # step 1 is inside the window: stochastic update, ode_transition not called
         current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=torch.tensor(0.6),
@@ -290,6 +331,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
 
         current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
@@ -427,6 +469,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 )
 
                 prev_sgl = current_rollout_controller.flow_sde_sampling(
+                    batch=batch,
                     model_output=model_output,
                     sample=sample,
                     current_sigma=current_sigma,
@@ -515,6 +558,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             # noise buffer. If flow_sde_sampling fails to cast to fp32 at
             # entry, the buffer is bf16 → log_prob becomes bf16.
             current_rollout_controller.flow_sde_sampling(
+                batch=batch,
                 model_output=model_output,
                 sample=sample,
                 current_sigma=current_sigma,
@@ -570,6 +614,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
 
         # Step 0: not in filter → deterministic ODE transition, no noise draw.
         prev_0 = current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
@@ -583,6 +628,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
 
         # Step 1: in filter → real SDE, noise drawn, prev differs from ODE form.
         prev_1 = current_rollout_controller.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,

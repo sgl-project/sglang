@@ -33,8 +33,8 @@ class FlowRolloutController:
         generator: Union[torch.Generator, list[torch.Generator]],
         return_dit_trajectory: bool,
         return_step_indices: list[int] | None,
-        shard_for_sp: Callable[[torch.Tensor], torch.Tensor],
-        gather_for_sp: Callable[[torch.Tensor], torch.Tensor],
+        shard_for_sp: Callable[[Any, torch.Tensor], torch.Tensor],
+        gather_for_sp: Callable[[Any, torch.Tensor], torch.Tensor],
         sigmas: torch.Tensor,
         latents_shape: tuple,
         ode_transition: Callable[..., torch.Tensor] | None = None,
@@ -47,7 +47,8 @@ class FlowRolloutController:
         self.generator = generator
         self.return_dit_trajectory = return_dit_trajectory
         self.return_step_indices = return_step_indices
-        # Shard a full-shape tensor to this rank / gather [B, T, ...] stacks back.
+        # Shard a full-shape tensor to this rank / gather [B, T, ...] stacks back. Both
+        # read the request's live SP state, so the request is passed in per call.
         self.shard_for_sp = shard_for_sp
         self.gather_for_sp = gather_for_sp
         # [T+1] sigma grid of the loop, terminal 0 included.
@@ -105,7 +106,7 @@ class FlowRolloutController:
         self._reset_rollout_debug_tensors()
         return variance_noises, prev_sample_means, noise_std_devs, model_outputs
 
-    def collect_rollout_debug_tensors(self) -> RolloutDebugTensors:
+    def collect_rollout_debug_tensors(self, batch: Any) -> RolloutDebugTensors:
         """
         Consume rollout debug tensors and merge for all SP ranks.
 
@@ -115,9 +116,9 @@ class FlowRolloutController:
             self.consume_local_rollout_debug_tensors()
         )
 
-        variance_noises = self.gather_for_sp(variance_noises)
-        prev_sample_means = self.gather_for_sp(prev_sample_means)
-        model_outputs = self.gather_for_sp(model_outputs)
+        variance_noises = self.gather_for_sp(batch, variance_noises)
+        prev_sample_means = self.gather_for_sp(batch, prev_sample_means)
+        model_outputs = self.gather_for_sp(batch, model_outputs)
         # noise_std_devs is same on every device, not a sharded latent tensor.
 
         return RolloutDebugTensors(
@@ -130,6 +131,7 @@ class FlowRolloutController:
     def transition(
         self,
         *,
+        batch: Any,
         model_output: torch.FloatTensor,
         sample: torch.FloatTensor,
         current_sigma: torch.FloatTensor,
@@ -139,7 +141,8 @@ class FlowRolloutController:
         step_index: int,
         timestep: Any,
     ) -> torch.FloatTensor:
-        """Stand-in for ``scheduler._transition``, passed as ``step(transition=...)``;
+        """Stand-in for ``scheduler._transition``, passed as ``step(transition=...)``
+        with ``batch`` bound by ``rollout_step_kwargs``;
         ``sample`` arrives already upcast to fp32 by ``step()``.
 
         Draws variance noise from the request generator captured at creation, so
@@ -152,6 +155,7 @@ class FlowRolloutController:
             latents=sample, timestep_value=timestep, step_index=step_index
         )
         return self.flow_sde_sampling(
+            batch=batch,
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
@@ -180,6 +184,7 @@ class FlowRolloutController:
 
     def _rollout_variance_noise(
         self,
+        batch: Any,
         model_output: torch.FloatTensor,
         generator: Union[torch.Generator, list[torch.Generator]],
     ) -> torch.FloatTensor:
@@ -209,7 +214,7 @@ class FlowRolloutController:
                 generator=generator[i],
             )
 
-        sharded_noise = self.shard_for_sp(buffer)
+        sharded_noise = self.shard_for_sp(batch, buffer)
         if tuple(sharded_noise.shape) != local_shape:
             raise ValueError(
                 "Rollout SP noise shape mismatch after shard. "
@@ -219,6 +224,7 @@ class FlowRolloutController:
 
     def flow_sde_sampling(
         self,
+        batch: Any,
         model_output: torch.FloatTensor,
         sample: torch.FloatTensor,
         current_sigma: torch.FloatTensor,
@@ -259,7 +265,9 @@ class FlowRolloutController:
         if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = self._rollout_variance_noise(model_output, generator)
+            variance_noise = self._rollout_variance_noise(
+                batch, model_output, generator
+            )
             full_variance_noise = self.noise_buffer
             std_dev_t = (
                 torch.sqrt(
@@ -290,7 +298,9 @@ class FlowRolloutController:
         elif effective_sde_type == "cps":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = self._rollout_variance_noise(model_output, generator)
+            variance_noise = self._rollout_variance_noise(
+                batch, model_output, generator
+            )
             full_variance_noise = self.noise_buffer
             std_dev_t = next_sigma * math.sin(self.noise_level * math.pi / 2)
             noise_std_dev = std_dev_t
