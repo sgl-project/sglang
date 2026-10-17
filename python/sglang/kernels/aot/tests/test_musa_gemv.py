@@ -81,10 +81,12 @@ def moe_gemv_reference(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mode", ["plain", "swigelu", "rmsnorm"])
 def test_musa_fused_gemv_matches_reference(dtype: torch.dtype, mode: str):
-    batch_size = 1 if mode == "rmsnorm" else 2
+    batch_size = 2
     hidden_size, output_size = 128, 64
     weight_rows = output_size * (2 if mode == "swigelu" else 1)
     inputs = torch.randn(batch_size, hidden_size, dtype=dtype, device=DEVICE).mul_(0.5)
+    if mode == "rmsnorm":
+        inputs[1].mul_(8.0)
     weights = torch.randn(weight_rows, hidden_size, dtype=dtype, device=DEVICE).mul_(
         0.5
     )
