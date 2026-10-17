@@ -518,6 +518,20 @@ def _is_deepseek_r1(ctx):
     return ctx.force_reasoning
 
 
+def _is_llama_nemotron_optional_think(ctx):
+    # nvidia/Llama-3_3-Nemotron-Super-49B-v1 and Llama-3_1-Nemotron-Ultra-253B-v1
+    # opt into reasoning through a "detailed thinking on" system prompt, so the
+    # template never opens <think>; it only strips a prior turn's </think> block.
+    # Forcing reasoning would file a non-thinking answer as reasoning_content and
+    # hand back empty content. DeepSeek-R1-0528 shares the shape but not the
+    # Llama-3 headers, and keeps its own always-on rule below.
+    return (
+        ctx.has_text("<|start_header_id|>")
+        and ctx.has_pattern(r"split\(\s*['\"]</think>['\"]\s*\)")
+        and not ctx.has_text("<think>")
+    )
+
+
 def _is_deepseek_r1_think_tags(ctx):
     return not _is_lfm2(ctx) and (ctx.has_text("<think>") or ctx.has_text("</think>"))
 
@@ -568,6 +582,11 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
+    ),
+    DetectionRule(
+        name="llama_nemotron_optional_think",
+        value="llama_nemotron",
+        predicate=_is_llama_nemotron_optional_think,
     ),
     DetectionRule(
         name="deepseek_r1_think_tags",

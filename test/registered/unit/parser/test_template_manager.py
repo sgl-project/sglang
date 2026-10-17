@@ -92,6 +92,34 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
             "gigachat35",
         )
 
+    def test_llama_nemotron_optional_think_not_forced_as_deepseek_r1(self):
+        """Llama-3_3-Nemotron-Super / Llama-3_1-Nemotron-Ultra reason only when the
+        system prompt says "detailed thinking on", and their template mentions
+        </think> just to strip a prior turn. Picking a force-reasoning parser made a
+        non-thinking answer come back as reasoning_content with content empty."""
+        template = (
+            "{{- bos_token }}"
+            "{%- if message['role'] == 'assistant' and '</think>' in message['content'] %}"
+            "{%- set content = message['content'].split('</think>')[-1].lstrip() %}"
+            "{%- endif %}"
+            "{{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>' }}"
+        )
+        force, _, parser = self._detect(template, ["<think>", "</think>"])
+        self.assertFalse(force)
+        self.assertEqual(parser, "llama_nemotron")
+
+    def test_deepseek_r1_0528_shape_keeps_force_reasoning_parser(self):
+        """R1-0528 has the same </think>-only shape but is always-on reasoning, so
+        the Nemotron rule must key on the Llama-3 headers and leave it alone."""
+        template = (
+            "{%- if '</think>' in content %}"
+            "{%- set content = content.split('</think>')[-1] %}"
+            "{%- endif %}"
+            "{{- '<｜Assistant｜>' }}"
+        )
+        _, _, parser = self._detect(template, ["<think>", "</think>"])
+        self.assertEqual(parser, "deepseek-r1")
+
     def test_qwen3_template_not_misclassified_as_glm45(self):
         template = """
         {% set enable_thinking = enable_thinking if enable_thinking is defined else true %}

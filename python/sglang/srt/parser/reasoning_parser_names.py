@@ -31,6 +31,7 @@ REASONING_PARSER_NAMES = [
     "step3p5",
     "mistral",
     "nemotron_3",
+    "llama_nemotron",
     "granite_thinking_parser",
     "interns1",
     "gemma4",
