@@ -528,7 +528,7 @@ fn tokenize_goes_to_the_pool_without_detok_registration() {
                 skip_tokenizer_init,
                 ..test_limits()
             },
-            test_mm(flume::unbounded().0, true),
+            test_mm(flume::unbounded().0, true /* enabled */),
             sd_rx,
         );
         let (tx, mut rx) = mpsc::channel(8);

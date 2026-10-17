@@ -468,9 +468,9 @@ mod tests {
                 other => panic!("expected token ids, got {other:?}"),
             }
         };
-        assert_eq!(run("hi", true), vec![0, 2]);
-        assert_eq!(run("hi", false), vec![2]);
-        assert_eq!(run("", true), vec![0]);
-        assert_eq!(run("", false), Vec::<i64>::new());
+        assert_eq!(run("hi", true /* add_special_tokens */), vec![0, 2]);
+        assert_eq!(run("hi", false /* add_special_tokens */), vec![2]);
+        assert_eq!(run("", true /* add_special_tokens */), vec![0]);
+        assert_eq!(run("", false /* add_special_tokens */), Vec::<i64>::new());
     }
 }

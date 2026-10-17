@@ -1191,7 +1191,11 @@ mod tests {
     async fn token_operations_mint_internal_rids() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
-        let task = tokio::spawn(async move { handle.detokenize(vec![1, 2], false).await });
+        let task = tokio::spawn(async move {
+            handle
+                .detokenize(vec![1, 2], false /* skip_special_tokens */)
+                .await
+        });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(!request.rid.as_str().is_empty());
@@ -1209,7 +1213,11 @@ mod tests {
         assert_eq!(task.await.unwrap().unwrap(), "decoded");
 
         let handle = harness.handle.clone();
-        let task = tokio::spawn(async move { handle.tokenize("hi".into(), true).await });
+        let task = tokio::spawn(async move {
+            handle
+                .tokenize("hi".into(), true /* add_special_tokens */)
+                .await
+        });
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(!request.rid.as_str().is_empty());
         assert!(matches!(

@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn decode_once_rejects_skip_mode() {
         let error = DetokenizerBackend::Skip
-            .decode_once(&[1], true)
+            .decode_once(&[1], true /* skip_special_tokens */)
             .unwrap_err();
         assert!(matches!(error, Error::Validation(_)));
         assert!(error.to_string().contains("skip_tokenizer_init=True"));
@@ -552,7 +552,7 @@ mod tests {
             &mut table,
             &Rid::from("d1"),
             &[1],
-            true,
+            true, /* skip_special_tokens */
             &DetokenizerBackend::Skip,
         );
 
@@ -568,7 +568,7 @@ mod tests {
             &mut table,
             &Rid::from("d2"),
             &[1],
-            true,
+            true, /* skip_special_tokens */
             &DetokenizerBackend::Skip,
         );
         assert!(rx.try_recv().is_err());
