@@ -16,6 +16,12 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on how long the watchdog waits for diagnostics (dump_info, py-spy)
+# before giving up on them, so a wedged diagnostic cannot block SIGQUIT.
+_DIAGNOSTICS_TIMEOUT_S = 60.0
+# Give the parent process some time to print the error before SIGQUIT.
+_SIGQUIT_DELAY_S = 5.0
+
 
 class Watchdog:
     @staticmethod
@@ -146,21 +152,39 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
-
-        pyspy_dump_schedulers()
+        # Log first: diagnostics may block (e.g. CUDA sync on a wedged GPU) or raise.
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"
         )
+        self._run_diagnostics()
         print(file=sys.stderr, flush=True)
         print(file=sys.stdout, flush=True)
 
         if not self.soft:
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
+            time.sleep(_SIGQUIT_DELAY_S)
             self.parent_process.send_signal(signal.SIGQUIT)
+
+    def _run_diagnostics(self):
+        def _dump():
+            try:
+                if self.dump_info is not None and (info_msg := self.dump_info()):
+                    logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+                pyspy_dump_schedulers()
+            except Exception as e:
+                logger.error(
+                    f"{self.debug_name} watchdog diagnostics failed: {e}",
+                    exc_info=True,
+                )
+
+        t = threading.Thread(target=_dump, daemon=True)
+        t.start()
+        t.join(timeout=_DIAGNOSTICS_TIMEOUT_S)
+        if t.is_alive():
+            logger.error(
+                f"{self.debug_name} watchdog diagnostics did not finish within "
+                f"{_DIAGNOSTICS_TIMEOUT_S}s, skipping"
+            )
 
 
 class SubprocessWatchdog:
