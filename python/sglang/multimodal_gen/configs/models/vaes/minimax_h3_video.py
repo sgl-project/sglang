@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_contract import (
     validate_minimax_h3_vae_latent_stats,
+    validate_minimax_h3_vae_tiling,
 )
 
 
@@ -71,6 +72,12 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
 
     def post_init(self) -> None:
         self.resolved_parallel_decode_mode()
+        validate_minimax_h3_vae_tiling(
+            self.arch_config.vae_tile_size,
+            self.arch_config.vae_tile_overlap_min,
+            self.arch_config.spatial_compression_ratio,
+            prefix="vae_",
+        )
         if (
             self.arch_config.latents_mean is None
             and self.arch_config.latents_std is None
