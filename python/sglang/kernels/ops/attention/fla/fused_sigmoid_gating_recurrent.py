@@ -576,6 +576,10 @@ def fused_sigmoid_gating_delta_rule_update(
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
     """
+    if match_cutedsl_decode and _is_hip:
+        raise ValueError(
+            "match_cutedsl_decode uses NVIDIA PTX and is not supported on HIP/ROCm."
+        )
     if match_cutedsl_decode and (not is_kda or lower_bound is not None):
         raise ValueError(
             "match_cutedsl_decode is defined for the KDA softplus gate only "

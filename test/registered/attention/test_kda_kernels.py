@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 import triton
@@ -17,11 +18,12 @@ from sglang.kernels.ops.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.common import get_device, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+# backend-specific: exercise the ROCm recurrent KDA path and reject PTX-only parity.
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
@@ -711,7 +713,38 @@ class TestKDAPackedDecode(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDADecodeParityPlatformGuard(CustomTestCase):
+    def test_hip_rejected_before_tensor_access(self):
+        # Simulate HIP on CPU too: unsupported parity must fail before any
+        # tensor access, allocation, or Triton compilation.
+        with (
+            patch(
+                "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent._is_hip",
+                True,
+            ),
+            self.assertRaisesRegex(ValueError, "NVIDIA PTX.*HIP/ROCm"),
+        ):
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=None,
+                a=None,
+                dt_bias=None,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=None,
+                k=None,
+                v=None,
+                b=None,
+                initial_state_source=None,
+                initial_state_indices=None,
+                is_kda=True,
+                match_cutedsl_decode=True,
+            )
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or is_hip(),
+    "Decode parity requires NVIDIA PTX; HIP/ROCm is unsupported",
+)
 class TestKDAVerifyDecodeParity(CustomTestCase):
     """With ``match_cutedsl_decode`` a T-token verify launch must reproduce the
     T single-token launches a decode loop runs over a BF16 state pool, bit for
