@@ -41,7 +41,10 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.datasets.mooncake import (
+    get_mooncake_request_over_time,
+    get_mooncake_rounds,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -108,6 +111,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    client_timing: Optional[Dict[str, Any]] = None
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -120,6 +124,33 @@ class RequestFuncOutput:
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
         return output
+
+
+async def _request_with_timing(request_func, request_func_input, pbar, timing):
+    """Observe client boundaries, not server execution or socket send time.
+
+    All times are seconds from the benchmark's monotonic origin. Dispatch is
+    entry into the backend request function, after client concurrency waiting.
+    """
+    origin = timing["origin"]
+    dispatched = time.perf_counter()
+    output = await request_func(request_func_input=request_func_input, pbar=pbar)
+    terminal = time.perf_counter()
+    started = output.start_time if output.start_time > 0 else None
+    output.client_timing = {
+        "scheduled_arrival_s": timing["scheduled_arrival_s"],
+        "ready_s": timing["ready"] - origin,
+        "dispatch_s": dispatched - origin,
+        "backend_start_s": started - origin if started is not None else None,
+        "first_token_s": (
+            started + output.ttft - origin
+            if started is not None and output.ttft > 0
+            else None
+        ),
+        "terminal_s": terminal - origin,
+        "success": output.success,
+    }
+    return output
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -1425,38 +1456,29 @@ async def benchmark(
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    async def limited_request_func(request_func_input, pbar):
+    async def limited_request_func(request_func_input, pbar, timing=None):
+        async def invoke():
+            if timing is None:
+                return await request_func(
+                    request_func_input=request_func_input, pbar=pbar
+                )
+            return await _request_with_timing(
+                request_func, request_func_input, pbar, timing
+            )
+
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await invoke()
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await invoke()
 
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Handle the data structure difference for the warmup request
     if is_mooncake:
-        # For mooncake, input_requests is a list of dicts.
-        # We need to build a temporary DatasetRow for the warmup phase.
-        warmup_record = input_requests[0]
-
-        # Build prompt from hash_ids, just like in the async generator
-        hash_ids = warmup_record.get("hash_ids", [])
-        prompt_text = ""
-        for hash_id in hash_ids:
-            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
-        prompt_text += "Can you tell me a detailed story in 1000 words?"
-
-        output_len = warmup_record.get("output_length", 32)
-        prompt_len = len(tokenizer.encode(prompt_text))
-
-        # Create a temporary DatasetRow object for warmup
-        test_request = DatasetRow(
-            prompt=prompt_text,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            image_data=None,  # Mooncake doesn't have image data
-        )
+        # Replay sorts the trace. Warm exactly that first request's prompt.
+        warmup_record = min(input_requests, key=lambda record: record["timestamp"])
+        test_request = next(get_mooncake_rounds(warmup_record, tokenizer, 1))
     else:
         # For all other datasets, input_requests is a list of DatasetRow objects
         test_request = input_requests[0]
@@ -1545,12 +1567,14 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and is_mooncake
-    ):  # Assuming mooncake is mainly for sglang or similar backends
+    if is_mooncake:
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
+            input_requests,
+            tokenizer,
+            mooncake_slowdown_factor,
+            mooncake_num_rounds,
+            start_time=benchmark_start_time,
         )
         print(
             f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
@@ -1571,7 +1595,11 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     benchmark_requests: List[DatasetRow] = []
+    trace_origin_ms = (
+        min(record["timestamp"] for record in input_requests) if is_mooncake else None
+    )
     async for request in request_generator:
+        ready = time.perf_counter()
         benchmark_requests.append(request)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
@@ -1607,7 +1635,25 @@ async def benchmark(
 
         tasks.append(
             asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                limited_request_func(
+                    request_func_input=request_func_input,
+                    pbar=pbar,
+                    timing=(
+                        {
+                            "origin": benchmark_start_time,
+                            "ready": ready,
+                            "scheduled_arrival_s": (
+                                (request.timestamp - trace_origin_ms)
+                                / 1000.0
+                                * mooncake_slowdown_factor
+                                if is_mooncake
+                                else None
+                            ),
+                        }
+                        if not is_multi_turn
+                        else None
+                    ),
+                )
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
@@ -1933,6 +1979,9 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        # Index-aligned with errors, output_lens, and other request details.
+        # Multi-turn wrappers do not yet provide per-round scheduling times.
+        "client_timings": [output.client_timing for output in outputs],
     }
 
     if args.cache_report:
