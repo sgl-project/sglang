@@ -17,6 +17,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -271,6 +275,64 @@ class TestLayerShardedHostTransfers(CustomTestCase):
                 buffer[destination], torch.full((64, 1, 12), value, dtype=torch.float16)
             )
             self.assertEqual(torch.count_nonzero(buffer[64:]).item(), 0)
+
+
+def _fake_dsa_device_pool(size: int = 1024) -> SimpleNamespace:
+    logical = size * DCP_SIZE
+    elems = 128 + 128 // 128 * 4
+    buffers = [
+        torch.zeros(
+            (logical + PHYSICAL_PAGE) // PHYSICAL_PAGE,
+            PHYSICAL_PAGE * elems,
+            dtype=torch.uint8,
+        )
+        for _ in range(2)
+    ]
+    return SimpleNamespace(
+        index_k_with_scale_buffer=buffers,
+        index_page_size=PHYSICAL_PAGE,
+        page_size=PHYSICAL_PAGE,
+        index_head_dim=128,
+        quant_block_size=128,
+        skip_topk_layers=[False, False],
+        store_dtype=torch.float16,
+        layer_num=2,
+        start_layer=0,
+        end_layer=1,
+        device="cpu",
+        layer_shard_enabled=False,
+    )
+
+
+class TestDsaIndexerHostPoolUnderDcp(CustomTestCase):
+    def test_host_index_pages_cover_the_replicated_device_index(self):
+        """The index-K host mirror holds a page for every widened slot, untranslated."""
+        anchor = _make_host_pool(dcp_rank=3)
+        self.addCleanup(anchor.destroy)
+        pool = _fake_dsa_device_pool()
+        host = DSAIndexerPoolHost(
+            decl=make_dsa_indexer_pool_decl(pool), anchor_host=anchor, pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        self.assertEqual(host.page_size, PHYSICAL_PAGE)
+        self.assertEqual(host.size, anchor.logical_size)
+        self.assertGreaterEqual(
+            host.indexer_page_num * PHYSICAL_PAGE, anchor.logical_size
+        )
+        last_page = anchor.logical_size - WIDENED_PAGE
+        logical = torch.arange(last_page, last_page + WIDENED_PAGE)
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.dsa.transfer_kv_all_layer_mla",
+            create=True,
+        ) as kernel:
+            host.backup_from_device_all_layer(pool, logical, logical.clone(), "kernel")
+        kwargs = kernel.call_args.kwargs
+        expected = torch.arange(
+            last_page // PHYSICAL_PAGE, anchor.logical_size // PHYSICAL_PAGE
+        )
+        torch.testing.assert_close(kwargs["src_indices"], expected)
+        torch.testing.assert_close(kwargs["dst_indices"], expected)
+        self.assertLess(int(expected.max()), host.indexer_page_num)
 
 
 if __name__ == "__main__":
