@@ -33,6 +33,9 @@ from typing import Any, Callable
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
+from triton import knobs
+from triton.knobs import HookChain
+from triton.runtime import driver
 from triton.runtime.jit import JITFunction
 
 logger = logging.getLogger(__name__)
@@ -125,8 +128,10 @@ class _Plan:
     def __init__(self, outputs: list, result: str, launches: list, device: int):
         self.outputs = outputs  # (size, stride, dtype, device), or an input index
         self.result = result  # "none", "tensor" or "tuple"
-        self.launches = launches  # (launcher, constant args, tensor slots)
+        # (kernel, grid, run, function, metadata, constant args, tensor slots)
+        self.launches = launches
         self.device = device
+        self.current_stream = driver.active.get_current_stream
 
     def replay(self, inputs: list[torch.Tensor]):
         outs = [
@@ -140,14 +145,27 @@ class _Plan:
             for spec in self.outputs
         ]
         sources = (inputs, outs)
-        for launcher, constants, slots in self.launches:
+        stream = None if _launch_hooked() else self.current_stream(self.device)
+        for compiled, grid, run, function, metadata, constants, slots in self.launches:
             values = list(constants)
             for position, source, index in slots:
                 values[position] = sources[source][index]
-            launcher(*values)
+            if stream is None:
+                compiled[grid](*values)
+            else:
+                # Triton's runner, minus the hook metadata it builds per launch.
+                run(*grid, stream, function, metadata, None, None, None, *values)
         if self.result == "tensor":
             return outs[0]
         return tuple(outs) if self.result == "tuple" else None
+
+
+def _launch_hooked() -> bool:
+    """A profiler such as proton hooks Triton launches; those go through the runner."""
+    return any(
+        hook is not None and not (isinstance(hook, HookChain) and not hook.calls)
+        for hook in (knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook)
+    )
 
 
 def _covers_storage(t: torch.Tensor) -> bool:
@@ -209,8 +227,9 @@ def _plan(out: Any, inputs: list[torch.Tensor], launches: list) -> Any:
                 slots.append((position, 0, input_at[pointer][0]))
             else:  # a temporary, or an ambiguous input
                 return _NORMAL
-        launcher = compiled[tuple(grid) + (1,) * (3 - len(grid))]
-        replays.append((launcher, tuple(constants), tuple(slots)))
+        grid = tuple(grid) + (1,) * (3 - len(grid))
+        launcher = (compiled.run, compiled.function, compiled.packed_metadata)
+        replays.append((compiled, grid, *launcher, tuple(constants), tuple(slots)))
         devices.add(device)
     if len(devices) != 1:
         return _NORMAL
