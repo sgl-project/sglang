@@ -356,9 +356,6 @@ class TestPrepareServerArgs(CustomTestCase):
                 speculative_algorithm=algorithm,
                 speculative_num_draft_tokens=draft_tokens,
                 max_running_requests=None,
-                attn_dp_size=1,
-                ep_join_mode=None,
-                tp_size=1,
             )
 
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
@@ -390,7 +387,6 @@ class TestPrepareServerArgs(CustomTestCase):
                 ),
                 max_running_requests=requests,
                 attn_dp_size=dp_size,
-                ep_join_mode=None,
                 tp_size=tp_size,
                 speculative_algorithm=algorithm,
                 speculative_num_draft_tokens=6,
