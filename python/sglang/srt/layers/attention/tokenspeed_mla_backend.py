@@ -471,6 +471,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
         # Hybrid MLA models resolve the model-side hook through the outer
