@@ -262,6 +262,10 @@ class C_SchedulerRequestReceiver(BaseHook):
         original_recv_requests = target.recv_requests
 
         def wrapped_recv_requests(self, *args, **kwargs):
+            if C_SchedulerHook.COORDINATOR is not None:
+                return C_SchedulerHook.COORDINATOR.receive(
+                    lambda: original_recv_requests(self, *args, **kwargs)
+                )
             recv_reqs = original_recv_requests(self, *args, **kwargs)
             C_SchedulerRequestReceiver.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerRequestReceiver.REQ_DISPATCHER.dispatch()
@@ -274,6 +278,7 @@ class C_SchedulerHook(BaseHook):
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
 
     INFERENCE_PREDICTOR: InferTimePredictor = None
+    COORDINATOR = None
 
     ITERATION_STATS: list[dict] = []
     TOTAL_PREDICTOR_TIME_COST = 0
@@ -295,6 +300,7 @@ class C_SchedulerHook(BaseHook):
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
+        original_on_idle = target.on_idle
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -343,6 +349,14 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.INFERENCE_PREDICTOR = (
                     ConfigManager.get_inference_time_predictor(model, hw, sched_config)
                 )
+                if Envs.coordinator_endpoint():
+                    from sglang_simulator.simulation.sglang.coordinated import (
+                        CoordinatedScheduler,
+                    )
+
+                    C_SchedulerHook.COORDINATOR = CoordinatedScheduler(
+                        scheduler=self, endpoint=Envs.coordinator_endpoint()
+                    )
             except Exception as e:
                 logger.error(
                     f"Failed to initialize inference time predictor. Error: {e}"
@@ -350,6 +364,10 @@ class C_SchedulerHook(BaseHook):
                 raise e
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
+            if C_SchedulerHook.COORDINATOR is not None:
+                return C_SchedulerHook.COORDINATOR.receive(
+                    lambda: original_recv_requests(self, *args, **kwargs)
+                )
             recv_reqs = original_recv_requests(self, *args, **kwargs)
             C_SchedulerHook.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerHook.REQ_DISPATCHER.dispatch()
@@ -380,6 +398,8 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request
                         pass
+            elif C_SchedulerHook.COORDINATOR is not None:
+                pass  # Only the coordinator may advance virtual time.
             elif len(running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
@@ -473,6 +493,14 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
+            if C_SchedulerHook.COORDINATOR is not None:
+                return C_SchedulerHook.COORDINATOR.process_batch_result(
+                    args[0],
+                    args[1],
+                    process=lambda: original_process_batch_result(
+                        self, *args, **kwargs
+                    ),
+                )
             process_batch_result_start = time.perf_counter()
             ret = original_process_batch_result(self, *args, **kwargs)
             process_batch_result_end = time.perf_counter()
@@ -633,6 +661,13 @@ class C_SchedulerHook(BaseHook):
                         _request_dispatcher._mapping[ty] = override_profile
             return ret
 
+        def wrapped_on_idle(self, *args, **kwargs):
+            ret = original_on_idle(self, *args, **kwargs)
+            if C_SchedulerHook.COORDINATOR is not None:
+                C_SchedulerHook.COORDINATOR.on_idle()
+            return ret
+
+        target.on_idle = wrapped_on_idle
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill

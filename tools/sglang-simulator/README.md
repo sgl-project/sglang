@@ -85,6 +85,84 @@ latency, throughput, and prefix-cache metrics.
 
 ## Serving mode
 
+### Closed-loop workloads
+
+`OFFLINE` can optionally coordinate virtual time with an external workload
+driver. Leave `SGLANG_SIMULATOR_COORDINATOR` unset to retain the existing
+`OFFLINE` and `BLOCKING` behavior. Coordination is incompatible with `BLOCKING`.
+
+In the server terminal, use the existing launch command below with:
+
+```bash
+export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
+export SGLANG_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001
+```
+
+Then run the two-request example from the repository root:
+
+```bash
+python3 tools/sglang-simulator/examples/closed_loop.py --tool-delay 5
+```
+
+The five-second tool delay advances virtual time without sleeping for five
+seconds. The example uses the existing `/generate` endpoint. OpenAI HTTP/SSE
+requests can use the same protocol by including the request `rid` in the body.
+One server handles one coordinated run; restart it for a fresh run and cache.
+
+A driver sends `Ready` after processing all work at the current time, listing
+its ordered `Submit`/`Cancel` operations and earliest timer. The simulator waits
+for all listed payloads, then replies with `Grant` at the next visible event.
+Normal completion requires both the HTTP result and its matching Grant terminal.
+Use unique, equal-length request IDs within a run. HTTP connections must not wait
+for earlier responses before sending the rest of a round; the example uses a
+dedicated aiohttp pool with no connection admission limit. Workload credits, not
+the physical pool, control simulated concurrency.
+
+The initial scope is one local driver and scheduler, text generation with
+ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
+sessions, LoRA, speculative decoding, and asynchronous grammar are rejected.
+Phase deadlines are driver-owned virtual timers; native wall-time waiting/running
+timeouts must be disabled. HTTP/SSE transport and predictor execution time do not
+contribute to virtual CPU overhead. Unmodeled frontend/CPU costs are zero.
+Predicted batch durations must be positive at nanosecond resolution; a zero-cost
+fallback is rejected rather than allowing an endless workload at one timestamp.
+
+Startup generation warmup is skipped. Workload/cache warmup belongs to the
+driver and must be excluded from its measurement window while retaining cache
+state. Administrative resets and profiling requests are rejected. The two-request
+example demonstrates the driver protocol; AgentX phase scheduling and metric
+aggregation belong to the separate AgentX adapter.
+
+Coordinated streaming chat (`/v1/chat/completions`, `n=1`) emits an additional
+SSE event before each native content output:
+
+```text
+event: sglang_simulator
+data: {"version":1,"rid":"request0","arrival_ns":0,"first_token_ns":10000000,"last_token_ns":30000000,"commit_ns":30000000,"terminal_ns":30000000,"prompt_tokens":7,"completion_tokens":3,"cached_tokens":0}
+```
+
+All times are integer nanoseconds relative to the coordinated run. Arrival is
+the `Submit` time; first/last token times are native visible-token commits after
+the modeled batch finishes. `commit_ns` is the current result's commit time.
+`terminal_ns` is null until native completion; first/last are null until a token
+is committed. A result with no new tokens leaves first/last unchanged. Counts
+come from native prompt, visible output and cache state; cache reporting is
+enabled automatically for coordinated runs.
+
+Snapshots use constant space per request and preserve first/last times when
+streaming chunks are coalesced or emitted less frequently. They do not contain
+per-token timestamps, so they support TTFT, completion latency and mean TPOT,
+not per-token ITL percentiles. The initial empty role chunk can precede the first
+snapshot. Normal success requires a terminal snapshot, matching final usage and
+`[DONE]`; cancellation before a token commit retains the native abort response.
+
+Focused tests are `test_simulation_coordinator.py`,
+`test_simulation_timing_metadata.py`, `test_simulation_coordinated_bridge.py`, and
+`test_simulation_coordinated_serving.py`. Run test files in separate processes,
+as simulator hooks cache configuration at import time.
+
+### Timestamped serving workloads
+
 Choose a fresh output directory and export it in the server terminal before
 starting the server:
 
