@@ -1106,6 +1106,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 names = sorted(p for p in unloaded_params if pred(p))
                 if names:
                     logger.log(level, "%s: %s", msg, names)
+        self.language_model._initialize_xpu_gate_up_lut()
+        self.language_model._assert_xpu_gate_up_lut_initialized()
         return loaded_params
 
     def should_apply_lora(self, module_name: str) -> bool:
