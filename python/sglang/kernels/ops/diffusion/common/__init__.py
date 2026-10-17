@@ -4,3 +4,6 @@
 - ``fallback_*``: pure-torch / NPU / MPS implementations for Triton-less devices
 - ``fast_launch``: signature-cached launches for small Triton kernels
 """
+
+NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
+NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
