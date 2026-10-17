@@ -234,6 +234,64 @@ def test_custom_all_reduce(
         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
 
 
+def _eager_all_reduce(comm: CustomAllReduceV2, x: torch.Tensor) -> torch.Tensor:
+    outs = []
+    for row in x.clone():
+        outs.append(comm.custom_all_reduce(row))
+        torch.cuda.synchronize()
+    return torch.stack(outs)
+
+
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
+    """Without an override, eager calls launch the tuned algorithm (cached per size)."""
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    comm.override_algo = None
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
+    nbytes = inp[0].numel() * inp.element_size()
+    tuned = comm._pick_config(nbytes, False) is not None
+    assert comm.should_custom_ar(inp[0]) == tuned
+    if not tuned:
+        return
+    out_ref = inp.clone()
+    dist.all_reduce(out_ref, group=nccl_group)
+    for _ in range(2):  # the second pass runs from the cached launch
+        torch.testing.assert_close(
+            out_ref, _eager_all_reduce(comm, inp), atol=0, rtol=0
+        )
+
+
+@torch.inference_mode()
+def test_custom_all_reduce_eager_plan_follows_config() -> None:
+    """The cached eager launch is rebuilt when the config object is replaced."""
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    comm.override_algo = None
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    inp = torch.randint(0, 16, (TEST_LAYERS, 1024), dtype=torch.bfloat16, device=device)
+    assert comm.should_custom_ar(inp[0])  # cached under the tuned config
+    tuned = comm.config
+    try:
+        eager = tuned.eager._replace(
+            one_shot_push_threshold=0,
+            one_shot_pull_threshold=0,
+            two_shot_pull_threshold=0,
+            mc=tuned.eager.mc._replace(min_bytes=0, max_bytes=0),
+        )
+        comm.config = tuned._replace(eager=eager)
+        assert not comm.should_custom_ar(inp[0])
+    finally:
+        comm.config = tuned
+    assert comm.should_custom_ar(inp[0])
+    out_ref = inp.clone()
+    dist.all_reduce(out_ref, group=nccl_group)
+    torch.testing.assert_close(out_ref, _eager_all_reduce(comm, inp), atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     # Only sweep the common world sizes (2, 4, 8, 16) by default: testing every
     # count in 2..16 serially overruns the per-file CI time budget, and numbers
