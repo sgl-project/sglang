@@ -3194,7 +3194,7 @@ class DeepseekV2Model(nn.Module):
                 topk_indices = index_topk_share.topk_indices
                 if (
                     not forward_batch.forward_mode.is_idle()
-                    and hidden_states.shape[0] != 0
+                    and proxy_tensors["hidden_states"].shape[0] != 0
                 ):
                     assert topk_indices is not None, (
                         f"PP stage ending at layer {self.end_layer} must forward "
@@ -3202,7 +3202,7 @@ class DeepseekV2Model(nn.Module):
                         "skip-topk layer."
                     )
                 if topk_indices is None:
-                    topk_indices = hidden_states.new_empty(
+                    topk_indices = proxy_tensors["hidden_states"].new_empty(
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
                 proxy_tensors.tensors["topk_indices"] = topk_indices

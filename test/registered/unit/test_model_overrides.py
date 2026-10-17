@@ -198,6 +198,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
+                    "enable_decoder_swa_bounded_replay",
                     "dsa_topk_backend",
                     "enable_dsa_fused_indexer",
                     "prefill_attention_backend",

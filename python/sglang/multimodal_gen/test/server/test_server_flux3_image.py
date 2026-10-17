@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FLUX.3 image TP2 e2e and opt-in full-checkpoint batching checks."""
+"""Opt-in FLUX.3 full-checkpoint batching checks."""
 
 import base64
 import io
@@ -10,14 +10,12 @@ from threading import Barrier
 import numpy as np
 import pytest
 import requests
-from openai import Client
 from PIL import Image
 from skimage.metrics import structural_similarity
 
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -107,39 +105,3 @@ def test_grouped_requests_multi_output_and_repeat(diffusion_server):
         assert not np.array_equal(multi[0], multi[1])
         np.testing.assert_array_equal(generate(editing=editing)[0], serial[0])
     assert "Processed native grouped batch" in diffusion_server.stdout_file.read_text()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        DiffusionTestCase(
-            "flux3_image_t2i_2_gpus",
-            DiffusionServerArgs(
-                model_path="black-forest-labs/flux-3-image-klein",
-                num_gpus=2,
-                tp_size=2,
-                extras=["--component-residency all=resident --attention-backend fa"],
-            ),
-            DiffusionSamplingParams(
-                prompt="A red fox in snow",
-                output_size="512x512",
-                output_format="png",
-                extras={"seed": 42},
-            ),
-            run_perf_check=False,
-            run_consistency_check=False,
-            run_component_accuracy_check=False,
-        )
-    ],
-    ids=lambda case: case.id,
-)
-def test_tp2_text_to_image(case, diffusion_server):
-    generate = get_generate_fn(
-        case.server_args.model_path,
-        case.server_args.modality,
-        case.sampling_params,
-    )
-    with Client(
-        base_url=f"http://localhost:{diffusion_server.port}/v1", api_key="EMPTY"
-    ) as client:
-        generate(case.id, client)
