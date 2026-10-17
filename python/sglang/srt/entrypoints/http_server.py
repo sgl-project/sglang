@@ -502,6 +502,10 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
+    from sglang.srt.entrypoints.guard_integration import attach_guard
+
+    attach_guard(app)
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
