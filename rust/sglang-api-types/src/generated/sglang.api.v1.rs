@@ -304,6 +304,17 @@ pub struct SamplingParams {
     /// the number of returned sequences (n \<= beam_width).
     #[prost(int64, optional, tag = "26")]
     pub beam_width: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "27")]
+    pub watermark: ::core::option::Option<WatermarkRequestConfig>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatermarkRequestConfig {
+    #[prost(bool, optional, tag = "1")]
+    pub enabled: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "2")]
+    pub key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "3")]
+    pub context_window: ::core::option::Option<i64>,
 }
 /// (message_json).unknown_fields defaults to IGNORE — stated here as schema
 /// intent, load-bearing for client compat.
@@ -363,6 +374,31 @@ pub struct GenerateRequest {
     pub video_data: ::core::option::Option<MediaInput>,
     #[prost(message, optional, tag = "22")]
     pub audio_data: ::core::option::Option<MediaInput>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the same
+    /// key. One key for every batch item, or one per item; an empty key means
+    /// none.
+    #[prost(message, optional, tag = "23")]
+    pub extra_key: ::core::option::Option<StringOrList>,
+    /// Scheduling priority, one value for every batch item; the scheduler
+    /// validates it against its priority-scheduling mode.
+    #[prost(int64, optional, tag = "24")]
+    pub priority: ::core::option::Option<i64>,
+    /// Prefix-cache salt: a second namespace beside `extra_key`, normalized the
+    /// same way.
+    #[prost(message, optional, tag = "25")]
+    pub cache_salt: ::core::option::Option<StringOrList>,
+    /// Apply grammar constraints only after the reasoning section, for every
+    /// batch item.
+    #[prost(bool, optional, tag = "26")]
+    pub require_reasoning: ::core::option::Option<bool>,
+    /// Fields this server cannot honour. Unknown keys are ignored, but
+    /// dropping these would silently change the result (base-model output for a
+    /// LoRA request, a stateless answer for a session request), so a non-null
+    /// value is rejected instead.
+    #[prost(string, optional, tag = "27")]
+    pub lora_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "28")]
+    pub session_params: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SamplingParamsOrList {
@@ -453,6 +489,12 @@ pub struct GenerateMetaInfo {
     /// on the terminal frame.
     #[prost(double, optional, tag = "12")]
     pub e2e_latency: ::core::option::Option<f64>,
+    /// Prompt tokens served from the prefix cache, and output tokens spent
+    /// reasoning so far; reported on every frame.
+    #[prost(uint32, tag = "13")]
+    pub cached_tokens: u32,
+    #[prost(uint64, tag = "14")]
+    pub reasoning_tokens: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
@@ -535,6 +577,15 @@ pub struct MediaRef {
     /// Video: also decode the audio track.
     #[prost(bool, optional, tag = "14")]
     pub use_audio: ::core::option::Option<bool>,
+    /// GLM-Image external AR uses grids with input_ids to compute MRoPE positions.
+    #[prost(message, optional, tag = "15")]
+    pub image_grid_thw: ::core::option::Option<ImageGridThw>,
+}
+/// One (t, h, w) row per image; the processor validates row arity.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ImageGridThw {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<Int64List>,
 }
 /// One media item. JSON: a bare string is the source; an object is a MediaRef.
 #[derive(Clone, PartialEq, ::prost::Message)]
