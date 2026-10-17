@@ -49,15 +49,21 @@ def _convert_param_value(
     """
     param_value = html.unescape(param_value)
 
-    # Handle null value for any type
-    if param_value.lower() == "null":
-        return None
-
     param_type = _get_param_type(func_name, param_name, tools)
 
     if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+        # A string parameter carries literal text, so a value that happens to
+        # read as a JSON keyword is still that text. Returning None here would
+        # rewrite a search for the word "null" into a JSON null, and an invalid
+        # boolean such as "yes" into false, without anything in the model output
+        # suggesting it happened. Only non-string types may reinterpret a value.
         return param_value
-    elif (
+
+    # Handle null value for non-string types
+    if param_value.lower() == "null":
+        return None
+
+    if (
         param_type.startswith("int")
         or param_type.startswith("integer")
         or param_type.startswith("uint")
