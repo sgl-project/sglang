@@ -21,6 +21,10 @@
 
 #pragma once
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/scalar_type.hpp>
@@ -493,6 +497,21 @@ exec_config_t determine_exec_config(
     bool is_zp_float,
     int max_shared_mem,
     int sms) {
+#if SGL_CUDA_ARCH == 800
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16> && !kIsEP && !kHasBias) {
+    // Default-off exact-shape experiment: use an already instantiated tile.
+    // Both flags are read on the host before graph capture; captured graphs
+    // retain their chosen kernel when the environment subsequently changes.
+    const char* experimental = std::getenv("SGLANG_DSV41_SM80_EXPERIMENTAL");
+    const char* narrow_n = std::getenv("SGLANG_DSV41_SM80_MARLIN_N64");
+    if (experimental != nullptr && std::strcmp(experimental, "1") == 0 && narrow_n != nullptr &&
+        std::strcmp(narrow_n, "1") == 0 && q_type == host::kFE2M1f && group_size == 32 && prob_m == 1 &&
+        prob_n == 640 && prob_k == 5120 && top_k == 6 && thread_m_blocks == 1 && m_block_size_8 &&
+        !has_act_order && !has_zp) {
+      return exec_config_t{2, thread_config_t{128, 64, 128}};
+    }
+  }
+#endif
 #if SGL_CUDA_ARCH == 900
   if constexpr (std::is_same_v<scalar_t, __nv_bfloat16> && !kIsEP && !kHasBias) {
     // H200 TP8 DeepSeek-V4.1 gate/up: six sparse expert rows need a narrower
@@ -745,6 +764,41 @@ void marlin_mm(
         sms);
     thread_tfg = exec_cfg.tb_cfg;
   }
+
+#if SGL_CUDA_ARCH == 800
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16> && !kIsEP && !kHasBias) {
+    // Exact V4.1 TP8 down projection: the six routed activations are rows,
+    // unlike gate/up's M=1, top_k=6. Read the opt-in before graph capture.
+    const char* experimental = std::getenv("SGLANG_DSV41_SM80_EXPERIMENTAL");
+    const char* down_blocks = std::getenv("SGLANG_DSV41_SM80_MOE_DOWN_BLOCKS");
+    if (experimental != nullptr && std::strcmp(experimental, "1") == 0 && down_blocks != nullptr &&
+        q_type == host::kFE2M1f && group_size == 32 && prob_m == 6 && prob_n == 5120 && prob_k == 320 &&
+        top_k == 1 && thread_m_blocks == 1 && m_block_size_8 && mul_topk_weights && !use_atomic_add &&
+        use_fp32_reduce && is_k_full && !has_act_order && !has_zp && thread_tfg.thread_k == 64 &&
+        thread_tfg.thread_n == 128 && thread_tfg.num_threads == 128) {
+      int requested = std::strcmp(down_blocks, "1") == 0 ? 1 :
+                      std::strcmp(down_blocks, "2") == 0 ? 2 :
+                      std::strcmp(down_blocks, "4") == 0 ? 4 : 0;
+      if (requested != 0) {
+        int candidate_shared_mem = requested > 1 ? max_shared_mem / requested - kSharedMemoryLaunchReserve
+                                                 : max_shared_mem;
+        host::RuntimeCheck(
+            is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+                            num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float,
+                            candidate_shared_mem),
+            "Invalid SM80 down projection blocks_per_sm request: ", requested);
+        exec_cfg.blocks_per_sm = requested;
+      }
+      // Diagnostic opt-in is shape-scoped, not a general kernel log or env dump.
+      // `auto` logs the unchanged heuristic so the benchmark knows its baseline.
+      if (std::strcmp(down_blocks, "auto") == 0) {
+        std::fprintf(stderr, "SM80_DOWN_CONFIG requested=%s blocks_per_sm=%d tile_k=%d tile_n=%d threads=%d\n",
+                     down_blocks, exec_cfg.blocks_per_sm, thread_tfg.thread_k, thread_tfg.thread_n,
+                     thread_tfg.num_threads);
+      }
+    }
+  }
+#endif
 
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;

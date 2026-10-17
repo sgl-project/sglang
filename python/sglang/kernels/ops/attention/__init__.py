@@ -58,6 +58,27 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+# Experimental V4.1 byte-decoding fallbacks: inventory only, no eager GPU imports.
+for _mod, _fn in [
+    ("dequant_k_cache_sm80", "dequantize_k_cache_paged_sm80"),
+    ("flash_mla_sm80", "flash_mla_with_kvcache_sm80"),
+    ("indexer_finish_sm80", "finish_indexer_selected_sm80"),
+    ("sparse_attention_sm80", "sparse_attention_sm80"),
+    ("sparse_attention_sm80_tiled", "sparse_attention_sm80_tiled"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.{_mod}:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(8, 0), max_sm=(8, 0))}
+            ),
+            description="Experimental DeepSeek-V4.1 NVIDIA SM80 fallback.",
+        )
+    )
+del _mod, _fn
+
 register_kernel(
     KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",

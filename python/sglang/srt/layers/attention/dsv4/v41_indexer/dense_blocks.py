@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 
+from .full_topk import FullTopKIndexer, _all_causal_bound, _write_all_causal
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
@@ -47,6 +48,12 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     rows_per_request: Optional[List[int]] = None
     # Hopper decode materializes this once at the source and reuses it in consumers.
     decode_mask: Optional[torch.Tensor] = None
+    # Only our exact all-block publisher sets this proof. Ordinary candidate
+    # subsets must never enable an all-causal consumer shortcut.
+    all_causal_ratio: Optional[int] = None
+    all_causal_bound: Optional[int] = None
+    all_causal_seq_lens: Optional[Tuple[int, ...]] = None
+    all_causal_lens: Optional[torch.Tensor] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -55,7 +62,16 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
             tail_rows_per_request=rows_per_request,
             device=self.blocks.device,
         )
-        return BlockIds(blocks=self.blocks[rows], rows_per_request=rows_per_request)
+        return BlockIds(
+            blocks=self.blocks[rows],
+            rows_per_request=rows_per_request,
+            all_causal_ratio=self.all_causal_ratio,
+            all_causal_bound=self.all_causal_bound,
+            all_causal_seq_lens=self.all_causal_seq_lens,
+            all_causal_lens=(
+                self.all_causal_lens[rows] if self.all_causal_lens is not None else None
+            ),
+        )
 
 
 class DenseBlocksBackend:
@@ -74,7 +90,75 @@ class DenseBlocksBackend:
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
 
+    def _publish_all_blocks(self, inputs, bound: int) -> BlockIds:
+        width = (bound + self.block_size - 1) // self.block_size
+        ids = torch.arange(width, device=inputs.positions.device, dtype=torch.int32)
+        lens = (inputs.positions + 1) // inputs.compress_ratio
+        blocks = torch.where(
+            ids[None, :] < ((lens + self.block_size - 1) // self.block_size)[:, None],
+            ids[None, :],
+            -1,
+        )
+        prefill = isinstance(inputs, PrefillInputs)
+        return BlockIds(
+            blocks=blocks,
+            rows_per_request=inputs.rows_per_request if prefill else None,
+            all_causal_ratio=inputs.compress_ratio,
+            all_causal_bound=bound,
+            all_causal_seq_lens=tuple(inputs.seq_lens_cpu) if prefill else None,
+            # Preserve the exact source candidate extent on device. Consumers
+            # may have shorter/tail rows; never assume their positions match.
+            all_causal_lens=((lens + self.block_size - 1) // self.block_size)
+            * self.block_size,
+        )
+
+    def _all_blocks_bound(self, inputs) -> Optional[int]:
+        bound = _all_causal_bound(inputs, self.req_to_token)
+        if (
+            bound is not None
+            and self.block_size == 8
+            and (bound + 7) // 8 <= self.topk_blocks
+        ):
+            return bound
+        return None
+
+    def _consume_all_causal(self, inputs, published: Optional[BlockIds]) -> bool:
+        bound = self._all_blocks_bound(inputs)
+        if (
+            bound is None
+            or bound > 512
+            or published is None
+            or published.all_causal_ratio != inputs.compress_ratio
+            or published.all_causal_bound is None
+            or published.all_causal_bound < bound
+            or published.blocks.shape[0] != inputs.positions.shape[0]
+            or published.all_causal_lens is None
+            or published.all_causal_lens.shape != inputs.positions.shape
+        ):
+            return False
+        if isinstance(inputs, PrefillInputs):
+            if (
+                published.rows_per_request != inputs.rows_per_request
+                or published.all_causal_seq_lens != tuple(inputs.seq_lens_cpu)
+            ):
+                return False
+        elif published.rows_per_request is not None:
+            return False
+        _write_all_causal(
+            inputs, self.req_to_token, bound, candidate_lens=published.all_causal_lens
+        )
+        return True
+
     def publish_prefill(self, inputs: PrefillInputs):
+        if not self.use_deep_gemm_prefill:
+            bound = self._all_blocks_bound(inputs)
+            if bound is not None:
+                if bound <= 512:
+                    _write_all_causal(inputs, self.req_to_token, bound)
+                else:
+                    # Only block selection is redundant above top-512.
+                    FullTopKIndexer._torch_prefill(self, inputs)
+                return self._publish_all_blocks(inputs, bound)
         if self.use_deep_gemm_prefill:
             return self._deep_gemm_publish_prefill(inputs)
         return self._torch_publish_prefill(inputs)
@@ -84,12 +168,20 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if not self.use_deep_gemm_prefill and self._consume_all_causal(
+            inputs, published
+        ):
+            return
         if self.use_deep_gemm_prefill:
             self._deep_gemm_consume_prefill(inputs, published)
         else:
             self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
+        bound = self._all_blocks_bound(inputs)
+        if bound is not None and bound <= 512:
+            _write_all_causal(inputs, self.req_to_token, bound)
+            return self._publish_all_blocks(inputs, bound)
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -97,7 +189,9 @@ class DenseBlocksBackend:
         )
         if d is None:
             return None
-        if isinstance(d, PagedDecodeScores):
+        if bound is not None:
+            published = self._publish_all_blocks(inputs, bound)
+        elif isinstance(d, PagedDecodeScores):
             assert self.block_size == 8
             blocks = amax_topk_blocks(
                 d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
@@ -123,6 +217,8 @@ class DenseBlocksBackend:
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if self._consume_all_causal(inputs, published):
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,

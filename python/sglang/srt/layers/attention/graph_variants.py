@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -116,13 +118,27 @@ def create_dsv41_candidate_graph_variants(
         and not model_runner.is_draft_worker
         and captured_req_width > 0
     )
+    # SM80 is a separate, decode-only opt-in: enabling the full graph does not
+    # by itself authorize extra captures or length-dependent indexer bypasses.
+    sm80_decode_variants = (
+        capture_forward_mode == ForwardMode.DECODE
+        and model_runner.device == "cuda"
+        and not is_hip()
+        and envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and envs.SGLANG_DSV41_SM80_FULL_GRAPH.get() == "1"
+        and envs.SGLANG_DSV41_SM80_GRAPH_VARIANTS.get() == "1"
+        and torch.cuda.get_device_capability(model_runner.gpu_id) == (8, 0)
+    )
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
         and (
-            is_gfx95_supported()
-            if is_hip()
-            else torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+            sm80_decode_variants
+            or (
+                is_gfx95_supported()
+                if is_hip()
+                else torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+            )
         )
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0

@@ -1789,7 +1789,13 @@ class KVCacheConfigurator:
             kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
-            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+            kv_layout, compressed_kv_layout = select_dsv4_kv_layout(
+                is_dsv41=(
+                    getattr(self.model_config.hf_text_config, "model_type", None)
+                    == "deepseek_v41"
+                ),
+                device=self.device,
+            )
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )

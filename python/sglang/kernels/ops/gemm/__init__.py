@@ -26,6 +26,18 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+register_kernel(
+    KernelSpec(
+        op="gemm.dsv41_m1_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_m1_gemv:dsv41_m1_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(8, 0), max_sm=(8, 0))}
+        ),
+        description="Opt-in V4.1 single-row BF16 GEMV with byte-decoded FP8 weights.",
+    )
+)
+
 
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,

@@ -37,6 +37,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.sm80_utils import is_dsv41_sm80_experimental
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -186,7 +187,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
-def _create_flashmla_metadata():
+def _create_flashmla_metadata(skip: bool = False):
+    if skip:
+        return None
     if get_platform().is_sm120 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
@@ -371,6 +374,7 @@ class DSV4AttnMetadata:
     # Sorted compress ratios present in this stage; absent ratios keep no
     # buffers or schedules.
     present_ratios: Tuple[int, ...]
+    skip_flashmla_metadata: bool = False
     request_window_layout: Optional[object] = None
     # Shared by all layer stores; locations are in SWA space.
     swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -864,10 +868,18 @@ class DSV4AttnMetadata:
             self.c4_sparse_topk_lengths = None
             self.c4_sparse_page_indices = None
             self.c4_sparse_raw_indices = None
-        self.c0_flashmla_metadata = _create_flashmla_metadata()
-        self.c4_flashmla_metadata = _create_flashmla_metadata() if self.has_c4 else None
+        self.c0_flashmla_metadata = _create_flashmla_metadata(
+            skip=self.skip_flashmla_metadata
+        )
+        self.c4_flashmla_metadata = (
+            _create_flashmla_metadata(skip=self.skip_flashmla_metadata)
+            if self.has_c4
+            else None
+        )
         self.c128_flashmla_metadata = (
-            _create_flashmla_metadata() if self.has_c128 else None
+            _create_flashmla_metadata(skip=self.skip_flashmla_metadata)
+            if self.has_c128
+            else None
         )
         if low_ratio_buffers is not None:
             assert not is_prefill and self.low_ratios == (1, 2)
@@ -877,8 +889,12 @@ class DSV4AttnMetadata:
             self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
                 low_ratio_buffers[6:8]
             )
-            self.c1_flashmla_metadata = _create_flashmla_metadata()
-            self.c2_flashmla_metadata = _create_flashmla_metadata()
+            self.c1_flashmla_metadata = _create_flashmla_metadata(
+                skip=self.skip_flashmla_metadata
+            )
+            self.c2_flashmla_metadata = _create_flashmla_metadata(
+                skip=self.skip_flashmla_metadata
+            )
             return
         if 1 in self.low_ratios:
             (
@@ -888,7 +904,9 @@ class DSV4AttnMetadata:
             ) = _low_ratio_sparse_buffers(
                 self.c1_topk_lengths_clamp1, self.index_topk, is_prefill
             )
-            self.c1_flashmla_metadata = _create_flashmla_metadata()
+            self.c1_flashmla_metadata = _create_flashmla_metadata(
+                skip=self.skip_flashmla_metadata
+            )
         if 2 in self.low_ratios:
             (
                 self.c2_sparse_topk_lengths,
@@ -897,7 +915,9 @@ class DSV4AttnMetadata:
             ) = _low_ratio_sparse_buffers(
                 self.c2_topk_lengths_clamp1, self.index_topk, is_prefill
             )
-            self.c2_flashmla_metadata = _create_flashmla_metadata()
+            self.c2_flashmla_metadata = _create_flashmla_metadata(
+                skip=self.skip_flashmla_metadata
+            )
 
 
 class LateLayerTail(msgspec.Struct, frozen=True):
@@ -1172,6 +1192,15 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        # Resolve once: graph metadata resets must keep this backend's route.
+        self.use_dsv41_sm80_experimental = is_dsv41_sm80_experimental(
+            getattr(cfg, "model_type", None), self.device
+        )
+        if (
+            self.use_dsv41_sm80_experimental
+            and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        ):
+            raise ValueError("experimental DeepSeek-V4.1 SM80 does not support trtllm")
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -1241,7 +1270,11 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
-        self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.sparse_prefill_workspace = (
+            None
+            if self.use_dsv41_sm80_experimental
+            else SparsePrefillWorkspace(self.device)
+        )
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2594,7 +2627,8 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
         return (
-            forward_batch.forward_mode.is_extend_without_speculative()
+            not self.use_dsv41_sm80_experimental
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and not is_cp_active(forward_batch)
             and not get_platform().is_sm120
             and (
@@ -2986,15 +3020,25 @@ class DeepseekV4AttnBackend(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
             core = metadata.core_attn_metadata
-            core.c0_flashmla_metadata = _create_flashmla_metadata()
+            core.c0_flashmla_metadata = _create_flashmla_metadata(
+                skip=self.use_dsv41_sm80_experimental
+            )
             if core.has_c4:
-                core.c4_flashmla_metadata = _create_flashmla_metadata()
+                core.c4_flashmla_metadata = _create_flashmla_metadata(
+                    skip=self.use_dsv41_sm80_experimental
+                )
             if core.has_c128:
-                core.c128_flashmla_metadata = _create_flashmla_metadata()
+                core.c128_flashmla_metadata = _create_flashmla_metadata(
+                    skip=self.use_dsv41_sm80_experimental
+                )
             if 1 in core.low_ratios:
-                core.c1_flashmla_metadata = _create_flashmla_metadata()
+                core.c1_flashmla_metadata = _create_flashmla_metadata(
+                    skip=self.use_dsv41_sm80_experimental
+                )
             if 2 in core.low_ratios:
-                core.c2_flashmla_metadata = _create_flashmla_metadata()
+                core.c2_flashmla_metadata = _create_flashmla_metadata(
+                    skip=self.use_dsv41_sm80_experimental
+                )
 
         # Warmup upgraded raw->full on the host; restore raw so capture
         # re-runs the upgrade inside the graph.
@@ -3757,6 +3801,26 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
+            if self.use_dsv41_sm80_experimental:
+                from sglang.kernels.ops.attention.dsv4.flash_mla_sm80 import (
+                    flash_mla_with_kvcache_sm80,
+                )
+
+                # The adapter validates its own contract; unsupported shapes or
+                # layouts must fail here, never fall through to native FlashMLA.
+                return flash_mla_with_kvcache_sm80(
+                    q,
+                    swa_k_cache,
+                    self.head_dim_v,
+                    self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0].squeeze(1)
+
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
             assert swa_page_indices.shape[-1] % 64 == 0, (
@@ -4376,6 +4440,7 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths=swa_topk_lengths,
             index_topk=self.index_topk,
             present_ratios=self.present_ratios,
+            skip_flashmla_metadata=self.use_dsv41_sm80_experimental,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
             swa_out_cache_loc=swa_out_cache_loc,
@@ -4397,7 +4462,9 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c4_sparse_raw_indices = None
-            core_attn_metadata.c0_flashmla_metadata = _create_flashmla_metadata()
+            core_attn_metadata.c0_flashmla_metadata = _create_flashmla_metadata(
+                skip=self.use_dsv41_sm80_experimental
+            )
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
             if self.trtllm_attn:

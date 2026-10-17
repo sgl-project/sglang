@@ -1049,6 +1049,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         cfg = kvc.model_config
+        self.is_dsv41 = (
+            getattr(cfg.hf_text_config, "model_type", None) == "deepseek_v41"
+        )
+        self.device = kvc.device
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
@@ -1333,7 +1337,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             select_dsv4_kv_layout,
         )
 
-        layout, compressed_option = select_dsv4_kv_layout()
+        layout, compressed_option = select_dsv4_kv_layout(
+            is_dsv41=self.is_dsv41, device=self.device
+        )
         page_size = self.page_size
         if compress_ratio:
             layout = resolve_compressed_kv_layout(

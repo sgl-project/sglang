@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -481,6 +482,40 @@ def select_decode(
 
 def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> None:
     k = idx.shape[1]
+    out = inputs.out_page_indices
+    # V4.1 decode-only experimental finish. Unsupported metadata stays on the
+    # original writer; all eligibility checks use host shapes/dtypes/strides.
+    if (
+        envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and envs.SGLANG_DSV41_SM80_INDEXER_FINISH.get() == "1"
+        and torch.version.hip is None
+        and d.bs == 1
+        and idx.ndim == d.slots.ndim == out.ndim == 2
+        and d.lens.ndim == 1
+        and idx.shape[0] == d.slots.shape[0] == d.bs
+        and d.lens.shape == (d.bs,)
+        and out.shape[0] >= d.bs
+        and 0 < k <= out.shape[1] <= 512
+        and 0 < d.lmax == d.slots.shape[1] < 2147483647
+        and idx.is_cuda
+        and d.slots.is_cuda
+        and d.lens.is_cuda
+        and out.is_cuda
+        and idx.device == d.slots.device == d.lens.device == out.device
+        and idx.dtype in (torch.int32, torch.int64)
+        and d.slots.dtype in (torch.int32, torch.int64)
+        and d.lens.dtype in (torch.int32, torch.int64)
+        and out.dtype == torch.int32
+        and all(s > 0 for t in (idx, d.slots, d.lens, out) for s in t.stride())
+        and out.is_contiguous()
+        and torch.cuda.get_device_capability(idx.device) == (8, 0)
+    ):
+        from sglang.kernels.ops.attention.dsv4.indexer_finish_sm80 import (
+            finish_indexer_selected_sm80,
+        )
+
+        finish_indexer_selected_sm80(idx, d.slots, d.lens, out[: d.bs])
+        return
     idx = idx.sort(dim=-1).values
     reach = idx < d.lens[:, None]
     inputs.out_page_indices[: d.bs, :k] = torch.where(

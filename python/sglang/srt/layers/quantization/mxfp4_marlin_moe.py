@@ -4,17 +4,31 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from torch.nn import Module
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
+from sglang.srt.utils import (
+    get_device_capability,
+    log_info_on_rank0,
+    round_up,
+    set_weight_attrs,
+)
+from torch.nn import Module
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _is_experimental_sm80_marlin() -> bool:
+    # Deliberately opt-in and exact: the BF16 E2M1/E8M0 evidence is SM80-only.
+    return (
+        envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and get_device_capability() == (8, 0)
+    )
 
 
 def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
@@ -69,20 +83,35 @@ class Mxfp4MarlinMoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
+        experimental_sm80 = _is_experimental_sm80_marlin()
+        if experimental_sm80:
+            if params_dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "Experimental SM80 MXFP4 Marlin requires BF16 params_dtype "
+                    "to preserve E8M0 scales."
+                )
+            # Preparation uses orig_dtype to normalize and encode E8M0 scales.
+            layer.orig_dtype = params_dtype
+
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        # Hopper repacking pads the loaded gate/up halves and down columns to
-        # the required tile sizes. Keep their logical widths until then: early
-        # padding to 128 turns a TP8 width of 288 into 384 instead of 320.
-        if not get_platform().is_sm90:
+        # Hopper and experimental SM80 repacking pad the loaded gate/up halves
+        # and down columns to the required tiles. Keep logical widths until
+        # then: early I128 padding turns TP8 width 288 into 384, not 320, and
+        # changes the loader's gate/up boundary. Logical widths also keep
+        # buffer-based TP slicing consistent with the checkpoint.
+        if not get_platform().is_sm90 and not experimental_sm80:
             intermediate_size_per_partition = round_up(
                 intermediate_size_per_partition, 128
             )
         hidden_size = round_up(hidden_size, 256)
         self.hidden_pad = hidden_size - layer.hidden_size
 
+        # A partial checkpoint load must leave neutral packed FP4 zeros, not
+        # uninitialized bytes (including any hidden-size padding).
+        allocate_weight = torch.zeros if experimental_sm80 else torch.empty
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            allocate_weight(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
@@ -91,7 +120,7 @@ class Mxfp4MarlinMoEMethod:
             requires_grad=False,
         )
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            allocate_weight(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
@@ -148,8 +177,21 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        experimental_sm80 = _is_experimental_sm80_marlin()
+        if (
+            not get_platform().is_sm90
+            and not get_platform().is_sm120
+            and not experimental_sm80
+        ):
+            raise RuntimeError(
+                "MXFP4 Marlin requires SM90 or SM120, or experimental SM80 "
+                "with SGLANG_DSV41_SM80_EXPERIMENTAL=1."
+            )
+        if experimental_sm80 and getattr(layer, "orig_dtype", None) != torch.bfloat16:
+            raise RuntimeError(
+                "Experimental SM80 MXFP4 Marlin requires BF16 orig_dtype "
+                "to preserve E8M0 scales."
+            )
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(
