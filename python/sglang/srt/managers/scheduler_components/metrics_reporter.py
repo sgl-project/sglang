@@ -402,7 +402,9 @@ class SchedulerMetricsReporter:
                 self.forward_pass_device_timer = DeviceTimer(
                     reporter=_fpm_device_timer_reporter,
                 )
-            self.scheduler._fpm_uses_device_timer = True
+            self.scheduler._fpm_uses_device_timer = (
+                self.forward_pass_device_timer.timing_supported
+            )
             self.scheduler.enable_fpm = True
             logger.info(
                 "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
@@ -1298,6 +1300,10 @@ class SchedulerMetricsReporter:
 
     def update_device_timer(self):
         if not ENABLE_METRICS_DEVICE_TIMER:
+            return
+        # A device without timing events contributes no GPU time, and 0/cpu_time
+        # would publish a permanently idle occupancy instead of no sample at all.
+        if not self.forward_pass_device_timer.timing_supported:
             return
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
