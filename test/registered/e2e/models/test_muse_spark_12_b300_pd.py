@@ -1,9 +1,11 @@
 """B300 1P1D coverage for Muse Spark 1.2 NVFP4 with DFlash2."""
 
 import json
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import requests
 
@@ -51,6 +53,11 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Use the gated-model credential only in this test and its server children.
+        if token := os.environ.get("HF_MUSE_SPARK_TOKEN"):
+            token_env = patch.dict(os.environ, {"HF_TOKEN": token})
+            token_env.start()
+            cls.addClassCleanup(token_env.stop)
         cls.model = try_cached_model(MODEL_PATH)
         cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
         common_args = [
