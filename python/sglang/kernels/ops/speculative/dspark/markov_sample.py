@@ -127,7 +127,13 @@ def _select_block(
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
         # Small words convert to FP32 exactly, so the winning small noise stays precise.
-        uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
+
+        bits_hi = (bits >> 16).to(tl.int32).to(tl.float32)
+        bits_lo = (bits & 0xFFFF).to(tl.int32).to(tl.float32)
+        bits_f32 = bits_hi * 65536.0 + bits_lo
+        uniform = (bits_f32 + 0.5) * _UNIFORM_SCALE
+
+        # uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
         exp_noise = -libdevice.log1p(-uniform)
         key = value / temperature - tl.log(exp_noise)
     nan = valid & (key != key)
@@ -246,8 +252,21 @@ class MarkovSampleStep:
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
     ``has_sampled_rows=False`` argmaxes every row."""
 
+    # @classmethod
+    # def execute(cls, **kwargs) -> torch.Tensor:
+    #     if inputs_on_cuda(**kwargs):
+    #         return cls.triton(**kwargs)
+    #     return cls.torch(**kwargs)
+
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
+        # NPU_LEGACY_TRITON_ADAPTER_V1
+        if kwargs["base_logits"].device.type == "npu":
+            from sglang.kernels.ops.speculative.dspark.markov_sample_npu_legacy import (
+                sample_markov_step_npu,
+            )
+
+            return sample_markov_step_npu(**kwargs)
         if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
