@@ -196,6 +196,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.set_eagle3_layers_to_capture(layer_ids)
+
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
