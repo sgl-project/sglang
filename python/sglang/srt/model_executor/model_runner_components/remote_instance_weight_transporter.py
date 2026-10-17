@@ -71,8 +71,8 @@ class RemoteInstanceWeightTransporter:
     def publish_rank_info(self, role: str) -> None:
         """Publishes this runner's rank info under `role` (``target``, or the draft role `weight_update_runners()`
         names): its parallelism config, which the P2P weight-update client needs to map training-side parameters
-        onto this rank's shards, and, once its weights are registered with a transfer engine, their locations and the
-        session to reach them."""
+        onto this rank's shards, its weight locations, which peers write into, and, once its weights are registered
+        with a transfer engine, the session to reach them."""
         transfer_session_id = None
         if (
             remote_instance_transfer_engine_enabled()
@@ -87,6 +87,9 @@ class RemoteInstanceWeightTransporter:
             register_weight_memory(self.model, self.engine)
             self.weight_locations = describe_weight_locations(self.model)
             transfer_session_id = self.session_id
+        if self.server_args.publishes_rank_info() and self.weight_locations is None:
+            # a colocated peer copies into these addresses without a transfer engine
+            self.weight_locations = describe_weight_locations(self.model)
         parallelism_config = (
             self.parallelism_config.to_dict()
             if self.server_args.publishes_rank_info()
@@ -99,9 +102,7 @@ class RemoteInstanceWeightTransporter:
             role,
             {
                 "parallelism_config": parallelism_config,
-                "weight_locations": (
-                    self.weight_locations if transfer_session_id is not None else None
-                ),
+                "weight_locations": self.weight_locations,
                 "transfer_session_id": transfer_session_id,
             },
         )
