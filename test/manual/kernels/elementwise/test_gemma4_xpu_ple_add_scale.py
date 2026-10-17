@@ -30,7 +30,7 @@ class TestGemma4PleAddScale(CustomTestCase):
         config = get_config(
             snapshot, trust_remote_code=False, local_files_only=True
         ).text_config
-        self.assertIsNone(config.per_layer_config)
+        self.assertFalse(config.is_heterogeneous)
         context = create_context(
             ServerArgs(
                 model_path=snapshot,
