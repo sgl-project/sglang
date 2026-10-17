@@ -497,6 +497,40 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.can_replay_locally.assert_called_once()
         self.assertFalse(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
+    def test_vote_counts_folded_encoder_replay_rows(self):
+        """A backend that folds the encoder-SWA replay forwards the replay rows
+        with the extend, so the bucket vote must see them: voting on the scheduled
+        rows alone let a rank pick the graph for a fold the runner cannot replay."""
+        runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
+        runner.enable_lora = False
+        runner.max_context_size = runner.max_seq_len = None
+        runner._qwen_bcg_hc_sidechannel = False
+        runner.can_replay_locally.return_value = True
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_num_tokens=10,
+            encoder_swa_reset=[True, False],
+            prefix_lens=[512, 64],
+            multimodal_inputs=None,
+            input_embeds=None,
+            replace_embeds=None,
+            return_logprob=False,
+            batch_size=lambda: 2,
+        )
+        for folds, expected in ((True, 10 + 128), (False, 10)):
+            dp_attn._local_prefill_cuda_graph_vote(
+                local_batch=batch,
+                prefill_graph_runner=runner,
+                coordinated_prefill=True,
+                breakable_prefill=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+                folds_encoder_swa_replay=folds,
+            )
+            self.assertEqual(
+                runner.can_replay_locally.call_args.kwargs["num_tokens"], expected
+            )
+
     def test_mixed_batch_delegates_to_runner_policy(self):
         vote, runner = self._vote(ForwardMode.MIXED)
 

@@ -705,6 +705,9 @@ class DSV4AttnMetadata:
         # the field is produced in-graph before the attention graph break reads it.
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
+        if self.request_window_layout is not None:
+            # Captured window copy/commit kernels read the layout by address.
+            self.request_window_layout.copy_(other.request_window_layout)
 
     def init_compression_metadata(
         self, num_tokens: Optional[int] = None, low_ratio_buffers=None
@@ -976,6 +979,9 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # Folded encoder-replay rows the ratio-1/2 compressors skip under the prefill
+    # graph (their groups are cached already), [num_q_tokens] bool.
+    low_ratio_replay_rows: Optional[torch.Tensor] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1028,6 +1034,9 @@ class DSV4Metadata:
         )
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
+        )
+        maybe_copy_inplace(
+            self.low_ratio_replay_rows, src=static_metadata.low_ratio_replay_rows
         )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
@@ -1446,7 +1455,13 @@ class DeepseekV4AttnBackend(
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
-            num_groups=len(extend_seq_lens_cpu),
+            num_groups=(
+                # One captured window layout serves every batch size of a bucket.
+                self.req_to_token_pool.size
+                if use_prefill_cuda_graph
+                and self.token_to_kv_pool.request_window is not None
+                else len(extend_seq_lens_cpu)
+            ),
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -1524,7 +1539,25 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
+            if self.token_to_kv_pool.request_window is not None:
+                metadata.low_ratio_replay_rows = self._encoder_replay_rows(
+                    forward_batch,
+                    num_tokens=num_tokens,
+                    num_rows=out_cache_loc.shape[0],
+                )
         return metadata
+
+    def _encoder_replay_rows(
+        self, forward_batch: Optional[ForwardBatch], *, num_tokens: int, num_rows: int
+    ) -> torch.Tensor:
+        rows = torch.zeros(num_rows, dtype=torch.bool, device=self.device)
+        keep = (
+            None if forward_batch is None else forward_batch.encoder_swa_compress_rows
+        )
+        if keep is not None:
+            rows[:num_tokens] = True
+            rows[keep] = False
+        return rows
 
     def _low_ratio_prefill_indexer_metadata(
         self, core: DSV4AttnMetadata, compress_ratio: int
@@ -2822,11 +2855,14 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        self._activate_request_window(self.forward_metadata, reserve=True)
         with_tail = (
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -2886,6 +2922,8 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        self.encoder_replay = metadata_batch.encoder_swa_replay
+        self.encoder_row_floor = metadata_batch.encoder_swa_row_floor
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2894,11 +2932,25 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
+        self._activate_request_window(capture_metadata)
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(metadata_batch, max_seq_len)
             if capture_metadata.prefill_graph_tail
             else None
         )
+
+    def _activate_request_window(
+        self, metadata: DSV4Metadata, *, reserve: bool = False
+    ) -> None:
+        window = self.token_to_kv_pool.request_window
+        if window is None:
+            return
+        layout = metadata.core_attn_metadata.request_window_layout
+        if reserve:
+            # Prefill graphs capture first and largest bucket first, so no graph
+            # holds the workspace address yet.
+            window.reserve_workspace(layout.size)
+        window.activate(layout)
 
     def _prefill_graph_tail_metadata(
         self, forward_batch: ForwardBatch, max_seq_len: int
@@ -3053,7 +3105,12 @@ class DeepseekV4AttnBackend(
             _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
-                    layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                    layer,
+                    x,
+                    req,
+                    pos,
+                    projected=(bufs["kv"], bufs.get("score")),
+                    skip_rows=meta.low_ratio_replay_rows,
                 )
             if run_indexer and layer.indexer is not None:
                 self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
@@ -3314,18 +3371,33 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+        self,
+        layer,
+        x,
+        req,
+        pos,
+        projected=None,
+        *,
+        fuse_index_store=False,
+        skip_rows: Optional[torch.Tensor] = None,
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
         kv, score = projected if projected is not None else layer.compressor.project(x)
         if not num_tokens:
             return
+        # Skipped rows act as padding: no ring state, writes land on the dummy slot.
+        pad = core.raw_out_loc[:num_tokens] == 0
+        if skip_rows is not None:
+            pad = pad | skip_rows[:num_tokens]
         if layer.compress_ratio == 1:
+            slots = core.c1_out_loc[:num_tokens]
+            if skip_rows is not None:
+                slots = torch.where(pad, torch.zeros_like(slots), slots)
             self._low_ratio_write_group(
                 layer,
                 kv,
-                core.c1_out_loc[:num_tokens],
+                slots,
                 pos,
                 fuse_index_store=fuse_index_store,
             )
@@ -3337,7 +3409,7 @@ class DeepseekV4AttnBackend(
             score=score,
             req=req,
             pos=pos,
-            pad=core.raw_out_loc[:num_tokens] == 0,
+            pad=pad,
         )
         pooled = layer.compressor.pool_pairs(
             torch.stack([partner_kv, kv], dim=1),
@@ -3345,7 +3417,8 @@ class DeepseekV4AttnBackend(
         )
         group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
         out_loc = core.c2_out_loc[:num_tokens]
-        slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
+        writable = out_loc >= 0 if skip_rows is None else (out_loc >= 0) & ~pad
+        slots = torch.where(writable, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(
             layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store
         )
@@ -4308,12 +4381,14 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
+            # Padding rows hold the dummy slot and take the spare group.
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
+                pad=out_loc == 0,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths

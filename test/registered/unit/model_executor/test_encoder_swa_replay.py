@@ -219,6 +219,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             capacity=2 * SWA_WINDOW,
             floor=floor,
             num_groups=3,
+            pad=torch.zeros(req.shape[0], dtype=torch.bool),
         )
         layout = metadata.core_attn_metadata.request_window_layout
         torch.testing.assert_close(layout.lengths, expected.lengths)
@@ -270,6 +271,133 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         torch.testing.assert_close(
             out.hidden_states, fx.batch.input_ids[expected][:, None].float()
         )
+
+
+class TestWindowLayoutPadding(CustomTestCase):
+    def test_padding_rows_group_apart_and_never_commit(self):
+        """Padding rows (DP fill, prefill graph bucket) carry the last request's
+        slot at position 0. Grouped with it, they shortened its commit range by
+        their count and committed garbage into its ring slot 0."""
+        live, fill = 300, 100
+        req = torch.full((live + fill,), 7, dtype=torch.int64)
+        pos = torch.cat([torch.arange(live), torch.zeros(fill, dtype=torch.int64)])
+        pad = torch.cat(
+            [torch.zeros(live, dtype=torch.bool), torch.ones(fill, dtype=torch.bool)]
+        )
+        layout = window_layout(req, pos, capacity=256, num_groups=1, pad=pad)
+        alone = window_layout(req[:live], pos[:live], capacity=256, num_groups=2)
+
+        self.assertFalse(layout.commit_mask[live:].any())
+        torch.testing.assert_close(layout.commit_mask[:live], alone.commit_mask)
+        self.assertEqual(int(layout.commit_mask.sum()), 256)
+        torch.testing.assert_close(layout.indices[:live], alone.indices)
+        torch.testing.assert_close(layout.lengths[:live], alone.lengths)
+        # The spare group holds no history, so nothing reads the pad rows' slot.
+        self.assertFalse(layout.history_valid[SWA_WINDOW:].any())
+
+
+class TestPrefillGraphReplay(CustomTestCase):
+    """--enable-encoder-swa-bounded-replay under the breakable prefill CUDA graph."""
+
+    def _layout(self, seed):
+        g = torch.Generator().manual_seed(seed)
+        req = torch.randint(1, 5, (8,), generator=g).sort().values
+        pos = torch.randint(0, 600, (8,), generator=g)
+        return window_layout(req, pos, capacity=256, num_groups=4)
+
+    def _core(self, layout):
+        n = layout.req.shape[0]
+        metadata = DSV4AttnMetadata(
+            page_size=256,
+            page_table=torch.zeros((n, 2), dtype=torch.int32),
+            raw_out_loc=torch.zeros(n, dtype=torch.int32),
+            cuda_int32_kwargs={"dtype": torch.int32},
+            seq_lens_casual=torch.zeros(n, dtype=torch.int32),
+            positions_casual=torch.zeros(n, dtype=torch.int32),
+            swa_page_indices=torch.zeros((n, 2), dtype=torch.int32),
+            swa_topk_lengths=torch.zeros(n, dtype=torch.int32),
+            index_topk=128,
+            present_ratios=(0,),
+            request_window_layout=layout,
+        )
+        for name in (
+            "c4_sparse_topk_lengths",
+            "c4_sparse_page_indices",
+            "c0_flashmla_metadata",
+            "c4_flashmla_metadata",
+            "c128_flashmla_metadata",
+        ):
+            setattr(metadata, name, None)
+        return metadata
+
+    def test_replay_refreshes_the_captured_window_layout_in_place(self):
+        """The captured window copy/commit kernels read the layout tensors by
+        address, so a replay must rewrite the captured object's contents."""
+        captured, live = self._layout(1), self._layout(2)
+        metadata = self._core(captured)
+        metadata.refresh_for_breakable_cuda_graph_replay_(self._core(live))
+        self.assertIs(metadata.request_window_layout, captured)
+        for name in ("req", "pos", "indices", "lengths", "commit_mask", "history_pos"):
+            torch.testing.assert_close(getattr(captured, name), getattr(live, name))
+
+    def _backend(self, c1_out_loc, c2_out_loc, raw_out_loc):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.device = torch.device("cpu")
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(
+                c1_out_loc=c1_out_loc, c2_out_loc=c2_out_loc, raw_out_loc=raw_out_loc
+            )
+        )
+        backend._low_ratio_write_group = MagicMock()
+        return backend
+
+    def test_in_graph_compressor_skips_folded_replay_rows(self):
+        """Inside the graph the ratio-1/2 compressors see every bucket row, replay
+        rows included; those groups are cached already, so their writes must land
+        on the dummy slot and they must not feed the ring state."""
+        fx = _Fixture()
+        folded = fx.folded
+        n, rows = 320, folded.num_rows  # bucket rows, folded live rows
+        fb = SimpleNamespace(encoder_swa_compress_rows=folded.keep_rows)
+        backend = self._backend(
+            c1_out_loc=torch.arange(1, n + 1, dtype=torch.int32),
+            c2_out_loc=torch.arange(1, n + 1, dtype=torch.int32),
+            raw_out_loc=torch.cat([torch.ones(rows), torch.zeros(n - rows)]).int(),
+        )
+        skip = backend._encoder_replay_rows(fb, num_tokens=rows, num_rows=n)
+        expected = torch.zeros(n, dtype=torch.bool)
+        expected[40:168] = True  # slot 2 replays 128 rows before its 30 new ones
+        expected[198:262] = True  # slot 3 replays 64 rows before its 20 new ones
+        torch.testing.assert_close(skip, expected)
+        self.assertEqual(int(skip.sum()), REPLAY_ROWS)
+
+        kv, score, pos = torch.zeros(n, 4), torch.zeros(n, 4), torch.arange(n)
+        req = torch.zeros(n, dtype=torch.int64)
+        pad = (torch.arange(n) >= rows) | skip
+        layer = SimpleNamespace(compress_ratio=1, compressor=MagicMock(), layer_id=0)
+        backend._low_ratio_compress_torch(
+            layer, None, req, pos, projected=(kv, score), skip_rows=skip
+        )
+        slots = backend._low_ratio_write_group.call_args.args[2]
+        torch.testing.assert_close(
+            slots[pad], torch.zeros(int(pad.sum()), dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            slots[~pad], torch.arange(1, n + 1, dtype=torch.int32)[~pad]
+        )
+
+        layer.compress_ratio = 2
+        layer.compressor.pool_pairs.return_value = kv
+        backend._low_ratio_pair_partners = MagicMock(return_value=(kv, score))
+        backend._low_ratio_compress_torch(
+            layer, None, req, pos, projected=(kv, score), skip_rows=skip
+        )
+        torch.testing.assert_close(
+            backend._low_ratio_pair_partners.call_args.kwargs["pad"], pad
+        )
+        slots = backend._low_ratio_write_group.call_args.args[2]
+        self.assertFalse(slots[pad].any())
+        self.assertTrue((slots[~pad] > 0).all())
 
 
 class TestFoldMlpSync(CustomTestCase):
