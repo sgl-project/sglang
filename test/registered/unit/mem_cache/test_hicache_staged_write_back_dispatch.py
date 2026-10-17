@@ -1162,7 +1162,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
-        controller.load_fence_stream = None
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1198,7 +1198,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
-        controller.load_fence_stream = None
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
         )
@@ -1257,7 +1257,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
-        controller.load_fence_stream = None
+        controller.write_fence_stream = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
         return controller
@@ -1303,7 +1303,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller = self._chain_write_controller(events)
         controller.l2_transfer_engine.device_to_host_stream = RecordingStream("d2h")
-        controller.load_fence_stream = RecordingStream("forward")
+        controller.write_fence_stream = RecordingStream("forward")
 
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.write(_indices(4, 8), node_id=1)
@@ -1351,7 +1351,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
-        controller.load_fence_stream = None
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1389,7 +1389,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
-        controller.load_fence_stream = None
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
         )

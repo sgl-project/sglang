@@ -1,6 +1,7 @@
 //! The shared handle: submission with admission and cancellation ownership,
 //! runtime-to-semantic event translation, and the typed control operations
-//! (model info, server info, weights check, detokenize, health probe).
+//! (model info, server info, flush cache, weights check, tokenize, detokenize,
+//! health probe).
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -13,7 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::io_struct::{CheckWeightsReqInput, ControlRequest, GetInternalStateReq};
+use crate::message::io_struct::{
+    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
+};
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
@@ -56,6 +59,7 @@ pub(crate) struct CoreMetadata {
     max_context_length: u64,
     max_total_num_tokens: u64,
     version: String,
+    launch_server_info: Arc<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -73,6 +77,7 @@ impl From<&ServerArgs> for CoreMetadata {
             max_context_length: args.model_config.context_len,
             max_total_num_tokens: args.max_total_num_tokens,
             version: args.version.clone(),
+            launch_server_info: args.launch_server_info.0.clone(),
         }
     }
 }
@@ -190,9 +195,10 @@ impl CoreHandle {
     /// Raw control bytes and the scheduler's full launch-argument dump never
     /// cross the core boundary.
     pub(crate) async fn server_info(&self) -> Result<ServerInfo, CoreError> {
-        let internal_state = self.internal_state().await?;
+        let mut internal_state = self.internal_state().await?;
         let metadata = &self.inner.metadata;
         Ok(ServerInfo {
+            launch_fields: metadata.launch_server_info.clone(),
             model_path: metadata.model_path.clone(),
             served_model_name: metadata.served_model_name.clone(),
             tokenizer_path: metadata.tokenizer_path.clone(),
@@ -200,6 +206,7 @@ impl CoreHandle {
             max_total_num_tokens: metadata.max_total_num_tokens,
             version: metadata.version.clone(),
             frontend: "rust",
+            startup_time: internal_state.rust_server_startup_time.take(),
             internal_states: vec![internal_state],
         })
     }
@@ -215,6 +222,21 @@ impl CoreHandle {
             .map_err(|error| {
                 CoreError::InvalidResponse(format!("invalid internal-state response: {error}"))
             })
+    }
+
+    /// Ask the scheduler to flush its caches, waiting up to `timeout_s` for it
+    /// to go idle. The scheduler runs its own flush handler in its own loop;
+    /// this only relays the request and its outcome.
+    pub(crate) async fn flush_cache(&self, timeout_s: f64) -> Result<FlushCacheOutcome, CoreError> {
+        let bytes = self
+            .control(ControlRequest::FlushCacheReqInput(FlushCacheReqInput::new(
+                Rid::new().to_string(),
+                Some(timeout_s),
+            )))
+            .await?;
+        rmp_serde::from_slice::<FlushCacheOutcome>(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid flush-cache response: {error}"))
+        })
     }
 
     /// Ask every scheduler rank to run the weight checker's `action` on the
@@ -255,8 +277,17 @@ impl CoreHandle {
     }
 
     /// Decode token IDs into text without exposing the runtime's byte payload.
-    pub(crate) async fn detokenize(&self, token_ids: TokenIds) -> Result<String, CoreError> {
-        let mut call = self.submit(RequestKind::Detokenize { token_ids }).await?;
+    pub(crate) async fn detokenize(
+        &self,
+        token_ids: TokenIds,
+        skip_special_tokens: bool,
+    ) -> Result<String, CoreError> {
+        let mut call = self
+            .submit(RequestKind::Detokenize {
+                token_ids,
+                skip_special_tokens,
+            })
+            .await?;
         let bytes = match call.recv().await {
             Some(ResponseItem::Data(bytes)) => bytes,
             Some(ResponseItem::Error(Error::Validation(message))) => {
@@ -274,6 +305,31 @@ impl CoreHandle {
         };
         String::from_utf8(bytes.to_vec())
             .map_err(|_| CoreError::InvalidResponse("detokenized prompt is not valid UTF-8".into()))
+    }
+
+    /// Encode one text into token IDs on the tokenizer pool.
+    pub(crate) async fn tokenize(
+        &self,
+        text: String,
+        add_special_tokens: bool,
+    ) -> Result<TokenIds, CoreError> {
+        let mut call = self
+            .submit(RequestKind::Tokenize {
+                text,
+                add_special_tokens,
+            })
+            .await?;
+        match call.recv().await {
+            Some(ResponseItem::TokenIds(ids)) => Ok(ids),
+            Some(ResponseItem::Error(Error::Validation(message))) => {
+                Err(CoreError::InvalidArgument(message))
+            }
+            Some(ResponseItem::Error(error)) => Err(translate_runtime_error(error)),
+            Some(_) => Err(CoreError::InvalidResponse(
+                "unexpected output for tokenize request".into(),
+            )),
+            None => Err(CoreError::Internal("reply channel closed".into())),
+        }
     }
 
     /// Confirm that scheduler output is moving. The response heartbeat is the
@@ -526,10 +582,20 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
             }
         }
         ResponseItem::Error(error) => CoreEvent::Failed(translate_runtime_error(error)),
-        ResponseItem::Control(_) | ResponseItem::Data(_) => CoreEvent::Failed(
-            CoreError::InvalidResponse("unexpected non-generation response".into()),
-        ),
+        ResponseItem::Control(_) | ResponseItem::Data(_) | ResponseItem::TokenIds(_) => {
+            CoreEvent::Failed(CoreError::InvalidResponse(
+                "unexpected non-generation response".into(),
+            ))
+        }
     }
+}
+
+/// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub(crate) struct FlushCacheOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
 }
 
 /// The scheduler's `CheckWeightsReqOutput`: whether every rank succeeded, why
@@ -591,7 +657,16 @@ impl Drop for RuntimeCall {
             // Pending cancellation is consumed by Intake before it starts work.
             // Once Intake has accepted the request, use the normal abort lane.
             if self.admission.cancel_requires_abort() {
-                let _ = self.abort_tx.send(AbortSource::Guard(self.rid.clone()));
+                let rid = self.rid.clone();
+                let source = match self.expected_response {
+                    ExpectedResponse::Tokenize | ExpectedResponse::Detokenize => {
+                        AbortSource::Local(rid)
+                    }
+                    ExpectedResponse::Generate | ExpectedResponse::Control => {
+                        AbortSource::Guard(rid)
+                    }
+                };
+                let _ = self.abort_tx.send(source);
             }
             self.in_flight = false;
         }
@@ -604,7 +679,7 @@ fn request_rid(kind: &RequestKind) -> Rid {
         RequestKind::Generate(request) => request.rid.clone(),
         RequestKind::Control(request) => request.rid().into(),
         // Internal service calls are not client-addressable.
-        RequestKind::Detokenize { .. } => Rid::new(),
+        RequestKind::Detokenize { .. } | RequestKind::Tokenize { .. } => Rid::new(),
     }
 }
 
@@ -613,6 +688,7 @@ enum ExpectedResponse {
     Generate,
     Control,
     Detokenize,
+    Tokenize,
 }
 
 impl ExpectedResponse {
@@ -621,6 +697,7 @@ impl ExpectedResponse {
             RequestKind::Generate(_) => Self::Generate,
             RequestKind::Control(_) => Self::Control,
             RequestKind::Detokenize { .. } => Self::Detokenize,
+            RequestKind::Tokenize { .. } => Self::Tokenize,
         }
     }
 
@@ -631,6 +708,7 @@ impl ExpectedResponse {
                 (Self::Generate, ResponseItem::Done(_))
                     | (Self::Control, ResponseItem::Control(_))
                     | (Self::Detokenize, ResponseItem::Data(_))
+                    | (Self::Tokenize, ResponseItem::TokenIds(_))
             )
     }
 }
@@ -1110,19 +1188,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detokenize_operation_mints_an_internal_rid() {
+    async fn token_operations_mint_internal_rids() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
-        let task = tokio::spawn(async move { handle.detokenize(vec![1, 2]).await });
+        let task = tokio::spawn(async move {
+            handle
+                .detokenize(vec![1, 2], false /* skip_special_tokens */)
+                .await
+        });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(!request.rid.as_str().is_empty());
-        assert!(matches!(request.kind, RequestKind::Detokenize { .. }));
+        assert!(matches!(
+            request.kind,
+            RequestKind::Detokenize {
+                skip_special_tokens: false,
+                ..
+            }
+        ));
         request
             .sink
             .try_send(ResponseItem::Data(Bytes::from_static(b"decoded")))
             .unwrap();
         assert_eq!(task.await.unwrap().unwrap(), "decoded");
+
+        let handle = harness.handle.clone();
+        let task = tokio::spawn(async move {
+            handle
+                .tokenize("hi".into(), true /* add_special_tokens */)
+                .await
+        });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(!request.rid.as_str().is_empty());
+        assert!(matches!(
+            &request.kind,
+            RequestKind::Tokenize {
+                text,
+                add_special_tokens: true,
+            } if text == "hi"
+        ));
+        request
+            .sink
+            .try_send(ResponseItem::TokenIds(vec![1, 2]))
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), vec![1, 2]);
         assert!(harness.abort_rx.try_recv().is_err());
     }
 }

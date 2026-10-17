@@ -466,6 +466,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.max_context_size = None
         runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = True
+        runner._backend_vote_prefill_cuda_graph = None
         runner.can_replay_locally.side_effect = lambda **kwargs: (
             not kwargs["contains_mm_inputs"]
             or runner_cls.can_replay_locally(self=runner, **kwargs)
@@ -514,6 +515,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.max_context_size = None
         runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = False
+        runner._backend_vote_prefill_cuda_graph = None
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2
         runner.prefer_eager_mixed_prefill = False

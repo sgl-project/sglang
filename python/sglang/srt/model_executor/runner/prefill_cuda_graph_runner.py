@@ -300,6 +300,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _use_draft_input_embeds = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
+    # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
+    _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
 
@@ -324,6 +326,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.dllm_attention.can_run_prefill_cuda_graph
             if self.dllm_attention is not None
             else getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
+        )
+        self._backend_vote_prefill_cuda_graph = getattr(
+            model_runner.attn_backend, "vote_prefill_cuda_graph", None
         )
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
