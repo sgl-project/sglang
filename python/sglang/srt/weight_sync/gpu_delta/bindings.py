@@ -356,10 +356,13 @@ def dense_target(name, meta, module, target, slices):
                 if type(module).__name__ == "RowParallelLinear"
                 else getattr(target, "output_dim", None)
             )
-            if dim != allowed_dim or not hasattr(module, "tp_rank"):
+            if dim != allowed_dim or not hasattr(module, "tp_group"):
                 raise ValueError(f"unclassified tensor-parallel mapping: {name}")
+            from sglang.srt.distributed.utils import get_group_rank_size
+
+            rank, _ = get_group_rank_size(module.tp_group)
             size = target.shape[dim]
-            slices[dim] = [module.tp_rank * size, (module.tp_rank + 1) * size]
+            slices[dim] = [rank * size, (rank + 1) * size]
     return target, slices
 
 
@@ -396,10 +399,13 @@ class ConsumerSnapshot:
 
 
 def gate_up_target(target, module, shard, slices):
+    from sglang.srt.distributed.utils import get_group_rank_size
+
+    rank, _ = get_group_rank_size(module.tp_group)
     dim = target.output_dim
     half = target.shape[dim] // 2
     target = target.narrow(dim, shard * half, half)
-    slices[dim] = [module.tp_rank * half, (module.tp_rank + 1) * half]
+    slices[dim] = [rank * half, (rank + 1) * half]
     return target
 
 

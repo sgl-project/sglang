@@ -235,9 +235,14 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     expected = decoded.view(dtype).reshape(12, 20)[2:10, 5:13]
                     torch.testing.assert_close(_bytes(payload), _bytes(expected))
 
-    def test_unfused_bf16_shared_experts_use_ordinary_tp8_slices(self):
-        tp_rank, intermediate, hidden = 3, 32, 16
-        shard = intermediate // 8
+    def test_unfused_bf16_shared_experts_follow_linear_partition_group(self):
+        for tp_rank, tp_size in ((0, 1), (3, 8)):
+            with self.subTest(tp_rank=tp_rank, tp_size=tp_size):
+                self._check_shared_expert_partition(tp_rank, tp_size)
+
+    def _check_shared_expert_partition(self, tp_rank, tp_size):
+        intermediate, hidden = 32, 16
+        shard = intermediate // tp_size
         before = {
             key: torch.randn(shape).bfloat16()
             for key, shape in (
@@ -270,8 +275,14 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         )
         shared.gate_up_proj.weight.output_dim = 0
         shared.down_proj.weight.input_dim = 1
+        # The current Linear API retains its partition owner, not tp_rank.
+        group = (
+            None
+            if tp_size == 1
+            else SimpleNamespace(rank_in_group=tp_rank, world_size=tp_size)
+        )
         for module in (shared.gate_up_proj, shared.down_proj):
-            module.tp_rank, module.tp_size = tp_rank, 8
+            module.tp_group = group
         inventory = {
             f"model.layers.0.mlp.shared_experts.{key}_proj.weight": {
                 "dtype": "BF16",
