@@ -58,7 +58,7 @@ _SHAPES = (
         "speculative_eagle_topk": 1,
         "speculative_num_draft_tokens": 4,
     },
-    {"dp_size": 2, "tp_size": 2, "enable_dp_attention": True},
+    {"attn_dp_size": 2, "tp_size": 2},
     {"enable_hierarchical_cache": True},
     {"disaggregation_mode": "prefill"},
     {"enable_lora": True, "max_lora_rank": 16},
@@ -77,6 +77,7 @@ _REACHED_BY_SHAPES = frozenset(
         "_speculative_draft_quantization_explicitly_set",
         "allowed_media_domains",
         "attention_backend",
+        "attn_dp_size",
         "chunked_prefill_size",
         "cuda_graph_config",
         "custom_weight_loader",
@@ -84,7 +85,6 @@ _REACHED_BY_SHAPES = frozenset(
         "disable_cuda_graph",
         "disaggregation_ib_device",
         "dp_size",
-        "enable_dp_attention",
         "enable_dp_attention_local_control_broadcast",
         "enable_dp_lm_head",
         "enable_flashinfer_allreduce_fusion",
@@ -95,7 +95,6 @@ _REACHED_BY_SHAPES = frozenset(
         "flashinfer_allreduce_fusion_backend",
         "grammar_backend",
         "hicache_ratio",
-        "keep_mm_feature_on_device",
         "load_balance_method",
         "max_running_requests",
         "mem_fraction_static",
@@ -283,7 +282,9 @@ class TestResolutionDeclarations(CustomTestCase):
         from sglang.srt.runtime_context import publish, reset_context
 
         mapping = namespace_of(ServerArgs)
-        self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
+        self.assertEqual(
+            set(mapping), {field.name for field in msgspec.structs.fields(ServerArgs)}
+        )
 
         self.assertEqual(
             set(),
@@ -760,7 +761,7 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
             ("disaggregation", {"disaggregation_mode": "prefill"}),
             ("deterministic", {"enable_deterministic_inference": True}),
             ("speculative", {"speculative_algorithm": "EAGLE"}),
-            ("dp_attention", {"tp_size": 2, "dp_size": 2, "enable_dp_attention": True}),
+            ("dp_attention", {"tp_size": 2, "attn_dp_size": 2}),
         ):
             with self.subTest(shape=label):
                 server_args, recorded = self._resolve_recording_each_entry(**supplied)

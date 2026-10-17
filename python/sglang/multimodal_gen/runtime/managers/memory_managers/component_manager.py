@@ -48,7 +48,21 @@ class ComponentUse:
     memory_intensive: bool = False
     target_dtype: torch.dtype | None = None
     keep_ready_after_warmup: bool = False
+    # Stay on GPU after a real request (preferred_* still offloads).
+    keep_ready_after_request: bool = False
     start_at_stage_entry: bool = True
+    # Layerwise components release their resident set when the use ends, which
+    # is right for a DiT (one use spans every denoise step) and buys nothing for
+    # a component used once per forward. Set this when something that knows the
+    # pipeline's per-phase headroom has decided the room is better spent holding
+    # the set until this component runs again.
+    retain_resident_layers: bool = False
+    # If True, skip keep-single-DiT and run finish_use after this interval.
+    release_after_use: bool = False
+    # H2D / restore this use on the request tail. Default off.
+    prefetch_after_request: bool = False
+    # Skip empty_cache after this use D2H.
+    skip_empty_cache_on_release: bool = False
 
 
 @dataclass(slots=True)
@@ -243,10 +257,18 @@ class ComponentResidencyManager:
         no declared ``ComponentUse`` would otherwise be accepted but never
         moved to the device before a forward pass.
         """
-        if not isinstance(self.server_args, ServerArgs):
+        if (
+            not isinstance(self.server_args, ServerArgs)
+            or not self.server_args.component_residency
+        ):
             return
 
-        declared_components = {use.component_name for use in self._ordered_uses}
+        # sequential multi-output execution runs subsets of the full pipeline
+        declared_components = {
+            use.component_name
+            for name, stage in self.pipeline._stage_name_mapping.items()
+            for use in stage.component_uses(self.server_args, name)
+        }
         unmanaged_components = sorted(
             component_name
             for component_name, module in self.pipeline.modules.items()
@@ -332,6 +354,7 @@ class ComponentResidencyManager:
     def end_stage(self) -> None:
         """Close the component interval owned by the current stage."""
         self._record_warmup_phase_peak()
+        self._release_unconsumed_stage_prefetches()
         if self._active_use is None:
             return
         if self._active_use.stage_name != self.state.stage_name:
@@ -442,6 +465,14 @@ class ComponentResidencyManager:
         """Prepare a shared component and wait without making it the active use."""
         self._prepare_forward_use(use, module=module)
 
+    def finish_unused_component(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
+        """Release retained weights when conditioning reuse skips their use."""
+        if self._active_use is not None and self._same_use(self._active_use, use):
+            return
+        self._finish_use(use, module=module, keep_on_warmup=False, force=True)
+
     def remove_nvtx_hooks_for_module(self, module: nn.Module | None) -> None:
         """Detach NVTX hooks before a component object is deleted or replaced."""
         if module is None:
@@ -500,7 +531,10 @@ class ComponentResidencyManager:
         self.state.current_use = None
         self._begin_warmup_between_uses()
         if prefetch_next:
-            self._prefetch_next_memory_intensive_use()
+            # Stages call this when done with their components, so a later use
+            # declared by the same stage (e.g. transformer_2 on a warmup that
+            # only ran the high-noise expert) will not run in this request.
+            self._prefetch_next_memory_intensive_use(skip_stage=self.state.stage_name)
 
     def _prepare_forward_use(
         self, use: ComponentUse, module: nn.Module | None = None
@@ -581,6 +615,8 @@ class ComponentResidencyManager:
         """Prepare a future memory-intensive component without waiting."""
         if not use.allow_prefetch:
             return
+        if self._use_key(use) in self._prefetched_use_keys:
+            return
         module = self.get_module(use.component_name)
         if module is None:
             return
@@ -590,9 +626,10 @@ class ComponentResidencyManager:
             and self._active_use is not None
         ):
             return
-        if is_resident_layerwise_module(module):
+        # Resident layerwise already keeps a layer window on GPU. Only Flux3's
+        # request-tail prefetch opts back in.
+        if is_resident_layerwise_module(module) and not use.prefetch_after_request:
             return
-
         self._uses_seen[use.component_name] = use
         self._modules_seen[use.component_name] = module
         self._begin_warmup_prefetch(use)
@@ -617,13 +654,18 @@ class ComponentResidencyManager:
             return
         if not force:
             should_keep = (
-                keep_on_warmup and self.state.batch_is_warmup
+                keep_on_warmup
+                and self.state.batch_is_warmup
+                and self.server_args.explicit_residency_mode(use.component_name) is None
             ) or self._should_keep_after_use(use)
             if should_keep:
                 return
         strategy = self.strategy_for(use.component_name, module)
         was_on_supported_device = self._module_on_supported_device(module)
         strategy.finish_use(module, use, self.state)
+        self._prefetched_use_keys = {
+            key for key in self._prefetched_use_keys if key[1] != use.component_name
+        }
         self._empty_cache_after_large_release(
             use, strategy, module, was_on_supported_device
         )
@@ -637,9 +679,17 @@ class ComponentResidencyManager:
                 module = self.get_module(component_name)
             if module is None:
                 continue
-            if self.state.batch_is_warmup and use.keep_ready_after_warmup:
+            # pipeline hints must not override an explicit placement policy
+            explicit_mode = self.server_args.explicit_residency_mode(component_name)
+            preferred = component_name in preferred_uses and explicit_mode is None
+            if (
+                self.state.batch_is_warmup
+                and use.keep_ready_after_warmup
+                and explicit_mode is None
+            ):
                 continue
-            preferred = component_name in preferred_uses
+            if use.keep_ready_after_request:
+                continue
             if is_resident_layerwise_module(module):
                 preferred = False
             keep_single_dit = self._should_keep_single_dit(component_name, module)
@@ -688,6 +738,21 @@ class ComponentResidencyManager:
                 log_host_memory_breakdown(
                     self.placement_modules(),
                     label=f"after request {self._debug_requests_seen}",
+                )
+        self._prefetch_next_request()
+
+    def _prefetch_next_request(self) -> None:
+        """H2D / restore uses that set prefetch_after_request."""
+        for uses in self._stage_uses_by_index:
+            for use in uses:
+                if not use.prefetch_after_request:
+                    continue
+                if use.keep_ready_after_request:
+                    continue
+                self._prefetch_use(use)
+                logger.info(
+                    "prefetch %s for the next request",
+                    use.component_name,
                 )
 
     def _begin_warmup_phase(
@@ -876,22 +941,45 @@ class ComponentResidencyManager:
                 return index
         return None
 
-    def _prefetch_next_memory_intensive_use(self) -> None:
+    def _prefetch_next_memory_intensive_use(
+        self, *, skip_stage: str | None = None
+    ) -> None:
         for use in self._ordered_uses[self._current_use_index + 1 :]:
-            if not use.memory_intensive:
+            if not use.memory_intensive or use.stage_name == skip_stage:
                 continue
             if self._use_key(use) in self._prefetched_use_keys:
                 return
             self._prefetch_use(use)
             return
 
+    def _release_unconsumed_stage_prefetches(self) -> None:
+        """Release prefetched uses of the ending stage that never began."""
+        for use in self.state.future_uses:
+            key = self._use_key(use)
+            if use.stage_name != self.state.stage_name or (
+                key not in self._prefetched_use_keys
+            ):
+                continue
+            self._prefetched_use_keys.discard(key)
+            if self._active_use is None or (
+                self._active_use.component_name != use.component_name
+            ):
+                self._finish_use(use, keep_on_warmup=False, force=True)
+
     def _should_keep_after_use(self, use: ComponentUse) -> bool:
+        if use.keep_ready_after_request:
+            return True
         if self.state.future_uses and self._same_use(use, self.state.future_uses[0]):
             return True
+        if use.release_after_use:
+            return False
         module = self.get_module(use.component_name)
         if module is not None and self._should_keep_single_dit(
             use.component_name, module
         ):
+            if is_resident_layerwise_module(module):
+                # Layerwise DiT with resident layers must not stay on GPU through decode.
+                return False
             return True
         return False
 
@@ -960,6 +1048,18 @@ class ComponentResidencyManager:
             self._module_device(module)
         )
 
+    def _module_on_cuda(self, module: nn.Module | None) -> bool:
+        """True if any parameter or buffer still has CUDA storage."""
+        if module is None:
+            return False
+        for tensor in module.parameters():
+            if tensor.device.type == "cuda":
+                return True
+        for tensor in module.buffers():
+            if tensor.device.type == "cuda":
+                return True
+        return False
+
     def _empty_cache_after_large_release(
         self,
         use: ComponentUse,
@@ -968,6 +1068,10 @@ class ComponentResidencyManager:
         was_on_supported_device: bool,
     ) -> None:
         if not use.memory_intensive:
+            return
+        if use.skip_empty_cache_on_release:
+            return
+        if self._keep_ready_component_on_cuda():
             return
         released_device_storage = (
             was_on_supported_device and not self._module_on_supported_device(module)
@@ -981,6 +1085,18 @@ class ComponentResidencyManager:
         if not torch.get_device_module().is_available():
             return
         torch.get_device_module().empty_cache()
+
+    def _keep_ready_component_on_cuda(self) -> bool:
+        """True if a keep-ready component still owns CUDA storage."""
+        for component_name, seen_use in self._uses_seen.items():
+            if not seen_use.keep_ready_after_request:
+                continue
+            seen = self._modules_seen.get(component_name)
+            if seen is None:
+                seen = self.get_module(component_name)
+            if self._module_on_cuda(seen):
+                return True
+        return False
 
 
 _GLOBAL_COMPONENT_RESIDENCY_MANAGER: ComponentResidencyManager | None = None

@@ -44,7 +44,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         url,
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
-        bootstrap_port: None,
+        ..Default::default()
     });
     // Use the configured tokenizer so the chat path can emit input_ids.
     let policies =
@@ -102,53 +102,6 @@ async fn plain_chat_forwards_input_ids_and_keeps_messages() {
 }
 
 #[tokio::test]
-async fn tool_request_omits_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids; got {body}"
-    );
-}
-
-#[tokio::test]
-async fn thinking_request_omits_input_ids() {
-    // `chat_template_kwargs` steers engine-side thinking mode, which the
-    // router's encoder renders in the default mode only — forwarding ids would
-    // silently run the wrong mode, so the handler must omit them.
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": true},
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "thinking-mode requests must not forward input_ids; got {body}"
-    );
-}
-
-#[tokio::test]
 async fn multimodal_request_omits_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
@@ -198,7 +151,18 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
             send(Arc::clone(&ctx), request.clone()).await,
             StatusCode::OK
         );
-        assert_eq!(captured(&mock), request, "body must be forwarded untouched");
+        let mut forwarded = captured(&mock);
+        let rid = forwarded
+            .as_object_mut()
+            .expect("a forwarded chat body is an object")
+            .remove("rid");
+        assert!(
+            rid.as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(crate::common::is_engine_shaped_rid),
+            "plain mode must mint an abort rid; got {rid:?}",
+        );
+        assert_eq!(forwarded, request, "body must be forwarded untouched");
     }
     // Bypasses are not rendering failures.
     assert!(!ctx

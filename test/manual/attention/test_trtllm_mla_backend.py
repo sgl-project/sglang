@@ -327,7 +327,6 @@ class TestTRTLLMMLA(CustomTestCase):
     def setUpClass(cls):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         set_global_server_args_for_scheduler(server_args)
 
     @classmethod

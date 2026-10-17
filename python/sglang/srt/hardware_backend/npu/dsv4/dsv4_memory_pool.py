@@ -79,9 +79,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         self.kv_cache_total_dim = kv_dim
         # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
         # For example: kernel_page_size * kv_dim * sizeof(bf16).
-        self.bytes_per_page_padded = (
-            self.kernel_page_size * kv_dim * torch.bfloat16.itemsize
-        )
+        self.bytes_per_page_padded = self.kernel_page_size * kv_dim * kv_dtype.itemsize
         # Writes are flat-indexed by loc; kernel_page_size controls the physical
         # page layout exposed to the NPU operators.
         npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
@@ -371,6 +369,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        global_page_size: Optional[int] = None,
     ) -> NPUDeepSeekV4IndexerPool:
         # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(
@@ -382,6 +381,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device,
             enable_memory_saver,
             kernel_page_size=page_size,
+            global_page_size=global_page_size,
         )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:

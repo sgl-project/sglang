@@ -137,6 +137,7 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 - Each test file should take < 500 seconds; split if longer.
 - Each GitHub Actions job should take < 30 minutes; split if longer.
 - If tests are too slow for per-commit, consider nightly suites.
+- New GSM8K or MMLU accuracy checks should use sgl-eval (`sglang.test.sgl_eval_utils.run_sgl_eval` or `sgl-eval run`) instead of adding another dataset or evaluator copy.
 
 ## Other Notes
 

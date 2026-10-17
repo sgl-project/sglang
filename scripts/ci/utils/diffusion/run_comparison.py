@@ -1,9 +1,18 @@
 """Diffusion serving benchmark for SGLang-Diffusion nightly CI.
 
-Launches an SGLang-Diffusion server for each test case, sends repeated
-requests, measures median end-to-end latency, and writes comparison-results.json.
-The runner still supports extra frameworks via --frameworks, but the nightly
-config tracks SGLang-Diffusion only.
+Launches a server for each test case, sends repeated requests, measures median
+end-to-end latency, and writes comparison-results.json. The runner still
+supports extra frameworks via --frameworks, but the nightly config tracks
+SGLang-Diffusion only.
+
+Every framework is measured the way an outside benchmark would measure it:
+- the server starts with exactly the case's recipe arguments;
+- latency is client-side, from the request leaving the client until the media
+  bytes are in hand (async video jobs are polled every POLL_INTERVAL_S and the
+  output file is downloaded);
+- the same client warmup requests are sent to every framework and discarded;
+  the first one is reported separately as first_request_latency_s.
+Server perf dumps are stage telemetry only and never feed the comparison.
 
 Usage:
     # Full run (requires GPU)
@@ -49,6 +58,8 @@ SGLANG_MASTER_PORT_OFFSET = 5
 SGLANG_SCHEDULER_PORT_OFFSET = 55
 HEALTH_TIMEOUT = 2400  # seconds (40 min — keep large model download/warmup headroom)
 REQUEST_TIMEOUT = 1200  # seconds
+POLL_INTERVAL_S = 0.1  # async jobs: polling adds at most this much latency
+METHODOLOGY = "client-e2e-v1"
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
 SERVER_FATAL_ERROR_PATTERNS = (
     "CUDA out of memory",
@@ -61,6 +72,7 @@ INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
 # Cached reference image (downloaded once)
 _cached_ref_image: bytes | None = None
 _cached_ref_image_path: str | None = None
+_ref_image_variants: dict[int, bytes] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -86,29 +98,9 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     ]
     if case["num_gpus"] > 1:
         cmd += ["--num-gpus", str(case["num_gpus"])]
-    serve_args = shlex.split(fw_cfg.get("serve_args", ""))
-    cmd += serve_args
-
-    def has_option(name: str) -> bool:
-        return any(arg == name or arg.startswith(f"{name}=") for arg in serve_args)
-
-    server_warmup = any(
-        arg == "--warmup-mode=server"
-        or (
-            arg == "--warmup-mode"
-            and index + 1 < len(serve_args)
-            and serve_args[index + 1] == "server"
-        )
-        for index, arg in enumerate(serve_args)
-    )
-    if server_warmup and not has_option("--warmup-resolutions"):
-        cmd += ["--warmup-resolutions", f"{case['width']}x{case['height']}"]
-    if (
-        server_warmup
-        and case.get("num_frames") is not None
-        and not has_option("--warmup-num-frames")
-    ):
-        cmd += ["--warmup-num-frames", str(case["num_frames"])]
+    # The recipe as published: an outside benchmark would not know to add
+    # shape-specific warmup flags, so the harness does not add them either.
+    cmd += shlex.split(fw_cfg.get("serve_args", ""))
     return cmd
 
 
@@ -232,8 +224,19 @@ HEALTH_ENDPOINTS = {
 }
 
 
+def _raise_if_exited(proc: subprocess.Popen | None) -> None:
+    # a server that died during startup would otherwise cost the full timeout
+    if proc is not None and proc.poll() is not None:
+        raise RuntimeError(
+            f"Server exited with code {proc.returncode} before becoming ready"
+        )
+
+
 def wait_for_health(
-    base_url: str, framework: str = "sglang", timeout: int = HEALTH_TIMEOUT
+    base_url: str,
+    framework: str = "sglang",
+    timeout: int = HEALTH_TIMEOUT,
+    proc: subprocess.Popen | None = None,
 ) -> None:
     """Poll health endpoint until 200, then verify model is loaded."""
     endpoint = HEALTH_ENDPOINTS.get(framework, "/health")
@@ -241,6 +244,7 @@ def wait_for_health(
     print(f"  Waiting for server at {health_url} ...")
     start = time.time()
     while True:
+        _raise_if_exited(proc)
         try:
             resp = requests.get(health_url, timeout=2)
             if resp.status_code == 200:
@@ -258,6 +262,7 @@ def wait_for_health(
     if framework == "sglang":
         models_url = f"{base_url}/v1/models"
         while True:
+            _raise_if_exited(proc)
             try:
                 resp = requests.get(models_url, timeout=5)
                 if resp.status_code == 200:
@@ -339,9 +344,31 @@ def _get_ref_image_bytes(config: dict) -> bytes:
     return _cached_ref_image
 
 
-def _get_ref_image_b64(config: dict) -> str:
+def _get_ref_image_variant(config: dict, variant: int | None) -> bytes:
+    """The reference image, or a copy with a corner patch unique to `variant`.
+
+    sglang reuses the VAE and vision encodings of an image it has already seen,
+    so requests that repeat one image would time that reuse instead of the
+    encoders. The patch is large enough to survive the server's resize.
+    """
+    data = _get_ref_image_bytes(config)
+    if variant is None:
+        return data
+    if variant not in _ref_image_variants:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        level = 8 + 24 * variant
+        image.paste((level, level, level), (0, 0, 8, 8))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        _ref_image_variants[variant] = buffer.getvalue()
+    return _ref_image_variants[variant]
+
+
+def _get_ref_image_b64(config: dict, variant: int | None = None) -> str:
     """Get reference image as base64 string."""
-    return base64.b64encode(_get_ref_image_bytes(config)).decode("utf-8")
+    return base64.b64encode(_get_ref_image_variant(config, variant)).decode("utf-8")
 
 
 def _get_ref_image_path(config: dict) -> str:
@@ -432,6 +459,33 @@ def _read_perf_dump(perf_dump_path: str, timeout: float = 30.0) -> dict | None:
     return None
 
 
+def _download_media(url: str) -> int:
+    """GET the finished output; returns its size, which must be non-zero."""
+    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    if not resp.content:
+        raise RuntimeError(f"Empty media download from {url}")
+    return len(resp.content)
+
+
+def _wait_for_sglang_video(base_url: str, job_id: str, start: float) -> None:
+    """Poll an SGLang video job until it finishes, then download the video."""
+    poll_url = f"{base_url}/v1/videos/{job_id}"
+    while True:
+        poll_resp = requests.get(poll_url, timeout=30)
+        poll_resp.raise_for_status()
+        poll_data = poll_resp.json()
+        status = poll_data.get("status")
+        if status == "completed":
+            break
+        if status == "failed":
+            raise RuntimeError(f"Video generation failed: {poll_data}")
+        if time.perf_counter() - start > REQUEST_TIMEOUT:
+            raise TimeoutError(f"Video generation timed out after {REQUEST_TIMEOUT}s")
+        time.sleep(POLL_INTERVAL_S)
+    _download_media(f"{poll_url}/content")
+
+
 def send_image_request_sglang(
     base_url: str, case: dict, perf_dump_path: str | None = None
 ) -> float:
@@ -440,13 +494,13 @@ def send_image_request_sglang(
     if perf_dump_path:
         payload["perf_dump_path"] = perf_dump_path
 
-    start = time.time()
+    start = time.perf_counter()
     resp = requests.post(
         f"{base_url}/v1/images/generations",
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
-    client_latency = time.time() - start
+    client_latency = time.perf_counter() - start
     resp.raise_for_status()
     data = resp.json()
     if "data" not in data or len(data["data"]) == 0:
@@ -464,9 +518,7 @@ def send_video_request_sglang(
     if perf_dump_path:
         payload["perf_dump_path"] = perf_dump_path
 
-    start = time.time()
-
-    # Submit job
+    start = time.perf_counter()
     resp = requests.post(
         f"{base_url}/v1/videos",
         json=payload,
@@ -477,23 +529,8 @@ def send_video_request_sglang(
     job_id = job.get("id")
     if not job_id:
         raise RuntimeError(f"Video submit returned no job id: {job}")
-
-    # Poll for completion
-    poll_url = f"{base_url}/v1/videos/{job_id}"
-    while True:
-        time.sleep(1)
-        poll_resp = requests.get(poll_url, timeout=30)
-        poll_resp.raise_for_status()
-        poll_data = poll_resp.json()
-        status = poll_data.get("status")
-        if status == "completed":
-            break
-        elif status == "failed":
-            raise RuntimeError(f"Video generation failed: {poll_data}")
-        if time.time() - start > REQUEST_TIMEOUT:
-            raise TimeoutError(f"Video generation timed out after {REQUEST_TIMEOUT}s")
-
-    client_latency = time.time() - start
+    _wait_for_sglang_video(base_url, job_id, start)
+    client_latency = time.perf_counter() - start
 
     print(f"  Video generated in {client_latency:.2f}s")
     return client_latency
@@ -504,7 +541,7 @@ def send_image_conditioned_request_sglang(
 ) -> float:
     """Send an image-conditioned request (edit/I2V/TI2V) via SGLang multipart API."""
     task = case["task"]
-    ref_bytes = _get_ref_image_bytes(config)
+    ref_bytes = _get_ref_image_variant(config, case.get("input_variant"))
 
     # Build multipart form — field name depends on endpoint:
     # image edits use "image", video (I2V/TI2V) uses "input_reference"
@@ -540,38 +577,21 @@ def send_image_conditioned_request_sglang(
     else:
         endpoint = "/v1/images/generations"
 
-    start = time.time()
+    start = time.perf_counter()
     resp = requests.post(
         f"{base_url}{endpoint}",
         files=files,
         data=data,
         timeout=REQUEST_TIMEOUT,
     )
-
-    # For video endpoints, need to poll
+    resp.raise_for_status()
     if task in ("image-to-video", "text-image-to-video"):
-        resp.raise_for_status()
         job = resp.json()
         job_id = job.get("id")
         if not job_id:
             raise RuntimeError(f"Video submit returned no job id: {job}")
-        poll_url = f"{base_url}/v1/videos/{job_id}"
-        while True:
-            time.sleep(1)
-            poll_resp = requests.get(poll_url, timeout=30)
-            poll_resp.raise_for_status()
-            poll_data = poll_resp.json()
-            status = poll_data.get("status")
-            if status == "completed":
-                break
-            elif status == "failed":
-                raise RuntimeError(f"Video generation failed: {poll_data}")
-            if time.time() - start > REQUEST_TIMEOUT:
-                raise TimeoutError(f"Timed out after {REQUEST_TIMEOUT}s")
-    else:
-        resp.raise_for_status()
-
-    client_latency = time.time() - start
+        _wait_for_sglang_video(base_url, job_id, start)
+    client_latency = time.perf_counter() - start
 
     print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
     return client_latency
@@ -601,7 +621,7 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
     # Build message content (text or text+image)
     content: list[dict] | str = case["prompt"]
     if case.get("reference_image"):
-        ref_b64 = _get_ref_image_b64(config)
+        ref_b64 = _get_ref_image_b64(config, case.get("input_variant"))
         content = [
             {
                 "type": "image_url",
@@ -616,13 +636,13 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
         "extra_body": extra_body,
     }
 
-    start = time.time()
+    start = time.perf_counter()
     resp = requests.post(
         f"{base_url}/v1/chat/completions",
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
-    latency = time.time() - start
+    latency = time.perf_counter() - start
     resp.raise_for_status()
     data = resp.json()
     choices = data.get("choices", [])
@@ -667,9 +687,7 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
     if case.get("reference_image"):
         payload["image_path"] = config.get("test_image_url", "")
 
-    start = time.time()
-
-    # Submit task
+    start = time.perf_counter()
     resp = requests.post(
         f"{base_url}{endpoint}",
         json=payload,
@@ -681,22 +699,22 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
     if not task_id:
         raise RuntimeError(f"LightX2V submit returned no task_id: {task_data}")
 
-    # Poll for completion
     poll_url = f"{base_url}/v1/tasks/{task_id}/status"
     while True:
-        time.sleep(1)
         poll_resp = requests.get(poll_url, timeout=30)
         poll_resp.raise_for_status()
         poll_data = poll_resp.json()
         status = poll_data.get("task_status", "").upper()
         if status == "COMPLETED":
             break
-        elif status in ("FAILED", "CANCELLED"):
+        if status in ("FAILED", "CANCELLED"):
             raise RuntimeError(f"LightX2V task {status}: {poll_data}")
-        if time.time() - start > REQUEST_TIMEOUT:
+        if time.perf_counter() - start > REQUEST_TIMEOUT:
             raise TimeoutError(f"LightX2V task timed out after {REQUEST_TIMEOUT}s")
-
-    latency = time.time() - start
+        time.sleep(POLL_INTERVAL_S)
+    # end-to-end means the output is in hand, as for the other frameworks
+    _download_media(f"{base_url}/v1/tasks/{task_id}/result")
+    latency = time.perf_counter() - start
     print(f"  Generated in {latency:.2f}s (lightx2v)")
     return latency
 
@@ -704,6 +722,24 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
 # ---------------------------------------------------------------------------
 # Unified request dispatcher
 # ---------------------------------------------------------------------------
+
+
+def _request_case(case: dict, request_index: int) -> dict:
+    """The case with inputs that no earlier request of the run has used.
+
+    A benchmark draws distinct prompts, and sglang reuses the encodings of
+    inputs it has seen. A one-digit tag keeps the prompt's token count, and so
+    every shape, the same across requests.
+    """
+    if not 0 <= request_index <= 9:
+        raise ValueError(
+            f"request {request_index} of a case: one-digit input tags cover 10"
+        )
+    return {
+        **case,
+        "prompt": f"{case['prompt']} (take {request_index})",
+        "input_variant": request_index,
+    }
 
 
 def send_request(
@@ -785,9 +821,12 @@ def run_single(
         "framework": framework,
         "model": case["model"],
         "task": case["task"],
+        "methodology": METHODOLOGY,
         "latency_s": None,
         "latency_samples_s": [],
         "measurement_count": 0,
+        "first_request_latency_s": None,
+        "warmup_requests": 0,
         "error": None,
     }
 
@@ -847,15 +886,43 @@ def run_single(
         log_thread.start()
 
         base_url = f"http://{DEFAULT_HOST}:{port}"
-        wait_for_health(base_url, framework)
+        wait_for_health(base_url, framework, proc=proc)
 
-        # SGLang server warmup uses the measured shape added by
-        # _build_sglang_cmd. The repeated requests below absorb any remaining
-        # request-path cold effects, including image-conditioned preprocessing.
-        # NOTE: vllm-omni / lightx2v configure no server-side warmup; if
-        # cross-framework comparison is restored, they must add their own warmup
-        # to stay on equal footing — otherwise their measured request pays the
-        # full cold-start.
+        # Identical client warmup for every framework, discarded from the
+        # measurement. The first request after the server reports ready is
+        # kept on its own: it is what a user (or a benchmark that skips
+        # warmup) sees, so cold-path regressions stay visible.
+        warmup_requests = int((config or {}).get("warmup_requests", 1))
+        for warmup_index in range(warmup_requests):
+            print(f"  Sending warmup request {warmup_index + 1}/{warmup_requests}...")
+            first_dump_path = None
+            if framework == "sglang" and warmup_index == 0:
+                # stage timings of the cold request, to set against the
+                # steady-state stage medians
+                first_dump_path = str(
+                    (log_dir / f"perf_{case['id']}_first.json").resolve()
+                )
+                if os.path.exists(first_dump_path):
+                    os.remove(first_dump_path)
+            latency = send_request(
+                base_url,
+                _request_case(case, warmup_index),
+                framework,
+                config,
+                perf_dump_path=first_dump_path,
+            )
+            if warmup_index == 0:
+                result["first_request_latency_s"] = round(latency, 3)
+                first_dump = (
+                    _read_perf_dump(first_dump_path) if first_dump_path else None
+                )
+                if first_dump is not None:
+                    result["first_request_stage_ms"] = {
+                        stage["name"]: round(float(stage["duration_ms"]), 3)
+                        for stage in first_dump.get("steps", [])
+                        if stage.get("name") and stage.get("duration_ms") is not None
+                    }
+        result["warmup_requests"] = warmup_requests
 
         latency_samples: list[float] = []
         perf_dumps: list[dict] = []
@@ -877,7 +944,11 @@ def run_single(
                 f"{measurement_repeats}..."
             )
             latency = send_request(
-                base_url, case, framework, config, perf_dump_path=perf_dump_path
+                base_url,
+                _request_case(case, warmup_requests + sample_index),
+                framework,
+                config,
+                perf_dump_path=perf_dump_path,
             )
             latency_samples.append(round(latency, 3))
 
@@ -1067,7 +1138,9 @@ def run_comparison(
         "timestamp": timestamp,
         "commit_sha": commit_sha,
         "run_id": run_id,
+        "methodology": METHODOLOGY,
         "measurement_repeats": repeats,
+        "warmup_requests": int(config.get("warmup_requests", 1)),
         "results": results,
     }
 

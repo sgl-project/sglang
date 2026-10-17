@@ -16,7 +16,9 @@ from sglang.test.test_utils import CustomTestCase, find_available_port
 register_cpu_ci(est_time=43, suite="stage-a-test-cpu-intel")
 
 
-def run_distributed_test(rank, world_size, master_port, output_writer, fn):
+def run_distributed_test(
+    rank, world_size, master_port, output_writer, fn, init_legacy_shm=True
+):
     try:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -25,10 +27,10 @@ def run_distributed_test(rank, world_size, master_port, output_writer, fn):
         os.environ["LOCAL_SIZE"] = str(world_size)
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        torch.ops.sgl_kernel.initialize(world_size, rank)
 
+        if init_legacy_shm:
+            torch.ops.sgl_kernel.initialize(world_size, rank)
         fn(rank, world_size)
-
         execution_ok = True
     except Exception as e:
         print(f"subprocess[{rank=}] has error: {e}", flush=True)
@@ -117,8 +119,94 @@ def reduce_scatter_tensor_fn(rank, world_size):
         torch.testing.assert_close(output_tensor, output_shm)
 
 
+def init_group(rank):
+    group_ranks_list = [[0, 2], [1, 3]]
+
+    groups = [dist.new_group(ranks=ranks, backend="gloo") for ranks in group_ranks_list]
+
+    group_idx = rank % 2
+    group = groups[group_idx]
+    group_ranks = group_ranks_list[group_idx]
+
+    group_size = dist.get_world_size(group)
+    group_rank = dist.get_rank(group)
+
+    group_name = f"test_group_{os.environ['MASTER_PORT']}_" + "_".join(
+        map(str, group_ranks)
+    )
+
+    handle = torch.ops.sgl_kernel.shm_group_initialize(
+        group_name, group_size, group_rank
+    )
+
+    return group, handle
+
+
+def group_all_reduce_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    op = dist.ReduceOp.SUM
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        for size in [(2, 10), (600000,)]:
+            tensor = torch.randn(size, dtype=dtype)
+            tensor_shm = copy.deepcopy(tensor)
+
+            dist.all_reduce(tensor, op=op, group=group)
+
+            torch.ops.sgl_kernel.shm_allreduce(tensor_shm, op, handle)
+
+            torch.testing.assert_close(tensor, tensor_shm)
+
+
+def group_all_gather_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    group_size = dist.get_world_size(group)
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(2, 10, dtype=dtype)
+
+        input_size = tensor.size()
+        output_size = (input_size[0] * group_size,) + input_size[1:]
+
+        output_tensor = torch.empty(
+            output_size,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        output_shm = torch.empty(
+            output_size,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
+        dist.all_gather_into_tensor(output_tensor, tensor, group=group)
+
+        torch.ops.sgl_kernel.shm_allgather_into_tensor(output_shm, tensor, handle)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+def group_all_to_all_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    group_size = dist.get_world_size(group)
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(group_size * 2, 10, dtype=dtype)
+        output_tensor = torch.empty_like(tensor)
+        output_shm = torch.empty_like(tensor)
+
+        dist.all_to_all_single(output_tensor, tensor, group=group)
+
+        torch.ops.sgl_kernel.shm_alltoall(output_shm, tensor, handle)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
 class TestComm(CustomTestCase):
-    def _spawn_and_check(self, fn, world_size=2):
+    def _spawn_and_check(self, fn, world_size=2, init_legacy_shm=True):
         mp.set_start_method("spawn", force=True)
         master_port = find_available_port(23456)
 
@@ -134,6 +222,7 @@ class TestComm(CustomTestCase):
                     master_port=master_port,
                     output_writer=output_writer,
                     fn=fn,
+                    init_legacy_shm=init_legacy_shm,
                 ),
             )
             p.start()
@@ -146,16 +235,25 @@ class TestComm(CustomTestCase):
             p.join()
 
     def test_all_reduce(self):
-        self._spawn_and_check(all_reduce_fn)
+        self._spawn_and_check(all_reduce_fn, init_legacy_shm=True)
 
     def test_all_gather(self):
-        self._spawn_and_check(all_gather_fn)
+        self._spawn_and_check(all_gather_fn, init_legacy_shm=True)
 
     def test_all_gather_into_tensor(self):
-        self._spawn_and_check(all_gather_into_tensor_fn)
+        self._spawn_and_check(all_gather_into_tensor_fn, init_legacy_shm=True)
 
     def test_reduce_scatter_tensor(self):
-        self._spawn_and_check(reduce_scatter_tensor_fn)
+        self._spawn_and_check(reduce_scatter_tensor_fn, init_legacy_shm=True)
+
+    def test_group_all_reduce(self):
+        self._spawn_and_check(group_all_reduce_fn, world_size=4, init_legacy_shm=False)
+
+    def test_group_all_gather(self):
+        self._spawn_and_check(group_all_gather_fn, world_size=4, init_legacy_shm=False)
+
+    def test_group_all_to_all(self):
+        self._spawn_and_check(group_all_to_all_fn, world_size=4, init_legacy_shm=False)
 
 
 if __name__ == "__main__":

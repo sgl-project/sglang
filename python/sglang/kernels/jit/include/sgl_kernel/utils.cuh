@@ -27,6 +27,7 @@
 #include <optional>
 #include <type_traits>
 #ifndef USE_ROCM
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -327,13 +328,42 @@ SGL_DEVICE_HOST constexpr uint32_t get_tmem_cols(uint32_t num_cols) {
 
 namespace host {
 
+namespace runtime {
+
+inline bool is_cuda_error(::cudaError_t error) {
+  return error != ::cudaSuccess;
+}
+
+inline const char* get_cuda_error_string(::cudaError_t error) {
+  return ::cudaGetErrorString(error);
+}
+
+#ifndef USE_ROCM
+
+inline bool is_cuda_error(::CUresult error) {
+  return error != ::CUDA_SUCCESS;
+}
+
+inline const char* get_cuda_error_string(::CUresult error) {
+  const char* error_string = "";
+  // cuGetErrorString only fails with CUDA_ERROR_INVALID_VALUE, leaving the string null.
+  const auto new_error = ::cuGetErrorString(error, &error_string);
+  return new_error == ::CUDA_SUCCESS ? error_string : "Unknown error";
+}
+
+#endif
+
+}  // namespace runtime
+
 /**
- * \brief Check the CUDA error code and panic with location info on failure.
+ * \brief Check a CUDA runtime (`cudaError_t`) or driver (`CUresult`) error code
+ *        and panic with location info on failure.
  */
-inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
-  if (error != ::cudaSuccess) {
+template <typename T>
+inline void RuntimeDeviceCheck(T error, DebugInfo location = {}) {
+  if (runtime::is_cuda_error(error)) {
     [[unlikely]];
-    host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    panic(location, "CUDA error: ", runtime::get_cuda_error_string(error));
   }
 }
 
@@ -470,12 +500,10 @@ struct LaunchKernel {
   cudaLaunchAttribute m_attrs[2];
 };
 
-// The empty-true-branch if/else form keeps a trailing `else` in user code
-// bound to the user's `if`, not to the macro's.
-#define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
-  } else                                                              \
-    host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+#define CHECK_CUDA(COND)                                                                    \
+  if (const auto _err = (COND); !::sglang::host::runtime::is_cuda_error(_err)) [[likely]] { \
+  } else                                                                                    \
+    SGL_PANIC << "CUDA error: " << ::sglang::host::runtime::get_cuda_error_string(_err) << ". "
 
 }  // namespace host
 
