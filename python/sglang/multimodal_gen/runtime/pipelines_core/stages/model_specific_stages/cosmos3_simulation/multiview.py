@@ -87,6 +87,12 @@ logger = init_logger(__name__)
 # Clips decoded concurrently by the input stage (one ffmpeg process each).
 # Arbitrary; 8 keeps a 22-clip rig within a few seconds on a 24-core host.
 COSMOS3_MULTIVIEW_MEDIA_THREADS = 8
+# Frames resized at a time by ``fit_uint8_cthw``. The resize is per frame, so
+# the chunk only bounds the float32 temporaries: a 297-frame 1924x1084 MADS
+# control needs 15 GB of host memory resized whole and under 2 GB in chunks of
+# 16, with bit-identical output. Whole-clip resizes of every camera at once,
+# on every rank, took a four-GPU replica past its 660 GB limit.
+COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES = 16
 
 # ``batch.extra`` keys shared by the multiview stages.
 EXTRA_CONTROL_PIXELS = "multiview_control_pixels"
@@ -202,7 +208,9 @@ def load_media_uint8_cthw(
 ) -> torch.Tensor:
     """Load an image or the first ``max_frames`` of a clip as ``uint8 [3, T, H, W]``.
 
-    Frames are aspect-resized and center-cropped to ``height x width``.
+    Frames are aspect-resized and center-cropped to ``height x width``. The
+    decoded frames are converted and resized a chunk at a time, so only the
+    decoder's frames and the canvas-sized result are ever whole in memory.
     """
     if media_kind(path) == "image":
         frames = [load_image(path).convert("RGB")]
@@ -213,31 +221,128 @@ def load_media_uint8_cthw(
                 f"No frames decoded from Cosmos3 multiview media {path!r}."
             )
         frames = [frame.convert("RGB") for frame in decoded]
-    cthw = torch.stack([_pil_to_uint8_tensor(frame) for frame in frames], dim=1)
-    return fit_uint8_cthw(cthw, height=height, width=width)
+    first = _pil_to_uint8_tensor(frames[0])
+    if first.ndim != 3 or first.shape[0] != 3:
+        raise ValueError(
+            f"Cosmos3 multiview media {path!r} must decode to RGB frames, got {tuple(first.shape)}"
+        )
+    return _fit_uint8_chunks(
+        (
+            torch.stack(
+                [
+                    _pil_to_uint8_tensor(frame)
+                    for frame in frames[start : start + chunk]
+                ],
+                dim=1,
+            )
+            for start, chunk in _chunk_spans(len(frames))
+        ),
+        num_frames=len(frames),
+        orig_h=int(first.shape[1]),
+        orig_w=int(first.shape[2]),
+        height=height,
+        width=width,
+    )
 
 
-def fit_uint8_cthw(frames: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
+def _chunk_spans(
+    num_frames: int, chunk_frames: int = COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES
+):
+    """``(start, length)`` of each resize chunk; the last one may be shorter."""
+    if chunk_frames < 1:
+        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
+    for start in range(0, num_frames, chunk_frames):
+        yield start, min(chunk_frames, num_frames - start)
+
+
+def _fit_geometry(orig_h: int, orig_w: int, height: int, width: int) -> tuple[int, int]:
+    """Resize target before the center crop: the aspect-preserving cover of the canvas."""
+    scale = max(width / orig_w, height / orig_h)
+    return int(math.ceil(scale * orig_h)), int(math.ceil(scale * orig_w))
+
+
+def _fit_uint8_chunk(
+    chunk: torch.Tensor, *, resize_h: int, resize_w: int, height: int, width: int
+) -> torch.Tensor:
+    """Resize and crop one ``uint8 [3, t, H, W]`` chunk; the resize is per frame."""
+    chunk_tchw = chunk.permute(1, 0, 2, 3).to(dtype=torch.float32)
+    resized = TF.resize(chunk_tchw, [resize_h, resize_w])
+    cropped = TF.center_crop(resized, [height, width])
+    return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3)
+
+
+def _fit_uint8_chunks(
+    chunks,
+    *,
+    num_frames: int,
+    orig_h: int,
+    orig_w: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Assemble ``uint8 [3, num_frames, height, width]`` from source-size uint8 chunks."""
+    resize_h, resize_w = _fit_geometry(orig_h, orig_w, height, width)
+    out = torch.empty((3, num_frames, height, width), dtype=torch.uint8)
+    start = 0
+    for chunk in chunks:
+        if (
+            chunk.ndim != 4
+            or chunk.shape[0] != 3
+            or chunk.shape[2:] != (orig_h, orig_w)
+        ):
+            raise ValueError(
+                f"Multiview frame chunk must have shape [3, t, {orig_h}, {orig_w}], got {tuple(chunk.shape)}"
+            )
+        length = int(chunk.shape[1])
+        if start + length > num_frames:
+            raise ValueError(
+                f"Multiview frame chunks hold more than the declared {num_frames} frames"
+            )
+        out[:, start : start + length] = _fit_uint8_chunk(
+            chunk, resize_h=resize_h, resize_w=resize_w, height=height, width=width
+        )
+        start += length
+    if start != num_frames:
+        raise ValueError(
+            f"Multiview frame chunks hold {start} frames, {num_frames} declared"
+        )
+    return out
+
+
+def fit_uint8_cthw(
+    frames: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    chunk_frames: int = COSMOS3_MULTIVIEW_RESIZE_CHUNK_FRAMES,
+) -> torch.Tensor:
     """Aspect-preserving antialiased resize plus center crop of ``uint8 [3, T, H, W]``.
 
     Same arithmetic as imaginaire4's ``_resize_and_center_crop`` (torchvision
     resize with antialias, crop offset rounded half to even). The single-view
     helper in cosmos3.py keeps vLLM-Omni's floor offset without antialias,
     which lands one row off on 1720x1080 fisheye sources.
+
+    The clip is resized ``chunk_frames`` frames at a time. Resize, crop, round
+    and clamp act on each frame alone, so the chunking changes no value; it
+    bounds the float32 temporaries, which for a whole 297-frame 1924x1084 clip
+    would be eight times the clip itself.
     """
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
             f"Multiview frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
         )
-    orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
-    scale = max(width / orig_w, height / orig_h)
-    resize_h = int(math.ceil(scale * orig_h))
-    resize_w = int(math.ceil(scale * orig_w))
-    frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = TF.resize(frames_tchw, [resize_h, resize_w])
-    cropped = TF.center_crop(resized, [height, width])
-    return (
-        cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
+    num_frames = int(frames.shape[1])
+    return _fit_uint8_chunks(
+        (
+            frames[:, start : start + length]
+            for start, length in _chunk_spans(num_frames, chunk_frames)
+        ),
+        num_frames=num_frames,
+        orig_h=int(frames.shape[2]),
+        orig_w=int(frames.shape[3]),
+        height=height,
+        width=width,
     )
 
 

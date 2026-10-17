@@ -8,6 +8,7 @@ wiring."""
 import builtins
 import copy
 import importlib.util
+import math
 import os
 import tempfile
 import unittest
@@ -16,6 +17,8 @@ from unittest import mock
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
+from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
@@ -86,6 +89,12 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.encoder import (
 from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.layers import (
     _natten_backend_cache,
     resolve_natten_backend,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    _pil_to_uint8_tensor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation import (
+    multiview as multiview_stage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
     lidar_output_payload,
@@ -1173,6 +1182,85 @@ class TestPixelHelpersAndPrompt(unittest.TestCase):
         self.assertFalse(
             torch.equal(actual[:, 0], resized[0, :, 21:501].round().to(torch.uint8))
         )
+
+    def test_fit_uint8_cthw_chunks_change_no_pixel(self):
+        """Chunked resize is the whole-clip resize, value for value, at every geometry
+        the corpora use: 1924x1084 MADS controls (odd, downscale), 1280x720 KPI
+        controls (identity scale), 1720x1080 fisheye and a 4:3 upscale."""
+
+        def whole_clip(frames, *, height, width):
+            orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
+            scale = max(width / orig_w, height / orig_h)
+            resize_h = int(math.ceil(scale * orig_h))
+            resize_w = int(math.ceil(scale * orig_w))
+            tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
+            resized = TF.resize(tchw, [resize_h, resize_w])
+            cropped = TF.center_crop(resized, [height, width])
+            return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3)
+
+        generator = torch.Generator().manual_seed(0)
+        for (orig_h, orig_w), (height, width) in (
+            ((1084, 1924), (720, 1280)),
+            ((720, 1280), (720, 1280)),
+            ((1080, 1720), (480, 832)),
+            ((544, 736), (720, 1280)),
+        ):
+            for num_frames in (1, 5, 17):
+                clip = torch.randint(
+                    0,
+                    256,
+                    (3, num_frames, orig_h, orig_w),
+                    dtype=torch.uint8,
+                    generator=generator,
+                )
+                expected = whole_clip(clip, height=height, width=width)
+                for chunk_frames in (1, 4, 16, 64):
+                    actual = fit_uint8_cthw(
+                        clip, height=height, width=width, chunk_frames=chunk_frames
+                    )
+                    self.assertEqual(
+                        tuple(actual.shape), (3, num_frames, height, width)
+                    )
+                    self.assertEqual(actual.dtype, torch.uint8)
+                    self.assertTrue(
+                        torch.equal(actual, expected),
+                        f"{(orig_h, orig_w)}->{(height, width)} T={num_frames} chunk={chunk_frames}",
+                    )
+        self.assertEqual(
+            tuple(fit_uint8_cthw(clip[:, :0], height=480, width=832).shape),
+            (3, 0, 480, 832),
+        )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            fit_uint8_cthw(clip, height=480, width=832, chunk_frames=0)
+
+    def test_load_media_streams_decoded_frames_through_the_chunked_resize(self):
+        """The loader converts and resizes the decoder's frames chunk by chunk and
+        produces exactly what stacking every frame first would."""
+        generator = torch.Generator().manual_seed(1)
+        frames = [
+            Image.fromarray(
+                torch.randint(
+                    0, 256, (90, 160, 3), dtype=torch.uint8, generator=generator
+                ).numpy()
+            )
+            for _ in range(37)
+        ]
+        stacked = torch.stack([_pil_to_uint8_tensor(frame) for frame in frames], dim=1)
+        with mock.patch.object(
+            multiview_stage, "load_video", return_value=frames
+        ) as load:
+            actual = multiview_stage.load_media_uint8_cthw(
+                "rig/front.mp4", height=48, width=64, max_frames=37
+            )
+        load.assert_called_once_with("rig/front.mp4", max_frames=37)
+        self.assertTrue(
+            torch.equal(actual, fit_uint8_cthw(stacked, height=48, width=64))
+        )
+        with mock.patch.object(multiview_stage, "load_video", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "No frames decoded"):
+                multiview_stage.load_media_uint8_cthw(
+                    "rig/front.mp4", height=48, width=64, max_frames=4
+                )
 
     def test_pad_view_frames_truncates_or_repeats_last_frame(self):
         frames = torch.stack(
