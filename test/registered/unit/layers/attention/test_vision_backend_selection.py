@@ -276,7 +276,6 @@ def test_ascend_attention_initializes_padding(
     cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)])
     valid_mask = (torch.arange(seq_len)[None, :] < lengths[:, None]).flatten()
 
-    # Make unwritten rows fail deterministically, including reused graph buffers.
     empty_like = torch.empty_like
     monkeypatch.setattr(
         torch,
