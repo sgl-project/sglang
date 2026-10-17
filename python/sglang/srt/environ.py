@@ -649,6 +649,15 @@ class Envs:
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # ===================================================================
+    # Beam search
+    # ===================================================================
+    # Approximate constrained scores by normalizing only the retained trie
+    # candidates instead of streaming a full-vocabulary normalizer.
+    SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB = EnvBool(False)
+    # Experimental shared-context decode attention for wide beam batches.
+    SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+
+    # ===================================================================
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)

@@ -171,6 +171,17 @@ class PrefillMetadata:
 # flashinfer sizing drift across versions). Sizing logic lives in
 # FlashInferAttnBackend._full_cg_prefill_workspace_bytes.
 FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
+FLASHINFER_GRAPH_WORKSPACE_BASE_BYTES = 32 * 1024 * 1024
+FLASHINFER_GRAPH_WORKSPACE_PER_ROW_BYTES = 192 * 1024
+
+
+def _flashinfer_decode_graph_max_rows(req_pool_size: int) -> int:
+    configured_sizes = get_exec().graph.cuda_graph_config.decode.bs or ()
+    return min(
+        max(configured_sizes, default=0),
+        get_cuda_graph_max_batch_size(req_pool_size),
+    )
+
 
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
@@ -426,6 +437,26 @@ class FlashInferAttnBackend(AttentionBackend):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
+        decode_graph_max_rows = _flashinfer_decode_graph_max_rows(
+            model_runner.req_to_token_pool.size
+        )
+        graph_workspace_size = (
+            FLASHINFER_GRAPH_WORKSPACE_BASE_BYTES
+            + decode_graph_max_rows * FLASHINFER_GRAPH_WORKSPACE_PER_ROW_BYTES
+        )
+        if (
+            decode_backend == "flashinfer"
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            and graph_workspace_size > envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+        ):
+            logger.info(
+                "Increasing FlashInfer workspace to %.0f MB for decode CUDA "
+                "graphs up to %d rows",
+                graph_workspace_size / (1024 * 1024),
+                decode_graph_max_rows,
+            )
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(graph_workspace_size)
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -445,7 +476,6 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -960,6 +990,9 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.beam_attention_metadata is not None:
+            self.forward_metadata = DecodeMetadata([])
+            return
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.kv_index_translator.write_ids(
@@ -1487,10 +1520,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
-
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1505,6 +1534,24 @@ class FlashInferAttnBackend(AttentionBackend):
                     v,
                     *self._kv_write_scales(layer),
                 )
+
+        if not layer.is_cross_attention:
+            from sglang.srt.beam_search.shared_context_attention import (
+                forward as forward_beam_attention,
+            )
+
+            beam_output = forward_beam_attention(
+                q,
+                layer,
+                forward_batch,
+                self.token_to_kv_pool,
+            )
+            if beam_output is not None:
+                return beam_output
+
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
 
         if self.decode_uses_dequant_workspace:
             kv_cache = (

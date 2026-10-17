@@ -25,6 +25,7 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -705,6 +706,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.beam_trie_compact_enabled = False
         self.load_model()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 
@@ -724,6 +726,7 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.init_beam_trie_output_heads()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
@@ -1392,6 +1395,18 @@ class ModelRunner:
                 tp_rank=get_parallel().tp_rank,
                 is_ep_joiner=get_exec().moe.is_ep_joiner,
             )
+
+    def init_beam_trie_output_heads(self) -> None:
+        """Configure model-native trie output heads on compatible processors."""
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            model=self.model,
+            config=self.model_config.beam_trie_config,
+            device=self.device,
+            tp_size=get_parallel().tp_size,
+            quantization=self.model_config.quantization,
+            lora_enabled=self.lora_manager is not None,
+            rl_on_policy_target=get_exec().deterministic.rl_on_policy_target,
+        )
 
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None

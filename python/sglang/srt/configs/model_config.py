@@ -27,6 +27,10 @@ from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.beam_search.trie_config import (
+    TRIE_OUTPUT_HEAD_FILENAME,
+    discover_trie_output_head_config,
+)
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
@@ -793,6 +797,22 @@ class ModelConfig:
         # Derive context length and model shapes
         self._derive_context_length(context_length)
         self._derive_model_shapes()
+        self.beam_trie_config = (
+            None
+            if self.is_draft_model
+            else discover_trie_output_head_config(self.model_path, revision)
+        )
+        if self.beam_trie_config is not None:
+            if self.beam_trie_config.token_end > self.vocab_size:
+                raise ValueError(
+                    "The model-bundled beam trie SID token range exceeds the "
+                    f"model vocabulary: end={self.beam_trie_config.token_end}, "
+                    f"vocab_size={self.vocab_size}"
+                )
+            logger.info(
+                "Discovered model-native trie output head at %s",
+                self.beam_trie_config.tensor_path,
+            )
 
         # Update hybrid model
         self._derive_hybrid_model()
@@ -2153,7 +2173,12 @@ class ModelConfig:
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(
+                    allow_pattern=[
+                        "*config.json",
+                        f"*{TRIE_OUTPUT_HEAD_FILENAME}",
+                    ]
+                )
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 

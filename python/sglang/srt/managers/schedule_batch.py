@@ -3708,7 +3708,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
+                if not self.reqs[i].finished()
+                and not (
+                    self.reqs[i].beam_group is not None
+                    and self.reqs[i].beam_group.launch_complete()
+                )
+                and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

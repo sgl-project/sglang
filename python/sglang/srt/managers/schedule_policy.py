@@ -597,6 +597,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        beam_kv_reserved_tokens: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -625,6 +626,7 @@ class PrefillAdder:
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+        self.memory_budget.total_offset += beam_kv_reserved_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -752,6 +754,9 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        beam_budget = self._beam_decode_token_budget(req)
+        if beam_budget is not None:
+            return 0 if req.beam_group.kv_reserved else beam_budget
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
         return (
@@ -761,6 +766,19 @@ class PrefillAdder:
             )
             * ratio
         )
+
+    @staticmethod
+    def _beam_decode_token_budget(req: Req) -> Optional[int]:
+        group = req.beam_group
+        if group is None or group.retired:
+            return None
+        return group.remaining_kv_reservation()
+
+    def _decode_token_budget_for_admission(self, req: Req, normal_budget: int) -> int:
+        beam_budget = self._beam_decode_token_budget(req)
+        if beam_budget is not None:
+            return 0 if req.beam_group.kv_reserved else beam_budget
+        return normal_budget
 
     @property
     def rem_total_tokens(self):
@@ -1161,10 +1179,11 @@ class PrefillAdder:
         self._update_prefill_budget(
             0,
             req.extend_len,
-            (
+            self._decode_token_budget_for_admission(
+                req,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
-                else 0
+                else 0,
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
@@ -1210,15 +1229,26 @@ class PrefillAdder:
         )
         if not fits:
             return AddReqResult.NO_TOKEN
+        if (
+            paged_input + self._decode_token_budget_for_admission(req, 0)
+            > self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                r.output_ids
-            )
+            beam_budget = self._beam_decode_token_budget(r)
+            if beam_budget is None:
+                new_token_ratio = (
+                    1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+                )
+                tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                    r.output_ids
+                )
+            else:
+                tokens_left = beam_budget
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
+            if beam_budget is not None:
+                tokens_occupied += r.beam_group.extra_uncached_tokens()
 
             if tokens_left <= 0:
                 return
@@ -1299,7 +1329,9 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                self._decode_token_budget_for_admission(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                ),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
@@ -1326,7 +1358,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 trunc_len,
-                0,
+                self._decode_token_budget_for_admission(req, 0),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(
@@ -1359,9 +1391,12 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        max_new = self._decode_token_budget_for_admission(
+            req,
+            min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            ),
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
@@ -1614,7 +1649,7 @@ class PrefillAdder:
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
-            admission.max_new_tokens,
+            self._decode_token_budget_for_admission(req, admission.max_new_tokens),
             req.retracted_stain,
             mamba_gap_reserve=mamba_gap_reserve,
             request_slot_reserve=self._request_slot_reserve_for_req(
@@ -1642,7 +1677,7 @@ class PrefillAdder:
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
-            if r not in self.preempt_list and not r.finished()
+            if r not in self.preempt_list and not r.finished() and r.beam_group is None
         )
 
         sorted_valid_running_reqs = sorted(

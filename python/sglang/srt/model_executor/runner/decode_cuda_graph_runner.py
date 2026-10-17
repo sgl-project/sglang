@@ -226,6 +226,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     dllm_input_preparation = None
     dllm_attention = None
+    # Speculative runners inherit capture without running decode initialization.
+    capture_beam_trie_graph: bool = False
 
     def __init__(
         self,
@@ -294,6 +296,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             get_spec().speculative_num_draft_tokens
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
+        )
+        self.capture_beam_trie_graph = (
+            model_runner.beam_trie_compact_enabled
+            and model_runner.spec_algorithm.is_none()
+            and not self.is_dllm
+            and not envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
         )
 
         # --- capture mode + tokens-per-bs ------------------------------
@@ -379,7 +387,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else self.max_bs * self.captured_req_width
         )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
-
+        self.beam_trie_levels_buffer = (
+            torch.zeros(
+                self.max_num_token,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            if self.capture_beam_trie_graph
+            else None
+        )
         # Init PDMux if needed
         self.maybe_init_pdmux()
         self.seq_len_fill_value = (
@@ -594,14 +610,41 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _has_beam_trie_graph(self, beam_trie: bool) -> bool:
+        return not beam_trie or self.capture_beam_trie_graph
+
+    def _stage_beam_trie_levels(
+        self,
+        forward_batch: ForwardBatch,
+        raw_num_token: int,
+        padded_num_tokens: int,
+    ) -> None:
+        buffer = self.beam_trie_levels_buffer
+        if buffer is None:
+            return
+        levels = forward_batch.beam_trie_levels
+        if levels is None:
+            return
+        if levels.ndim != 1 or levels.numel() != raw_num_token:
+            raise RuntimeError("Per-row beam trie depths must match decode token rows")
+        buffer[:raw_num_token].copy_(levels)
+        if padded_num_tokens > raw_num_token:
+            buffer[raw_num_token:padded_num_tokens].zero_()
+
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, attention_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        attention_variant=None,
+        beam_trie=False,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             attention_variant=attention_variant,
+            beam_trie=beam_trie,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -743,6 +786,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        beam_trie = forward_batch.beam_trie_levels is not None
+        if not self._has_beam_trie_graph(beam_trie):
+            return False
+        beam_attention_metadata = forward_batch.beam_attention_metadata
+        if beam_attention_metadata is not None:
+            return False
+
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
@@ -752,6 +802,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.disable_padding
                 else None
             ),
+            beam_trie=beam_trie,
         )
 
         is_bs_supported = (
@@ -955,6 +1006,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        beam_trie: bool = False,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -1096,6 +1148,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
             attn_tp_sequence_sharded=attn_tp_sharded,
+            beam_trie_levels=(
+                self.beam_trie_levels_buffer[:num_tokens] if beam_trie else None
+            ),
+            beam_attention_metadata=None,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,
@@ -1218,19 +1274,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._set_profile_trace_tag(
                         bs, stream_idx, variant_label, attention_variant
                     )
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=get_parallel().tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
-                        )
+                    for beam_trie in (
+                        (False, True) if self.capture_beam_trie_graph else (False,)
+                    ):
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=get_parallel().tp_group,
+                        ) as forward:
+                            if beam_trie:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    attention_variant,
+                                    beam_trie=True,
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    attention_variant,
+                                )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1240,6 +1309,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        beam_trie: bool = False,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1250,8 +1320,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
+        capture_kwargs = {"beam_trie": True} if beam_trie else {}
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+            bs,
+            stream_idx=stream_idx,
+            num_tokens=num_tokens,
+            **capture_kwargs,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1339,6 +1413,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     attention_variant,
+                    beam_trie,
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1422,6 +1497,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._set_dp_real_num_tokens(self.raw_num_token)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self._stage_beam_trie_levels(
+                forward_batch,
+                self.raw_num_token,
+                self.bs * self.captured_req_width,
+            )
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1453,7 +1533,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, attention_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                attention_variant,
+                forward_batch.beam_trie_levels is not None,
             )
             return
 
@@ -1496,7 +1580,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
+        self._stage_beam_trie_levels(
+            forward_batch,
+            raw_num_token,
+            padded_num_tokens,
+        )
         if (
             not is_ragged
             and (
@@ -1587,7 +1675,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variant = self._resolve_attention_variant(forward_batch, bs)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, attention_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            attention_variant,
+            forward_batch.beam_trie_levels is not None,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1655,6 +1747,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return dataclasses.replace(
                 output,
                 next_token_logits=next_token_logits,
+                beam_normalizer=(
+                    output.beam_normalizer[: self.raw_num_token]
+                    if output.beam_normalizer is not None
+                    else None
+                ),
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]

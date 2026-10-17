@@ -143,6 +143,28 @@ class TestStashGatePreservesPrefix(CustomTestCase):
             req, up_to=self.POST_RESET_FILL_LEN
         )
 
+    def test_non_cacheable_chunked_req_preserves_private_prefix(self):
+        full_prompt_len = self.POST_RESET_FILL_LEN + 16
+        cache = _make_tree_cache()
+        req = _make_req(
+            req_pool_idx=self.POOL_IDX,
+            fill_ids=list(range(full_prompt_len)),
+            prefix_len=self.INITIAL_PREFIX_LEN,
+            fill_len=self.POST_RESET_FILL_LEN,
+        )
+        req.skip_radix_cache_insert = True
+        req.kv.cache_protected_len = 3
+        s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
+
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
+
+        self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
+        self.assertEqual(len(req.full_untruncated_fill_ids) - req.prefix_len, 16)
+        self.assertEqual(req.kv.cache_protected_len, 3)
+        cache.checkpoint.assert_not_called()
+
     def test_no_chunked_req_never_mutates_state(self):
         # The outer `if chunked_req is not None` guard must hold on the retract
         # path that clears chunked_req.

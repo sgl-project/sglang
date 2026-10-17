@@ -68,6 +68,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -2572,6 +2573,14 @@ class Scheduler(
         return SchedulerOutputStreamer
 
     def init_beam_coordinator(self) -> None:
+        trie_constraint = (
+            BeamTrieConstraint.load(
+                self.model_config.beam_trie_config,
+                self.req_to_token_pool.device,
+            )
+            if self.model_config.beam_trie_config is not None
+            else None
+        )
         self.beam_coordinator = BeamCoordinator(
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
@@ -2581,6 +2590,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
+            trie_constraint=trie_constraint,
         )
 
     def init_batch_result_processor(self) -> None:
@@ -4100,6 +4110,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            beam_kv_reserved_tokens=self.beam_coordinator.reserved_kv_tokens(),
         )
 
         if self.chunked_req is not None:
@@ -4239,6 +4250,7 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
             return None, running_batch
+        self.beam_coordinator.reserve_kv_for(can_run_list)
 
         can_run_set = set(can_run_list)
         retries = self.tree_cache.storage_prefetch_retries

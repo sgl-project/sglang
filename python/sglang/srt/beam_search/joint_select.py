@@ -74,8 +74,13 @@ def joint_select(
     top_tokens: torch.Tensor,  # [num_rows, num_candidates] int64
     stop_token_ids: torch.Tensor,  # [num_stop] int64, may be empty (ignore_eos)
     beam_width: int,
+    num_output_candidates: int | None = None,
 ) -> SelectResult:
-    num_candidates = top_logprobs.shape[1]
+    num_candidates = (
+        top_logprobs.shape[1]
+        if num_output_candidates is None
+        else num_output_candidates
+    )
     k = beam_width
 
     cand_scores, parent, tokens = _ranked_candidates(
