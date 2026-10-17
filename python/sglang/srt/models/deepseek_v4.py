@@ -418,6 +418,7 @@ _wo_a_aiter_batched_gemm_disabled = False
 # ``None`` here means the platform keeps the bf16 absorb GEMM.
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
+_wo_a_fp8_mxscale_prequant = None
 _wo_a_weight_scale_to_e8m0 = None
 _hip = None
 if _is_hip:
@@ -425,6 +426,7 @@ if _is_hip:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
         apply_wo_a_fp8_mxscale_fused_invrope,
+        apply_wo_a_fp8_mxscale_prequant,
         is_wo_a_fp8_fused_invrope_supported,
         is_wo_a_fp8_mxscale_supported,
         wo_a_weight_scale_to_e8m0,
@@ -440,6 +442,7 @@ if _is_hip:
             and is_wo_a_fp8_fused_invrope_supported()
         ):
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+        _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
 
 @functools.lru_cache(maxsize=1)
@@ -548,7 +551,14 @@ def _apply_wo_a_bf16_matmul(
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
-def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
+def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
+    if e8m0:
+        # Consumers run the e8m0 mxscale GEMM (SGLANG_DSV4_DENSE_MXSCALE).
+        from sglang.kernels.ops.layernorm.rmsnorm_fp8_e8m0 import (
+            rmsnorm_fp8_e8m0_quant,
+        )
+
+        return rmsnorm_fp8_e8m0_quant(hidden_states, weight, eps)
     x_quant, x_bf16, _, _ = fused_rms_fp8_group_quant(
         hidden_states,
         weight,
@@ -1077,6 +1087,27 @@ class MqaAttentionBase(nn.Module):
         # Other FlashMLA implementations retain their existing padded shape.
         return 64 if self.n_local_heads <= 64 else self.n_heads
 
+    def _wo_a_quant_freqs(
+        self, forward_batch: ForwardBatch, q_rope: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Rope table when the fp8 unified_kv decode (aiter FlyDSL) should also
+        do the inverse RoPE and the wo_a mxfp8 quant; else None."""
+        mode = forward_batch.forward_mode
+        if q_rope is None or not (mode.is_decode() or mode.is_target_verify()):
+            return None
+        if not hasattr(self, "_wo_a_freqs"):
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+            fused = (
+                _wo_a_fp8_mxscale_prequant is not None
+                and self.wo_a_fp8
+                and runtime.flydsl_decode_supported(q_rope.shape[1])
+            )
+            self._wo_a_freqs = (
+                torch.view_as_real(self.freqs_cis).flatten(1) if fused else None
+            )
+        return self._wo_a_freqs
+
     def _local_attn_sink(self, kernel_num_heads: Optional[int] = None) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return self.attn_sink
@@ -1101,6 +1132,22 @@ class MqaAttentionBase(nn.Module):
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
+
+    def _q_lora_quant_e8m0(self, with_indexer: bool) -> bool:
+        """Whether the fused q_norm quant feeds wq_b (and the indexer's wq_b, which
+        reuses it) with ue8m0 scales: only when each consumer runs the e8m0 mxscale
+        GEMM. Resolved on first use, after the weights are processed."""
+        key = "_q_lora_e8m0_idx" if with_indexer else "_q_lora_e8m0"
+        cached = self.__dict__.get(key)
+        if cached is None:
+            from sglang.srt.layers.quantization.fp8_utils import dense_mxscale_ready
+
+            indexer = getattr(self, "indexer", None) if with_indexer else None
+            cached = dense_mxscale_ready(
+                self.wq_b, getattr(indexer, "wq_b", None) if indexer else None
+            )
+            self.__dict__[key] = cached
+        return cached
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1330,9 +1377,28 @@ class MQALayer(MqaAttentionBase):
             self.n_local_heads in (64, 128) and self._wq_b_uses_flashinfer_mxfp8()
         )
         if self.mega_wq_b_permuted:
-            for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
-                param.data.copy_(interleave_query_rows(param.data, self.n_local_heads))
-            self.wq_b.quant_method._process_mxfp8_linear_weight_scale(self.wq_b)
+            method = self.wq_b.quant_method
+            if method.use_mxfp8:
+                for param in (self.wq_b.weight, self.wq_b.weight_scale_inv):
+                    param.data.copy_(
+                        interleave_query_rows(param.data, self.n_local_heads)
+                    )
+                method._process_mxfp8_linear_weight_scale(self.wq_b)
+            else:
+                block_n, block_k = method.weight_block_size
+                sf = self.wq_b.weight_scale_inv.data.repeat_interleave(
+                    block_n // 16, dim=0
+                )
+                sf = (
+                    sf.view(self.n_local_heads, 32, -1)
+                    .transpose(0, 1)
+                    .reshape(sf.shape)
+                )
+                self.wq_b.weight.data.copy_(
+                    interleave_query_rows(self.wq_b.weight.data, self.n_local_heads)
+                )
+                self.wq_b.weight_scale_inv.data = sf.contiguous()
+                method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
@@ -1340,7 +1406,10 @@ class MQALayer(MqaAttentionBase):
         method = self.wq_b.quant_method
         backend = getattr(method, "mxfp8_dense_backend", None)
         return bool(
-            getattr(method, "use_mxfp8", False)
+            (
+                getattr(method, "use_mxfp8", False)
+                or getattr(method, "block_fp8_as_mxfp8", False)
+            )
             and backend is not None
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
         )
@@ -1873,6 +1942,7 @@ class MQALayer(MqaAttentionBase):
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
+                    e8m0=self._q_lora_quant_e8m0(with_indexer=False),
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
@@ -1975,10 +2045,9 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
         )
-        # fp8 verify packs like prefill but keeps verify's store timing: the pair
-        # lands in the caller's buffers and the backend writes the ring off the
-        # per-token slot map before attention. Keyed off those buffers the same
-        # way fuse_prefill is, so the two arms cannot disagree about the layout.
+        # fp8 verify stores like decode: the kernel writes each token's ring row
+        # (swa_loc) before attention, so no packed pair, kv copy or backend
+        # scatter. Keyed off the caller's buffers the same way fuse_prefill is.
         fuse_verify_fp8 = (
             fuse_verify
             and unified
@@ -2007,14 +2076,18 @@ class MQALayer(MqaAttentionBase):
             unified and (is_decode or fuse_verify or fuse_prefill)
         ) or (not unified and self.use_fused_qk_norm_rope)
 
+        # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
+        q_lora_quant = None
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
+                    e8m0=self._q_lora_quant_e8m0(with_indexer=True),
                 )
                 q, _ = self.wq_b(q_for_wqb)
+                q_lora_quant = q_for_wqb
             else:
                 q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
                 q, _ = self.wq_b(q_for_wqb)
@@ -2027,7 +2100,7 @@ class MQALayer(MqaAttentionBase):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_rope_cache = None
-            if unified and fuse_verify:
+            if unified and fuse_verify and not fuse_verify_fp8:
                 # Target-verify runs through the unified_kv decode path. The
                 # backend writes the current chunk's KV into the ring *before*
                 # attention (save_kv_cache=True -> store_swa_into_unified ahead
@@ -2045,12 +2118,13 @@ class MQALayer(MqaAttentionBase):
                 # it in place. The unfused path pays the same copy inside
                 # _compute_kv_bf16.
                 #
-                # Under fp8 the kernel writes the packed pair to the caller's
-                # buffers rather than norming kv in place, and the same backend
-                # store takes that pair -- only the row format changes.
+                # Under fp8, verify takes the decode arm below instead: the ring
+                # rows are per token (swa_loc is built for verify too) and are
+                # written before attention either way, so the kernel stores them
+                # itself, off the strided kv.
                 kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
-                swa_page_size, bf16_store = 1, not fuse_verify_fp8
+                swa_page_size, bf16_store = 1, True
             elif unified and fuse_prefill:
                 # No pools, so the kernel norms + RoPEs + packs and writes no
                 # ring row. It must not: those rows are this fwd's extend region
@@ -2106,8 +2180,8 @@ class MQALayer(MqaAttentionBase):
                 bf16_store=bf16_store,
                 fp8_2buff=fp8_2buff,
                 swa_rope_cache=swa_rope_cache,
-                k_nope_out=k_nope_out if (fuse_prefill or fuse_verify_fp8) else None,
-                k_rope_out=k_rope_out if (fuse_prefill or fuse_verify_fp8) else None,
+                k_nope_out=k_nope_out if fuse_prefill else None,
+                k_rope_out=k_rope_out if fuse_prefill else None,
                 q_rope_out=q_rope_out,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
@@ -2115,7 +2189,7 @@ class MQALayer(MqaAttentionBase):
             # current chunk (attn_k = kv) and save_kv_cache = kv is not None lets
             # the backend do its normal causally-indexed store into the ring
             # before the decode kernel runs -- exactly as the unfused path did.
-            if unified and (fuse_prefill or fuse_verify_fp8):
+            if unified and fuse_prefill:
                 # The packed nope half rides out on the kv slot -- attention
                 # takes it as attn_k and save_kv_cache stays on so the backend
                 # does the ring write. Its rope half went to the caller's buffer,
@@ -2133,7 +2207,7 @@ class MQALayer(MqaAttentionBase):
                     swa_k=kv,
                     forward_batch=forward_batch,
                 )
-            elif not (unified and fuse_verify):
+            elif not (unified and fuse_verify and not fuse_verify_fp8):
                 kv = None
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
@@ -2285,6 +2359,7 @@ class MQALayer(MqaAttentionBase):
                         q_lora=q_lora,
                         forward_batch=forward_batch,
                         attn_backend=attn_backend,
+                        q_lora_quant=q_lora_quant,
                     )
             if self.compressor is not None:
                 if use_npu_cp_full_metadata:
@@ -2559,6 +2634,7 @@ class MQALayer(MqaAttentionBase):
             if _is_hip
             else None
         )
+        wo_a_quant_freqs = None
         if unified:
             # only the HIP radix backend takes these; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2570,6 +2646,9 @@ class MQALayer(MqaAttentionBase):
                 rope_kwargs["k_rope"] = k_rope
             if inv_rope is not None:
                 rope_kwargs["inv_rope"] = inv_rope
+            wo_a_quant_freqs = self._wo_a_quant_freqs(forward_batch, q_rope)
+            if wo_a_quant_freqs is not None:
+                rope_kwargs["wo_a_quant_freqs"] = wo_a_quant_freqs
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -2613,7 +2692,15 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
-        if (
+        if wo_a_quant_freqs is not None:
+            # the decode already returned the wo_a mxfp8 (codes, scales)
+            G = self.n_local_groups
+            o = _wo_a_fp8_mxscale_prequant(
+                *o,
+                self.wo_a.weight.view(G, self.o_lora_rank, -1),
+                self.wo_a.weight_scale_inv.data,
+            )
+        elif (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
             and not _is_npu
@@ -3629,26 +3716,30 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
-        # Rows outside the tail are never computed past the last kv_source layer.
+    def _check_late_layer_tail_readers(
+        self, forward_batch: ForwardBatch, tail: LateLayerTail
+    ) -> None:
+        # Rows outside the tail are never computed past the last kv_source layer;
+        # late_layer_whole_extend gives the requests that read them a whole tail.
+        extend_lens = forward_batch.extend_seq_lens_cpu
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
             and self.dspark_layers_to_capture is None
+            and list(tail.extend_seq_lens_cpu) != list(extend_lens)
         ):
             raise ValueError(
-                "decoder SWA bounded replay cannot capture hidden states of all "
-                "prompt tokens"
+                "decoder SWA bounded replay tail misses captured hidden-state rows"
             )
         if forward_batch.return_logprob and any(
-            start < n
-            for start, n in zip(
+            start < n - t
+            for start, n, t in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
+                extend_lens,
+                tail.extend_seq_lens_cpu,
             )
         ):
             raise ValueError(
-                "decoder SWA bounded replay cannot return logprobs of prompt tokens; "
-                "set logprob_start_len to the prompt length"
+                "decoder SWA bounded replay tail misses prompt-logprob rows"
             )
 
     def _forward_layers_hc_pre_from_prev(
@@ -3693,9 +3784,9 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+            self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -3706,7 +3797,8 @@ class DeepseekV4Model(nn.Module):
         if (
             self.late_layer_start is not None
             and get_parallel().attn_dp_size > 1
-            and (forward_batch.is_extend_in_batch or _is_hip)
+            # The prefill graph's capture batch leaves is_extend_in_batch unset.
+            and (forward_batch.is_extend_in_batch or tail_in_graph or _is_hip)
         ):
             late_dp_counts = late_layer_dp_counts(
                 forward_batch,
@@ -4215,10 +4307,23 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
             from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
-            from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
+            from sglang.srt.layers.quantization.fp8_utils import (
+                set_dense_mxscale,
+                set_force_ck_w8a8,
+            )
 
             set_force_ck_w8a8(True)
             set_batched_rope(True)
+            # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+            # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+            # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+            from sglang.srt.models.deepseek_common.amd.aiter_intree_tune import (
+                install_aiter_intree_tune,
+            )
+
+            install_aiter_intree_tune()
+            if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
+                set_dense_mxscale(True)
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -4523,7 +4628,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
-            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = (
+                # A prompt-logprob reader's tail is its whole extend, so its start
+                # stands; every other start is the extend's end.
+                [
+                    min(start, t)
+                    for start, t in zip(
+                        forward_batch.extend_logprob_start_lens_cpu,
+                        tail.extend_seq_lens_cpu,
+                    )
+                ]
+                if forward_batch.return_logprob
+                else tail.extend_seq_lens_cpu
+            )
 
         output = self.logits_processor(
             input_ids,
