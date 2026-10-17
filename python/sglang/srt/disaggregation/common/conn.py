@@ -380,13 +380,14 @@ class CommonKVManager(BaseKVManager):
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
         self.defer_decode_allocation = (
-            get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+            get_disagg().disaggregation_decode_allocation_policy
+            in ("first_chunk", "prefill_complete")
         )
         self.deferred_bootstrap = None
         if self.defer_decode_allocation:
             if any(state != StateType.DSA for state in args.state_types):
                 raise ValueError(
-                    "prefill_complete currently supports full-attention and DSA KV pools only"
+                    f"{get_disagg().disaggregation_decode_allocation_policy} currently supports full-attention and DSA KV pools only"
                 )
             if disaggregation_mode == DisaggregationMode.PREFILL:
                 self.deferred_bootstrap = DeferredBootstrap(
@@ -1952,6 +1953,7 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
+        # Allocation-ready time; first accepted chunk for the first_chunk policy.
         self._prefill_complete_time: Optional[float] = None
         self._owns_bootstrap_room = True
         if mgr.deferred_bootstrap is not None:
@@ -2018,9 +2020,16 @@ class CommonKVSender(BaseKVSender):
         )
 
     def mark_prefill_complete(self) -> None:
+        self._mark_allocation_ready()
+
+    def mark_prefill_chunk_ready(self) -> None:
+        self._mark_allocation_ready()
+
+    def _mark_allocation_ready(self) -> None:
         if self.kv_mgr.deferred_bootstrap is None:
             return
-        # Give decode admission a fresh budget, excluding prefill queue/compute.
+        # This is destination-allocation readiness, never transfer completion.
+        # The timeout excludes P's queue and computation before this boundary.
         if self._prefill_complete_time is None:
             self._prefill_complete_time = time.time()
             self.kv_mgr._notify_bootstrap(
@@ -2235,10 +2244,10 @@ class CommonKVReceiver(BaseKVReceiver):
                 f"prefill={info.decode_allocation_policy}, decode={policy}. "
                 "Set --disaggregation-decode-allocation-policy identically on both roles."
             )
-        elif policy == "prefill_complete" and (
+        elif policy in ("first_chunk", "prefill_complete") and (
             info.attn_tp_size != 1 or info.attn_cp_size != 1 or info.pp_size != 1
         ):
-            reason = "prefill_complete requires peer attention TP1/CP1/PP1"
+            reason = f"{policy} requires peer attention TP1/CP1/PP1"
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -2300,7 +2309,11 @@ class CommonKVReceiver(BaseKVReceiver):
             if time.time() - self._prefill_wait_start >= self.kv_mgr.waiting_timeout:
                 self.abort()
                 self.kv_mgr.record_failure(
-                    self.bootstrap_room, "Timed out waiting for prefill completion"
+                    self.bootstrap_room,
+                    "Timed out waiting for first prefill chunk"
+                    if get_disagg().disaggregation_decode_allocation_policy
+                    == "first_chunk"
+                    else "Timed out waiting for prefill completion",
                 )
                 return KVPoll.Failed
         elif status == KVPoll.WaitingForInput:

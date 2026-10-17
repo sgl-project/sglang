@@ -305,10 +305,12 @@ def test_sampling_mask_abort_preserves_error_and_releases_once(
 
 
 class TestPrefillCompleteResult(CustomTestCase):
+    policy = "prefill_complete"
+
     def setUp(self):
         super().setUp()
         override = get_context().override_server_args(
-            disaggregation_decode_allocation_policy="prefill_complete"
+            disaggregation_decode_allocation_policy=self.policy
         )
         override.install()
         self.addCleanup(override.restore)
@@ -343,7 +345,12 @@ class TestPrefillCompleteResult(CustomTestCase):
                 )
             )
 
-        req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
+        signal = (
+            req.disagg_kv_sender.mark_prefill_chunk_ready
+            if self.policy == "first_chunk"
+            else req.disagg_kv_sender.mark_prefill_complete
+        )
+        signal.side_effect = ready
         scheduler.process_batch_result_disagg_prefill(batch, result)
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
         self.assertTrue(req.pending_bootstrap)
@@ -358,6 +365,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        req.disagg_kv_sender.mark_prefill_chunk_ready.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
     def test_discarded_attempt_never_publishes_ready(self, force_retry):
@@ -371,6 +379,60 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertEqual(req.output_ids, [])
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        req.disagg_kv_sender.mark_prefill_chunk_ready.assert_not_called()
+
+
+class TestFirstChunkResult(TestPrefillCompleteResult):
+    policy = "first_chunk"
+
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_middle_chunk_notifies_after_result_copy_before_final_token(self, cache):
+        scheduler = _Scheduler()
+        scheduler.enable_overlap = getattr(self, "overlap", True)
+        req = _Req(inflight_middle_chunks=2)
+        req.to_finish = None
+        scheduler.chunked_req = req
+        event = Mock()
+        result = _result()
+        result.copy_done = event
+        observed = []
+
+        def ready():
+            event.synchronize.assert_called_once_with()
+            self.assertEqual(req.output_ids, [])
+            self.assertEqual(req.inflight_middle_chunks, 1)
+            observed.append("ready")
+
+        req.disagg_kv_sender.mark_prefill_chunk_ready.side_effect = ready
+        scheduler.process_batch_result_disagg_prefill(_batch(req), result)
+        self.assertEqual(observed, ["ready"])
+        self.assertTrue(req.pending_bootstrap)
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        scheduler.send_kv_chunk.assert_not_called()
+        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_chunk_before_first_ready_abort_does_not_publish(self, cache):
+        scheduler = _Scheduler()
+        req = _Req(inflight_middle_chunks=2)
+        scheduler.chunked_req = req
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        req.disagg_kv_sender.mark_prefill_chunk_ready.assert_not_called()
+        scheduler.send_kv_chunk.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_yielded_chunk_does_not_publish_old_attempt(self, cache):
+        scheduler = _Scheduler()
+        req = _Req(inflight_middle_chunks=2)
+        req.to_finish = None
+        scheduler.optimistic_release_and_requeue = Mock()
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        scheduler.optimistic_release_and_requeue.assert_called_once_with(req)
+        req.disagg_kv_sender.mark_prefill_chunk_ready.assert_not_called()
+
+
+class TestFirstChunkNonOverlapResult(TestFirstChunkResult):
+    overlap = False
 
 
 if __name__ == "__main__":

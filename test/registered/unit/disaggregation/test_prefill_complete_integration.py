@@ -1,5 +1,6 @@
 """Exercise the allocation policy through production transport and queue methods."""
 
+import argparse
 import threading
 import time
 import unittest
@@ -7,6 +8,8 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+
+import numpy as np
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
@@ -34,16 +37,33 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestAllocationConfiguration(CustomTestCase):
+    policy = "prefill_complete"
+
     def test_policy_owns_optimistic_prefill_dependency(self):
         args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="prefill",
-            disaggregation_decode_allocation_policy="prefill_complete",
+            disaggregation_decode_allocation_policy=self.policy,
         )
         handle_pd_disaggregation(args)
         self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
         # Resolution must not rewrite the raw user input.
         self.assertEqual(args.optimistic_prefill_attempts, 0)
+
+    def test_cli_accepts_policy_without_changing_early_default(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--disaggregation-decode-allocation-policy",
+                self.policy,
+            ]
+        )
+        self.assertEqual(parsed.disaggregation_decode_allocation_policy, self.policy)
+        default = parser.parse_args(["--model-path", "dummy"])
+        self.assertEqual(default.disaggregation_decode_allocation_policy, "early")
 
     def test_early_does_not_enable_optimistic_prefill(self):
         args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
@@ -56,7 +76,7 @@ class TestAllocationConfiguration(CustomTestCase):
                 args = ServerArgs(
                     model_path="dummy",
                     disaggregation_mode="prefill",
-                    disaggregation_decode_allocation_policy="prefill_complete",
+                    disaggregation_decode_allocation_policy=self.policy,
                     tp_size=size,
                     dp_size=size,
                     enable_dp_attention=size > 1,
@@ -94,21 +114,23 @@ class TestAllocationConfiguration(CustomTestCase):
                 values = dict(
                     model_path="dummy",
                     disaggregation_mode="prefill",
-                    disaggregation_decode_allocation_policy="prefill_complete",
+                    disaggregation_decode_allocation_policy=self.policy,
                 )
                 values.update(changed)
-                with self.assertRaisesRegex(ValueError, "prefill_complete"):
+                with self.assertRaisesRegex(ValueError, self.policy):
                     handle_pd_disaggregation(ServerArgs(**values))
 
 
 class TestAllocationIntegration(CustomTestCase):
+    policy = "prefill_complete"
+
     def setUp(self):
         super().setUp()
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
         override = get_context().override_server_args(
-            disaggregation_decode_allocation_policy="prefill_complete"
+            disaggregation_decode_allocation_policy=self.policy
         )
         override.install()
         self.addCleanup(override.restore)
@@ -163,7 +185,14 @@ class TestAllocationIntegration(CustomTestCase):
     def sender(self, room=1):
         return MooncakeKVSender(self.prefill, "prefill:8998", room)
 
-    def receiver(self, room=1, policy="prefill_complete"):
+    def mark_ready(self, sender):
+        if self.policy == "first_chunk":
+            sender.mark_prefill_chunk_ready()
+        else:
+            sender.mark_prefill_complete()
+
+    def receiver(self, room=1, policy=None):
+        policy = policy or self.policy
         receiver = MooncakeKVReceiver(self.decode, "prefill:8998", room)
         receiver.bootstrap_infos = [{"rank_ip": "prefill", "rank_port": 1}]
         self.decode.prefill_info_table = {
@@ -199,7 +228,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
 
@@ -246,7 +275,7 @@ class TestAllocationIntegration(CustomTestCase):
                     self.decode._fail_prefill_recompute(old_receiver, "late HTTP error")
                 self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
                 self.assertNotIn(1, self.decode.failure_records)
-                sender.mark_prefill_complete()
+                self.mark_ready(sender)
                 self.flush()
                 self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
                 # Duplicate control registration must not enqueue another ready
@@ -270,7 +299,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def test_completion_before_receiver_uses_same_bootstrap(self):
         sender = self.sender()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         receiver = self.receiver()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
@@ -280,7 +309,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
         sender = self.sender()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         self.assertEqual(list(self.wire), [])
@@ -333,7 +362,7 @@ class TestAllocationIntegration(CustomTestCase):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
         receiver._prefill_wait_start = 0
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         self.assertIsNone(receiver._prefill_wait_start)
@@ -343,7 +372,7 @@ class TestAllocationIntegration(CustomTestCase):
         sender.init_time = 0
         self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
         self.flush()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
         sender._prefill_complete_time = 0
         self.assertEqual(sender.poll(), KVPoll.Failed)
@@ -353,7 +382,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_failure_wins_over_late_ready(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         sender.abort()
         # Deliver failure before the already-emitted ready status.
         self.wire.reverse()
@@ -392,7 +421,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_fake_warmup_sender_never_registers_deferred_bootstrap(self):
         sender = FakeKVSender(self.prefill, "fake:0", 0)
         sender.init(0)
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
         sender.send([])
         self.assertEqual(sender.poll(), KVPoll.Success)
@@ -470,7 +499,7 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertFalse(entry.waiting_for_input)
             queue.req_to_metadata_buffer_idx_allocator.available_size.assert_not_called()
             queue.req_to_token_pool.available_size.assert_not_called()
-            sender.mark_prefill_complete()
+            self.mark_ready(sender)
             self.flush()
             self.assertEqual(queue.pop_preallocated(), ([], []))
         self.assertTrue(entry.waiting_for_input)
@@ -481,7 +510,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_exhausted_optimistic_attempt_follows_allocation_policy(self):
         override = get_context().override_server_args(
             optimistic_prefill_attempts=1,
-            disaggregation_decode_allocation_policy="prefill_complete",
+            disaggregation_decode_allocation_policy=self.policy,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -541,7 +570,7 @@ class TestAllocationIntegration(CustomTestCase):
             )
 
     def test_chunked_prefill_does_not_yield_for_decode_admission(self):
-        for policy in ("early", "prefill_complete"):
+        for policy in ("early", "first_chunk", "prefill_complete"):
             for overlap in (False, True):
                 with self.subTest(policy=policy, overlap=overlap):
                     override = get_context().override_server_args(
@@ -569,7 +598,7 @@ class TestAllocationIntegration(CustomTestCase):
                             SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
                                 scheduler, None, running
                             )
-                        if policy == "prefill_complete":
+                        if policy != "early":
                             self.assertIs(scheduler.chunked_req, req)
                             self.assertFalse(running.batch_is_full)
                             scheduler.optimistic_release_and_requeue.assert_not_called()
@@ -605,7 +634,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_completed_prefill_parks_until_normal_pointer_handshake(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         # Decode may reserve KV now, but prefill still has no destination indices.
@@ -673,7 +702,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
         self.assertEqual(sender.poll(), KVPoll.Success)
@@ -712,7 +741,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_worker_cleanup_finishes_before_sender_can_report_success(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         mgr = self.prefill
         mgr._staging_outstanding = defaultdict(int)
@@ -790,7 +819,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         self.flush()
         self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
         self.assertEqual(sender.poll(), KVPoll.Success)
@@ -848,7 +877,7 @@ class TestAllocationIntegration(CustomTestCase):
                 self.prefill.deferred_bootstrap.lock.release()
 
         self.prefill.send_kv_status_message = send
-        sender.mark_prefill_complete()
+        self.mark_ready(sender)
         sender.abort()
         sender.clear()
 
@@ -871,7 +900,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(req.disagg_prefill_dp_rank, 0)
 
     def test_rebootstrap_dispatches_once_across_init_and_metadata(self):
-        for policy in ("early", "prefill_complete"):
+        for policy in ("early", "first_chunk", "prefill_complete"):
             with self.subTest(policy=policy):
                 override = get_context().override_server_args(
                     disaggregation_decode_allocation_policy=policy
@@ -971,6 +1000,57 @@ class TestAllocationIntegration(CustomTestCase):
         self.decode.update_status(1, KVPoll.Failed)
         receiver.clear()
         self.assertEqual(self.decode.failure_records[1], "original failure")
+
+
+class TestFirstChunkConfiguration(TestAllocationConfiguration):
+    policy = "first_chunk"
+
+
+class TestFirstChunkAllocationIntegration(TestAllocationIntegration):
+    policy = "first_chunk"
+
+    def test_first_ready_is_idempotent_and_does_not_complete_transfer(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
+        sender.mark_prefill_chunk_ready()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        self.assertNotEqual(receiver.poll(), KVPoll.Success)
+        sender.mark_prefill_chunk_ready()
+        sender.mark_prefill_complete()
+        self.assertEqual(list(self.wire), [])
+        self.assertNotEqual(receiver.poll(), KVPoll.Success)
+
+    def test_middle_chunk_transfer_keeps_final_completion_barrier(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_chunk_ready()
+        self.flush()
+        sender.num_kv_indices = 8
+        sender.aux_index = 0
+        sender.trace_ctx = Mock()
+        self.prefill.enable_all_cp_ranks_for_transfer = False
+        self.prefill.kv_item_lens_sum = 4
+        self.prefill.state_item_lens_sum = 0
+        self.prefill.add_transfer_request = Mock()
+        sender.send(np.arange(4, dtype=np.int32))
+        middle = self.prefill.add_transfer_request.call_args
+        self.assertFalse(middle.args[3])
+        self.assertEqual(middle.args[2], slice(0, 4))
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        sender.send(np.arange(4, 8, dtype=np.int32))
+        final = self.prefill.add_transfer_request.call_args
+        self.assertTrue(final.args[3])
+        self.assertEqual(final.args[2], slice(4, 8))
+        self.assertEqual(final.kwargs["aux_index"], 0)
+        self.assertNotEqual(receiver.poll(), KVPoll.Success)
+
+    def test_complete_policy_peer_is_rejected_before_allocating(self):
+        receiver = self.receiver(policy="prefill_complete")
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertIn("policy mismatch", self.decode.failure_records[1])
+        self.assertEqual(list(self.wire), [])
 
 
 if __name__ == "__main__":

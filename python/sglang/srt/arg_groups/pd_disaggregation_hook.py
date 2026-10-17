@@ -44,8 +44,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
-    if cfg.disaggregation_decode_allocation_policy == "prefill_complete":
-        _validate_prefill_complete(server_args)
+    if cfg.disaggregation_decode_allocation_policy in (
+        "first_chunk",
+        "prefill_complete",
+    ):
+        _validate_deferred_allocation(server_args)
         if (
             cfg.disaggregation_mode == "prefill"
             and cfg.optimistic_prefill_attempts == 0
@@ -195,7 +198,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
 
 
-def _validate_prefill_complete(server_args: ServerArgs) -> None:
+def _validate_deferred_allocation(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     unsupported = []
     if cfg.disaggregation_mode not in ("prefill", "decode"):
@@ -236,7 +239,8 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("the Rust bootstrap registry")
     if unsupported:
         raise ValueError(
-            "--disaggregation-decode-allocation-policy prefill_complete does not "
+            "--disaggregation-decode-allocation-policy "
+            f"{cfg.disaggregation_decode_allocation_policy} does not "
             "yet support " + ", ".join(unsupported)
         )
 

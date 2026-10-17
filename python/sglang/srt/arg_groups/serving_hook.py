@@ -510,12 +510,13 @@ def handle_other_validations(server_args: Any):
             )
 
     if (
-        cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+        cfg.disaggregation_decode_allocation_policy
+        in ("first_chunk", "prefill_complete")
         and cfg.disaggregation_mode == "prefill"
         and resolving_view(server_args).optimistic_prefill_attempts <= 0
     ):
         raise ValueError(
-            "prefill_complete requires optimistic prefill, but the resolved "
+            f"{cfg.disaggregation_decode_allocation_policy} requires optimistic prefill, but the resolved "
             "model/cache configuration disabled it."
         )
 

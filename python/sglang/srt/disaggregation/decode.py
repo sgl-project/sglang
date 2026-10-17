@@ -1076,7 +1076,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
         decode_req.kv_receiver.init(prefill_dp_rank)
         if (
-            get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+            get_disagg().disaggregation_decode_allocation_policy
+            in ("first_chunk", "prefill_complete")
             and decode_req.kv_receiver.conclude_state != KVPoll.Failed
         ):
             decode_req.req.disagg_prefill_dp_rank = prefill_dp_rank

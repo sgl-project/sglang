@@ -41,6 +41,31 @@ requests for destination KV capacity. It also retains KV on prefill longer and
 removes overlap between chunked prefill and KV transfer. Compare both policies
 for your workload; this option is not a general throughput improvement.
 
+To reserve destination KV after the first accepted prefill chunk, set the following on both roles:
+
+```bash
+--disaggregation-decode-allocation-policy first_chunk
+```
+
+`first_chunk` reserves the complete request destination after the first chunk's
+result is accepted. It does not allocate one chunk at a time. Once decode admits
+the request and sends destination indices, existing chunk transfers can overlap
+later prefill computation. If admission is delayed, prefill continues computing
+and sends the retained KV when the handshake completes. A single-chunk request
+signals readiness only after accepting its final result and sidecars.
+
+Allocation readiness does not make a request runnable on decode: the existing
+whole-transfer and final-token checks still apply. Pending requests retain KV on
+prefill; decode-capacity pressure can therefore become prefill-capacity pressure.
+The readiness/admission/transfer timeout budgets start at their existing phase
+boundaries, with the first accepted chunk replacing final-result acceptance as
+the initial readiness boundary. There are no SGLang performance measurements for
+this policy yet; compare it with both `early` and `prefill_complete` for your load.
+
+The following deferred-allocation restrictions apply to **both** `first_chunk`
+and `prefill_complete`. Set matching policies on P and D, and upgrade both roles
+before selecting `first_chunk`.
+
 This initial implementation requires Mooncake (RDMA or `mooncake_tcp`), the Python
 bootstrap registry, and attention TP/CP and pipeline sizes of one. Attention DP
 is allowed when each DP rank has attention TP size one. Prefill automatically
