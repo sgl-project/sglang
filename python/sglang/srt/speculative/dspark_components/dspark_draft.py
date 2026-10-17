@@ -77,6 +77,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_raw: Optional[torch.Tensor] = None
     folded: bool = False
+    # [bs, gamma] top-1 probability of each step's draft distribution; set only
+    # under adaptive verification.
+    draft_top_probs: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -195,6 +198,7 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
+    top_prob_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
@@ -205,6 +209,7 @@ def _draft_step(
                 base_logits=base_logits,
                 prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
                 w2_weight=w2_weight,
+                top_prob_out=top_prob_out,
             )
             return tokens, state
     bias, state = markov_head.step_bias(
@@ -231,6 +236,7 @@ def _draft_step(
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
+        top_prob_out=top_prob_out,
         **sharded,
     )
     return tokens, state
@@ -247,6 +253,7 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    top_probs_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
     written to ``logits_out`` or allocated here; a greedy draft keeps none."""
@@ -271,6 +278,7 @@ def draft_markov_block(
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
+            top_prob_out=None if top_probs_out is None else top_probs_out[:, step],
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -291,6 +299,7 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
     greedy_draft: bool,
+    top_probs_out: Optional[torch.Tensor] = None,
 ) -> DraftBlockResult:
     params = resolve_draft_params(
         sampling_info=sampling_info, bs=base_logits.shape[0], device=device
@@ -304,6 +313,7 @@ def sample_draft_block(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        top_probs_out=top_probs_out,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
@@ -329,6 +339,7 @@ class DraftBlockProposer:
         random_seed: int,
         greedy_draft: bool,
         dp_moe_sync: bool = False,
+        track_top_probs: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -339,6 +350,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
+        self._track_top_probs = track_top_probs
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -395,7 +407,7 @@ class DraftBlockProposer:
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = None
+        confidence = confidence_raw = draft_top_probs = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -415,12 +427,18 @@ class DraftBlockProposer:
             if draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
+            if draft_sampler.top_probs_out is not None:
+                draft_top_probs = draft_sampler.top_probs_out[:bs]
         else:
             with self._base_logits_context():
                 base_logits, confidence_features = self.draft_model.compute_base_logits(
                     fwd.raw_hidden
                 )
                 base_logits = base_logits.view(bs, self.gamma, -1)
+            if self._track_top_probs:
+                draft_top_probs = torch.empty(
+                    (bs, self.gamma), dtype=torch.float32, device=device
+                )
             draft_block = sample_draft_block(
                 base_logits=base_logits,
                 anchor_tokens=draft_block_ids[:, 0],
@@ -431,6 +449,7 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
+                top_probs_out=draft_top_probs,
             )
             if self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(
@@ -449,6 +468,7 @@ class DraftBlockProposer:
             confidence=confidence,
             confidence_raw=confidence_raw,
             folded=folded,
+            draft_top_probs=draft_top_probs,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:

@@ -79,6 +79,7 @@ from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.eagle_adaptive_verify import EagleAdaptiveVerifier
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -185,6 +186,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         self._rebuild_topk1_chain_buffers()
+        self.draft_top_probs: Optional[torch.Tensor] = (
+            torch.ones(
+                (self._topk1_parents_prealloc.shape[0], self.speculative_num_steps),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if get_spec().speculative_adaptive_verification
+            else None
+        )
 
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
@@ -693,6 +703,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return verify_input, parent_list, top_scores_index
         return verify_input
 
+    def collect_draft_top_probs(
+        self, *, draft_input: EagleDraftInput, num_reqs: int
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                draft_input.topk_p[:num_reqs, :1].to(torch.float32),
+                self.draft_top_probs[:num_reqs, 1 : self.speculative_num_steps],
+            ],
+            dim=1,
+        )
+
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -821,6 +842,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            compute_prob=self.draft_top_probs is not None,
+                            draft_probs=self.draft_top_probs,
+                            draft_prob_column=i + 1,
                         )
                     else:
                         topk_index = torch.argmax(
@@ -1198,6 +1222,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits
             )
             ret_draft_probs = None
+        elif self.topk == 1 and self.draft_top_probs is not None:
+            ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
+                draft_logits_output.next_token_logits, compute_prob=True
+            )
+            ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
@@ -1295,6 +1324,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.adaptive_verifier: Optional[EagleAdaptiveVerifier] = None
 
     @property
     def last_shared_read_runner(self):
@@ -1320,6 +1350,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        if get_spec().speculative_adaptive_verification and self._hosts_draft:
+            self.adaptive_verifier = EagleAdaptiveVerifier(
+                num_steps=self.speculative_num_steps,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                target_model_runner=self._target_worker.model_runner,
+                device=self.device,
+                overlap=not get_schedule().disable_overlap_schedule,
+            )
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1346,6 +1384,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+    def get_confidence_budget_prepare(self):
+        return self._prepare_adaptive_verify_budget
+
+    def _prepare_adaptive_verify_budget(self, batch, future_map) -> None:
+        if self.adaptive_verifier is not None:
+            self.adaptive_verifier.prepare_verify_budget(batch, future_map)
 
     def forward_batch_generation(
         self,
@@ -1395,6 +1440,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
+            adaptive_verify_step = None
+            adaptive_verify_timer = None
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input
                 # from relayed per-req chains — it must match what earlier
@@ -1405,6 +1452,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                draft_input: EagleDraftInput = batch.spec_info
+                adaptive_verify = (
+                    self.adaptive_verifier is not None
+                    and self.adaptive_verifier.applies_to(batch)
+                )
+                if adaptive_verify:
+                    adaptive_verify_timer = self.adaptive_verifier.begin_step()
                 with (
                     draft_tp_context(self.draft_worker.draft_owns_attention),
                     speculative_moe_backend_context(),
@@ -1412,6 +1466,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                if adaptive_verify:
+                    adaptive_verify_step = self.adaptive_verifier.plan(
+                        batch=batch,
+                        verify_input=verify_input,
+                        draft_probs=self.draft_worker.collect_draft_top_probs(
+                            draft_input=draft_input,
+                            num_reqs=len(batch.seq_lens),
+                        ),
+                        verify_token_budget=draft_input.verify_token_budget,
+                    )
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(
@@ -1421,7 +1485,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+                on_publish(
+                    batch_output.new_seq_lens,
+                    confidence=(
+                        None
+                        if adaptive_verify_step is None
+                        else adaptive_verify_step.prediction.predictions
+                    ),
+                )
             if (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
@@ -1437,6 +1508,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
+            if adaptive_verify_step is not None:
+                self.adaptive_verifier.finish_step(
+                    step=adaptive_verify_step,
+                    accept_lens=batch_output.accept_lens,
+                    timer_start=adaptive_verify_timer,
+                )
 
             if (
                 get_parallel().pp_size > 1

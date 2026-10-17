@@ -555,10 +555,15 @@ def eagle_prepare_for_verify(
         prepare_mamba_track_for_verify,
     ) = _PREPARE_FOR_VERIFY_DEPS
 
+    ragged_forward = verify_input.ragged_forward
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
-        batch.input_ids = verify_input.draft_token
+        batch.input_ids = (
+            verify_input.draft_token
+            if ragged_forward is None
+            else ragged_forward.window.verify_ids
+        )
         maybe_detect_oob(
             batch.input_ids,
             0,
@@ -569,7 +574,9 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        if verify_input.prepared_out_cache_loc is not None:
+        if ragged_forward is not None:
+            batch.out_cache_loc = ragged_forward.window.verify_cache_loc
+        elif verify_input.prepared_out_cache_loc is not None:
             batch.out_cache_loc = verify_input.prepared_out_cache_loc
         else:
             batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
@@ -609,9 +616,20 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
-        spec_mrope_positions=verify_input.prepared_mrope_positions,
+        spec_mrope_positions=(
+            verify_input.prepared_mrope_positions
+            if ragged_forward is None
+            else ragged_forward.mrope_positions
+        ),
         kv_loc_plan=verify_input.kv_loc_plan,
+        write_cols=(
+            ragged_forward.window.window_index
+            if ragged_forward is not None and verify_input.kv_loc_plan is not None
+            else None
+        ),
     )
+    if ragged_forward is not None:
+        verify_forward_batch.positions = ragged_forward.window.positions
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(

@@ -31,6 +31,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        track_top_probs: bool = False,
         out=None,
     ):
         self.model = model
@@ -59,6 +60,11 @@ class DsparkDraftSampler:
                 dtype=confidence_head.proj.weight.dtype,
                 device=device,
             )
+        self.top_probs_out = (
+            torch.empty((self.max_bs, self.gamma), dtype=torch.float32, device=device)
+            if track_top_probs
+            else None
+        )
         self.greedy_draft = greedy_draft
         self._noise = noise
         self._tp_sync = tp_sync
@@ -116,6 +122,9 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            top_probs_out=None
+            if self.top_probs_out is None
+            else self.top_probs_out[:bs],
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
@@ -143,6 +152,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    track_top_probs: bool = False,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -170,5 +180,6 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        track_top_probs=track_top_probs,
         out=out,
     )
