@@ -3,6 +3,7 @@ import asyncio
 import sys
 import unittest
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
@@ -297,6 +298,258 @@ class InputMessageConstructionTestCase(CustomTestCase):
         messages = serving._construct_input_messages(request)
         self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
         self.assertEqual([m["content"] for m in messages], ["working", "answer"])
+
+    def test_phased_tool_turn_matches_stored_and_client_replay(self):
+        """Stored and client replay must preserve one tool turn and leave input intact."""
+        for phase in (None, "commentary", "final_answer"):
+            for text in ("", "\n\n", "Looking it up."):
+                with self.subTest(phase=phase, text=text):
+                    serving = make_serving()
+                    user = {"role": "user", "content": "question"}
+                    message = {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }
+                    if phase is not None:
+                        message["phase"] = phase
+                    output = [
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "plan"}],
+                        },
+                        message,
+                        *[
+                            {
+                                "type": "function_call",
+                                "call_id": f"call_{i}",
+                                "name": "lookup",
+                                "arguments": "{}",
+                            }
+                            for i in range(2)
+                        ],
+                    ]
+                    results = [
+                        {
+                            "type": "function_call_output",
+                            "call_id": f"call_{i}",
+                            "output": f"result {i}",
+                        }
+                        for i in range(2)
+                    ]
+                    history = [user, *output]
+                    original = deepcopy(history)
+                    serving.msg_store["resp_prev"] = history
+                    assistant = {
+                        "role": "assistant",
+                        "reasoning_content": "plan",
+                        "content": [{"type": "text", "text": text}],
+                        "tool_calls": [
+                            {
+                                "id": f"call_{i}",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                            for i in range(2)
+                        ],
+                    }
+                    if phase is not None:
+                        assistant["phase"] = phase
+                    expected = [
+                        user,
+                        assistant,
+                        *[
+                            {
+                                "role": "tool",
+                                "tool_call_id": f"call_{i}",
+                                "content": f"result {i}",
+                            }
+                            for i in range(2)
+                        ],
+                    ]
+                    for request in (
+                        ResponsesRequest(model="x", input=history + results),
+                        ResponsesRequest(
+                            model="x", previous_response_id="resp_prev", input=results
+                        ),
+                    ):
+                        self.assertEqual(
+                            serving._construct_input_messages(request), expected
+                        )
+                    self.assertEqual(history, original)
+
+    def test_reasoning_belongs_to_following_assistant_phase(self):
+        """Reasoning between phases must join the following message, not the prior one."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "final plan"}],
+                },
+                {"role": "assistant", "content": "answer", "phase": "final_answer"},
+            ],
+        )
+        self.assertEqual(
+            serving._construct_input_messages(request),
+            [
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "phase": "final_answer",
+                    "reasoning_content": "final plan",
+                },
+            ],
+        )
+
+    def test_reasoning_before_tool_call_inherits_preceding_phase(self):
+        """Reasoning and calls must stay with commentary without absorbing final text."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "assistant", "content": "working", "phase": "commentary"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "tool plan"}],
+                },
+                {
+                    "type": "function_call",
+                    "name": "lookup",
+                    "call_id": "call_1",
+                    "arguments": "{}",
+                },
+                {"role": "assistant", "content": "answer", "phase": "final_answer"},
+            ],
+        )
+        messages = serving._construct_input_messages(request)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["phase"], "commentary")
+        self.assertEqual(messages[0]["reasoning_content"], "tool plan")
+        self.assertEqual(messages[0]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(
+            messages[1],
+            {"role": "assistant", "content": "answer", "phase": "final_answer"},
+        )
+
+    def test_auxiliary_items_do_not_carry_phase_across_role_boundaries(self):
+        """User, tool and developer boundaries must prevent assistant phase leakage."""
+        for boundary in (
+            {"role": "user", "content": "next"},
+            {"type": "function_call_output", "call_id": "call_0", "output": "result"},
+            {"role": "developer", "content": "instruction"},
+        ):
+            with self.subTest(boundary=boundary):
+                serving = make_serving()
+                request = ResponsesRequest(
+                    model="x",
+                    input=[
+                        {
+                            "role": "assistant",
+                            "content": "working",
+                            "phase": "commentary",
+                        },
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "first plan"}],
+                        },
+                        boundary,
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "next plan"}],
+                        },
+                        {
+                            "type": "function_call",
+                            "name": "lookup",
+                            "call_id": "call_1",
+                            "arguments": "{}",
+                        },
+                    ],
+                )
+                assistants = [
+                    m
+                    for m in serving._construct_input_messages(request)
+                    if m["role"] == "assistant"
+                ]
+                self.assertEqual(len(assistants), 2)
+                self.assertEqual(assistants[0]["phase"], "commentary")
+                self.assertEqual(assistants[0]["reasoning_content"], "first plan")
+                self.assertNotIn("phase", assistants[1])
+                self.assertEqual(assistants[1]["reasoning_content"], "next plan")
+                self.assertEqual(assistants[1]["tool_calls"][0]["id"], "call_1")
+
+    def test_trailing_reasoning_keeps_preceding_phase(self):
+        """Trailing reasoning must survive, with or without a preceding message."""
+        for phase in (None, "commentary", "final_answer"):
+            with self.subTest(phase=phase):
+                serving = make_serving()
+                message = {"role": "assistant", "content": "working"}
+                if phase is not None:
+                    message["phase"] = phase
+                reasoning = {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                }
+                request = ResponsesRequest(model="x", input=[message, reasoning])
+                self.assertEqual(
+                    serving._construct_input_messages(request),
+                    [{**message, "reasoning_content": "plan"}],
+                )
+                standalone = ResponsesRequest(model="x", input=[reasoning])
+                self.assertEqual(
+                    serving._construct_input_messages(standalone),
+                    [{"role": "assistant", "reasoning_content": "plan"}],
+                )
+
+    def test_unphased_messages_remain_phase_boundaries(self):
+        """An unphased message must not merge with either adjacent phased message."""
+        serving = make_serving()
+        history = [
+            {"role": "assistant", "content": "working", "phase": "commentary"},
+            {"role": "assistant", "content": "unphased"},
+            {"role": "assistant", "content": "answer", "phase": "final_answer"},
+        ]
+        request = ResponsesRequest(model="x", input=history)
+        self.assertEqual(serving._construct_input_messages(request), history)
+
+    def test_phased_custom_tool_call_merges_with_message(self):
+        """Custom tool calls must remain in their preceding phased assistant turn."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "assistant", "content": "running", "phase": "commentary"},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_1",
+                    "name": "code",
+                    "input": "print(42)",
+                },
+            ],
+        )
+        self.assertEqual(
+            serving._construct_input_messages(request),
+            [
+                {
+                    "role": "assistant",
+                    "content": "running",
+                    "phase": "commentary",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "code",
+                                "arguments": '{"input": "print(42)"}',
+                            },
+                        }
+                    ],
+                }
+            ],
+        )
 
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
