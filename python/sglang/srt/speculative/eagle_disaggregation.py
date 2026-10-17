@@ -12,6 +12,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.utils.common import async_h2d_stack
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -58,37 +59,28 @@ def build_eagle_disagg_draft_input(
     if spec.enable_multi_layer_eagle:
         num_states *= spec.speculative_num_steps
 
-    topk_p = torch.stack(
+    topk_p = async_h2d_stack(
         [
-            torch.as_tensor(
-                req.output_topk_p[:num_states],
-                device=batch.device,
-                dtype=torch.float32,
-            )
+            torch.as_tensor(req.output_topk_p[:num_states], dtype=torch.float32)
             for req in batch.reqs
         ],
-        dim=0,
+        device=batch.device,
     )
-    topk_index = torch.stack(
+    topk_index = async_h2d_stack(
         [
-            torch.as_tensor(
-                req.output_topk_index[:num_states],
-                device=batch.device,
-                dtype=torch.int64,
-            )
+            torch.as_tensor(req.output_topk_index[:num_states], dtype=torch.int64)
             for req in batch.reqs
         ],
-        dim=0,
+        device=batch.device,
     )
-
-    hidden_states = torch.stack(
-        [req.hidden_states_tensor for req in batch.reqs], dim=0
-    ).to(batch.device)
+    hidden_states = async_h2d_stack(
+        [req.hidden_states_tensor for req in batch.reqs], device=batch.device
+    )
 
     dsa_topk_indices = None
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
-        dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
+        dsa_topk_indices = async_h2d_stack(dsa_indices_list, device=batch.device)
         if should_remap_pd_dsa_seed_to_local_slots():
             # PD sends request-relative positions; fused TopK consumes
             # decode-local physical slots. Remap once before the draft loop/graph.
