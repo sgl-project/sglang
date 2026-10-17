@@ -1,4 +1,4 @@
-"""DeepEP-family backend recognition in RoutedExpertsCapturer."""
+"""RoutedExpertsCapturer: DeepEP-family backend recognition and capture width."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.state_capturer import routed_experts as re_mod
+from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,6 +66,47 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
         ):
             out = self._slice(cap, n_local=999)
         self.assertTrue(torch.equal(out, buf[6:10, :, : self.K]))
+
+
+class TestCaptureRoutedIdsOnly(CustomTestCase):
+    def test_routed_only_ids_fill_the_routed_columns(self):
+        """A route whose fused shared columns are appended after capture hands
+        over routed ids only, narrower than the device buffer; they must land in
+        the routed columns, with and without the scattered-a2a gather."""
+        topk_size = 3
+        ids = torch.arange(4 * topk_size, dtype=torch.int32).view(4, topk_size)
+        for backend in ("none", "deepep"):
+            with self.subTest(backend=backend):
+                cap = object.__new__(re_mod.RoutedExpertsCapturer)
+                cap.device_cache = BaseDeviceCache(
+                    max_batch_size=8,
+                    num_layers=2,
+                    topk_size=topk_size + 1,
+                    device="cpu",
+                    name="routed_experts",
+                )
+                cap.gather_buffer = torch.empty((8, topk_size + 1), dtype=torch.int32)
+                with (
+                    mock.patch.object(
+                        re_mod,
+                        "get_moe_a2a_backend",
+                        return_value=MoeA2ABackend(backend),
+                    ),
+                    mock.patch.object(
+                        re_mod,
+                        "attn_tp_all_gather_into_tensor",
+                        side_effect=lambda out, inp: out.copy_(inp),
+                    ),
+                    mock.patch.object(
+                        re_mod,
+                        "get_parallel",
+                        return_value=SimpleNamespace(attn_tp_size=1),
+                    ),
+                ):
+                    cap.capture(layer_id=1, topk_indices=ids)
+                self.assertTrue(
+                    torch.equal(cap.device_cache.buffer[:4, 1, :topk_size], ids)
+                )
 
 
 if __name__ == "__main__":

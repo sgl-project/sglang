@@ -1811,8 +1811,8 @@ def biased_grouped_topk_gpu(
             moe_fused_gate as jit_grouped_gate,
         )
 
-        # The kernel wants the total width; select_experts passes a routed-only
-        # topk on the aiter path only (`num_routed_topk if _use_aiter else top_k`).
+        # The kernel wants the total width; off aiter, topk already counts the
+        # num_fused_shared_experts slots it writes.
         #
         # Fold whenever the steps after top-k assume a fold, which on aiter they
         # always do, whether or not this call is given the shared slots.
@@ -2239,19 +2239,17 @@ def remap_topk_for_per_rank_shared_slots(
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK IDs to a per-rank shared-slot layout.
+    """Append the fused shared columns to the routed ones, in the per-rank layout.
 
-    DeepEP and MegaMoE dispatch need each rank's shared expert at a unique ID
-    so tokens route to the correct rank. The layout is ordered by rank:
+    Takes routed columns only. DeepEP and MegaMoE dispatch need each rank's
+    shared expert at a unique ID so tokens route to the correct rank. The layout
+    is ordered by rank:
     [rank0 routed..., rank0 shared, rank1 routed..., rank1 shared, ...].
 
     Routed IDs:  e -> e + (e // num_local_routed) * num_fused_shared_experts
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
     Shared weight: fused_shared_expert_weight.
     """
-    if topk_ids.shape[0] == 0:
-        return topk_ids, topk_weights
-
     ep_size = get_parallel().moe_ep_size
     ep_rank = get_parallel().moe_ep_rank
     # Static EPLB may add redundant physical experts. At this point routed
@@ -2259,30 +2257,35 @@ def remap_topk_for_per_rank_shared_slots(
     # per-rank shared-slot layout must use the physical routed count.
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
+    num_tokens = topk_ids.shape[0]
 
     # Remap routed IDs: insert gaps for shared expert slots (single fused op).
     # Each rank r == e // num_local_routed is preceded by r shared-slot blocks of
     # width num_fused_shared_experts, so shift by (e // num_local_routed) * S --
     # a single-slot shift (S == 1) would let routed ids collide with an earlier
     # rank's shared slots once S > 1.
-    routed = topk_ids[:, :-num_fused_shared_experts]
-    topk_ids[:, :-num_fused_shared_experts] = (
-        routed + (routed // num_local_routed) * num_fused_shared_experts
-    )
+    routed_ids = topk_ids + (topk_ids // num_local_routed) * num_fused_shared_experts
 
-    # Set shared expert IDs to route to home rank (vectorized)
-    topk_ids[:, -num_fused_shared_experts:] = (
+    # Shared expert IDs route to the home rank.
+    shared_ids = (
         ep_rank * num_local_experts
         + num_local_routed
-        + torch.arange(num_fused_shared_experts, device=topk_ids.device)
+        + torch.arange(
+            num_fused_shared_experts, dtype=topk_ids.dtype, device=topk_ids.device
+        )
+    ).expand(num_tokens, -1)
+    shared_weights = topk_weights.new_full(
+        (num_tokens, num_fused_shared_experts),
+        fused_shared_expert_weight(
+            routed_scaling_factor=topk_config.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=topk_config.apply_routed_scaling_factor_on_output,
+        ),
     )
 
-    topk_weights[:, -num_fused_shared_experts:] = fused_shared_expert_weight(
-        routed_scaling_factor=topk_config.routed_scaling_factor,
-        apply_routed_scaling_factor_on_output=topk_config.apply_routed_scaling_factor_on_output,
+    return (
+        torch.cat([routed_ids, shared_ids], dim=-1),
+        torch.cat([topk_weights, shared_weights], dim=-1),
     )
-
-    return topk_ids, topk_weights
 
 
 def capture_routed_experts_if_allowed(
@@ -2321,12 +2324,13 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
+    # False when select_experts asked the router for routed experts only.
+    router_wrote_shared_cols = (
+        num_fused_shared_experts > 0 and topk_ids.shape[-1] == topk_config.top_k
+    )
     # The router already wrote the aiter shared columns (see _aiter_append below).
     _gate_appended = (
-        num_fused_shared_experts > 0
-        and _use_aiter
-        and not use_per_rank_shared_slots
-        and topk_ids.shape[-1] == topk_config.top_k
+        router_wrote_shared_cols and _use_aiter and not use_per_rank_shared_slots
     )
     routed_topk_ids = (
         topk_ids[:, :-num_fused_shared_experts] if _gate_appended else topk_ids
@@ -2360,7 +2364,7 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif num_fused_shared_experts > 0:
+        elif router_wrote_shared_cols:
             # Shared IDs are outside EPLB's routed-expert table for both global
             # and per-rank layouts, so remap only routed columns.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
@@ -2512,6 +2516,10 @@ def _post_process_topk_ids(
             if expert_location_dispatch_info is not None
             else router_logits.shape[1]
         )
+        if router_wrote_shared_cols:
+            # Placeholders; the remap appends the real shared columns.
+            topk_ids = topk_ids[:, :-num_fused_shared_experts]
+            topk_weights = topk_weights[:, :-num_fused_shared_experts]
         topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
             topk_ids,
             topk_weights,
@@ -2620,22 +2628,15 @@ def select_experts(
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
-    # DeepSeek V2/V3/R1 series models use grouped_top_k
-    # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
-    # On the per-rank shared-slot path the shared expert is appended afterwards by
-    # fused_append_remap_shared_experts_deepep, so the gate must not emit a shared
-    # marker as well. Doing both costs one routed expert (the gate is asked for
-    # K_routed = top_k - num_fused_shared_experts and then spends one of those
-    # slots on the marker) and places that marker at id num_experts, which the
-    # DeepEP remap shifts one past the end of the expert space -- 384 -> 392 for
-    # 384 routed experts on EP8, where the valid ids are 0..391.
-    # aiter appends the shared expert in _post_process_topk_ids, so the gate must not.
-    num_fused_shared_experts_for_gate = (
-        0
-        if (has_per_rank_fused_shared_slots(num_fused_shared_experts) or _use_aiter)
-        else num_fused_shared_experts
-    )
+    # On aiter and on the per-rank shared-slot path, _post_process_topk_ids appends
+    # the shared columns, so the router selects and renormalizes routed experts only.
+    if _use_aiter or has_per_rank_fused_shared_slots(num_fused_shared_experts):
+        top_k_for_gate = num_routed_topk
+        num_fused_shared_experts_for_gate = 0
+    else:
+        top_k_for_gate = top_k
+        num_fused_shared_experts_for_gate = num_fused_shared_experts
     if dynamic_expert_bias is not None:
         if scoring_func != "sigmoid":
             raise ValueError(
@@ -2660,7 +2661,7 @@ def select_experts(
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=top_k_for_gate,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -2674,7 +2675,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=top_k_for_gate,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -2691,7 +2692,7 @@ def select_experts(
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
+            topk=top_k_for_gate,
             renormalize=renormalize,
             correction_bias=correction_bias,
             scoring_func=scoring_func,
@@ -2736,7 +2737,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=top_k_for_gate,
                 renormalize=renormalize,
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_fused_shared_experts_for_gate,
@@ -2756,7 +2757,7 @@ def select_experts(
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=top_k_for_gate,
                 renormalize=renormalize,
             )
         else:
@@ -2799,7 +2800,7 @@ def select_experts(
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=top_k_for_gate,
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
@@ -2817,7 +2818,7 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
+            topk=top_k_for_gate,
             renormalize=renormalize,
         )
 
