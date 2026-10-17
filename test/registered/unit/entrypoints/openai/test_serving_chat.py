@@ -5095,7 +5095,7 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
-class InklingReasoningEffortTest(unittest.TestCase):
+class InklingReasoningEffortTest(CustomTestCase):
     """Inkling reasoning-effort mapping and validation."""
 
     def test_named_levels(self):
@@ -5157,11 +5157,38 @@ class InklingReasoningEffortTest(unittest.TestCase):
 
         serving.apply_reasoning_enabled(request, False)
         self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(serving._get_reasoning_from_request(request))
 
         # Enabling leaves an effort set via output_config.effort alone.
         request.reasoning_effort = "low"
         serving.apply_reasoning_enabled(request, True)
         self.assertEqual(request.reasoning_effort, "low")
+        self.assertTrue(serving._get_reasoning_from_request(request))
+
+    def test_reasoning_mode_matches_effective_effort(self):
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "inkling"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default="always")
+
+        for default_effort in (0.0, 0.9):
+            serving._inkling_default_reasoning_effort = default_effort
+            for effort, expected in (
+                (None, default_effort != 0.0),
+                ("none", False),
+                (0.0, False),
+                ("low", True),
+                (0.5, True),
+            ):
+                with self.subTest(default_effort=default_effort, effort=effort):
+                    request = ChatCompletionRequest(
+                        model="test-model",
+                        messages=[{"role": "user", "content": "hi"}],
+                        reasoning_effort=effort,
+                    )
+                    self.assertEqual(
+                        serving._get_reasoning_from_request(request), expected
+                    )
 
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS

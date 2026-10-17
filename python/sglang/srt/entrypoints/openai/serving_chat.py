@@ -3008,6 +3008,12 @@ class OpenAIServingChat(OpenAIServingBase):
             # output into reasoning_content.
             return request.reasoning_effort not in (None, "none", "no_think")
 
+        if self.reasoning_parser == "inkling":
+            effort = self._parse_inkling_reasoning_effort(request.reasoning_effort)
+            if effort is None:
+                effort = self._inkling_default_reasoning_effort
+            return effort != 0.0
+
         config = self.template_manager.reasoning_config
         if config is None:
             # Fallback to parser-level defaults when template toggle config
