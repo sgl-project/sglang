@@ -159,6 +159,9 @@ http2 = [
 fastokens = [
   "fastokens>=0.3.2",
 ]
+toktier = [
+  "toktier>=0.3.0",
+]
 
 test = [
   "accelerate",
