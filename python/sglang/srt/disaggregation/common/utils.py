@@ -1,5 +1,6 @@
 import ctypes
 import dataclasses
+import os
 import struct
 import threading
 from collections import deque
@@ -108,6 +109,59 @@ class AuxDataCodec:
         return
 
 
+def register_chunk_pages() -> int:
+    """Pages per registered chunk of a decode KV buffer; 0 registers whole buffers.
+
+    Some RDMA NICs (AMD ionic) reject a single memory region of more than
+    about 1 GiB of 4 KiB pages. A decode whose per-layer KV buffer is larger
+    than that (for example a host-memory KV pool) registers each KV buffer in
+    chunks of this many pages, and the prefill splits transfers at the same
+    destination-page boundaries. Both roles must use the same value.
+    """
+    chunk_pages = int(os.environ.get("SGLANG_DISAGG_REGISTER_CHUNK_PAGES", "0") or 0)
+    if chunk_pages < 0:
+        raise ValueError(
+            "SGLANG_DISAGG_REGISTER_CHUNK_PAGES must be 0 (whole buffers) or "
+            f"positive, got {chunk_pages}"
+        )
+    return chunk_pages
+
+
+def register_chunks_compatible(local_chunk_pages: int, dst_chunk_pages: int) -> bool:
+    """Whether this prefill's transfer splits respect a decode's registered chunks.
+
+    group_concurrent_contiguous breaks transfers at multiples of the local
+    value; that covers every boundary of a decode registered in chunks of
+    dst_chunk_pages only when the local value divides it.
+    """
+    if dst_chunk_pages <= 0:
+        return True
+    return local_chunk_pages > 0 and dst_chunk_pages % local_chunk_pages == 0
+
+
+def chunk_register_regions(
+    ptrs: List[int], lens: List[int], item_lens: List[int], chunk_pages: int
+) -> List[Tuple[int, int]]:
+    """Split each (ptr, len) buffer into regions of at most chunk_pages items.
+
+    Chunks start at the buffer base and at every chunk_pages * item_len bytes,
+    matching the destination-page boundaries group_concurrent_contiguous
+    breaks transfers at; the last chunk of a buffer may be shorter.
+    """
+    regions: List[Tuple[int, int]] = []
+    for ptr, length, item_len in zip(ptrs, lens, item_lens):
+        step = chunk_pages * int(item_len)
+        if step <= 0:
+            raise ValueError(
+                f"chunk of {chunk_pages} pages of {item_len} bytes is empty"
+            )
+        regions.extend(
+            (ptr + offset, min(step, length - offset))
+            for offset in range(0, length, step)
+        )
+    return regions
+
+
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:
@@ -125,7 +179,13 @@ def group_concurrent_contiguous(
             f"got {src_indices.size} and {dst_indices.size}"
         )
 
-    brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+    breaks = (np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1)
+    chunk_pages = register_chunk_pages()
+    if chunk_pages > 0:
+        # The destination registered its buffers in chunks of chunk_pages
+        # pages; a transfer must not straddle two memory regions.
+        breaks |= (dst_indices[1:] // chunk_pages) != (dst_indices[:-1] // chunk_pages)
+    brk = np.where(breaks)[0] + 1
     src_groups = np.split(src_indices, brk)
     dst_groups = np.split(dst_indices, brk)
 
