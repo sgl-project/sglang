@@ -8,10 +8,45 @@ Individual functions register (or are imported) under the functional op id
 they logically belong to.
 """
 
-from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from typing import TYPE_CHECKING
 
-__all__ = []
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
+
+if TYPE_CHECKING:
+    import torch
+
+__all__ = ["bf16_add_then_scale"]
+
+register_kernel(
+    KernelSpec(
+        op="elementwise.bf16_add_then_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.elementwise.xpu_bf16_add_then_scale:bf16_add_then_scale",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="BF16 matrix add rounded before multiplication by a BF16 [1] scalar",
+        ),
+    )
+)
+
+
+def bf16_add_then_scale(
+    x: "torch.Tensor", y: "torch.Tensor", scale: "torch.Tensor"
+) -> "torch.Tensor":
+    """Two eager BF16 pointwise operations in one XPU pass."""
+    from sglang.kernels.ops.elementwise.xpu_bf16_add_then_scale import (
+        bf16_add_then_scale as implementation,
+    )
+
+    return implementation(x, y, scale)
+
 
 for _fn in ("hc_combine_gate", "hc_combine_apply", "hc_combine_apply_norm"):
     register_kernel(
