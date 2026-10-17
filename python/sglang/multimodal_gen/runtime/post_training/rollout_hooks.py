@@ -10,6 +10,7 @@ serving requests.
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Callable
 
 import torch
@@ -53,7 +54,11 @@ def rollout_step_kwargs(batch: Req) -> dict[str, Any]:
     current_rollout_controller = batch.rollout_controllers.get(VISUAL_STREAM)
     if current_rollout_controller is None:
         return {}
-    return {"transition": current_rollout_controller.transition}
+    return {
+        "transition": functools.partial(
+            current_rollout_controller.transition, batch=batch
+        )
+    }
 
 
 def _build_scheduler_rollout_controller(
@@ -73,10 +78,10 @@ def _build_scheduler_rollout_controller(
         generator=batch.generator,
         return_dit_trajectory=batch.rollout_return_dit_trajectory,
         return_step_indices=batch.rollout_return_step_indices,
-        shard_for_sp=lambda latents: pipeline_config.shard_latents_for_sp(
+        shard_for_sp=lambda batch, latents: pipeline_config.shard_latents_for_sp(
             batch=batch, latents=latents
         )[0],
-        gather_for_sp=lambda stacked_latents: gather_stacked_latents_for_sp(
+        gather_for_sp=lambda batch, stacked_latents: gather_stacked_latents_for_sp(
             pipeline_config=pipeline_config,
             batch=batch,
             stacked_latents=stacked_latents,
@@ -187,7 +192,7 @@ def _collect_rollout_log_probs(batch: Req) -> None:
     )
     if batch.rollout_debug_mode:
         batch.rollout_trajectory_data.rollout_debug_tensors = (
-            current_rollout_controller.collect_rollout_debug_tensors()
+            current_rollout_controller.collect_rollout_debug_tensors(batch)
         )
 
 
@@ -203,7 +208,7 @@ def _finalize_rollout_env(*, batch: Req, pipeline_config: Any) -> None:
 
     if step_latents:
         step_latents_tensor = current_rollout_controller.gather_for_sp(
-            torch.stack(step_latents, dim=1)
+            batch, torch.stack(step_latents, dim=1)
         )
         batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
             latents=step_latents_tensor.cpu(),
