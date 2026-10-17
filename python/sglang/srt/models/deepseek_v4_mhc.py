@@ -52,6 +52,9 @@ _is_xpu = is_xpu()
 HcTriplet = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+MHC_POST_MULT_VALUE = 2.0
+
+
 class HcConfig(NamedTuple):
     """Everything about a layer's mHC that is fixed for the model's lifetime."""
 

@@ -194,9 +194,9 @@ def _req_radix_key(
     token_ids: array[int],
     max_prefix_len: Optional[int] = None,
 ) -> RadixKey:
-    # unified_kv SWA lives in a per-request ring the tree never stores, so a reused
-    # prefix carries stale SWA; cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+    # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
+    # bounded replay); cap the match so the window is re-prefilled.
+    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
     if max_prefix_len is not None:
         key_limit = (

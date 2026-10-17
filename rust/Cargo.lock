@@ -3767,6 +3767,7 @@ dependencies = [
  "axum",
  "bytemuck",
  "bytes",
+ "chrono",
  "core_affinity",
  "dynamo-parsers",
  "dynamo-protocols",
