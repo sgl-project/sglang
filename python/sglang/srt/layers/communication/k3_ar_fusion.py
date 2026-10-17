@@ -365,8 +365,11 @@ def finalize_all_reduce_push_norm(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Deferred MoE finalize fused into the 1shot push AR + RMSNorm; ``out`` is
-    output-only. Caller checked :func:`finalize_push_fits`."""
+    """Finalize and reduce the latent, optionally reducing trailing shared rows.
+
+    Only the leading latent is normalized and output-only. Any trailing
+    shared rows must contain rank-local sums. Caller checked
+    :func:`finalize_push_fits`."""
     from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
