@@ -34,37 +34,6 @@ DEFAULT_DEVICE = "cuda"
 DENSE_ATOL = 3e-2
 DENSE_RTOL = 3e-2
 
-# SWA decode rule classification — production metadata builders differ:
-#   - `min_seq_len_window` rule: `window_kv_lens = min(seq_lens, window)` (the
-#     extra current-token slot is NOT included; total = `window` keys).
-#   - `extend_window` rule: keys at `[query_pos - window, query_pos]` are
-#     allowed by the extend kernel mask (the current token IS included; total
-#     = `window + 1` keys). FlashInfer's SWA decode metadata uses
-#     `clamp(seq_lens, max=window + 1)` (`flashinfer_backend.py:1031`) which
-#     gives `window + 1` keys when `seq_len > window`, matching this rule.
-#     Within-window seqs collapse to `seq_len` in both rules, so cases that
-#     stay below the window can't distinguish them.
-# Each known backend must be classified into exactly one set; an unclassified
-# backend trips `_swa_decode_uses_min_seq_len_rule` so a future SWA backend
-# can't silently inherit the wrong rule via a fallback.
-_SWA_DECODE_MIN_SEQ_LEN_WINDOW: frozenset[str] = frozenset({"triton"})
-_SWA_DECODE_EXTEND_WINDOW: frozenset[str] = frozenset(
-    {"torch_native", "fa3", "fa4", "flex_attention", "trtllm_mha", "flashinfer"}
-)
-
-
-def _swa_decode_uses_min_seq_len_rule(case: "DenseAttentionCase") -> bool:
-    if case.backend in _SWA_DECODE_MIN_SEQ_LEN_WINDOW:
-        return True
-    if case.backend in _SWA_DECODE_EXTEND_WINDOW:
-        return False
-    raise ValueError(
-        f"Unknown SWA decode rule for backend {case.backend!r}. Add it to "
-        f"either `_SWA_DECODE_MIN_SEQ_LEN_WINDOW` or `_SWA_DECODE_EXTEND_WINDOW` "
-        f"in common/attention_methods/dense_attention.py, depending on what its "
-        f"`init_forward_metadata_decode` metadata builder produces."
-    )
-
 
 @dataclass(frozen=True)
 class DenseAttentionCase:
@@ -825,15 +794,9 @@ def _dense_attention_reference(
             query_pos = case.prefix_lens[req_idx] + offset
             key_start = 0
             if case.sliding_window_size is not None:
-                # Two SWA mask rules in production:
-                #   - extend kernel: `kv_id >= q_id - window` (window + 1 keys).
-                #   - SWA-aware decode metadata: `min(seq_lens, window)` keys.
-                if case.forward_mode.is_decode() and _swa_decode_uses_min_seq_len_rule(
-                    case
-                ):
-                    key_start = max(0, query_pos + 1 - case.sliding_window_size)
-                else:
-                    key_start = max(0, query_pos - case.sliding_window_size)
+                # sliding_window_size excludes the query: every backend attends to the
+                # query and the sliding_window_size keys before it, extend and decode alike.
+                key_start = max(0, query_pos - case.sliding_window_size)
             keys = _expand_gqa(
                 req_k[key_start : query_pos + 1].movedim(0, 1), case.num_heads
             )

@@ -210,6 +210,11 @@ class TritonAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
         self.sliding_window_size = model_runner.sliding_window_size
+        # sliding_window_size excludes the query, decode seq_lens include it, and the
+        # decode kernel has no window mask: decode reads one key more, as FlashInfer.
+        self._decode_window_len = (
+            None if self.sliding_window_size is None else self.sliding_window_size + 1
+        )
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -568,7 +573,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.kv_index_translator,
                 plan,
                 req_pool_indices,
-                self.sliding_window_size,
+                self._decode_window_len,
                 seq_lens,
                 bs,
                 token_to_kv_pool=self.token_to_kv_pool,
@@ -878,7 +883,7 @@ class TritonAttnBackend(AttentionBackend):
                             self.kv_index_translator,
                             forward_batch.kv_loc_plan,
                             forward_batch.req_pool_indices,
-                            self.sliding_window_size,
+                            self._decode_window_len,
                             forward_batch.seq_lens,
                             bs,
                             self.device,
@@ -1185,7 +1190,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
-                    (max_num_tokens * self.sliding_window_size),
+                    (max_num_tokens * self._decode_window_len),
                     dtype=torch.int64,
                     device=self.device,
                 )
