@@ -450,8 +450,13 @@ def handle_model_specific_adjustments(server_args: Any):
                         "_handle_model_specific_adjustments",
                         disable_aiter_allreduce_fusion_in_prefill=True,
                     )
-                    logger.info(
-                        "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
+                    # TP4 on MI355X: the fused 2-stage AR+RMSNorm is ~10% slower
+                    # than custom AR followed by the add-RMSNorm kernel at every
+                    # decode/verify size (16..256 tokens x 6144).
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        disable_aiter_allreduce_fusion_in_decode=True,
                     )
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the
