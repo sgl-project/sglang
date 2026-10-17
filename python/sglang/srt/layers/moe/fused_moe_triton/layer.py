@@ -121,6 +121,10 @@ def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
             isinstance(quant_method, UnquantizedFusedMoEMethod)
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
+        or (
+            isinstance(quant_method, Fp8MoEMethod)
+            and get_moe_a2a_backend().is_megamoe()
+        )
     )
 
 
