@@ -1084,7 +1084,9 @@ class TestTriGeometry(CustomTestCase):
                 before = snapshot(a)
                 self.assertFalse(a._token_reclaim_satisfied(5))
                 with patch.object(
-                    kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
+                    kv.swa_kv_pool,
+                    "move_physical_pages",
+                    wraps=kv.swa_kv_pool.move_physical_pages,
                 ) as copies:
                     self.assertFalse(a.ensure_capacity(5, 5))
                 self.assertEqual(copies.call_count, 0)
