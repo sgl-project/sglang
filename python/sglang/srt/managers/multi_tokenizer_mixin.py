@@ -703,6 +703,12 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
+        if isinstance(recv_obj, (BatchTokenIDOutput, BatchStrOutput)):
+            _send_output_to_tokenizer_workers(
+                recv_obj, recv_obj.http_worker_ipcs, self.socket_mapping
+            )
+            return
+
         if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
