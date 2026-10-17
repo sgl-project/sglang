@@ -65,6 +65,56 @@ def _load_v4(
 
 
 @gluon.jit
+def _load_v41(
+    CACHE,
+    ids,
+    valid,
+    PAGE: gl.constexpr,
+    STRIDE: gl.constexpr,
+    KV_LAYOUT: gl.constexpr,
+    DATA_BYTES: gl.constexpr,
+    SCALE_BYTES: gl.constexpr,
+    TILE: gl.constexpr,
+    IS_FP4: gl.constexpr,
+    BT: gl.constexpr,
+):
+    # V4.1 quantizes all 512 values, so there is no bf16 rope tail to splice back
+    # in. V41 is 512 e4m3 with ue8m0 scales; V41_FP4 is the same 512 values as
+    # e2m1 two per byte, and its scale plane is e4m3 -- a different format, not a
+    # wider ue8m0.
+    d = gl.arange(0, 512, gl.SliceLayout(0, KV_LAYOUT))
+    base = (ids // PAGE).to(gl.int64)[:, None] * STRIDE
+    slot = (ids % PAGE)[:, None]
+    scale_ptr = CACHE + base + PAGE * DATA_BYTES + slot * SCALE_BYTES
+    if IS_FP4:
+        # The packed row is half as wide as the widened one: two e2m1 values per
+        # byte. Indexing the 512 lanes by d // 2 would make consecutive lanes
+        # share an address, and the backend then cannot prove the pattern
+        # contiguous, so it drops to one scalar byte load per lane.
+        dp = gl.arange(0, DATA_BYTES, gl.SliceLayout(0, KV_LAYOUT))
+        packed = gl.load(
+            CACHE + base + slot * DATA_BYTES + dp[None, :], valid[:, None], 0
+        )
+        esc = gl.load(scale_ptr + dp[None, :] // (TILE // 2), valid[:, None], 0)
+        scale = esc.to(gl.float8e4nv, bitcast=True).to(gl.float32)
+        # One instruction widens both nibbles into the 512-wide row.
+        vals = gl.fp4_to_fp(packed, gl.bfloat16, 1).to(gl.float32)
+        # The two elements of a packed byte share one scale tile -- (2j) // TILE
+        # equals (2j + 1) // TILE -- so duplicating each scale entry lines it up
+        # with the widened row. Both sides then carry the upcast's layout, so the
+        # product converts once instead of twice.
+        sc = gl.reshape(gl.join(scale, scale), (BT, 512))
+        return gl.convert_layout((vals * sc).to(gl.bfloat16), KV_LAYOUT)
+    bits = gl.load(CACHE + base + slot * DATA_BYTES + d[None, :], valid[:, None], 0)
+    value = bits.to(gl.float8e4nv, bitcast=True).to(gl.float32)
+    exponent = gl.load(scale_ptr + d[None, :] // TILE, valid[:, None], 0).to(gl.int32)
+    scale = gl.where(exponent == 0, 0x00400000, exponent << 23).to(
+        gl.float32, bitcast=True
+    )
+    return (value * scale).to(gl.bfloat16)
+
+
+@gluon.jit
 def partial_gluon(
     Q,
     K,
@@ -98,8 +148,19 @@ def partial_gluon(
     DATA_BYTES: gl.constexpr,
     SCALE_BYTES: gl.constexpr,
     TILE: gl.constexpr,
+    E_DATA_BYTES: gl.constexpr,
+    E_SCALE_BYTES: gl.constexpr,
+    E_TILE: gl.constexpr,
+    IS_V41: gl.constexpr,
+    IS_FP4: gl.constexpr,
+    E_IS_V41: gl.constexpr,
+    E_IS_FP4: gl.constexpr,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
+    # V4.1 pairs its fp4 compressed cache only with an fp8 main cache, so the
+    # fp4 flag never applies to a V4 row.
+    gl.static_assert(not IS_FP4 or IS_V41)
+    gl.static_assert(not E_IS_FP4 or E_IS_V41)
     b, t = gl.program_id(0), gl.program_id(1)
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
@@ -108,33 +169,63 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = _load_v4(
-            K,
-            gl.maximum(ids, 0),
-            valid,
-            KP,
-            KS,
-            kv_layout,
-            DATA_BYTES,
-            SCALE_BYTES,
-            TILE,
-        )
+        if IS_V41:
+            kv = _load_v41(
+                K,
+                gl.maximum(ids, 0),
+                valid,
+                KP,
+                KS,
+                kv_layout,
+                DATA_BYTES,
+                SCALE_BYTES,
+                TILE,
+                IS_FP4,
+                BT,
+            )
+        else:
+            kv = _load_v4(
+                K,
+                gl.maximum(ids, 0),
+                valid,
+                KP,
+                KS,
+                kv_layout,
+                DATA_BYTES,
+                SCALE_BYTES,
+                TILE,
+            )
     else:
         at = (t - KT) * BT + n
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = _load_v4(
-            E,
-            gl.maximum(ids, 0),
-            valid,
-            EP,
-            ES,
-            kv_layout,
-            DATA_BYTES,
-            SCALE_BYTES,
-            TILE,
-        )
+        if E_IS_V41:
+            kv = _load_v41(
+                E,
+                gl.maximum(ids, 0),
+                valid,
+                EP,
+                ES,
+                kv_layout,
+                E_DATA_BYTES,
+                E_SCALE_BYTES,
+                E_TILE,
+                E_IS_FP4,
+                BT,
+            )
+        else:
+            kv = _load_v4(
+                E,
+                gl.maximum(ids, 0),
+                valid,
+                EP,
+                ES,
+                kv_layout,
+                E_DATA_BYTES,
+                E_SCALE_BYTES,
+                E_TILE,
+            )
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
     q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
