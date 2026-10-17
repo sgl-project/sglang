@@ -30,15 +30,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 CHUNK = 64
 
 
-def _track_seqlen(
+def _run_tracker(
     *,
     tree_page: int,
     prefix_len: int,
     extend_len: int,
     dcp_enabled: bool = False,
-) -> int | None:
-    """Run one extend through the tracker and report the donated depth, or
-    None when the extend donates no checkpoint."""
+    track_buffer: torch.Tensor | None = None,
+):
+    """Run one extend through the tracker; returns its entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
@@ -55,7 +55,11 @@ def _track_seqlen(
     )
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
-    req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
+    req.kv.mamba_ping_pong_track_buffer = (
+        torch.tensor([0, 1], dtype=torch.int64)
+        if track_buffer is None
+        else track_buffer
+    )
     req.kv.mamba_next_track_idx = 0
     req.mamba_branching_seqlen = None
 
@@ -72,6 +76,12 @@ def _track_seqlen(
         return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
     ):
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    return entry, req
+
+
+def _track_seqlen(**kwargs) -> int | None:
+    """The donated depth of one extend, or None when it donates no checkpoint."""
+    entry, req = _run_tracker(**kwargs)
     if not entry.track_mask:
         assert req.kv.mamba_last_track_seqlen is None
         return None
@@ -79,6 +89,28 @@ def _track_seqlen(
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
+    def test_track_index_is_the_slot_before_the_flip_and_stays_on_device(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        track_buffer = torch.tensor([7, 9], dtype=torch.int64, device=device)
+        if device == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            entry, req = _run_tracker(
+                tree_page=CHUNK,
+                prefix_len=0,
+                extend_len=4 * CHUNK,
+                track_buffer=track_buffer,
+            )
+        finally:
+            if device == "cuda":
+                torch.cuda.set_sync_debug_mode("default")
+
+        self.assertTrue(entry.track_mask)
+        self.assertEqual(entry.track_index.device, track_buffer.device)
+        self.assertEqual(int(entry.track_index), 7)
+        self.assertEqual(req.kv.mamba_next_track_idx, 1)
+
     def test_widened_tree_page_moves_the_donated_depth_onto_it(self):
         # 4066 tokens past a 16384 prefix: the chunk grid would stop at 20416,
         # which a 256-token page cannot name.
