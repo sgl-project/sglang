@@ -16,6 +16,7 @@ import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    MAX_N,
     MAX_REQUEST_REASONING_END_TOKEN_IDS,
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
@@ -109,6 +110,21 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
+
+    def test_n_bounds(self):
+        """n outside [1, MAX_N] must be rejected at admission on every entrypoint.
+
+        An unadmitted n reached `prompt_index = idx // request.n` in the
+        completions response path, where n=0 raised ZeroDivisionError and
+        surfaced as HTTP 500 instead of a 400.
+        """
+        for value in (-1, 0, MAX_N + 1, "2"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "n must be"):
+                    self._make(n=value).verify(self.VOCAB_SIZE)
+
+        self._make(n=1).verify(self.VOCAB_SIZE)
+        self._make(n=MAX_N).verify(self.VOCAB_SIZE)
 
     def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
         self._make(
@@ -314,6 +330,47 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Test that logit_bias with token_ids within [0, vocab_size) is accepted."""
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_value_bounds(self):
+        """Malformed and oversized native bias values must fail admission.
+
+        These inputs previously raised TypeError or OverflowError instead of
+        ValueError, escaping the request-validation error path.
+        """
+        for value in (
+            -101.0,
+            101.0,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "abc",
+            None,
+            True,
+            1 << 2000,
+            -(1 << 2000),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logit_bias"):
+                    self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
+
+        # An int bias is a valid JSON number; the type guard must not narrow to float.
+        self._make(logit_bias={"0": -100.0, "1": 5, "31999": 100.0}).verify(
+            self.VOCAB_SIZE
+        )
+
+    def test_stop_token_id_bounds(self):
+        """Invalid native stop IDs must fail before minimum-token penalization."""
+        for min_new_tokens in (0, 1):
+            for token_id in (-1, self.VOCAB_SIZE, self.VOCAB_SIZE + 1):
+                with self.subTest(min_new_tokens=min_new_tokens, token_id=token_id):
+                    with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+                        self._make(
+                            stop_token_ids=[token_id], min_new_tokens=min_new_tokens
+                        ).verify(self.VOCAB_SIZE)
+
+        self._make(stop_token_ids=[0, self.VOCAB_SIZE - 1], min_new_tokens=1).verify(
+            self.VOCAB_SIZE
+        )
 
     # --- sampling_seed ---
     def test_sampling_seed_valid(self):
