@@ -117,6 +117,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -3897,6 +3898,9 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
+            # dLLM prefills its context over several steps without chunked_req.
+            if not self.dllm_manager.any_context_in_progress():
+                mm_schedule.release_prefill_rows()
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
             new_batch = None
@@ -3982,6 +3986,10 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        # Every prefill loop passes here after dropping chunked requests, and before
+        # add_chunked_req ends a last chunk whose forward still reads its kept rows.
+        if self.chunked_req is None:
+            mm_schedule.release_prefill_rows()
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -5433,6 +5441,7 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            mm_schedule.release_prefill_rows()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5588,9 +5597,14 @@ class Scheduler(
             logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
-            for req in self.dllm_manager.pop_aborted_reqs(
+            aborted_dllm_reqs = self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
-            ):
+            )
+            # Other dLLM contexts stay part-way prefilled, so keep their rows.
+            mm_schedule.release_prefill_rows(
+                rids=[req.rid for req in aborted_dllm_reqs]
+            )
+            for req in aborted_dllm_reqs:
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
@@ -5782,6 +5796,9 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
+        # Paused loops skip scheduling, so drop the kept encoder rows here.
+        if self.chunked_req is None:
+            mm_schedule.release_prefill_rows()
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

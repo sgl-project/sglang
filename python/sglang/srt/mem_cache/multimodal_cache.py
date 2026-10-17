@@ -112,6 +112,9 @@ class MultiModalStaticCache(MultimodalCache):
         tensor = embedding.embedding
         storage_size = _get_tensor_size(tensor)
         data_size = min(storage_size, tensor.element_size() * tensor.numel())
+        if data_size > self.max_size:
+            # Larger than the whole cache: evicting would only empty it.
+            return False
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
                 return False
@@ -132,6 +135,10 @@ class MultiModalStaticCache(MultimodalCache):
         if embedding is not None:
             self.mm_cache.move_to_end(mm_hash)
         return embedding
+
+    def peek(self, mm_hash: int) -> Optional[EmbeddingResult]:
+        """Return the entry without changing the LRU order."""
+        return self.mm_cache.get(mm_hash)
 
     def has(self, mm_hash: int) -> bool:
         return mm_hash in self.mm_cache
