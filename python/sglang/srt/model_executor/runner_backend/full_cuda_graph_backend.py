@@ -156,17 +156,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             else None
         )
 
-        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+        # Warm up kernels and one-time setup before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         warmup_output = None
-        for warmup_step in range(2):
+        for _ in range(2 if profiler is not None else 1):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
-                output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
-                warmup_output = output
-            del output
+                warmup_output = forward_fn()
             if profiler is not None:
                 profiler.step()
             if post_warmup_hook is not None:
