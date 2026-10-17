@@ -149,12 +149,6 @@ def _finish_vision_topk(
             expert_location_dispatch_info=expert_location_dispatch_info,
             padded_rows_masked=padded_rows_masked,
         )
-        if (
-            config.num_fused_shared_experts
-            and config.apply_routed_scaling_factor_on_output
-        ):
-            # MegaMoE applies no post-expert scale when it is already in top-k.
-            weights[:, -config.num_fused_shared_experts :] = 1.0
         if recorder_ids is not None:
             get_global_expert_distribution_recorder().on_select_experts(
                 topk_ids=recorder_ids

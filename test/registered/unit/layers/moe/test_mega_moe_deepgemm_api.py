@@ -234,6 +234,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )
@@ -463,6 +464,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=fused_shared,
             layer_id=0,
             routed_scaling_factor=2.0,
+            routed_scaling_factor_fused_in_topk=scale_in_topk,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )

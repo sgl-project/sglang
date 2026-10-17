@@ -1,13 +1,14 @@
-"""Unit tests for fused shared-expert weight scaling.
+"""Unit tests for routed_scaling_factor counting exactly once around a MoE block.
 
-These tests pin the fused shared expert's topk weight contract on three paths:
+routed_scaling_factor is applied either in top-k, folded into the routed weights
+(aiter, or a quant method that asks for it), or to the MoE output after the
+experts. Every step that applies it or compensates for it must agree on which:
 
-  * aiter (HIP) per-rank-slot path: routed_scaling_factor is folded into the
-    routed weights and the post-MoE multiply is skipped, so the shared weight
-    must be 1.0 for a net 1.0x contribution.
-  * post-MoE scaling per-rank-slot path (default): the whole MoE output is
-    multiplied by routed_scaling_factor afterward, so the shared weight must
-    be 1/rsf.
+  * a fused shared expert's topk weight, on the per-rank-slot path and under
+    Waterfill: 1.0 when the factor is folded in top-k, else 1/rsf so that the
+    later multiply nets it out to 1.0x.
+  * the two-batch-overlap MoE epilogue: scales the routed output only when top-k
+    did not.
   * standard EP path (no per-rank slots): every rank computes the fused shared
     expert and the outputs are all-reduced, so the model-supplied 1/ep_size
     factor must be applied to the shared weight.
@@ -15,7 +16,7 @@ These tests pin the fused shared expert's topk weight contract on three paths:
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 import unittest
 from contextlib import nullcontext
@@ -24,8 +25,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.batch_overlap.operations import _StateDict
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopK, TopKConfig
+from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.model_executor.model_runner_components import moe_ep_setup
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -36,7 +42,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     EP_RANK = 0
     ROUTED_SCALING_FACTOR = 2.5
 
-    def _run_remap(self, *, use_aiter):
+    def _run_remap(self, *, use_aiter, folded_in_topk=False):
         # Layout: [routed, routed, routed, shared]; the trailing column is the
         # fused shared expert. The shared weight starts at a sentinel to prove
         # the function overwrites it.
@@ -48,6 +54,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             top_k=4,
             num_fused_shared_experts=1,
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+            apply_routed_scaling_factor_on_output=folded_in_topk,
         )
 
         with (
@@ -83,6 +90,90 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         # the shared weight must be 1/rsf to net out to 1.0.
         shared_weight = self._run_remap(use_aiter=False)
         self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
+
+    def test_factor_folded_in_topk_uses_unit_shared_weight(self):
+        # Regression: a quant method that folds rsf into the top-k weights
+        # (ModelOpt NVFP4, FP8 on CUTLASS) has no post-MoE multiply, so 1/rsf
+        # left the always-on shared expert at 0.4x in every MoE layer.
+        shared_weight = self._run_remap(use_aiter=False, folded_in_topk=True)
+        self.assertAlmostEqual(shared_weight, 1.0)
+
+    def _waterfill_shared_weight(self, *, use_aiter, folded_in_topk):
+        # Waterfill takes the shared column out of TopK and appends it itself.
+        topk = TopK.__new__(TopK)
+        torch.nn.Module.__init__(topk)
+        topk.layer_id = 0
+        topk.enable_waterfill = True
+        topk.waterfill_balancer = None
+        topk.topk_config = TopKConfig(
+            top_k=8,
+            routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+            apply_routed_scaling_factor_on_output=folded_in_topk,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(n_routed_experts=self.NUM_PHYSICAL_ROUTED)
+        )
+        with (
+            patch.object(topk_module, "_use_aiter", use_aiter),
+            patch.object(
+                moe_ep_setup,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(ep_num_redundant_experts=0)
+                ),
+            ),
+            get_parallel().override(moe_ep_size=self.EP_SIZE, moe_ep_rank=self.EP_RANK),
+        ):
+            moe_ep_setup.prepare_moe_topk(
+                model=torch.nn.ModuleList([topk]), model_config=model_config
+            )
+        return topk.waterfill_balancer.shared_weight
+
+    def test_waterfill_shared_weight_matches_the_per_rank_slot(self):
+        # Waterfill and the per-rank slot place the same fused shared expert;
+        # Waterfill used 1/rsf even where rsf was already in the routed weights.
+        cases = (
+            # (use_aiter, folded_in_topk, shared weight for a net 1.0x)
+            (False, False, 1.0 / self.ROUTED_SCALING_FACTOR),
+            (False, True, 1.0),
+            (True, False, 1.0),
+        )
+        for use_aiter, folded_in_topk, expected in cases:
+            with self.subTest(use_aiter=use_aiter, folded_in_topk=folded_in_topk):
+                waterfill = self._waterfill_shared_weight(
+                    use_aiter=use_aiter, folded_in_topk=folded_in_topk
+                )
+                per_rank_slot = self._run_remap(
+                    use_aiter=use_aiter, folded_in_topk=folded_in_topk
+                )
+                self.assertAlmostEqual(waterfill, expected)
+                self.assertAlmostEqual(per_rank_slot, expected)
+
+    def test_two_batch_overlap_epilogue_applies_factor_once(self):
+        """The two-batch-overlap MoE epilogue must not scale the combined routed
+        output again when top-k already folded routed_scaling_factor into it."""
+        torch.manual_seed(0)
+        routed = torch.randn(4, 6)
+        shared = torch.randn(4, 6)
+        for folded_in_topk in (False, True):
+            for has_shared in (False, True):
+                with self.subTest(folded_in_topk=folded_in_topk, has_shared=has_shared):
+                    moe = SimpleNamespace(
+                        routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+                        routed_scaling_factor_fused_in_topk=folded_in_topk,
+                    )
+                    state = _StateDict()
+                    state.hidden_states_after_combine = routed.clone()
+                    state.shared_output = shared.clone() if has_shared else None
+                    with get_flags().moe.override(a2a_backend=MoeA2ABackend.DEEPEP):
+                        DeepseekV2MoE.op_output(moe, state)
+
+                    expected = routed * (
+                        1.0 if folded_in_topk else self.ROUTED_SCALING_FACTOR
+                    )
+                    if has_shared:
+                        expected = expected + shared
+                    torch.testing.assert_close(state.hidden_states_mlp_output, expected)
 
     def _run_post_process_standard_path(self, *, scaling_factor):
         topk_ids = torch.tensor([[5, 40, 100, 256]], dtype=torch.int32)

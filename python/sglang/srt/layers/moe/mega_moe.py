@@ -306,7 +306,7 @@ def _run_mega_routed(
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
         routed_scaling_factor=(
             1.0
-            if moe.experts.should_fuse_routed_scaling_factor_in_topk
+            if moe.routed_scaling_factor_fused_in_topk
             else float(moe.routed_scaling_factor)
         ),
         num_shared_experts=(
