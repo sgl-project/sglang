@@ -328,6 +328,88 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 > **Note:** The diffusion engine (SGLang-Diffusion) does not currently support hot refit (updating weights while inference is in progress). The diffusion scheduler processes one request at a time and completes the entire inference before handling the next request, so weight updates and inference never run concurrently.
 
+#### Pull Published Weights to a Host-Local Checkpoint
+
+When the trainer publishes each weight version to a shared filesystem, `POST /pull_weights` has every host of the deployment bring its own local checkpoint up to a target version; a following `update_weights_from_disk` with `model_path` set to that local dir then loads it. The pull only touches disk and runs off the scheduler thread, so it can overlap generation.
+
+The trainer writes version `N` as `weight_v{N:06d}/` under `source_dir`. A version is either a full HF checkpoint, which is copied as is, or a delta against version `N-1` (its index metadata carries `delta_encoding`), which is applied in place and checked against per-tensor checksums. Version 0 is the server's own `--model-path`. A pull seeds from the newest full version at or below the target and applies the deltas after it; one that fails midway leaves the host to reseed on its next pull. The local checkpoint only moves forward: pulling a version below it fails.
+
+If the shared filesystem lacks cross-host read-after-write consistency (common for object-store mounts), set `--custom-pull-weights-pre-read-hook` to a `hook(source_dir, target_version)` that makes the published files visible before they are read.
+
+**Endpoint:** `POST /pull_weights`
+
+**Request body:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Field</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Defaults</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Options</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`local_checkpoint_dir`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host-local dir the pulled checkpoint lands in.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Required</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`source_dir`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Shared dir the trainer publishes <code>weight_v&#123;N:06d&#125;/</code> version dirs under.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Required</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`target_version`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Version to bring the local checkpoint up to.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Required</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+  </tbody>
+</table>
+
+**Response body:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Field</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Defaults</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Options</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`success`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Whether every host now holds the target version.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`message`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Status / error message, with the traceback of every failed rank.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+  </tbody>
+</table>
+
 ### Weight Update Session
 
 `update_weights_from_tensor` and `update_weights_from_distributed` must run inside a weight-update session. The update calls only write checkpoint-format values; `end_weight_update` runs every quantized layer's `process_weights_after_loading` once, turning them into kernel layout (Marlin repack, MXFP8 shuffles, ...), and runs `post_load_weights` if no weights were loaded through the engine during the session (P2P/RDMA writes). `begin_weight_update` first restores the few schemes whose kernel layout changes parameter shapes (today compressed-tensors W4A16 MoE on Marlin) so the checkpoint-format values fit. One session can span many update calls, so the finalize cost is paid once per refit rather than once per bucket. A call outside a session, a second `begin_weight_update`, or an `end_weight_update` without one is rejected with `success: false` (HTTP 400) and leaves the weights untouched.
