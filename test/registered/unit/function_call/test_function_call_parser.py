@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 
@@ -28,6 +29,7 @@ from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
+from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
@@ -3981,6 +3983,46 @@ class TestLing3Detector(unittest.TestCase):
                 self.assertEqual(len(tool_calls), 1)
                 self.assertEqual(tool_calls[0]["name"], "get_weather")
                 self.assertEqual(tool_calls[0]["parameters"], expected)
+
+
+class TestInternlmDetector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            ),
+        ]
+        self.detector = InternlmDetector()
+
+    def test_unclosed_tool_call_tags_parse_in_linear_time(self):
+        """Opening tags or whitespace without an end tag must not stall the
+        parser (it runs on the event loop); the complete call still parses."""
+        bot = self.detector.bot_token
+        complete = f'{bot}\n{{"name": "get_weather", "parameters": {{"city": "Tokyo"}}}}<|action_end|>'
+
+        start = time.perf_counter()
+        repeated = self.detector.detect_and_parse(
+            complete + (bot + " ") * 5000, self.tools
+        )
+        whitespace = self.detector.detect_and_parse(
+            complete + bot + "\n" * 40000, self.tools
+        )
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        for result in (repeated, whitespace):
+            self.assertEqual(
+                [(call.name, call.parameters) for call in result.calls],
+                [("get_weather", '{"city": "Tokyo"}')],
+            )
 
 
 class TestJsonArrayParser(unittest.TestCase):
