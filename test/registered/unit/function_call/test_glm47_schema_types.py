@@ -264,6 +264,65 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             {"value": "123abc"},
         )
 
+    def test_non_json_container_and_boolean_values_stream_as_json(self):
+        """Streaming passed array/object/boolean values through verbatim, so a
+        value that isn't JSON ("1, 2", "True") produced invalid JSON while
+        non-streaming parsed it."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array"},
+                "flag": {"type": "boolean"},
+                "opts": {"type": "object"},
+            },
+        }
+        self.check_arguments(schema, {"ids": [1, 2]}, raw_values={"ids": "1, 2"})
+        self.check_arguments(schema, {"flag": True}, raw_values={"flag": "True"})
+        self.check_arguments(
+            schema,
+            {"ids": [1, 2], "opts": {"a": 1}},
+            raw_values={"ids": "\n[1, 2]\n", "opts": ' {"a": 1}'},
+        )
+
+    def test_streamed_container_values_are_not_buffered(self):
+        """Once an array/object value opens as JSON it streams through, so the
+        detector must not also keep a copy of it."""
+        for value_type, value in (
+            ("array", list(range(64))),
+            ("object", {str(i): i for i in range(32)}),
+        ):
+            with self.subTest(value_type=value_type):
+                schema = {
+                    "type": "object",
+                    "properties": {"value": {"type": value_type}},
+                }
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(name="inspect", parameters=schema),
+                    )
+                ]
+                raw = " " + json.dumps(value)
+                detector = Glm47MoeDetector()
+                calls = list(
+                    detector.parse_streaming_increment(
+                        "<tool_call>inspect<arg_key>value</arg_key><arg_value>", tools
+                    ).calls
+                )
+                for offset in range(0, len(raw), 7):
+                    calls.extend(
+                        detector.parse_streaming_increment(
+                            raw[offset : offset + 7], tools
+                        ).calls
+                    )
+                    self.assertEqual(detector._current_value, "")
+                for char in "</arg_value></tool_call>":
+                    calls.extend(detector.parse_streaming_increment(char, tools).calls)
+                self.assertEqual(
+                    json.loads("".join(call.parameters for call in calls)),
+                    {"value": value},
+                )
+
     def test_completed_siblings_disambiguate_root_union(self):
         for keyword in ("oneOf", "anyOf"):
             for discriminator in ("const", "enum"):
