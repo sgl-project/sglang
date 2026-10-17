@@ -255,6 +255,15 @@ def _extract_cache_from_sglext(data, output):
         output.cached_tokens_details = details
 
 
+def _raise_for_stream_error(data):
+    # HTTP headers are already sent when a running request is aborted. The
+    # server then reports its status in an SSE error frame, not in choices.
+    if "error" in data:
+        raise ValueError(
+            f"Server returned a streaming error: {json.dumps(data['error'])}"
+        )
+
+
 def _record_server_prompt_len(data, output):
     """Take the prompt length from the server, the only side that knows it.
 
@@ -352,6 +361,7 @@ async def async_request_openai_completions(
                             pass
                         else:
                             data = json.loads(chunk)
+                            _raise_for_stream_error(data)
                             _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
@@ -539,6 +549,7 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                _raise_for_stream_error(data)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
