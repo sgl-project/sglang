@@ -102,7 +102,9 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+        check_ipc_quant_support(
+            quant_method, engine_quant_config, where="client", model_config=model_config
+        )
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config, device_config)
@@ -198,19 +200,12 @@ class IpcModelLoader(BaseModelLoader):
             )
             return
 
-        def _daemon_alive(pid: int) -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True  # exists but owned by another user
-            return True
+        from .protocol import _is_pid_alive
 
         def _watch() -> None:
             while True:
                 time.sleep(_DAEMON_LIVENESS_POLL_INTERVAL)
-                if not _daemon_alive(daemon_pid):
+                if not _is_pid_alive(daemon_pid):
                     logger.critical(
                         f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
                         f"died while this engine holds its weights via CUDA IPC. "
@@ -272,7 +267,7 @@ class IpcModelLoader(BaseModelLoader):
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
 
     @staticmethod
-    def _set_module_tensor(model, name, tensor, is_param=True):
+    def _set_module_tensor(model, name, tensor, is_param=True, persistent=True):
         """Replace or register a parameter/buffer in the model by its full dotted name.
 
         This is necessary because setting param.data on a meta-device tensor
@@ -303,7 +298,7 @@ class IpcModelLoader(BaseModelLoader):
                 del obj._parameters[leaf_name]
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
-            obj.register_buffer(leaf_name, tensor)
+            obj.register_buffer(leaf_name, tensor, persistent=persistent)
 
     def _load_zero_copy_mode(
         self,
@@ -360,6 +355,9 @@ class IpcModelLoader(BaseModelLoader):
         for name, entry in entries.items():
             imported_tensor = self._transport_backend.import_tensor(entry)
             is_param = entry.get("is_param", True)
+            # Default True keeps compatibility with daemons predating the
+            # persistence flag.
+            persistent = entry.get("persistent", True)
 
             if name in existing_names:
                 # Existing parameter/buffer — validate shape/dtype
@@ -379,7 +377,9 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            self._set_module_tensor(
+                model, name, imported_tensor, is_param=is_param, persistent=persistent
+            )
             imported_refs.append(imported_tensor)
             imported_count += 1
 
@@ -390,11 +390,11 @@ class IpcModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
                 f"mismatch between the IPC daemon and the meta-initialized model. "
-                f"The quantization method passed the IPC allowlist gate "
-                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
-                f"case — it indicates the daemon's weight fingerprint is "
-                f"incomplete or the daemon/client configs drifted (a bug to fix), "
-                f"not merely uninitialized weights:\n" + "\n".join(mismatched)
+                f"The model passed the IPC admission gate "
+                f"(check_ipc_quant_support), so either an unsupported post-load "
+                f"layout bypassed the gate (a gate gap to fix), the daemon's "
+                f"weight fingerprint is incomplete, or the daemon/client configs "
+                f"drifted — not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
 
         # After mapping every daemon entry, any tensor still on the meta device
