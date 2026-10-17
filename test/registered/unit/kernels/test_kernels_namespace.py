@@ -13,6 +13,7 @@ import sglang.kernels.fused_op as fo
 import sglang.kernels.selector as sel
 from sglang.kernels import KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
+from sglang.kernels.spec import DeviceType
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=24, suite="base-a-test-cpu")
@@ -116,6 +117,29 @@ def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
 )
 def test_capability_is_satisfied_by(req, plat, ok):
     assert req.is_satisfied_by(plat) is ok
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_platform_detection_reports_xpu_without_cpu_capabilities(
+    monkeypatch, available
+):
+    """An XPU process must not qualify for a CPU-only kernel backend."""
+    from types import SimpleNamespace
+
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch, "npu", None, raising=False)
+    monkeypatch.setattr(
+        torch, "xpu", SimpleNamespace(is_available=lambda: available), raising=False
+    )
+    platform = PlatformInfo.detect()
+    assert platform.device_type == ("xpu" if available else "cpu")
+    assert Cap.XPU.is_satisfied_by(platform) is available
+    assert Cap(device=DeviceType.CPU).is_satisfied_by(platform) is not available
+    assert not Cap.CUDA.is_satisfied_by(platform)
+    assert not Cap.HIP.is_satisfied_by(platform)
 
 
 def test_capabilities_or_semantics():
