@@ -287,6 +287,7 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
+    pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_alphas = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}
@@ -407,3 +408,34 @@ def test_apply_composed_adapter_end_to_end():
         + _reference_delta(x, a_list, b_list, adapter_alpha) * strength
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_loader_folds_per_section_alpha_into_fused_group():
+    pipeline = _make_loader_pipeline()
+    state = _qkv_state_dict()
+    for name in ("q", "k", "v"):
+        state[f"attn.{name}.alpha"] = torch.tensor(1.0)
+    _load_adapter(pipeline, state)
+
+    adapter = pipeline.lora_adapters["adapter"]
+    # rank 2, alpha 1 per section -> B is scaled by 0.5; no raw alpha stack left
+    assert adapter["attn.to_qkv.alpha"].ndim == 0
+    assert adapter["attn.to_qkv.alpha"].item() == adapter["attn.to_qkv.lora_A"].shape[0]
+    raw_b = state["attn.q.lora_B.default.weight"]
+    torch.testing.assert_close(
+        adapter["attn.to_qkv.lora_B"][: raw_b.shape[0], :2], raw_b * 0.5
+    )
+
+
+def test_loader_equal_sections_with_alpha_does_not_crash():
+    pipeline = _make_loader_pipeline()
+    state_dict = {
+        "mlp.gate.lora_A.weight": torch.randn(2, IN_DIM),
+        "mlp.gate.lora_B.weight": torch.randn(4, 2),
+        "mlp.gate.alpha": torch.tensor(1.0),
+        "mlp.up.lora_A.weight": torch.randn(2, IN_DIM),
+        "mlp.up.lora_B.weight": torch.randn(4, 2),
+        "mlp.up.alpha": torch.tensor(1.0),
+    }
+    _load_adapter(pipeline, state_dict)
+    assert pipeline.lora_adapters["adapter"]["mlp.gate_up.alpha"].ndim == 0

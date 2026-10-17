@@ -25,7 +25,7 @@ class SetLoraReq(msgspec.Struct):
 
 class MergeLoraWeightsReq(msgspec.Struct):
     target: str = "all"
-    strength: float = 1.0
+    strength: Optional[float] = None  # None keeps each adapter's own strength
 
 
 class UnmergeLoraWeightsReq(msgspec.Struct):

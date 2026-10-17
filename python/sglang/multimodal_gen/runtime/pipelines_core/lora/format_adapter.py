@@ -289,38 +289,6 @@ def _convert_non_diffusers_sd_simple(
     return out
 
 
-def _convert_with_diffusers_utils_if_available(
-    state_dict: Mapping[str, torch.Tensor],
-    log: logging.Logger,
-) -> Optional[Dict[str, torch.Tensor]]:
-    """Use diffusers.lora_conversion_utils if available."""
-    try:
-        if hasattr(lcu, "maybe_convert_state_dict"):
-            converted = lcu.maybe_convert_state_dict(  # type: ignore[attr-defined]
-                state_dict
-            )
-        else:
-            converted = dict(state_dict)
-
-        if not isinstance(converted, dict):
-            converted = dict(converted)
-
-        sample = _sample_keys(converted.keys(), 20)
-        log.info(
-            "[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, "
-            "sample keys (<=20): %s",
-            ", ".join(sample),
-        )
-        return converted
-    except Exception as exc:  # pragma: no cover
-        log.warning(
-            "[LoRAFormatAdapter] diffusers lora_conversion_utils failed, "
-            "falling back to internal converters. Error: %s",
-            exc,
-        )
-        return None
-
-
 def _convert_via_diffusers_candidates(
     state_dict: Mapping[str, torch.Tensor],
     candidate_names: tuple[str, ...],
@@ -448,9 +416,18 @@ def _convert_ai_toolkit_flux_lora(
     lora_keys = ("lora_A", "lora_B")
     attn_types = ("img_attn", "txt_attn")
 
+    def move_alpha(old_prefix: str, new_prefixes: list[str]) -> None:
+        # Per-module alpha follows the module it scales; split sections share it.
+        alpha = original_state_dict.pop(f"{old_prefix}.alpha", None)
+        if alpha is not None:
+            for new_prefix in new_prefixes:
+                out[f"{new_prefix}.alpha"] = alpha
+
     for sl in range(num_single_layers):
         single_block_prefix = f"single_blocks.{sl}"
         attn_prefix = f"single_transformer_blocks.{sl}.attn"
+        move_alpha(f"{single_block_prefix}.linear1", [f"{attn_prefix}.to_qkv_mlp_proj"])
+        move_alpha(f"{single_block_prefix}.linear2", [f"{attn_prefix}.to_out"])
 
         for lora_key in lora_keys:
             linear1_key = f"{single_block_prefix}.linear1.{lora_key}.weight"
@@ -467,6 +444,17 @@ def _convert_ai_toolkit_flux_lora(
 
     for dl in range(num_double_layers):
         transformer_block_prefix = f"transformer_blocks.{dl}"
+
+        for attn_type in attn_types:
+            proj_names = (
+                ["to_q", "to_k", "to_v"]
+                if attn_type == "img_attn"
+                else ["add_q_proj", "add_k_proj", "add_v_proj"]
+            )
+            move_alpha(
+                f"double_blocks.{dl}.{attn_type}.qkv",
+                [f"{transformer_block_prefix}.attn.{n}" for n in proj_names],
+            )
 
         for lora_key in lora_keys:
             for attn_type in attn_types:
@@ -514,6 +502,10 @@ def _convert_ai_toolkit_flux_lora(
             ("txt_attn.proj", "attn.to_add_out"),
         ]
         for org_proj, diff_proj in proj_mappings:
+            move_alpha(
+                f"double_blocks.{dl}.{org_proj}",
+                [f"{transformer_block_prefix}.{diff_proj}"],
+            )
             for lora_key in lora_keys:
                 original_key = f"double_blocks.{dl}.{org_proj}.{lora_key}.weight"
                 if original_key in original_state_dict:
@@ -580,15 +572,11 @@ def convert_lora_state_dict_by_format(
         return _convert_non_diffusers_sd_simple(converted, log)
 
     if fmt == LoRAFormat.WAN:
-        maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
-        if maybe is None:
-            maybe = dict(state_dict)
+        maybe = dict(state_dict)
         return _convert_non_diffusers_sd_simple(maybe, log)
 
     if fmt == LoRAFormat.STANDARD:
-        maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
-        if maybe is None:
-            maybe = dict(state_dict)
+        maybe = dict(state_dict)
 
         if _looks_like_qwen_image(maybe):
             return _convert_qwen_image_standard(maybe, log)
@@ -596,9 +584,7 @@ def convert_lora_state_dict_by_format(
         return maybe
 
     if fmt == LoRAFormat.NON_DIFFUSERS_SD:
-        maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
-        if maybe is None:
-            maybe = dict(state_dict)
+        maybe = dict(state_dict)
         return _convert_non_diffusers_sd_simple(maybe, log)
 
     log.info(

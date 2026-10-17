@@ -734,6 +734,24 @@ class BaseLayerWithLoRA(nn.Module):
 
         self.merged = False
 
+    def reset_lora(self) -> None:
+        """Drop every adapter from this layer, restoring the base weight.
+
+        Unlike ``unmerge_lora_weights`` this works on a layer that is already
+        disabled, so a delta merged by an earlier adapter is never left behind.
+        """
+        if self.merged:
+            self.disable_lora = False
+            self.unmerge_lora_weights()
+        self.disable_lora = True
+        self.lora_weights_list.clear()
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_output_offset = None
+        self.has_lora_output_offset = False
+        self.lora_path = None
+        self.strength = 1.0
+
     @torch.no_grad()
     def commit_merged_as_base(self) -> None:
         """Promote the currently merged weights to the permanent base.

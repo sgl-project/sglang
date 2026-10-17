@@ -33,6 +33,11 @@ _NATIVE_LORA_A_SUFFIXES = (
 )
 
 
+def lora_rank(shape: Any) -> int:
+    """Rank from a LoRA A shape: (r, in), stacked (N, r, in) or conv (r, in, kh, kw)."""
+    return int(shape[-2] if len(shape) == 3 else shape[0])
+
+
 def _has_unambiguous_global_alpha(file: Any) -> bool:
     """Reject bare mixed-rank files whose global alpha semantics are ambiguous."""
     keys = list(file.keys())
@@ -45,7 +50,7 @@ def _has_unambiguous_global_alpha(file: Any) -> bool:
             continue
         shape = file.get_slice(name).get_shape()
         if len(shape) >= 2:
-            ranks.add(shape[-2])
+            ranks.add(lora_rank(shape))
     return len(ranks) == 1
 
 
@@ -228,6 +233,14 @@ def _validate_peft_features(
         )
 
 
+def _split_lora_key(name: str, kind: str) -> str | None:
+    """Module prefix of ``<prefix>.<kind>[.weight]``, or None for other keys."""
+    for suffix in (f".{kind}.weight", f".{kind}"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return None
+
+
 def apply_peft_config(
     state_dict: dict[str, torch.Tensor], config: Mapping[str, Any]
 ) -> dict[str, torch.Tensor]:
@@ -254,11 +267,10 @@ def apply_peft_config(
             )
         compiled_patterns.append((expression, alpha))
 
-    suffix = ".lora_A.weight"
     for name in state_dict:
-        if not name.endswith(suffix):
+        base = _split_lora_key(name, "lora_A")
+        if base is None:
             continue
-        base = name[: -len(suffix)]
         alpha = next(
             (alpha for pattern, alpha in compiled_patterns if pattern.match(base)), None
         )
@@ -267,7 +279,7 @@ def apply_peft_config(
         alpha_key = f"{base}.alpha"
         existing = normalized.get(alpha_key)
         if existing is not None and (
-            existing.numel() != 1 or int(existing.item()) != alpha
+            existing.numel() != 1 or float(existing.item()) != alpha
         ):
             raise ValueError(f"PEFT alpha_pattern conflicts with tensor {alpha_key!r}")
         normalized[alpha_key] = torch.tensor(alpha)
@@ -278,15 +290,17 @@ def apply_peft_config(
     if not use_rslora:
         return normalized
 
-    suffix = ".lora_B.weight"
     pairs = 0
     for name, weight in state_dict.items():
-        if not name.endswith(suffix):
+        base = _split_lora_key(name, "lora_B")
+        if base is None:
             continue
-        lora_a = state_dict.get(f"{name[: -len(suffix)]}.lora_A.weight")
-        if lora_a is None or lora_a.ndim < 2 or lora_a.shape[-2] <= 0:
+        lora_a = state_dict.get(f"{base}.lora_A.weight")
+        if lora_a is None:
+            lora_a = state_dict.get(f"{base}.lora_A")
+        if lora_a is None or lora_a.ndim < 2 or lora_rank(lora_a.shape) <= 0:
             raise ValueError(f"RSLoRA weight {name!r} has no valid rank-bearing A")
-        normalized[name] = weight * math.sqrt(lora_a.shape[-2])
+        normalized[name] = weight * math.sqrt(lora_rank(lora_a.shape))
         pairs += 1
     if not pairs:
         raise ValueError("PEFT use_rslora is true, but no LoRA A/B pairs were found")
@@ -304,7 +318,7 @@ def scale_fused_sections(
         return None
     scaled = []
     for index in range(len(a_parts)):
-        rank = a_parts[index].shape[0]
+        rank = lora_rank(a_parts[index].shape)
         alpha = float(
             alpha_parts[index].item()
             if index in alpha_parts
