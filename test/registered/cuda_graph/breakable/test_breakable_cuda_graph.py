@@ -71,6 +71,50 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
                 graph.replay()
                 self.assertEqual(result.tolist(), [[3, 3]] * n + [[0, 0]] * (8 - n))
 
+    def test_falcon_h1_mamba2_uses_live_lengths(self):
+        """Falcon-H1's Mamba2 mixer runs per replay on the live token count and
+        zeroes the padded rows, instead of replaying its capture-time launch."""
+        from sglang.srt.models import falcon_h1
+
+        metadata = SimpleNamespace(
+            num_prefill_tokens=8,
+            num_decodes=0,
+            draft_token_num=1,
+            is_target_verify=False,
+        )
+
+        def mixer_forward(mixer, hidden_states, output, **kwargs):
+            output[: hidden_states.shape[0]].copy_(hidden_states)
+
+        attn_backend = SimpleNamespace(
+            linear_attn_backend=SimpleNamespace(
+                forward_metadata=metadata, forward=mixer_forward
+            )
+        )
+        context = SimpleNamespace(forward_batch=None)
+        layer = SimpleNamespace(mamba=None, layer_id=0, mup_vector=None)
+        x = torch.zeros((8, 2), device=self.device)
+        output = torch.empty((8, 2), device=self.device)
+        graph = self.BreakableCUDAGraph()
+        with (
+            patch.object(
+                falcon_h1, "get_tc_piecewise_forward_context", return_value=context
+            ),
+            patch.object(falcon_h1, "get_attn_backend", return_value=attn_backend),
+        ):
+            with self.BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
+                falcon_h1._breakable_falcon_h1_mamba2_with_output(
+                    layer=layer, hidden_states=x + 1, output=output
+                )
+            for n in (3, 8):
+                metadata.num_prefill_tokens = n
+                x.fill_(2)
+                output.fill_(-1)
+                graph.replay()
+                self.assertEqual(
+                    output.tolist(), [[3.0, 3.0]] * n + [[0.0, 0.0]] * (8 - n)
+                )
+
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""
         x = torch.zeros(4, device=self.device)
