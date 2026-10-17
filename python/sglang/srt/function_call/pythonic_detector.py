@@ -129,7 +129,8 @@ class PythonicDetector(BaseFormatDetector):
     def _find_matching_bracket(self, buffer: str, start: int) -> int:
         """
         Find the matching closing bracket for the opening bracket at start position.
-        Properly handles nested brackets.
+        Ignore brackets inside Python string literals, including escaped quotes
+        and triple-quoted strings, while counting nested containers.
 
         Args:
             buffer: The text buffer to search in
@@ -138,14 +139,33 @@ class PythonicDetector(BaseFormatDetector):
         Returns:
             Position of the matching closing bracket ']', or -1 if not found
         """
+        # An apostrophe in ordinary bracketed prose (e.g. [O'Reilly]) is
+        # not a Python string opener. Only apply string rules to call lists.
+        is_call_list = re.match(r"\[[a-zA-Z]\w*\(", buffer[start:]) is not None
         bracket_count = 0
-        for i in range(start, len(buffer)):
-            if buffer[i] == "[":
+        quote = None
+        i = start
+        while i < len(buffer):
+            char = buffer[i]
+            if quote is not None:
+                if char == "\\":
+                    i += 2
+                    continue
+                if buffer.startswith(quote, i):
+                    i += len(quote)
+                    quote = None
+                    continue
+            elif is_call_list and char in ("'", '"'):
+                quote = char * 3 if buffer.startswith(char * 3, i) else char
+                i += len(quote)
+                continue
+            elif char == "[":
                 bracket_count += 1
-            elif buffer[i] == "]":
+            elif char == "]":
                 bracket_count -= 1
                 if bracket_count == 0:
                     return i
+            i += 1
         return -1  # No matching bracket found
 
     def _strip_and_split_buffer(self, buffer: str) -> tuple[str, str]:
@@ -185,40 +205,38 @@ class PythonicDetector(BaseFormatDetector):
         # Strip special tokens from entire buffer and handle partial tokens
         stripped_buffer, held_back = self._strip_and_split_buffer(self._buffer)
 
-        start = stripped_buffer.find("[")
+        normal_text = []
+        calls = []
+        position = 0
+        while position < len(stripped_buffer):
+            start = stripped_buffer.find("[", position)
+            if start == -1:
+                normal_text.append(stripped_buffer[position:])
+                position = len(stripped_buffer)
+                break
 
-        if start == -1:
-            # No tool call bracket found
-            self._buffer = held_back
-            return StreamingParseResult(normal_text=stripped_buffer)
+            normal_text.append(stripped_buffer[position:start])
+            end = self._find_matching_bracket(stripped_buffer, start)
+            if end == -1:
+                position = start
+                break
 
-        normal_text = stripped_buffer[:start] if start > 0 else ""
-
-        end = self._find_matching_bracket(stripped_buffer, start)
-        if end != -1:
-            # Found complete tool call
             call_text = stripped_buffer[start : end + 1]
             result = self.detect_and_parse(call_text, tools)
+            normal_text.append(result.normal_text)
+            for call in result.calls:
+                # detect_and_parse numbers calls within one list. Streaming
+                # indexes must remain unique across every list in the response.
+                self.current_tool_id += 1
+                call.tool_index = self.current_tool_id
+                calls.append(call)
+            position = end + 1
 
-            # Update buffer with remaining text after tool call plus any held back text
-            remaining_text = stripped_buffer[end + 1 :] + held_back
-            self._buffer = remaining_text
-
-            # If we had normal text before the tool call, add it to the result
-            if normal_text:
-                result.normal_text = normal_text + (result.normal_text or "")
-
-            return result
-
-        # We have an opening bracket but no closing bracket yet
-        # Put back everything from the bracket onwards plus held back text
-        self._buffer = stripped_buffer[start:] + held_back
-
-        if normal_text:
-            return StreamingParseResult(normal_text=normal_text)
-
-        # Otherwise, we're still accumulating a potential tool call
-        return StreamingParseResult(normal_text="")
+        # Only incomplete calls or special-token prefixes need another chunk.
+        # Drain complete calls and trailing text now: a final chunk may contain
+        # more than one call, and the serving layer need not invoke us again.
+        self._buffer = stripped_buffer[position:] + held_back
+        return StreamingParseResult(normal_text="".join(normal_text), calls=calls)
 
     def _get_parameter_value(self, val):
         if isinstance(val, ast.Constant):
