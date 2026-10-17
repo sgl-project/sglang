@@ -374,6 +374,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     incompatible = (
+        # Every row's hidden state is read, so every tail would be the whole
+        # extend; the DP prefill-graph vote also sees per-request readers only.
+        ("--enable-return-hidden-states", cfg.enable_return_hidden_states),
         (
             "the prefill CUDA graph",
             cfg.cuda_graph_config.prefill.backend

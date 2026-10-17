@@ -300,6 +300,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _use_draft_input_embeds = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
+    # Decoder SWA bounded replay's late-layer tail check, for the DP vote.
+    _backend_fits_late_tail = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
 
@@ -325,6 +327,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.dllm_attention is not None
             else getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
         )
+        if getattr(
+            model_runner.attn_backend, "enable_decoder_swa_bounded_replay", False
+        ):
+            self._backend_fits_late_tail = getattr(
+                model_runner.attn_backend, "prefill_graph_fits_late_tail", None
+            )
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
         )
