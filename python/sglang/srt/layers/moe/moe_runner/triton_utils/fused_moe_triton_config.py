@@ -10,10 +10,77 @@ import torch
 import triton
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_device_name, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_is_gfx95 = _is_hip and is_gfx95_supported()
+
+# gfx950 fp8_w8a8 (per-channel / per-tensor) default tiles, keyed on routed rows per
+# expert, M * topk / E. BLOCK_SIZE_M is also the moe_align_block_size alignment:
+# every touched expert is padded to a whole block, and padded blocks still run the
+# full K loop, so the tile has to follow rows per expert rather than M alone.
+# BLOCK_SIZE_K stays 128, as in the branches these replace, so the K reduction
+# order and the results are unchanged.
+_GFX95_FP8_MOE_TILES: Tuple[Tuple[int, Dict[str, int]], ...] = (
+    (
+        48,
+        {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 2,
+        },
+    ),
+    (
+        24,
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        },
+    ),
+    (
+        8,
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        },
+    ),
+    (
+        0,
+        {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        },
+    ),
+)
+
+
+def _gfx95_fp8_moe_default_config(M: int, E: int, topk: int) -> Dict[str, int]:
+    rows_per_expert = M * topk / E
+    return dict(
+        next(
+            config
+            for min_rows_per_expert, config in _GFX95_FP8_MOE_TILES
+            if rows_per_expert >= min_rows_per_expert
+        )
+    )
+
+
 _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES = 128 * 1024
 
 
@@ -215,6 +282,8 @@ def get_default_config(
                         "num_warps": 4,
                         "num_stages": 2,
                     }
+            elif _is_gfx95:
+                config = _gfx95_fp8_moe_default_config(M, E, topk)
             else:
                 config = {
                     "BLOCK_SIZE_M": 128,
