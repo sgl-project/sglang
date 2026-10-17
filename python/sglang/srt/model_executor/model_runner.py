@@ -721,9 +721,7 @@ class ModelRunner:
         self.maybe_init_expert_backup_client()
         # drafts publish once the spec worker binds the target's embed and head (Scheduler.init_memory_pools)
         if not self.is_draft_worker:
-            self.remote_instance_weight_transporter.publish_rank_info(
-                role="target"
-            )
+            self.remote_instance_weight_transporter.publish_rank_info(role="target")
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
