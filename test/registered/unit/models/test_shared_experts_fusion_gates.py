@@ -733,32 +733,18 @@ class TestBailingMoeV3Gate(_FusionGateCase):
 
         self.assertIn("different quant methods", reason)
 
-    def test_nextn_constructor_calls_v3_fusion_setup(self):
-        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+    def test_nextn_fuses_the_v3_count_only_for_a_v3_checkpoint(self):
+        # The NextN entry class builds Ling-V3 layers that read the fused count
+        # for a V3 checkpoint, and V2.5 layers that never fuse otherwise.
+        _, bailing_moe_nextn = _import_bailing_modules()
+        nextn = bailing_moe_nextn.BailingMoeForCausalLMNextN
 
         config = SimpleNamespace(
-            architectures=["BailingMoeForCausalLMNextN"],
-            model_type="bailing_hybrid",
-            use_kda=True,
-            num_shared_experts=1,
-            vocab_size=32000,
-            hidden_size=4096,
+            model_type="bailing_hybrid", use_kda=True, num_shared_experts=1
         )
-        self._seed(enable_dp_lm_head=False)
-        with (
-            get_parallel().override(tp_size=1, moe_ep_size=1),
-            unittest.mock.patch.object(
-                bailing_moe_v3,
-                "is_shared_experts_fusion_disabled",
-                return_value=False,
-            ),
-            unittest.mock.patch.object(bailing_moe_nextn, "BailingMoEModelNextN"),
-            unittest.mock.patch.object(bailing_moe_nextn, "ParallelLMHead"),
-            unittest.mock.patch.object(bailing_moe_nextn, "LogitsProcessor"),
-        ):
-            model = bailing_moe_nextn.BailingMoeForCausalLMNextN(config)
-
-        self.assertEqual(model.num_fused_shared_experts, 1)
+        self.assertEqual(nextn.num_fusable_shared_experts(config), 1)
+        config.use_kda = False
+        self.assertEqual(nextn.num_fusable_shared_experts(config), 0)
 
 
 class TestQwen3_5Gate(_FusionGateCase):

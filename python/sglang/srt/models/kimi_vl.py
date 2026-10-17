@@ -129,6 +129,14 @@ class KimiVLForConditionalGeneration(nn.Module):
             _language_model_config(hf_config), quant_config
         )
 
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        if hf_config.encoder_only:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(
+            _language_model_config(hf_config)
+        )
+
     def __init__(
         self,
         config: KimiVLConfig,

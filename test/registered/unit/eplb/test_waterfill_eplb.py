@@ -16,7 +16,7 @@ from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -144,7 +144,7 @@ class TestWaterfillEPLB(CustomTestCase):
     def test_the_shared_expert_column_has_exactly_one_writer(self):
         """A fused shared expert's top-k column is written by the router, or appended
         by Waterfill after routing; never both (the shared expert would run twice)
-        and never neither (it would be dropped). A layer without fused shared
+        and never neither (it would be dropped). A model without fused shared
         experts gets no Waterfill even when Waterfill is enabled."""
         for enable_waterfill in (False, True):
             exec_config = SimpleNamespace(
@@ -154,15 +154,13 @@ class TestWaterfillEPLB(CustomTestCase):
                 self.subTest(enable_waterfill=enable_waterfill),
                 patch.object(moe_utils, "get_exec", return_value=exec_config),
             ):
-                topk = TopK(top_k=9, layer_id=0, num_fused_shared_experts=1)
-                hash_topk = HashTopK(
-                    topk=9,
-                    num_experts=256,
-                    num_fused_shared_experts=1,
-                    vocab_size=4,
-                    layer_id=0,
-                )
-                unfused_topk = TopK(top_k=8, layer_id=0)
+                with get_flags().moe.override(num_fused_shared_experts=1):
+                    topk = TopK(top_k=8, layer_id=0)
+                    hash_topk = HashTopK(
+                        topk=8, num_experts=256, vocab_size=4, layer_id=0
+                    )
+                with get_flags().moe.override(num_fused_shared_experts=0):
+                    unfused_topk = TopK(top_k=8, layer_id=0)
 
                 for layer, router_top_k, router_shared_columns in (
                     (

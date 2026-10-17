@@ -1,10 +1,10 @@
 """A draft's construction decides for itself and leaves the process state alone.
 
-The shared-experts-fusion decision is per checkpoint: each MoE model's gate
-writes the ACTIVE moe flag (both ways) before its own layers build and read
-it, and ``draft_model_build_scope`` — which brackets every draft
-construction — records it on the speculative leaf and restores the target's
-value on exit. The config bag keeps the
+The shared-experts-fusion decision and its fused count are per checkpoint: the
+loader writes the ACTIVE moe flags before a model's layers build and read
+them, and ``draft_model_build_scope`` — which brackets every draft
+construction — records them on the speculative leaves and restores the
+target's values on exit. The config bag keeps the
 user's intent. A draft's weight update does not rewrite the
 process's model_path record.
 """
@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
+    get_num_fused_shared_experts,
     install_shared_experts_fusion_decision,
     is_shared_experts_fusion_disabled,
     speculative_moe_backend_context,
@@ -38,6 +39,30 @@ class _NoGate:
     """A model family without an auto-disable gate: it follows the intent."""
 
 
+class _FusesOne:
+    """A family that fuses one shared expert as a routed slot unless vetoed."""
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        return None
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config):
+        return 1
+
+
+class _AlwaysDisablesButCountsOne(_FusesOne):
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        return "stand-in: this checkpoint cannot fuse."
+
+
+class _CountsOneWithoutGate:
+    @staticmethod
+    def num_fusable_shared_experts(hf_config):
+        return 1
+
+
 def _install(model_class):
     install_shared_experts_fusion_decision(model_class, SimpleNamespace(), None)
 
@@ -49,9 +74,13 @@ class TestFusionDecisionFlag(CustomTestCase):
         self._saved = (
             moe.disable_shared_experts_fusion,
             moe.speculative_disable_shared_experts_fusion,
+            moe.num_fused_shared_experts,
+            moe.speculative_num_fused_shared_experts,
         )
         moe.disable_shared_experts_fusion = None
         moe.speculative_disable_shared_experts_fusion = None
+        moe.num_fused_shared_experts = None
+        moe.speculative_num_fused_shared_experts = None
         moe.in_speculative_scope = False
 
     def tearDown(self):
@@ -59,6 +88,8 @@ class TestFusionDecisionFlag(CustomTestCase):
         (
             moe.disable_shared_experts_fusion,
             moe.speculative_disable_shared_experts_fusion,
+            moe.num_fused_shared_experts,
+            moe.speculative_num_fused_shared_experts,
         ) = self._saved
         super().tearDown()
 
@@ -97,6 +128,27 @@ class TestFusionDecisionFlag(CustomTestCase):
         self.assertFalse(is_shared_experts_fusion_disabled())
         # The draft's decision stays inspectable on the twin leaf.
         self.assertTrue(get_flags().moe.speculative_disable_shared_experts_fusion)
+
+    def test_the_draft_build_scope_restores_the_targets_fused_count(self):
+        # Every TopK and MoE block reads the count while it builds, so a draft
+        # that fuses differently must not leave its count to the target.
+        self._seed(disable_shared_experts_fusion=False)
+        _install(_FusesOne)  # the target's build
+        with draft_model_build_scope():
+            _install(_AlwaysDisablesButCountsOne)  # the draft's build
+            self.assertEqual(get_num_fused_shared_experts(), 0)
+        self.assertEqual(get_num_fused_shared_experts(), 1)
+        self.assertEqual(get_flags().moe.speculative_num_fused_shared_experts, 0)
+
+    def test_fusing_needs_both_the_gate_and_the_count(self):
+        # An entry class that misses either hook (a wrapper or draft class
+        # that forgot to delegate) runs its shared experts unfused, instead of
+        # fusing by the intent without its family's conditions.
+        self._seed(disable_shared_experts_fusion=False)
+        for model_class in (_NoGate, _CountsOneWithoutGate):
+            with self.subTest(model_class=model_class.__name__):
+                _install(model_class)
+                self.assertEqual(get_num_fused_shared_experts(), 0)
 
     def test_a_gateless_draft_inherits_the_active_decision(self):
         self._seed(disable_shared_experts_fusion=False)
@@ -167,6 +219,8 @@ class TestFusionDecisionFlag(CustomTestCase):
         with forward_context(ForwardContext(attn_backend=SimpleNamespace())):
             with self.assertRaises(AssertionError):
                 is_shared_experts_fusion_disabled()
+            with self.assertRaises(AssertionError):
+                get_num_fused_shared_experts()
 
     def test_the_intent_stays_on_the_bag(self):
         self._seed(disable_shared_experts_fusion=False)
