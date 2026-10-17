@@ -24,7 +24,10 @@ from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
-from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    PLAIN_ADD,
+    norm_quant_kernel,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -115,23 +118,42 @@ class AttnBankState:
             write=write,
         )
 
-    def read_attn_input(self, residual, norm):
+    def read_attn_input(self, residual, norm, quant_format=""):
         # No pending add: the residual alone is the head (the stack's input,
         # or the residual of a stream that was written).
-        return self._attn_aggregate(residual, None, norm)
+        return self._attn_aggregate(
+            contribution=residual, residual=None, norm=norm, quant_format=quant_format
+        )
 
-    def update_and_read_attn_input(self, contribution, residual, norm):
-        return self._attn_aggregate(contribution, residual, norm)
+    def update_and_read_attn_input(self, contribution, residual, norm, quant_format=""):
+        return self._attn_aggregate(
+            contribution=contribution,
+            residual=residual,
+            norm=norm,
+            quant_format=quant_format,
+        )
 
-    def _attn_aggregate(self, contribution, residual, norm):
+    def _attn_aggregate(self, *, contribution, residual, norm, quant_format):
+        # A quantized read aggregates without the norm, then runs the norm fused
+        # with that format's quantization; where it cannot, it reads plainly.
+        quantize = (
+            bool(quant_format)
+            and contribution.shape[0] > 0
+            and not self.reads_slices
+            and self.bank.require().aggregates_unnormed(contribution.shape[-1])
+        )
         normed, residual = self._aggregate(
             contribution,
             residual,
-            norm,
+            None if quantize else norm,
             score_proj=self.attn_score_proj,
             score_norm=self.attn_score_norm,
             write=self.writes_block,
         )
+        if quantize:
+            normed, _ = norm_quant_kernel(quant_format)(
+                norm, normed, residual=None, post_residual_addition=None
+            )
         return normed, None if self.writes_block else residual
 
     def update_and_read_ffn_input(self, contribution, residual, norm):
@@ -214,6 +236,7 @@ class _BankReadout:
 
     is_plain_norm = False
     reads_before_dp_gather = True
+    reads_quantized = False
     completing_fusions = ()
     gathering_reads = ()
 
@@ -224,7 +247,7 @@ class _BankReadout:
         return hidden_states
 
     def _reject(self, update, quant_format):
-        if quant_format:
+        if quant_format and not self.reads_quantized:
             raise NotImplementedError(
                 f"an attention-residual bank read in {quant_format=}"
             )
@@ -239,7 +262,11 @@ class _BankReadout:
 class _AttnReadout(_BankReadout):
     """The attention input: the bank aggregation and this layer's input norm.
     A write layer snapshots the residual this read forms. ``read`` rejects a
-    ``post_residual_addition``; ``update_and_read`` does not apply one."""
+    ``post_residual_addition``; ``update_and_read`` does not apply one. A
+    ``quant_format`` read fuses the norm with that quantization where the
+    aggregation can leave the norm out, and reads plainly elsewhere."""
+
+    reads_quantized = True
 
     @property
     def reads_after_attn_tp_gather(self):
@@ -258,11 +285,14 @@ class _AttnReadout(_BankReadout):
             raise NotImplementedError(
                 "an attention-residual bank read with a separate addition"
             )
-        return self.state.read_attn_input(residual, norm)
+        return self.state.read_attn_input(residual, norm, quant_format)
 
     def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
-        self._reject(update, kwargs.get("quant_format", ""))
-        return self.state.update_and_read_attn_input(hidden_states, residual, norm)
+        quant_format = kwargs.get("quant_format", "")
+        self._reject(update, quant_format)
+        return self.state.update_and_read_attn_input(
+            hidden_states, residual, norm, quant_format
+        )
 
 
 class _FfnReadout(_BankReadout):

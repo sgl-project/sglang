@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+import unittest.mock
 
 import torch
 
@@ -153,6 +154,43 @@ class TestShouldIgnoreLayerFusedNames(CustomTestCase):
                 ignore=ignore,
                 fused_mapping=QKV_MAPPING,
             )
+        )
+
+
+class TestQuarkMXFP4Densify(CustomTestCase):
+    """A linear densified before the loader's post-processing must keep its BF16
+    weight: the second pass would otherwise decode the BF16 bytes as MXFP4."""
+
+    def test_post_processing_after_densify_is_a_no_op(self):
+        from sglang.srt.layers.quantization.quark.schemes import (
+            quark_w4a4_mxfp4 as mxfp4,
+        )
+
+        QuarkW4A4MXFP4 = mxfp4.QuarkW4A4MXFP4
+
+        scheme = QuarkW4A4MXFP4.__new__(QuarkW4A4MXFP4)
+        scheme.is_checkpoint_mxfp4_serialized = True
+        layer = torch.nn.Module()
+        # Codes 0x22 decode to 1.0 per nibble; scale byte 127 is 2^0.
+        layer.weight = torch.nn.Parameter(
+            torch.full((2, 16), 0x22, dtype=torch.uint8), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.full((2, 1), 127, dtype=torch.uint8), requires_grad=False
+        )
+        layer.dequantized_bf16 = False
+
+        scheme.dequantize_to_bf16(layer)
+        densified = layer.weight.detach().clone()
+        # The loader pass re-dequantizes whenever MXFP4 linears run in BF16.
+        with unittest.mock.patch.object(mxfp4, "_dequant_linear_to_bf16", True):
+            scheme.process_weights_after_loading(layer)
+
+        self.assertTrue(layer.dequantized_bf16)
+        self.assertIsNone(layer.weight_scale)
+        torch.testing.assert_close(layer.weight, densified)
+        torch.testing.assert_close(
+            layer.weight, torch.ones(2, 32, dtype=torch.bfloat16)
         )
 
 
