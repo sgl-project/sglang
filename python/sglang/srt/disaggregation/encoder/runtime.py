@@ -1301,7 +1301,9 @@ async def execute_encode_pipeline(
         raise
     except asyncio.TimeoutError:
         error_msg = "encoder batch timed out"
-        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        time_stats.trace_ctx.abort(
+            abort_info={"reason": error_msg, "status_code": HTTPStatus.GATEWAY_TIMEOUT}
+        )
         error_published = await _publish_pipeline_error(req_id, error_msg)
         await _release_failed_request(
             enc,
@@ -1312,7 +1314,16 @@ async def execute_encode_pipeline(
         raise
     except Exception as e:
         error_msg = str(e)
-        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_msg,
+                "status_code": (
+                    e.code
+                    if isinstance(e, MMError)
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                ),
+            }
+        )
         error_published = await _publish_pipeline_error(req_id, error_msg)
         await _release_failed_request(
             enc,
@@ -1324,7 +1335,12 @@ async def execute_encode_pipeline(
 
     nbytes, embedding_len, embedding_dim, error_msg, error_code = result
     if error_msg:
-        time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_msg,
+                "status_code": error_code or HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         error_published = await _publish_pipeline_error(req_id, error_msg)
         if backend == "mooncake":
             await _release_failed_request(
@@ -1368,7 +1384,12 @@ async def execute_encode_pipeline(
             await _push_embedding_to_prefill(enc, request)
             content = None
     except Exception as e:
-        time_stats.trace_ctx.abort(abort_info={"reason": str(e)})
+        time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": str(e),
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         await enc.release_request(req_id)
         _record_pipeline_result(modality, "error")
         raise
