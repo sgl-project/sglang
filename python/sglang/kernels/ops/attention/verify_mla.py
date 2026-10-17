@@ -64,7 +64,7 @@ def _verify_mla_prefix_stage1(
     qo_indptr,
     kv_indptr,
     kv_indices,
-    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] bf16
+    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] fp32
     Att_Lse,  # [BS, H_Q, MAX_N_SPLITS, L_EXT]     fp32
     num_splits,  # launched split count
     stride_qbs,
@@ -415,10 +415,10 @@ class VerifyMLA:
 
     def _alloc(self, max_bs):
         self.max_bs = max_bs
-        # bf16 partials (halves scratch traffic vs fp32); lse stays fp32.
+        # Preserve cancellation residuals until the final prefix/draft merge.
         self.att_out = torch.empty(
             (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad, self.v_head_dim),
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             device=self.device,
         )
         self.att_lse = torch.empty(
