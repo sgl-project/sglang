@@ -71,19 +71,40 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertTrue(is_multimodal_model(["NemotronH_Omni_Reasoning_V3"]))
 
     def test_qwen35_mtp_depth_is_synced_to_text_config(self):
+        target_text_config = SimpleNamespace(
+            num_attention_heads=8,
+            num_hidden_layers=8,
+            layer_types=["linear_attention"] * 6 + ["full_attention"] * 2,
+            full_attention_interval=4,
+        )
+        target_config = SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            text_config=target_text_config,
+        )
         config = object.__new__(ModelConfig)
         config.is_draft_model = True
         config.speculative_algorithm = "EAGLE"
-        config.hf_config = SimpleNamespace(
-            architectures=["Qwen3_5MoeForConditionalGeneration"]
-        )
-        config.hf_text_config = SimpleNamespace()
+        config.hf_config = target_config
+        config.hf_text_config = target_text_config
 
         config._config_draft_model()
 
         self.assertEqual(config.hf_config.architectures, ["Qwen3_5ForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
+        self.assertEqual(config.hf_text_config.num_hidden_layers, 1)
+        self.assertEqual(config.hf_text_config.layer_types, ["full_attention"])
+        self.assertEqual(config.hf_text_config.full_attention_interval, 1)
+        self.assertIsNot(config.hf_config, target_config)
+        self.assertIsNot(config.hf_text_config, target_text_config)
+        self.assertEqual(
+            target_config.architectures, ["Qwen3_5MoeForConditionalGeneration"]
+        )
+        self.assertEqual(target_text_config.num_hidden_layers, 8)
+        self.assertEqual(
+            target_text_config.layer_types,
+            ["linear_attention"] * 6 + ["full_attention"] * 2,
+        )
 
     def test_nemotron_h_omni_mtp_uses_language_model_config(self):
         config = object.__new__(ModelConfig)

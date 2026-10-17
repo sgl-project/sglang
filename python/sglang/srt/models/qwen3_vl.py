@@ -111,6 +111,22 @@ logger = logging.getLogger(__name__)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
+
+def _vision_quant_config(quant_config: Optional[QuantizationConfig]):
+    """Opt the vision tower in only when checkpoint metadata lists it."""
+    if quant_config is None:
+        return None
+    if getattr(quant_config, "get_name", lambda: None)() not in {
+        "modelopt_fp4",
+        "modelopt_mixed",
+    }:
+        return None
+    layers = getattr(quant_config, "quantized_layers", None) or {}
+    if not any(key.startswith(("model.visual.", "visual.")) for key in layers):
+        return None
+    return quant_config
+
+
 # Below this image count the per-image loop beats the vectorized path (which has a
 # fixed setup cost; measured crossover ~6 on H20); both give the same result.
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
@@ -1331,9 +1347,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
-                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-                quant_config=None,
+                quant_config=_vision_quant_config(quant_config),
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,

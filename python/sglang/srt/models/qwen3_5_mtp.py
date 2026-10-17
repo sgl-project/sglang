@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -54,18 +55,26 @@ def _mtp_quant_config(quant_config):
     quantized; the loader's fusion gate has to see the same normalization the
     constructor applies, or it would answer for the target's quantization.
     """
-    # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
-    # BF16. Disable quantization for those checkpoints; non-serialized
-    # modelopt_fp4 still converts MoE expert weights on load.
+    # ModelOpt checkpoints often keep embedded MTP weights in BF16. Only
+    # explicit per-layer metadata opts serialized MTP weights into quantization;
+    # non-serialized modelopt_fp4 still converts MoE expert weights on load.
     if quant_config and quant_config.get_name() == "modelopt_mixed":
         # MIXED_PRECISION lists mtp.* layers only when the MTP head is quantized.
-        if any(name.startswith("mtp.") for name in quant_config.quantized_layers):
+        if any(
+            name.startswith("mtp.")
+            for name in getattr(quant_config, "quantized_layers", {})
+        ):
             return quant_config
         return None
     if quant_config and (
         quant_config.get_name() == "modelopt_fp4"
         and quant_config.is_checkpoint_nvfp4_serialized
     ):
+        if any(
+            name.startswith("mtp.")
+            for name in getattr(quant_config, "quantized_layers", {})
+        ):
+            return quant_config
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
@@ -126,7 +135,20 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        if quant_config and quant_config.get_name() in {
+            "modelopt_fp4",
+            "modelopt_mixed",
+        }:
+            self.fc = ReplicatedLinear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("mtp.fc", prefix),
+            )
+        else:
+            self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self._fc_returns_tuple = isinstance(self.fc, ReplicatedLinear)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -134,6 +156,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
         mtp_config = copy.deepcopy(config)
         mtp_config.num_hidden_layers = 1
+        mtp_config.layer_types = ["full_attention"]
         mtp_config.full_attention_interval = 1
         self.model = Qwen3_5ForCausalLM(
             mtp_config,
@@ -243,6 +266,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)
+            if self._fc_returns_tuple:
+                hidden_states, _ = hidden_states
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(

@@ -1,17 +1,26 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+)
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,6 +28,294 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestModelOptNvfp4(CustomTestCase):
+    def _check_visual_alias_mapping(self, *, excluded):
+        mapper = Qwen3VLForConditionalGeneration.hf_to_sglang_mapper
+        original_mappings = (
+            dict(mapper.orig_to_new_substr),
+            dict(mapper.orig_to_new_prefix),
+            dict(mapper.orig_to_new_suffix),
+        )
+        runtime_prefix = "model.visual.blocks.0.attn.qkv_proj"
+        mapped_prefix = "visual.blocks.0.attn.qkv_proj"
+        for config_cls, quant_algo in (
+            (ModelOptFp4Config, "NVFP4"),
+            (ModelOptMixedPrecisionConfig, "MIXED_PRECISION"),
+        ):
+            for visual_prefix in ("model.visual", "visual"):
+                for projection in ("qkv", "qkv_proj"):
+                    with self.subTest(
+                        config=config_cls.__name__,
+                        visual_prefix=visual_prefix,
+                        projection=projection,
+                    ):
+                        source_prefix = f"{visual_prefix}.blocks.0.attn.{projection}"
+                        layer_info = {"quant_algo": "NVFP4", "group_size": 16}
+                        cfg = config_cls.from_config(
+                            {
+                                "quant_algo": quant_algo,
+                                "group_size": 16,
+                                "ignore": [source_prefix] if excluded else [],
+                                "packed_modules_mapping": {},
+                                "quantized_layers": {source_prefix: layer_info},
+                            }
+                        )
+                        cfg.apply_weight_name_mapper(mapper)
+                        self.assertEqual(
+                            cfg.quantized_layers, {mapped_prefix: layer_info}
+                        )
+                        self.assertEqual(
+                            cfg.exclude_modules, [mapped_prefix] if excluded else []
+                        )
+                        self.assertEqual(
+                            cfg.is_layer_excluded(runtime_prefix), excluded
+                        )
+                        if isinstance(cfg, ModelOptMixedPrecisionConfig):
+                            self.assertEqual(
+                                cfg.resolve_quant_algo(runtime_prefix), "NVFP4"
+                            )
+                        layer = ReplicatedLinear(
+                            16,
+                            16,
+                            bias=False,
+                            params_dtype=torch.bfloat16,
+                            quant_config=cfg,
+                            prefix=runtime_prefix,
+                        )
+                        self.assertIsInstance(
+                            layer.quant_method,
+                            UnquantizedLinearMethod
+                            if excluded
+                            else ModelOptFp4LinearMethod,
+                        )
+                        self.assertEqual(
+                            layer.weight.dtype,
+                            torch.bfloat16 if excluded else torch.uint8,
+                        )
+                        self.assertEqual(
+                            layer.weight.shape, (16, 16 if excluded else 8)
+                        )
+                        self.assertEqual(
+                            original_mappings,
+                            (
+                                mapper.orig_to_new_substr,
+                                mapper.orig_to_new_prefix,
+                                mapper.orig_to_new_suffix,
+                            ),
+                        )
+
+    def test_visual_metadata_mapping_preserves_checkpoint_and_runtime_aliases(self):
+        self._check_visual_alias_mapping(excluded=False)
+
+    def test_visual_exclusion_mapping_preserves_checkpoint_and_runtime_aliases(self):
+        self._check_visual_alias_mapping(excluded=True)
+
+    def test_serialized_fp4_preserves_flat_and_nested_layer_metadata(self):
+        layer_map = {"model.visual.blocks.0.mlp.linear_fc1": {"quant_algo": "NVFP4"}}
+        for config in (
+            {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "ignore": [],
+                "quantized_layers": layer_map,
+            },
+            {
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "exclude_modules": [],
+                    "quantized_layers": layer_map,
+                }
+            },
+        ):
+            parsed = ModelOptFp4Config.from_config(config)
+            self.assertEqual(parsed.quantized_layers, layer_map)
+
+    def test_visual_exclusions_match_checkpoint_and_runtime_qkv_names(self):
+        cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["visual.blocks.0.attn.qkv"],
+        )
+        self.assertTrue(cfg.is_layer_excluded("model.visual.blocks.0.attn.qkv_proj"))
+
+    def test_uniform_fp4_partial_auxiliary_map_keeps_unlisted_layers_bf16(self):
+        cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            packed_modules_mapping={},
+            quantized_layers={
+                "model.visual.blocks.0.mlp.linear_fc1": {"quant_algo": "NVFP4"},
+                "mtp.fc": {"quant_algo": "NVFP4"},
+            },
+        )
+        for prefix, quantized in (
+            ("visual.blocks.0.mlp.linear_fc1", True),
+            ("model.visual.blocks.0.mlp.linear_fc2", False),
+            ("mtp.fc", True),
+            ("mtp.layers.0.self_attn.o_proj", False),
+            ("model.layers.0.self_attn.o_proj", True),
+        ):
+            with self.subTest(prefix=prefix):
+                layer = ReplicatedLinear(
+                    16,
+                    16,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=cfg,
+                    prefix=prefix,
+                )
+                self.assertIsInstance(
+                    layer.quant_method,
+                    ModelOptFp4LinearMethod if quantized else UnquantizedLinearMethod,
+                )
+                self.assertEqual(
+                    layer.weight.dtype, torch.uint8 if quantized else torch.bfloat16
+                )
+                self.assertEqual(layer.weight.shape, (16, 8 if quantized else 16))
+
+    def test_uniform_fp4_auxiliary_exclusion_overrides_layer_map(self):
+        cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            packed_modules_mapping={},
+            exclude_modules=["visual.blocks.0.attn.qkv"],
+            quantized_layers={
+                "model.visual.blocks.0.attn.qkv": {"quant_algo": "NVFP4"}
+            },
+        )
+        layer = ReplicatedLinear(
+            16,
+            16,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=cfg,
+            prefix="model.visual.blocks.0.attn.qkv_proj",
+        )
+        self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+        self.assertEqual(layer.weight.dtype, torch.bfloat16)
+        self.assertEqual(layer.weight.shape, (16, 16))
+
+    def test_uniform_fp4_auxiliary_fused_shards_require_complete_metadata(self):
+        prefix = "mtp.layers.0.self_attn"
+        for shards, quantized in (((), False), (("q", "k", "v"), True)):
+            cfg = ModelOptFp4Config(
+                is_checkpoint_nvfp4_serialized=True,
+                group_size=16,
+                packed_modules_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+                quantized_layers={
+                    "mtp.fc": {"quant_algo": "NVFP4"},
+                    **{
+                        f"{prefix}.{shard}_proj": {"quant_algo": "NVFP4"}
+                        for shard in shards
+                    },
+                },
+            )
+            layer = ReplicatedLinear(
+                16,
+                16,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=cfg,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.assertIsInstance(
+                layer.quant_method,
+                ModelOptFp4LinearMethod if quantized else UnquantizedLinearMethod,
+            )
+
+        cfg.quantized_layers.pop(f"{prefix}.v_proj")
+        with self.assertRaisesRegex(ValueError, "Partial quantized_layers metadata"):
+            ReplicatedLinear(
+                16, 16, bias=False, quant_config=cfg, prefix=f"{prefix}.qkv_proj"
+            )
+
+    def test_uniform_fp4_auxiliary_moe_rejects_per_expert_metadata(self):
+        """One expert projection cannot opt unlisted fused expert buffers into FP4."""
+        # Only the config dispatch is needed; runtime/communication setup is
+        # outside this test's boundary.
+        layer = object.__new__(FusedMoE)
+        nn.Module.__init__(layer)
+        prefix = "mtp.layers.0.mlp.experts"
+        cfg = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            packed_modules_mapping={},
+            quantized_layers={f"{prefix}.0.gate_proj": {"quant_algo": "NVFP4"}},
+        )
+        with self.assertRaisesRegex(ValueError, "Per-expert quantized_layers metadata"):
+            cfg.get_quant_method(layer, prefix)
+
+        # A descendant exclusion must not bypass the whitelist and quantize
+        # the entire otherwise-unlisted MoE.
+        cfg.quantized_layers = {"mtp.fc": {"quant_algo": "NVFP4"}}
+        cfg.exclude_modules = [f"{prefix}.0.gate_proj"]
+        self.assertIsNone(cfg.get_quant_method(layer, prefix))
+
+    def test_mixed_precision_resolves_visual_aliases(self):
+        self.assertEqual(
+            ModelOptMixedPrecisionConfig.from_config(
+                {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.visual.blocks.0.attn.qkv": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        }
+                    },
+                }
+            ).resolve_quant_algo("visual.blocks.0.attn.qkv_proj"),
+            "NVFP4",
+        )
+
+    def test_w4a4_restores_noncontiguous_vision_activation_shape(self):
+        """Vision rows retain their order when the matrix kernel flattens them."""
+        method = object.__new__(ModelOptFp4LinearMethod)
+        method.quant_mode = "w4a4"
+        method.quant_config = SimpleNamespace(is_awq=False)
+        layer = SimpleNamespace(
+            weight=torch.zeros(4, 8, dtype=torch.uint8),
+            weight_scale_interleaved=torch.zeros(4, 1, dtype=torch.float8_e4m3fn),
+            alpha=torch.ones(1, dtype=torch.float32),
+            input_scale_inv=torch.ones(1),
+            output_size_per_partition=4,
+        )
+        x = torch.arange(96, dtype=torch.float32).reshape(2, 3, 16).transpose(0, 1)
+        bias = torch.arange(4, dtype=torch.float32)
+        matrix_inputs = []
+
+        def quantize(matrix, scale):
+            self.assertEqual(matrix.ndim, 2)
+            matrix_inputs.append(matrix)
+            return (
+                torch.zeros(matrix.shape[0], 8, dtype=torch.uint8),
+                torch.zeros(matrix.shape[0], 1, dtype=torch.float8_e4m3fn),
+            )
+
+        # Replace only accelerator kernels; the production apply path performs
+        # flattening, output slicing, bias addition and shape restoration.
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_fp4_gemm_runner_backend",
+                return_value=SimpleNamespace(is_marlin=lambda: False),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_quantize",
+                side_effect=quantize,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_gemm",
+                side_effect=lambda *args: matrix_inputs[-1][:, :4].clone(),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.enable_flashinfer_fp4_gemm",
+                False,
+            ),
+        ):
+            output = method.apply(layer, x, bias)
+
+        torch.testing.assert_close(output, x[..., :4] + bias)
+        self.assertEqual(output.shape, (3, 2, 4))
+
     def test_only_interleaving_backends_support_the_fusion(self):
         for backend, expected in (
             (Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL, True),
