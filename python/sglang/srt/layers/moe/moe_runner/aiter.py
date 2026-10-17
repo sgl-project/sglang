@@ -205,6 +205,29 @@ class AiterRunnerCore(MoeRunnerCore):
             if runner_input.a1_scale is not None
             else quant_info.a13_scale
         )
+        hidden_states = runner_input.hidden_states
+        # Token-order MXFP4 published by the HIP radix launch. Only the
+        # prequant GEMM consumes it; block_m 16 f16in keeps the bf16 row.
+        from sglang.srt.layers.moe import route_quant_handoff
+
+        use_hip_prequant = False
+        inter_dim, num_experts = route_quant_handoff.staged_moe_shape()
+        hip_q = None
+        if hidden_states.shape[-1] == 3584 and route_quant_handoff.hip_prequant_bucket(
+            hidden_states.shape[0], inter_dim, num_experts
+        ):
+            hip_q = route_quant_handoff.take_hip_mxfp4(hidden_states)
+        if hip_q is not None:
+            from aiter import dtypes
+
+            fp4_u8, scale_u8 = hip_q
+            hidden_states = fp4_u8.view(dtypes.fp4x2)
+            a1_scale = scale_u8.view(dtypes.fp8_e8m0)
+            use_hip_prequant = True
+            # fused_moe uses hidden_states.dtype as the output dtype when dtype
+            # is omitted. This row is fp4x2; the MoE result is bf16.
+            if runner_input.output_dtype is None:
+                runner_input.output_dtype = torch.bfloat16
 
         is_gfx95 = is_gfx95_supported()
         extra: dict = {}
@@ -257,13 +280,18 @@ class AiterRunnerCore(MoeRunnerCore):
         extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY
 
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
-        if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
+        # The prequant handoff is fp4 and must not enter this bf16 kernel.
+        if (
+            not use_hip_prequant
+            and _SMALLM_MOE_ON
+            and quant_info.w13_weight.element_size() == 1
+        ):
             from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
 
             try:
                 if (
                     _smallm.smallm_moe_supported(
-                        runner_input.hidden_states,
+                        hidden_states,
                         quant_info.w13_weight,
                         quant_info.w2_weight,
                         runner_input.topk_ids,
@@ -279,7 +307,7 @@ class AiterRunnerCore(MoeRunnerCore):
                     and runner_input.num_local_tokens is None
                 ):
                     out = _smallm.smallm_moe_fwd(
-                        runner_input.hidden_states,
+                        hidden_states,
                         quant_info.w13_weight,
                         quant_info.w2_weight,
                         runner_input.topk_weights,
@@ -297,7 +325,7 @@ class AiterRunnerCore(MoeRunnerCore):
             activation = _aiter_activation(self.config)
 
         output = fused_moe(
-            hidden_states=runner_input.hidden_states,
+            hidden_states=hidden_states,
             w1=quant_info.w13_weight,
             w2=quant_info.w2_weight,
             topk_weight=runner_input.topk_weights,

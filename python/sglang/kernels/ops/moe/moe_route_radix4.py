@@ -45,7 +45,10 @@ def build() -> Module:
     return load_jit(
         "moe_route_radix4",
         cuda_files=["moe/route_radix4_hip.cuh"],
-        cuda_wrappers=[("run", "RouteRadix4Kernel::run")],
+        cuda_wrappers=[
+            ("run", "RouteRadix4Kernel::run"),
+            ("run_fused", "RouteQuantFusedHipKernel::run"),
+        ],
         # No fast-math: expert-id selection must stay comparable to aiter under
         # ties and NaN.
         extra_cuda_cflags=["-O3"],
@@ -135,3 +138,44 @@ def route_radix4(
         bool(renormalize),
     )
     return out_w, out_i
+
+
+_MXFP4_HIDDEN = 3584
+_MXFP4_GROUPS = _MXFP4_HIDDEN // 32
+
+
+def route_radix4_quant(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    x: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Same route as route_radix4, plus MXFP4 of x, in one launch.
+
+    x is the routed activation [M, 3584] bf16, token order, not the scores.
+    Returns (weights, ids, fp4 uint8 [M, 1792], e8m0 uint8 [M, 112]). The quant
+    block does not read the route outputs; the launch lasts as long as the
+    slower of the two blocks.
+    """
+    M = scores.shape[0]
+    out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
+    out_i = torch.empty((M, topk), dtype=torch.int32, device=scores.device)
+    out_fp4 = torch.empty(
+        (M, _MXFP4_HIDDEN // 2), dtype=torch.uint8, device=scores.device
+    )
+    out_scale = torch.empty((M, _MXFP4_GROUPS), dtype=torch.uint8, device=scores.device)
+    build().run_fused(
+        scores,
+        bias,
+        x,
+        out_w,
+        out_i,
+        out_fp4,
+        out_scale,
+        topk,
+        float(routed_scaling_factor),
+        bool(renormalize),
+    )
+    return out_w, out_i, out_fp4, out_scale
