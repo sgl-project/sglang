@@ -2279,6 +2279,12 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return uses
 
 
+def denormalize_vae_latents(
+    latents: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
+    return latents.to(mean.dtype) * std + mean
+
+
 class Cosmos3DecodingStage(PipelineStage):
     """
     VAE decoding stage for Cosmos3.
@@ -2327,7 +2333,9 @@ class Cosmos3DecodingStage(PipelineStage):
                     .view(1, -1, 1, 1, 1)
                     .to(device, vae_dtype)
                 )
-            return (latents * self._latents_std) + self._latents_mean
+            return denormalize_vae_latents(
+                latents, self._latents_mean, self._latents_std
+            )
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
         return latents / scaling_factor
 

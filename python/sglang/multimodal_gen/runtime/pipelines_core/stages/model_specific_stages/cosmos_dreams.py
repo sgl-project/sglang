@@ -50,6 +50,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    denormalize_vae_latents,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     VIDEO_RES_SIZE_INFO,
     VIEWPOINT_TEMPLATES,
@@ -846,14 +849,16 @@ class CausalDecodeQueue:
         self.submitted = 0
         self.vae.reset_causal_decode_state()
         config = vae.config
-        self._mean = torch.tensor(config.latents_mean, device=device).view(
+        dtype = next(vae.parameters()).dtype
+        self._mean = torch.tensor(config.latents_mean, device=device, dtype=dtype).view(
             1, -1, 1, 1, 1
         )
-        self._std = torch.tensor(config.latents_std, device=device).view(1, -1, 1, 1, 1)
+        self._std = torch.tensor(config.latents_std, device=device, dtype=dtype).view(
+            1, -1, 1, 1, 1
+        )
 
     def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
-        vae_dtype = next(self.vae.parameters()).dtype
-        return (latents.float() * self._std + self._mean).to(vae_dtype)
+        return denormalize_vae_latents(latents, self._mean, self._std)
 
     def submit(self, latents: torch.Tensor) -> None:
         self.stream.wait_stream(torch.cuda.current_stream(self.device))

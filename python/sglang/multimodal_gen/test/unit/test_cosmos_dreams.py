@@ -48,7 +48,11 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     split_interleaved_action_vision_tokens,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+    Cosmos3DecodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+    CausalDecodeQueue,
     CosmosDreamsRolloutStage,
     _history_view,
     actions_for_frames,
@@ -1062,6 +1066,41 @@ class TestCosmosDreamsUnifiedContract(unittest.TestCase):
 
 
 class TestCosmosDreamsInferenceProfile(unittest.TestCase):
+    """Per-chunk schedules and history length are deployment settings."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA decode stream")
+    def test_overlap_and_serial_vae_inputs_match(self):
+        class IdentityVAE(torch.nn.Module):
+            def __init__(self, dtype):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.zeros(1, device="cuda", dtype=dtype)
+                )
+                self.config = SimpleNamespace(
+                    latents_mean=[-0.7571, -0.7089], latents_std=[2.8184, 1.4541]
+                )
+
+            def reset_causal_decode_state(self):
+                pass
+
+            def causal_decode(self, latents):
+                return latents
+
+        latents = torch.linspace(-3, 3, 128, device="cuda").reshape(1, 2, 4, 4, 4)
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                vae = IdentityVAE(dtype)
+                stage = object.__new__(Cosmos3DecodingStage)
+                stage.vae = vae
+                stage._latents_mean = stage._latents_std = None
+                expected = stage._denormalize_latents(latents)
+                queue = CausalDecodeQueue(vae, device=torch.device("cuda"))
+                for chunk in latents.split(2, dim=2):
+                    queue.submit(chunk)
+                torch.testing.assert_close(
+                    queue.finish(), expected.cpu(), rtol=0, atol=0
+                )
+
     def test_offloaded_vae_uses_serial_decode(self):
         with mock.patch.object(ServerArgs, "__post_init__", lambda self: None):
             args = ServerArgs(model_path="unused", pipeline_config=CosmosDreamsConfig())
@@ -1081,10 +1120,6 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
             [use.component_name for use in stage.component_uses(args)],
             ["transformer", "vae"],
         )
-
-    """Per-chunk sigma schedules and history length are deployment settings the
-    artifact does not carry; the defaults must not change the exported rollout
-    except for keeping the whole-clip history training used."""
 
     STEP42 = [[1.0, 0.9375, 0.8333333333333334, 0.625], [1.0, 0.8333333333333334]]
 
