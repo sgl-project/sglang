@@ -93,7 +93,7 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter", "moonmath_mla"}
 
 
 if _is_cuda:
