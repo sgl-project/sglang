@@ -2905,6 +2905,15 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
             )
+            if (
+                metadata.core_metadata.low_ratios
+                and not use_prefill_cuda_graph
+                and not dsa_use_prefill_cp(forward_batch)
+            ):
+                metadata.low_ratio_req_indices = token_req_indices(
+                    forward_batch, num_tokens=forward_batch.positions.shape[0]
+                )
+                metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
