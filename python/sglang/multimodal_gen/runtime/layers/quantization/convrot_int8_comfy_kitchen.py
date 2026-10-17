@@ -59,6 +59,65 @@ def _row_split(rows: int, out_features: int) -> int | None:
     return _MAX_ROWS_PER_CALL
 
 
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    bias: torch.Tensor | None = None,
+    split_out_features: int | None = None,
+) -> torch.Tensor:
+    """One fused ConvRot + IMMA GEMM over ``[..., K]`` activations and a 2-D weight.
+
+    ConvRot quantises the activation row-wise, independently of the output
+    columns, so ``weight`` may be a packed ``[sum(N_i), K]`` whose row blocks are
+    several projections of one activation: the call is then bit-exact against
+    one call per projection and drops ``n - 1`` redundant activation
+    quantisations. ``weight_scale`` is the matching ``[sum(N_i), 1]`` scale and
+    ``group_size`` the ConvRot group that every block shares.
+
+    ``split_out_features`` overrides the width the row-split heuristic judges:
+    a packed caller passes the per-projection width so the fused call issues
+    exactly the split the separate calls would have.
+    """
+    out_code = _OUT_DTYPE_CODE.get(x.dtype)
+    if out_code is None:
+        raise ValueError(f"convrot_int8 does not support activation dtype {x.dtype}")
+
+    # The kernel takes 2D activations; callers may pass [..., K].
+    orig_shape = x.shape
+    if x.dim() != 2:
+        x = x.reshape(-1, orig_shape[-1])
+    x = x.contiguous()
+
+    def run(rows: torch.Tensor) -> torch.Tensor:
+        return torch.ops.comfy_kitchen.int8_linear(
+            rows,
+            weight,
+            weight_scale,
+            bias,
+            out_code,
+            True,  # convrot
+            group_size,
+        )
+
+    n_rows, n_out = x.shape[0], weight.shape[0]
+    width = split_out_features if split_out_features is not None else n_out
+    split = _row_split(n_rows, width)
+    if split is None:
+        out = run(x)
+    else:
+        # Row slices of a contiguous 2D tensor are themselves contiguous, so
+        # this splits without copying the activation.
+        out = torch.empty(n_rows, n_out, dtype=x.dtype, device=x.device)
+        for start in range(0, n_rows, split):
+            out[start : start + split] = run(x[start : start + split])
+
+    if len(orig_shape) != 2:
+        out = out.reshape(*orig_shape[:-1], out.shape[-1])
+    return out
+
+
 @functools.cache
 def comfy_kitchen_available() -> bool:
     """Whether comfy_kitchen is importable and registers int8_linear."""
@@ -184,40 +243,7 @@ class ConvRotInt8ComfyKitchenLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        out_code = _OUT_DTYPE_CODE.get(x.dtype)
-        if out_code is None:
-            raise ValueError(
-                f"convrot_int8 does not support activation dtype {x.dtype}"
-            )
-
-        # The kernel takes 2D activations; callers may pass [..., K].
-        orig_shape = x.shape
-        if x.dim() != 2:
-            x = x.reshape(-1, orig_shape[-1])
-        x = x.contiguous()
-
-        def run(rows: torch.Tensor) -> torch.Tensor:
-            return torch.ops.comfy_kitchen.int8_linear(
-                rows,
-                layer.weight,
-                layer.weight_scale,
-                bias,
-                out_code,
-                True,  # convrot
-                self.group_size,
-            )
-
-        n_rows, n_out = x.shape[0], layer.weight.shape[0]
-        split = _row_split(n_rows, n_out)
-        if split is None:
-            out = run(x)
-        else:
-            # Row slices of a contiguous 2D tensor are themselves contiguous, so
-            # this splits without copying the activation.
-            out = torch.empty(n_rows, n_out, dtype=x.dtype, device=x.device)
-            for start in range(0, n_rows, split):
-                out[start : start + split] = run(x[start : start + split])
-
-        if len(orig_shape) != 2:
-            out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        return out
+        # The fused kernel lives in ``int8_linear``: a caller holding several
+        # projections of one activation can then issue a single call over the
+        # packed weight. This adapter only keeps the linear-method signature.
+        return int8_linear(x, layer.weight, layer.weight_scale, self.group_size, bias)
