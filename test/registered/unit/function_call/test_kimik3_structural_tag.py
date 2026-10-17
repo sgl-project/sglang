@@ -195,6 +195,101 @@ def test_strict_schema_rejects_invalid_parameters(arguments):
     assert not _accepts(grammar, _tools_section(_call("weather", 1, *arguments)))
 
 
+def _free_text_tool(additional_properties=False):
+    return Tool(
+        type="function",
+        function=Function(
+            name="annotate",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "score": {"type": "integer"},
+                },
+                "required": ["label"],
+                "additionalProperties": additional_properties,
+            },
+        ),
+    )
+
+
+def test_free_text_string_cannot_close_itself_early():
+    """An unconstrained string value compiled to a qwen_xml string schema,
+    which may contain the argument close marker, so the model could end the
+    value early and continue with arguments the schema forbids; the detector
+    splits at the first close marker, so those arguments were returned.
+    With additionalProperties False an undeclared key, or a declared key
+    with the wrong type, was accepted right after a free-text argument."""
+    tool = _free_text_tool()
+    structural_tag = get_kimik3_structural_tag(
+        [tool], tool_choice="required", thinking_mode=False, parallel_tool_calls=True
+    )
+    grammar = xgr.Grammar.from_structural_tag(structural_tag)
+    label = _argument("label", "string", "sample")
+
+    assert _accepts(grammar, _tools_section(_call("annotate", 1, label)))
+    assert _accepts(
+        grammar,
+        _tools_section(_call("annotate", 1, _argument("label", "string", "a<b|c>d"))),
+    )
+    smuggled = (
+        _tools_section(_call("annotate", 1, label, _argument("bogus", "string", "x"))),
+        _tools_section(
+            _call("annotate", 1, label, _argument("score", "string", "high"))
+        ),
+        _tools_section(
+            _call("annotate", 1, _argument("label", "string", f"a{ARGUMENT_CLOSE}b"))
+        ),
+    )
+    for value in smuggled:
+        assert not _accepts(grammar, value), value
+        assert not _token_accepts(structural_tag, value), value
+
+
+def test_constrained_strings_keep_their_schema():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="annotate",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["fast", "slow"]},
+                    "code": {"type": "string", "pattern": "[A-Z]{3}"},
+                },
+                "required": ["mode", "code"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    assert _accepts(
+        grammar,
+        _tools_section(
+            _call(
+                "annotate",
+                1,
+                _argument("mode", "string", "fast"),
+                _argument("code", "string", "ABC"),
+            )
+        ),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call(
+                "annotate",
+                1,
+                _argument("mode", "string", "medium"),
+                _argument("code", "string", "ABC"),
+            )
+        ),
+    )
+
+
 def test_required_allows_response_prefix_but_requires_tools():
     grammar = _grammar([_tool()], tool_choice="required")
     response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
