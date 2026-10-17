@@ -10,7 +10,12 @@ import triton.language as tl
 from .kv_layout import KVLayout
 
 LAYOUT = KVLayout.V4
+# Row bounds the callers dispatch at; the kernels take any row count, since each
+# (row, KV tile) is its own CTA. gfx950 keeps MAX_BATCH. On SM100 the alternative is
+# FlashMLA on 64 zero-padded heads, which swap-AB beats up to 24 rows (GB300 TP4, per
+# layer: 10.2 vs 21.7 us at 12 rows, 15 us at 24); FlashMLA is faster from 32 rows.
 MAX_BATCH = 8
+SM100_MAX_ROWS = 24
 NUM_HEADS = 16
 HEAD_DIM = 512
 SOFTMAX_SCALE = HEAD_DIM**-0.5
@@ -26,7 +31,7 @@ def can_use_swapab_attention(
 ) -> bool:
     """The caller adds the SM100 and single-query forward-mode gates."""
     return (
-        0 < q.shape[0] <= MAX_BATCH
+        0 < q.shape[0] <= SM100_MAX_ROWS
         and num_heads == NUM_HEADS
         and q.dtype == torch.bfloat16
         and q.shape[-1] == HEAD_DIM
@@ -69,9 +74,15 @@ def _combine(
     ST: tl.constexpr,
     H: tl.constexpr,
     BD: tl.constexpr,
+    USE_GDC: tl.constexpr,
 ):
     b, h, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t, d = tl.arange(0, ST), tile * BD + tl.arange(0, BD)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        # Trigger right after the wait, not after the loads: fused_rope_wo_a streams its
+        # weights before its own wait. Faster in 7 of 9 GB300 cases at 6-24 rows.
+        tl.extra.cuda.gdc_launch_dependents()
     den = tl.load(SUM + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.load(MAX + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.where(den > 0, mx, -float("inf"))
@@ -105,17 +116,21 @@ def swapab_attention(
     extra_lengths=None,
     inv_rope=None,
     partial_gluon=None,
+    pdl=True,
+    narrow_combine=True,
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
-    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's)."""
+    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's,
+    with `pdl` and `narrow_combine` off). `pdl` launches both kernels as programmatic
+    dependents; `narrow_combine` runs the combine as one-warp programs over 128 columns."""
     if partial_gluon is None:
         from .decode_attention_sm100_gluon import partial_gluon
 
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)
-    assert 0 < b <= MAX_BATCH and h == NUM_HEADS and d == HEAD_DIM
+    assert b > 0 and h == NUM_HEADS and d == HEAD_DIM
     assert q.dtype == torch.bfloat16 and q.stride(-1) == 1
     assert kv.shape[-1] == LAYOUT.bytes_per_token
     assert kv.dtype in (torch.uint8, torch.float8_e4m3fn)
@@ -172,6 +187,8 @@ def swapab_attention(
         SCALE_BYTES=LAYOUT.scale_bytes,
         TILE=LAYOUT.tile_size,
         num_warps=4,
+        # The HIP partial kernel takes no USE_GDC.
+        **({"USE_GDC": True, "launch_pdl": True} if pdl else {}),
     )
     if inv_rope is not None:
         freqs, positions = inv_rope
@@ -182,7 +199,10 @@ def swapab_attention(
     else:
         freqs = positions = out
         rope_dim = 0
-    bd = 64 if ne else 512
+    bd, combine_warps = 64 if ne else 512, 4
+    if narrow_combine and ne:
+        # GB300, 10 KV tiles: 2.1 vs 3.1 us at 12 rows, 2.5 vs 4.6 at 24.
+        bd, combine_warps = 128, 1
     _combine[(b, h, triton.cdiv(512, bd))](
         partial,
         maximum,
@@ -197,6 +217,8 @@ def swapab_attention(
         ST=triton.next_power_of_2(nt),
         H=h,
         BD=bd,
-        num_warps=4,
+        USE_GDC=pdl,
+        num_warps=combine_warps,
+        **({"launch_pdl": True} if pdl else {}),
     )
     return out
