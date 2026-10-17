@@ -4,7 +4,8 @@
 // Supported shape family:
 //   - bf16 activations, B == 1, hidden dim == 3072
 //   - layer norm only, no affine weight/bias
-//   - scale/shift are bf16 row-broadcast tensors ([D], [1,D], or [1,1,D])
+//   - scale/shift are bf16 row-broadcast tensors ([D], [1,D], or [1,1,D]),
+//     or, on the non-residual path, per-token tensors shaped like x
 //   - optional residual path uses a bf16 row-broadcast gate
 //
 // All other public-op inputs fall back to the existing CuTe-DSL implementation
@@ -90,7 +91,12 @@ SGL_DEVICE float triton_scale_reciprocal(float scale) {
   return reciprocal;
 }
 
-template <bool kHasResidual, bool kHasInputBias = false, bool kQuantizeFp8 = false, bool kQuantizeNvfp4 = false>
+template <
+    bool kHasResidual,
+    bool kHasInputBias = false,
+    bool kQuantizeFp8 = false,
+    bool kQuantizeNvfp4 = false,
+    bool kPerTokenMod = false>
 __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_constant__ params) {
   static_assert(!(kQuantizeFp8 && kQuantizeNvfp4));
   using namespace device;
@@ -171,8 +177,9 @@ __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_consta
   Vec shv;
   Vec yv;
   AlignedVector<fp8_e4m3_t, kVecElems> qv;
-  scv.load(static_cast<const bf16_t*>(params.scale) + elem_offset);
-  shv.load(static_cast<const bf16_t*>(params.shift) + elem_offset);
+  const int mod_offset = (kPerTokenMod ? row_offset : 0) + elem_offset;
+  scv.load(static_cast<const bf16_t*>(params.scale) + mod_offset);
+  shv.load(static_cast<const bf16_t*>(params.shift) + mod_offset);
 
   float input_scale_inv = 0.0f;
   if constexpr (kQuantizeFp8) {
@@ -282,6 +289,47 @@ struct NormScaleShiftKernel {
         .eps = static_cast<float>(eps),
     };
     LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<false>, params);
+  }
+};
+
+struct NormScaleShiftPerTokenKernel {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      double eps) {
+    using namespace host;
+    auto N = SymbolicSize{"num_rows"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHidden})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(x)
+        .verify(y)
+        .verify(scale)
+        .verify(shift);
+
+    const uint32_t grid = verify_nss_geometry(N);
+    const auto params = NormScaleShiftParams{
+        .y = y.data_ptr(),
+        .res_out = nullptr,
+        .quantized = nullptr,
+        .quant_scales = nullptr,
+        .x = x.data_ptr(),
+        .input_bias = nullptr,
+        .residual = nullptr,
+        .gate = nullptr,
+        .scale = scale.data_ptr(),
+        .shift = shift.data_ptr(),
+        .input_scale = nullptr,
+        .global_scale = nullptr,
+        .num_rows = grid,
+        .eps = static_cast<float>(eps),
+    };
+    LaunchKernel(grid, kThreads, device.unwrap())(norm_scale_shift_kernel<false, false, false, false, true>, params);
   }
 };
 
