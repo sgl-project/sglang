@@ -463,6 +463,8 @@ __all__ = [
     "try_sm120_fp8_linear",
 ]
 
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.gemm import cake as _cake  # noqa: E402, F401
 
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
