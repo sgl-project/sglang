@@ -1655,9 +1655,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
             shape = (capacity, num_kv_heads, head_dim)
+            # Zeroed once: a row is packed only up to its last visible page, so
+            # bytes past it are never written and must not be NaN garbage.
             buffers = (
-                torch.empty(shape, dtype=dtype, device=device),
-                torch.empty(shape, dtype=dtype, device=device),
+                torch.zeros(shape, dtype=dtype, device=device),
+                torch.zeros(shape, dtype=dtype, device=device),
             )
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
@@ -1746,6 +1748,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                     if compress_ratio > 1
                     else None
                 ),
+                # trtllm_decode reads each row only up to valid_counts.
+                visible_page_size=page,
             )
         else:
             qwen_sparse_valid_counts_triton(

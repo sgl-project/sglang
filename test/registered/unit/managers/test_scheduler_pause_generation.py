@@ -647,6 +647,39 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
 
+    def test_pd_decode_retract_includes_transferred_waiting_reqs(self):
+        """A transferred request waiting for a running slot holds a request row
+        and KV; retract must rebuild it too, so a paused flush cannot free it."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+
+        def _req(rid, req_pool_idx):
+            return SimpleNamespace(
+                rid=rid,
+                finished=lambda: False,
+                output_ids=[7],
+                time_stats=MagicMock(),
+                kv=SimpleNamespace(holds_kv=req_pool_idx is not None),
+            )
+
+        running = _req("running", 0)
+        staged = _req("staged", 1)
+        unstaged = _req("unstaged", None)
+        scheduler.running_batch.reqs = [running]
+        scheduler.waiting_queue = [staged, unstaged]
+
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(mock_retract_all.call_args.kwargs["reqs"], [running, staged])
+        self.assertEqual(scheduler.waiting_queue, [unstaged])
+        held = [
+            c.args[0]
+            for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
+        ]
+        self.assertEqual(held, [running, staged])
+
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and
         must not leave offload acks that keep the paused engine from going idle."""
