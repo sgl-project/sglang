@@ -22,6 +22,8 @@ def _make_k_only_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
         head_num=2,
         head_dim=8,
         idx_head_dim=16,
+        idx_head_num=1,
+        global_index_head_num=4,
         dense_layer_ids=dense_layer_ids,
         sparse_layer_ids=sparse_layer_ids,
         disable_value_sparse_layer_ids=sparse_layer_ids,
@@ -59,13 +61,20 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
         setup_state_kv_args(kv_args, pool)
         self.assertEqual(
             kv_args.state_types,
-            [StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV],
+            [StateType.MINIMAX_INDEX_K],
         )
-        self.assertEqual(len(kv_args.state_data_ptrs), 2)
+        self.assertEqual(len(kv_args.state_data_ptrs), 1)
         self.assertEqual(len(kv_args.state_data_ptrs[0]), pool.index_k_pool.layer_num)
         self.assertEqual(len(kv_args.state_item_lens[0]), pool.index_k_pool.layer_num)
-        self.assertEqual(len(kv_args.state_data_ptrs[1]), 6)
-        self.assertEqual(len(kv_args.state_item_lens[1]), 6)
+        self.assertEqual(kv_args.state_layer_ids, [[3, 4, 5, 6]])
+        self.assertEqual(kv_args.minimax_index_head_num, 1)
+        self.assertEqual(kv_args.minimax_global_index_head_num, 4)
+        self.assertEqual(kv_args.minimax_index_k_layout, "nhd")
+
+    def test_minimax_transfer_entries_use_global_layer_ids(self):
+        pool = _make_k_only_pool(start_layer=30)
+
+        self.assertEqual(pool.get_kv_layer_ids(), [30, 31, 32, 33, 34, 35, 36] * 2)
 
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()
