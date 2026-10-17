@@ -1,29 +1,24 @@
-"""DeepSeek-V4.1-Flash accuracy with DSPARK on four GB300 GPUs.
+"""Shared DeepSeek-V4.1-Flash + DSPARK accuracy recipe for the GB300 tests.
 
-Run GSM8K and MMMU-Pro in TP4+EP4 and DP-attention4 + EP4 configurations,
-plus decoder SWA bounded replay inside breakable prefill graphs with the
-default and TRT-LLM attention backends.
-The DP+EP recipe is intentionally exercised rather than skipped: startup or
-accuracy failures must be visible in CI while this path is being validated.
+Each server configuration lives in its own file under
+``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
+configurations partition independently across GB300 runners.
 """
-
-import unittest
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, _run_accuracy_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-gb300")
-
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
+
+# Tensor-parallel attention and expert-parallel MoE, without DP attention.
+TP4_EP4_ARGS = ["--attn-dp-size", "1", "--ep-size", "4"]
 
 
 class DSV41FlashAccuracyMixin(GSM8KMixin):
@@ -36,7 +31,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     mmmu_pro_score_threshold = 0.75
     mmmu_pro_num_examples = 200
     mmmu_pro_num_threads = 64
-    # Bound long reasoning responses consistently across all three CI recipes.
+    # Bound long reasoning responses consistently across all CI recipes.
     mmmu_pro_max_tokens = 32768
     mmmu_pro_load_preset_from_model_id = MODEL
 
@@ -72,6 +67,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
                 "auto",
                 "--tool-call-parser",
                 "auto",
+                "--disable-flashinfer-autotune",
                 *cls.parallel_args,
                 *cls.graph_args,
             ],
@@ -107,70 +103,3 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             max_tokens=self.mmmu_pro_max_tokens,
         )
         self.assert_dspark_accepts_draft_tokens()
-
-
-class TestDSV41FlashTP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
-    """Tensor-parallel attention and expert-parallel MoE, without DP attention."""
-
-    parallel_args = ["--attn-dp-size", "1", "--ep-size", "4"]
-
-
-class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
-    """DP attention and EP MoE using the built-in gather/reduce path.
-
-    DSPARK with DP attention does not support the DeepEP backend.
-    """
-
-    parallel_args = [
-        "--attn-dp-size",
-        "4",
-        "--ep-size",
-        "4",
-        "--enable-dp-lm-head",
-        "--moe-a2a-backend",
-        "none",
-    ]
-
-
-class TestDSV41FlashTP4EP4DSparkBoundedReplayBCG(TestDSV41FlashTP4EP4DSpark):
-    """Exercise bounded late-layer replay inside the breakable prefill graph."""
-
-    # Leave memory for the prefill graph pool. With 32 requests, the tail
-    # capacity is 4096 rows, below the largest 8192-token capture shape.
-    mem_fraction_static = "0.7"
-    max_running_requests = "32"
-    graph_args = [
-        "--enable-decoder-swa-bounded-replay",
-        "--cuda-graph-backend-prefill",
-        "breakable",
-        "--cuda-graph-max-bs-prefill",
-        "8192",
-        "--chunked-prefill-size",
-        "8192",
-    ]
-
-
-class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):
-    """TRT-LLM varlen attention through the full and bounded-tail graph breaks."""
-
-    parallel_args = [
-        "--attn-dp-size",
-        "1",
-        "--ep-size",
-        "4",
-        "--dsv4-attn-backend",
-        "trtllm",
-        "--enable-decoder-swa-bounded-replay",
-        "--cuda-graph-backend-prefill",
-        "breakable",
-        "--cuda-graph-max-bs-prefill",
-        "4096",
-        "--cuda-graph-max-seq-len-prefill",
-        "16384",
-        "--chunked-prefill-size",
-        "4096",
-    ]
-
-
-if __name__ == "__main__":
-    unittest.main()
