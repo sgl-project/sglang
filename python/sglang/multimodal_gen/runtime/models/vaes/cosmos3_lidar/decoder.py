@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos3 V1.2 LiDAR range-map decoder (inference only).
 
-Mirror image of ``cosmos3_lidar_encoder``: a stem at the bottleneck grid, the
+Mirror image of the LiDAR ``encoder``: a stem at the bottleneck grid, the
 joint 3D-RoPE bottleneck blocks, three up levels of temporal-then-neighborhood
 attention with 2x patch expanding, and a detokenizer back to three channels of
 network-space range, intensity, and mask logit. Parameter names follow the

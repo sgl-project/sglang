@@ -7,7 +7,7 @@ changes is the GEN attention: every token of the current chunk takes one
 softmax over the keys the replay predicate admits from the current chunk, the
 KV ring of committed chunks and the per-camera caption documents, executed as
 one block-sparse FlexAttention call planned on the host
-(``cosmos3_sim_auto_attention``). Every forward returns the chunk's post-norm,
+(``cosmos3_simulation.sim_auto_attention``). Every forward returns the chunk's post-norm,
 post-RoPE K and raw V, which a clean refresh commits to the ring.
 """
 

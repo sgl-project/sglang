@@ -7,7 +7,7 @@ of view zero, then view one, and so on. ``MaskItem`` describes one such item,
 ``MultiviewLayout`` the whole packed sequence plus the attention contract the
 checkpoint was exported with, and ``MultiviewAttentionContext`` carries the
 request-local caches from the pipeline to the transformer. The attention
-itself lives in ``cosmos3_multiview_attention`` (one visibility mask on
+itself lives in ``multiview_attention`` (one visibility mask on
 FlexAttention Triton or FlashAttention-4 block-sparse kernels).
 """
 
@@ -133,7 +133,7 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
     #: one prompt's length, so the compiled attention sees a single shape.
     max_und_tokens: int = DEFAULT_MAX_UND_TOKENS
     #: Explicit FA4 sparse block map; None derives it from the device's compute
-    #: capability at plan time (``cosmos3_multiview_attention.fa4_sparse_block_sizes``).
+    #: capability at plan time (``multiview_attention.fa4_sparse_block_sizes``).
     fa4_block_sizes: tuple[int, int] | None = None
     #: Packed GEN items in sequence order. Empty selects the camera-only pair
     #: (one fully-clean WSM control item, then one RGB target); joint

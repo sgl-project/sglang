@@ -3,7 +3,7 @@
 
 Same weights and layer stack as ``Cosmos3OmniTransformer``. Two things change
 inside the network. The GEN cross-attention runs the masked block-sparse
-multiview attention of ``cosmos3_multiview_attention`` (FlexAttention Triton or
+multiview attention of ``cosmos3_simulation.multiview_attention`` (FlexAttention Triton or
 FlashAttention-4 kernels) whenever the pipeline hands over a ``MultiviewLayout``.
 And the GEN sequence is assembled from packed sensor items instead of one video
 clip: the WSM control cameras, the RGB target cameras, and on joint checkpoints
