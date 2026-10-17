@@ -300,6 +300,8 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        cache_lookup_pending: External lookup has not resolved on every rank.
+                              The request must be rematched before admission.
     """
 
     device_prefix_len: int
@@ -315,6 +317,7 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    cache_lookup_pending: bool = False
 
 
 def zero_match_result(

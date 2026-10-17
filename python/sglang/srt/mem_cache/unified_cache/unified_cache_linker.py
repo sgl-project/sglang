@@ -134,7 +134,7 @@ class UnifiedCacheLinker(ABC):
     layer_done_counter: object
 
     @abstractmethod
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int] | None:
         """Return every prefix length (in pages) that is fully restorable.
 
         A length is included only when *all* pools satisfy their hit policy at
@@ -144,7 +144,23 @@ class UnifiedCacheLinker(ABC):
         and generally non-contiguous -- returning just the local maximum would
         let the tree pick a length that is invalid on another rank.
 
-        Local to this rank; the tree intersects the sets across ranks.
+        Local to this rank; the tree intersects the sets across ranks. Return
+        None while an asynchronous lookup is pending, or [] for a terminal
+        miss. Pending requests are rematched on later scheduler iterations,
+        without allocating destinations or blocking other ready requests.
+
+        Async backends must bound their wait or raise on failure, validate the
+        current lookup inputs on each call, and implement cancel_lookup. A
+        pending lookup does not authorize writes into engine-owned pages.
+        """
+
+    def cancel_lookup(self, rid: str) -> None:
+        """Retire lookup-only interest for an aborted or superseded match.
+
+        Async backends must make this local, nonblocking and idempotent, and
+        prevent retired callbacks from satisfying a later lookup for this rid.
+        It must not cancel accepted loads or claim physical transfer drain.
+        Synchronous backends have no lookup work to retire.
         """
 
     @abstractmethod
@@ -256,18 +272,25 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def cancel_lookup(self, rid: str) -> None:
+        self.cache_linker.cancel_lookup(rid)
+        self.hit_markers.pop(rid, None)
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        self.hit_markers.pop(req.rid, None)
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
+            self.cancel_lookup(req.rid)
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            self.cancel_lookup(req.rid)
             return result
 
         lookup_transfers = []
@@ -276,6 +299,7 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
+                self.cancel_lookup(req.rid)
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
@@ -286,7 +310,10 @@ class UnifiedCacheLinkerWrapper:
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        if hit_pages is None:
+            return result._replace(cache_lookup_pending=True)
         if hit_pages == 0:
+            self.cancel_lookup(req.rid)
             return result
         hit_tokens = hit_pages * page
 
@@ -313,24 +340,26 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
-    ) -> int:
+        self, restorable: list[int] | None, *, num_pages: int, device_hit_pages: int
+    ) -> int | None:
         """Intersect the per-rank sets of restorable prefix lengths and return the
-        longest one, or 0 when the ranks share none beyond the device prefix.
+        longest one, 0 for a shared miss, or None while any rank is pending.
 
         A rank's set is sparse, so reducing per-rank maxima could land on a
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
-        makes the reduction an intersection.
+        makes the reduction an intersection. Slot zero indicates a terminal
+        lookup, not a cache hit.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
-        for pages in restorable:
-            if device_hit_pages < pages <= num_pages:
-                mask[pages] = 1
+        if restorable is not None:
+            mask[0] = 1
+            for pages in restorable:
+                if device_hit_pages < pages <= num_pages:
+                    mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        common = mask.nonzero()
-        if common.numel() == 0:
-            return 0
-        return int(common[-1].item())
+        if not mask[0].item():
+            return None
+        return int(mask.nonzero()[-1].item())
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
@@ -576,15 +605,20 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads.clear()
 
     def release_request(self, rid: str) -> None:
-        self.hit_markers.pop(rid, None)
-        # A queued load targets slots the request owns and is about to free.
-        # A started one is finished by finish_loads before anything is freed.
-        if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
-            self.inflight_load_rids.remove(rid)
-            self.private_load_indices.pop(rid, None)
+        try:
+            self.cancel_lookup(rid)
+        finally:
+            # A queued load targets slots the request owns and is about to free.
+            # A started one is finished by finish_loads before anything is freed.
+            if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(
+                rid
+            ):
+                self.inflight_load_rids.remove(rid)
+                self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
         self.cache_linker.close()
+        self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()
