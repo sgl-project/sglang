@@ -190,6 +190,25 @@ class DwdpManager:
 
         torch.cuda.synchronize(weight_buffer.device_id)
 
+    @staticmethod
+    def _memory_major_permutation(tensor: torch.Tensor) -> Optional[List[int]]:
+        """Return a permutation making `tensor` contiguous, or None if already so.
+
+        DeepGEMM hands back mn-major expert scales (logical (E, n, sk), stored
+        (E, sk, n)), which NCCL rejects; sorting dims by descending stride recovers
+        the contiguous view while keeping experts outermost for the gather.
+        """
+        if tensor.is_contiguous():
+            return None
+
+        perm = sorted(range(tensor.dim()), key=lambda d: -tensor.stride(d))
+        if perm[0] != 0 or not tensor.permute(perm).is_contiguous():
+            raise ValueError(
+                f"cannot make expert tensor contiguous for all_gather: "
+                f"shape={tuple(tensor.shape)} stride={tensor.stride()}"
+            )
+        return perm
+
     def _allgather_small_params(
         self, moe_layers: List[Tuple[int, FusedMoE]], group
     ) -> None:
@@ -198,9 +217,18 @@ class DwdpManager:
 
         for li, experts in moe_layers:
             for pname, data in experts.named_per_expert_tensors(local_experts):
-                shards = [torch.empty_like(data) for _ in range(self.dwdp_size)]
-                dist.all_gather(shards, data, group=group.device_group)
+                # Gather in memory-major order, then restore the logical dim order.
+                perm = self._memory_major_permutation(data)
+                send = data if perm is None else data.permute(perm)
+
+                shards = [torch.empty_like(send) for _ in range(self.dwdp_size)]
+                dist.all_gather(shards, send, group=group.device_group)
                 full = torch.cat(shards, dim=0)[:num_total].contiguous()
+                if perm is not None:
+                    inverse = [0] * len(perm)
+                    for pos, d in enumerate(perm):
+                        inverse[d] = pos
+                    full = full.permute(inverse)
                 experts.replace_expert_tensor(pname, full)
 
                 logger.debug(
