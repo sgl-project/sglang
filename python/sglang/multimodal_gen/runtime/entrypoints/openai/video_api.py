@@ -45,6 +45,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     flatten_extra_params,
     get_declared_request_extra_fields,
     merge_image_input_list,
+    parse_form_extra_value,
+    parse_multipart_extra_containers,
     process_generation_batch,
     request_extra_value,
     request_field_value,
@@ -98,15 +100,6 @@ async def shutdown_video_jobs() -> None:
             await task
 
 
-def _parse_form_extra_value(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return value
-
-
 _MULTIPART_EXTRA_FORM_FIELDS = (
     "attention_backend_override",
     "cache_dit_params",
@@ -148,7 +141,7 @@ def _merge_multipart_extra_form_fields(
 ) -> None:
     for key in _multipart_extra_form_keys(sampling_params_cls):
         if key in raw_form:
-            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+            extra_from_form[key] = parse_form_extra_value(raw_form[key])
 
 
 def _multipart_video_extras(
@@ -160,23 +153,7 @@ def _multipart_video_extras(
 ) -> Dict[str, Any]:
     """Build and validate multipart extras once for request construction."""
 
-    extra_from_form: Dict[str, Any] = {}
-    if extra_body:
-        try:
-            extra_from_form = flatten_extra_params(json.loads(extra_body))
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            raise HTTPException(
-                status_code=400, detail="extra_body is not valid JSON"
-            ) from exc
-    if extra_params:
-        try:
-            extra_from_form.update(
-                flatten_extra_params({"extra_params": json.loads(extra_params)})
-            )
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            raise HTTPException(
-                status_code=400, detail="extra_params is not valid JSON"
-            ) from exc
+    extra_from_form = parse_multipart_extra_containers(extra_body, extra_params)
     _merge_multipart_extra_form_fields(
         raw_form,
         extra_from_form,
@@ -594,13 +571,13 @@ async def create_video(
 
         def form_value(name: str, value: Any) -> Any:
             selected = value if value is not None else extra_from_form.get(name)
-            return _parse_form_extra_value(selected)
+            return parse_form_extra_value(selected)
 
         def form_text_value(name: str, value: Any) -> Any:
             """Resolve a text field without JSON-decoding it.
 
             Some models take a serialized JSON object as the prompt text, which
-            ``_parse_form_extra_value`` would turn back into a dict and fail
+            ``parse_form_extra_value`` would turn back into a dict and fail
             request validation.
             """
             return value if value is not None else extra_from_form.get(name)
