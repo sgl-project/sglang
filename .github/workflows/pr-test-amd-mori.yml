@@ -30,6 +30,83 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action != 'labeled' }}
 
 jobs:
+  # The other jobs here are label-only. gemm-ar also runs unasked on a change to
+  # the adapter or to the pinned MORI_COMMIT, which is what it guards against:
+  # a mori whose gemm_ar signatures moved breaks the fused path silently, and a
+  # PR bumping the commit would otherwise never run the test that catches it.
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      gemm_ar: ${{ steps.filter.outputs.gemm_ar }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            gemm_ar:
+              - "python/sglang/srt/layers/mori_gemm_ar.py"
+              - "test/registered/amd/test_mori_gemm_ar*.py"
+              - "docker/rocm.Dockerfile"
+              - ".github/workflows/pr-test-amd-mori.yml"
+
+  mori-gemm-ar:
+    needs: [check-changes]
+    if: |
+      always() && (
+        github.event_name == 'workflow_dispatch' ||
+        needs.check-changes.outputs.gemm_ar == 'true' ||
+        (github.event.action == 'labeled' && github.event.label.name == 'run-mori-gemm-ar') ||
+        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-mori-gemm-ar'))
+      )
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm10
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+
+      # mori's own put test, bounded and with no collective behind it. A stack
+      # whose SDMA queues exist but whose copies never land fails here in
+      # seconds, rather than as a timeout in the collective test below.
+      - name: Gate on mori's SDMA put
+        timeout-minutes: 5
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e MORI_ENABLE_SDMA=1 \
+            -w /sgl-workspace/mori \
+            python3 -m pytest -q tests/python/cco/test_sdma_api.py -k alltoall
+
+      # Without MORI_ENABLE_SDMA the cco puts move no bytes, the all-reduce
+      # returns mostly the local slice, and self_test is what reports it.
+      - name: Run gemm_ar tests
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e MORI_ENABLE_SDMA=1 \
+            -w /sglang-checkout/test \
+            python3 -m pytest -q \
+              registered/amd/test_mori_gemm_ar.py \
+              registered/amd/test_mori_gemm_ar_contract.py \
+              registered/amd/test_mori_gemm_ar_collective.py
+
   mori-pd:
     if: |
       github.event_name == 'workflow_dispatch' ||
