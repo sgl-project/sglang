@@ -169,7 +169,7 @@ The server implements an OpenAI-compatible Images API under the `/v1/images` nam
 
 #### Request quality
 
-`quality` selects a cumulative request-level optimization tier: `lossless` keeps the selected deployment's reference path and all unconditional bit-exact replacements; `extra-high` additionally enables only request-gated DiT/VAE kernel fusions; `high` includes the full `extra-high` set and may also enable model-owned sparse, caching, lower-precision, or other approximate paths. The tier does not override separately configured quantization, attention, or caching options. Omit it (or send OpenAI's default `auto`) to keep the `lossless` runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
+`quality` selects a cumulative request-level optimization tier: `exact` keeps the selected deployment's reference path and all unconditional bit-exact replacements, so output is bit-identical to it in the same environment; `lossless` additionally enables the request-gated DiT/VAE fusions that keep the reference math and every operand's precision and only move the rounding; `high` includes the full `lossless` set and may also enable model-owned sparse, caching, lower-precision, or other approximate paths. `extra-high` is accepted as the former name of `lossless`. The tier does not override separately configured quantization, attention, or caching options. Omit it (or send OpenAI's default `auto`) to keep the `lossless` runtime default. It is distinct from `output_quality`, which controls only output-file compression. The same extension is accepted by image edits and video requests.
 
 **Python Example (b64_json response):**
 
@@ -318,6 +318,21 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
         "size": "1280x720"
       }'
 ```
+
+<Note>
+`size` is the literal output resolution for most pipelines. Wan-Animate-2
+treats it as a pixel-area budget instead: the output keeps the reference image's
+aspect ratio and uses the largest frame with at most `width × height` pixels whose
+sides are multiples of 16, so `size=640x800` with a 9:16 reference image yields a
+528×944 video. Request a budget with the reference image's aspect ratio to get a
+specific size. Wan-Animate-2 also ignores `seconds` and `num_frames`: the output
+has as many frames as the (resampled) reference video, generated in chunks of
+`clip_len` frames; see the
+[Wan-Animate-2 cookbook](/cookbook/diffusion/Wan/Wan-Animate-2#1-2-defaults).
+Wan-Animate-2 keeps the reference video's audio track on the output; the
+model-specific `enable_audio` field (form field or `extra_body`, default `true`)
+set to `false` gives a silent output.
+</Note>
 
 #### MP4 encoding
 

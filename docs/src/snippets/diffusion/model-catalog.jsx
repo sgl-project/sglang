@@ -4,6 +4,17 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MOSS-Image",
+      modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
+      cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
+      note: "Base is the reference checkpoint; SFT checkpoint validation is pending.",
+    },
+    {
+      name: "HunyuanImage-3.0",
+      modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
+      cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
+    },
+    {
       name: "Anima",
       modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
       cookbook: "/cookbook/diffusion/CircleStone/Anima",
@@ -27,6 +38,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/FLUX/FLUX",
     },
     {
+      name: "FLUX.3 Image",
+      modelIds: ["black-forest-labs/flux-3-image-klein", "black-forest-labs/flux-3-image-klein-base"],
+      cookbook: "/cookbook/diffusion/FLUX/FLUX.3",
+    },
+    {
       name: "Qwen-Image",
       modelIds: [
         "Qwen/Qwen-Image",
@@ -36,8 +52,8 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
-      name: "Qwen-Image 2.1",
-      modelIds: ["Qwen/Qwen-Image-2.1"],
+      name: "Qwen-Image 2.1 / Turbo",
+      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
@@ -174,6 +190,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
     },
     {
+      name: "Wan-Animate-2",
+      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
+    },
+    {
       name: "FastWan / TurboWan",
       modelIds: [
         "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
@@ -219,9 +240,9 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "FastH3",
       modelIds: [
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
       ],
-      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
     },
     {
       name: "VDN-H3",
@@ -243,6 +264,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "SANA-Video",
       modelIds: ["Efficient-Large-Model/SANA-Video_2B_480p_diffusers"],
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
+    },
+    {
+      name: "SANA-Video 2.0",
+      modelIds: ["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
+      cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video#6-sana-video-20",
     },
     {
       name: "LingBot Video MoE",

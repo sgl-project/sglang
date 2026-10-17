@@ -4,6 +4,7 @@ SGLang SDARModelLM (block diffusion / dLLM-style forward).
 """
 
 import logging
+from functools import partial
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -99,7 +100,6 @@ class SDARAttention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
@@ -129,8 +129,7 @@ class SDARAttention(nn.Module):
             self.total_num_kv_heads,
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -139,8 +138,7 @@ class SDARAttention(nn.Module):
             bias=getattr(config, "attention_bias", False),
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -294,14 +292,22 @@ class SDARBlock(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=False,
-                    next_layer_sparse=False,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
             ),
         )
 
@@ -364,6 +370,7 @@ class SDARModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(SDARBlock.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             norm_kwargs = (

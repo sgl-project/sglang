@@ -157,21 +157,15 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
     audio_downsample_factor: int = 1024
 
     def __post_init__(self) -> None:
-        if len(self.text_encoder_configs) != 2:
-            raise ValueError(
-                "Kandinsky6 pipeline requires exactly 2 text encoders "
-                f"(Reason1 and CLIP), but got {len(self.text_encoder_configs)}."
-            )
-        if len(self.text_encoder_precisions) != 2:
-            raise ValueError(
-                "Kandinsky6 pipeline requires exactly 2 text encoder "
-                f"precisions, but got {len(self.text_encoder_precisions)}."
-            )
-        if len(self.text_encoder_extra_args) != 2:
-            raise ValueError(
-                "Kandinsky6 pipeline requires exactly 2 text encoder extra "
-                f"tokenizer arg dicts, but got {len(self.text_encoder_extra_args)}."
-            )
+        for name, values in (
+            ("text encoders (Reason1 and CLIP)", self.text_encoder_configs),
+            ("text encoder precisions", self.text_encoder_precisions),
+            ("text encoder extra tokenizer arg dicts", self.text_encoder_extra_args),
+        ):
+            if len(values) != 2:
+                raise ValueError(
+                    f"Kandinsky6 pipeline requires exactly 2 {name}, but got {len(values)}."
+                )
 
         # keep the video VAE encoder available for optional image conditioning
         self.vae_config.load_encoder = True
