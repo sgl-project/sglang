@@ -116,6 +116,8 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
         )
     if not hasattr(scheduler, "draft_worker"):
         scheduler.draft_worker = None
+    if not hasattr(scheduler, "enable_hierarchical_cache"):
+        scheduler.enable_hierarchical_cache = False
     context = types.SimpleNamespace(
         enable_metrics=False,
         is_stats_logging_rank=True,
