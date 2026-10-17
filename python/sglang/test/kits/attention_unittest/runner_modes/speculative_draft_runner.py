@@ -1816,6 +1816,8 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
     vocab_size: int = 64,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    dsa_decode_backend: str = "flashmla_kv",
+    fp8_kv_cache: bool = False,
 ):
     """DSA EAGLE draft CUDA-graph runner coverage. Chain-only (topk=1)
     for now; the DSA indexer-replacement synthesis here uses trailing
@@ -1854,6 +1856,8 @@ def run_dsa_eagle_draft_cuda_graph_runner_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            dsa_decode_backend=dsa_decode_backend,
+            fp8_kv_cache=fp8_kv_cache,
         ),
         settings=settings,
     )
