@@ -965,6 +965,10 @@ def _flash_attn_fwd(
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    # The hd256 kernel's signature has no leftpad_k or head_gate slots.
+    takes_leftpad_and_head_gate = arch // 10 in [10, 11] and not use_dedicated_hd256_kernel
+    if use_dedicated_hd256_kernel and (leftpad_k is not None or head_gate is not None):
+        raise ValueError("leftpad_k and head_gate are not supported with head_dim 256")
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -1653,7 +1657,7 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 page_table_tensor,
             ]
-            if arch // 10 in [10, 11]:
+            if takes_leftpad_and_head_gate:
                 compile_args.append(leftpad_k_tensor)
             compile_args.extend(
                 [
@@ -1662,8 +1666,9 @@ def _flash_attn_fwd(
                     learnable_sink_tensor,
                 ]
             )
-            if arch // 10 in [10, 11]:
+            if takes_leftpad_and_head_gate:
                 compile_args.append(head_gate_tensor)
+            if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend(
                 [
@@ -1751,7 +1756,7 @@ def _flash_attn_fwd(
                 seqused_k,
                 page_table,
             ]
-            if arch // 10 in [10, 11]:
+            if takes_leftpad_and_head_gate:
                 call_args.append(leftpad_k)
             call_args.extend(
                 [
@@ -1760,8 +1765,9 @@ def _flash_attn_fwd(
                     learnable_sink,
                 ]
             )
-            if arch // 10 in [10, 11]:
+            if takes_leftpad_and_head_gate:
                 call_args.append(head_gate)
+            if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend(
                 [
