@@ -5,9 +5,10 @@ causal (target-verify) path. These tests check:
   (a) numerical parity with ``extend_attention_fwd`` on the pure-causal path
       (the operative case at topk=1), across head dims / GQA ratios / prefix
       lengths / extend lengths / KV scales;
-  (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
-      (non-causal, sinks, sliding-window, logit-cap, ragged extend), so the
-      backend falls back to ``extend_attention_fwd``.
+  (b) ``can_handle()`` rejects cases the kernel cannot serve
+      (non-causal, sinks, logit-cap, ragged extend), so the
+      backend falls back to ``extend_attention_fwd``, and accepts integer
+      sliding windows.
 
 The topk>1 case is gated off in the backend (TritonAttnBackend enables this path
 only when ``self.topk == 1``), since the kernel ignores the tree custom_mask;
@@ -241,26 +242,17 @@ class TestVerifySplitKV(CustomTestCase):
         )
         self.assertFalse(
             can_handle(
-                q,
-                k,
-                v,
-                kb,
-                vb,
-                qo,
-                kvp,
-                kvi,
-                None,
-                True,
-                None,
-                mle,
-                sliding_window_size=128,
-            )
-        )
-        self.assertFalse(
-            can_handle(
                 q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle, logit_cap=30.0
             )
         )
+
+    def test_sliding_window_eligibility(self):
+        q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
+        args = (q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle)
+        # Integer windows are supported; numerical bounds and graph replay
+        # are checked against an independent reference in test_verify_swa_cuda.
+        self.assertTrue(can_handle(*args, sliding_window_size=128))
+        self.assertFalse(can_handle(*args, sliding_window_size="128"))
 
     def test_fallback_ragged_extend(self):
         # q rows (bs*l_ext) inconsistent with the claimed max_len_extend -> reject.
