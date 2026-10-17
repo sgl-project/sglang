@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 import msgspec
@@ -838,7 +839,8 @@ class CausalDecodeQueue:
 
     Each chunk waits for the producing stream, decodes with the decoder's
     feature cache carried across chunks, and lands in pinned host memory
-    asynchronously; ``finish`` drains the stream and concatenates the frames.
+    asynchronously; leaving the context drains the stream and resets the VAE,
+    then ``finish`` concatenates the completed frames.
     """
 
     def __init__(self, vae: Any, *, device: torch.device) -> None:
@@ -856,6 +858,17 @@ class CausalDecodeQueue:
         self._std = torch.tensor(config.latents_std, device=device, dtype=dtype).view(
             1, -1, 1, 1, 1
         )
+
+    def __enter__(self) -> "CausalDecodeQueue":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        try:
+            self.stream.synchronize()
+        finally:
+            self.vae.reset_causal_decode_state()
+            if exc_type is not None:
+                self.outputs.clear()
 
     def _denormalize(self, latents: torch.Tensor) -> torch.Tensor:
         return denormalize_vae_latents(latents, self._mean, self._std)
@@ -875,8 +888,6 @@ class CausalDecodeQueue:
         self.submitted += 1
 
     def finish(self) -> torch.Tensor:
-        self.stream.synchronize()
-        self.vae.reset_causal_decode_state()
         return torch.cat(self.outputs, dim=2)
 
 
@@ -1286,6 +1297,7 @@ class _RolloutContext(msgspec.Struct):
 
     text_kv: list[KVPair]
     fps: float
+    domain_id: int
     # ``[1]`` request-level domain; ``row_domain_ids`` (``[T]``) overrides it per row.
     domain_ids: torch.Tensor
     tokens_per_frame: int
@@ -1298,9 +1310,11 @@ class _RolloutContext(msgspec.Struct):
     def chunk_domain_ids(
         self, frame_start: int, frame_end: int, action_count: int
     ) -> torch.Tensor:
+        if self.row_domain_ids is None:
+            return self.domain_ids
         return domains_for_frames(
             self.row_domain_ids,
-            scalar_domain=int(self.domain_ids[0].item()),
+            scalar_domain=self.domain_id,
             frame_start=frame_start,
             frame_end=frame_end,
             action_tokens_per_frame=action_count,
@@ -1397,6 +1411,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         context = _RolloutContext(
             text_kv=text_kv,
             fps=float(batch.fps),
+            domain_id=batch.extra[EXTRA_DOMAIN_ID],
             domain_ids=torch.tensor(
                 [batch.extra[EXTRA_DOMAIN_ID]], device=device, dtype=torch.long
             ),
@@ -1426,105 +1441,114 @@ class CosmosDreamsRolloutStage(PipelineStage):
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
         decode_queue = self._decode_queue(device)
-        next_frame = 0
-        if batch.image_latent is not None:
-            initial_latent = batch.image_latent.to(device=device, dtype=context.dtype)
-            action, null_indexes = self._actions(
-                rows, frame_start=0, frame_end=1, context=context
-            )
-            if target_frame > 1:
-                history = self._commit_clean_frame(
-                    context,
-                    history,
-                    initial_latent,
-                    frame_idx=0,
-                    action=action,
-                    null_action=bool(null_indexes),
-                    domain_ids=context.chunk_domain_ids(
-                        0, 1, manifest.action_tokens_per_frame
-                    ),
+        with decode_queue or nullcontext():
+            next_frame = 0
+            if batch.image_latent is not None:
+                initial_latent = batch.image_latent.to(
+                    device=device, dtype=context.dtype
                 )
-            latents.append(initial_latent)
-            if decode_queue is not None:
-                decode_queue.submit(initial_latent)
-            next_frame = 1
-
-        for chunk_start, chunk_end in iter_ar_chunk_ranges(
-            next_frame, target_frame, manifest.chunk_size
-        ):
-            action, null_indexes = self._actions(
-                rows, frame_start=chunk_start, frame_end=chunk_end, context=context
-            )
-            generator = torch.Generator(device=device).manual_seed(seed + chunk_start)
-            # The reference draws checkpoint-dtype noise, then promotes it to fp32.
-            noise = torch.randn(
-                (
-                    1,
-                    context.latent_channels,
-                    chunk_end - chunk_start,
-                    geometry.latent_height,
-                    geometry.latent_width,
-                ),
-                generator=generator,
-                device=device,
-                dtype=context.dtype,
-            )
-            action_count = manifest.action_tokens_per_frame
-            chunk_domains = context.chunk_domain_ids(
-                chunk_start, chunk_end, action_count
-            )
-            # One retrieval per chunk, shared by every denoising step and refresh.
-            selected = (
-                None if selector is None else selector.select(chunk_start, chunk_end)
-            )
-            clean_chunk = self._denoise_chunk(
-                context,
-                noise,
-                seed=seed,
-                history=_history_view(history, selected, context.tokens_per_frame),
-                frame_start=chunk_start,
-                action=action,
-                null_indexes=null_indexes,
-                domain_ids=chunk_domains,
-            )
-            for local_idx, frame_idx in iter_clean_commit_frames(
-                chunk_start, chunk_end, target_frame=target_frame
-            ):
-                # The framewise refresh also sees the chunk's already-committed frames.
-                read_history = (
-                    None
-                    if selected is None
-                    else _history_view(
+                action, null_indexes = self._actions(
+                    rows, frame_start=0, frame_end=1, context=context
+                )
+                if target_frame > 1:
+                    history = self._commit_clean_frame(
+                        context,
                         history,
-                        selected + list(range(chunk_start, frame_idx)),
-                        context.tokens_per_frame,
+                        initial_latent,
+                        frame_idx=0,
+                        action=action,
+                        null_action=bool(null_indexes),
+                        domain_ids=context.chunk_domain_ids(
+                            0, 1, manifest.action_tokens_per_frame
+                        ),
                     )
+                latents.append(initial_latent)
+                if decode_queue is not None:
+                    decode_queue.submit(initial_latent)
+                next_frame = 1
+
+            for chunk_start, chunk_end in iter_ar_chunk_ranges(
+                next_frame, target_frame, manifest.chunk_size
+            ):
+                action, null_indexes = self._actions(
+                    rows, frame_start=chunk_start, frame_end=chunk_end, context=context
                 )
-                history = self._commit_clean_frame(
+                generator = torch.Generator(device=device).manual_seed(
+                    seed + chunk_start
+                )
+                # The reference draws checkpoint-dtype noise, then promotes it to fp32.
+                noise = torch.randn(
+                    (
+                        1,
+                        context.latent_channels,
+                        chunk_end - chunk_start,
+                        geometry.latent_height,
+                        geometry.latent_width,
+                    ),
+                    generator=generator,
+                    device=device,
+                    dtype=context.dtype,
+                )
+                action_count = manifest.action_tokens_per_frame
+                chunk_domains = context.chunk_domain_ids(
+                    chunk_start, chunk_end, action_count
+                )
+                # One retrieval per chunk, shared by every denoising step and refresh.
+                selected = (
+                    None
+                    if selector is None
+                    else selector.select(chunk_start, chunk_end)
+                )
+                clean_chunk = self._denoise_chunk(
                     context,
-                    history,
-                    clean_chunk[:, :, local_idx : local_idx + 1],
-                    frame_idx=frame_idx,
-                    action=action[
-                        :, local_idx * action_count : (local_idx + 1) * action_count
-                    ],
-                    null_action=local_idx in null_indexes,
-                    domain_ids=frame_domain_ids(chunk_domains, local_idx, action_count),
-                    read_history=read_history,
+                    noise,
+                    seed=seed,
+                    history=_history_view(history, selected, context.tokens_per_frame),
+                    frame_start=chunk_start,
+                    action=action,
+                    null_indexes=null_indexes,
+                    domain_ids=chunk_domains,
                 )
-            latents.append(clean_chunk)
-            if decode_queue is not None:
-                decode_queue.submit(clean_chunk)
-            retrieval = (
-                ""
-                if selected is None
-                else "; frustum history "
-                + describe_selection(selector, chunk_start, selected)
-            )
-            self.log_info(
-                f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
-                f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps){retrieval}"
-            )
+                for local_idx, frame_idx in iter_clean_commit_frames(
+                    chunk_start, chunk_end, target_frame=target_frame
+                ):
+                    # The framewise refresh also sees the chunk's already-committed frames.
+                    read_history = (
+                        None
+                        if selected is None
+                        else _history_view(
+                            history,
+                            selected + list(range(chunk_start, frame_idx)),
+                            context.tokens_per_frame,
+                        )
+                    )
+                    history = self._commit_clean_frame(
+                        context,
+                        history,
+                        clean_chunk[:, :, local_idx : local_idx + 1],
+                        frame_idx=frame_idx,
+                        action=action[
+                            :, local_idx * action_count : (local_idx + 1) * action_count
+                        ],
+                        null_action=local_idx in null_indexes,
+                        domain_ids=frame_domain_ids(
+                            chunk_domains, local_idx, action_count
+                        ),
+                        read_history=read_history,
+                    )
+                latents.append(clean_chunk)
+                if decode_queue is not None:
+                    decode_queue.submit(clean_chunk)
+                retrieval = (
+                    ""
+                    if selected is None
+                    else "; frustum history "
+                    + describe_selection(selector, chunk_start, selected)
+                )
+                self.log_info(
+                    f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
+                    f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps){retrieval}"
+                )
         if decode_queue is not None:
             batch.extra[EXTRA_DECODED_OUTPUT] = decode_queue.finish()
             self.log_info(

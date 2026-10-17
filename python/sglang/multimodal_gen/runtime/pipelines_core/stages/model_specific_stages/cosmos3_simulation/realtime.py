@@ -239,6 +239,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
         state.context = _RolloutContext(
             text_kv=text_kv,
             fps=state.fps,
+            domain_id=prepared.domain_id,
             domain_ids=torch.tensor(
                 [prepared.domain_id], device=device, dtype=torch.long
             ),

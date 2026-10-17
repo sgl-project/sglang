@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     CausalDecodeQueue,
     CosmosDreamsRolloutStage,
     _history_view,
+    _RolloutContext,
     actions_for_frames,
     append_kv_history,
     closest_canvas,
@@ -1063,8 +1064,28 @@ class TestCosmosDreamsUnifiedContract(unittest.TestCase):
         self.assertTrue(native.format_prompt_as_json)
 
 
-class TestCosmosDreamsInferenceProfile(unittest.TestCase):
-    """Per-chunk schedules and history length are deployment settings."""
+class TestCosmosDreamsRuntime(unittest.TestCase):
+    def test_scalar_domain_tensor_is_reused_across_chunks(self):
+        domains = torch.tensor([2], dtype=torch.long)
+        context = _RolloutContext(
+            text_kv=[],
+            fps=24.0,
+            domain_id=2,
+            domain_ids=domains,
+            tokens_per_frame=8,
+            latent_channels=16,
+            geometry=resolve_geometry(
+                height=32, width=32, manifest=MANIFEST, max_pixels=1024
+            ),
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
+        self.assertIs(context.chunk_domain_ids(0, 1, 4), domains)
+        self.assertIs(context.chunk_domain_ids(1, 5, 4), domains)
+        context.row_domain_ids = torch.tensor([2, 2, 2, 2, 3, 3, 3, 3])
+        torch.testing.assert_close(
+            context.chunk_domain_ids(1, 3, 4), context.row_domain_ids.unsqueeze(0)
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA decode stream")
     def test_overlap_and_serial_vae_inputs_match(self):
@@ -1079,9 +1100,10 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
                 )
 
             def reset_causal_decode_state(self):
-                pass
+                self.cached_latents = None
 
             def causal_decode(self, latents):
+                self.cached_latents = latents.square()
                 return latents
 
         latents = torch.linspace(-3, 3, 128, device="cuda").reshape(1, 2, 4, 4, 4)
@@ -1092,12 +1114,21 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
                 stage.vae = vae
                 stage._latents_mean = stage._latents_std = None
                 expected = stage._denormalize_latents(latents)
-                queue = CausalDecodeQueue(vae, device=torch.device("cuda"))
-                for chunk in latents.split(2, dim=2):
-                    queue.submit(chunk)
-                torch.testing.assert_close(
-                    queue.finish(), expected.cpu(), rtol=0, atol=0
-                )
+                with self.assertRaisesRegex(RuntimeError, "injected rollout failure"):
+                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                        queue.submit(latents[:, :, :2])
+                        raise RuntimeError("injected rollout failure")
+                self.assertIsNone(vae.cached_latents)
+                self.assertTrue(queue.stream.query())
+                self.assertEqual(queue.outputs, [])
+                for _ in range(2):
+                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                        for chunk in latents.split(2, dim=2):
+                            queue.submit(chunk)
+                    self.assertIsNone(vae.cached_latents)
+                    torch.testing.assert_close(
+                        queue.finish(), expected.cpu(), rtol=0, atol=0
+                    )
 
     def test_offloaded_vae_uses_serial_decode(self):
         with mock.patch.object(ServerArgs, "__post_init__", lambda self: None):
@@ -1118,6 +1149,10 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
             [use.component_name for use in stage.component_uses(args)],
             ["transformer", "vae"],
         )
+
+
+class TestCosmosDreamsInferenceProfile(unittest.TestCase):
+    """Per-chunk schedules and history length are deployment settings."""
 
     STEP42 = [[1.0, 0.9375, 0.8333333333333334, 0.625], [1.0, 0.8333333333333334]]
 

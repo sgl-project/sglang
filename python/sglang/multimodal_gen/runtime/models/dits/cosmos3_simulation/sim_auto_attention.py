@@ -28,6 +28,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     TRITON_KV_BLOCK_SIZE,
     TRITON_Q_BLOCK_SIZE,
+    _block_indices,
     fa4_sparse_block_sizes,
     flex_attention,
     pack_allowed_bits,
@@ -398,13 +399,6 @@ def _presence(ids: torch.Tensor, block: int, count: int) -> torch.Tensor:
     presence = torch.zeros((blocks.shape[0], count), dtype=torch.bool)
     presence.scatter_(1, blocks, True)
     return presence
-
-
-def _block_indices(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # Full-width contiguous indices, the layout BlockMask helpers assume.
-    counts = mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.argsort(mask.to(torch.int8), dim=-1, descending=True, stable=True)
-    return counts, indices.to(torch.int32)
 
 
 def _padded_streams(plan: ReplayPlan, block_size: tuple[int, int]) -> _PaddedStreams:
