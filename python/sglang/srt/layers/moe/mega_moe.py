@@ -579,6 +579,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
     experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+    # EPLB moves each expert's slice of every parameter, so the UTCCP copies
+    # move with the scales they are transposed from.
+    experts.register_parameter(
+        "mega_w13_weight_scale_utccp",
+        torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+    )
+    experts.register_parameter(
+        "mega_w2_weight_scale_utccp",
+        torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+    )
 
     experts._mega_moe_weights_built = True
 
