@@ -24,7 +24,7 @@ from sglang.srt.function_call.gemma4_detector import (
     _parse_gemma4_value,
 )
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector, parse_arguments
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
@@ -39,6 +39,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -2900,6 +2901,57 @@ class TestGptOssDetector(unittest.TestCase):
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
+
+
+class TestGlm4ArgumentFallback(CustomTestCase):
+    def test_comma_expressions_remain_strings(self):
+        """Comma expressions must not become arrays without an array schema."""
+        for raw in ("1,000", '"a","b"', "1,", "(1, 2)"):
+            for arg_type in (None, "number"):
+                with self.subTest(raw=raw, arg_type=arg_type):
+                    self.assertEqual(parse_arguments(raw, arg_type), (raw, True))
+
+    def test_array_comma_expressions_remain_arrays(self):
+        """Array schemas preserve comma-separated values as JSON arrays."""
+        for raw, expected in (
+            ("1, 2", [1, 2]),
+            ('"a","b"', ["a", "b"]),
+            ("1,", [1]),
+            ("(1, 2)", [1, 2]),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_arguments(raw, "array"), (expected, True))
+
+    def test_tool_call_preserves_comma_value(self):
+        """Tool calls preserve comma values according to their argument schema."""
+        for arg_type, raw, expected in (
+            ("number", "1,000", "1,000"),
+            ("array", "1, 2", [1, 2]),
+        ):
+            with self.subTest(arg_type=arg_type):
+                self._assert_tool_call_comma_value(arg_type, raw, expected)
+
+    def _assert_tool_call_comma_value(self, arg_type, raw, expected):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="book",
+                    parameters={
+                        "type": "object",
+                        "properties": {"n": {"type": arg_type}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>book\n<arg_key>n</arg_key>\n"
+            f"<arg_value>{raw}</arg_value>\n</tool_call>"
+        )
+        calls = Glm4MoeDetector().detect_and_parse(text, tools).calls
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "book")
+        self.assertEqual(json.loads(calls[0].parameters), {"n": expected})
 
 
 class TestGlm4MoeDetector(unittest.TestCase):
