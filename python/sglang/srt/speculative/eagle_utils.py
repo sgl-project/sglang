@@ -747,6 +747,7 @@ def eagle_sample(
     *,
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
+    force_greedy_verify: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -859,7 +860,7 @@ def eagle_sample(
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
+        is_all_greedy=sampling_info.is_all_greedy or force_greedy_verify,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
