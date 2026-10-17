@@ -119,12 +119,8 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
 #      the JIT per_token_group_quant kernel and pinned bit-exact in test_per_token_group_quant
 #      (test_v3_ue8m0_row_packed_bitexact);
 #   2. fp32 [T, G] storing power-of-two VALUES (the deep_gemm.fp8_einsum
-#      format) -- v2-only. No srt caller requests it (production ties
-#      scale_ue8m0 and column_major_scales to the same DEEPGEMM_SCALE_UE8M0
-#      flag), so the srt entry `sglang_per_token_group_quant_fp8`, which now
-#      routes to the JIT kernel, rejects it loudly instead of allocating an fp32
-#      buffer the kernel cannot fill. The v2 JIT kernel itself still implements it and is
-#      covered by test_v2_jit_matches_aot above.
+#      format) -- supported by the current JIT per_token_group_quant kernel
+#      with a supplied float32 output_s; covered by test_ue8m0_fp32_scale.
 
 
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the
