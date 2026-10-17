@@ -82,6 +82,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRACK_STATE: tl.constexpr,
+    KG_CHUNK_MAJOR: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -110,7 +111,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # calculate offset
     h += ((boh * H + i_h) * V * K).to(tl.int64)
     v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
+    if KG_CHUNK_MAJOR:
+        # [chunks, Hg, K, BT]: chunk i_t of this sequence at boh + i_t.
+        k += ((boh * Hg + i_h // (H // Hg)) * K * BT).to(tl.int64)
+    else:
+        k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
     if SAVE_NEW_VALUE:
         v_new += ((bos * H + i_h) * V).to(tl.int64)
@@ -303,27 +308,48 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
-        )
+        if KG_CHUNK_MAJOR:
+            # Tokens contiguous: the update's reduction dimension loads straight
+            # into the MFMA operand; tail tokens are stored as zeros.
+            k_c = k + i_t * Hg * K * BT
+            p_k = tl.make_block_ptr(k_c, (K, BT), (BT, 1), (0, 0), (64, BT), (1, 0))
+        else:
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+            )
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h1 += tl.trans(tl.dot(b_k, b_v))
         if K > 64:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-            )
+            if KG_CHUNK_MAJOR:
+                p_k = tl.make_block_ptr(
+                    k_c, (K, BT), (BT, 1), (64, 0), (64, BT), (1, 0)
+                )
+            else:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+                )
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h2 += tl.trans(tl.dot(b_k, b_v))
         if K > 128:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-            )
+            if KG_CHUNK_MAJOR:
+                p_k = tl.make_block_ptr(
+                    k_c, (K, BT), (BT, 1), (128, 0), (64, BT), (1, 0)
+                )
+            else:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+                )
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h3 += tl.trans(tl.dot(b_k, b_v))
         if K > 192:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-            )
+            if KG_CHUNK_MAJOR:
+                p_k = tl.make_block_ptr(
+                    k_c, (K, BT), (BT, 1), (192, 0), (64, BT), (1, 0)
+                )
+            else:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+                )
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
@@ -364,7 +390,11 @@ def chunk_gated_delta_rule_fwd_h(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    kg_chunk_major: bool = False,
+    tile: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """kg_chunk_major: k is [chunks, Hg, K, 64] (tokens contiguous, tail tokens zero)
+    instead of [B, T, Hg, K]. tile: (BV, num_warps, num_stages) instead of the env config."""
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
     )
@@ -377,8 +407,12 @@ def chunk_gated_delta_rule_fwd_h(
         assert track_state.dtype == torch.float32, (
             f"track_state must be fp32, got {track_state.dtype}"
         )
-    B, T, Hg, K, V = *k.shape, u.shape[-1]
-    H = u.shape[-2]
+    if kg_chunk_major:
+        B, T, H, V = u.shape
+        Hg, K = k.shape[1], k.shape[2]
+    else:
+        B, T, Hg, K, V = *k.shape, u.shape[-1]
+        H = u.shape[-2]
     BT = CHUNK_SIZE
 
     if chunk_indices is None and cu_seqlens is not None:
@@ -398,10 +432,19 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
+    if tile is not None:
+        # The bare JIT function: the autotuner's single config would override the tile.
+        kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64.fn
+        launch = dict(BV=tile[0], num_warps=tile[1], num_stages=tile[2])
+        grid = (triton.cdiv(V, tile[0]), N * H)
+    else:
+        kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+        launch = {}
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), N * H)
+
+    kernel[grid](
         k=k,
         v=u,
         w=w,
@@ -434,5 +477,7 @@ def chunk_gated_delta_rule_fwd_h(
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
+        KG_CHUNK_MAJOR=kg_chunk_major,
+        **launch,
     )
     return h, v_new

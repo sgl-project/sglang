@@ -71,6 +71,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     USE_SAFE_GATE: tl.constexpr,
     FUSE_RECOMPUTE: tl.constexpr,
     FUSE_DIAGONAL: tl.constexpr,
+    KG_CHUNK_MAJOR: tl.constexpr = False,
 ):
     """
     Fused kernel: compute inter-subchunk Akk + solve_tril in one pass.
@@ -88,6 +89,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
+        i_tg = i_t
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
             tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
@@ -98,6 +100,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         )
         T = eos - bos
     else:
+        i_tg = i_b * tl.cdiv(T, BT) + i_t
         bos, eos = i_b * T, i_b * T + T
 
     if i_t * BT >= T:
@@ -723,18 +726,35 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_kg2 = b_k2r * exp2(b_gn[None, :] - b_gk2r)
             b_kg3 = b_k3r * exp2(b_gn[None, :] - b_gk3r)
 
-            p_kg0 = tl.make_block_ptr(
-                kg_base, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
-            )
-            p_kg1 = tl.make_block_ptr(
-                kg_base, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
-            )
-            p_kg2 = tl.make_block_ptr(
-                kg_base, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
-            )
-            p_kg3 = tl.make_block_ptr(
-                kg_base, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
-            )
+            if KG_CHUNK_MAJOR:
+                # [chunks, H, K, BT]: tokens contiguous; tail tokens store the
+                # zeros their masked k loads produced.
+                kgc_base = kg_out + (i_tg * H + i_h).to(tl.int64) * K * BT
+                p_kg0 = tl.make_block_ptr(
+                    kgc_base, (BT, K), (1, BT), (0, i_k * BK), (BC, BK), (0, 1)
+                )
+                p_kg1 = tl.make_block_ptr(
+                    kgc_base, (BT, K), (1, BT), (BC, i_k * BK), (BC, BK), (0, 1)
+                )
+                p_kg2 = tl.make_block_ptr(
+                    kgc_base, (BT, K), (1, BT), (2 * BC, i_k * BK), (BC, BK), (0, 1)
+                )
+                p_kg3 = tl.make_block_ptr(
+                    kgc_base, (BT, K), (1, BT), (3 * BC, i_k * BK), (BC, BK), (0, 1)
+                )
+            else:
+                p_kg0 = tl.make_block_ptr(
+                    kg_base, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0)
+                )
+                p_kg1 = tl.make_block_ptr(
+                    kg_base, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0)
+                )
+                p_kg2 = tl.make_block_ptr(
+                    kg_base, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0)
+                )
+                p_kg3 = tl.make_block_ptr(
+                    kg_base, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0)
+                )
             tl.store(p_kg0, b_kg0.to(p_kg0.dtype.element_ty), boundary_check=(0, 1))
             tl.store(p_kg1, b_kg1.to(p_kg1.dtype.element_ty), boundary_check=(0, 1))
             tl.store(p_kg2, b_kg2.to(p_kg2.dtype.element_ty), boundary_check=(0, 1))
@@ -924,6 +944,7 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     fuse_recompute: bool = False,
     fuse_diagonal: bool = False,
+    kg_chunk_major: bool = False,
 ):
     B, T, H, K = k.shape
     V = v.shape[-1]
@@ -984,7 +1005,11 @@ def chunk_kda_fwd_intra(
     if fuse_recompute:
         w = torch.empty_like(k)
         u = torch.empty_like(v)
-        kg = torch.empty_like(k)
+        kg = (
+            k.new_empty(B * NT if cu_seqlens is None else NT, H, K, BT)
+            if kg_chunk_major
+            else torch.empty_like(k)
+        )
         chunk_kda_fwd_kernel_inter_solve_fused[grid](
             q=q,
             k=k,
@@ -1009,6 +1034,7 @@ def chunk_kda_fwd_intra(
             USE_SAFE_GATE=safe_gate,
             FUSE_RECOMPUTE=True,
             FUSE_DIAGONAL=fuse_diagonal,
+            KG_CHUNK_MAJOR=kg_chunk_major,
         )
         return w, u, None, kg, Aqk, None
 
@@ -1053,5 +1079,6 @@ def chunk_kda_fwd_intra(
         gk=gk,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        kg_chunk_major=kg_chunk_major,
     )
     return w, u, None, kg, Aqk, Akk

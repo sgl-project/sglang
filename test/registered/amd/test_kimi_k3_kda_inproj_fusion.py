@@ -155,6 +155,39 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
         )
         torch.testing.assert_close(eager_gate, expected_gate)
 
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm-only fused path")
+    def test_quantized_moe_checkpoint_still_fuses_bf16_inproj(self):
+        """A checkpoint with a quantized MoE (so quant_config is set) whose KDA
+        projections stay bf16 must still take the fused in-projection."""
+        attention = SimpleNamespace(
+            use_full_rank_gate=True,
+            attn_tp_size=8,
+            tp_size=8,
+            do_fuse_qkvbfg=False,
+            _bfa_uses_block_fp8=False,
+            fused_qkvg_proj=self.qkvg,
+            f_a_proj=self.f_a,
+            b_proj=self.b,
+        )
+        self.assertTrue(KimiK3DeltaAttention._may_fuse_kda_inproj(attention))
+
+    @unittest.skipUnless(torch.version.hip is not None, "gfx950 f_b GEMM kernel")
+    def test_f_b_gemm_matches_linear(self):
+        """The gfx950 f_b GEMM at EAGLE verify sizes reads strided f_a slices and
+        must match F.linear within one bf16 rounding (hipBLASLt's accumulation
+        order varies with the row count)."""
+        for rows in (1, 4, 13, 16, 64):
+            fused = torch.randn(
+                rows, MERGED, dtype=torch.bfloat16, device=self.merged.device
+            )
+            f_a = fused[:, WIDE : WIDE + HEAD_DIM]
+            got = kimi_k3_tiny_gemm(f_a, self.f_b_w).float()
+            want = torch.nn.functional.linear(f_a, self.f_b_w).float()
+            with self.subTest(rows=rows):
+                self.assertFalse(
+                    ((got - want).abs() > want.abs() * 2**-7 + 1e-6).any().item()
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
