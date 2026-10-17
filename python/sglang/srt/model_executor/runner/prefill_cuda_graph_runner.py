@@ -300,6 +300,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _use_draft_input_embeds = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
+    # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
+    _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
 
@@ -324,6 +326,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.dllm_attention.can_run_prefill_cuda_graph
             if self.dllm_attention is not None
             else getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
+        )
+        self._backend_vote_prefill_cuda_graph = getattr(
+            model_runner.attn_backend, "vote_prefill_cuda_graph", None
         )
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
@@ -2263,6 +2268,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def _wait_for_layer_loads(self) -> None:
+        # Full replay skips the per-layer load waits in the pool accessors; breakable
+        # replay still runs them at its eager breaks.
+        if not self._is_full_backend:
+            return
+        counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
+        if counter is not None and counter.consumer_index >= 0:
+            counter.wait_until(counter.num_layers - 1)
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
@@ -2280,6 +2294,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             maybe_publish_prefill_shared_read_done(
                 self.model_runner, forward_batch, self.device_module
             )
+            self._wait_for_layer_loads()
 
             if self.enable_cp_bcg_capture:
                 assert self.max_context_size is None, (

@@ -4,7 +4,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.request_window_copy import copy_packed_rows
+from sglang.kernels.ops.attention.dsv4.request_window_copy import (
+    commit_packed_rows,
+    copy_packed_rows,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -241,17 +244,12 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
-        dst = torch.where(
-            layout.commit_mask,
-            layout.req * self.capacity + layout.pos % self.capacity,
-            self.sink_row,
-        )
-        copy_packed_tokens(
+        commit_packed_rows(
             self.buffer(layer),
             self.state.kv_buffer[layer],
-            layout.write_loc,
-            dst,
+            self.tags[layer],
+            layout,
             page_size=self.page_size,
+            capacity=self.capacity,
             layout=self.state.kv_layout,
         )
-        self.tags[layer, dst] = layout.pos
