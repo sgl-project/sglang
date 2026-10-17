@@ -73,6 +73,30 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         self.assertEqual(server_args.load_balance_method, "total_tokens")
         self.assertEqual(server_args.tp_size, 4)
 
+    def test_prefix_affinity_options_parse(self):
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--load-balance-method",
+                "prefix_affinity",
+                "--prefix-affinity-fallback",
+                "total_requests",
+                "--prefix-affinity-max-load-skew",
+                "2.0",
+                "--prefix-affinity-hash-tokens",
+                "2048",
+                "--prefix-affinity-disable-token-fallback",
+            ]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertEqual(server_args.load_balance_method, "prefix_affinity")
+        self.assertEqual(server_args.prefix_affinity_fallback, "total_requests")
+        self.assertEqual(server_args.prefix_affinity_max_load_skew, 2.0)
+        self.assertEqual(server_args.prefix_affinity_hash_tokens, 2048)
+        self.assertTrue(server_args.prefix_affinity_disable_token_fallback)
+
 
 if __name__ == "__main__":
     unittest.main()

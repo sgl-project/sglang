@@ -75,7 +75,12 @@ def should_use_zmq() -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "prefix_affinity"})
+
+
+def is_load_aware_method(method: str) -> bool:
+    """Whether ``method`` requires fresh per-rank load snapshots to dispatch."""
+    return method.lower() in _LOAD_AWARE_METHODS
 
 
 def _tokenizer_load_snapshot_owner_caller() -> str:
@@ -101,11 +106,11 @@ def zmq_reader_owner(caller: str) -> bool:
     Rules:
       - Non-zero node_rank: no TokenizerManager, DataParallelController only
         launches schedulers and waits -> nobody owns it.
-      - dp_size == 1: no DataParallelController exists -> tokenizer-side owner
+      - num_dp_ranks == 1: no DataParallelController exists -> tokenizer-side owner
         owns it.
-      - dp_size > 1, load-aware method: DataParallelController polls on every
+      - num_dp_ranks > 1, load-aware method: DataParallelController polls on every
         dispatch via refresh_load_budget() -> DataParallelController owns it.
-      - dp_size > 1, round-robin / other: DataParallelController never reads
+      - num_dp_ranks > 1, round-robin / other: DataParallelController never reads
         load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
 
     The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
@@ -119,12 +124,11 @@ def zmq_reader_owner(caller: str) -> bool:
     if get_parallel().node_rank != 0:
         return False
     if caller == "DataParallelController":
-        return (
-            get_parallel().num_dp_ranks > 1
-            and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+        return get_parallel().num_dp_ranks > 1 and is_load_aware_method(
+            get_parallel().load_balance_method
         )
     if get_parallel().num_dp_ranks > 1 and (
-        get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+        is_load_aware_method(get_parallel().load_balance_method)
     ):
         return False
     return caller == _tokenizer_load_snapshot_owner_caller()
