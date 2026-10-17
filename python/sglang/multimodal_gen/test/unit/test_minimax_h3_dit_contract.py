@@ -887,3 +887,42 @@ def test_compiled_attention_runs_its_fused_section_eager(compiling):
 
 def test_eager_attention_section_is_hidden_from_dynamo():
     assert MiniMaxH3Attention._attend_eager._torchdynamo_disable
+
+
+def test_pipelined_ulysses_attention_projects_its_output_once():
+    _ensure_single_process_parallel_runtime()
+    arch = MiniMaxH3DiTArchConfig()
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    attention._use_fused_qknorm_rope = True
+    tokens = 4
+    attended = torch.empty(
+        tokens, attention.num_heads, attention.head_dim, device="meta"
+    )
+    projected = torch.empty(tokens, arch.hidden_size, device="meta")
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "_minimax_h3_qknorm_rope_pipelined_attention",
+            return_value=attended,
+        ) as pipeline,
+        patch.object(
+            attention.out_proj, "forward", return_value=(projected, None)
+        ) as project,
+    ):
+        result = attention(
+            torch.empty(tokens, arch.hidden_size, device="meta"),
+            rope_cache=(
+                torch.empty(tokens, attention.head_dim, device="meta"),
+                torch.arange(tokens),
+            ),
+            cu_seqlens=torch.empty(2, dtype=torch.int32, device="meta"),
+            max_seqlen=tokens,
+            ulysses_active=True,
+        )
+
+    pipeline.assert_called_once()
+    project.assert_called_once()
+    assert project.call_args.args[0].shape == (tokens, attention.local_inner_dim)
+    assert result is projected
