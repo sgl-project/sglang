@@ -118,6 +118,56 @@ class TestMuseGlimmerDetector(CustomTestCase):
         self.assertIn("It is sunny.", normal)
         self.assert_streaming_matches(text)
 
+    def test_string_typed_arguments_keep_their_literal_text(self):
+        # A string-typed value that happens to be valid JSON must not be
+        # rewritten: 123 stays "123", true stays "true", a quoted literal
+        # keeps its quotes, and "null" becomes None only when the schema
+        # accepts null.
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "note": {"type": "string"},
+                            "state": {"type": "string"},
+                            "extra": {"type": ["string", "null"]},
+                            "limit": {"type": "integer"},
+                        },
+                    },
+                ),
+            ),
+        ]
+        text = "<|start|>assistant to=get_weather<|message|>" + atem(
+            "get_weather",
+            city="123",
+            note="true",
+            state='"null"',
+            extra="null",
+            limit="5",
+        )
+        _, calls = self.parse(text)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "get_weather",
+                    {
+                        "city": "123",
+                        "note": "true",
+                        "state": '"null"',
+                        "extra": None,
+                        "limit": 5,
+                    },
+                )
+            ],
+        )
+        self.assert_streaming_matches(text)
+
     def test_namespaced_name_passes_through(self):
         tools = [
             Tool(
