@@ -1,0 +1,81 @@
+---
+title: HiDream-O1-Image
+metatags:
+    description: "Deploy HiDream-O1-Image with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "pixel-space", "8B UiT"]} />
+
+## 1. Model Introduction
+
+[HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) is an 8B pixel-level Unified Transformer (UiT). Unlike the usual latent-diffusion layout, it has neither a VAE nor a separate text encoder: one Qwen3-VL backbone embeds the prompt and predicts clean 32x32 RGB patches directly, and the flow-matching head reads its timestep from a dedicated token in the prompt. It loads through SGLang's native `HiDreamO1ImagePipeline`.
+
+The checkpoint ships a stock `qwen3_vl` config with no `model_index.json`, so the pipeline loads the transformer itself instead of going through the diffusers component loaders.
+
+| Model | Hugging Face model ID | Notes |
+| --- | --- | --- |
+| HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | Text-to-image, bf16 only |
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+pip install -e "python[diffusion]"
+```
+
+For full installation options, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Serve the model
+
+```bash Command
+sglang serve \
+  --model-path HiDream-ai/HiDream-O1-Image \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+## 4. Generate an image
+
+One-shot generation from the CLI:
+
+```bash Command
+sglang generate \
+  --model-path HiDream-ai/HiDream-O1-Image \
+  --prompt "A cat is sitting next to a sign that says 'HiDream-O1'" \
+  --num-inference-steps 50 \
+  --guidance-scale 5.0 \
+  --save-output
+```
+
+Or through the OpenAI-compatible image generation API once the server is up:
+
+```python Python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30010/v1")
+
+response = client.images.generate(
+    model="HiDream-ai/HiDream-O1-Image",
+    prompt="A cinematic photo of a quiet lakeside cabin at sunrise",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("hidream_o1.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+## 5. Configuration tips
+
+- The model is released in bfloat16 only; `--dit-precision` / `--component-precisions` overrides are rejected rather than silently downcast.
+- The trained resolutions are 2048x2048, 2304x1728, 2560x1440, 2496x1664, 3104x1312, 2304x1792 and their transposes. Nothing snaps: an off-grid size is warned about in the server log and then rendered exactly as requested, and because pixel patches carry no scale invariance the quality degrades badly.
+- Sequence parallelism is unsupported: the prompt span is causal while the image span is bidirectional, which needs a dense `[B, 1, S, S]` mask that cannot be sharded along the sequence. Use `--tp-size` for multi-GPU instead. `--cfg-parallel-size 2` also applies at the default `--guidance-scale 5.0`, since it splits the two CFG branches across GPUs.
+- Encoder/denoiser/decoder disaggregation does not apply — one component does all three, so the pipeline only runs in the monolithic role.
+- The defaults are the reference `full` recipe: 50 steps, `--guidance-scale 5.0`, shift 3.0 (fixed). Classifier-free guidance costs a second forward pass per step, so `--guidance-scale 1.0` halves the step cost at some quality loss.
+- Noise is drawn on the host, so a given `--seed` reproduces the same image on any accelerator.
