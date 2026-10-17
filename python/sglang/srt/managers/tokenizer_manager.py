@@ -167,7 +167,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
-    redact_watermark_command_line,
     redact_watermark_secrets,
     resolve_watermark_request,
 )
@@ -3467,9 +3466,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ),
                     "resolved_config": self._dump_config_snapshot(),
                     "requests": redact_watermark_secrets(data_to_dump),
-                    "launch_command": redact_watermark_command_line(
-                        sys.argv, self.server_args.watermark_config
-                    ),
+                    # The record's copy, redacted at capture. The raw
+                    # `sys.argv` carries `--api-key VALUE` verbatim.
+                    "launch_command": self.server_args.launch_command,
                 }
                 with open(filename, "wb") as f:
                     try:
