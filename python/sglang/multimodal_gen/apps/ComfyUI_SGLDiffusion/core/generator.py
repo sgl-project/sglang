@@ -322,7 +322,11 @@ class SGLDiffusionGenerator:
             _SHARED.close_generator()
 
     def init_generator(
-        self, model_path: str, pipeline_class_name: str, kwargs: dict = None
+        self,
+        model_path: str,
+        pipeline_class_name: str,
+        kwargs: dict = None,
+        worker_patches=(),
     ):
         """Initialize the diffusion generator."""
         if self.generator is not None:
@@ -352,7 +356,11 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            with _spawn_without_launcher_main():
+            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+                scheduler_profiles,
+            )
+
+            with scheduler_profiles(worker_patches), _spawn_without_launcher_main():
                 self.generator = DiffGenerator.from_pretrained(
                     model_path=model_path,
                     pipeline_class_name=pipeline_class_name,
@@ -576,6 +584,13 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
+        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            canonical_profiles,
+            validate_options,
+        )
+
+        patches = canonical_profiles(plugin.get("worker_patches"))
+        reload_kwargs["sgld_options"]["worker_patches"] = patches
         set_model_type = plugin.get("model_type")
         if set_model_type in NATIVE_MODEL_TYPES:
             raise ValueError(
@@ -605,8 +620,10 @@ class SGLDiffusionGenerator:
             "set_model_type": set_model_type,
             "runtime_model_path": runtime_model_path,
             "int8_kernel": plugin.get("int8_kernel", "auto"),
+            "worker_patch_identity": patches,
         }
         if self._can_reuse(gather_options):
+            validate_options(patches, self.model_type, {**sgld_options, **plugin})
             check_model_options(
                 self.model_type, {**sgld_options, **plugin}, native_dir=native_dir
             )
@@ -624,6 +641,7 @@ class SGLDiffusionGenerator:
         check_model_options(
             model_type, {**sgld_options, **plugin}, native_dir=native_dir
         )
+        validate_options(patches, model_type, {**sgld_options, **plugin})
         if model_type == "fast_h3":
             load_fasth3_release(runtime_model_path)
         if model_type == "minimax_h3":
@@ -645,7 +663,10 @@ class SGLDiffusionGenerator:
         )
         with _worker_env(worker_env):
             self.generator = self.init_generator(
-                worker_model_path, pipeline_class_name, sgld_options
+                worker_model_path,
+                pipeline_class_name,
+                sgld_options,
+                worker_patches=patches,
             )
         self.model_type = model_type
 

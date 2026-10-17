@@ -158,3 +158,56 @@ def test_h3_dynamic_lora_rejected():
 
     with pytest.raises(ValueError, match="LoRA"):
         _reject_lora("adapter")
+
+
+@pytest.fixture
+def options_module():
+    # Load the schema without importing ComfyUI's node/runtime dependencies.
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(patches.__file__).parent.parent / "ComfyUI_SGLDiffusion/options.py"
+    spec = importlib.util.spec_from_file_location("sgld_options_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_alignment_default_preserves_existing_options(options_module):
+    node = options_module.SGLDOptions()
+    options = node.create_options()[0]
+    assert options == node.create_options(alignment_mode="default")[0]
+    assert "worker_patches" not in options
+    assert "attention_backend" not in options
+
+
+def test_comfyui_mode_auto_attention_is_valid_for_h3(options_module):
+    options = options_module.SGLDOptions().create_options(alignment_mode="comfyui")[0]
+    assert options["worker_patches"] == ["h3_comfyui_v1"]
+    assert options["attention_backend"] == "torch_sdpa"
+    patches.validate_options(options["worker_patches"], "minimax_h3", options)
+
+
+def test_comfyui_mode_preserves_and_rejects_explicit_attention(options_module):
+    options = options_module.SGLDOptions().create_options(
+        alignment_mode="comfyui", attention_backend="flash_attention"
+    )[0]
+    assert options["attention_backend"] == "fa"
+    with pytest.raises(ValueError, match="torch_sdpa"):
+        patches.validate_options(options["worker_patches"], "minimax_h3", options)
+
+
+def test_unknown_alignment_mode_rejected(options_module):
+    with pytest.raises(ValueError, match="alignment_mode"):
+        options_module.SGLDOptions().create_options(alignment_mode="typo")
+
+
+def test_legacy_widget_positions_preserved(options_module):
+    legacy = (
+        "model_type num_gpus parallel_mode tp_size ulysses_degree ring_degree "
+        "attention_backend attention_backend_config quantization int8_gemm "
+        "cache_mode cache_dit_tuning cache_warmup_steps cache_threshold "
+        "cache_max_cached_steps cache_fn_blocks execution_mode regional_compile "
+        "memory_mode resident_layers prefetch_layers"
+    ).split()
+    assert list(options_module._FIELDS) == legacy + ["alignment_mode"]
