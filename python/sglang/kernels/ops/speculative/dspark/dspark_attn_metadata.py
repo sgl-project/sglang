@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import is_sm120_supported
 
 
 class DsparkWindowGather(msgspec.Struct, frozen=True):
@@ -228,6 +229,20 @@ def compute_dspark_window_gather_triton(
     )
 
 
+# FlashInfer's SM120 sparse-MLA prefill instantiates only these widths and aborts on
+# anything else; DSPARK's swa_window + block_size lands on 192. Widen to the next
+# instantiated width -- the padded tail is -1 and masked per row via topk_length.
+# 128 must stay: it is the only width the DSv4 dual (SWA extra-cache) dispatch
+# instantiates, and widening it breaks MTP.
+_SM120_INDEX_WIDTHS = (128, 512, 1024, 2048)
+
+
+def _sm120_index_width(width: int) -> int:
+    if width in _SM120_INDEX_WIDTHS or not is_sm120_supported():
+        return width
+    return next((w for w in _SM120_INDEX_WIDTHS if w > width), width)
+
+
 def build_dspark_swa_page_indices(
     *,
     req_to_token: torch.Tensor,
@@ -260,7 +275,9 @@ def build_dspark_swa_page_indices(
     block_full_locs = out_loc[: bs * block_size].view(bs, block_size)
     block_swa_locs = full_to_swa_mapping[block_full_locs].to(torch.int32)
 
-    target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
+    target_width = _sm120_index_width(
+        ceil_align(swa_window + block_size, page_index_aligned_size)
+    )
 
     swa_page_indices = _compact_dspark_window_then_block(
         window_swa_locs=window_swa_locs,
@@ -386,7 +403,9 @@ def build_dspark_swa_page_indices_triton(
     out_loc = out_loc[: bs * block_size].contiguous()
     context_lens = context_lens.to(device=device, dtype=torch.int32).contiguous()
     rt_stride = req_to_token.stride(0)
-    target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
+    target_width = _sm120_index_width(
+        ceil_align(swa_window + block_size, page_index_aligned_size)
+    )
     n_q = bs * block_size
     swa_page_indices = torch.empty(
         (n_q, target_width), dtype=torch.int32, device=device
