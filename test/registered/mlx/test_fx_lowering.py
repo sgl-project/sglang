@@ -248,7 +248,7 @@ def test_same_mlx_executor_runs_real_sglang_mlp_architectures(architecture):
             if architecture == "qwen3":
                 model = Qwen3MLP(8, 16, "silu")
             else:
-                model = LlamaMLP(8, 16, "silu", tp_rank=0, tp_size=1)
+                model = LlamaMLP(8, 16, "silu")
             model = model.to(device="mps", dtype=torch.bfloat16).eval()
             with torch.no_grad():
                 for parameter in model.parameters():
