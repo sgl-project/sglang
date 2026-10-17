@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -54,6 +56,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_gfx1250_supported,
     is_hip,
     is_xpu,
     next_power_of_2,
@@ -75,6 +78,29 @@ if TYPE_CHECKING:
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_mla_decode_fwd():
+    """aiter's gfx1250 Gluon MLA decode, or None where it cannot be used.
+
+    Before aiter #5935 the kernel writes its segment softmax state over the
+    output whenever a batch runs one segment per sequence (bs >= 97 on 96 CUs).
+    """
+    if not (_is_hip and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()):
+        return None
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention import (
+            mla as gluon_mla_kernels,
+        )
+        from aiter.ops.triton.attention.mla import mla_decode_fwd
+
+        src = inspect.getsource(gluon_mla_kernels)
+    except (ImportError, OSError):
+        return None
+    if "if NUM_SEGMENTS_PER_SEQ > 1:" not in src:
+        return None
+    return mla_decode_fwd
 
 
 def _mla_decode_kv_splits_cap(
@@ -365,6 +391,42 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
+
+        # aiter's Gluon MLA decode reads the KV pool as pages, so it needs a
+        # paged pool (>= 16 tokens per page) and the plain causal MLA case.
+        self.gluon_mla_decode_fwd = None
+        if (
+            self.use_mla
+            and self.page_size >= 16
+            and self.page_size & (self.page_size - 1) == 0
+            and self.dcp_size == 1
+            and not self.enable_deterministic
+            and self.sliding_window_size is None
+            and not self.use_sliding_window_kv_pool
+        ):
+            kv_buffer = self.token_to_kv_pool.get_key_buffer(
+                self.token_to_kv_pool.start_layer
+            )
+            if (
+                kv_buffer.dim() == 3
+                and kv_buffer.shape[1] == 1
+                and kv_buffer.shape[0] % self.page_size == 0
+                and kv_buffer.is_contiguous()
+            ):
+                self.gluon_mla_decode_fwd = _gluon_mla_decode_fwd()
+        if self.gluon_mla_decode_fwd is not None:
+            self.gluon_first_layer_id = self.token_to_kv_pool.start_layer
+            self.gluon_kv_lora_rank = mla_config.kv_lora_rank
+            self.gluon_rope_head_dim = mla_config.qk_rope_head_dim
+            self.gluon_page_starts = torch.arange(
+                0, self.req_to_token.shape[1], self.page_size, device=self.device
+            )
+            self.gluon_kv_descale_one = torch.ones(
+                1, dtype=torch.float32, device=self.device
+            )
+            self.gluon_block_tables = None
+            self.gluon_seq_lens = None
+            self.gluon_cu_seqlens_q = None
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -2372,6 +2434,20 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        if (
+            self.gluon_mla_decode_fwd is not None
+            and forward_batch.spec_info is None
+            and sinks is None
+            and score_mod is None
+            and logits_soft_cap == 0
+            and (layer.xai_temperature_len is None or layer.xai_temperature_len <= 0)
+            and (layer.sliding_window_size is None or layer.sliding_window_size < 0)
+            and layer.qk_head_dim == self.gluon_kv_lora_rank + self.gluon_rope_head_dim
+            and layer.v_head_dim == self.gluon_kv_lora_rank
+        ):
+            self._gluon_mla_decode(q=q, o=o, layer=layer, forward_batch=forward_batch)
+            return o
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -2401,6 +2477,61 @@ class TritonAttnBackend(AttentionBackend):
             lean_locks=self.forward_metadata.lean_locks,
         )
         return o
+
+    def _gluon_mla_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        # Page table and lengths are per forward, not per layer: build them at
+        # the first layer from the same (graph-static) batch tensors the Triton
+        # path reads, so CUDA graph replay refreshes them too.
+        if (
+            layer.layer_id == self.gluon_first_layer_id
+            or self.gluon_block_tables is None
+        ):
+            bs = forward_batch.batch_size
+            self.gluon_block_tables = (
+                self.req_to_token[
+                    forward_batch.req_pool_indices[:bs, None],
+                    self.gluon_page_starts[None, :],
+                ]
+                // self.page_size
+            )
+            self.gluon_seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
+            self.gluon_cu_seqlens_q = torch.arange(
+                bs + 1, dtype=torch.int32, device=q.device
+            )
+        kv_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_buffer = kv_buffer.view(
+            -1, self.page_size, kv_buffer.shape[-2], kv_buffer.shape[-1]
+        )
+        if kv_buffer.dtype == torch.bfloat16:
+            kv_descale = None
+        elif layer.k_scale is not None:
+            kv_descale = layer.k_scale
+        else:
+            kv_descale = self.gluon_kv_descale_one
+        self.gluon_mla_decode_fwd(
+            q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            kv_buffer=kv_buffer,
+            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            cu_seqlens_q=self.gluon_cu_seqlens_q,
+            seqused_k=self.gluon_seq_lens,
+            # 0: the kernel sizes its KV split from a fixed guess, which keeps
+            # CUDA graph replay valid for any sequence length.
+            max_seqlen_kv=0,
+            block_tables=self.gluon_block_tables,
+            softmax_scale=layer.scaling,
+            kv_lora_rank=self.gluon_kv_lora_rank,
+            qk_rope_head_dim=self.gluon_rope_head_dim,
+            causal=True,
+            q_descale=None,
+            kv_descale=kv_descale,
+        )
 
 
 class TritonMultiStepDraftBackend:
