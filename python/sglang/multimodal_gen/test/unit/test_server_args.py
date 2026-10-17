@@ -394,11 +394,27 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
 
     def test_fasth3_selects_vsa_h3_for_the_transformer(self):
         for capability in ((8, 0), (9, 0), (10, 0), (10, 3)):
-            with self.subTest(capability=capability):
+            # Check configuration selection without importing a GPU backend.
+            with (
+                self.subTest(capability=capability),
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+                ) as get_attn_backend,
+            ):
                 args = self._fasth3_args(capability)
                 self.assertEqual(
                     args.component_attention_backends,
                     {"transformer": "video_sparse_attn_h3"},
+                )
+                get_attn_backend.assert_called_once()
+                self.assertEqual(
+                    get_attn_backend.call_args.kwargs["selected_attention_backend"],
+                    AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
+                )
+                self.assertTrue(
+                    get_attn_backend.call_args.kwargs[
+                        "attention_requirements"
+                    ].packed_varlen
                 )
 
     def test_fasth3_keeps_a_requested_or_incompatible_transformer_backend(self):
