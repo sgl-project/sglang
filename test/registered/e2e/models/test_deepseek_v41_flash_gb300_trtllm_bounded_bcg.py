@@ -23,7 +23,9 @@ class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):
         "4",
         "--dsv4-attn-backend",
         "trtllm",
-        "--enable-decoder-swa-bounded-replay",
+    ]
+    max_running_requests = "64"
+    graph_args = [
         "--cuda-graph-backend-prefill",
         "breakable",
         "--cuda-graph-max-bs-prefill",
