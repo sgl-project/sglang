@@ -1,10 +1,12 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=126, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=141, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -93,6 +95,42 @@ class TestBatchingFDFO(CustomTestCase):
                 self.assertGreater(speed, 10)
             else:
                 self.assertGreater(speed, 250)
+
+    def _completion(self, prompt: str, **sampling_params) -> str:
+        response = requests.post(
+            f"{self.base_url}/v1/completions",
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "max_tokens": 128,
+                **sampling_params,
+            },
+            timeout=120,
+        )
+        return response.json()["choices"][0]["text"]
+
+    def test_sampling_params_reach_the_denoise_step(self):
+        """Regression: dLLM decoding accepted temperature/top_p and ignored them.
+
+        The denoise step reads its sampling params off the ForwardBatch rather
+        than a dedicated field, so a refactor of dLLM batch construction can stop
+        populating them and leave every request silently greedy again. Greedy is
+        reproduced first, so a difference is attributable to the params and not to
+        run-to-run nondeterminism.
+        """
+        prompt = "Question: Why is the sea salty? Answer:"
+        greedy = self._completion(prompt, temperature=0)
+        self.assertEqual(
+            self._completion(prompt, temperature=0),
+            greedy,
+            "greedy dLLM decoding must be reproducible for this test to mean "
+            "anything; a mismatch here invalidates the comparison below.",
+        )
+        self.assertNotEqual(
+            self._completion(prompt, temperature=1.0, top_p=0.95),
+            greedy,
+            "temperature and top_p must change dLLM output, not be dropped.",
+        )
 
 
 if __name__ == "__main__":

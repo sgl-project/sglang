@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Optional
 
 import numpy as np
 import torch
@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.sampling import DllmSamplingPlan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_npu
 
@@ -18,6 +19,7 @@ def joint_threshold_update_step_vectorized(
     prompt_masks: torch.Tensor,  # [B, blk]
     finished: torch.Tensor,  # [B]
     post_edit_steps: torch.Tensor,  # [B]
+    plan: Optional[DllmSamplingPlan],
     mask_id: int,
     blk: int,
     threshold: float,
@@ -60,6 +62,36 @@ def joint_threshold_update_step_vectorized(
         -1
     )
 
+    unsettled = None
+    if plan is not None:
+        sampled_rows = plan.sampled_rows
+        row_logits = logits[sampled_rows].view(-1, V)
+        req_ids = sampled_rows.repeat_interleave(blk)
+        tokens, conf = plan.sample(
+            logits=row_logits,
+            req_ids=req_ids,
+            argmax_probs=p[sampled_rows].reshape(-1),
+        )
+        x = x.index_copy(0, sampled_rows, tokens.view(-1, blk).to(x.dtype))
+        p = p.index_copy(0, sampled_rows, conf.view(-1, blk).to(p.dtype))
+        # Redrawing every step means "the token changed" is always true, so T2T
+        # needs a fixed point of its own: stop editing a position once the token
+        # sitting there is itself a plausible draw. Only the relative half of the
+        # commit test applies -- the argmax half asks whether to decide the
+        # position, which post-edit has already done.
+        unsettled = torch.ones_like(input_ids, dtype=torch.bool).index_copy(
+            0,
+            sampled_rows,
+            (
+                plan.confidence(
+                    logits=row_logits,
+                    req_ids=req_ids,
+                    token_ids=input_ids[sampled_rows].reshape(-1),
+                )
+                < threshold
+            ).view(-1, blk),
+        )
+
     mask_pos = input_ids.eq(mask_id)
     has_mask = mask_pos.any(dim=1)
 
@@ -92,6 +124,8 @@ def joint_threshold_update_step_vectorized(
     # ---------- T2T ----------
     edit_mask = (~mask_pos) & (~prompt_masks)
     t2t = (p > edit_threshold) & (input_ids != x) & edit_mask
+    if unsettled is not None:
+        t2t = t2t & unsettled
     t2t = t2t & eligible.view(B, 1)
 
     # ---------- combine ----------
@@ -190,6 +224,7 @@ class JointThreshold(DllmAlgorithm):
             prompt_masks=shared["prompt_masks"],
             finished=shared["finished"],
             post_edit_steps=shared["post_edit_steps"],
+            plan=DllmSamplingPlan.maybe_build(forward_batch.sampling_info),
             mask_id=self.mask_id,
             blk=self.block_size,
             threshold=self.threshold,
@@ -226,6 +261,7 @@ class JointThreshold(DllmAlgorithm):
             prompt_masks=prompt_masks,
             finished=finished,
             post_edit_steps=post_edit_steps,
+            plan=DllmSamplingPlan.maybe_build(forward_batch.sampling_info),
             mask_id=self.mask_id,
             blk=self.block_size,
             threshold=self.threshold,
@@ -249,6 +285,7 @@ class JointThreshold(DllmAlgorithm):
     ) -> List[bool]:
         batch_size = forward_batch.batch_size
         done: List[bool] = []
+        plan = DllmSamplingPlan.maybe_build(forward_batch.sampling_info)
 
         for i in range(batch_size):
             state = states[i]
@@ -271,12 +308,20 @@ class JointThreshold(DllmAlgorithm):
             x = torch.argmax(curr_logits, dim=-1)
             p = torch.squeeze(
                 torch.gather(
-                    F.softmax(curr_logits, dim=-1),
-                    dim=-1,
-                    index=torch.unsqueeze(x, -1),
+                    F.softmax(curr_logits, dim=-1), dim=-1, index=torch.unsqueeze(x, -1)
                 ),
                 -1,
             )
+
+            samples_row = plan is not None and plan.row_samples[i]
+            if samples_row:
+                req_ids = torch.full(
+                    (self.block_size,), i, dtype=torch.int64, device=curr_logits.device
+                )
+                tokens, conf = plan.sample(
+                    logits=curr_logits, req_ids=req_ids, argmax_probs=p
+                )
+                x, p = tokens.to(x.dtype), conf.to(p.dtype)
 
             mask_index = curr_input_ids == self.mask_id
             has_mask = mask_index.any()
@@ -302,6 +347,21 @@ class JointThreshold(DllmAlgorithm):
                 edit_transfer_index = (
                     (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
                 )
+                if samples_row:
+                    # Redrawing every step means "the token changed" is always
+                    # true, so T2T needs a fixed point of its own: stop editing a
+                    # position once the token sitting there is a plausible draw.
+                    # Only the relative half of the commit test applies -- the
+                    # argmax half asks whether to decide the position, which
+                    # post-edit has already done.
+                    edit_transfer_index = edit_transfer_index & (
+                        plan.confidence(
+                            logits=curr_logits,
+                            req_ids=req_ids,
+                            token_ids=curr_input_ids,
+                        )
+                        < self.threshold
+                    )
                 transfer_index = mask_transfer_index | edit_transfer_index
                 if transfer_index.any():
                     curr_input_ids[transfer_index] = x[transfer_index]
