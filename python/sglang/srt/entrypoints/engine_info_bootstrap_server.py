@@ -14,7 +14,7 @@
 
 import logging
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -28,25 +28,19 @@ logger = logging.getLogger(__name__)
 class EngineInfoBootstrapServer:
     """Lightweight HTTP server for per-rank model info registration.
 
-    Runs in a daemon thread on node_rank==0. Each ModelRunner registers its
-    info via HTTP PUT after model initialization. The Engine
-    accesses the collected info directly in-process; external consumers can
-    query via HTTP GET.
-
-    Currently supports transfer engine memory registration info and
-    per-rank parallelism configuration. Each model runner of a rank registers
-    under its weight-update role (``target``, or a draft role such as ``draft``),
-    so a speculative draft never replaces its target's entry.
+    Runs in a daemon thread on node_rank==0. Each ModelRunner registers one rank-info record via HTTP PUT after
+    model initialization: its parallelism config and, when its weights are registered with a transfer engine, their
+    locations and the session to reach them. External consumers query via HTTP GET. Each model runner of a rank
+    registers under its weight-update role (``target``, or a draft role such as ``draft``), so a speculative draft
+    never replaces its target's entry.
     """
 
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
 
-        # Storage: {(role, tp_rank): (session_id, weights_info_dict)}
-        self.transfer_engine_info: Dict[Tuple[str, int], Tuple] = {}
-        # Storage: {(role, tp_rank): parallelism_config_dict}
-        self.parallelism_config: Dict[Tuple[str, int], dict] = {}
+        # {(role, tp_rank): {"parallelism_config", "weight_locations", "transfer_session_id"}}
+        self.rank_info: Dict[Tuple[str, int], dict] = {}
         self.lock = threading.Lock()
 
         app = FastAPI(**fastapi_telemetry_disabled_kwargs())
@@ -55,83 +49,66 @@ class EngineInfoBootstrapServer:
         def health():
             return PlainTextResponse("OK")
 
-        @app.put("/register_transfer_engine_info")
-        def register_transfer_engine_info(data: dict):
+        @app.put("/register_rank_info")
+        def register_rank_info(data: dict):
             try:
                 role = data["role"]
                 tp_rank = data["tp_rank"]
-                info = data["transfer_engine_info"]
-                session_id = info["session_id"]
-                weights_info_dict = info["weights_info_dict"]
-
+                rank_info = data["rank_info"]
                 with self.lock:
-                    self.transfer_engine_info[(role, tp_rank)] = (
-                        session_id,
-                        weights_info_dict,
-                    )
-
+                    self.rank_info[(role, tp_rank)] = rank_info
                 logger.info(
-                    f"Registered transfer engine info for role={role} tp_rank={tp_rank}, "
-                    f"session_id={session_id}"
+                    f"Registered rank info for role={role} tp_rank={tp_rank}, "
+                    f"transfer_session_id={rank_info['transfer_session_id']}"
                 )
                 return PlainTextResponse("OK")
             except Exception as e:
-                logger.error(f"Failed to register engine info: {e}")
+                logger.error(f"Failed to register rank info: {e}")
                 raise HTTPException(status_code=400, detail=str(e))
+
+        def get_or_404(rank: int, role: str) -> dict:
+            if rank < 0:
+                raise HTTPException(status_code=400, detail="Invalid rank parameter")
+            with self.lock:
+                rank_info = self.rank_info.get((role, rank))
+            if rank_info is None:
+                raise HTTPException(
+                    status_code=404, detail=f"No rank info for role {role} rank {rank}"
+                )
+            return rank_info
+
+        @app.get("/get_rank_info")
+        def get_rank_info(rank: int, role: str = "target"):
+            return get_or_404(rank, role)
 
         @app.get("/get_transfer_engine_info")
         def get_transfer_engine_info(rank: int, role: str = "target"):
-            if rank < 0:
-                raise HTTPException(status_code=400, detail="Invalid rank parameter")
-
-            with self.lock:
-                info = self.transfer_engine_info.get((role, rank))
-
-            if info is None:
+            rank_info = get_or_404(rank, role)
+            if rank_info["transfer_session_id"] is None:
                 raise HTTPException(
                     status_code=404,
                     detail=f"No transfer engine info for role {role} rank {rank}",
                 )
-
-            return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
-
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-        self._server = uvicorn.Server(config)
-
-        @app.put("/register_parallelism_config")
-        def register_parallelism_config(data: dict):
-            try:
-                role = data["role"]
-                tp_rank = data["tp_rank"]
-                config = data["parallelism_config"]
-
-                with self.lock:
-                    self.parallelism_config[(role, tp_rank)] = config
-
-                logger.info(
-                    f"Registered parallelism config for role={role} tp_rank={tp_rank}"
-                )
-                return PlainTextResponse("OK")
-            except Exception as e:
-                logger.error(f"Failed to register parallelism config: {e}")
-                raise HTTPException(status_code=400, detail=str(e))
+            return {
+                "rank": rank,
+                "remote_instance_transfer_engine_info": [
+                    rank_info["transfer_session_id"],
+                    rank_info["weight_locations"],
+                ],
+            }
 
         @app.get("/get_parallelism_config")
         def get_parallelism_config(rank: int, role: str = "target"):
-            if rank < 0:
-                raise HTTPException(status_code=400, detail="Invalid rank parameter")
-
-            with self.lock:
-                config = self.parallelism_config.get((role, rank))
-
-            if config is None:
+            rank_info = get_or_404(rank, role)
+            if rank_info["parallelism_config"] is None:
                 raise HTTPException(
                     status_code=404,
                     detail=f"No parallelism config for role {role} rank {rank}",
                 )
+            return rank_info["parallelism_config"]
 
-            return config
-
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        self._server = uvicorn.Server(config)
         self._thread = threading.Thread(
             target=self._server.run,
             daemon=True,
@@ -142,15 +119,3 @@ class EngineInfoBootstrapServer:
     def close(self):
         self._server.should_exit = True
         self._thread.join(timeout=5)
-
-    def get_transfer_engine_info(
-        self, rank: int, role: str = "target"
-    ) -> Optional[Tuple]:
-        """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
-        return self.transfer_engine_info.get((role, rank))
-
-    def get_parallelism_config_info(
-        self, rank: int, role: str = "target"
-    ) -> Optional[dict]:
-        """Direct in-process access for parallelism config (no HTTP round-trip)."""
-        return self.parallelism_config.get((role, rank))

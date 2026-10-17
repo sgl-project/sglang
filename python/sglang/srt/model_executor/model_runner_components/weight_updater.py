@@ -327,15 +327,15 @@ class WeightUpdater:
     def _assert_published_storage_unmoved(self: WeightUpdater) -> None:
         """Peers write weight updates straight into the addresses this rank published at startup (p2p), so a
         weight-update session must leave every published parameter's storage where it was."""
-        published_weight_info = (
-            self.get_model_runner().remote_instance_weight_transporter.weight_info
+        published_weight_locations = (
+            self.get_model_runner().remote_instance_weight_transporter.weight_locations
         )
         # nothing published: nobody writes by address
-        if published_weight_info is None:
+        if published_weight_locations is None:
             return
         params = dict(self.get_model().named_parameters())
         moved = []
-        for name, (address, numel, element_size) in published_weight_info.items():
+        for name, (address, numel, element_size) in published_weight_locations.items():
             param = params.get(name)
             now = (
                 None
