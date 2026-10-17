@@ -78,17 +78,17 @@ async fn model_info(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// `GET /server_info` — serialize typed, allowlisted runtime metrics plus
-/// curated launch metadata. The raw scheduler state embeds
-/// `api_key`/`admin_api_key` and is never visible to this HTTP adapter.
-///
-/// TODO(server_info): Python also includes `kv_events`; add once plumbed.
+/// `GET /server_info` — Python's launch-time fields (resolved `server_args`,
+/// `launch_command`, scheduler init info, `kv_events`), as Python reports
+/// them, beneath the runtime's startup timings, typed allowlisted scheduler
+/// metrics and launch metadata. The raw scheduler state is never visible to
+/// this HTTP adapter.
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let info = match await_server_info(&state).await {
         Ok(info) => info,
         Err(resp) => return resp,
     };
-    match serde_json::to_vec(&info) {
+    match info.to_json().and_then(|body| serde_json::to_vec(&body)) {
         Ok(json) => (StatusCode::OK, [("content-type", "application/json")], json).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "server_info: shaping failed");
@@ -378,6 +378,12 @@ mod tests {
         kvcache: rmpv::Value,
         expected_kvcache: serde_json::Value,
     ) {
+        let launch_fields = serde_json::json!({
+            "model_path": "/model",
+            "tp_size": 4,
+            "max_total_num_tokens": 1,
+            "launch_command": "launch --tp-size 4",
+        });
         let (state, intake_rx, abort_rx) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
@@ -388,6 +394,9 @@ mod tests {
             },
             max_total_num_tokens: 8192,
             version: "1.2.3".into(),
+            launch_server_info: crate::message::config::LaunchServerInfo(Arc::new(
+                launch_fields.as_object().unwrap().clone(),
+            )),
             ..Default::default()
         });
         let request = tokio::spawn(
@@ -426,6 +435,13 @@ mod tests {
                 rmpv::Value::from(1.5),
             ),
             (
+                rmpv::Value::from("rust_server_startup_time"),
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::from("load_weight"), rmpv::Value::from(1.5)),
+                    (rmpv::Value::from("tokenizer_e2e"), rmpv::Value::from(9.0)),
+                ]),
+            ),
+            (
                 rmpv::Value::from("memory_usage"),
                 rmpv::Value::Map(vec![
                     (rmpv::Value::from("kvcache"), kvcache),
@@ -456,6 +472,36 @@ mod tests {
 
         let response = request.await.unwrap().unwrap();
         let body = response_json(response).await;
+        // Python's launch-time fields come first, in order; a runtime field
+        // replaces a launch-time one in place, and the rest follow.
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys[..5],
+            [
+                "model_path",
+                "tp_size",
+                "max_total_num_tokens",
+                "launch_command",
+                "served_model_name"
+            ]
+        );
+        assert_eq!(body["tp_size"], 4);
+        assert_eq!(body["launch_command"], "launch --tp-size 4");
+        // The embedded server's startup timings move to the top level.
+        assert_eq!(
+            body["startup_time"],
+            serde_json::json!({"load_weight": 1.5, "tokenizer_e2e": 9.0})
+        );
+        assert!(
+            body["internal_states"][0]
+                .get("rust_server_startup_time")
+                .is_none()
+        );
         assert_eq!(body["model_path"], "/model");
         assert_eq!(body["served_model_name"], "served");
         assert_eq!(body["tokenizer_path"], "/tokenizer");
