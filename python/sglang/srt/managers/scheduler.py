@@ -3896,6 +3896,11 @@ class Scheduler(
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
 
+        # A waiting turn must find the finished turn it continues in the tree.
+        self.batch_result_processor.release_deferred_kv_caches_continued_by(
+            self.waiting_queue
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
@@ -4399,6 +4404,9 @@ class Scheduler(
             return batch
 
         kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and self.batch_result_processor.deferred_kv_releases:
+            self.batch_result_processor.release_deferred_kv_caches()
+            kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
@@ -5153,6 +5161,7 @@ class Scheduler(
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        self.batch_result_processor.release_deferred_kv_caches()
         self.dp_attn_adapter.drop_sync_wait_carry()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
@@ -5261,6 +5270,7 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            and not self.batch_result_processor.deferred_kv_releases
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)

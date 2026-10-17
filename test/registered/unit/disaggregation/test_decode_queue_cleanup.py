@@ -1,4 +1,5 @@
 import unittest
+from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -518,6 +519,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.batch_result_processor = MagicMock(deferred_kv_releases=deque())
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
         scheduler.chunked_req = None
