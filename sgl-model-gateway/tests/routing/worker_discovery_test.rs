@@ -10,7 +10,92 @@ use crate::common::{
 
 #[cfg(test)]
 mod worker_discovery_tests {
+    use axum::{
+        http::{HeaderMap, StatusCode},
+        routing::get,
+        Router,
+    };
+    use smg::{
+        core::{
+            steps::{create_local_worker_workflow_data, DetectConnectionModeStep},
+            ConnectionMode,
+        },
+        protocols::worker_spec::WorkerConfigRequest,
+    };
+    use tokio::net::TcpListener;
+    use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowInstanceId};
+
     use super::*;
+
+    async fn detect_worker_connection(
+        required_key: Option<&str>,
+        api_key: Option<&str>,
+    ) -> (Result<StepResult, WorkflowError>, Option<ConnectionMode>) {
+        let expected_auth = required_key.map(|key| format!("Bearer {key}"));
+        let app = Router::new().route(
+            "/health",
+            get(move |headers: HeaderMap| {
+                let expected_auth = expected_auth.clone();
+                async move {
+                    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                    if auth == expected_auth.as_deref() {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let router_config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .api_key("router-key")
+            .build_unchecked();
+        let app_context = create_test_context(router_config).await;
+        let config: WorkerConfigRequest = serde_json::from_value(serde_json::json!({
+            "url": url,
+            "api_key": api_key,
+            "health_check_timeout_secs": 1,
+        }))
+        .unwrap();
+        let data = create_local_worker_workflow_data(config, app_context);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        let result = DetectConnectionModeStep.execute(&mut context).await;
+
+        server.abort();
+        let _ = server.await;
+        (result, context.data.connection_mode)
+    }
+
+    /// A worker protecting /health must be detected as HTTP with its own key;
+    /// missing or incorrect credentials must leave connection detection failed.
+    #[tokio::test]
+    async fn test_connection_detection_with_worker_api_key() {
+        for key in [Some("worker-key"), None, Some("wrong-key")] {
+            let (result, mode) = detect_worker_connection(Some("worker-key"), key).await;
+            if key == Some("worker-key") {
+                assert_eq!(result.unwrap(), StepResult::Success);
+                assert_eq!(mode, Some(ConnectionMode::Http));
+            } else {
+                let WorkflowError::StepFailed { message, .. } = result.unwrap_err() else {
+                    panic!("Expected a connection detection failure");
+                };
+                assert!(message.contains("401"), "{message}");
+                assert_eq!(mode, None);
+            }
+        }
+    }
+
+    /// A worker without a key must remain reachable without inheriting the router key.
+    #[tokio::test]
+    async fn test_connection_detection_without_worker_api_key() {
+        let (result, mode) = detect_worker_connection(None, None).await;
+        assert_eq!(result.unwrap(), StepResult::Success);
+        assert_eq!(mode, Some(ConnectionMode::Http));
+    }
 
     /// Normal path: model name is discovered from /server_info.
     #[tokio::test]
