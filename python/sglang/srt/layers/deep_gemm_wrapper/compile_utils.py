@@ -5,6 +5,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -115,6 +116,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
+    GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
 
 
@@ -269,6 +271,9 @@ class _BaseWarmupExecutor:
     def create(kernel_type: DeepGemmKernelType, **kwargs):
         return {
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
+                _NormalWarmupExecutor, block_size=32
+            ),
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
@@ -282,8 +287,17 @@ class _BaseWarmupExecutor:
     ) -> float:
         # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
-        lhs_scales = max_m * ceil_div(k, _BLOCK_SIZE) * 4
-        rhs_scales = ceil_div(n, _BLOCK_SIZE) * ceil_div(k, _BLOCK_SIZE) * 4
+        is_dense_fp8 = kernel_type in (
+            DeepGemmKernelType.GEMM_NT_F8F8BF16,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
+        )
+        block_size = (
+            32
+            if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
+            else _BLOCK_SIZE
+        )
+        lhs_scales = max_m * ceil_div(k, block_size) * 4
+        rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
         scale_workspace = _get_fp8_scale_workspace(
             max_m,
             n,
@@ -293,11 +307,10 @@ class _BaseWarmupExecutor:
                 if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
                 else 1
             ),
-            rhs_groups=(
-                1 if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16 else num_groups
-            ),
+            rhs_groups=1 if is_dense_fp8 else num_groups,
+            block_size=block_size,
         )
-        if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
+        if is_dense_fp8:
             return (
                 max_m * k
                 + n * k
@@ -358,9 +371,9 @@ def _packed_scale_workspace(rows: int, cols: int, groups: int) -> tuple[int, int
 
 
 def _get_fp8_scale_workspace(
-    max_m: int, n: int, k: int, lhs_groups: int, rhs_groups: int
+    max_m: int, n: int, k: int, lhs_groups: int, rhs_groups: int, block_size: int = 128
 ) -> int:
-    scale_k = ceil_div(k, _BLOCK_SIZE)
+    scale_k = ceil_div(k, block_size)
     if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
         return lhs_groups * ceil_align(max_m, 4) * scale_k * 4
     if DEEPGEMM_SCALE_UE8M0:
@@ -373,22 +386,22 @@ def _get_fp8_scale_workspace(
     return 0
 
 
-def _empty_token_fp8(size):
+def _empty_token_fp8(size, block_size=128):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.ones(
-            (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
+            (*dims, ceil_div(k, block_size)), device="cuda", dtype=torch.float32
         ),
     )
 
 
-def _empty_block_fp8(size):
+def _empty_block_fp8(size, block_size=128):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
         torch.ones(
-            (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
+            (*dims, ceil_div(n, block_size), ceil_div(k, block_size)),
             device="cuda",
             dtype=torch.float32,
         ),
@@ -399,9 +412,12 @@ _BLOCK_SIZE = 128
 
 
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
-        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k))
+    def __init__(
+        self, max_m: int, n: int, k: int, num_groups: int, block_size: int = 128
+    ):
+        self.recipe = (1, block_size, block_size)
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), block_size)
+        self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), block_size)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
@@ -409,6 +425,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
+            recipe=self.recipe,
         )
 
 

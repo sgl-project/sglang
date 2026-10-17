@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     install_move_gate,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
@@ -335,33 +336,6 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
-    def bind_swa_for_loaded_rows(
-        self, full_token_ids: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        """Bind SWA pages to resident or newly loaded full-attention virtual IDs.
-
-        Bind before translating: unbound pages translate to the padding sink.
-        Return physical IDs, or None if capacity cannot be reclaimed.
-        """
-        ids = full_token_ids.to(torch.int64)
-        if ids.numel() == 0:
-            return ids
-        ps = self.page_size
-        pages = torch.unique(ids // ps)
-        # Tombstones (-1) and the padding sink (0) both need a physical binding.
-        unbound = pages[self.swa_attn_allocator.virtual_to_physical[pages] <= 0]
-        need = int(unbound.numel()) * ps
-        if need:
-            if need > self.swa_available_size():
-                return None
-            if (
-                need > self.swa_attn_allocator.available_size()
-                and not _relieve_for_alloc(self.swa_attn_allocator, need)
-            ):
-                return None
-            self.swa_attn_allocator.alloc_with_virtual(unbound)
-        return self.translate_loc_from_full_to_swa(ids)
-
     def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
         """Block page relocation while host transfers use resolved device indices."""
         install_move_gate(
@@ -371,6 +345,11 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             feature="HiCache",
             lazy_compaction=self.lazy_compaction,
         )
+
+    def prewarm_compaction(self) -> None:
+        """Prewarm the page-move path of every member that compacts."""
+        for allocator in self._move_gate_targets():
+            allocator.prewarm_compaction()
 
     def translate_write_loc(
         self,
@@ -935,12 +914,14 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
+        prefer_swa: bool = False,
     ) -> Optional[Tuple[int, int]]:
         """Return cumulative FULL/SWA eviction targets, or None if impossible.
 
         The tree evicts FULL before SWA. Minimize required SWA reclaim with all
         evictable FULL available, then trim excess FULL reclaim. FULL eviction's
         actual SWA cascade is counted by the tree's shared eviction tracker.
+        With ``prefer_swa``, minimize FULL reclaim first and trim SWA instead.
         """
         if full_tokens < 0 or swa_tokens < 0:
             return None
@@ -989,12 +970,20 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
                     low = mid + 1
             return low
 
-        swa_reclaim_pages = first_fit(
-            max_swa_pages, lambda value: fits(max_full_pages, value)
-        )
-        full_reclaim_pages = first_fit(
-            max_full_pages, lambda value: fits(value, swa_reclaim_pages)
-        )
+        if prefer_swa:
+            full_reclaim_pages = first_fit(
+                max_full_pages, lambda value: fits(value, max_swa_pages)
+            )
+            swa_reclaim_pages = first_fit(
+                max_swa_pages, lambda value: fits(full_reclaim_pages, value)
+            )
+        else:
+            swa_reclaim_pages = first_fit(
+                max_swa_pages, lambda value: fits(max_full_pages, value)
+            )
+            full_reclaim_pages = first_fit(
+                max_full_pages, lambda value: fits(value, swa_reclaim_pages)
+            )
         return (
             full_reclaim_pages * page_size,
             swa_reclaim_pages * page_size,
@@ -1201,12 +1190,19 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
+        # Read per call: storage attach/detach and PD role switches move both leaves.
+        memory = get_memory()
+        prefer_swa = (
+            memory.enable_hierarchical_cache
+            and memory.hicache_storage_backend is not None
+        ) or get_disagg().disaggregation_mode == "decode"
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
         reclaim_plan = self.reclaim_plan(
             num_tokens,
             required_swa,
             full_evictable_tokens=tree_cache.full_evictable_size(),
             swa_evictable_tokens=tree_cache.swa_evictable_size(),
+            prefer_swa=prefer_swa,
         )
         if reclaim_plan is None:
             return

@@ -96,6 +96,11 @@ class TestWarmupMemory(CustomTestCase):
                 (16384, 4096, 7168, 32),  # V3 DP8/EP8 startup OOM shape.
             ):
                 for kernel_type in DeepGemmKernelType:
+                    if (
+                        kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
+                        and architecture != "hopper"
+                    ):
+                        continue  # Native block32 is only dispatched on Hopper.
                     with self.subTest(
                         architecture=architecture, kernel_type=kernel_type, max_m=max_m
                     ):

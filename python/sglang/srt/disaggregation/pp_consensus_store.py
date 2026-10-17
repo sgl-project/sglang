@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
-import pickle
 import queue
 import threading
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional
+from enum import IntEnum
+from typing import Any, Dict, List, Optional, Union
 
+import msgspec
 import zmq
 
 from sglang.srt.utils.network import (
@@ -20,9 +20,27 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
-class _OpKind(Enum):
-    PUT = auto()
-    DELETE = auto()
+class _OpKind(IntEnum):
+    PUT = 1
+    DELETE = 2
+
+
+class _ReplicationOp(msgspec.Struct, array_like=True, frozen=True):
+    """One replicated mutation, msgpack-encoded for the PP0 PULL socket.
+
+    The socket is bound on a routable host address and is unauthenticated, so
+    the wire format must never be pickle and the decoder must reject any
+    message that is not exactly this shape.
+    """
+
+    kind: int
+    rank: int
+    key: Union[int, str]
+    value: Optional[int] = None
+
+
+_encoder = msgspec.msgpack.Encoder()
+_decoder = msgspec.msgpack.Decoder(_ReplicationOp)
 
 
 class PPConsensusStore:
@@ -75,16 +93,22 @@ class PPConsensusStore:
             )
             logger.info("PPConsensusStore connected to %s:%d", host, port)
 
-    def _maybe_replicate_to_rank0(self, op: tuple) -> None:
-        if self._pp_rank > 0:
-            self._replication_queue.put(op)
+    def _maybe_replicate_to_rank0(
+        self, kind: _OpKind, key: Any, value: Optional[int] = None
+    ) -> None:
+        if self._pp_rank == 0:
+            return
+        # Encode on the caller's thread so an unsupported key or value raises
+        # here instead of killing the background sender.
+        op = _ReplicationOp(kind=int(kind), rank=self._pp_rank, key=key, value=value)
+        self._replication_queue.put(_encoder.encode(op))
 
     def pop(self, key: Any, default: Any = None) -> Any:
         with self._cache_lock:
             if key not in self._local_map:
                 return default
             value = self._local_map.pop(key)
-            self._maybe_replicate_to_rank0((_OpKind.DELETE, self._pp_rank, key))
+            self._maybe_replicate_to_rank0(_OpKind.DELETE, key)
         return value
 
     def get(self, key: Any, default: Any = None) -> Any:
@@ -101,15 +125,15 @@ class PPConsensusStore:
 
     def __setitem__(self, key: Any, value: Any) -> None:
         with self._cache_lock:
+            self._maybe_replicate_to_rank0(_OpKind.PUT, key, value)
             self._local_map[key] = value
-            self._maybe_replicate_to_rank0((_OpKind.PUT, self._pp_rank, key, value))
 
     def __delitem__(self, key: Any) -> None:
         with self._cache_lock:
             if key not in self._local_map:
                 raise KeyError(key)
             self._local_map.pop(key)
-            self._maybe_replicate_to_rank0((_OpKind.DELETE, self._pp_rank, key))
+            self._maybe_replicate_to_rank0(_OpKind.DELETE, key)
 
     def close(self) -> None:
         if self._pp_rank > 0:
@@ -136,18 +160,41 @@ class PPConsensusStore:
         finally:
             self._socket.close(linger=0)
 
+    def _decode(self, raw: bytes) -> Optional[_ReplicationOp]:
+        """Return the op, or None for anything a peer rank could not have sent."""
+        try:
+            op = _decoder.decode(raw)
+        except msgspec.MsgspecError as e:
+            logger.warning(
+                "PPConsensusStore dropped a malformed message (%d bytes): %s",
+                len(raw),
+                e,
+            )
+            return None
+        if not (0 < op.rank < self._pp_size):
+            logger.warning(
+                "PPConsensusStore dropped a message from invalid rank %s", op.rank
+            )
+            return None
+        if op.kind not in (_OpKind.PUT, _OpKind.DELETE):
+            logger.warning(
+                "PPConsensusStore dropped a message with unknown op kind %s", op.kind
+            )
+            return None
+        return op
+
     def _recv_once(self) -> None:
-        op = pickle.loads(self._socket.recv())
-        if op[0] == _OpKind.PUT:
-            _, rank, key, value = op
-            logger.debug("recv put rank=%s %s = %s", rank, key, value)
+        op = self._decode(self._socket.recv())
+        if op is None:
+            return
+        if op.kind == _OpKind.PUT:
+            logger.debug("recv put rank=%s %s = %s", op.rank, op.key, op.value)
             with self._cache_lock:
-                self._peer_map.setdefault(rank, {})[key] = value
-        elif op[0] == _OpKind.DELETE:
-            _, rank, key = op
-            logger.debug("recv delete rank=%s %s", rank, key)
+                self._peer_map.setdefault(op.rank, {})[op.key] = op.value
+        else:
+            logger.debug("recv delete rank=%s %s", op.rank, op.key)
             with self._cache_lock:
-                self._peer_map.get(rank, {}).pop(key, None)
+                self._peer_map.get(op.rank, {}).pop(op.key, None)
 
     def _recv_loop(self) -> None:
         assert self._pp_rank == 0
@@ -157,11 +204,10 @@ class PPConsensusStore:
     def _send_loop(self) -> None:
         assert self._pp_rank > 0
         while True:
-            op = self._replication_queue.get()
-            if op is None:  # A signal for shutdown.
+            encoded = self._replication_queue.get()
+            if encoded is None:  # A signal for shutdown.
                 return
-            logger.debug("send %s", op)
-            self._socket.send(pickle.dumps(op))
+            self._socket.send(encoded)
 
     def collect(self, key: Any) -> List[Any]:
         assert self._pp_rank == 0, "collect can only be used on PP rank 0"

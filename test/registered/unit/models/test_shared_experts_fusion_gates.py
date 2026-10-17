@@ -309,22 +309,6 @@ class TestGlmMoeGate(_FusionGateCase):
         )
         self.assertTrue(reason)
 
-    def test_the_dsa_variant_declares_its_own_architecture(self):
-        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
-
-        self.assertEqual(
-            GlmMoeDsaForCausalLM.fused_shared_experts_architecture,
-            "GlmMoeDsaForCausalLM",
-        )
-
-    def test_the_dsa_nextn_draft_declares_its_own_architecture(self):
-        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
-
-        self.assertEqual(
-            GlmMoeDsaForCausalLMNextN.fused_shared_experts_architecture,
-            "GlmMoeDsaForCausalLMNextN",
-        )
-
     def test_the_dsa_nextn_draft_can_fuse_the_target_layout(self):
         from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
 

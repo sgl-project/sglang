@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -72,6 +73,7 @@ def build_draft_tp_worker(
     attention_backend_override: Optional[str] = None,
     draft_worker_cls: type[TpModelWorker] = TpModelWorker,
     random_seed: Optional[int] = None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
@@ -93,6 +95,7 @@ def build_draft_tp_worker(
             nccl_port=nccl_port,
             is_draft_worker=True,
             random_seed=random_seed,
+            load_group=load_group,
             # The draft runs at absolute target positions.
             context_length=target_model_config.context_len,
             draft_attention_backend=draft_backend,

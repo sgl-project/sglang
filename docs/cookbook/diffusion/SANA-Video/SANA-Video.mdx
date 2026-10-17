@@ -9,7 +9,20 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["video", "text-to-video", "480p", "2B lightweight"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/SANA/sana-video.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [SANA-Video 2B 480p](https://huggingface.co/Efficient-Large-Model/SANA-Video_2B_480p_diffusers)
 is a lightweight text-to-video model served through a native SGLang Diffusion
@@ -25,10 +38,6 @@ from the prompt with an optional `motion score: N.` suffix.
 | Model ID | Task | Default output |
 | --- | --- | --- |
 | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | Text to video | 832x480, 81 frames at 16 FPS |
-
-## 2. Installation
-
-Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Docker is recommended for Linux GPU deployments; run the commands below inside the container or your installed Python environment.
 
 ## 3. Serve SANA-Video
 
