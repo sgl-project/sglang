@@ -42,28 +42,100 @@ def concat_and_cast_mha_k_kernel(
     tl.store(dst_rope_ptr, src_rope)
 
 
+@triton.jit
+def concat_and_cast_mha_k_pad_kernel(
+    k_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    head_cnt: tl.constexpr,
+    k_stride0: tl.constexpr,
+    k_stride1: tl.constexpr,
+    nope_stride0: tl.constexpr,
+    nope_stride1: tl.constexpr,
+    rope_stride0: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+):
+    """
+    concat_and_cast_mha_k_kernel for a head count that is not a power of two.
+    tl.arange needs a power-of-two extent, so walk HEAD_BLOCK == next_power_of_2(head_cnt)
+    lanes and mask the tail.
+    """
+    pid_loc = tl.program_id(0)
+    head_range = tl.arange(0, HEAD_BLOCK)
+    head_mask = head_range < head_cnt
+
+    k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
+
+    nope_offs = tl.arange(0, nope_dim)
+
+    src_nope_ptr = (
+        k_nope_ptr
+        + pid_loc * nope_stride0
+        + head_range[:, None] * nope_stride1
+        + nope_offs[None, :]
+    )
+    dst_nope_ptr = k_head_ptr + nope_offs[None, :]
+
+    nope_mask = tl.broadcast_to(head_mask[:, None], (HEAD_BLOCK, nope_dim))
+    src_nope = tl.load(src_nope_ptr, mask=nope_mask, other=0)
+    tl.store(dst_nope_ptr, src_nope, mask=nope_mask)
+
+    rope_offs = tl.arange(0, rope_dim)
+    src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
+    dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
+    rope_mask = tl.broadcast_to(head_mask[:, None], (HEAD_BLOCK, rope_dim))
+    src_rope = tl.load(src_rope_ptr)
+    tl.store(
+        dst_rope_ptr,
+        tl.broadcast_to(src_rope, (HEAD_BLOCK, rope_dim)),
+        mask=rope_mask,
+    )
+
+
 def concat_and_cast_mha_k_triton(
     k: torch.Tensor,
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
 ):
     # The source data type will be implicitly converted to the target data type.
-    assert (
-        len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3
-    ), f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[0] == k_nope.shape[0] and k.shape[0] == k_rope.shape[0]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[1] == k_nope.shape[1] and 1 == k_rope.shape[1]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[-1] == k_nope.shape[-1] + k_rope.shape[-1]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    assert len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3, (
+        f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
+    assert k.shape[0] == k_nope.shape[0] and k.shape[0] == k_rope.shape[0], (
+        f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
+    assert k.shape[1] == k_nope.shape[1] and 1 == k_rope.shape[1], (
+        f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
+    assert k.shape[-1] == k_nope.shape[-1] + k_rope.shape[-1], (
+        f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    )
 
     nope_dim = k_nope.shape[-1]
     rope_dim = k_rope.shape[-1]
     grid = (k.shape[0],)
+
+    head_cnt = k.shape[1]
+    if head_cnt != triton.next_power_of_2(head_cnt):
+        # Not the power of two concat_and_cast_mha_k_kernel's tl.arange needs;
+        # Kimi-K3's 96 heads give 12 at TP8.
+        concat_and_cast_mha_k_pad_kernel[grid](
+            k,
+            k_nope,
+            k_rope,
+            head_cnt,
+            k.stride(0),
+            k.stride(1),
+            k_nope.stride(0),
+            k_nope.stride(1),
+            k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            HEAD_BLOCK=triton.next_power_of_2(head_cnt),
+        )
+        return
 
     concat_and_cast_mha_k_kernel[grid](
         k,
@@ -91,6 +163,11 @@ def reshape_and_cache_flash(
     k_scale_ptr,
     v_scale_ptr,
     block_stride,
+    value_block_stride,
+    cache_token_stride: tl.constexpr,
+    cache_head_stride: tl.constexpr,
+    value_cache_token_stride: tl.constexpr,
+    value_cache_head_stride: tl.constexpr,
     key_stride,
     value_stride,
     num_heads,
@@ -109,6 +186,7 @@ def reshape_and_cache_flash(
 
     Target cache layout:
         cache: [num_blocks, block_size, num_heads, head_size]
+        Token and head strides may describe a view of physical HND storage.
 
     Each Triton program instance handles:
         - one token (program_id(0))
@@ -127,7 +205,12 @@ def reshape_and_cache_flash(
         swa_slot_mapping_ptr: Optional second-stage slot remap for SWA mode.
         k_scale_ptr: Optional key scaling factor pointer.
         v_scale_ptr: Optional value scaling factor pointer.
-        block_stride: Stride between cache blocks.
+        block_stride: Stride between key cache blocks.
+        value_block_stride: Stride between value cache blocks.
+        cache_token_stride: Stride between key cache tokens.
+        cache_head_stride: Stride between key cache heads.
+        value_cache_token_stride: Stride between value cache tokens.
+        value_cache_head_stride: Stride between value cache heads.
         key_stride: Stride between source key tokens.
         value_stride: Stride between source value tokens.
         num_heads: Number of attention heads.
@@ -198,10 +281,20 @@ def reshape_and_cache_flash(
     # target layout
     # [block_idx, block_offset, head, dim]
     # ----------------------------------
-    tgt = block_idx * block_stride + block_offset * num_heads * head_size + offs
-
-    tl.store(key_cache_ptr + tgt, k, mask=mask)
-    tl.store(value_cache_ptr + tgt, v, mask=mask)
+    tgt_k = (
+        block_idx * block_stride
+        + block_offset * cache_token_stride
+        + head_idx[:, None] * cache_head_stride
+        + dim_idx[None, :]
+    )
+    tgt_v = (
+        block_idx * value_block_stride
+        + block_offset * value_cache_token_stride
+        + head_idx[:, None] * value_cache_head_stride
+        + dim_idx[None, :]
+    )
+    tl.store(key_cache_ptr + tgt_k, k, mask=mask)
+    tl.store(value_cache_ptr + tgt_v, v, mask=mask)
 
 
 def launch_reshape_and_cache_flash(
@@ -254,6 +347,11 @@ def launch_reshape_and_cache_flash(
         k_scale if k_scale is not None else key,
         v_scale if v_scale is not None else key,
         key_cache.stride(0),
+        value_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        value_cache.stride(1),
+        value_cache.stride(2),
         key.stride(0),
         value.stride(0),
         num_heads,
@@ -292,9 +390,13 @@ def concat_and_cast_q_fp8_pad_kernel(
     no = tl.arange(0, NOPE)
     src_n = tl.load(q_nope_ptr + pid * nope_s0 + hr[:, None] * nope_s1 + no[None, :])
     tl.store(qpad_head + no[None, :], src_n)
-    ro = tl.arange(0, ROPE)
-    src_r = tl.load(q_rope_ptr + pid * rope_s0 + hr[:, None] * rope_s1 + ro[None, :])
-    tl.store(qpad_head + NOPE + ro[None, :], src_r)
+    # NoPE models pass ROPE=0; tl.arange rejects empty ranges, so skip statically.
+    if ROPE > 0:
+        ro = tl.arange(0, ROPE)
+        src_r = tl.load(
+            q_rope_ptr + pid * rope_s0 + hr[:, None] * rope_s1 + ro[None, :]
+        )
+        tl.store(qpad_head + NOPE + ro[None, :], src_r)
 
 
 def concat_and_cast_q_fp8_pad(q_fp8_pad, q_nope, q_rope, num_heads):
@@ -302,7 +404,7 @@ def concat_and_cast_q_fp8_pad(q_fp8_pad, q_nope, q_rope, num_heads):
     [:, :num_heads, :] slice of the padded fp8 q buffer.  Bit-exact replacement for the
     two strided converting copy_() in the Q8KV8 prefill q-prep, ~3.7x faster.  Requires
     num_heads / nope_dim / rope_dim to be powers of two (always true for DeepSeek: 128
-    heads / any TP, 512 nope, 64 rope)."""
+    heads / any TP, 512 nope, 64 rope); rope_dim may also be 0 for NoPE models."""
     num_tokens = q_nope.shape[0]
     nope_dim = q_nope.shape[-1]
     rope_dim = q_rope.shape[-1]
@@ -566,9 +668,9 @@ def absorbed_bmm_concat_cast_q_fp8(
     assert q_fp8_pad.shape[0] >= num_tokens and q_fp8_pad.shape[1] >= num_heads
     assert q_fp8_pad.shape[2] == n_dim + rope_dim
     # tl.arange / tl.dot constraints
-    assert (
-        k_dim % 16 == 0 and 16 <= k_dim <= 256
-    ), "K must be a multiple of 16 in [16, 256]"
+    assert k_dim % 16 == 0 and 16 <= k_dim <= 256, (
+        "K must be a multiple of 16 in [16, 256]"
+    )
     assert (rope_dim & (rope_dim - 1)) == 0, "ROPE must be a power of two"
     assert n_dim % block_n == 0, "N must be a multiple of block_n"
     assert q_nope.stride(2) == 1 and q_rope.stride(2) == 1
@@ -608,22 +710,22 @@ def absorbed_bmm_concat_cast_q_fp8(
             # Largest power-of-2 divisor of K, capped at 128 (K % 16 == 0
             # makes this >= 16), unless the caller pinned block_k.
             blk_k = block_k or min(k_dim & -k_dim, 128)
-            assert (
-                k_dim % blk_k == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16
-            ), "loop needs BLOCK_K a power-of-2 divisor of K >= 16"
+            assert k_dim % blk_k == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16, (
+                "loop needs BLOCK_K a power-of-2 divisor of K >= 16"
+            )
             k_mode = 1
         elif v == "two_dot":
             blk_k = 1 << (k_dim.bit_length() - 1)  # largest power of 2 < K
             k1 = k_dim - blk_k
-            assert (
-                k1 & (k1 - 1) == 0 and k1 >= 16
-            ), "two_dot needs K = pow2 + pow2 with both halves >= 16"
+            assert k1 & (k1 - 1) == 0 and k1 >= 16, (
+                "two_dot needs K = pow2 + pow2 with both halves >= 16"
+            )
             k_mode = 2
         elif v == "three_dot":
             blk_k = k_dim // 3
-            assert (
-                k_dim % 3 == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16
-            ), "three_dot needs K = 3 * pow2 with pow2 >= 16"
+            assert k_dim % 3 == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16, (
+                "three_dot needs K = 3 * pow2 with pow2 >= 16"
+            )
             k_mode = 3
         elif v == "pad":
             blk_k = 1 << k_dim.bit_length()  # next power of 2 above K

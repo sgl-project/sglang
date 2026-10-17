@@ -2,7 +2,7 @@
 """
 Generate diffusion CI outputs for consistency testing.
 
-This script reuses the CI test code by calling run_suite.py with SGLANG_GEN_GT=1,
+This script reuses the CI test adapter with SGLANG_GEN_GT=1,
 ensuring that GT generation uses exactly the same code path as CI tests.
 
 Usage:
@@ -17,14 +17,16 @@ import sys
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.run_suite import (
-    SUITES,
+from sglang.multimodal_gen.test.partitioning import (
     PartitionItem,
+    partition_items_by_lpt,
+)
+from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
+    SUITES,
     _maybe_pin_update_weights_model_pair,
     get_case_est_time,
     get_suite_files_rel,
     parse_partition_plan,
-    partition_items_by_lpt,
 )
 from sglang.multimodal_gen.test.runner.pytest_runner import (
     collect_test_items,

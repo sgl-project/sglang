@@ -17,6 +17,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    retrieve_timesteps,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -30,59 +40,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.component_load import (
-    load_transformer_if_needed,
-    register_loaded_transformer,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import export_to_trimesh
 
 logger = init_logger(__name__)
-
-
-def retrieve_timesteps(
-    scheduler,
-    num_inference_steps=None,
-    device=None,
-    timesteps=None,
-    sigmas=None,
-    **kwargs,
-):
-    """Retrieve timesteps from scheduler."""
-    import inspect
-
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of timesteps or sigmas can be passed.")
-
-    if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
-        if not accepts_timesteps:
-            raise ValueError(
-                f"Scheduler {scheduler.__class__} doesn't support custom timesteps."
-            )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-
-    elif sigmas is not None:
-        accepts_sigmas = "sigmas" in set(
-            inspect.signature(scheduler.set_timesteps).parameters.keys()
-        )
-        if not accepts_sigmas:
-            raise ValueError(
-                f"Scheduler {scheduler.__class__} doesn't support custom sigmas."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-
-    return timesteps, num_inference_steps
 
 
 def _prepare_shape_image(image_processor, image, mask=None) -> dict:
@@ -164,6 +125,15 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         shape = (batch_size, *self.latent_shape)
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents * getattr(scheduler, "init_noise_sigma", 1.0)
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name), "hy3dshape_conditioner"
+            )
+        ]
 
     def _find_conditioner_dtype(self, items_fn_name: str) -> torch.dtype | None:
         items_fn = getattr(self.conditioner, items_fn_name, None)
@@ -282,8 +252,10 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
 class Hunyuan3DShapeDenoisingStage(DenoisingStage):
     """Denoising stage for Hunyuan3D shape generation."""
 
-    def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
-        super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
+    def _component_name_for_stage_module(self, module, default_name: str) -> str:
+        if module is self.transformer:
+            return "hy3dshape_model"
+        return super()._component_name_for_stage_module(module, default_name)
 
     def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
         """Prepare Hunyuan3D-specific variables for the base denoising loop."""
@@ -450,6 +422,11 @@ class Hunyuan3DShapeExportStage(PipelineStage):
         self.vae = vae
         self.config = config
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [ComponentUse(self._component_stage_name(stage_name), "hy3dshape_vae")]
+
     @property
     def role_affinity(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -468,15 +445,14 @@ class Hunyuan3DShapeExportStage(PipelineStage):
                 ]()
             except ImportError:
                 logger.warning(
-                    f"Could not load SurfaceExtractors for mc_algo={self.config.shape_mc_algo}"
+                    "Could not load SurfaceExtractors for mc_algo=%s",
+                    self.config.shape_mc_algo,
                 )
 
         latents = batch.latents
-
         if self.config.shape_output_type != "latent":
             latents = 1.0 / self.vae.scale_factor * latents
             latents = self.vae(latents)
-
             outputs = self.vae.latents2mesh(
                 latents,
                 bounds=self.config.shape_box_v,
@@ -550,6 +526,11 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
                 "Mesh generation failed: surface extraction returned None. "
                 "The surface level may be outside the volume data range."
             )
+
+        if batch.is_warmup:
+            if self.config.paint_enable:
+                return batch
+            return OutputBatch(output_file_paths=[], metrics=batch.metrics)
 
         obj_path, return_path = self._get_output_paths(batch)
         output_dir = os.path.dirname(obj_path)

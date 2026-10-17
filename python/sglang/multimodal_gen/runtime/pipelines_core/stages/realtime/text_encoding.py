@@ -11,10 +11,15 @@ closer to the actual denoising step.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -31,22 +36,6 @@ def _normalize_prompt_value(
     if isinstance(value, list):
         return tuple(value)
     return value
-
-
-def _copy_tensor_list(
-    value: list[torch.Tensor] | None,
-) -> list[torch.Tensor] | None:
-    if value is None:
-        return None
-    return list(value)
-
-
-def _copy_seq_lens(
-    value: list[list[int]] | None,
-) -> list[list[int]] | None:
-    if value is None:
-        return None
-    return [list(seq_lens) for seq_lens in value]
 
 
 _TEXT_CACHE_TENSOR_LIST_FIELDS = (
@@ -72,9 +61,11 @@ _TEXT_CACHE_DEFAULT_EMPTY_LIST_FIELDS = {
 
 
 def _copy_text_cache_field(name: str, value):
+    if value is None:
+        return None
     if name in _TEXT_CACHE_SEQ_LENS_FIELDS:
-        return _copy_seq_lens(value)
-    return _copy_tensor_list(value)
+        return [list(seq_lens) for seq_lens in value]
+    return list(value)
 
 
 class RealtimeTextState(BaseRealtimeState):
@@ -105,8 +96,20 @@ class RealtimeTextState(BaseRealtimeState):
 class RealtimeTextEncodingStage(TextEncodingStage):
     """Cache text encoder outputs across realtime chunks by prompt identity."""
 
+    deduplicated_output_fields = ()
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Cache hits return before encode_text reaches the declared use site.
+        return [
+            replace(use, start_at_stage_entry=False)
+            for use in super().component_uses(server_args, stage_name)
+        ]
+
     def _make_cache_key(self, batch: Req) -> tuple[Any, ...]:
         return (
+            conditioning_weights_epoch(),
             _normalize_prompt_value(batch.prompt),
             bool(batch.do_classifier_free_guidance),
             (
@@ -134,7 +137,11 @@ class RealtimeTextEncodingStage(TextEncodingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        if batch.session is None:
+        if (
+            batch.session is None
+            or server_args.disable_conditioning_cache
+            or server_args.conditioning_cache_max_size_mb == 0
+        ):
             return super().forward(batch, server_args)
 
         state = batch.session.get_or_create_state(RealtimeTextState)

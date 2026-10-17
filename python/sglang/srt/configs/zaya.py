@@ -167,9 +167,9 @@ class ZayaConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.kv_channels = kv_channels if kv_channels is not None else head_dim
         assert self.head_dim is not None, "head_dim is required for ZayaConfig"
-        assert (
-            self.num_query_groups == num_key_value_heads
-        ), "num_query_groups must equal num_key_value_heads for ZAYA1 checkpoints"
+        assert self.num_query_groups == num_key_value_heads, (
+            "num_query_groups must equal num_key_value_heads for ZAYA1 checkpoints"
+        )
         self.num_key_value_heads = num_key_value_heads
         self.activation_func = activation_func
         self.max_position_embeddings = max_position_embeddings
@@ -266,9 +266,8 @@ class ZayaConfig(PretrainedConfig):
         # equals the global TP group (DP attention is unsupported), so the two
         # are always identical in practice.
         try:
-
             tp_size = get_parallel().tp_size
-        except (AssertionError, RuntimeError):
+        except (AssertionError, RuntimeError, ValueError):
             tp_size = 1
 
         in_out_ch_full = (
@@ -307,18 +306,15 @@ class ZayaConfig(PretrainedConfig):
 def register_zaya_config() -> None:
     """Register :class:`ZayaConfig` with HuggingFace ``AutoConfig``.
 
-    Safe to call multiple times. ``AutoConfig.register`` raises ``ValueError``
-    on duplicate registration, which is suppressed so importing this module
-    stays idempotent.
+    ``exist_ok=True`` overrides the native ``zaya`` config transformers ships;
+    SGLang's carries the hybrid-pool properties the runtime needs, and both
+    classes are named ``ZayaConfig`` so the Auto* mappings still key.
     """
     try:
         from transformers import AutoConfig
 
-        AutoConfig.register(ZayaConfig.model_type, ZayaConfig)
+        AutoConfig.register(ZayaConfig.model_type, ZayaConfig, exist_ok=True)
     except (ValueError, ImportError):
-        # Either the installed ``transformers`` does not expose
-        # ``AutoConfig.register``, or the "zaya" model type is already
-        # registered – nothing to do in either case.
         pass
 
 

@@ -62,6 +62,8 @@ def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
             normalize_reference_timestep=True,
             omit_reference_guidance=True,
         )
+    if "sana-video" in model_path or "sana_video" in model_path:
+        return TransformerHookCompat(omit_reference_guidance=True)
     if "sana" in model_path:
         return TransformerHookCompat(
             omit_reference_guidance=True,

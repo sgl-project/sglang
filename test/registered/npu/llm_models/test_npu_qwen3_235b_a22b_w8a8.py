@@ -5,7 +5,7 @@ from sglang.test.ascend.test_ascend_utils import QWEN3_235B_A22B_W8A8_WEIGHTS_PA
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-8-npu-a3", nightly=True)
 
 
 class TestQwen3235BA22BW8A8(GSM8KAscendMixin, CustomTestCase):

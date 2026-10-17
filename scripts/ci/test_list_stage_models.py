@@ -590,8 +590,9 @@ class ResolveCommit(unittest.TestCase):
             self.assertEqual(lsm.resolve_commit(None, "/nonexistent"), "deadbeef")
 
     def test_unknown_when_no_git(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
-            os.environ, {}, clear=True
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, {}, clear=True),
         ):
             self.assertEqual(lsm.resolve_commit(None, tmp), "unknown")
 

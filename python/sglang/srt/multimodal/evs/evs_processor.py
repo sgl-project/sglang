@@ -20,7 +20,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.utils import logger
 
 from .evs_core import tokens_per_frame
-from .evs_module import EVS, EVSConfig, EVSDataItem, VideoEVSDataItem
+from .evs_module import EVS, EVSConfig
 
 
 def _non_evs_data_items(
@@ -72,7 +72,7 @@ class EVSProcessor:
             return
         evs_config = evs_model.create_evs_config(hf_config)
         logger.info(
-            f"""[EVS] {evs_config} {'enabled' if evs_config.video_pruning_rate > 0.0 else 'disabled'} for model={evs_model.__name__}; model_config={config_name}"""
+            f"""[EVS] {evs_config} {"enabled" if evs_config.video_pruning_rate > 0.0 else "disabled"} for model={evs_model.__name__}; model_config={config_name}"""
         )
         if evs_config.video_pruning_rate > 0.0:
             self.evs_config = evs_config
@@ -99,23 +99,25 @@ class EVSProcessor:
             items = []
             if image is not None:
                 image_thw_grids = [(1, rows, cols)] * num_images
-                item = EVSDataItem(
+                item = MultimodalDataItem(
                     modality=Modality.IMAGE,
                     feature=image,
                     offsets=image_offsets,
-                    thw_grids=image_thw_grids,
+                    model_specific_data={"thw_grids": image_thw_grids},
                 )
                 items.append(item)
             if video is not None:
                 video_thw_grids = [
                     (num_frames, rows, cols) for num_frames in frames_per_video
                 ]
-                item = VideoEVSDataItem(
+                item = MultimodalDataItem(
                     modality=Modality.VIDEO,
                     feature=video,
                     offsets=video_offsets,
-                    thw_grids=video_thw_grids,
-                    pre_chunked_input_ids=input_ids_list,
+                    model_specific_data={
+                        "thw_grids": video_thw_grids,
+                        "pre_chunked_input_ids": input_ids_list,
+                    },
                 )
                 items.append(item)
             return items

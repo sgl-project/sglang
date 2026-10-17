@@ -14,75 +14,37 @@ read of that slot.
 """
 
 import logging
-import os
 import socket
 from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
 from sglang.multimodal_gen import envs
 
 logger = logging.getLogger(__name__)
 
-_SYNC_DECL = (
-    "void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,"
-    " torch::Tensor peer_timed_out, int64_t budget_ns);\n"
-    "void bump_signal(torch::Tensor seq, torch::Tensor peer_flag);"
-)
-_SYNC_SRC = """
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-__device__ __forceinline__ unsigned long long now_ns() {
-    // %globaltimer is a nanosecond wall clock, so the budget needs no SM-clock
-    // conversion -- cudaDevAttrClockRate is not dependable across architectures
-    // (B200 reports 120 MHz, which would shrink the timeout ~16x).
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
-}
-__global__ void spin_wait_kernel(volatile int* flag, const int* target,
-                                 int* timed_out, int* peer_timed_out,
-                                 unsigned long long budget_ns) {
-    int t = *target;
-    unsigned long long start = now_ns();
-    while (*flag < t) {
-        if (now_ns() - start > budget_ns) {
-            // Give up rather than hang the stream forever. The peer never
-            // published, so this exchange's data is incomplete. Flag it on the
-            // peer as well as here: both ranks must retire the transport at the
-            // same request boundary, or the one that switched to NCCL would post
-            // a collective the other never posts.
-            *timed_out = 1;
-            *peer_timed_out = 1;
-            __threadfence_system();
-            return;
-        }
-    }
-    __threadfence_system();
-}
-__global__ void bump_signal_kernel(int* seq, volatile int* peer_flag) {
-    int v = *seq + 1;
-    *seq = v;
-    __threadfence_system();
-    *peer_flag = v;
-}
-void spin_wait(torch::Tensor flag, torch::Tensor target, torch::Tensor timed_out,
-               torch::Tensor peer_timed_out, int64_t budget_ns) {
-    spin_wait_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (volatile int*)flag.data_ptr<int>(), target.data_ptr<int>(),
-        timed_out.data_ptr<int>(), peer_timed_out.data_ptr<int>(),
-        (unsigned long long)budget_ns);
-}
-void bump_signal(torch::Tensor seq, torch::Tensor peer_flag) {
-    bump_signal_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
-        seq.data_ptr<int>(), (volatile int*)peer_flag.data_ptr<int>());
-}
-"""
-
 
 class _Unsupported(RuntimeError):
     """This topology cannot run the transport -- an expected outcome, not a bug."""
+
+
+def ipc_shareable_zeros(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    """Zeros for a buffer exported over CUDA IPC, kept out of expandable segments.
+
+    Freeing an expandable segment that was exported over IPC breaks the CUDA
+    allocator on fabric-handle systems (GB200/GB300): empty_cache raises
+    "std::get: wrong index for variant" or "bad optional access" on some ranks,
+    which then diverge and hang the next collective.
+    """
+    if "expandable_segments:True" not in torch._C._accelerator_getAllocatorSettings():
+        return torch.zeros(*shape, dtype=dtype, device="cuda")
+    torch._C._accelerator_setAllocatorSettings("expandable_segments:False")
+    try:
+        return torch.zeros(*shape, dtype=dtype, device="cuda")
+    finally:
+        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
 
 
 def _peer_cuda_device(group, rank: int, device: int) -> int:
@@ -133,12 +95,26 @@ class IpcA2AState:
         self.calls = 0
         self.rank = None
         self.group = None
+        # global ranks of the pair the peer mappings connect
+        self.ranks = None
         self.failed = False
         self.inited = False
 
     def reset(self) -> None:
         """Drop mappings that belong to a model-parallel group being replaced."""
         self.__init__()
+
+    def drop_staging(self) -> None:
+        """Release the cached staging buffers (both ranks call this at the same point).
+
+        Staging is keyed by message size and only evicted by count, so a warmup
+        probe at the full serving shape leaves buffers sized for it behind.
+        """
+        if not self.staging:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.staging.clear()
 
     def _share(self, t, group):
         """Exchange `t` with the peer via torch IPC, re-opening the handle in
@@ -171,12 +147,23 @@ class IpcA2AState:
     def init(self, group):
         import ctypes
 
-        from torch.utils.cpp_extension import load_inline
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+        from sglang.multimodal_gen.runtime.platforms.cuda import (
+            device_id_to_physical_device_id,
+        )
 
         self.rank = dist.get_rank(group=group)
         self.group = group
+        self.ranks = dist.get_process_group_ranks(group)
         dev = torch.cuda.current_device()
         peer_dev = _peer_cuda_device(group, self.rank, dev)
+        # Peer access alone also admits PCIe pairs, where this NVLink transport
+        # can stall in its GPU-side flag wait. Query the same pair on both ranks.
+        physical_devices = sorted(
+            device_id_to_physical_device_id(d) for d in (dev, peer_dev)
+        )
+        if not current_platform.is_full_nvlink(physical_devices):
+            raise _Unsupported("requires an NVLink-connected GPU pair")
         try:
             has_peer_access = torch.cuda.can_device_access_peer(dev, peer_dev)
         except RuntimeError as e:
@@ -189,22 +176,10 @@ class IpcA2AState:
             )
         # kernel-level dereference of peer mappings needs explicit peer access
         ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
-        build_dir = os.path.join(
-            envs.SGLANG_DIFFUSION_CACHE_ROOT, f"ipc_a2a_sync_r{dev}"
-        )
-        os.makedirs(build_dir, exist_ok=True)
-        self.ops = load_inline(
-            name="ipc_a2a_sync",
-            cpp_sources=_SYNC_DECL,
-            cuda_sources=_SYNC_SRC,
-            functions=["spin_wait", "bump_signal"],
-            extra_cuda_cflags=["-O3"],
-            build_directory=build_dir,
-            verbose=False,
-        )
-        self.flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.ops = load_ipc_a2a_sync()
+        self.flag = ipc_shareable_zeros(1, dtype=torch.int32)
         self.my_seq = torch.zeros(1, dtype=torch.int32, device="cuda")
-        self.timed_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self.timed_out = ipc_shareable_zeros(1, dtype=torch.int32)
         self.budget_ns = int(envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS * 1e6)
         self.max_buffers = envs.SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS
         self.peer_flag = self._share(self.flag, group)
@@ -225,7 +200,7 @@ class IpcA2AState:
         if pair is None:
             if torch.cuda.is_current_stream_capturing():
                 return None
-            local = torch.zeros(2, n_local, dtype=dtype, device="cuda")
+            local = ipc_shareable_zeros(2, n_local, dtype=dtype)
             peer = self._share(local, group)
             pair = (local, peer)
             if len(self.staging) >= self.max_buffers:
@@ -310,7 +285,13 @@ def ipc_a2a_ready(group) -> bool:
 
     if not envs.SGLANG_DIFFUSION_IPC_A2A:
         return False
-    if IPC_A2A.group is not None and IPC_A2A.group is not group:
+    # AllToAll4D passes the SP device group and USP the Ulysses group: distinct
+    # handles over one pair, so only a different pair invalidates the mappings.
+    if (
+        IPC_A2A.group is not None
+        and group is not IPC_A2A.group
+        and dist.get_process_group_ranks(group) != IPC_A2A.ranks
+    ):
         IPC_A2A.reset()
     if IPC_A2A.failed:
         return False

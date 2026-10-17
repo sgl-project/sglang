@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -135,9 +136,11 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         self.assertIs(kwargs["camera_conditions"], camera_conditions)
         self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
 
-    def test_get_model_deployment_config_enables_dit_layerwise_offload(self) -> None:
+    def test_deployment_config_enables_memory_mode_dit_layerwise_offload(
+        self,
+    ) -> None:
         deployment = self.config.get_model_deployment_config()
-        self.assertTrue(deployment.auto_dit_layerwise_offload)
+        self.assertEqual(deployment.dit_layerwise_offload_modes, ("memory",))
         self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
 
     def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
@@ -1509,6 +1512,51 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
             )
 
         self.assertTrue(torch.equal(frames, decoded))
+
+    def test_refiner_forward_uses_non_streaming_decode_override(self) -> None:
+        decoded = torch.arange(1 * 3 * 4 * 2 * 2).reshape(1, 3, 4, 2, 2)
+        decoding_module = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+        for applied in (True, False):
+            with self.subTest(refiner_applied=applied):
+                vae = SimpleNamespace()
+                stage = SanaWMRefinerDecodingStage(vae=vae)
+                batch = SimpleNamespace(
+                    latents=torch.empty(1, 128, 4, 2, 2),
+                    sampling_params=SanaWMSamplingParams(),
+                    extra={"sana_wm_refiner_applied": applied},
+                    return_trajectory_decoded=False,
+                    trajectory_timesteps=None,
+                    trajectory_latents=None,
+                    rollout_trajectory_data=None,
+                    metrics=None,
+                    usage=None,
+                )
+                args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
+                with (
+                    patch.object(stage, "load_model"),
+                    patch.object(
+                        stage, "use_declared_component", return_value=nullcontext(vae)
+                    ),
+                    patch(
+                        f"{decoding_module}.resolve_decode_precision",
+                        return_value=torch.bfloat16,
+                    ),
+                    patch(
+                        f"{decoding_module}.use_vae_fast_path",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(DecodingStage, "decode", return_value=decoded),
+                    patch.object(
+                        args.pipeline_config,
+                        "post_decoding",
+                        side_effect=lambda frames, _: frames,
+                    ),
+                ):
+                    output = stage.forward(batch, args)
+
+                expected = decoded[:, :, 1:] if applied else decoded
+                self.assertTrue(torch.equal(output.output, expected))
+                self.assertIsNone(output.output_file_paths)
 
 
 if __name__ == "__main__":

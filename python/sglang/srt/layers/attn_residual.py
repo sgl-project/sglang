@@ -8,7 +8,7 @@
 #   fast  — warp-specialized TMA kernel: cp.async.bulk producer +
 #           online-softmax consumers over a double-buffered chunk ring, out
 #           norm fused, per-nvb tuned launch config, one persistent CTA per
-#           SM. Taken on SM100+ with H=7168.
+#           SM. Taken on SM100+ except SM12x with H=7168.
 #   hip   — single Triton kernel, everything in one launch; taken on ROCm
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
@@ -24,7 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -33,13 +33,20 @@ _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
 
+def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
+    """Return whether the device is eligible for the TMA fast path."""
+    major, _ = capability
+    return major >= 10 and major != 12
+
+
 def _use_fast(hidden_size: int) -> bool:
-    """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
-    template instantiation; everything else takes the triton pipeline."""
+    """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
+    and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
+    if not is_cuda():
+        return False
     if _FAST_SUPPORTED is None:
-        major, _ = torch.cuda.get_device_capability()
-        _FAST_SUPPORTED = major >= 10
+        _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
     return _FAST_SUPPORTED and hidden_size == 7168
 
 
@@ -50,7 +57,7 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
         return False
     global _HIP_SHAPE_GATE
     if _HIP_SHAPE_GATE is None:
-        from sglang.kernels.ops.kimi_k3.attn_res_hip import supports_attn_res_hip
+        from sglang.kernels.ops.attention.attn_res_hip import supports_attn_res_hip
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
@@ -90,7 +97,7 @@ def _aggregate_fast(
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
-    from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
+    from sglang.kernels.ops.attention.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
@@ -208,7 +215,19 @@ def _mix_fused(
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
     T, H = prefix_sum.shape
+    if T == 0:
+        return prefix_sum
     cw = get_cw(score_proj, score_norm)
+    if is_npu():
+        from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused
+
+        return mix_fused(
+            prefix_sum,
+            bank,
+            nvb,
+            cw,
+            score_norm.variance_epsilon,
+        )
     n_h_blocks = H // _BLOCK_H
 
     # Step 1: score each row (2D grid, full row-parallelism)
@@ -275,7 +294,7 @@ def _aggregate_hip(
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
     pre-norm mixture instead. Returns (result, prefix)."""
-    from sglang.kernels.ops.kimi_k3.attn_res_hip import attn_res_hip
+    from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
@@ -394,6 +413,8 @@ def _aggregate(
     into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
     the caller (AttnResidual.forward) owns that fallback.
     """
+    if prefix_sum.shape[0] == 0:
+        return prefix_sum
     if _use_fast(prefix_sum.shape[1]):
         return _aggregate_fast(
             prefix_sum,
@@ -439,6 +460,9 @@ class AttnResidual:
             (num_tokens, block_num, hidden_size)
         )
         self.num_valid_blocks = 0
+        # Whether a write snapshotted only this rank's slice of the rows, which
+        # leaves the bank's other rows stale on this rank.
+        self.written_on_slice = False
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -451,7 +475,11 @@ class AttnResidual:
         """
         bank = self.block_residual if rows is None else self.block_residual[rows]
         bank[:, self.num_valid_blocks, :].copy_(prefix_sum)
+        self._count_write(rows)
+
+    def _count_write(self, rows: Optional[slice]) -> None:
         self.num_valid_blocks += 1
+        self.written_on_slice |= rows is not None
 
     def forward(
         self,
@@ -467,6 +495,11 @@ class AttnResidual:
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
+        if rows is None and self.written_on_slice:
+            raise RuntimeError(
+                "a read of every row after a write of this rank's slice of "
+                "them would aggregate stale snapshots"
+            )
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
@@ -512,7 +545,7 @@ class AttnResidual:
                 write_bank_row=fused_write,
             )
         if fused_write:
-            self.num_valid_blocks += 1  # row nvb written in-kernel
+            self._count_write(rows)  # row nvb written in-kernel
         elif write:
             self.write(prefix, rows)
         return normed, prefix
@@ -537,7 +570,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         normed = k3_sp_collective.attn_res_all_gather(
             prefix,
@@ -551,7 +584,7 @@ class AttnResidual:
         if normed is None:
             return None
         if write:
-            self.num_valid_blocks += 1
+            self._count_write(rows)
         return normed, prefix
 
     def forward_sp_reduce_scatter(
@@ -574,7 +607,7 @@ class AttnResidual:
         bank = self.block_residual[rows]
         cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
         assert score_norm.variance_epsilon == out_norm.variance_epsilon
-        from sglang.srt.layers import k3_sp_collective
+        from sglang.srt.layers.communication import k3_sp_collective
 
         return k3_sp_collective.reduce_scatter_attn_res(
             hidden_states,

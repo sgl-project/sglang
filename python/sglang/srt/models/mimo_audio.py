@@ -14,17 +14,73 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from transformers import AttentionInterface
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    AttentionMaskInterface,
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+)
+from sglang.srt.utils import is_sm90_supported
 
 logger = logging.getLogger(__name__)
+
+
+def _mimo_local_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    is_causal=None,
+    position_bias=None,
+    **kwargs,
+):
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    if (
+        query.dtype in (torch.float16, torch.bfloat16)
+        and attention_mask is None
+        and position_bias is None
+        and dropout == 0.0
+        and not kwargs.get("output_attentions", False)
+    ):
+        from sglang.kernels.ops.attention.mimo_local_attention import (
+            mimo_local_attention,
+        )
+
+        causal = is_causal if is_causal is not None else module.is_causal
+        return mimo_local_attention(
+            query,
+            key,
+            value,
+            scale=scaling if scaling is not None else 0.25,
+            is_causal=bool(causal),
+        ), None
+    return sdpa_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=dropout,
+        scaling=scaling,
+        is_causal=is_causal,
+        position_bias=position_bias,
+        **kwargs,
+    )
 
 
 def _compute_default_rope_parameters(
@@ -511,6 +567,12 @@ class AudioEncoderAttention(nn.Module):
             window_size=window_size,
             customized_position_embedding_applier=_audio_rope_applier,
             prefix="attn",
+            # TODO: the audio encoder does not follow --mm-enable-dp-encoder and
+            # reduces over the full TP group, so its output is wrong under
+            # attention DP narrower than TP. Rejecting that would reject the
+            # documented MiMo-V2.5 `--tp 8 --attn-dp-size 2` launch; fix the
+            # reduce group or run the encoder data-parallel instead.
+            allow_tp_reduce_mismatch=True,
         )
 
     def forward(
@@ -1120,7 +1182,6 @@ class MiMoV2AudioConfig:
 
 
 def _remap_audio_tokenizer_state_dict(state_dict: dict) -> dict:
-    from sglang.srt.runtime_context import get_parallel
 
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
@@ -1225,6 +1286,19 @@ class AudioEncoderMixin:
             partial_rotary_factor=config.partial_rotary_factor,
         )
         input_local_config.head_dim = config.input_local_head_dim
+        input_local_config._attn_implementation = "sdpa"
+        if (
+            is_sm90_supported()
+            and input_local_config.head_dim == 16
+            and 0 < self.audio_group_size <= 4
+        ):
+            attention_name = "sglang_mimo_local"
+            AttentionInterface.register(attention_name, _mimo_local_attention_forward)
+            # Reuse SDPA's mask preparation for the custom attention implementation.
+            AttentionMaskInterface.register(
+                attention_name, ALL_MASK_ATTENTION_FUNCTIONS["sdpa"]
+            )
+            input_local_config._attn_implementation = attention_name
         self.input_local_transformer = Qwen2Model(input_local_config)
         if not config.add_post_norm:
             self.input_local_transformer.norm = nn.Identity()

@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=363, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_MOE_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
@@ -43,7 +43,7 @@ class _Qwen3MoePPCompatMixin:
                 "--max-running-requests",
                 "32",
                 "--trust-remote-code",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
             ],
@@ -90,20 +90,18 @@ class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
         "--cp-strategy",
         "zigzag",
     ]
-    server_env = {"SGLANG_ENABLE_CP_V2": "1"}
 
 
 class TestQwen3MoePPxDP(_Qwen3MoePPCompatMixin, CustomTestCase):
-    """PP x DP: pp_size=2 x dp_size=2 attention (tp_size=2)."""
+    """PP x DP: pp_size=2 x attn_dp_size=2 (tp_size=2)."""
 
     parallel_args = [
         "--tp-size",
         "2",
         "--pp-size",
         "2",
-        "--dp-size",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
     ]
 
 

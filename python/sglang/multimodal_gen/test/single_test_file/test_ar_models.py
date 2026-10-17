@@ -71,9 +71,10 @@ class ARCluster(DisaggCluster):
             "--tokenizer-path",
             os.path.join(local_model, "processor"),
             "--enable-multimodal",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             "1",
-            "--disable-fast-image-processor",
+            "--image-processor-backend",
+            "pil",
             "--tp-size",
             str(len(gpus)),
             "--port",
@@ -93,8 +94,7 @@ class ARCluster(DisaggCluster):
             )
         except Exception as e:
             raise RuntimeError(
-                f"AR model failed to start for {self.name}. Log tail:\n"
-                f"{_tail_log(log)}"
+                f"AR model failed to start for {self.name}. Log tail:\n{_tail_log(log)}"
             ) from e
 
     def _launch_server_head(self) -> None:
@@ -143,7 +143,6 @@ class ARCluster(DisaggCluster):
 
 
 class _ARTestBase(_DisaggTestBase):
-
     @classmethod
     def setUpClass(cls) -> None:
         super(CustomTestCase, cls).setUpClass()

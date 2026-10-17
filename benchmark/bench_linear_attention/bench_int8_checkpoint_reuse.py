@@ -20,7 +20,7 @@ Method, per K in ``--num-prefixes``:
 Run the server twice and compare (same flags, toggle int8):
 
   python -m sglang.launch_server --model-path <gdn-or-kda-hybrid> --tp 4 \
-      --trust-remote-code --mamba-scheduler-strategy extra_buffer \
+      --trust-remote-code --mamba-radix-cache-strategy extra_buffer \
       --max-mamba-cache-size 256 [--enable-int8-mamba-checkpoint] --port 30000
 
   python benchmark/bench_linear_attention/bench_int8_checkpoint_reuse.py \
@@ -28,7 +28,7 @@ Run the server twice and compare (same flags, toggle int8):
 
 NOTE: prefix-tokens must cross the mamba cache chunk granularity (typically ~512),
 otherwise nothing is cacheable and reuse is 0 by construction (not a regression).
-Use ``--mamba-scheduler-strategy extra_buffer`` on the server: ``no_buffer`` only
+Use ``--mamba-radix-cache-strategy extra_buffer`` on the server: ``no_buffer`` only
 snapshots state at the full-sequence leaf, so a divergent-suffix probe never reuses.
 """
 

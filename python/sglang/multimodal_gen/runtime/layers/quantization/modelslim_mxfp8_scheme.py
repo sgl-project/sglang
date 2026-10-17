@@ -1,4 +1,4 @@
-"""ModelSlim MXFP8 scheme for pre-quantized weight inference on Ascend NPU.
+"""ModelSlim MXFP8 scheme for pre-quantized weight inference on NPU.
 
 Loads weights pre-quantized by msmodelslim (float8_e4m3fn weights,
 uint8 scales) and runs MXFP8 matmul at inference.
@@ -25,7 +25,6 @@ MXFP8_BLOCK_SIZE = 32
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -53,7 +52,8 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
 
         # msmodelslim exports weight_scale as uint8, shape [out, in/32].
         # NOTE: This parameter is intentionally named "weight_scale" (not
-        # "weight_scale_inv" as used in mxfp8_npu.py) because the weight loader
+        # "weight_scale_inv" as used by SRT's NPUMXFP8LinearMethod) because the
+        # weight loader
         # matches parameter names to checkpoint keys, and msmodelslim checkpoints
         # store this tensor under the key "<layer>.weight_scale".
         scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE

@@ -68,6 +68,22 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
+@lru_cache(2)
+def precompute_cos_sin_table(
+    dim,
+    seqlen,
+    original_seq_len,
+    base,
+    factor,
+    beta_fast,
+    beta_slow,
+) -> torch.Tensor:
+    freqs_cis = precompute_freqs_cis(
+        dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
+    )
+    return torch.view_as_real(freqs_cis).transpose(1, 2).reshape(seqlen, -1)
+
+
 @triton.jit
 def apply_rotary_emb_triton_kernel(
     x_ptr,
@@ -354,9 +370,9 @@ def apply_rotary_emb_triton(
     grid = (batch_size, n_heads if is_3d else 1, num_blocks_dim)
 
     if positions is not None:
-        assert positions.shape == (
-            batch_size,
-        ), f"positions shape {positions.shape} != ({batch_size},)"
+        assert positions.shape == (batch_size,), (
+            f"positions shape {positions.shape} != ({batch_size},)"
+        )
 
         apply_rotary_emb_triton_kernel[grid](
             x,
@@ -374,9 +390,9 @@ def apply_rotary_emb_triton(
             BLOCK_SIZE=BLOCK_SIZE,
         )
     else:
-        assert (
-            freqs_real.shape[0] == batch_size
-        ), f"freqs_cis batch size {freqs_real.shape[0]} != x batch size {batch_size}"
+        assert freqs_real.shape[0] == batch_size, (
+            f"freqs_cis batch size {freqs_real.shape[0]} != x batch size {batch_size}"
+        )
 
         apply_rotary_emb_triton_kernel[grid](
             x,
@@ -621,9 +637,9 @@ def fused_norm_rope_inplace_triton(
     if weight is not None:
         assert weight.shape == (head_dim,)
     if positions is None:
-        assert (
-            freqs_real.shape[0] == M
-        ), f"freqs_cis row count {freqs_real.shape[0]} != M={M}"
+        assert freqs_real.shape[0] == M, (
+            f"freqs_cis row count {freqs_real.shape[0]} != M={M}"
+        )
     else:
         assert positions.shape == (M,) and positions.dim() == 1
 

@@ -12,7 +12,7 @@ def _wrap_debug_kernel(func: F, op_name: str | None = None) -> F:
         return func
 
     try:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
     except Exception:
         return func
 

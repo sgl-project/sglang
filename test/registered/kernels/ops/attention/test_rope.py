@@ -1,3 +1,4 @@
+import itertools
 import sys
 
 import pytest
@@ -8,7 +9,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=64, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=390, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=64, suite="jit-kernel-unit-test-amd")
@@ -142,26 +143,80 @@ def reference_rope(
 # Test parameters
 # ---------------------------------------------------------------------------
 
-BS_LIST = [2**x for x in range(12)]
-BS_LIST += [x + 1 for x in BS_LIST]  # odd sizes to stress non-aligned paths
-BS_LIST = get_ci_test_range(BS_LIST, [1, 129, 2048, 2049])
-NUM_KV_HEADS_LIST = get_ci_test_range([1, 2, 8], [1, 8])
-GQA_RATIO = get_ci_test_range([1, 4, 8], [1, 8])
-ROPE_DIM_LIST = get_ci_test_range([64, 128, 256, 512], [64, 256])
+_FULL_BS_LIST = [2**x for x in range(12)]
+_FULL_BS_LIST += [x + 1 for x in _FULL_BS_LIST]  # stress non-aligned paths
+_FULL_NUM_KV_HEADS_LIST = [1, 2, 8]
+_FULL_GQA_RATIO_LIST = [1, 4, 8]
+_FULL_ROPE_DIM_LIST = [64, 128, 256, 512]
 IS_NEOX_LIST = [False, True]
-DTYPE_LIST = get_ci_test_range(
-    [torch.bfloat16, torch.float16], [torch.bfloat16, torch.float16]
+_FULL_DTYPE_LIST = [torch.bfloat16, torch.float16]
+_FULL_PARTIAL_ROPE_DIM_LIST = [64, 80, 96, 128]
+_FULL_HEAD_DIM_LIST = [64, 128, 256]
+
+ROPE_CASES = get_ci_test_range(
+    list(
+        itertools.product(
+            _FULL_BS_LIST,
+            _FULL_GQA_RATIO_LIST,
+            _FULL_NUM_KV_HEADS_LIST,
+            _FULL_ROPE_DIM_LIST,
+            IS_NEOX_LIST,
+            _FULL_DTYPE_LIST,
+        )
+    ),
+    [
+        (1, 1, 1, 64, False, torch.bfloat16),
+        (129, 8, 1, 256, True, torch.float16),
+        (2048, 1, 8, 64, True, torch.float16),
+        (2049, 8, 8, 256, False, torch.bfloat16),
+        (1, 8, 8, 64, True, torch.bfloat16),
+        (129, 1, 1, 256, False, torch.float16),
+        (2048, 8, 1, 256, False, torch.bfloat16),
+        (2049, 1, 8, 64, True, torch.float16),
+    ],
 )
-PARTIAL_ROPE_DIM_LIST = get_ci_test_range([64, 80, 96, 128], [64, 96])
-HEAD_DIM_LIST = get_ci_test_range([64, 128, 256], [64, 256])
+PARTIAL_ROPE_CASES = get_ci_test_range(
+    list(
+        itertools.product(
+            _FULL_BS_LIST,
+            IS_NEOX_LIST,
+            _FULL_PARTIAL_ROPE_DIM_LIST,
+            _FULL_HEAD_DIM_LIST,
+        )
+    ),
+    [
+        (1, False, 64, 64),
+        (129, True, 96, 256),
+        (2048, False, 96, 128),
+        (2049, True, 64, 256),
+    ],
+)
+FUSED_ROPE_STORE_CASES = get_ci_test_range(
+    list(
+        itertools.product(
+            _FULL_BS_LIST,
+            _FULL_GQA_RATIO_LIST,
+            _FULL_NUM_KV_HEADS_LIST,
+            _FULL_ROPE_DIM_LIST,
+            IS_NEOX_LIST,
+        )
+    ),
+    [
+        (1, 1, 1, 64, False),
+        (129, 8, 1, 256, True),
+        (2048, 1, 8, 64, True),
+        (2049, 8, 8, 256, False),
+        (1, 8, 8, 64, True),
+        (129, 1, 1, 256, False),
+        (2048, 8, 1, 256, False),
+        (2049, 1, 8, 64, True),
+    ],
+)
 
 
-@pytest.mark.parametrize("batch_size", BS_LIST)
-@pytest.mark.parametrize("gqa_ratio", GQA_RATIO)
-@pytest.mark.parametrize("num_kv_heads", NUM_KV_HEADS_LIST)
-@pytest.mark.parametrize("rope_dim", ROPE_DIM_LIST)
-@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
-@pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize(
+    "batch_size,gqa_ratio,num_kv_heads,rope_dim,is_neox,dtype", ROPE_CASES
+)
 def test_rope(
     batch_size: int,
     gqa_ratio: int,
@@ -295,10 +350,7 @@ def test_rope_store_mixed_q_dtype(is_neox: bool) -> None:
     assert torch.equal(vc_mixed, vc_ref)
 
 
-@pytest.mark.parametrize("batch_size", BS_LIST)
-@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
-@pytest.mark.parametrize("rope_dim", PARTIAL_ROPE_DIM_LIST)
-@pytest.mark.parametrize("head_dim", HEAD_DIM_LIST)
+@pytest.mark.parametrize("batch_size,is_neox,rope_dim,head_dim", PARTIAL_ROPE_CASES)
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
@@ -321,11 +373,9 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("batch_size", BS_LIST)
-@pytest.mark.parametrize("gqa_ratio", GQA_RATIO)
-@pytest.mark.parametrize("num_kv_heads", NUM_KV_HEADS_LIST)
-@pytest.mark.parametrize("rope_dim", ROPE_DIM_LIST)
-@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+@pytest.mark.parametrize(
+    "batch_size,gqa_ratio,num_kv_heads,rope_dim,is_neox", FUSED_ROPE_STORE_CASES
+)
 def test_fused_rope_store(
     batch_size: int,
     gqa_ratio: int,

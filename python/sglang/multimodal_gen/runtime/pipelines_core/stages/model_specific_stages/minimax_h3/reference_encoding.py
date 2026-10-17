@@ -3,9 +3,12 @@
 
 Encoding recipes for user-provided reference materials:
 
-- image reference: independent 2048px short-edge resize with upscale enabled,
-  LANCZOS, and nearest-32 dimensions, then the SAME keyframe tokenizer recipe
-  as fl2va (seed-42 sampled encode, normalize, [1,2,2] patchify);
+- image reference: configurable ``match``, ``max``, or ``diffusers`` resizing
+  while preserving the display ratio, followed by LANCZOS and nearest-32
+  dimensions, then the SAME keyframe tokenizer recipe as fl2va (seed-42
+  sampled encode, normalize, [1,2,2] patchify). ``match`` follows the target
+  canvas pixel area without upscaling, ``max`` caps the short edge at 2048
+  without upscaling, and ``diffusers`` forces the short edge to 2048;
 - audio reference: the audio material chain (pure
   audio is losslessly normalized
   to stereo; video soundtracks are extracted as 44.1 kHz stereo), then a
@@ -19,6 +22,11 @@ from __future__ import annotations
 
 import functools
 import math
+import mmap
+import os
+import socket
+import subprocess
+import sys
 from typing import Any
 
 import torch
@@ -29,7 +37,10 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEArchConfig,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_replica_group
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_REFERENCE_RESIZE_MODES,
     MINIMAX_H3_SUPPORTED_FPS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
@@ -64,6 +75,8 @@ class _AudioVAEDeterminismContext:
     _saved: tuple | None = None
 
     def __enter__(self):
+        if not torch.cuda.is_available():
+            return self
         if _AudioVAEDeterminismContext._depth == 0:
             b = torch.backends
             _AudioVAEDeterminismContext._saved = (
@@ -88,6 +101,8 @@ class _AudioVAEDeterminismContext:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if not torch.cuda.is_available():
+            return
         _AudioVAEDeterminismContext._depth -= 1
         if _AudioVAEDeterminismContext._depth == 0:
             b = torch.backends
@@ -115,21 +130,27 @@ def minimax_h3_resolve_reference_image_shape(
     *,
     width: int | float,
     height: int | float,
+    canvas_width: int | float,
+    canvas_height: int | float,
+    mode: str = "diffusers",
 ) -> dict[str, Any]:
-    """Resolve a ref2va image independently from the target canvas.
+    """Resolve a ref2va image with a selectable resize policy.
 
-    The image keeps its display ratio, always targets a 2048px short edge (even
-    when that requires upscaling), and rounds both dimensions independently to
-    the nearest 32px grid. Unlike target/video ``adapt_shape_v1``, reference
-    images have no area-cap branch.
+    All modes preserve the reference display ratio and round both dimensions
+    independently to the nearest 32px grid. ``match`` follows the target canvas
+    pixel area without upscaling a smaller reference, ``max`` only downsizes a
+    reference whose short edge exceeds 2048px, and ``diffusers`` always targets
+    a 2048px short edge, including by upscaling.
     """
 
     try:
         source_width = float(width)
         source_height = float(height)
+        canvas_width = float(canvas_width)
+        canvas_height = float(canvas_height)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "reference image width and height must be positive finite numbers"
+            "reference image and target canvas dimensions must be finite numbers"
         ) from exc
     if (
         not math.isfinite(source_width)
@@ -140,30 +161,67 @@ def minimax_h3_resolve_reference_image_shape(
         raise ValueError(
             "reference image width and height must be positive finite numbers"
         )
+    if (
+        not math.isfinite(canvas_width)
+        or not math.isfinite(canvas_height)
+        or canvas_width <= 0.0
+        or canvas_height <= 0.0
+    ):
+        raise ValueError(
+            "target canvas width and height must be positive finite numbers"
+        )
     if source_width > 4.0 * source_height or source_height > 4.0 * source_width:
         raise ValueError(
             "reference image ratio must be within the inclusive range "
             f"1:4 to 4:1, got {source_width:g}x{source_height:g}"
         )
+    mode = str(mode).strip().lower()
+    if mode not in MINIMAX_H3_REFERENCE_RESIZE_MODES:
+        raise ValueError(
+            "reference_resize_mode must be one of "
+            f"{sorted(MINIMAX_H3_REFERENCE_RESIZE_MODES)}, got {mode!r}"
+        )
 
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(source_width, source_height)
-    target_width = _nearest_multiple(
+    short_edge = min(source_width, source_height)
+    if mode == "match":
+        scale = min(
+            1.0,
+            math.sqrt((canvas_width * canvas_height) / (source_width * source_height)),
+        )
+    elif mode == "max":
+        scale = min(1.0, MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge)
+    else:  # diffusers
+        scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge
+
+    resolved_width = _nearest_multiple(
         source_width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
-    target_height = _nearest_multiple(
+    resolved_height = _nearest_multiple(
         source_height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
+    size_mode = {
+        "match": "target_area",
+        "max": "short_edge_cap",
+        "diffusers": "short_edge",
+    }[mode]
     return {
         "geometry": "reference_image_resolved",
-        "shape_policy_version": "reference_image_short_edge_v1",
+        "shape_policy_version": (
+            "reference_image_short_edge_v1"
+            if mode == "diffusers"
+            else f"reference_image_{mode}_v1"
+        ),
+        # Keep the legacy short-edge metadata for shape-schema compatibility.
+        # ``match`` does not use this value in its scale calculation.
         "base_short_edge": MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE,
-        "effective_short_edge": min(target_width, target_height),
-        "size_mode": "short_edge",
+        "effective_short_edge": min(resolved_width, resolved_height),
+        "reference_resize_mode": mode,
+        "size_mode": size_mode,
         "multiple": MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
         "rounding": "nearest",
-        "allow_upscale": True,
-        "width": target_width,
-        "height": target_height,
+        "allow_upscale": mode == "diffusers",
+        "width": resolved_width,
+        "height": resolved_height,
     }
 
 
@@ -209,8 +267,6 @@ def _load_waveform(
     writes bounded interleaved float PCM directly to stdout, avoiding a
     temporary lossless file plus a second decode.
     """
-
-    import subprocess
 
     import numpy as np
 
@@ -313,7 +369,10 @@ def minimax_h3_encode_reference_audio_rows(
         waveform = _audio_resampler(int(source_rate))(waveform)
     waveform = waveform.to(device)
 
-    with _AudioVAEDeterminismContext():
+    with (
+        _AudioVAEDeterminismContext(),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
         audio_data = model.preprocess(
             waveform.unsqueeze(1), MINIMAX_H3_AUDIO_SAMPLE_RATE
         )
@@ -361,16 +420,15 @@ def minimax_h3_decode_reference_video_frames(
     target_frame_count: int,
     fps: float = MINIMAX_H3_SUPPORTED_FPS,
     start_time_seconds: float = 0.0,
+    share_across_replicas: bool = False,
 ) -> Any:
     """Decode, transform, and truncate a reference video in one ffmpeg pass.
 
     ffmpeg applies display rotation, CFR sampling, direct Lanczos scaling, and
-    square-pixel normalization before writing bounded RGB24 frames to stdout.
+    square-pixel normalization before writing a bounded RGB24 stream.
     The returned array is shared by Qwen and the visual VAE, so conditioning
     never passes through a lossy x264 intermediate or a second video decode.
     """
-    import subprocess
-
     import numpy as np
 
     if target_frame_count <= 0:
@@ -407,28 +465,200 @@ def minimax_h3_decode_reference_video_frames(
         "rawvideo",
         "-pix_fmt",
         "rgb24",
-        "pipe:1",
     ]
-    decoded = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-    )
-    payload = decoded.stdout
-    if not isinstance(payload, bytes):
-        raise TypeError("ffmpeg RGB24 output must be bytes")
     frame_bytes = target_width * target_height * 3
-    if len(payload) % frame_bytes:
+    if share_across_replicas:
+        payload, payload_size = _decode_reference_video_shared(command)
+    else:
+        payload, payload_size = _decode_reference_video_local(command)
+
+    if payload_size <= 0:
+        raise ValueError(f"reference video has no frames: {video_path}")
+    if payload_size % frame_bytes:
         raise ValueError(
             "ffmpeg returned a partial reference-video frame: "
-            f"{len(payload)} bytes for {target_width}x{target_height} RGB24"
+            f"{payload_size} bytes for {target_width}x{target_height} RGB24"
         )
-    frame_count = len(payload) // frame_bytes
-    if frame_count <= 0:
-        raise ValueError(f"reference video has no frames: {video_path}")
+    frame_count = payload_size // frame_bytes
     return np.frombuffer(payload, dtype=np.uint8).reshape(
         frame_count, target_height, target_width, 3
     )
+
+
+def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
+    """Write one worker's RGB stream without a large stdout aggregation."""
+
+    # Linux workers can let ffmpeg write the exact RGB24 stream into an
+    # anonymous file descriptor. Mapping that output avoids communicate()'s
+    # chunk list and final bytes join for a several-hundred-MiB reference.
+    output_fd = -1
+    if sys.platform.startswith("linux"):
+        try:
+            output_fd = os.memfd_create(
+                "sglang-h3-reference-video",
+                flags=os.MFD_CLOEXEC,
+            )
+        except OSError:
+            output_fd = -1
+
+    payload: Any = b""
+    payload_size = 0
+    if output_fd >= 0:
+        try:
+            payload_size = _write_reference_video_to_fd(command, output_fd)
+            if payload_size > 0:
+                payload = mmap.mmap(
+                    output_fd,
+                    payload_size,
+                    access=mmap.ACCESS_WRITE,
+                )
+        finally:
+            os.close(output_fd)
+    else:
+        decoded = subprocess.run(
+            [*command, "pipe:1"],
+            check=True,
+            capture_output=True,
+        )
+        payload = decoded.stdout
+        if not isinstance(payload, bytes):
+            raise TypeError("ffmpeg RGB24 output must be bytes")
+        payload_size = len(payload)
+    return payload, payload_size
+
+
+def _write_reference_video_to_fd(command: list[str], output_fd: int) -> int:
+    subprocess.run(
+        [*command, f"pipe:{output_fd}"],
+        check=True,
+        pass_fds=(output_fd,),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return os.lseek(output_fd, 0, os.SEEK_CUR)
+
+
+def _all_gather_group_objects(group: Any, value: Any) -> list[Any]:
+    values = [None] * group.world_size
+    torch.distributed.all_gather_object(
+        values,
+        value,
+        group=group.cpu_group,
+    )
+    return values
+
+
+@functools.lru_cache(maxsize=1)
+def _reference_video_host_leader() -> int:
+    group = get_replica_group()
+    hostnames = _all_gather_group_objects(group, socket.gethostname())
+    return hostnames.index(hostnames[group.rank_in_group])
+
+
+def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
+    """Decode once per host per replica; its worker ranks map the same RGB pages.
+
+    Collectives stay inside the request's pipeline replica: the world group
+    spans replicas when dp_size > 1 and only one replica runs this request.
+    """
+    group = get_replica_group()
+    if (
+        group.world_size <= 1
+        or not sys.platform.startswith("linux")
+        or not os.path.isdir("/proc/self/fd")
+    ):
+        return _decode_reference_video_local(command)
+
+    leader = _reference_video_host_leader()
+    is_leader = group.rank_in_group == leader
+
+    leader_fd = -1
+    payload_size = 0
+    owner_exception = None
+    leader_state = None
+    if is_leader:
+        try:
+            try:
+                leader_fd = os.memfd_create(
+                    "sglang-h3-reference-video-shared",
+                    flags=os.MFD_CLOEXEC,
+                )
+            except OSError:
+                # Anonymous file descriptors can be disabled by a container's
+                # seccomp policy. Tell every host to use the unchanged local
+                # decode path instead of failing a valid request.
+                leader_state = (None, 0, None)
+            else:
+                payload_size = _write_reference_video_to_fd(command, leader_fd)
+                leader_state = (
+                    f"/proc/{os.getpid()}/fd/{leader_fd}",
+                    payload_size,
+                    None,
+                )
+        except Exception as exc:
+            owner_exception = exc
+            leader_state = (None, 0, f"{type(exc).__name__}: {exc}")
+
+    states = _all_gather_group_objects(group, leader_state)
+    host_states = [state for state in states if state is not None]
+    owner_error = next(
+        (state[2] for state in host_states if state[2] is not None),
+        None,
+    )
+    # Every rank makes the same decision here. In particular, a decode failure
+    # on one host must not leave the other hosts entering the mapping collective.
+    if owner_error is not None:
+        if leader_fd >= 0:
+            os.close(leader_fd)
+        if owner_exception is not None and owner_error.endswith(str(owner_exception)):
+            raise owner_exception
+        raise RuntimeError(f"MiniMax H3 shared video decode failed: {owner_error}")
+    if any(state[0] is None for state in host_states):
+        if leader_fd >= 0:
+            os.close(leader_fd)
+        return _decode_reference_video_local(command)
+    if any(state[1] <= 0 for state in host_states):
+        if leader_fd >= 0:
+            os.close(leader_fd)
+        return b"", 0
+
+    state = states[leader]
+    if state is None:
+        raise RuntimeError("MiniMax H3 shared video decode returned no descriptor")
+    local_path, payload_size, _ = state
+    if payload_size <= 0:
+        if leader_fd >= 0:
+            os.close(leader_fd)
+        return b"", 0
+    if local_path is None:
+        raise RuntimeError("MiniMax H3 shared video decode returned no path")
+
+    mapping = None
+    map_error = None
+    try:
+        map_fd = os.open(local_path, os.O_RDWR)
+        try:
+            mapping = mmap.mmap(map_fd, payload_size, access=mmap.ACCESS_COPY)
+        finally:
+            os.close(map_fd)
+    except Exception as exc:
+        map_error = f"{type(exc).__name__}: {exc}"
+
+    map_errors = _all_gather_group_objects(group, map_error)
+    failed = next((error for error in map_errors if error is not None), None)
+    if is_leader:
+        os.close(leader_fd)
+    if failed is not None:
+        if mapping is not None:
+            mapping.close()
+        # /proc fd traversal can be denied by hidepid or a container policy.
+        # All ranks fall back together so the optimization never makes a
+        # previously valid request fail or changes its RGB bytes.
+        return _decode_reference_video_local(command)
+
+    if mapping is None:
+        raise RuntimeError("MiniMax H3 shared video mapping returned no payload")
+    return mapping, payload_size
 
 
 MINIMAX_H3_REFERENCE_VIDEO_ENCODE_SEED = 42
@@ -569,7 +799,12 @@ def _reference_video_target_frame_count(
     )
 
 
-def minimax_h3_prepared_reference_videos(batch: Any, plan: Any) -> dict[str, Any]:
+def minimax_h3_prepared_reference_videos(
+    batch: Any,
+    plan: Any,
+    *,
+    share_across_replicas: bool = False,
+) -> dict[str, Any]:
     """Decode the bounded reference-video RGB frames once per request.
 
     BOTH the visual-condition tokenizer and Qwen consume the same transformed
@@ -629,6 +864,7 @@ def minimax_h3_prepared_reference_videos(batch: Any, plan: Any) -> dict[str, Any
             target_frame_count=target_frames,
             fps=float(plan.shape["fps"]),
             start_time_seconds=float(material.start_time_seconds),
+            share_across_replicas=share_across_replicas,
         )
         prepared_videos.append(
             {

@@ -5,16 +5,19 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import ExitStack
 from pathlib import Path
-from unittest import mock
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.layers.layer_boundary import UnreducedOutput
+from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_attn_input
+from sglang.srt.layers.moe import utils as moe_utils
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.communicator_patch import patch_communicator
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 
@@ -64,7 +67,8 @@ def _run_residual_accuracy_check():
         distributed_init_method="env://",
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(tp_size=world_size, world_rank=rank)
+    initialize_model_parallel()
 
     dtype = torch.bfloat16
     eps = 1e-6
@@ -158,7 +162,6 @@ def _run_residual_accuracy_check():
 
 
 class TestAiterAllreduceFusionAmd(unittest.TestCase):
-
     @staticmethod
     def _gpu_count():
         return torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -348,132 +351,146 @@ class TestAiterAllreduceFusionAmd(unittest.TestCase):
         )
 
 
-def _fake_self(*, mlp_mode=ScatterMode.TP_ATTN_FULL, is_last_layer=False, tp_size=8):
-    """Minimal stand-in for a LayerCommunicator with the fields the gate reads."""
+def _fake_forward_batch(batch_size=8, forward_mode=ForwardMode.DECODE):
     return types.SimpleNamespace(
-        _speculative_algo=None,
-        layer_scatter_modes=types.SimpleNamespace(mlp_mode=mlp_mode),
-        is_last_layer=is_last_layer,
-        _context=types.SimpleNamespace(tp_size=tp_size),
+        input_ids=types.SimpleNamespace(shape=(batch_size,)),
+        forward_mode=forward_mode,
     )
 
 
-def _fake_forward_batch(batch_size=8):
-    return types.SimpleNamespace(input_ids=types.SimpleNamespace(shape=(batch_size,)))
-
-
 class TestAiterAllreduceFusionGate(CustomTestCase):
-    """Pure-logic coverage of the aiter all-reduce + RMSNorm fusion gate.
+    """Consumer fusion guards and the producer's expert-parallel gate.
 
-    Covers ``LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer``,
-    specifically the AMD/aiter branch guards that disable the fused path under
-    DP attention or an expert-parallel A2A backend (e.g. mori). Without those
-    guards the fused custom all-reduce is invoked during CUDA graph capture in
-    those configs and crashes in ``custom_all_reduce.flush_graph_buffers``.
-
-    The gate is pure decision logic, so the test stubs out the module-level
-    dependencies and invokes the method on a minimal fake instance. No GPU or
-    distributed initialization is required.
+    DP attention must not invoke the custom all-reduce, while an A2A MoE must
+    finish in its combine path instead of leaving a TP sum to this consumer.
+    These checks use CPU tensors and do not initialize distributed groups.
     """
 
     def _evaluate_gate(
         self,
         *,
         dp_attention,
-        a2a_is_none,
         aiter_enabled=True,
         use_aiter=True,
         tp_world_size=8,
-        mlp_mode=ScatterMode.TP_ATTN_FULL,
-        is_last_layer=False,
-        tp_size=8,
+        forward_mode=ForwardMode.DECODE,
+        disable_in_prefill=False,
+        disable_in_decode=False,
+        matching_group=True,
     ):
-        """Run the gate with the aiter branch isolated (flashinfer forced off)."""
-        a2a_backend = types.SimpleNamespace(is_none=lambda: a2a_is_none)
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                mock.patch.object(comm, "is_enable_moe_cp_allgather", lambda: False)
+        group = object()
+        norm = types.SimpleNamespace(
+            forward_with_allreduce_fusion=MagicMock(return_value=("norm", "residual"))
+        )
+        plan = types.SimpleNamespace(norm=norm)
+        hidden = torch.ones(8, 32)
+        owed = UnreducedOutput(hidden, group=group if matching_group else object())
+        with (
+            patch_communicator("flashinfer_ar_fusion_applies", return_value=False),
+            patch_communicator("post_experts_reduction_group", return_value=group),
+            patch_communicator("_use_aiter", use_aiter),
+            get_parallel().override(tp_size=tp_world_size),
+            get_context().override_server_args(
+                enable_aiter_allreduce_fusion=aiter_enabled,
+                disable_aiter_allreduce_fusion_in_prefill=disable_in_prefill,
+                disable_aiter_allreduce_fusion_in_decode=disable_in_decode,
+            ),
+            get_flags().dp.override(enabled=dp_attention),
+        ):
+            result = fused_attn_input(
+                plan,
+                owed,
+                hidden.clone(),
+                _fake_forward_batch(forward_mode=forward_mode),
+                None,
+                fuses_quant=False,
+                keep_bf16=False,
             )
-            stack.enter_context(
-                mock.patch.object(
-                    comm,
-                    "get_attn_tp_context",
-                    lambda: types.SimpleNamespace(input_scattered=False),
-                )
-            )
-            # Force the NVIDIA/flashinfer term off so the aiter branch decides.
-            stack.enter_context(
-                mock.patch.object(
-                    comm, "apply_flashinfer_allreduce_fusion", lambda batch_size: False
-                )
-            )
-            stack.enter_context(mock.patch.object(comm, "_use_aiter", use_aiter))
-            stack.enter_context(
-                mock.patch.object(
-                    comm,
-                    "get_parallel",
-                    lambda: types.SimpleNamespace(tp_size=tp_world_size),
-                )
-            )
-            # the gate reads get_exec().comm.enable_aiter_allreduce_fusion
-            from sglang.srt.runtime_context import get_context, get_flags
-
-            stack.enter_context(
-                get_context().override_server_args(
-                    enable_aiter_allreduce_fusion=aiter_enabled
-                )
-            )
-
-            stack.enter_context(get_flags().dp.override(enabled=dp_attention))
-            stack.enter_context(
-                mock.patch.object(comm, "get_moe_a2a_backend", lambda: a2a_backend)
-            )
-
-            fake_self = _fake_self(
-                mlp_mode=mlp_mode, is_last_layer=is_last_layer, tp_size=tp_size
-            )
-            return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                fake_self, _fake_forward_batch()
-            )
+        self.assertEqual(norm.forward_with_allreduce_fusion.called, result is not None)
+        return result is not None
 
     def test_dense_tp_fuses(self):
         # Baseline supported path: dense TP, no DP attention, no EP backend.
-        self.assertTrue(self._evaluate_gate(dp_attention=False, a2a_is_none=True))
+        self.assertTrue(self._evaluate_gate(dp_attention=False))
 
     def test_dp_attention_disables_fusion(self):
         # The fix: DP attention has no dense TP all-reduce to fuse.
-        self.assertFalse(self._evaluate_gate(dp_attention=True, a2a_is_none=True))
+        self.assertFalse(self._evaluate_gate(dp_attention=True))
 
-    def test_ep_backend_disables_fusion(self):
-        # The fix: with an EP A2A backend (e.g. mori) the reduction lives in
-        # combine(), not a TP all-reduce.
-        self.assertFalse(self._evaluate_gate(dp_attention=False, a2a_is_none=False))
+    def test_ep_backend_does_not_leave_a_tp_sum(self):
+        # The producer rejects A2A before the consumer can select fusion.
+        # In particular, Mori combine owns the output's reduction.
+        backend = types.SimpleNamespace(is_none=lambda: False)
+        with patch.object(moe_utils, "get_moe_a2a_backend", return_value=backend):
+            self.assertFalse(moe_utils.post_experts_sum_is_one_all_reduce())
 
-    def test_dp_attention_and_ep_disables_fusion(self):
-        # The crashing config from the TP8+EP8+mori repro.
-        self.assertFalse(self._evaluate_gate(dp_attention=False, a2a_is_none=False))
-        self.assertFalse(self._evaluate_gate(dp_attention=True, a2a_is_none=False))
+    def test_another_reduction_group_does_not_fuse(self):
+        self.assertFalse(self._evaluate_gate(dp_attention=False, matching_group=False))
 
     def test_flag_off_disables_fusion(self):
         # Sanity: the gate still respects the opt-in flag on the dense path.
-        self.assertFalse(
-            self._evaluate_gate(
-                dp_attention=False, a2a_is_none=True, aiter_enabled=False
-            )
-        )
+        self.assertFalse(self._evaluate_gate(dp_attention=False, aiter_enabled=False))
 
-    def test_last_layer_disables_fusion(self):
-        self.assertFalse(
-            self._evaluate_gate(
-                dp_attention=False, a2a_is_none=True, is_last_layer=True
-            )
-        )
+    def test_tp6_does_not_use_aiter_fusion(self):
+        self.assertFalse(self._evaluate_gate(dp_attention=False, tp_world_size=6))
 
-    def test_tp1_disables_fusion(self):
-        self.assertFalse(
-            self._evaluate_gate(dp_attention=False, a2a_is_none=True, tp_size=1)
-        )
+    PREFILL_MODES = (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL)
+    DECODE_MODES = (
+        ForwardMode.DECODE,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.DRAFT_EXTEND_V2,
+        ForwardMode.IDLE,
+    )
+
+    def test_prefill_opt_out_disables_fusion_in_prefill_only(self):
+        for mode in self.PREFILL_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertFalse(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        forward_mode=mode,
+                        disable_in_prefill=True,
+                    )
+                )
+        for mode in self.DECODE_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertTrue(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        forward_mode=mode,
+                        disable_in_prefill=True,
+                    )
+                )
+
+    def test_decode_opt_out_disables_fusion_in_decode_only(self):
+        for mode in self.DECODE_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertFalse(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        forward_mode=mode,
+                        disable_in_decode=True,
+                    )
+                )
+        for mode in self.PREFILL_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertTrue(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        forward_mode=mode,
+                        disable_in_decode=True,
+                    )
+                )
+
+    def test_no_phase_opt_out_fuses_everywhere(self):
+        for mode in self.PREFILL_MODES + self.DECODE_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertTrue(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        forward_mode=mode,
+                    )
+                )
 
 
 if __name__ == "__main__":

@@ -93,7 +93,9 @@ class HunyuanConfig(PipelineConfig):
     # DiT
     dit_config: DiTConfig = field(default_factory=HunyuanVideoConfig)
     # VAE
-    vae_config: VAEConfig = field(default_factory=HunyuanVAEConfig)
+    vae_config: VAEConfig = field(
+        default_factory=lambda: HunyuanVAEConfig(parallel_decode_mode="tiled")
+    )
     # Denoising stage
     embedded_cfg_scale: int = 6
     flow_shift: int = 7
@@ -164,5 +166,30 @@ class FastHunyuanConfig(HunyuanConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            keep_resident_components=("vae",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit", "vae"),
         )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan import (
+        FastHunyuanSamplingParam,
+        HunyuanSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HunyuanSamplingParams,
+        pipeline_config_cls=HunyuanConfig,
+        hf_model_paths=[
+            "hunyuanvideo-community/HunyuanVideo",
+        ],
+        model_detectors=[lambda hf_id: "hunyuanvideo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=FastHunyuanSamplingParam,
+        pipeline_config_cls=FastHunyuanConfig,
+        hf_model_paths=[
+            "FastVideo/FastHunyuan-diffusers",
+        ],
+    )
