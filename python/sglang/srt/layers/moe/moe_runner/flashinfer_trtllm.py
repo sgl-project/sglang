@@ -1452,17 +1452,23 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     # Deferred outputs keep the padded width, so padded weights always finalize.
     defer_finalize = (
         _deferred_finalize_enabled.get()
-        and not use_routed_topk
-        and TopKOutputChecker.format_is_bypassed(topk_output)
+        and (use_routed_topk or TopKOutputChecker.format_is_bypassed(topk_output))
         and hidden_pad == 0
     )
 
     symm_output = None
-    if not defer_finalize:
-        num_tokens = hs_fp4.shape[0]
-        hidden_size = (
-            hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
-        )
+    num_tokens = hs_fp4.shape[0]
+    hidden_size = (
+        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    )
+    if defer_finalize:
+        if use_routed_topk:
+            # Workaround for flashinfer-ai/flashinfer#6077: the ignored buffer's shape
+            # keeps the autotune lookup on the tuned entry; drop once fixed upstream.
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+            )
+    else:
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
@@ -1507,12 +1513,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             local_num_experts=quant_info.local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
-            do_finalize=True,
+            do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
-        )[0]
+        )
+        if defer_finalize:
+            result = _make_deferred_finalize_output(
+                result, top_k=_routing_top_k(routing)
+            )
+        else:
+            result = result[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
