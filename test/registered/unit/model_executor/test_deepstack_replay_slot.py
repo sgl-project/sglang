@@ -243,6 +243,7 @@ class TestDeepStackReplaySlotWiring(CustomTestCase):
     def _runner(self, replay):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner.is_dsv41_model = False
         runner._qwen_bcg_hc_sidechannel = False
         runner._use_draft_input_embeds = False
         runner._input_embeds_arg_idx = None
