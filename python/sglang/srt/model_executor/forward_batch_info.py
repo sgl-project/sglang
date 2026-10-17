@@ -710,6 +710,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Decode-graph-owned destination for AuxHiddenStatePacker; None when eager.
     aux_hidden_states_buffer: Optional[torch.Tensor] = None
 
+    # Row mask of moe_num_token_non_padded(), built by the first MoE layer.
+    _moe_valid_token_mask: Optional[torch.Tensor] = None
+
     # Prefill body-CUDA-graph context limit. Attention backends that allocate
     # context-shaped metadata use this fixed maximum instead of deriving a
     # shape from the live batch. None preserves eager/default graph behavior.
@@ -1376,6 +1379,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return self.num_token_non_padded
         # None under cuda-graph replay: its static batch carries no GLOBAL count.
         return self.global_num_token_non_padded
+
+    def moe_valid_token_mask(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """Per-row form of moe_num_token_non_padded(), shared by every MoE layer."""
+        num_token_non_padded = self.moe_num_token_non_padded()
+        if num_token_non_padded is None:
+            return None
+        mask = self._moe_valid_token_mask
+        if mask is None or mask.shape[0] != num_tokens:
+            mask = (
+                torch.arange(num_tokens, device=num_token_non_padded.device)
+                < num_token_non_padded
+            )
+            self._moe_valid_token_mask = mask
+        return mask
 
     def _moe_input_gathered_across_cp(self) -> bool:
         from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp

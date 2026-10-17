@@ -37,7 +37,7 @@ def mhc_mega_boundary(
     rows, hidden = x.shape
     hc = residual.shape[1]
     updated = torch.empty_like(residual)
-    normalized = torch.empty_like(x)
+    normalized = torch.empty((rows, hidden), dtype=x.dtype, device=x.device)
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)
     next_comb = torch.empty_like(comb)

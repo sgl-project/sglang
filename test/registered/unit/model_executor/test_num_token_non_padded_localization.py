@@ -225,6 +225,20 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
         ):
             self.assertIsNone(_value(_forward_batch(sharded=True, glob=None)))
 
+    def test_valid_token_mask_is_shared_across_moe_layers(self):
+        """Every MoE layer of a forward reads one row mask; none when unmasked."""
+        with (
+            get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+            sparse_moe_input("local"),
+        ):
+            batch = _forward_batch(sharded=False)
+            mask = batch.moe_valid_token_mask(10)
+            self.assertEqual(mask.tolist(), [True] * LOCAL + [False] * (10 - LOCAL))
+            self.assertIs(batch.moe_valid_token_mask(10), mask)
+            self.assertIsNone(
+                _forward_batch(sharded=False, local=None).moe_valid_token_mask(10)
+            )
+
     def test_absent_local_count_stays_absent(self):
         """Without expert parallelism the count is never filled, and routing
         must not mask every row against the unfilled buffer."""

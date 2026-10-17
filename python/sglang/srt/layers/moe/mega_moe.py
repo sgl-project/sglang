@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -196,7 +197,7 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     return (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
         and get_moe_a2a_backend().is_megamoe()
-        and getattr(moe.experts, "_mega_moe_weights_built", False)
+        and moe.experts._mega_moe_weights_built
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
         and moe.shared_experts_is_fp8
@@ -261,35 +262,45 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
+        num_token_non_padded = None
+        valid_token_mask = None
+        if forward_batch is not None:
+            num_token_non_padded = forward_batch.moe_num_token_non_padded()
+            valid_token_mask = forward_batch.moe_valid_token_mask(num_tokens)
         dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-        if (
-            not moe.is_hash
-            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
-        ):
-            topk_output = vision_topk(
-                moe,
-                router_logits,
-                input_ids_global,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-            )
+        if should_use_mega_gate(moe, hidden_states, dispatch_info):
+            import deep_gemm
+
+            with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+                topk_weights, topk_ids = run_mega_gate(
+                    moe,
+                    hidden_states,
+                    input_ids_global,
+                    num_token_non_padded,
+                    valid_token_mask,
+                    dispatch_info,
+                )
         else:
-            topk_output = moe.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            if not moe.is_hash and moe.gate.e_score_correction_bias_vl is not None:
+                topk_output = vision_topk(
+                    moe,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                )
+            else:
+                topk_output = moe.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
     else:
         topk_ids = None
         topk_weights = None
@@ -528,7 +539,7 @@ def build_mega_moe_experts_weights(experts) -> None:
         transform_sf_into_required_layout,
     )
 
-    if getattr(experts, "_mega_moe_weights_built", False):
+    if experts._mega_moe_weights_built:
         return
 
     mma_type = _mega_moe_mma_type(experts)
