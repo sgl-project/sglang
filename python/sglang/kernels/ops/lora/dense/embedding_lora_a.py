@@ -184,3 +184,114 @@ def embedding_lora_a_fwd(
     )
 
     return output
+
+
+@triton.jit
+def _embedding_lora_a_tokens_kernel(
+    input_ids,
+    weights,
+    output,
+    extra_embeddings,
+    token_lora_mapping,  # int32 [S]: adapter slot per token, -1 = none
+    lora_ranks,
+    vocab_size,
+    rank,
+    w_stride_0,
+    w_stride_1,
+    w_stride_2,
+    output_stride_0,
+    output_stride_1,
+    extra_emb_stride_0,
+    extra_emb_stride_1,
+    extra_emb_stride_2,
+    BLOCK_RANK: tl.constexpr,
+    HAS_EXTRA_EMBEDDINGS: tl.constexpr,
+):
+    """One program per token; zero inactive rows and columns beyond live rank."""
+    token = tl.program_id(axis=0)
+    slot = tl.load(token_lora_mapping + token)
+    has_adapter = slot >= 0
+    w_index = tl.where(has_adapter, slot, 0)
+    rank_val = tl.where(has_adapter, tl.load(lora_ranks + w_index), 0)
+    token_id = tl.load(input_ids + token)
+    is_extra_token = token_id >= vocab_size
+    token_id_clamped = tl.minimum(token_id, vocab_size - 1)
+    extra_token_id = tl.maximum(token_id - vocab_size, 0)
+    for block_id in range(tl.cdiv(rank, BLOCK_RANK)):
+        rank_offset = tl.arange(0, BLOCK_RANK) + block_id * BLOCK_RANK
+        live = rank_offset < rank_val
+        if HAS_EXTRA_EMBEDDINGS and is_extra_token:
+            emb_values = tl.load(
+                extra_embeddings
+                + w_index * extra_emb_stride_0
+                + extra_token_id * extra_emb_stride_1
+                + rank_offset * extra_emb_stride_2,
+                mask=live,
+                other=0.0,
+            )
+        else:
+            emb_values = tl.load(
+                weights
+                + w_index * w_stride_0
+                + rank_offset * w_stride_1
+                + token_id_clamped * w_stride_2,
+                mask=live,
+                other=0.0,
+            )
+        tl.store(
+            output + token * output_stride_0 + rank_offset * output_stride_1,
+            emb_values,
+            mask=rank_offset < rank,
+        )
+
+
+def embedding_lora_a_tokens_fwd(
+    input_ids: torch.Tensor,
+    weights: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    vocab_size: int,
+    extra_embeddings: torch.Tensor = None,
+) -> torch.Tensor:
+    """Look up LoRA A by token slot (-1 = inactive), respecting per-slot ranks.
+
+    The grid follows token count, not request count, including graph padding.
+    """
+    assert input_ids.is_contiguous() and weights.is_contiguous()
+    assert input_ids.dim() == 1 and weights.dim() == 3
+    S = input_ids.shape[0]
+    assert token_lora_mapping.shape[0] >= S, (token_lora_mapping.shape, S)
+    rank = weights.shape[1]
+    has_extra = extra_embeddings is not None
+    if has_extra:
+        assert extra_embeddings.is_contiguous()
+        extra_emb_stride = tuple(extra_embeddings.stride())
+    else:
+        extra_embeddings = torch.empty(
+            (1, 1, 1), device=input_ids.device, dtype=weights.dtype
+        )
+        extra_emb_stride = (1, 1, 1)
+    output = torch.empty((S, rank), device=input_ids.device, dtype=weights.dtype)
+    if S == 0:
+        return output
+    _embedding_lora_a_tokens_kernel[(S,)](
+        input_ids,
+        weights,
+        output,
+        extra_embeddings,
+        token_lora_mapping,
+        lora_ranks,
+        vocab_size,
+        rank,
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(2),
+        output.stride(0),
+        output.stride(1),
+        extra_emb_stride[0],
+        extra_emb_stride[1],
+        extra_emb_stride[2],
+        BLOCK_RANK=128,
+        HAS_EXTRA_EMBEDDINGS=has_extra,
+    )
+    return output
