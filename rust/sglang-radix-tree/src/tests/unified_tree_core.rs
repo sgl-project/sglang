@@ -3014,32 +3014,8 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
     assert_eq!(action.node_ids, vec![c]);
 }
 
-// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
-// node and stamp every node its transfers cover with that node's ack.
-// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
-fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
-    for &node_id in &backup.node_ids {
-        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
-        if device_value.numel() == 0 && comp_xfers.is_empty() {
-            continue;
-        }
-        let mut publish_node_ids = Vec::new();
-        for transfer in comp_xfers.values_mut().flatten() {
-            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
-            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
-        }
-        if !publish_node_ids.contains(&node_id) {
-            publish_node_ids.push(node_id);
-        }
-        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
-            .expect("live test node");
-        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
-            .expect("live test nodes");
-    }
-}
-
 #[test]
-fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+fn write_back_defers_swa_window_backup_until_eviction() {
     // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
     //                  -> d(Full unbacked) -> t2(Full backed)
     // Every node holds a device-only SWA value inside the window.
@@ -3079,7 +3055,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
     }
 
     // Two requests in one batch finish at t1 and t2; neither ack drains.
-    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+    for key in [&key_t1, &key_t2] {
         let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
         let backups: Vec<&BackupKV> = result
             .cache_actions
@@ -3089,9 +3065,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
                 _ => None,
             })
             .collect();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].node_ids, vec![target]);
-        execute_backup_kv_for_test(&mut tc, backups[0]);
+        assert!(backups.is_empty());
     }
 
     let pending = |node_id| {
@@ -3099,8 +3073,11 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
             .node(tc.arena.resolve(node_id).expect("live test node"))
             .write_through_pending_id
     };
-    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
-        assert_eq!(pending(node_id), Some(ack_id));
+    for node_id in [c, b, t1, d, t2] {
+        assert_eq!(pending(node_id), None);
+    }
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        assert!(!tc.arena.node(idx).has_host_value(SWA));
     }
     // Write-back defers the unbacked Full prefix to eviction.
     assert!(
