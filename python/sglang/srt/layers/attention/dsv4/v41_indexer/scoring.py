@@ -69,6 +69,18 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
         if inputs.out_page_indices is None:
             return
         raw = inputs.out_raw_indices[: self.num_rows]
+        if raw.is_cuda:
+            from sglang.kernels.ops.attention.dsv4.index_page_slots import (
+                index_page_slots,
+            )
+
+            index_page_slots(
+                raw,
+                self.request_starts,
+                self.k_slots,
+                inputs.out_page_indices[: self.num_rows],
+            )
+            return
         columns = (raw + self.request_starts[:, None]).clamp_min(0)
         inputs.out_page_indices[: self.num_rows, : raw.shape[1]] = torch.where(
             raw >= 0, self.k_slots[columns], -1

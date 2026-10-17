@@ -71,7 +71,7 @@ class FullTopKIndexer:
             self._torch_decode(inputs)
 
     def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
-        inputs.reset_outputs()
+        inputs.reset_outputs(page_indices=False)
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return

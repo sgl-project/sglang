@@ -62,9 +62,9 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     out_raw_indices: torch.Tensor
     out_page_indices: Optional[torch.Tensor]
 
-    def reset_outputs(self) -> None:
+    def reset_outputs(self, page_indices: bool = True) -> None:
         self.out_raw_indices.fill_(-1)
-        if self.out_page_indices is not None:
+        if page_indices and self.out_page_indices is not None:
             self.out_page_indices.fill_(-1)
 
 
