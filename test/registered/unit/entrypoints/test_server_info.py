@@ -35,6 +35,7 @@ from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.rust_server import config as rust_config
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -170,6 +171,23 @@ class TestServerInfoTransportParity(CustomTestCase):
                 self.assertEqual(
                     json.loads(leader_json), json.loads(json.dumps(http_info))
                 )
+
+                # The embedded Rust server's launch-time fields, which stamp
+                # the init info the scheduler handshake carries for Python.
+                scheduler = SimpleNamespace(
+                    server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertEqual(rust_launch.pop("status"), "ready")
+                self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
+                self.assertEqual(rust_launch, json.loads(leader_json))
+
+                # The Rust listener is HTTP/1 only, so it never advertises h2.
+                scheduler.server_args = ServerArgs(
+                    model_path="dummy", page_size=64, enable_http2=True
+                )
+                rust_launch = json.loads(rust_config._launch_server_info(scheduler))
+                self.assertIs(rust_launch["enable_http2"], False)
 
                 with (
                     patch.object(
