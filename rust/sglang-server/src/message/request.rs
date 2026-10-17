@@ -472,9 +472,20 @@ pub enum RequestKind {
     /// the same FSM as every request (validate → register → Queued), but the
     /// stage that answers it is the detok shard itself, never the scheduler
     /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
+    /// (the raw UTF-8 text). Callers: `/v1/completions` `echo` for token-id
+    /// prompts, and `/v1/detokenize`.
+    Detokenize {
+        token_ids: TokenIds,
+        skip_special_tokens: bool,
+    },
+    /// Internal service call: encode one text to token ids (`/v1/tokenize`).
+    /// Walks the same FSM to `Queued`, then the tokenizer pool answers it
+    /// through the request's own sink with one `TokenIds` payload. It never
+    /// reaches a detok shard, so it is not registered with one.
+    Tokenize {
+        text: String,
+        add_special_tokens: bool,
+    },
 }
 
 /// A single in-flight generation request (one item after adapter fan-out),
