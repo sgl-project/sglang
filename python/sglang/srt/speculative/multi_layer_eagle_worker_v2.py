@@ -25,7 +25,10 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
 )
-from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qsa.config import (
+    parse_qsa_profile,
+    qsa_dense_fallback,
+)
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
@@ -382,7 +385,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 "index_share_for_mtp_iteration is not supported with "
                 "multi-layer EAGLE; the draft indexer runs every step"
             )
-        qsa_profile = parse_qsa_profile(hf_config)
+        qsa_profile = None if qsa_dense_fallback() else parse_qsa_profile(hf_config)
         # Create attn backends
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):

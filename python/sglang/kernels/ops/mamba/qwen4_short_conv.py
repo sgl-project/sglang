@@ -66,16 +66,16 @@ def can_fuse_qwen4_short_conv_state(
     """Return whether decode state movement can use the exact fused kernel."""
 
     return (
-        state.is_cuda
+        state.device.type == "cuda"
         and state.dtype in (torch.bfloat16, torch.float16)
         and state.dim() == 3
         and state.is_contiguous()
         and 0 < state.shape[2] <= _QWEN4_MAX_SHORT_CONV_STATE_LEN
-        and state_indices.is_cuda
+        and state_indices.device.type == "cuda"
         and state_indices.dtype == torch.long
         and state_indices.dim() == 1
         and state_indices.is_contiguous()
-        and x.is_cuda
+        and x.device.type == "cuda"
         and x.dtype == state.dtype
         and x.dim() == 2
         and x.is_contiguous()
@@ -226,7 +226,7 @@ def can_fuse_qwen4_verify_conv(
     x, residual, weight, state, state_indices, valid, width, dilation, intermediate
 ):
     return (
-        x.is_cuda
+        x.device.type == "cuda"
         and x.dtype == torch.bfloat16
         and x.ndim == 2
         and x.is_contiguous()

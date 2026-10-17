@@ -6,6 +6,9 @@ from typing import Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_npu
+
 _COMPRESSED_FIELDS = (
     "indexer_n_heads",
     "indexer_kv_heads",
@@ -94,8 +97,29 @@ def is_qwen_qsa(config) -> bool:
     return parse_qsa_profile(config) is not None
 
 
+def qsa_dense_fallback() -> bool:
+    """Explicit NPU fallback; context is bounded during model configuration."""
+
+    return is_npu() and envs.SGLANG_QWEN4_NPU_DENSE_FALLBACK.get()
+
+
+def validate_qsa_dense_fallback(config, context_len: int) -> None:
+    """Do not silently replace sparse selection beyond its token budget."""
+    if not qsa_dense_fallback():
+        return
+    profile = parse_qsa_profile(config)
+    if profile is not None and context_len > profile.budget:
+        raise ValueError(
+            "SGLANG_QWEN4_NPU_DENSE_FALLBACK requires --context-length "
+            f"<= indexer_budget ({profile.budget}); got {context_len}. "
+            "Long-context sparse attention is not implemented by this fallback."
+        )
+
+
 __all__ = [
     "QSAProfile",
     "is_qwen_qsa",
     "parse_qsa_profile",
+    "qsa_dense_fallback",
+    "validate_qsa_dense_fallback",
 ]

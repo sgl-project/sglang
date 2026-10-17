@@ -53,12 +53,12 @@ def can_fuse_qwen4_gate_value(gate: torch.Tensor, value: torch.Tensor) -> bool:
     """Return whether inputs match Qwen4's fixed BF16 gate/value contract."""
 
     return (
-        gate.is_cuda
+        gate.device.type == "cuda"
         and gate.dtype == torch.bfloat16
         and gate.dim() == 3
         and gate.shape[1:] == (_QWEN4_HC_COUNT, 1)
         and gate.is_contiguous()
-        and value.is_cuda
+        and value.device.type == "cuda"
         and value.dtype == gate.dtype
         and value.shape == (gate.shape[0], _QWEN4_HIDDEN_SIZE)
         and value.is_contiguous()
@@ -121,7 +121,7 @@ def _qwen4_gate_reduce_kernel(
 
 def can_fuse_qwen4_gate_reduce(key, query, value):
     return (
-        key.is_cuda
+        key.device.type == "cuda"
         and key.dtype == torch.bfloat16
         and key.ndim == 3
         and key.shape[1:] == (_QWEN4_HC_COUNT, _QWEN4_HIDDEN_SIZE)
