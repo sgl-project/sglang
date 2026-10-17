@@ -37,6 +37,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -134,6 +136,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("get_hicache_l3_cache_layout", GetHiCacheL3LayoutReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
@@ -957,6 +960,16 @@ class TokenizerControlMixin:
         ] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_hicache_l3_cache_layout(
+        self: TokenizerManager,
+    ) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        req = GetHiCacheL3LayoutReq()
+        responses: List[
+            GetHiCacheL3LayoutReqOutput
+        ] = await self.get_hicache_l3_cache_layout_communicator(req)
+        return [res.layout for res in responses]
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
