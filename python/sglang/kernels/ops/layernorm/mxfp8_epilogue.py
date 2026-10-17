@@ -54,6 +54,43 @@ def mxfp8_epilogue(
 
 
 @triton.jit
+def mxfp8_sf_offset(row, g, GROUPS_PAD: tl.constexpr):
+    return (
+        (row // 128) * (GROUPS_PAD * 128)
+        + (g // 4) * 512
+        + ((row % 32) * 4 + ((row // 32) % 4)) * 4
+        + (g % 4)
+    )
+
+
+@triton.jit
+def mxfp8_epilogue_tiled(
+    y,
+    row,
+    Q,
+    S,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUPS: tl.constexpr,
+    GROUPS_PAD: tl.constexpr,
+):
+    GP: tl.constexpr = BLOCK // 32
+    g = tl.arange(0, GP)
+    live = g < GROUPS
+    pad = (g >= GROUPS) & (g < GROUPS_PAD)
+    e = tl.arange(0, 32)
+    idx = g[:, None] * 32 + e[None, :]
+    v = tl.reshape(y.to(tl.float32), (GP, 32))
+    amax = tl.max(tl.abs(v), 1)
+    sf, scale = ue8m0_scale(amax)
+    q = tl.minimum(tl.maximum(v * scale[:, None], -448.0), 448.0).to(tl.float8e4nv)
+    tl.store(Q + row * K + idx, q, live[:, None])
+    off = mxfp8_sf_offset(row, g, GROUPS_PAD)
+    tl.store(S + off, sf.to(tl.uint8), live)
+    tl.store(S + off, 0, pad)
+
+
+@triton.jit
 def _rmsnorm_mxfp8_kernel(
     X,
     W,
@@ -66,6 +103,7 @@ def _rmsnorm_mxfp8_kernel(
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
     GROUPS: tl.constexpr,
+    GROUPS_PAD: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row < M:
@@ -75,12 +113,11 @@ def _rmsnorm_mxfp8_kernel(
         inv = tl.rsqrt(tl.sum(v * v, 0) / K + EPS)
         y = (v * inv * weight).to(tl.bfloat16)
         tl.store(Y + row * K + h, y, h < K)
-        mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, 0, GROUPS)
+        mxfp8_epilogue_tiled(y, row, Q, S, K, BLOCK, GROUPS, GROUPS_PAD)
     else:
-        # Padding scale entries are disjoint from the live rows above.
-        off = (row - M) * 512 + tl.arange(0, 512)
-        pad_row = ((off // 4) % 4) * 32 + ((off // 16) % 32)
-        tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
+        GP: tl.constexpr = BLOCK // 32
+        g = tl.arange(0, GP)
+        tl.store(S + mxfp8_sf_offset(row, g, GROUPS_PAD), 0, g < GROUPS_PAD)
 
 
 def rmsnorm_mxfp8(
@@ -88,12 +125,15 @@ def rmsnorm_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """RMSNorm returning ``(y_bf16, y_q, y_sf)`` with the same MXFP8 epilogue."""
     m, k = x.shape
-    assert 0 < m <= 8 and k % 32 == 0
+    assert m > 0 and k % 32 == 0
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
+    groups = k // 32
+    groups_pad = triton.cdiv(groups, 4) * 4
+    m_pad = triton.cdiv(m, 128) * 128
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    s = torch.empty((k // 32) * 128, dtype=torch.uint8, device=x.device)
-    _rmsnorm_mxfp8_kernel[(m + triton.cdiv(s.numel(), 512),)](
+    s = torch.empty(m_pad * groups_pad, dtype=torch.uint8, device=x.device)
+    _rmsnorm_mxfp8_kernel[(m_pad,)](
         x,
         weight,
         y,
@@ -104,7 +144,8 @@ def rmsnorm_mxfp8(
         K=k,
         EPS=eps,
         BLOCK=triton.next_power_of_2(k),
-        GROUPS=k // 32,
+        GROUPS=groups,
+        GROUPS_PAD=groups_pad,
         num_warps=8,
         enable_fp_fusion=False,
     )

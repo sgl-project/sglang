@@ -69,13 +69,45 @@ def check(x, w, got):
     assert torch.equal(y.view(torch.int16), expected.view(torch.int16))
     assert torch.equal(q.view(torch.uint8), eq.view(torch.uint8))
     m = x.shape[0]
-    g = torch.arange(40, device=x.device)
+    groups = x.shape[1] // 32
+    groups_pad = -(-groups // 4) * 4
+    assert sf.numel() == esf.numel() == -(-m // 128) * 128 * groups_pad
+    g = torch.arange(groups, device=x.device)
     row = torch.arange(m, device=x.device)[:, None]
-    offsets = (g // 4) * 512 + ((row % 32) * 4 + row // 32) * 4 + g % 4
+    offsets = (
+        (row // 128) * (groups_pad * 128)
+        + (g // 4) * 512
+        + ((row % 32) * 4 + (row // 32) % 4) * 4
+        + g % 4
+    )
     assert torch.equal(sf[offsets], esf.flatten()[offsets])
     pad = torch.ones_like(sf, dtype=torch.bool)
     pad[offsets] = False
     assert torch.count_nonzero(sf[pad]) == 0
+    assert torch.equal(sf, esf.flatten())
+
+
+def check_prefill(x, w, got):
+    y, q, sf = got
+    ref = flashinfer.norm.rmsnorm(x, w, 1e-6)
+    ulp = (y.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
+    assert int(ulp.max()) <= 1
+    assert int((ulp != 0).sum()) <= max(8, y.numel() // 20000)
+    eq, esf = flashinfer.mxfp8_quantize(y, is_sf_swizzled_layout=True)
+    assert torch.equal(q.view(torch.uint8), eq.view(torch.uint8))
+    assert sf.shape == esf.reshape(-1).shape
+    assert torch.equal(sf, esf.reshape(-1))
+
+
+@pytest.mark.parametrize("m", [9, 128, 129, 257, 1000, 4096, 16384])
+@pytest.mark.parametrize("stride", [1280, 1792])
+def test_prefill_rows(m, stride):
+    torch.manual_seed(1601 + m)
+    x = torch.randn((m, stride), device="cuda", dtype=torch.bfloat16)[:, :1280]
+    w = torch.randn(1280, device="cuda", dtype=torch.bfloat16)
+    for scale in [1e-4, 1, 100]:
+        x.copy_(torch.randn_like(x) * scale)
+        check_prefill(x, w, rmsnorm_mxfp8(x, w, 1e-6))
 
 
 @pytest.mark.parametrize("m", [1, 5, 6, 8])
