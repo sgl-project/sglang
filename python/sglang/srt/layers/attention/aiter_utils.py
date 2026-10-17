@@ -35,6 +35,11 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
 
 from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.tlx_utils import (
+    forward_decode_vectorized_5d_tlx,
+    should_use_tlx_decode,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -245,6 +250,15 @@ def forward_decode_vectorized_5d(
     is_swa_layer = (
         layer.sliding_window_size is not None and layer.sliding_window_size > -1
     )
+
+    tlx_mode = envs.SGLANG_AITER_5D_DECODE_BACKEND.get().lower()
+    if should_use_tlx_decode(
+        tlx_mode, backend, q, layer, forward_batch, k_cache, v_cache, sinks
+    ):
+        forward_decode_vectorized_5d_tlx(
+            backend, q, layer, forward_batch, k_cache, v_cache, o, sinks
+        )
+        return
 
     if is_swa_layer:
         block_tables_pa = (
