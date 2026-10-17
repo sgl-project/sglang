@@ -234,6 +234,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        self.is_dflash_mla_draft = model_runner.model_config.is_dflash_mla_draft
+        # Planned per batch, so every layer must share it: False only for a
+        # bidirectional DFlash MLA draft.
+        self.causal = True
+        if self.is_dflash_mla_draft:
+            from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_causal
+
+            self.causal = is_dflash_mla_draft_causal(
+                model_runner.model_config.hf_config
+            )
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -746,7 +756,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qall,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                causal=True,
+                causal=self.causal,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
@@ -1001,6 +1011,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.data_type = model_runner.dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
+        self.causal = attn_backend.causal
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1128,7 +1139,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
-                causal=True,
+                causal=self.causal,
             )
         elif fast_verify_plan_kwargs is not None:
             fast_mla_decode_plan(
@@ -1141,7 +1152,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
                 1,
-                True,
+                self.causal,
                 sm_scale,
                 self.q_data_type,
                 self.data_type,
@@ -1174,7 +1185,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
                 1,
-                True,
+                self.causal,
                 sm_scale,
                 self.q_data_type,
                 self.data_type,
