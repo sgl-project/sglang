@@ -86,6 +86,11 @@ class Qwen3ForPooledOutput(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            if name == "score.bias" and name not in params_dict:
+                raise ValueError(
+                    "Checkpoint has score.bias, but the sequence-classification "
+                    "score head is bias-free (as in HF transformers)."
+                )
             # Skip lm_head weights (pooled output models don't have lm_head)
             if name.startswith("lm_head"):
                 continue
@@ -133,7 +138,8 @@ class Qwen3ForSequenceClassification(Qwen3ForPooledOutput):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
+        # Matches HF GenericForSequenceClassification; no checkpoint ships a bias.
+        self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         # Use normalize=True for qwen3 embedding based on official implementation
         # Reference: https://github.com/QwenLM/Qwen3-Embedding/blob/main/examples/qwen3_embedding_transformers.py#L55
         # Official code: output = F.normalize(output, p=2, dim=1)

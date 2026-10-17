@@ -72,6 +72,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.rid_utils import expand_base_rid
 from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
@@ -761,8 +762,7 @@ class GenerateReqInput:
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
-            self.rid = new_rids
+            self.rid = expand_base_rid(self.rid, num)
         elif isinstance(self.rid, list):
             # Note: the length of rid shall be the same as the batch_size,
             # as the rid would be expanded for parallel sampling in tokenizer_manager
@@ -1367,6 +1367,8 @@ class EmbeddingReqInput:
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 

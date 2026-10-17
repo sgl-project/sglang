@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
+from sglang.srt.constants import DRAFT_RID_PREFIX
+
 
 class DraftMeshMessageType(str, Enum):
     CONTROL_BATCH = "control_batch"
@@ -24,12 +26,14 @@ class DraftReqKey:
 
 
 def build_draft_scheduler_rid(draft_key: DraftReqKey) -> str:
-    return f"draft:{int(draft_key.src_verifier_rank)}:{draft_key.request_id}"
+    return (
+        f"{DRAFT_RID_PREFIX}{int(draft_key.src_verifier_rank)}:{draft_key.request_id}"
+    )
 
 
 def parse_draft_scheduler_rid(rid: str) -> DraftReqKey:
-    if rid.startswith("draft:"):
-        encoded = rid[len("draft:") :]
+    if rid.startswith(DRAFT_RID_PREFIX):
+        encoded = rid[len(DRAFT_RID_PREFIX) :]
         rank_text, sep, request_id = encoded.partition(":")
         if sep and request_id:
             return DraftReqKey(

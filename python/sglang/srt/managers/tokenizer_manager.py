@@ -1596,6 +1596,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            self._validate_positional_embed_overrides(obj.positional_embed_overrides)
+
             tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1652,6 +1654,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
+            self._validate_positional_embed_overrides(positional_embed_overrides)
+
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1675,6 +1679,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    def _validate_positional_embed_overrides(
+        self,
+        positional_embed_overrides: Optional[PositionalEmbeds],
+    ) -> None:
+        # Reject here (HTTP 400): a malformed value would otherwise fail msgpack
+        # decode or the embed scatter inside the scheduler and abort the batch.
+        if positional_embed_overrides is None:
+            return
+        if not isinstance(positional_embed_overrides, PositionalEmbeds):
+            raise ValueError(
+                "positional_embed_overrides must be a PositionalEmbeds or null, got "
+                f"{type(positional_embed_overrides).__name__}."
+            )
+        positional_embed_overrides.validate_hidden_dim(self.model_config.hidden_size)
 
     @staticmethod
     def _resolve_embed_overrides(

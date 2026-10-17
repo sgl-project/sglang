@@ -76,6 +76,71 @@ class TestPositionalEmbeds(CustomTestCase):
         pe = PositionalEmbeds(embeds=torch.zeros(0, HIDDEN_DIM), positions=[])
         self.assertEqual(pe.embeds.shape[0], 0)
 
+    def test_validate_hidden_dim_rejects_mismatch(self):
+        pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
+        with self.assertRaises(ValueError) as ctx:
+            pe.validate_hidden_dim(HIDDEN_DIM + 1)
+        msg = str(ctx.exception)
+        self.assertIn("hidden_dim", msg)
+        self.assertIn(str(HIDDEN_DIM), msg)
+        self.assertIn(str(HIDDEN_DIM + 1), msg)
+
+
+# ========================================================================
+# TokenizerManager._validate_positional_embed_overrides
+# ========================================================================
+
+
+class TestValidatePositionalEmbedOverrides(CustomTestCase):
+    def _tm(self):
+        tm = MagicMock()
+        tm.model_config.hidden_size = HIDDEN_DIM
+        tm._validate_positional_embed_overrides = (
+            TokenizerManager._validate_positional_embed_overrides.__get__(
+                tm, TokenizerManager
+            )
+        )
+        return tm
+
+    def test_model_hidden_size_mismatch_raises(self):
+        pe = PositionalEmbeds(embeds=[torch.zeros(HIDDEN_DIM + 3)], positions=[0])
+        with self.assertRaises(ValueError):
+            self._tm()._validate_positional_embed_overrides(pe)
+
+    def test_list_is_rejected(self):
+        # Requests are split per item before validation, so a list is never valid.
+        pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
+        for bogus in ([None], [pe], [None, pe], (pe,), []):
+            with self.subTest(bogus=bogus):
+                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
+                    self._tm()._validate_positional_embed_overrides(bogus)
+
+    def test_non_positional_embeds_value_raises(self):
+        # Raw JSON from the FastAPI body must be a 400, not a scheduler-side crash.
+        for bogus in (
+            {"embeds": [[1, 2]], "positions": [0]},
+            "abc",
+            5,
+            {"embeds": 1},
+            [{"embeds": [[1, 2]], "positions": [0]}],
+        ):
+            with self.subTest(bogus=bogus):
+                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
+                    self._tm()._validate_positional_embed_overrides(bogus)
+
+
+class TestPositionalEmbedsRankAndEmptiness(CustomTestCase):
+    def test_three_dim_embeds_rejected(self):
+        # Passes the length and hidden-dim checks but breaks the scheduler scatter.
+        with self.assertRaisesRegex(ValueError, "must be 2-D"):
+            PositionalEmbeds(embeds=torch.zeros(1, 1, HIDDEN_DIM), positions=[0])
+
+    def test_empty_embeds_list_raises_value_error(self):
+        # Must be ValueError (-> HTTP 400), not the RuntimeError torch.cat([])
+        # would raise, which the entrypoints do not map and would surface as 500.
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            PositionalEmbeds(embeds=[], positions=[])
+
 
 # ========================================================================
 # convert_embeds_to_tensors

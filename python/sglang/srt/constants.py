@@ -10,6 +10,7 @@ GPU_MEMORY_ALL_TYPES = [
 ]
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
+DRAFT_RID_PREFIX = "draft:"
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
