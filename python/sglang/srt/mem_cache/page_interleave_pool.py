@@ -721,6 +721,8 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ):
         slot = self._acquire_slot_for_read(layer.layer_id)
         rows = self._translate_loc_cached(loc)
@@ -728,6 +730,12 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         if self.store_dtype != self.dtype:
             kv_buffer = kv_buffer.view(self.dtype)
         dst_dtype = dst_dtype or self.dtype
+        if out is not None:
+            cache_k_nope, cache_k_rope = out.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            get_mla_kv_buffer_triton(kv_buffer, rows, cache_k_nope, cache_k_rope)
+            return cache_k_nope, cache_k_rope
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,
