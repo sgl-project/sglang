@@ -975,15 +975,17 @@ def handle_model_capability_adjustments(server_args: Any):
             "prefill; using breakable CUDA graph for CUDA prefill."
         )
 
-    # A Clef checkpoint's joint schema head reads the final hidden state of
+    # Clef and Valen decision heads read the final hidden state of
     # every prompt token in one pass, so each request is one complete prefill
     # with no decode: embedding mode, without prefix reuse or chunking. This
     # also puts the FA backend on its raw K/V path, which skips the KV pool.
-    if model_config.joint_head_config is not None:
+    if model_config.joint_head_config is not None or getattr(
+        model_config, "is_valen", False
+    ):
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
-                "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
-                "since the joint schema head reads full LM head rows"
+                "Decision-head checkpoints currently require --tp-size 1 "
+                "and --pp-size 1 for complete request-local hidden-state readouts"
             )
         for key, value in (
             ("is_embedding", True),
@@ -1002,7 +1004,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 ),
             )
         logger.info(
-            "Clef joint schema head detected: serving /v1/systemone decisions in "
+            "Decision head detected: serving schema decisions in "
             "embedding mode without radix cache, chunked prefill, or CUDA graphs."
         )
 

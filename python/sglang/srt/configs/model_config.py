@@ -30,6 +30,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.valen import is_valen_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
@@ -310,6 +311,7 @@ def load_joint_head_config(model_path: str, revision: Optional[str]) -> Optional
 
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
+        "ValenQwenForDecisionMaking",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForCausalLM",
@@ -548,6 +550,11 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        self.is_valen = is_valen_config(self.hf_config)
+        if self.is_valen:
+            # Reuse Qwen's multimodal/MRoPE and hybrid-attention dispatch.
+            # The native architecture and Valen settings remain distinct.
+            self.hf_config.model_type = "qwen3_5"
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
@@ -2251,7 +2258,8 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
     # 2. check the `is_embedding` server args
 
     if (
-        "LlamaEmbeddingModel" in model_architectures
+        "ValenQwenForDecisionMaking" in model_architectures
+        or "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
         or "LlamaForSequenceClassification" in model_architectures
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
@@ -2277,6 +2285,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 
 multimodal_model_archs = [
+    "ValenQwenForDecisionMaking",
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
     "Cosmos3EdgeForConditionalGeneration",

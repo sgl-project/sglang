@@ -9,6 +9,8 @@ description: Answer typed choice, score, and yes or no questions with a probabil
   `/v1/decisions` is an SGLang extension under `/v1`, like `/v1/score` and `/v1/rerank`. It is not part of the OpenAI API, so call it over HTTP rather than through an OpenAI SDK method. Until a release contains it, install a [nightly build](/docs/get-started/install#nightly-builds), which is built from the main branch.
 </Note>
 
+For native Qwen3.5 + Mixer Valen checkpoints, see [Native Valen decisions](#native-valen-decisions).
+
 ## Supported models
 
 | Model | Example HuggingFace identifier | Notes |
@@ -251,6 +253,118 @@ What to expect from this route:
 - `usage.input_tokens` counts the prompt of every question, so the state is counted once per question, or once for a joint schema checkpoint, and `usage.output_tokens` is 0.
 - The SDKs' `models.list()` and response `request_id` are not supported, because `GET /v1/models` keeps its OpenAI format and no request id header is sent.
 - The SDKs time out after 10 seconds and retry, so raise their timeout for requests with many questions over a long state. A request whose client gives up still finishes its encoding and part of its prefill, so each retry repeats at least the encoding.
+
+## Native Valen decisions
+
+Valen checkpoints with architecture `ValenQwenForDecisionMaking` use a dense
+Qwen3.5 language and vision backbone plus an FP32 Mixer head. All questions share
+one causal prefill. The head pools context, instruction, candidate, and decision
+hidden states and returns candidate scores without generating text.
+
+### Launch Valen
+
+Use Linux with an NVIDIA CUDA GPU and a complete Hugging Face Valen checkpoint
+containing the backbone, vision encoder, Mixer weights, tokenizer, and processor.
+The native path requires `qwen_execution=shared_state`, a Mixer head, tied word
+embeddings, and unquantized weights. The initial configuration uses one GPU with
+TP=1 and PP=1. Video decoding requires FFmpeg shared libraries and TorchCodec,
+as provided by SGLang's CUDA container.
+
+```bash Command
+MODEL_PATH=/path/to/Valen-2B
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --model-impl sglang \
+  --dtype bfloat16 --tp-size 1 --pp-size 1 \
+  --attention-backend triton --linear-attn-backend triton \
+  --host 127.0.0.1 --port 30000
+```
+
+Set BF16 explicitly: released full checkpoints store FP32 backbone weights while
+reference inference uses BF16 autocast. The Mixer retains FP32 parameters and
+computation. Native BF16 kernels can produce slightly different scores from the
+reference implementation.
+
+SGLang detects the Valen architecture and enables embedding mode, disables radix
+reuse and chunked prefill, and disables CUDA graphs. It rejects prompts that
+exceed the checkpoint's `valen_max_length` or the server's effective prefill
+limit, instead of truncating role or readout positions.
+
+### Send text, images, or video
+
+Call `POST /v1/valen` with a text `state`, or a state object containing `messages`.
+Message content accepts text, `image_url`, and `video_url` parts in conversation
+order. Media URLs can be HTTP(S), data URIs, or absolute paths accessible to the
+server. The server's media URL restrictions and asset limits apply.
+
+This example sends a video and shares it across three questions. Set `VIDEO_PATH`
+to a file on the server.
+
+```python Example
+import requests
+
+VIDEO_PATH = "/absolute/path/traffic-light.mp4"
+response = requests.post(
+    "http://127.0.0.1:30000/v1/valen",
+    json={
+        "state": {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Observe the final traffic light."},
+            {"type": "video_url", "video_url": {"url": VIDEO_PATH}},
+        ]}]},
+        "questions": {
+            "color": {
+                "type": "choice",
+                "instructions": "What color is the light in the final frame?",
+                "criteria": {"red": "Red light", "green": "Green light"},
+            },
+            "go": {
+                "type": "noul",
+                "instructions": "Crossing is allowed only on green. Is crossing allowed now?",
+            },
+            "risk": {
+                "type": "score",
+                "instructions": "How risky is crossing in the final state?",
+                "criteria": ["Low risk", "Medium risk", "High risk"],
+            },
+        },
+    },
+    timeout=120,
+)
+response.raise_for_status()
+print(response.json()["answers"])
+```
+
+For an image, use `{"type": "image_url", "image_url": {"url": IMAGE_URL}}` in
+the content list. For text, set `state` to a string. Multi-turn messages can mix
+images and video. The HF processor uses `valen_media_kwargs` from the checkpoint
+for image resizing and video frame sampling. Its expanded token IDs, pixel
+tensors, and grids enter SGLang together, preserving the trained prompt layout.
+
+### Valen request and response fields
+
+| Field | Meaning |
+| --- | --- |
+| `state` | Text or an object with a nonempty `messages` list containing the shared context. |
+| `questions` | Nonempty map keyed by your question IDs; IDs key the answers. |
+| `questions[id].instructions` | Required, nonempty question text. |
+| `questions[id].criteria` | For Choice, 1–255 ordered key-to-description entries; for Score, 2–255 ordered descriptions. Descriptions must be nonempty. Noul uses its trained fixed True/False descriptions. |
+| `temperature` | Positive, finite number dividing candidate logits before softmax; default 1. |
+| `model` | Optional model name; the response identifies the served model. Adapter names containing a colon are refused. |
+
+Each answer includes its `type`. Choice returns `choice`, `probabilities`, and
+`confidence`. Noul returns the probability of true in `noul`. Score returns
+`score` as the probability-weighted, zero-based level index, together with
+`probabilities`, `legend`, and `confidence`. These fields use Valen's reference
+formulas. The response also includes `usage.input_tokens`, `usage.output_tokens`
+(always 0), and `internal_usage.compute_tokens`. Input tokens count the shared
+context and complete question schema once.
+
+The Valen `/v1/systemone` adapter accepts text `state` with optional `images`
+within that route's existing question schema. It requires instructions and
+nonempty Choice descriptions, uses fixed Noul descriptions, and refuses nonempty
+`chat_template_kwargs`. Use `/v1/valen` for message histories, video, or Score
+questions above the System One schema's 10-level limit. Reserved tokenizer
+control tokens in user text are refused. Generation and ordinary embedding
+requests do not return Valen decisions.
 
 ## Build decisions without `/v1/decisions`
 

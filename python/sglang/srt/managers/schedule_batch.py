@@ -1051,6 +1051,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         token_indices_to_pool: Optional[List[int]] = None,
         decision_layout: Optional[List[int]] = None,
+        valen_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ):
@@ -1087,6 +1088,7 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
         self.decision_layout = decision_layout
+        self.valen_layout = valen_layout
 
         # For req-level memory management
         self.kv = ReqKvInfo()
