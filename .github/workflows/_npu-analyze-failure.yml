@@ -13,7 +13,12 @@ on:
         type: string
         required: false
         default: 'diffusion-failures-*'
-        description: 'Glob pattern for diffusion failure artifacts (consistency failures)'
+        description: 'Glob pattern for diffusion test artifacts (results, logs, consistency failures)'
+      upstream_job_results:
+        type: string
+        required: false
+        default: '{}'
+        description: 'JSON needs context from the calling workflow'
       recommendations_content:
         type: string
         required: false
@@ -27,7 +32,6 @@ defaults:
 jobs:
   analyze:
     name: cross-reference failures with recommendations
-    continue-on-error: true  # Non-blocking on parse/read failure.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sglang repo
@@ -75,17 +79,6 @@ jobs:
           path: ./diffusion-failures
         continue-on-error: true
 
-      - name: Check for diffusion failure artifacts
-        id: check-diffusion
-        run: |
-          if compgen -G "./diffusion-failures/*/consistency_failures/summary.json" > /dev/null; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "Diffusion consistency failure artifacts found"
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "No diffusion consistency failure artifacts"
-          fi
-
       - name: Show downloaded artifacts structure
         run: |
           echo "Downloaded log files:"
@@ -99,7 +92,6 @@ jobs:
 
       # ----- Step 3: Run analysis -----
       - name: Ensure regex is available
-        if: ${{ steps.locate-recs.outputs.has_recommendations != 'false' || steps.check-diffusion.outputs.found == 'true' }}
         run: |
           set -euo pipefail
           if ! python3 -c "import regex" >/dev/null 2>&1; then
@@ -111,13 +103,14 @@ jobs:
           python3 -c "import regex; print('regex ok:', regex.__file__)"
 
       - name: Run failure analysis
-        if: ${{ steps.locate-recs.outputs.has_recommendations != 'false' || steps.check-diffusion.outputs.found == 'true' }}
         id: analysis
-        continue-on-error: true
+        env:
+          UPSTREAM_JOB_RESULTS: ${{ inputs.upstream_job_results }}
         run: |
           python3 scripts/ci/npu/precise-test/analyze_failure_report.py \
             --log-dir ./test-logs \
             --diffusion-dir ./diffusion-failures \
+            --job-results-json "$UPSTREAM_JOB_RESULTS" \
             --recommendations-file "${RECS_FILE}" \
             --recommendations-source "${RECS_SOURCE:-none}" \
             --output ./test-logs/failure_report.md
@@ -129,5 +122,5 @@ jobs:
         with:
           name: failure-analysis-report
           path: ./test-logs/failure_report.md
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14

@@ -9,8 +9,7 @@ Pipeline:
      a. TIMINGS JSON block (machine-readable, from ci_utils.py)
      b. ci_utils.py "✗ FAILED:" summary section (structured text)
      c. pytest "short test summary info" block (for pytest-style logs)
-  2. Collect diffusion consistency failures from diffusion-failures-* artifacts
-     (test_utils.py writes consistency_failures/summary.json per partition).
+  2. Collect diffusion test results, logs, and consistency failure artifacts.
   3. Read recommended_pytest_paths.txt
   4. Match: exact match + file-level match
   5. Generate a Markdown report
@@ -290,6 +289,22 @@ def diffusion_failure_id(record):
     return f"diffusion-consistency/{record['case_id']}"
 
 
+def extract_diffusion_test_results(diffusion_dir):
+    records = []
+    for path in sorted(Path(diffusion_dir).rglob("diffusion-test-summary.json")):
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(entries, list):
+                raise ValueError("Expected a list of test results")
+        except (OSError, ValueError) as exc:
+            print(f"::warning:: Cannot read {path}: {exc}")
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("testcase"):
+                records.append({**entry, "artifact": path.parent.name})
+    return records
+
+
 # ============================================================
 #  Step 2: Read recommendations
 # ============================================================
@@ -398,6 +413,8 @@ def generate_report(
     log_dir,
     recommendations_source="none",
     diffusion_records=None,
+    diffusion_results=None,
+    job_results=None,
 ):
     """Produce a Markdown summary table."""
     hit = matched["hit"]
@@ -410,6 +427,54 @@ def generate_report(
     out.append("")
     out.append(f"**Log source**: `{log_dir}`")
     out.append("")
+    if job_results:
+        out.extend(["## Diffusion Jobs", "", "| Job | Result |", "|---|---|"])
+        for job, result in job_results.items():
+            out.append(f"| `{job}` | {result['result']} |")
+        out.append("")
+        for job, result in job_results.items():
+            if result["result"] == "failure" and not any(
+                record.get("job") == job and record.get("status") == "failed"
+                for record in diffusion_results or []
+            ):
+                out.append(
+                    f"> **Missing diagnostics:** `{job}` failed without a failed-test "
+                    "summary. Check job logs for setup, collection, or runner errors."
+                )
+                out.append("")
+
+    if not failed:
+        out.append(
+            "> No failures were extracted from the available artifacts. "
+            "This does not establish that upstream jobs passed."
+        )
+        out.append("")
+
+    test_failures = [r for r in diffusion_results or [] if r.get("status") == "failed"]
+    if test_failures:
+        out.extend(["## Diffusion Test Failures", ""])
+        for record in test_failures:
+            out.append(f"### `{record['testcase']}`")
+            out.append("")
+            out.append(
+                f"Phase: {record.get('phase')}; error: {record.get('error_type')}; "
+                f"artifact: `{record['artifact']}`"
+            )
+            out.append("")
+            out.append(
+                f"Actual: {record.get('actual')}; baseline: {record.get('baseline')}; "
+                f"threshold: {record.get('threshold')}"
+            )
+            if url := record.get("job_url") or record.get("run_url"):
+                out.extend(["", f"[Source run/job]({url})"])
+            # Indentation keeps arbitrary exception messages inside a code block.
+            out.extend(
+                [
+                    "",
+                    *("    " + line for line in record.get("error", "").splitlines()),
+                    "",
+                ]
+            )
 
     # Recommendation source indicator
     if recommendations_source == "output":
@@ -579,6 +644,11 @@ def main():
         "--log-dir", required=True, help="Directory containing CI .log files"
     )
     parser.add_argument(
+        "--job-results-json",
+        default="{}",
+        help="Upstream workflow needs context, including diffusion job outcomes",
+    )
+    parser.add_argument(
         "--diffusion-dir",
         default=None,
         help="Directory containing downloaded diffusion-failures-* artifacts",
@@ -612,8 +682,21 @@ def main():
     print("Step 1: Extract failed tests from CI logs")
     print("=" * 50)
     failed = extract_failed_from_logs(args.log_dir)
+    job_results = {
+        job: result
+        for job, result in json.loads(args.job_results_json).items()
+        if job.startswith("multimodal-gen-test-")
+    }
+    diffusion_results = []
     diffusion_records = []
     if args.diffusion_dir:
+        diffusion_results = extract_diffusion_test_results(args.diffusion_dir)
+        for record in diffusion_results:
+            if record.get("status") == "failed" and record["testcase"] not in failed:
+                failed.append(record["testcase"])
+        for test in extract_failed_from_logs(args.diffusion_dir):
+            if test not in failed:
+                failed.append(test)
         print()
         print("=" * 50)
         print("Step 1b: Extract diffusion consistency failures")
@@ -624,6 +707,12 @@ def main():
         failure_id = diffusion_failure_id(record)
         if failure_id not in failed:
             failed.append(failure_id)
+    for job, result in job_results.items():
+        if result["result"] == "failure" and not any(
+            record.get("job") == job and record.get("status") == "failed"
+            for record in diffusion_results
+        ):
+            failed.append(f"diffusion-job/{job} (missing test diagnostics)")
 
     has_log_inputs = _dir_has_files(args.log_dir)
     has_diffusion_inputs = bool(args.diffusion_dir) and _dir_has_files(
@@ -665,6 +754,8 @@ def main():
         args.log_dir,
         args.recommendations_source,
         diffusion_records=diffusion_records,
+        diffusion_results=diffusion_results,
+        job_results=job_results,
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
