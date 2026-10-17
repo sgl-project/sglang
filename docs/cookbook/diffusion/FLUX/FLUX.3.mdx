@@ -318,6 +318,44 @@ jq -n --slurpfile p ${PUP_PATH}/system_prompts.json '{
 
 You can then pass the returned caption as the `--prompt` of a `t2i` request to the Flux3 pipeline.
 
+To have the image server call the upsampler itself, point it at this endpoint with the
+built-in `flux3-klein-pup` protocol. It reads `system_prompts.json` from the upsampler
+package (`protocol_source`, a local directory or the Hugging Face repo, which is the
+default) and follows BFL's reference code: the `t2i` prompt for generations, the `i2i`
+prompt with the references first (resized as the reference code does) for edits, greedy
+decoding with presence penalty 1.5 for `t2i` and 0 for `i2i`, and thinking disabled.
+
+```bash
+cat > flux3_pup.json <<'JSON'
+{
+  "base_url": "http://127.0.0.1:8001/v1",
+  "model": "flux-3-image-klein-pup",
+  "protocol": "flux3-klein-pup",
+  "protocol_source": "<local-path>"
+}
+JSON
+
+sglang serve --model-path black-forest-labs/flux-3-image-klein-base \
+  --prompt-enhancer-config flux3_pup.json --port 30010
+```
+
+A request opts in with `enhance_prompt`; it is off by default, so a full caption is sent
+as typed:
+
+```bash
+curl -sS -X POST http://localhost:30010/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "A man walking with his dog, afternoon sun", "enhance_prompt": true, "size": "1024x1024", "response_format": "b64_json"}'
+```
+
+Greedy decoding is not by itself reproducible here: the caption changes with the
+upsampler's prefix cache and batch. Start the upsampler with
+`--enable-deterministic-inference --disable-radix-cache` when the same request must give
+the same caption.
+
+The layout prompts (`t2i_bbox`, `i2i_bbox`) are not wired in yet; write the box table
+into the prompt yourself as described in [Model capabilities](#2-model-capabilities).
+
 ## 8. Dynamic batching
 
 Enable a small batching window to collect concurrent requests:
