@@ -5,13 +5,13 @@ from types import MethodType
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import AutoConfig
 
 from sglang.kernels.fused_op import get_fused_op_backend, set_fused_op_backend
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.models.gemma4_causal import Gemma4DecoderLayer, Gemma4TextModel
 from sglang.srt.runtime_context import SpawnRanks, create_context, use_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.hf_transformers import get_config
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -25,7 +25,12 @@ class TestGemma4PleAddScale(CustomTestCase):
             revision="3e22461f65e89153144f8adb70e3b8c2cc9845a7",
             local_files_only=True,
         )
-        config = AutoConfig.from_pretrained(snapshot, local_files_only=True).text_config
+        # Match serving: this loader normalizes Gemma4 heterogeneous attention
+        # fields before the global text config reaches Gemma4DecoderLayer.
+        config = get_config(
+            snapshot, trust_remote_code=False, local_files_only=True
+        ).text_config
+        self.assertIsNone(config.per_layer_config)
         context = create_context(
             ServerArgs(
                 model_path=snapshot,
