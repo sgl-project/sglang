@@ -16,6 +16,9 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
+    _append_token_ids_chunk_from_flat_scores,
+    _build_token_ids_chunk_plan,
+    append_distributed_topk_chunk,
     get_token_ids_logprobs,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -164,6 +167,87 @@ class TestLogprobChunkStitching(CustomTestCase):
         output.input_token_ids_logprobs_val = rows
         output.finalize_input_logprobs()
         self.assertIs(output.input_token_ids_logprobs_val, rows)
+
+    def test_distributed_staged_spans_finalize_after_chunk_stitching(self):
+        top_values = []
+        top_indices = []
+        split = append_distributed_topk_chunk(
+            torch.tensor([[1.0, 0.5], [2.0, 1.5]]),
+            torch.tensor([[1, 2], [3, 4]]),
+            [2],
+            [3],
+            top_values,
+            top_indices,
+            0,
+            copy_to_pinned_cpu=True,
+        )
+        self.assertEqual(split, 2)
+        split = append_distributed_topk_chunk(
+            torch.tensor([[3.0, 2.5]]),
+            torch.tensor([[5, 6]]),
+            [2],
+            [3],
+            top_values,
+            top_indices,
+            split,
+            copy_to_pinned_cpu=True,
+        )
+        self.assertEqual(split, 0)
+        split = append_distributed_topk_chunk(
+            torch.empty((1, 0)),
+            torch.empty((1, 0), dtype=torch.long),
+            [0],
+            [1],
+            top_values,
+            top_indices,
+            split_pruned_len=0,
+            copy_to_pinned_cpu=True,
+        )
+        self.assertEqual(split, 0)
+
+        plan = _build_token_ids_chunk_plan(
+            [[1, 3], None, []],
+            [1, 1, 1],
+            split_pruned_len=0,
+            num_rows=3,
+            device=torch.device("cpu"),
+        )
+        token_values = []
+        token_indices = []
+        _append_token_ids_chunk_from_flat_scores(
+            plan,
+            torch.tensor([0.1, 0.3]),
+            token_values,
+            token_indices,
+            copy_to_pinned_cpu=True,
+        )
+
+        copy_done = Mock()
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            input_top_logprobs_val=top_values,
+            input_top_logprobs_idx=top_indices,
+            input_token_ids_logprobs_val=token_values,
+            input_token_ids_logprobs_idx=token_indices,
+            input_logprobs_copy_done=copy_done,
+        )
+        output.finalize_input_logprobs()
+
+        self.assertEqual(
+            output.input_top_logprobs_val,
+            [[[1.0, 0.5], [2.0, 1.5], [3.0, 2.5]], [[]]],
+        )
+        self.assertEqual(
+            output.input_top_logprobs_idx,
+            [[[1, 2], [3, 4], [5, 6]], [[]]],
+        )
+        torch.testing.assert_close(
+            torch.tensor(output.input_token_ids_logprobs_val[0]),
+            torch.tensor([[0.1, 0.3]]),
+        )
+        self.assertEqual(output.input_token_ids_logprobs_val[1:], [[], [[]]])
+        self.assertEqual(output.input_token_ids_logprobs_idx, [[[1, 3]], [], [[]]])
+        copy_done.synchronize.assert_called_once_with()
 
     def test_mixed_batch_token_ids_copy_to_cpu_like_the_eager_path(self):
         # One request with token ids, one without, and one with an empty probe set.

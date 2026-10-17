@@ -7,14 +7,21 @@ agree with the reference path to floating-point tolerance, with identical
 top-k indices, across chunk splits and heterogeneous per-sequence params.
 """
 
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.layers.logprob_processor import (
+    DistributedLogprobContext,
     InputLogprobProcessor,
     compute_row_log_normalizer,
+    get_distributed_input_state,
+    get_distributed_topk,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.logprob_test_utils import coverage_cases
@@ -32,6 +39,287 @@ TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
 SEQ_SPEC_MENU = ((1, 1), (3, 0), (4, 1), (5, 5), (6, 2))
 # 5 singletons + 5*5 ordered pairs + 4*5 wide cases at width 3.
 EXPECTED_CASES = 50
+
+
+class _TorchDistributedGroup:
+    def __init__(self):
+        self.device_group = dist.group.WORLD
+        self.all_reduce_calls = 0
+        self.all_gather_calls = 0
+
+    def all_reduce(self, tensor):
+        self.all_reduce_calls += 1
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.device_group)
+        return tensor
+
+    def all_gather(self, tensor, dim):
+        self.all_gather_calls += 1
+        gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, tensor, group=self.device_group)
+        return torch.cat(gathered, dim=dim)
+
+
+def _distributed_input_logprob_worker(rank, world_size, init_file):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(17)
+        rows, vocab, shard_width = 7, 11, 6
+        full_logits = torch.randn(rows, vocab, dtype=torch.float32) * 3
+        # Force a winner on the nonzero shard. The random remainder keeps the
+        # test sensitive to ordinary cross-rank ordering as well.
+        full_logits[0, 10] = 20.0
+        if rank == 0:
+            local_logits = full_logits[:, :shard_width].clone()
+            vocab_start, vocab_end = 0, 6
+        else:
+            # A deliberately dominant padding value catches accidental
+            # participation in the distributed normalizer.
+            padding = torch.full((rows, 1), 1e4)
+            local_logits = torch.cat((full_logits[:, 6:], padding), dim=1)
+            vocab_start, vocab_end = 6, vocab
+
+        group = _TorchDistributedGroup()
+
+        def get_local_logits_fn(states, lm_head, logits_metadata):
+            return states
+
+        def gather_sampled_logits_fn(local_sampled):
+            shards = [torch.empty_like(local_sampled) for _ in range(world_size)]
+            dist.all_gather(shards, local_sampled, group=group.device_group)
+            return torch.cat(shards, dim=-1)[:, :vocab]
+
+        context = DistributedLogprobContext(
+            tp_group=group,
+            vocab_start_index=vocab_start,
+            vocab_end_index=vocab_end,
+            vocab_size=vocab,
+            get_local_logits_fn=get_local_logits_fn,
+            gather_sampled_logits_fn=gather_sampled_logits_fn,
+        )
+        sample_indices = torch.tensor([2, 5, 6], dtype=torch.long)
+        input_indices = torch.arange(7, dtype=torch.long)
+        target_ids = torch.tensor([0, 6, 10, 1, 7, 9, 4], dtype=torch.long)
+        metadata = SimpleNamespace(
+            sample_indices_cpu=sample_indices.tolist(),
+            input_logprob_indices_cpu=input_indices.tolist(),
+            extend_return_top_logprob=True,
+            extend_token_ids_logprob=True,
+            # Rank one has only five valid columns, exercising candidate
+            # padding for k=7. The middle request confirms k=0 does not
+            # disturb its row accounting.
+            top_logprobs_nums=[7, 0, 3],
+            extend_logprob_pruned_lens_cpu=[3, 3, 1],
+            extend_input_logprob_token_ids_gpu=target_ids,
+            token_ids_logprobs=[[0, 6, 10], [2, 7], []],
+        )
+
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
+        proc.enable_fast_input_logprobs = True
+        proc.enable_logprobs_chunk = True
+        proc.logprobs_chunk_size = 2
+
+        def unused_gathered_logits(*args, **kwargs):
+            raise AssertionError("distributed path unexpectedly gathered prompt rows")
+
+        result, sampled_logits = proc.forward(
+            pruned_states=local_logits,
+            sample_indices=sample_indices,
+            input_logprob_indices=input_indices,
+            token_to_seq_idx=[0, 0, 0, 1, 1, 1, 2],
+            lm_head=None,
+            get_logits_fn=unused_gathered_logits,
+            logits_metadata=metadata,
+            distributed_context=context,
+        )
+
+        reference = torch.log_softmax(full_logits, dim=-1)
+        expected_targets = reference[input_indices, target_ids]
+        torch.testing.assert_close(
+            result.token_logprobs, expected_targets, rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            sampled_logits, full_logits[sample_indices], rtol=0, atol=0
+        )
+
+        expected_explicit = [
+            reference[:3, [0, 6, 10]].tolist(),
+            reference[3:6, [2, 7]].tolist(),
+            [[]],
+        ]
+        _assert_nested_close(
+            unittest.TestCase(),
+            expected_explicit,
+            result.token_ids_logprobs_val,
+            "distributed explicit token IDs",
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        assert result.token_ids_logprobs_idx == [
+            [[0, 6, 10]] * 3,
+            [[2, 7]] * 3,
+            [[]],
+        ]
+        reference_top_vals, reference_top_idx = reference.topk(7, dim=-1)
+        expected_top_vals = [
+            reference_top_vals[:3].tolist(),
+            [[]] * 3,
+            [reference_top_vals[6, :3].tolist()],
+        ]
+        expected_top_idx = [
+            reference_top_idx[:3].tolist(),
+            [[]] * 3,
+            [reference_top_idx[6, :3].tolist()],
+        ]
+        _assert_nested_close(
+            unittest.TestCase(),
+            expected_top_vals,
+            result.top_logprobs_val,
+            "distributed prompt top-k",
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        assert result.top_logprobs_idx == expected_top_idx
+        assert result.top_logprobs_idx[0][0][0] == 10
+
+        # Cross-shard Nth-boundary ties are not required to select the same
+        # IDs as one monolithic torch.topk. They must, however, retain the
+        # exact target entry, N ranked scores, all strictly-above-cutoff IDs,
+        # and only distinct equal-cutoff alternatives for the remainder.
+        tie_full_logits = torch.tensor(
+            [
+                [10.0, 9.0, 8.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, -5.0, -6.0],
+                [9.0, 8.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, -4.0, -5.0, -6.0],
+            ]
+        )
+        if rank == 0:
+            tie_local_logits = tie_full_logits[:, :shard_width].clone()
+        else:
+            tie_padding = torch.full((2, 1), 1e4)
+            tie_local_logits = torch.cat((tie_full_logits[:, 6:], tie_padding), dim=1)
+
+        tie_metadata = SimpleNamespace(
+            sample_indices_cpu=[],
+            input_logprob_indices_cpu=[0, 1],
+            extend_return_top_logprob=True,
+            extend_token_ids_logprob=False,
+            top_logprobs_nums=[5],
+            extend_logprob_pruned_lens_cpu=[2],
+            extend_input_logprob_token_ids_gpu=torch.tensor([8, 3]),
+        )
+        tie_proc = InputLogprobProcessor(vocab_size=VOCAB)
+        tie_proc.enable_fast_input_logprobs = True
+        tie_proc.enable_logprobs_chunk = True
+        tie_proc.logprobs_chunk_size = 1
+        tie_result, tie_sampled_logits = tie_proc.forward(
+            pruned_states=tie_local_logits,
+            sample_indices=torch.empty(0, dtype=torch.long),
+            input_logprob_indices=torch.arange(2, dtype=torch.long),
+            token_to_seq_idx=[0, 0],
+            lm_head=None,
+            get_logits_fn=unused_gathered_logits,
+            logits_metadata=tie_metadata,
+            distributed_context=context,
+        )
+        assert tie_sampled_logits.shape == (0, vocab)
+        _assert_tied_distributed_topk(
+            unittest.TestCase(), tie_full_logits, torch.tensor([8, 3]), tie_result
+        )
+        # Four ordinary chunks plus two tied chunks each use one compact
+        # AllGather. The Top-N route must not fall back to score reductions.
+        assert group.all_gather_calls == 6, group.all_gather_calls
+        assert group.all_reduce_calls == 0, group.all_reduce_calls
+
+        # Without Top-N, retain the lower-overhead existing reductions rather
+        # than paying for a packed candidate exchange.
+        group.all_gather_calls = 0
+        group.all_reduce_calls = 0
+        no_top_metadata = SimpleNamespace(
+            sample_indices_cpu=[],
+            input_logprob_indices_cpu=[0, 1],
+            extend_return_top_logprob=False,
+            extend_token_ids_logprob=False,
+            top_logprobs_nums=[0],
+            extend_logprob_pruned_lens_cpu=[2],
+            extend_input_logprob_token_ids_gpu=torch.tensor([0, 6]),
+            token_ids_logprobs=[None],
+        )
+        no_top_proc = InputLogprobProcessor(vocab_size=VOCAB)
+        no_top_proc.enable_fast_input_logprobs = True
+        no_top_proc.enable_logprobs_chunk = True
+        no_top_proc.logprobs_chunk_size = 1
+        no_top_result, _ = no_top_proc.forward(
+            pruned_states=local_logits[:2],
+            sample_indices=torch.empty(0, dtype=torch.long),
+            input_logprob_indices=torch.arange(2, dtype=torch.long),
+            token_to_seq_idx=[0, 0],
+            lm_head=None,
+            get_logits_fn=unused_gathered_logits,
+            logits_metadata=no_top_metadata,
+            distributed_context=context,
+        )
+        torch.testing.assert_close(
+            no_top_result.token_logprobs,
+            reference[torch.arange(2), torch.tensor([0, 6])],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        assert group.all_gather_calls == 0, group.all_gather_calls
+        assert group.all_reduce_calls == 4, group.all_reduce_calls
+
+        # A rank with no valid vocabulary columns contributes only padding;
+        # the compact merge must retain the other rank's token and finite mass.
+        group.all_gather_calls = 0
+        group.all_reduce_calls = 0
+        empty_local = torch.tensor([[2.0]]) if rank == 0 else torch.tensor([[1e4]])
+        empty_context = DistributedLogprobContext(
+            tp_group=group,
+            vocab_start_index=0 if rank == 0 else 1,
+            vocab_end_index=1,
+            vocab_size=1,
+            get_local_logits_fn=lambda states, *_: states,
+            gather_sampled_logits_fn=lambda value: value[:, :1],
+        )
+        empty_metadata = SimpleNamespace(
+            sample_indices_cpu=[],
+            input_logprob_indices_cpu=[0],
+            extend_return_top_logprob=True,
+            extend_token_ids_logprob=False,
+            top_logprobs_nums=[1],
+            extend_logprob_pruned_lens_cpu=[1],
+            extend_input_logprob_token_ids_gpu=torch.tensor([0]),
+            token_ids_logprobs=[None],
+        )
+        empty_proc = InputLogprobProcessor(vocab_size=1)
+        empty_proc.enable_fast_input_logprobs = True
+        empty_result, _ = empty_proc.forward(
+            pruned_states=empty_local,
+            sample_indices=torch.empty(0, dtype=torch.long),
+            input_logprob_indices=torch.tensor([0]),
+            token_to_seq_idx=[0],
+            lm_head=None,
+            get_logits_fn=unused_gathered_logits,
+            logits_metadata=empty_metadata,
+            distributed_context=empty_context,
+        )
+        torch.testing.assert_close(
+            empty_result.token_logprobs, torch.tensor([0.0]), rtol=0, atol=0
+        )
+        assert empty_result.top_logprobs_idx == [[[0]]]
+        torch.testing.assert_close(
+            torch.tensor(empty_result.top_logprobs_val),
+            torch.tensor([[[0.0]]]),
+            rtol=0,
+            atol=0,
+        )
+        assert group.all_gather_calls == 1, group.all_gather_calls
+        assert group.all_reduce_calls == 0, group.all_reduce_calls
+    finally:
+        dist.destroy_process_group()
 
 
 def _build_batch(seq_specs, dtype, vocab=VOCAB):
@@ -124,7 +412,202 @@ def _shape_of(nested):
     return None
 
 
+def _assert_tied_distributed_topk(test, full_logits, target_ids, result):
+    """Check the public distributed tie contract without assuming tie IDs."""
+    reference = torch.log_softmax(full_logits, dim=-1)
+    row_ids = torch.arange(full_logits.shape[0])
+    torch.testing.assert_close(
+        result.token_logprobs,
+        reference[row_ids, target_ids],
+        rtol=1e-6,
+        atol=1e-6,
+        msg="target-token logprobs remain exact across the tied cutoff",
+    )
+
+    test.assertEqual(len(result.top_logprobs_val), 1)
+    test.assertEqual(len(result.top_logprobs_idx), 1)
+    test.assertEqual(len(result.top_logprobs_val[0]), full_logits.shape[0])
+    test.assertEqual(len(result.top_logprobs_idx[0]), full_logits.shape[0])
+    for row, (values, indices) in enumerate(
+        zip(result.top_logprobs_val[0], result.top_logprobs_idx[0])
+    ):
+        test.assertEqual(len(values), 5)
+        test.assertEqual(len(indices), 5)
+        test.assertEqual(len(set(indices)), 5, "Top-N IDs must be distinct")
+        test.assertTrue(
+            all(0 <= token_id < full_logits.shape[1] for token_id in indices)
+        )
+        test.assertTrue(
+            all(values[pos] >= values[pos + 1] for pos in range(len(values) - 1)),
+            "Top-N values must remain rank-descending",
+        )
+
+        returned = set(indices)
+        expected_values = reference[row, torch.tensor(indices)]
+        torch.testing.assert_close(
+            torch.tensor(values), expected_values, rtol=1e-6, atol=1e-6
+        )
+        cutoff = torch.topk(full_logits[row], 5).values[-1]
+        strictly_above = set(
+            torch.nonzero(full_logits[row] > cutoff, as_tuple=False).flatten().tolist()
+        )
+        equal_cutoff = set(
+            torch.nonzero(full_logits[row] == cutoff, as_tuple=False).flatten().tolist()
+        )
+        test.assertTrue(strictly_above <= returned)
+        test.assertTrue(returned - strictly_above <= equal_cutoff)
+        test.assertEqual(len(returned & equal_cutoff), 5 - len(strictly_above))
+
+
 class TestFastInputLogprobs(CustomTestCase):
+    def test_distributed_full_chunk_reuses_only_exact_row_order(self):
+        from sglang.srt.layers import logprob_processor as module
+
+        states = torch.arange(21, dtype=torch.float32).reshape(3, 7) / 10
+        group = SimpleNamespace(world_size=1, all_gather=lambda value, dim: value)
+        for rows, should_reuse in [
+            ([0, 1, 2], True),
+            ([0, 2], False),
+            ([0, 0, 2], False),
+        ]:
+            with self.subTest(rows=rows):
+                projected = []
+                observed = []
+
+                def project(value, *_):
+                    result = value.clone()
+                    projected.append(result)
+                    return result
+
+                original = module.get_distributed_input_state
+
+                def observe(value, *args, **kwargs):
+                    observed.append(value.data_ptr() == projected[-1].data_ptr())
+                    return original(value, *args, **kwargs)
+
+                targets = torch.arange(len(rows))
+                metadata = SimpleNamespace(
+                    sample_indices_cpu=[],
+                    input_logprob_indices_cpu=rows,
+                    extend_return_top_logprob=True,
+                    extend_token_ids_logprob=False,
+                    top_logprobs_nums=[2],
+                    extend_logprob_pruned_lens_cpu=[len(rows)],
+                    extend_input_logprob_token_ids_gpu=targets,
+                    token_ids_logprobs=[None],
+                )
+                context = DistributedLogprobContext(
+                    tp_group=group,
+                    vocab_start_index=0,
+                    vocab_end_index=7,
+                    vocab_size=7,
+                    get_local_logits_fn=project,
+                    gather_sampled_logits_fn=lambda value: value,
+                )
+                processor = InputLogprobProcessor(7)
+                processor.enable_fast_input_logprobs = True
+                processor.enable_logprobs_chunk = True
+                processor.logprobs_chunk_size = 3
+                with patch.object(module, "get_distributed_input_state", new=observe):
+                    result, _ = processor.forward(
+                        states,
+                        torch.empty(0, dtype=torch.long),
+                        torch.tensor(rows),
+                        [0, 0, 0],
+                        None,
+                        None,
+                        metadata,
+                        distributed_context=context,
+                    )
+                self.assertEqual(observed, [should_reuse])
+                torch.testing.assert_close(projected[0], states, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    result.token_logprobs,
+                    states.log_softmax(-1)[rows, targets],
+                    rtol=1e-6,
+                    atol=1e-6,
+                )
+
+    def test_compact_exchange_rejects_inexact_fp32_token_ids(self):
+        with self.assertRaisesRegex(ValueError, "vocab_size <= 2\\*\\*24"):
+            get_distributed_input_state(
+                torch.empty((1, 1)),
+                torch.tensor([0]),
+                torch.tensor([0]),
+                vocab_start_index=0,
+                vocab_end_index=1,
+                vocab_size=(2**24) + 1,
+                max_k=1,
+                tp_group=None,
+            )
+
+    def test_native_shard_precision_and_sampled_contract(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                self._check_native_shard_precision_and_sampled_contract(dtype)
+
+    def _check_native_shard_precision_and_sampled_contract(self, dtype):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        source = torch.tensor([[0.3, -1.7, 3.1]], dtype=dtype)
+        for cap in (None, 2.0):
+            fake = SimpleNamespace(
+                do_tensor_parallel_all_gather_dp_attn=False,
+                _compute_lm_head=lambda *_: source.clone(),
+                logit_scale=1.75,
+                final_logit_softcapping=cap,
+            )
+            with patch("sglang.srt.layers.logits_processor._is_cpu", True):
+                got = LogitsProcessor._get_local_logits_for_distributed_logprobs(
+                    fake, None, None, None
+                )
+            expected = source.clone().mul_(1.75).float()
+            if cap:
+                expected = cap * torch.tanh(expected / cap)
+                self.assertEqual(got.dtype, torch.float32)
+            else:
+                self.assertEqual(got.dtype, dtype)
+            torch.testing.assert_close(got.float(), expected, rtol=0, atol=0)
+
+        def gather(value):
+            self.assertEqual(value.dtype, torch.float32)
+            return torch.cat((value, value), dim=-1)
+
+        fake = SimpleNamespace(
+            use_attn_tp_group=False, _logits_gatherer=gather, vocab_size=5
+        )
+        got = LogitsProcessor._gather_sampled_logits(fake, source)
+        torch.testing.assert_close(
+            got,
+            torch.cat((source.float(), source.float()), dim=-1)[:, :5],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_distributed_topk_rejects_over_vocab_k(self):
+        with self.assertRaisesRegex(ValueError, "exceeds global vocabulary size"):
+            get_distributed_topk(
+                torch.empty((1, 3)),
+                valid_vocab_size=3,
+                max_k=4,
+                vocab_start_index=0,
+                vocab_size=3,
+                tp_group=None,
+            )
+
+    def test_distributed_exact_input_logprobs_cpu(self):
+        # Real collectives, but Gloo/CPU only: validates TP=2 normalization,
+        # padding exclusion, local/remote token ownership, heterogeneous
+        # prompt top-k, ragged explicit probes, chunk stitching, and
+        # sampled-row-only vocab gathering.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mp.spawn(
+                _distributed_input_logprob_worker,
+                args=(2, f"{tmp_dir}/init"),
+                nprocs=2,
+                join=True,
+            )
+
     def _sweep(self, dtype, rtol, atol):
         torch.manual_seed(0)
         proc = InputLogprobProcessor(vocab_size=VOCAB)
