@@ -44,6 +44,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="speculative.simulated_accept",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="speculative.div_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
