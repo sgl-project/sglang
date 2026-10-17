@@ -1317,6 +1317,8 @@ class EmbeddingReqInput:
         # text and input_ids cannot be provided at the same time
         if self.text is not None and self.input_ids is not None:
             raise ValueError("text and input_ids cannot be provided at the same time")
+        if self.input_ids is not None and len(self.input_ids) == 0:
+            raise ValueError("input_ids cannot be empty.")
 
         # Derive the batch size
         self.batch_size = 0
