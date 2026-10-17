@@ -1,17 +1,21 @@
 """DeepSeek-V4.1 vision tower and aligner."""
 
+import logging
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+
+logger = logging.getLogger(__name__)
 
 
 def _rms_norm(dim: int) -> RMSNorm:
@@ -44,10 +48,27 @@ class PatchEmbed(nn.Module):
         return self.proj(x.flatten(1))
 
 
-def apply_vision_rotary(q, k, position_embeddings, x_shape):
+def _apply_vision_rotary_eager(q, k, position_embeddings, x_shape):
     # The reference pairs the two halves of each head, with FP32 arithmetic.
     cos, sin = position_embeddings
     return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
+
+
+def _resolve_vision_rotary_applier():
+    if not envs.SGLANG_DSV41_VIT_ROPE_CUDA.get():
+        return _apply_vision_rotary_eager
+    try:
+        from sglang.kernels.ops.mm.dsv41_vit_rope import apply_vision_rotary
+
+        return apply_vision_rotary
+    except Exception as e:
+        logger.warning(
+            "DSV4.1 CUDA vision RoPE unavailable; using eager fallback: %s", e
+        )
+        return _apply_vision_rotary_eager
+
+
+apply_vision_rotary = _resolve_vision_rotary_applier()
 
 
 class Attention(VisionAttention):
