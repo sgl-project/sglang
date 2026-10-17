@@ -137,6 +137,14 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        # A release can overtake an update waiting for the tokenizer writer lock.
+        if GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags:
+            return UpdateWeightFromDiskReqOutput(
+                success=False,
+                message="Cannot update weights from disk while weight memory is released. "
+                "Call resume_memory_occupation(tags=['weights']) before updating weights.",
+                num_paused_requests=0,
+            )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
