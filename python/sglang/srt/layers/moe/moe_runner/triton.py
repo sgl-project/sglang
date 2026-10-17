@@ -72,9 +72,17 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     fuse_swiglu_interleaved: bool = False
 
 
-def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
-    # only expert parallelism can route a token to an expert this rank does not hold
-    return config.num_experts is None or config.num_experts != config.num_local_experts
+def _topk_ids_may_be_nonlocal(
+    config: MoeRunnerConfig, num_weight_experts: Optional[int] = None
+) -> bool:
+    # only expert parallelism can route a token to an expert this rank does not hold;
+    # the clamp bounds ids by the weights' expert count, so pass that where known
+    if config.num_experts is None or config.num_experts != config.num_local_experts:
+        return True
+    return (
+        num_weight_experts is not None
+        and num_weight_experts != config.num_local_experts
+    )
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -113,7 +121,9 @@ class TritonRunnerCore(MoeRunnerCore):
                 gemm1_limit=self.config.gemm1_clamp_limit,
                 swiglu_limit=self.config.swiglu_limit,
                 gate_up_interleaved=self.config.gate_up_interleaved,
-                sanitize_topk_ids=_topk_ids_may_be_nonlocal(self.config),
+                sanitize_topk_ids=_topk_ids_may_be_nonlocal(
+                    self.config, quant_info.w13_weight.shape[0]
+                ),
             )
             return TritonRunnerOutput(hidden_states=out)
 
@@ -127,6 +137,8 @@ class TritonRunnerCore(MoeRunnerCore):
             _fused_moe_kernel_sequence,
         )
 
+        # No weight count, unlike _topk_ids_may_be_nonlocal: filter_expert only
+        # zero-fills blocks whose expert id is -1, it never clamps ids.
         filter_expert = (
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts
@@ -214,7 +226,9 @@ def fused_experts_none_to_triton(
             gemm1_limit=runner_config.gemm1_clamp_limit,
             swiglu_limit=runner_config.swiglu_limit,
             gate_up_interleaved=runner_config.gate_up_interleaved,
-            sanitize_topk_ids=_topk_ids_may_be_nonlocal(runner_config),
+            sanitize_topk_ids=_topk_ids_may_be_nonlocal(
+                runner_config, quant_info.w13_weight.shape[0]
+            ),
         )
     else:
         if quant_info.use_mxfp8 and is_cuda():
