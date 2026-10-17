@@ -1,6 +1,7 @@
 //! The shared handle: submission with admission and cancellation ownership,
 //! runtime-to-semantic event translation, and the typed control operations
-//! (model info, server info, weights check, detokenize, health probe).
+//! (model info, server info, flush cache, weights check, tokenize, detokenize,
+//! health probe).
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -13,7 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
-use crate::message::io_struct::{CheckWeightsReqInput, ControlRequest, GetInternalStateReq};
+use crate::message::io_struct::{
+    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
+};
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
@@ -215,6 +218,21 @@ impl CoreHandle {
             .map_err(|error| {
                 CoreError::InvalidResponse(format!("invalid internal-state response: {error}"))
             })
+    }
+
+    /// Ask the scheduler to flush its caches, waiting up to `timeout_s` for it
+    /// to go idle. The scheduler runs its own flush handler in its own loop;
+    /// this only relays the request and its outcome.
+    pub(crate) async fn flush_cache(&self, timeout_s: f64) -> Result<FlushCacheOutcome, CoreError> {
+        let bytes = self
+            .control(ControlRequest::FlushCacheReqInput(FlushCacheReqInput::new(
+                Rid::new().to_string(),
+                Some(timeout_s),
+            )))
+            .await?;
+        rmp_serde::from_slice::<FlushCacheOutcome>(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid flush-cache response: {error}"))
+        })
     }
 
     /// Ask every scheduler rank to run the weight checker's `action` on the
@@ -530,6 +548,14 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
             CoreError::InvalidResponse("unexpected non-generation response".into()),
         ),
     }
+}
+
+/// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub(crate) struct FlushCacheOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
 }
 
 /// The scheduler's `CheckWeightsReqOutput`: whether every rank succeeded, why

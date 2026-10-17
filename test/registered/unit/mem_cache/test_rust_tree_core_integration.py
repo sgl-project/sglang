@@ -3714,10 +3714,14 @@ def test_write_back_swa_repair_backup_leaves_the_unbacked_parent_to_eviction(bac
         return device + 40000
 
     cache._execute_kv_backup = write
+    # An SWA eviction floor of 4 means the request's window already slid past
+    # its first 4 slots and released their SWA peers.
+    value = allocator.alloc(8)
+    allocator.free_swa(value[:4])
     cache.insert(
         InsertParams(
             key=_key(list(range(8))),
-            value=allocator.alloc(8),
+            value=value,
             component_evicted_seqlens={ComponentType.SWA: 4},
         )
     )
