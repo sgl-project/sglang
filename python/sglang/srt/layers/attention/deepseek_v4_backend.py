@@ -2704,6 +2704,16 @@ class DeepseekV4AttnBackend(
             request_window_layout=request_layout,
         )
 
+    @staticmethod
+    def _compressor_out_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Slot 0 for folded replay rows: their main KV, compressed groups and index
+        keys are cached, so the compressors write only the new rows."""
+        loc = forward_batch.out_cache_loc
+        keep = forward_batch.encoder_swa_compress_rows
+        if keep is None:
+            return loc
+        return torch.zeros_like(loc).index_copy_(0, keep, loc[keep])
+
     def _build_forward_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -2804,7 +2814,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=self._compressor_out_loc(forward_batch),
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -3127,11 +3137,6 @@ class DeepseekV4AttnBackend(
             # length is the request count; padded rows belong to no request.
             start_loc = forward_batch.extend_start_loc
             seq_lens = forward_batch.extend_seq_lens[: start_loc.shape[0]]
-            skip = forward_batch.encoder_swa_compress_skip
-            if skip is not None:
-                # Folded replay rows are cached already; compress the new rows only.
-                start_loc = start_loc + skip
-                seq_lens = seq_lens - skip
             self._low_ratio_compress_fused(
                 layer,
                 x,
@@ -3140,9 +3145,6 @@ class DeepseekV4AttnBackend(
                 extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
             )
         else:
-            rows = forward_batch.encoder_swa_compress_rows
-            if rows is not None and forward_batch.forward_mode.is_extend():
-                x, req, pos = x[rows], req[rows], pos[rows]
             self._low_ratio_compress_torch(
                 layer,
                 x,
