@@ -59,6 +59,10 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     supports_quantized_rl_reload,
 )
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_pp_layers
@@ -102,6 +106,11 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
+        # maybe_enable_silu_fp4_quant_fusion turns this on for NVFP4 projections;
+        # SiLU+mul and the down_proj input quantization then run as one kernel.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        self._down_input_scale_inv_1d = None
 
     def forward(
         self,
@@ -115,7 +124,10 @@ class Qwen2MLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            x = self.act_fn(gate_up)
+            if can_run_silu_fp4_quant_fusion(self, gate_up):
+                x = silu_and_mul_fp4_quant(self, gate_up)
+            else:
+                x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
