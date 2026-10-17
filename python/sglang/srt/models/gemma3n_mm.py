@@ -146,6 +146,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     config_class = Gemma3nConfig
     """Gemma3n multimodal model for conditional generation."""
 
+    # Request input_embeds reach forward() together with placeholder input_ids,
+    # which it rejects, and per-layer embeddings need the real token ids.
+    supports_input_embeds = False
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

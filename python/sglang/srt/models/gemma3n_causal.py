@@ -861,6 +861,10 @@ class Gemma3nForCausalLM(PreTrainedModel):
     config_class = Gemma3nTextConfig
     base_model_prefix = "language_model"
 
+    # Request input_embeds reach forward() together with placeholder input_ids,
+    # which it rejects, and per-layer embeddings need the real token ids.
+    supports_input_embeds = False
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
