@@ -973,6 +973,11 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # FlashKDA prefill keeps beta as logits and sigmoids them in the kernel.
+    # Interior snapshots and draft-extend stay on Triton either way.
+    SGLANG_ENABLE_AITER_KDA_FLASH_PREFILL = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_KDA_FLASH_PREFILL"
+    )
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -1008,6 +1013,26 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # gfx950 fp8 PS-ASM prefill memory-faults for 12-head zero-pad models.
+    # Set to 1 to opt into the 12->16 padded ASM prefill path anyway.
+    SGLANG_ENABLE_AITER_MLA_ZERO_PAD_FP8_PREFILL = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_MLA_ZERO_PAD_FP8_PREFILL"
+    )
+    # FlyDSL FP8 FMHA for a covered head shape (Kimi-K3 TP8: 12 heads,
+    # QK 192, V 128). The 12-head PS-ASM pad stays off while this is on.
+    SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL"
+    )
+    # Fail initialization or a declined launch instead of silently using bf16
+    # FMHA. Intended for benchmark recipes that require FlyDSL provenance.
+    SGLANG_ENABLE_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_MLA_FLYDSL_FP8_PREFILL_REQUIRED"
+    )
+    # MXFP4 kv_b_proj writes unit-scale FP8 K/V, including the RoPE concat,
+    # in the GEMM epilogue on the prefix-prefill path.
+    SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_MLA_FLYDSL_FUSED_KV_PROJ"
+    )
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
