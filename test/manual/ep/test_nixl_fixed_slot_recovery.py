@@ -91,6 +91,8 @@ def _server_args(
         "disabled",
         "--cuda-graph-backend-decode",
         "full",
+        "--cuda-graph-max-bs-decode",
+        "16",
         "--mem-fraction-static",
         "0.7",
     ]
@@ -167,6 +169,7 @@ class TestNixlFixedSlotRecovery(CustomTestCase):
         log_file = open(log_path, "w")
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = device
+        env["SGLANG_NIXL_EP_BF16_DISPATCH"] = "1"
         process = subprocess.Popen(
             _server_args(allocation_index, allocation_id, port, recover=recover),
             env=env,
