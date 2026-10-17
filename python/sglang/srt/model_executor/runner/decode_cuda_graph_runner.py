@@ -334,14 +334,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.captured_req_width,
             gathered_buffer_required=self.require_gathered_buffer,
         )
-        if self.dllm_uses_input_embeds:
-            max_requests = min(
-                self.dllm_config.max_running_requests, max(self.capture_bs)
-            )
-            self.capture_bs = sorted(
-                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
-            )
-            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
