@@ -1814,9 +1814,8 @@ def biased_grouped_topk_gpu(
         # The kernel wants the total width; select_experts passes a routed-only
         # topk on the aiter path only (`num_routed_topk if _use_aiter else top_k`).
         #
-        # True, not the caller's flag: an aiter runner skips the post-MoE multiply,
-        # so the routed weights must carry routed_scaling_factor and the shared
-        # slot must be 1.0. That flag describes the runner, not this kernel.
+        # Fold whenever the steps after top-k assume a fold, which on aiter they
+        # always do, whether or not this call is given the shared slots.
         return jit_grouped_gate(
             gating_output,
             correction_bias.to(dtype=torch.float32),
@@ -1827,10 +1826,8 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0
             ),
-            apply_routed_scaling_factor_on_output=(
-                True
-                if (_use_aiter and num_fused_shared_experts > 0)
-                else bool(apply_routed_scaling_factor_on_output)
+            apply_routed_scaling_factor_on_output=is_routed_scaling_factor_fused_in_topk(
+                apply_routed_scaling_factor_on_output
             ),
             num_expert_group=num_expert_group,
             topk_group=topk_group,
@@ -2208,6 +2205,33 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
+def is_routed_scaling_factor_fused_in_topk(
+    apply_routed_scaling_factor_on_output: bool,
+) -> bool:
+    """Whether the routed top-k weights already carry routed_scaling_factor.
+
+    When true, no step after top-k may apply the factor again, and a fused
+    shared expert's weight must not compensate for it.
+    """
+    # aiter_biased_grouped_topk folds the factor whatever the flag says.
+    return bool(apply_routed_scaling_factor_on_output) or _use_aiter
+
+
+def fused_shared_expert_weight(
+    *,
+    routed_scaling_factor: Optional[float],
+    apply_routed_scaling_factor_on_output: bool,
+) -> float:
+    """Top-k weight that makes a fused shared expert's output count exactly once."""
+    if (
+        is_routed_scaling_factor_fused_in_topk(apply_routed_scaling_factor_on_output)
+        or not routed_scaling_factor
+    ):
+        return 1.0
+    # The routed output, shared column included, is scaled by the factor later.
+    return 1.0 / routed_scaling_factor
+
+
 def remap_topk_for_per_rank_shared_slots(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2223,7 +2247,7 @@ def remap_topk_for_per_rank_shared_slots(
 
     Routed IDs:  e -> e + (e // num_local_routed) * num_fused_shared_experts
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
-    Shared weight: 1.0 on the aiter path, else 1/routed_scaling_factor (see below).
+    Shared weight: fused_shared_expert_weight.
     """
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
@@ -2253,34 +2277,10 @@ def remap_topk_for_per_rank_shared_slots(
         + torch.arange(num_fused_shared_experts, device=topk_ids.device)
     )
 
-    # Override the fused shared expert's weight so its net contribution is 1.0x.
-    #
-    # The correct value depends on whether routed_scaling_factor is applied to
-    # the MoE output AFTER the experts run, or already folded into the routed
-    # topk weights BEFORE dispatch:
-    #
-    #   * Post-MoE scaling path (default): DeepseekV2MoE.forward_deepep later
-    #     multiplies the whole MoE output by routed_scaling_factor, so the shared
-    #     weight must be 1/routed_scaling_factor for (1/rsf) * rsf = 1.0.
-    #   * aiter (HIP) path: aiter_biased_grouped_topk folds routed_scaling_factor
-    #     into each routed topk weight, and forward_deepep SKIPS the post-MoE
-    #     multiply for _use_aiter (see its `not (... or _use_aiter)` guard). The
-    #     shared weight must therefore be 1.0 -- applying 1/rsf here would
-    #     under-weight the always-on shared expert by routed_scaling_factor and
-    #     corrupt every MoE layer.
-    #
-    # NOTE: forward_deepep also skips the post-MoE multiply for the non-aiter
-    # families where routed_scaling_factor is pre-folded in topk
-    # (should_fuse_routed_scaling_factor_in_topk / apply_routed_scaling_factor_on_output:
-    # ModelOpt NVFP4, cutlass/trtllm-routed fp8), so those would likewise need a
-    # 1.0 shared weight. This fix is deliberately scoped to the aiter path (the
-    # one validated on AMD MI355X); those other backends are left at their
-    # existing behavior and can be addressed by their maintainers.
-    routed_scaling_factor = topk_config.routed_scaling_factor
-    if _use_aiter:
-        topk_weights[:, -num_fused_shared_experts:] = 1.0
-    elif routed_scaling_factor is not None and routed_scaling_factor != 0:
-        topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
+    topk_weights[:, -num_fused_shared_experts:] = fused_shared_expert_weight(
+        routed_scaling_factor=topk_config.routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=topk_config.apply_routed_scaling_factor_on_output,
+    )
 
     return topk_ids, topk_weights
 
@@ -2450,14 +2450,6 @@ def _post_process_topk_ids(
         # fused_append_shared_experts() + eager per-rank shared-slot remap pair,
         # collapsing ~6 launch-bound elementwise kernels/layer (div_floor / add /
         # arange / fill / copy) into the one append kernel that already runs.
-        #
-        # Shared weight is 1.0 here because this branch is aiter-only:
-        # aiter_biased_grouped_topk folds routed_scaling_factor into the routed
-        # weights and forward_deepep skips the post-MoE multiply for _use_aiter,
-        # so the always-on shared expert must contribute 1.0x. (The eager
-        # per-rank shared-slot remap instead sets shared weight to
-        # 1/routed_scaling_factor to compensate a post-MoE scale that the aiter
-        # path does not apply; see PR #28237.)
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None
@@ -2478,7 +2470,10 @@ def _post_process_topk_ids(
             topk_ids,
             topk_weights,
             num_fused_shared_experts,
-            1.0,  # shared-expert weight on the aiter path
+            fused_shared_expert_weight(
+                routed_scaling_factor=topk_config.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=topk_config.apply_routed_scaling_factor_on_output,
+            ),
             shared_id_base,
             num_local_routed,
             num_token_non_padded=(

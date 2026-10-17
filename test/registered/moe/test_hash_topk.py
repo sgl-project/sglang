@@ -131,6 +131,7 @@ def test_deepep_empty_forward_does_not_append_shared_slot_twice():
         experts=FakeExperts(),
         alt_stream=None,
         routed_scaling_factor=1.0,
+        routed_scaling_factor_fused_in_topk=True,
     )
 
     hidden_states = torch.empty((0, 4), dtype=torch.float32)
