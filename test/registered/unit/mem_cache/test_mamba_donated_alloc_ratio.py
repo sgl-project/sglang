@@ -12,6 +12,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -297,10 +298,11 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             layers=list(cls.MAMBA_LAYERS),
         )
         start, end = get_pp_indices(cls.TOTAL_LAYERS, pp_rank, pp_size)
-        fake = SimpleNamespace(
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        fixture = dict(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
-            server_args=SimpleNamespace(),
+            is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
             attn_dp_size=1,
@@ -310,6 +312,8 @@ class TestPPMambaPoolSizing(unittest.TestCase):
                 hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
             ),
         )
+        for name, value in fixture.items():
+            setattr(configurator, name, value)
         with rc.get_context().override_server_args(
             disable_radix_cache=False,
             max_mamba_cache_size=None,
@@ -317,7 +321,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             mamba_full_memory_ratio=0.5,
             enable_linear_replayssm_spec=False,
         ):
-            KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
+            configurator._handle_max_mamba_cache(cls.BUDGET_GB)
             return get_schedule().max_mamba_cache_size
 
     def test_stage_is_not_charged_for_the_whole_model(self):
@@ -342,19 +346,22 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
 
-        fake = SimpleNamespace(
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        fixture = dict(
             mambaish_config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(
                     layers=[0, 1, 2, 3], mamba_cache_per_req=4 << 20
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
             pp_size=pp_size,
             model_config=SimpleNamespace(num_hidden_layers=4),
-            _calculate_mamba_ratio=lambda: 2,
         )
+        for name, value in fixture.items():
+            setattr(configurator, name, value)
         args = dict(
             disable_radix_cache=False,
             max_mamba_cache_size=None,
@@ -364,8 +371,11 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
             speculative_num_draft_tokens=draft_tokens,
         )
         args.update(schedule)
-        with rc.get_context().override_server_args(**args):
-            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
+        with (
+            rc.get_context().override_server_args(**args),
+            patch.object(KVCacheConfigurator, "_calculate_mamba_ratio", return_value=2),
+        ):
+            remaining = configurator._handle_max_mamba_cache(120 / 1024)
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
 
     def test_auto_capacity_reserves_backend_state(self):
