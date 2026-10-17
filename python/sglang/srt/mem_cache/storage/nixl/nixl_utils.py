@@ -1,5 +1,8 @@
+import ctypes
+import errno
 import logging
 import os
+import uuid
 from typing import Optional
 
 from sglang.srt.environ import envs
@@ -11,12 +14,66 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
 
 logger = logging.getLogger(__name__)
 
+# 0 when the platform has no O_DIRECT (macOS); patched in tests.
+_O_DIRECT = getattr(os, "O_DIRECT", 0)
+# 0 before Linux 3.11 and on non-Linux; patched in tests.
+_O_TMPFILE = getattr(os, "O_TMPFILE", 0)
+# EINVAL (rejected FS or buffer) and EFAULT (unpinnable buffer) condemn O_DIRECT;
+# anything else (ENOSPC, EMFILE, EIO) is transient and must not disable it for good.
+_DIRECT_IO_UNUSABLE_ERRNOS = frozenset({errno.EFAULT, errno.EINVAL})
+# Buffered I/O is the last fallback, so these fail startup; others (ENOSPC, EIO)
+# may clear up and only warn.
+_BUFFERED_IO_FATAL_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+_BUFFERED_PROBE_BYTES = 4096
+
+# "active" is deliberately absent: it selects the plugin, so listing it would make
+# promotion flag every valid config.
 _SGLANG_NIXL_CONFIG_KEYS = {
     "use_direct_io",
     "l3_cleaner_enabled",
     "l3_cleaner_high_watermark",
     "l3_cleaner_low_watermark",
 }
+_SGLANG_NIXL_BOOL_KEYS = {"use_direct_io", "l3_cleaner_enabled"}
+
+# No NIXL plugin declares it, so forwarding it to create_backend passes an unknown option.
+_PLUGIN_SELECTOR_KEY = "active"
+
+
+def _parse_sglang_value(key: str, value):
+    # Strict because bool("false") is True: a lenient parse inverts what the user asked.
+    if key in _SGLANG_NIXL_BOOL_KEYS:
+        if isinstance(value, bool):
+            return value
+        # 0/1 is unambiguous, unlike a string, so rejecting it would only break
+        # configs that already work.
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        raise ValueError(f"{key} must be a boolean, got {value!r}")
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number, got {value!r}") from None
+
+
+def _normalize_initparam(key: str, value) -> str:
+    # NIXL plugins match boolean options case-sensitively, so "True" is ignored.
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    # Only Python's bool repr is folded; any other casing is an opaque NIXL value.
+    if value in ("True", "False"):
+        logger.warning(
+            "NIXL extra-config: %s is the string %r, which NIXL would compare "
+            "case-sensitively against its lowercase boolean options; sending %r "
+            "instead. Write a JSON boolean to make this unambiguous.",
+            key,
+            value,
+            value.lower(),
+        )
+        return value.lower()
+    return str(value)
 
 
 class NixlBackendConfig:
@@ -33,7 +90,60 @@ class NixlBackendConfig:
             2. flat form (for a specific selected plugin), assuming all params apply to a selected plugin
                 {'param1': 'value1', 'param2': 'value2', ...}
         """
-        self.config = config or {}
+        # Copied so promoting a misplaced key cannot mutate the caller's extra_config.
+        self.config = dict(config or {})
+        self._promote_misplaced_sglang_keys()
+
+    def _promote_misplaced_sglang_keys(self) -> None:
+        plugins = self.config.get("plugin")
+        if not isinstance(plugins, dict):
+            return
+        selected = self._selected_plugin_section(plugins)
+        for plugin_name, plugin_config in plugins.items():
+            if not isinstance(plugin_config, dict):
+                continue
+            for key in sorted(_SGLANG_NIXL_CONFIG_KEYS & plugin_config.keys()):
+                value = plugin_config[key]
+                if plugin_name != selected:
+                    # An unselected plugin's options must not reach the backend that runs.
+                    resolution = "that plugin is not the selected one, so it is ignored"
+                elif key in self.config:
+                    resolution = "the top-level value is used instead"
+                elif not self._is_parseable(key, value):
+                    # Unlike a top-level key, a mistyped nested one is ignored, not fatal;
+                    # it never took effect, so raising would break configs that start.
+                    resolution = (
+                        f"its value {value!r} has the wrong type and is ignored"
+                    )
+                else:
+                    resolution = "honoring it as a top-level option"
+                    self.config[key] = value
+                logger.warning(
+                    "NIXL extra-config: %s under plugin.%s is consumed by SGLang itself, "
+                    "not by the NIXL plugin; %s. Move it to the top level of "
+                    "--hicache-storage-backend-extra-config.",
+                    key,
+                    plugin_name,
+                    resolution,
+                )
+
+    @staticmethod
+    def _active_plugin_section(plugins: dict) -> Optional[str]:
+        for name, section in plugins.items():
+            if not isinstance(section, dict):
+                continue
+            if section.get(_PLUGIN_SELECTOR_KEY, False) in (True, "true", "True"):
+                return name
+        return None
+
+    @classmethod
+    def _selected_plugin_section(cls, plugins: dict) -> Optional[str]:
+        active = cls._active_plugin_section(plugins)
+        if active is not None:
+            return active
+        # "auto" resolves only at create_backend, so no section is known to be selected.
+        env_plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto").lower()
+        return env_plugin if env_plugin in plugins else None
 
     def get_use_direct_io(self) -> bool:
         """Return True if O_DIRECT should be requested when opening files.
@@ -43,7 +153,7 @@ class NixlBackendConfig:
         (default: enabled).
         """
         if "use_direct_io" in self.config:
-            return bool(self.config["use_direct_io"])
+            return _parse_sglang_value("use_direct_io", self.config["use_direct_io"])
         return envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
 
     def get_l3_cleaner_config(self) -> dict:
@@ -53,35 +163,47 @@ class NixlBackendConfig:
             "high_watermark": 80.0,
             "low_watermark": 70.0,
         }
-        if "l3_cleaner_enabled" in self.config:
-            enabled = self.config["l3_cleaner_enabled"]
-            if not isinstance(enabled, bool):
-                raise ValueError("l3_cleaner_enabled must be a boolean")
-            config["enabled"] = enabled
         key_map = {
-            "l3_cleaner_high_watermark": ("high_watermark", float),
-            "l3_cleaner_low_watermark": ("low_watermark", float),
+            "l3_cleaner_enabled": "enabled",
+            "l3_cleaner_high_watermark": "high_watermark",
+            "l3_cleaner_low_watermark": "low_watermark",
         }
-        for raw_key, (cleaner_key, parser) in key_map.items():
+        for raw_key, cleaner_key in key_map.items():
             if raw_key in self.config:
-                config[cleaner_key] = parser(self.config[raw_key])
+                config[cleaner_key] = _parse_sglang_value(raw_key, self.config[raw_key])
         return config
+
+    @staticmethod
+    def _is_parseable(key: str, value) -> bool:
+        try:
+            _parse_sglang_value(key, value)
+        except ValueError:
+            return False
+        return True
 
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
 
-        if "plugin" in self.config:
+        plugins = self.config.get("plugin")
+        if isinstance(plugins, dict):
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
             # choose the FIRST active plugin
-            for key, item in self.config["plugin"].items():
-                if item.get("active", False) in [True, "true", "True"]:
-                    plugin = key.upper()
-                    break
-        else:
-            # config is empty, or in flat form {'param1': 'value1', 'param2': 'value2', ...}
-            plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
+            active = self._active_plugin_section(plugins)
+            if active is not None:
+                return active.upper()
+            logger.warning(
+                "NIXL extra-config: no plugin under 'plugin' is marked active; "
+                "selecting the backend from SGLANG_HICACHE_NIXL_BACKEND_PLUGIN instead."
+            )
+        elif plugins is not None:
+            logger.warning(
+                "NIXL extra-config: 'plugin' is a %s, not a mapping of plugin name "
+                "to options; selecting the backend from "
+                "SGLANG_HICACHE_NIXL_BACKEND_PLUGIN instead.",
+                type(plugins).__name__,
+            )
 
-        return plugin
+        return os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
 
     def get_backend_initparams(self, backend_name) -> dict:
         """Get initialization parameters from config of NIXL backend for backend creation.
@@ -93,24 +215,26 @@ class NixlBackendConfig:
         initparams = {}
 
         # config can be in two forms:
-        if "plugin" in self.config:
+        plugins = self.config.get("plugin")
+        if plugins is not None:
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
-            if backend_name.lower() in self.config["plugin"]:
-                config_data = self.config["plugin"][backend_name.lower()]
-            else:
+            config_data = {}
+            if isinstance(plugins, dict):
+                section = plugins.get(backend_name.lower())
+                config_data = section if isinstance(section, dict) else {}
+            if not config_data:
                 logger.debug(
                     f"No specific config found for plugin {backend_name} in extra_config. Use default init params."
                 )
-                config_data = {}
         else:
             # flat form {'param1': 'value1', 'param2': 'value2', ...}
             config_data = self.config
 
         for key, value in config_data.items():
             # These keys are consumed by SGLang itself, not by NIXL plugins.
-            if key in _SGLANG_NIXL_CONFIG_KEYS:
+            if key in _SGLANG_NIXL_CONFIG_KEYS or key == _PLUGIN_SELECTOR_KEY:
                 continue
-            initparams[key] = str(value)
+            initparams[key] = _normalize_initparam(key, value)
 
         return initparams
 
@@ -204,6 +328,17 @@ class NixlBackendSelection:
             return False
 
 
+def _warn_inconclusive_probe(step: str, base: str, error: OSError) -> None:
+    logger.warning(
+        "NixlFileManager: O_DIRECT probe %s under %s failed with %s (errno %s), "
+        "which does not show O_DIRECT is unusable; keeping O_DIRECT.",
+        step,
+        base,
+        error.strerror,
+        error.errno,
+    )
+
+
 class NixlFileManager:
     """Handles file system operations for NIXL."""
 
@@ -233,6 +368,114 @@ class NixlFileManager:
                 f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
 
+    # ``addr`` must be page-aligned and ``size`` a page multiple; None means usable.
+    def direct_io_error(self, addr: int, size: int) -> Optional[str]:
+        if not self.base_dirs:
+            return None
+        if not _O_DIRECT:
+            return "O_DIRECT is not available on this platform"
+        # Each base dir may be a separate mount that accepts or rejects O_DIRECT.
+        for base in self.base_dirs:
+            error = self._direct_io_dir_error(base, addr, size)
+            if error is not None:
+                return error
+        return None
+
+    def _open_probe_file(self, base: str, direct: bool = True) -> int:
+        direct_flag = _O_DIRECT if direct else 0
+        # The probe must leave nothing behind even on SIGKILL: the L3 cleaner only
+        # walks bucket dirs, so a stray probe file in a base dir is never reclaimed.
+        if _O_TMPFILE:
+            try:
+                return os.open(base, os.O_WRONLY | _O_TMPFILE | direct_flag, 0o644)
+            except OSError:
+                # Not every filesystem implements O_TMPFILE.
+                pass
+        path = os.path.join(base, f".io_probe.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | direct_flag, 0o644)
+        try:
+            # Unlink right away to mirror O_TMPFILE; the fd stays writable.
+            os.unlink(path)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+
+    def check_buffered_io(self) -> None:
+        """Raise if a base or bucket directory cannot take a buffered tier-3 write."""
+        for base in self.base_dirs:
+            self._check_buffered_write(base)
+            for bucket_dir in self._bucket_dirs(base):
+                # Data files live in bucket dirs, which may predate this process.
+                if not os.access(bucket_dir, os.W_OK | os.X_OK):
+                    raise RuntimeError(
+                        f"NIXL tier-3 bucket directory {bucket_dir} is not writable "
+                        "by this process; fix its ownership or permissions."
+                    )
+
+    def _check_buffered_write(self, base: str) -> None:
+        fd = None
+        try:
+            fd = self._open_probe_file(base, direct=False)
+            os.pwrite(fd, bytes(_BUFFERED_PROBE_BYTES), 0)
+        except OSError as e:
+            if e.errno in _BUFFERED_IO_FATAL_ERRNOS:
+                raise RuntimeError(
+                    f"NIXL tier-3 storage directory {base} cannot take a buffered "
+                    f"write: {e.strerror} (errno {e.errno})."
+                ) from e
+            logger.warning(
+                "NixlFileManager: buffered write probe under %s failed with %s "
+                "(errno %s); continuing, but tier-3 writes there may fail.",
+                base,
+                e.strerror,
+                e.errno,
+            )
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _direct_io_dir_error(self, base: str, addr: int, size: int) -> Optional[str]:
+        fd = None
+        try:
+            try:
+                fd = self._open_probe_file(base)
+            except OSError as e:
+                if e.errno not in _DIRECT_IO_UNUSABLE_ERRNOS:
+                    _warn_inconclusive_probe(step="open", base=base, error=e)
+                    return None
+                return (
+                    f"opening a scratch file under {base} with O_DIRECT failed: "
+                    f"{e.strerror} (errno {e.errno})"
+                )
+            try:
+                written = os.pwrite(fd, (ctypes.c_char * size).from_address(addr), 0)
+            except OSError as e:
+                if e.errno not in _DIRECT_IO_UNUSABLE_ERRNOS:
+                    _warn_inconclusive_probe(step="write", base=base, error=e)
+                    return None
+                return (
+                    f"a page-aligned {size}-byte O_DIRECT write under {base} failed: "
+                    f"{e.strerror} (errno {e.errno})"
+                )
+            if written != size:
+                return (
+                    f"a page-aligned {size}-byte O_DIRECT write under {base} moved "
+                    f"only {written} bytes"
+                )
+            return None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def disable_direct_io(self, reason: str) -> None:
+        logger.warning(
+            "NixlFileManager: disabling O_DIRECT and falling back to buffered "
+            "tier-3 I/O: %s",
+            reason,
+        )
+        self.use_direct_io = False
+
     def clear(self) -> None:
         """Clear all files below every configured base directory."""
         if not self.base_dirs:
@@ -259,11 +502,15 @@ class NixlFileManager:
         fail due to a missing parent directory.
         """
         for base in self.base_dirs:
-            for i in range(_BUCKET_MASK + 1):
-                os.makedirs(
-                    os.path.join(base, f"{i:0{BUCKET_HEX_CHARS}x}"),
-                    exist_ok=True,
-                )
+            for bucket_dir in self._bucket_dirs(base):
+                os.makedirs(bucket_dir, exist_ok=True)
+
+    @staticmethod
+    def _bucket_dirs(base: str) -> list[str]:
+        return [
+            os.path.join(base, f"{i:0{BUCKET_HEX_CHARS}x}")
+            for i in range(_BUCKET_MASK + 1)
+        ]
 
     def iter_all_base_dirs(self) -> list[str]:
         """Return base directories that may contain NIXL FILE cache entries."""
@@ -287,8 +534,8 @@ class NixlFileManager:
         """
         flags = os.O_RDWR | os.O_CREAT if create else os.O_RDWR
         if self.use_direct_io:
-            if hasattr(os, "O_DIRECT"):
-                flags |= os.O_DIRECT
+            if _O_DIRECT:
+                flags |= _O_DIRECT
             else:
                 logger.warning(
                     "use_direct_io is True, but O_DIRECT is not available on "
