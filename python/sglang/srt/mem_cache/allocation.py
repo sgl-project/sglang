@@ -292,13 +292,15 @@ def ensure_mamba_capacity(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
+    *,
+    reserved_slots: int = 0,
 ) -> bool:
-    """Reclaim the Mamba slots needed before binding any request rows."""
+    """Reclaim request slots while preserving pending checkpoint restore capacity."""
     if not isinstance(req_to_token_pool, HybridReqToTokenPool):
         return True
 
     # Count the slots HybridReqToTokenPool.alloc will allocate for each request.
-    needed = 0
+    needed = reserved_slots
     for req in reqs:
         if not req.kv.holds_mamba:
             needed += 1

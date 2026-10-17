@@ -110,16 +110,13 @@ def handle_hicache_ratio_default(server_args: Any):
 def resolve_hicache_dcp_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
-    if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
+    if cfg.dcp_size <= 1 or not (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
         return
     if cfg.hicache_storage_backend is not None:
-        raise NotImplementedError(
-            "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-            "supported yet: under DCP each rank holds a distinct "
-            "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-            "backup and the storage keys must become dcp_rank-aware "
-            "first. Run HiCache+DCP with L1/L2 only."
-        )
+        validate_hicache_dcp_storage(server_args)
     if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise NotImplementedError(
             "HiCache with --dcp-size > 1 only supports DSPARK speculative "
@@ -143,11 +140,49 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "MHA host pool has none."
         )
     logger.info(
-        "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+        "HiCache + DCP enabled: host pool uses widened "
         "logical slot accounting with per-rank physical translation at "
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
     )
+
+
+def validate_hicache_dcp_storage(
+    server_args: Any, *, storage_backend=None, prefetch_policy=None
+):
+    """Backends implementing fixed-topology MLA DCP shard storage."""
+    cfg = resolving_view(server_args)
+    if cfg.dcp_size <= 1:
+        return
+    if not use_mla_backend(server_args):
+        raise NotImplementedError("HiCache L3 with DCP requires MLA.")
+    if cfg.hicache_host_memory_mode == "buffer_only":
+        # Buffer-mode staging budgets still count physical host rows.
+        raise NotImplementedError("HiCache L3 with DCP requires host cache mode.")
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError(
+            "HiCache L3 with DCP does not support speculative draft storage."
+        )
+    if cfg.disaggregation_mode == "decode":
+        if cfg.disaggregation_decode_enable_offload_kvcache:
+            raise NotImplementedError(
+                "HiCache L3 with DCP does not support decode offload."
+            )
+        # Decode promises the probed L3 span to prefill before the read completes.
+        policy = (
+            cfg.hicache_storage_prefetch_policy
+            if prefetch_policy is None
+            else prefetch_policy
+        )
+        if policy != "wait_complete":
+            raise NotImplementedError(
+                "Decode HiCache L3 with DCP requires "
+                "--hicache-storage-prefetch-policy wait_complete."
+            )
+    if (storage_backend or cfg.hicache_storage_backend) not in ("file", "mooncake"):
+        raise NotImplementedError(
+            "HiCache L3 with DCP requires file or Mooncake storage."
+        )
 
 
 def resolve_layout_io_compatibility(server_args: Any):

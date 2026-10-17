@@ -1351,6 +1351,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
+        reserved_restore_states = 0
+        if (
+            getattr(self.req_to_token_pool, "mamba_allocator", None) is not None
+            and self.scheduler.enable_decode_hicache
+        ):
+            reserved_restore_states = sum(
+                dr.prefix_match.needs_local_restore
+                for dr in self.transfer_queue.queue
+                if dr.prefix_match is not None
+                and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+                and dr.hicache_restore_lock is None
+            )
         full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
@@ -1453,10 +1465,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            # Reserve enough Mamba capacity for radix COW and tracking buffers
-            # before prefix matching can bind state or lock cached entries.
+            # Pending HiCache restores also need canonical recurrent slots.
             if not ensure_mamba_capacity(
-                self.req_to_token_pool, [decode_req.req], self.tree_cache
+                self.req_to_token_pool,
+                [decode_req.req],
+                self.tree_cache,
+                reserved_slots=reserved_restore_states,
             ):
                 break
 
@@ -1474,6 +1488,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
+                # A hybrid restore materializes one canonical checkpoint in
+                # addition to the request's live state received from prefill.
+                # If it cannot fit, promise only the device-resident prefix.
+                if prefix_match.needs_local_restore and not ensure_mamba_capacity(
+                    self.req_to_token_pool,
+                    [decode_req.req],
+                    self.tree_cache,
+                    reserved_slots=reserved_restore_states + 1,
+                ):
+                    prefix_match.l2_host_hit_length = 0
+                    prefix_match.l3_storage_hit_length = 0
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1575,6 +1600,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            if self.scheduler.enable_decode_hicache:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    # A probe is only a candidate hit. Admission may decline
+                    # prefetch, so allocate/advertise the resulting prefix.
+                    # Preserve any smaller SWA transfer cap selected above.
+                    total_prefix_len = min(
+                        total_prefix_len, prefix_match.decode_prefix_len
+                    )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1582,13 +1616,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
                 reserved_restore_tokens += prefix_match.restore_token_count
+                reserved_restore_states += int(prefix_match.needs_local_restore)
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
