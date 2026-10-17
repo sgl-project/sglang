@@ -11,8 +11,10 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#endif
 #include <type_traits>
 
 namespace sglang {
