@@ -500,6 +500,16 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Check modalities
         self.assertEqual(req.modalities, [None, "image"])
 
+    def test_first_request_without_images(self):
+        """Per-request image lists are kept when the first request has no images."""
+        req = copy.deepcopy(self.base_req)
+        req.image_data = [None, ["image1.jpg", "image2.jpg"]]
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.image_data, [None, ["image1.jpg", "image2.jpg"]])
+        self.assertEqual(req.modalities, [None, "multi-images"])
+
     def test_expanding_parallel_sample_correlation(self):
         """Test that when expanding with parallel samples, prompts, images and modalities are properly correlated."""
         req = copy.deepcopy(self.base_req)
