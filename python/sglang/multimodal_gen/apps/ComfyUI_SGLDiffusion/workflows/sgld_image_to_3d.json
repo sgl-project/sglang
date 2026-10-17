@@ -1,0 +1,41 @@
+{
+  "1": {
+    "class_type": "SGLDiffusionServerModel",
+    "inputs": {
+      "base_url": "http://localhost:3000/v1",
+      "api_key": "sk-proj-1234567890"
+    }
+  },
+  "2": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.png"
+    }
+  },
+  "3": {
+    "class_type": "SGLDiffusionGenerateMesh",
+    "inputs": {
+      "sgld_client": [
+        "1",
+        0
+      ],
+      "image": [
+        "2",
+        0
+      ],
+      "output_format": "glb",
+      "seed": -1,
+      "steps": 0,
+      "guidance_scale": -1.0
+    }
+  },
+  "4": {
+    "class_type": "Preview3D",
+    "inputs": {
+      "model_file": [
+        "3",
+        0
+      ]
+    }
+  }
+}
