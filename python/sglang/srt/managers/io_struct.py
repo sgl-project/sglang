@@ -1793,6 +1793,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # Seconds the detokenizer spent on this batch; set only when tracing.
+    detokenize_duration: Optional[float] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
