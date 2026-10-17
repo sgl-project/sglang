@@ -12,6 +12,7 @@ import torch
 from sglang.srt.utils import is_cuda
 
 from .full_topk import FullTopKIndexer
+from .litetopk import get_litetopk_dsv41
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -83,6 +84,7 @@ def make_full_topk_indexer(
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
         use_deep_gemm_decode=is_sm100_or_newer(),
+        litetopk=get_litetopk_dsv41(),
     )
 
 
@@ -127,6 +129,7 @@ def make_candidate_indexer(
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
+        litetopk=get_litetopk_dsv41(),
     )
     # A CP rank's rows are an interleaved subset of the batch; the torch prefill
     # env keeps the sparse table on decode only.

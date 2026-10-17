@@ -3,7 +3,7 @@ DeepGEMM on SM100, torch elsewhere."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -37,8 +37,13 @@ from .types import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    from .litetopk import Dsv41LiteTopK
+
 
 class FullTopKIndexer:
+    # The default decode top-k also serves instances built without __init__.
+    litetopk: Optional[Dsv41LiteTopK] = None
+
     def __init__(
         self,
         *,
@@ -46,6 +51,7 @@ class FullTopKIndexer:
         req_to_token: torch.Tensor,
         use_deep_gemm_prefill: bool,
         use_deep_gemm_decode: bool,
+        litetopk: Optional[Dsv41LiteTopK] = None,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
@@ -54,6 +60,7 @@ class FullTopKIndexer:
         self.use_deep_select_decode = (
             not use_deep_gemm_decode and is_deep_select_supported()
         )
+        self.litetopk = litetopk
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
         if self.use_deep_gemm_prefill:
@@ -119,6 +126,19 @@ class FullTopKIndexer:
                     ),
                 )
             return
+        if self.litetopk is not None:
+            scored = self.litetopk.scores(
+                data=data, metadata=metadata, out=inputs.out_page_indices
+            )
+            if scored is not None:
+                logits, plan = scored
+                self.litetopk.select(
+                    logits=logits,
+                    plan=plan,
+                    metadata=metadata,
+                    out=inputs.out_page_indices,
+                )
+                return
         logits = deep_gemm_fp4_paged_mqa_logits(
             (data.q_fp4, data.q_sf),
             data.k_cache,
