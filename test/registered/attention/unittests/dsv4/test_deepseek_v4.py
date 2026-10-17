@@ -19,6 +19,14 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DeepseekV4AttnBackend,
+    DSV4Metadata,
+)
+from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
+from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import DenseBlocksBackend
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import CapturedPrefillInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -680,11 +688,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
     def test_backend_replay_keeps_captured_metadata_active(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-            DSV4Metadata,
-        )
-
         capture_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -695,6 +698,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.prefill_candidates = object.__new__(DenseBlocksBackend)
         calls = []
 
         def fake_build_forward_metadata(
@@ -725,6 +729,63 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
+
+    class _FakePagedIndexerMetadata:
+        """The two tensors a captured full-top-k indexer binds by address."""
+
+        def __init__(self, base: int):
+            self.compressed_seq_lens = torch.tensor(
+                [base + 1, base + 2], dtype=torch.int32
+            )
+            self.page_table = torch.tensor(
+                [[base + 3, base + 4], [base + 5, base + 6]], dtype=torch.int32
+            )
+
+        def copy_(self, other):
+            self.compressed_seq_lens.copy_(other.compressed_seq_lens)
+            self.page_table.copy_(other.page_table)
+
+    def _make_low_ratio_metadata(self, base: int):
+        return DSV4Metadata(
+            self._make_core_metadata(base),
+            indexer_metadata=None,
+            c1_indexer_metadata=self._FakePagedIndexerMetadata(base),
+            c2_indexer_metadata=self._FakePagedIndexerMetadata(base + 100),
+        )
+
+    def test_backend_replay_refreshes_low_ratio_index_in_place_unless_two_level(
+        self,
+    ):
+        for candidates, in_place in (
+            (object.__new__(DenseBlocksBackend), True),
+            (object.__new__(SparseTableBackend), False),
+        ):
+            capture = self._make_low_ratio_metadata(0)
+            replay = self._make_low_ratio_metadata(1000)
+            held = (capture.c1_indexer_metadata, capture.c2_indexer_metadata)
+            bound_tensors = [(m.compressed_seq_lens, m.page_table) for m in held]
+            backend = object.__new__(DeepseekV4AttnBackend)
+            backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+            backend.prefill_candidates = candidates
+            backend._build_forward_metadata = lambda *_, **__: replay
+
+            backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                capture, SimpleNamespace(max_seq_len_override=None)
+            )
+
+            self.assertIs(backend.forward_metadata, capture)
+            for current, original, fresh, (lens, pages) in zip(
+                (capture.c1_indexer_metadata, capture.c2_indexer_metadata),
+                held,
+                (replay.c1_indexer_metadata, replay.c2_indexer_metadata),
+                bound_tensors,
+            ):
+                self.assertIs(current, original if in_place else fresh)
+                if in_place:
+                    self.assertIs(current.compressed_seq_lens, lens)
+                    self.assertIs(current.page_table, pages)
+                    self.assertTrue(torch.equal(lens, fresh.compressed_seq_lens))
+                    self.assertTrue(torch.equal(pages, fresh.page_table))
 
     def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
@@ -827,6 +888,67 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     combine.call_args.kwargs["topk_indices"].shape,
                     (2, expected_extent),
                 )
+
+
+class TestDSV4FullTopKCapturedFallback(CustomTestCase):
+    """CPU-only: the captured full-top-k fallback keeps every configured k."""
+
+    def _topk_calls(self, index_topk: int, width: int):
+        rows = 2
+        metadata = SimpleNamespace(
+            compressed_page_size=64,
+            max_compressed_seq_len=width,
+            compressed_seq_lens=torch.tensor([width, width // 2], dtype=torch.int32),
+            page_table=torch.zeros(rows, width // 64, dtype=torch.int32),
+            use_topk_v2=False,
+            row_chunks=lambda: [(slice(0, rows), None)],
+        )
+        inputs = CapturedPrefillInputs(
+            indexer=SimpleNamespace(index_topk=index_topk, n_local_heads=1, n_heads=1),
+            layer_id=0,
+            q=torch.zeros(rows, 1, 128, dtype=torch.bfloat16),
+            weights=torch.ones(rows, 1, dtype=torch.bfloat16),
+            paged_metadata=metadata,
+            out_page_indices=torch.full((rows, index_topk), -1, dtype=torch.int32),
+            out_raw_indices=torch.full((rows, index_topk), -1, dtype=torch.int32),
+        )
+        calls = []
+        with (
+            mock.patch.object(
+                full_topk,
+                "quantize_index_q",
+                return_value=(torch.zeros(rows, 1, 64), torch.zeros(rows, 1)),
+            ),
+            mock.patch.object(full_topk, "get_index_k_cache", return_value=object()),
+            mock.patch.object(
+                full_topk,
+                "deep_gemm_fp4_paged_mqa_logits",
+                return_value=torch.zeros(rows, width),
+            ),
+            mock.patch.object(
+                full_topk,
+                "topk_transform_paged_torch",
+                side_effect=lambda *a, **_: calls.append(("torch", a[3].shape[1])),
+            ),
+            mock.patch.object(
+                full_topk,
+                "topk_transform_paged_from_metadata",
+                side_effect=lambda *a, **_: calls.append(("kernel", None)),
+            ),
+        ):
+            full_topk.FullTopKIndexer._deep_gemm_prefill_captured(
+                SimpleNamespace(token_to_kv_pool=None), inputs
+            )
+        return calls
+
+    def test_v1_limit_uses_output_width(self):
+        for k, width, expected in (
+            (1024, 512, ("kernel", None)),
+            (2048, 4096, ("torch", 2048)),
+            (2048, 512, ("torch", 512)),
+        ):
+            with self.subTest(k=k, width=width):
+                self.assertEqual(self._topk_calls(k, width), [expected])
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
