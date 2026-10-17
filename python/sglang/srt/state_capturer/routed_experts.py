@@ -3,6 +3,7 @@ from typing import Any, Optional
 import numpy as np
 import pybase64
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
@@ -106,6 +107,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        # Routes whose shared columns are appended after capture pass routed ids only.
+        num_missing_cols = self.device_cache.buffer.shape[2] - topk_indices.shape[1]
+        if num_missing_cols > 0:
+            topk_indices = F.pad(topk_indices, (0, num_missing_cols), value=-1)
         if _is_scattered_a2a_backend():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[

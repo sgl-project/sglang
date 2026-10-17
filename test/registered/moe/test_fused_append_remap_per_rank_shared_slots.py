@@ -1,27 +1,28 @@
 """Unit tests for fused append + per-rank shared-slot remap.
 
-Covers ``fused_append_remap_shared_experts_deepep``, which collapses
-``fused_append_shared_experts()`` followed by
-``remap_topk_for_per_rank_shared_slots()`` into a
-single Triton launch on the per-rank shared-slot path. The kernel is GPU-only
-(Triton), so these tests are skipped when no accelerator is present.
+Covers ``fused_append_remap_shared_experts_deepep``, the single Triton launch
+form of ``remap_topk_for_per_rank_shared_slots()`` on the per-rank shared-slot
+path, and ``select_experts`` on that path with the real routers. The kernels are
+GPU-only (Triton), so these tests are skipped when no accelerator is present.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     fused_append_remap_shared_experts_deepep,
-    fused_append_shared_experts,
 )
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _use_aiter,
     remap_topk_for_per_rank_shared_slots,
+    select_experts,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_device, is_cuda
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -177,10 +178,10 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                 self.assertEqual(len(routed_set), npr)
                 self.assertLess(max(routed_set), ep_size * num_local_experts)
 
-    def test_equivalence_with_eager_append_then_remap(self):
-        """Fused kernel == append shared experts + per-rank shared-slot remap.
+    def test_equivalence_with_eager_remap(self):
+        """Fused kernel == the eager per-rank shared-slot remap, which also appends.
 
-        The eager remap overwrites the shared weight: 1.0 on the aiter/HIP path
+        The eager remap writes the shared weight: 1.0 on the aiter/HIP path
         (routed_scaling_factor is pre-folded into the routed topk weights), else
         1/routed_scaling_factor. The fused kernel is invoked with that same value
         so the two paths stay bit-identical (ids match regardless of scaling).
@@ -204,16 +205,9 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                 )
 
                 with get_parallel().override(moe_ep_size=ep_size, moe_ep_rank=ep_rank):
-                    eager_ids, eager_w = fused_append_shared_experts(
+                    eager_ids, eager_w = remap_topk_for_per_rank_shared_slots(
                         topk_ids.clone(),
                         topk_weights.clone(),
-                        s,
-                        scale_factor,
-                        npr,  # shared-expert base id (overwritten by the remap)
-                    )
-                    eager_ids, eager_w = remap_topk_for_per_rank_shared_slots(
-                        eager_ids,
-                        eager_w,
                         s,
                         npr,
                         TopKConfig(
@@ -294,6 +288,91 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         )
         self.assertTrue(torch.equal(got_ids, topk_ids))
         self.assertTrue(torch.equal(got_w, topk_weights))
+
+
+@unittest.skipUnless(is_cuda(), "covers the CUDA routers")
+class TestSelectExpertsPerRankSharedSlots(CustomTestCase):
+    """On the per-rank shared-slot path every router must select and renormalize
+    the routed experts as routing without fusion does. A router asked for top_k
+    with the shared slot counted renormalized over one routed expert too many,
+    which the shared column then overwrote."""
+
+    NUM_TOKENS, TOP_K, EP_SIZE, EP_RANK = 32, 8, 8, 3
+    # (num_experts, num_expert_group, topk_group, scoring_func, biased); each row
+    # reaches a different router.
+    ROUTERS = [
+        (256, 8, 4, "sigmoid", True),  # DeepSeek-V3 grouped routing
+        (384, 8, 4, "sigmoid", True),  # grouped, outside FlashInfer's shapes
+        (64, 8, 3, "softmax", False),  # grouped, no correction bias
+        (256, None, None, "sqrtsoftplus", True),  # DeepSeek-V4 routing
+        (128, None, None, "softmax", False),
+    ]
+
+    def _route(self, *, num_fused_shared_experts, logits, bias, router):
+        _, num_expert_group, topk_group, scoring_func, _ = router
+        topk_config = TopKConfig(
+            top_k=self.TOP_K + num_fused_shared_experts,
+            use_grouped_topk=num_expert_group is not None,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            correction_bias=bias,
+            scoring_func=scoring_func,
+            routed_scaling_factor=2.5,
+            allow_routed_experts_capture=False,
+        )
+        with (
+            patch.object(
+                topk_module,
+                "has_per_rank_fused_shared_slots",
+                side_effect=lambda num_fused: num_fused > 0,
+            ),
+            get_parallel().override(moe_ep_size=self.EP_SIZE, moe_ep_rank=self.EP_RANK),
+        ):
+            out = select_experts(
+                torch.empty(logits.shape[0], 16, device=logits.device),
+                logits,
+                topk_config,
+            )
+        return out.topk_ids.long(), out.topk_weights
+
+    def test_routes_like_no_fusion(self):
+        k = self.TOP_K
+        for router in self.ROUTERS:
+            num_experts, _, _, _, biased = router
+            with self.subTest(router=router):
+                g = torch.Generator(device="cpu").manual_seed(num_experts)
+                logits = torch.randn(self.NUM_TOKENS, num_experts, generator=g)
+                bias = 0.1 * torch.randn(num_experts, generator=g) if biased else None
+                logits = logits.to(get_device())
+                bias = bias.to(get_device()) if biased else None
+                ref_ids, ref_weights = self._route(
+                    num_fused_shared_experts=0, logits=logits, bias=bias, router=router
+                )
+                ids, weights = self._route(
+                    num_fused_shared_experts=1, logits=logits, bias=bias, router=router
+                )
+
+                self.assertEqual(ids.shape, (self.NUM_TOKENS, k + 1))
+                torch.testing.assert_close(
+                    weights[:, :k].sum(-1), torch.ones_like(weights[:, 0])
+                )
+                # Rank r's routed block starts at r * (num_local_routed + 1).
+                num_local_routed = num_experts // self.EP_SIZE
+                expected_ids = ref_ids + ref_ids // num_local_routed
+                order, ref_order = ids[:, :k].argsort(-1), expected_ids.argsort(-1)
+                self.assertTrue(
+                    torch.equal(
+                        ids[:, :k].gather(-1, order), expected_ids.gather(-1, ref_order)
+                    )
+                )
+                torch.testing.assert_close(
+                    weights[:, :k].gather(-1, order), ref_weights.gather(-1, ref_order)
+                )
+                home_shared_id = (
+                    self.EP_RANK * (num_local_routed + 1) + num_local_routed
+                )
+                self.assertTrue(torch.all(ids[:, k] == home_shared_id))
 
 
 if __name__ == "__main__":
