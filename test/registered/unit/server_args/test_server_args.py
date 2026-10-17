@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
@@ -2699,6 +2700,39 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
                 args = self._make_args(max_context_size)
                 with self.assertRaisesRegex(ValueError, expected_error):
                     finalize_cuda_graph_prefill_max_context(args)
+
+
+class TestTRTLLMMLAKVCacheDtypeValidation(CustomTestCase):
+    def _args(self, kv_cache_dtype, *, prefill="trtllm_mla", decode="fa3"):
+        args = ServerArgs(
+            model_path="dummy",
+            prefill_attention_backend=prefill,
+            decode_attention_backend=decode,
+            kv_cache_dtype=kv_cache_dtype,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.BREAKABLE)
+            ),
+        )
+        args._cuda_graph_config_locked = set()
+        args._model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MLA,
+            context_len=4096,
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(
+                architectures=["TestMultimodalForConditionalGeneration"],
+                dual_chunk_attention_config=None,
+            ),
+            is_encoder_decoder=False,
+            is_multimodal=True,
+            is_multimodal_breakable_cuda_graph_supported=False,
+        )
+        return args
+
+    @override_platform(is_blackwell=True, is_sm100=True)
+    def test_split_prefill_backend_rejects_fp8_e5m2(self):
+        args = self._args("fp8_e5m2")
+        with self.assertRaisesRegex(ValueError, "fp8_e5m2"):
+            handle_attention_backend_compatibility(args)
 
 
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):

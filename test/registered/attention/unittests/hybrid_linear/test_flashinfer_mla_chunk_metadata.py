@@ -74,6 +74,7 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
         qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
         hidden_size=64,
         context_len=DEFAULT_MAX_CONTEXT_LEN,
+        dtype=torch.float16,
     )
     runner = _ChunkKVMLARunner(
         case=case,
