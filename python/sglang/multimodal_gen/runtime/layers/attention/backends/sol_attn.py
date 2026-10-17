@@ -7,20 +7,22 @@ import re
 
 import torch
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 _SOL_ATTN_HEAD_DIM = 128
-_DENSE_BACKENDS = {"fa", "sage_attn"}
+_DENSE_BACKENDS = {"fa", "sage_attn", "aiter_sage"}
 
 
 def _parse_layer_ranges(spec: str | int | None) -> frozenset[int]:
@@ -59,8 +61,12 @@ def _resolve_kv_splits(q: torch.Tensor, kv_splits: int | str | None) -> int:
 def _get_sol_attn_runtime_config() -> dict:
     server_args = get_global_server_args()
     cfg = getattr(server_args, "attention_backend_config", None) or {}
+    default_dense_backend = "aiter_sage" if current_platform.is_rocm() else "fa"
     dense_backend = (
-        str(cfg.get("dense_backend", "fa")).strip().lower().replace("-", "_")
+        str(cfg.get("dense_backend", default_dense_backend))
+        .strip()
+        .lower()
+        .replace("-", "_")
     )
     if dense_backend in {"sage", "sageattention"}:
         dense_backend = "sage_attn"
@@ -109,16 +115,19 @@ class SolAttnImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        del num_heads, num_kv_heads, extra_impl_args
+        del num_kv_heads
         if head_size != _SOL_ATTN_HEAD_DIM:
             raise ValueError(
                 f"Sol-Attn requires head_size={_SOL_ATTN_HEAD_DIM}, got {head_size}"
             )
+        self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.extra_impl_args = extra_impl_args
         self.prefix = prefix
         self.layer_idx = self._parse_layer_idx(prefix)
         self._sol_params: frozenset[str] | None = None
+        self._aiter_sage_impl = None
 
     @staticmethod
     def _parse_layer_idx(prefix: str) -> int | None:
@@ -148,6 +157,10 @@ class SolAttnImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.flash_attention import (
+            flash_attn_varlen_func,
+        )
+
         output = flash_attn_varlen_func(
             query,
             key,
@@ -201,20 +214,54 @@ class SolAttnImpl(AttentionImpl):
             )[0]
         return output
 
+    def _dense_aiter_sage(self):
+        if self._aiter_sage_impl is None:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage import (
+                AITERSageImpl,
+            )
+
+            self._aiter_sage_impl = AITERSageImpl(
+                num_heads=self.num_heads,
+                head_size=_SOL_ATTN_HEAD_DIM,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                **self.extra_impl_args,
+            )
+        return self._aiter_sage_impl
+
     def _run_sol_attn_thd(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        from sol_attn import sol_attn
-
         cfg = _get_sol_attn_runtime_config()
         q = query.unsqueeze(0).contiguous()
         k = key.unsqueeze(0).contiguous()
         v = value.unsqueeze(0).contiguous()
         if q.dtype != torch.bfloat16:
             raise TypeError(f"Sol-Attn requires bfloat16 activations, got {q.dtype}")
+
+        if current_platform.is_rocm():
+            # aiter's gfx1201 kernel (the platform only selects SOL_ATTN there):
+            # diag threshold only; kv_splits is a CUDA scheduling knob.
+            if cfg["thresh_type"] != "diag":
+                raise ValueError(
+                    f"Sol-Attn on ROCm supports thresh_type='diag', got {cfg['thresh_type']!r}"
+                )
+            import aiter
+
+            return aiter.gfx1201_sol_attention(
+                q,
+                k,
+                v,
+                tau=cfg["tau"],
+                sink_tokens=cfg["sink_tokens"],
+                sink_start=cfg["sink_start"],
+                softmax_scale=self.softmax_scale,
+            ).squeeze(0)
+
+        from sol_attn import sol_attn
 
         if self._sol_params is None:
             self._sol_params = frozenset(inspect.signature(sol_attn).parameters)
@@ -244,8 +291,11 @@ class SolAttnImpl(AttentionImpl):
         del attn_metadata
         # ``query`` is NHD: [B, T, H, D]
         if self._should_use_dense():
-            if _get_sol_attn_runtime_config()["dense_backend"] == "sage_attn":
+            dense_backend = _get_sol_attn_runtime_config()["dense_backend"]
+            if dense_backend == "sage_attn":
                 return self._dense_sage(query, key, value)
+            if dense_backend == "aiter_sage":
+                return self._dense_aiter_sage().forward(query, key, value)
             # NHD [B, T, H, D] → packed THD [B*T, H, D] (plain reshape; do not
             # transpose — that would scramble token order for flash_attn_varlen).
             q = query.reshape(
@@ -285,8 +335,13 @@ class SolAttnImpl(AttentionImpl):
     ) -> torch.Tensor:
         del cu_seqlens_host
         if self._should_use_dense():
-            if _get_sol_attn_runtime_config()["dense_backend"] == "sage_attn":
+            dense_backend = _get_sol_attn_runtime_config()["dense_backend"]
+            if dense_backend == "sage_attn":
                 return self._dense_sage(query, key, value, cu_seqlens=cu_seqlens)
+            if dense_backend == "aiter_sage":
+                return self._dense_aiter_sage().forward_varlen(
+                    query, key, value, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                )
             return self._dense_fa(
                 query, key, value, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
             )
