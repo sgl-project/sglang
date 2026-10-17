@@ -25,9 +25,21 @@ use crate::utils::{error::Error, fsm::Event};
 pub trait TextTokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<TokenIds, Error>;
 
-    /// The special tokens this tokenizer auto-prepends on every `encode` —
-    /// Python's `encode("")` probe (`serving_chat._tokenizer_auto_adds_specials`).
-    /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
+    /// Encode a rendered prompt without adding post-processor special tokens.
+    /// The default preserves the existing prefix-only behavior for custom
+    /// implementations. `auto_specials` is cached by the worker, so this fallback
+    /// does not encode an empty string again for every request.
+    fn encode_without_special_tokens(
+        &self,
+        text: &str,
+        auto_specials: &[i64],
+    ) -> Result<TokenIds, Error> {
+        Ok(strip_auto_specials(self.encode(text)?, auto_specials))
+    }
+
+    /// Empty-input probe used by the default prefix-only fallback above.
+    /// Backends with suffix or other post-processing must override
+    /// `encode_without_special_tokens` instead of assuming these form a prefix.
     fn auto_specials(&self) -> Vec<i64> {
         Vec::new()
     }
@@ -49,17 +61,33 @@ pub fn load_tokenizer(
     let path = tokenizer_path.ok_or_else(|| {
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
+    load_tokenizer_with_special_tokens(path, revision, true).map(Some)
+}
+
+/// Load the additional encode handle used for already-rendered chat prompts.
+/// Dynamo fixes this option at construction time, so it cannot be changed by
+/// stripping IDs after encoding (padding and truncation depend on the option).
+pub fn load_tokenizer_without_special_tokens(
+    tokenizer_path: &str,
+    revision: Option<&str>,
+) -> Result<dynamo_tokenizers::Tokenizer, String> {
+    load_tokenizer_with_special_tokens(tokenizer_path, revision, false)
+}
+
+fn load_tokenizer_with_special_tokens(
+    path: &str,
+    revision: Option<&str>,
+    add_special_tokens: bool,
+) -> Result<dynamo_tokenizers::Tokenizer, String> {
     let file = resolve_model_file(path, revision, "tokenizer.json")
         .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
         &file,
-        dynamo_tokenizers::TokenizerOptions {
-            add_special_tokens: true,
-        },
+        dynamo_tokenizers::TokenizerOptions { add_special_tokens },
     )
     .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
-    tracing::info!(%path, "loaded tokenizer");
-    Ok(Some(tokenizer))
+    tracing::info!(%path, add_special_tokens, "loaded tokenizer");
+    Ok(tokenizer)
 }
 
 /// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
@@ -108,23 +136,39 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str)
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
 pub struct DynamoTokenizer {
     inner: dynamo_tokenizers::Tokenizer,
+    without_specials: Option<dynamo_tokenizers::Tokenizer>,
 }
 
 impl DynamoTokenizer {
     pub fn new(inner: dynamo_tokenizers::Tokenizer) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            without_specials: None,
+        }
     }
-}
 
-impl TextTokenizer for DynamoTokenizer {
-    fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+    /// Supply both construction-time modes, shared by every tokenizer worker.
+    /// The original handle remains available for ordinary prompts and decoding.
+    pub fn with_special_token_modes(
+        with_specials: dynamo_tokenizers::Tokenizer,
+        without_specials: dynamo_tokenizers::Tokenizer,
+    ) -> Self {
+        Self {
+            without_specials: Some(without_specials),
+            ..Self::new(with_specials)
+        }
+    }
+
+    fn encode_with(
+        tokenizer: &dynamo_tokenizers::Tokenizer,
+        text: &str,
+    ) -> Result<TokenIds, Error> {
         if text.is_empty() {
             // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
             // not the misleading 500 a tokenize error would give.
             return Err(Error::Validation("prompt cannot be empty".into()));
         }
-        let encoding = self
-            .inner
+        let encoding = tokenizer
             .encode(text)
             .map_err(|e| Error::Tokenize(e.to_string()))?;
         // Widened once here, in the parallel pool: the scheduler's `array("q")`
@@ -135,9 +179,25 @@ impl TextTokenizer for DynamoTokenizer {
             .map(|&id| i64::from(id))
             .collect())
     }
+}
 
-    /// The post-processor prepends exactly what `encode("")` returns, so the
-    /// probe is the same prefix [`strip_auto_specials`] removes.
+impl TextTokenizer for DynamoTokenizer {
+    fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+        Self::encode_with(&self.inner, text)
+    }
+
+    fn encode_without_special_tokens(
+        &self,
+        text: &str,
+        auto_specials: &[i64],
+    ) -> Result<TokenIds, Error> {
+        match &self.without_specials {
+            Some(tokenizer) => Self::encode_with(tokenizer, text),
+            // Preserve the original behavior for callers supplying one handle.
+            None => Ok(strip_auto_specials(self.encode(text)?, auto_specials)),
+        }
+    }
+
     fn auto_specials(&self) -> Vec<i64> {
         self.inner
             .encode("")
@@ -152,10 +212,9 @@ impl TextTokenizer for DynamoTokenizer {
     }
 }
 
-/// Remove one leading run of auto-added specials — exactly what an
-/// `add_special_tokens=false` encode would have produced, without a second
-/// tokenizer instance (the post-processor always prepends the same prefix, so
-/// a template-rendered copy of those tokens is preserved).
+/// Legacy fallback for custom tokenizers that only prepend special tokens.
+/// Concrete backends can override `encode_without_special_tokens` when their
+/// post-processor can also append tokens or perform other transformations.
 fn strip_auto_specials(mut ids: Vec<i64>, auto_specials: &[i64]) -> Vec<i64> {
     if ids.starts_with(auto_specials) {
         ids.drain(..auto_specials.len());
@@ -166,10 +225,9 @@ fn strip_auto_specials(mut ids: Vec<i64>, auto_specials: &[i64]) -> Vec<i64> {
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
 ///
-/// The `auto_specials` prefix (probed once at construction, Python's
-/// `encode("")` probe) is stripped from template-rendered prompts —
-/// [`GenerateRequest`]'s `skip_special_tokens` — so chat prompts gain no
-/// extra BOS/EOS while plain text keeps the post-processor specials.
+/// Template-rendered prompts (`GenerateRequest::skip_special_tokens`) use the
+/// backend's encode-without-specials path. The once-probed `auto_specials` is
+/// retained for custom tokenizers using the legacy prefix-only default.
 pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
@@ -217,13 +275,16 @@ impl Runnable for TokenizerWorker {
                 if let Some(n) = stop_tokens {
                     g.sampling_params.stop_str_max_len = n;
                 }
-                match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
+                let text = g.text.as_deref().unwrap_or("");
+                let encoded = if g.skip_special_tokens {
+                    self.tokenizer
+                        .encode_without_special_tokens(text, &self.auto_specials)
+                } else {
+                    self.tokenizer.encode(text)
+                };
+                match encoded {
                     Ok(ids) => {
-                        g.input_ids = Some(if g.skip_special_tokens {
-                            strip_auto_specials(ids, &self.auto_specials)
-                        } else {
-                            ids
-                        });
+                        g.input_ids = Some(ids);
                         Event::TokenizeDone
                     }
                     Err(err) => Event::Error(err),
@@ -345,9 +406,8 @@ mod tests {
         );
     }
 
-    /// The strip reproduces `add_special_tokens=false`: one leading run of
-    /// auto-added specials is removed, a template-rendered copy is kept, and
-    /// tokenizers with no auto specials (empty probe) are untouched.
+    /// The legacy fallback removes one probed prefix, preserving an explicit
+    /// template-rendered copy and leaving tokenizers with no probe untouched.
     #[test]
     fn strip_auto_specials_matches_add_special_tokens_false() {
         assert_eq!(strip_auto_specials(vec![0, 0, 1, 2], &[0]), vec![0, 1, 2]);
@@ -403,5 +463,178 @@ mod tests {
         };
         assert_eq!(run(false), vec![0, 2], "plain text prompts keep specials");
         assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
+    }
+    fn tokenize_prompt(tokenizer: DynamoTokenizer, text: &str, skip: bool) -> TokenIds {
+        let (req_tx, req_rx) = flume::unbounded();
+        let (tm_tx, tm_rx) = flume::unbounded();
+        let (sink_tx, _sink_rx) = mpsc::channel(4);
+        req_tx
+            .send(Request {
+                rid: "specials".into(),
+                state: RequestState::Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
+                sink: ResponseSink::Local(sink_tx),
+                kind: RequestKind::Generate(Box::new(GenerateRequest {
+                    text: Some(text.into()),
+                    skip_special_tokens: skip,
+                    ..Default::default()
+                })),
+            })
+            .unwrap();
+        drop(req_tx);
+        TokenizerWorker::new(req_rx, tm_tx, Arc::new(tokenizer)).run();
+        let TmEvent::Tokenized(req) = tm_rx.try_recv().unwrap() else {
+            panic!("expected tokenized request")
+        };
+        assert!(matches!(req.state, RequestState::PreSendValidating));
+        let RequestKind::Generate(g) = req.kind else {
+            panic!("expected generate")
+        };
+        g.input_ids.unwrap()
+    }
+
+    fn check_postprocessor_specials(prefix: bool, suffix: bool) {
+        check_postprocessor_config(
+            prefix,
+            suffix,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+    }
+
+    fn check_postprocessor_config(
+        prefix: bool,
+        suffix: bool,
+        padding: serde_json::Value,
+        truncation: serde_json::Value,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "sglang-tokenizer-specials-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        let mut single = Vec::new();
+        if prefix {
+            single.push(serde_json::json!({"SpecialToken": {"id": "<s>", "type_id": 0}}));
+        }
+        single.push(serde_json::json!({"Sequence": {"id": "A", "type_id": 0}}));
+        if suffix {
+            single.push(serde_json::json!({"SpecialToken": {"id": "</s>", "type_id": 0}}));
+        }
+        let json = serde_json::json!({
+            "version": "1.0", "truncation": truncation, "padding": padding,
+            "added_tokens": [
+                {"id":2,"content":"<s>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+                {"id":3,"content":"</s>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+            ],
+            "normalizer": null, "pre_tokenizer": {"type":"Whitespace"},
+            "post_processor": {"type":"TemplateProcessing", "single":single,
+                "pair":[{"Sequence":{"id":"A","type_id":0}},{"Sequence":{"id":"B","type_id":1}}],
+                "special_tokens": {
+                    "<s>":{"id":"<s>","ids":[2],"tokens":["<s>"]},
+                    "</s>":{"id":"</s>","ids":[3],"tokens":["</s>"]}
+                }},
+            "decoder": null,
+            "model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1,"<s>":2,"</s>":3},"unk_token":"[UNK]"}
+        });
+        std::fs::write(&path, json.to_string()).unwrap();
+        let load = |add_special_tokens| {
+            dynamo_tokenizers::Tokenizer::from_file_with_options(
+                path.to_str().unwrap(),
+                dynamo_tokenizers::TokenizerOptions { add_special_tokens },
+            )
+            .unwrap()
+        };
+        let with_specials = load(true);
+        let without_specials =
+            load_tokenizer_without_special_tokens(dir.to_str().unwrap(), None).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        for text in [
+            "hello",
+            "hello hello hello hello",
+            "<s>hello</s>",
+            "hello</s></s>",
+        ] {
+            for skip in [false, true] {
+                let reference = if skip {
+                    &without_specials
+                } else {
+                    &with_specials
+                };
+                let expected: Vec<_> = reference
+                    .encode(text)
+                    .unwrap()
+                    .token_ids()
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect();
+                assert_eq!(
+                    tokenize_prompt(
+                        DynamoTokenizer::with_special_token_modes(
+                            with_specials.clone(),
+                            without_specials.clone()
+                        ),
+                        text,
+                        skip
+                    ),
+                    expected,
+                    "prefix={prefix}, suffix={suffix}, skip={skip}, text={text:?}"
+                );
+            }
+        }
+        if padding.is_null() && truncation.is_null() {
+            assert_eq!(
+                tokenize_prompt(
+                    DynamoTokenizer::with_special_token_modes(with_specials, without_specials),
+                    "<s>hello</s>",
+                    true
+                ),
+                [2, 1, 3]
+            );
+        }
+    }
+
+    #[test]
+    fn chat_tokenization_omits_added_suffix_eos() {
+        check_postprocessor_specials(false, true);
+    }
+    #[test]
+    fn chat_tokenization_omits_added_bos_and_eos() {
+        check_postprocessor_specials(true, true);
+    }
+    #[test]
+    fn chat_tokenization_preserves_prefix_only_behavior() {
+        check_postprocessor_specials(true, false);
+    }
+    #[test]
+    fn chat_tokenization_preserves_no_postprocessor_specials() {
+        check_postprocessor_specials(false, false);
+    }
+    #[test]
+    fn chat_tokenization_preserves_configured_padding() {
+        check_postprocessor_config(
+            true,
+            true,
+            serde_json::json!({
+                "strategy": {"Fixed": 6}, "direction": "Right", "pad_to_multiple_of": null,
+                "pad_id": 0, "pad_type_id": 0, "pad_token": "[UNK]"
+            }),
+            serde_json::Value::Null,
+        );
+    }
+
+    #[test]
+    fn chat_tokenization_does_not_reserve_truncation_slots_for_specials() {
+        check_postprocessor_config(
+            true,
+            true,
+            serde_json::Value::Null,
+            serde_json::json!({
+                "direction": "Right", "max_length": 3, "strategy": "LongestFirst", "stride": 0
+            }),
+        );
     }
 }
