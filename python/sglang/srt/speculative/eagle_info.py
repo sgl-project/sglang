@@ -39,6 +39,13 @@ class EagleVerifyInput(SpecInput):
     # (`prepared_out_cache_loc`); verify and draft extend take it.
     kv_loc_plan: Optional[KVLocPlan] = None
 
+    # Never populated for verify. Declared as None so a DP-attention idle verify
+    # batch (padded, routed through init_forward_metadata) falls back to
+    # building plain metadata from seq_lens in backends that read
+    # spec_info.kv_indptr directly, instead of raising AttributeError.
+    kv_indptr: Optional[torch.Tensor] = None
+    kv_indices: Optional[torch.Tensor] = None
+
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
 
