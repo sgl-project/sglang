@@ -408,14 +408,16 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
+        """An mps-device MLX scheduler must relay CPU sampled tokens for a multi-request batch."""
         from sglang.srt.managers import scheduler as scheduler_module
         from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+        _set_dummy_server_args_for_auxiliary_state_tests()
         scheduler = object.__new__(Scheduler)
-        scheduler.device = "cpu"
+        scheduler.device = "mps"
         scheduler.draft_worker = None
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=None)
@@ -441,12 +443,13 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         finally:
             scheduler_module.use_mlx = original_use_mlx
 
-        self.assertIsNotNone(scheduler.future_map)
-        indices = torch.tensor([1], dtype=torch.int64)
+        # Two rows: a single-element index_put tolerates a device mismatch.
+        indices = torch.tensor([1, 2], dtype=torch.int64)
         scheduler.future_map.stash(
-            indices, RelayPayload(bonus_tokens=torch.tensor([7], dtype=torch.int64))
+            indices,
+            RelayPayload(bonus_tokens=torch.tensor([7, 8], dtype=torch.int64)),
         )
-        self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
+        self.assertEqual(scheduler.future_map.output_tokens_buf[1:3].tolist(), [7, 8])
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
         runner = object.__new__(MlxModelRunner)
