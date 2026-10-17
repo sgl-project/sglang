@@ -15,8 +15,7 @@
 import html
 import json
 import logging
-import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -28,6 +27,29 @@ from sglang.srt.function_call.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _search_tag(
+    text: str, prefix: str, close_tag: str, pos: int = 0
+) -> Optional[Tuple[str, str, int]]:
+    # Linear `prefix([^>]+)>(.*?)close_tag` search -> (name, body, end); that regex
+    # rescans from every prefix, but a missing ">"/close tag stays missing for later ones.
+    while (start := text.find(prefix, pos)) != -1:
+        name_start = start + len(prefix)
+        name_end = text.find(">", name_start)
+        if name_end == -1:
+            return None
+        if name_end > name_start:
+            body_end = text.find(close_tag, name_end + 1)
+            if body_end == -1:
+                return None
+            return (
+                text[name_start:name_end],
+                text[name_end + 1 : body_end],
+                body_end + len(close_tag),
+            )
+        pos = start + 1
+    return None
 
 
 def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
@@ -153,11 +175,6 @@ class MiMoDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-        self.func_regex = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
-        self.param_regex = re.compile(
-            r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL
-        )
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -174,9 +191,7 @@ class MiMoDetector(BaseFormatDetector):
         calls = []
         last_end = idx
 
-        for match in self.tool_call_regex.finditer(text):
-            tool_call_body = match.group(1)
-
+        for match_end, tool_call_body in self._iter_tool_call_bodies(text):
             parsed = self._parse_tool_call(tool_call_body, tools)
 
             if parsed:
@@ -186,14 +201,26 @@ class MiMoDetector(BaseFormatDetector):
                     logger.warning(f"Unknown function: {func_name}")
                     if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                         # Return tool call block as normal text
-                        normal_text += text[last_end : match.end()]
-                        last_end = match.end()
+                        normal_text += text[last_end:match_end]
+                        last_end = match_end
                         continue
                 calls.extend(self.parse_base_json(parsed, tools))
 
-            last_end = match.end()
+            last_end = match_end
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _iter_tool_call_bodies(self, text: str):
+        # Linear scan on purpose: a `<tool_call>(.*?)</tool_call>` finditer
+        # rescans to the end from every opening tag when the end tag never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            body_start = start + len(self.bot_token)
+            end = text.find(self.eot_token, body_start)
+            if end == -1:
+                return
+            yield end + len(self.eot_token), text[body_start:end]
+            start = text.find(self.bot_token, end + len(self.eot_token))
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -260,17 +287,19 @@ class MiMoDetector(BaseFormatDetector):
             tool_call_body contains: <function=name>...params...</function>
         """
         # Match complete <function=name>body</function> block
-        func_match = self.func_regex.search(tool_call_body)
+        func_match = _search_tag(tool_call_body, "<function=", "</function>")
         if not func_match:
             return None
 
-        func_name = func_match.group(1).strip()
-        func_body = func_match.group(2)
+        func_name = func_match[0].strip()
+        func_body = func_match[1]
 
         params = {}
-        for param_match in self.param_regex.finditer(func_body):
-            param_name = param_match.group(1).strip()
-            param_value = param_match.group(2)
+        pos = 0
+        while param_match := _search_tag(func_body, "<parameter=", "</parameter>", pos):
+            param_name = param_match[0].strip()
+            param_value = param_match[1]
+            pos = param_match[2]
             params[param_name] = _convert_param_value(
                 param_value, param_name, func_name, tools
             )
