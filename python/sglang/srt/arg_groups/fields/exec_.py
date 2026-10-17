@@ -359,8 +359,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
-                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "Skipped ops use FlashInfer's heuristic fallback."
             ),
             nargs="+",
         ),
