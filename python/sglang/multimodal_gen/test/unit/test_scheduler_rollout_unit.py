@@ -50,7 +50,7 @@ _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
 
 
 def _make_rollout_controller(
-    batch, pipeline_config=None, ode_transition=None
+    batch, pipeline_config=None, ode_transition=None, generator=None
 ) -> FlowRolloutController:
     """The controller the denoising stage creates for ``batch`` (single GPU)."""
     return FlowRolloutController(
@@ -59,7 +59,7 @@ def _make_rollout_controller(
         log_prob_no_const=batch.rollout_log_prob_no_const,
         debug_mode=batch.rollout_debug_mode,
         sde_step_indices=batch.rollout_sde_step_indices,
-        generator=torch.Generator().manual_seed(0),
+        generator=torch.Generator().manual_seed(0) if generator is None else generator,
         return_dit_trajectory=batch.rollout_return_dit_trajectory,
         return_step_indices=batch.rollout_return_step_indices,
         shard_for_sp=lambda batch, latents: pipeline_config.shard_latents_for_sp(
@@ -119,7 +119,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         batch.rollout_return_dit_trajectory = True
         current_rollout_controller = _make_rollout_controller(batch)
         timestep = torch.tensor(500.0, device="cuda")
-        current_rollout_controller._maybe_append_dit_trajectory_step(
+        current_rollout_controller.record_trajectory_step(
             latents=batch.latents, timestep_value=timestep, step_index=0
         )
         self.assertEqual(
@@ -128,10 +128,11 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
 
     def test_ode_step_does_not_call_variance_noise_sampler(self):
         batch = self._build_batch(debug_mode=False)
-        current_rollout_controller = _make_rollout_controller(batch)
-
         generator = torch.Generator().manual_seed(1)
         generator_state = generator.get_state()
+        current_rollout_controller = _make_rollout_controller(
+            batch, generator=generator
+        )
 
         sample = torch.randn(2, 4, 8, 8, dtype=torch.float32)
         model_output = torch.randn_like(sample)
@@ -144,7 +145,6 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=generator,
             step_index=2,
         )
         # The ODE path must not draw variance noise from the request generator.
@@ -187,7 +187,6 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=torch.Generator(device=sample.device).manual_seed(0),
             step_index=2,
         )
         # Exact expression used by the non-rollout branch at
@@ -291,7 +290,10 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             return sample * 2
 
         current_rollout_controller = _make_rollout_controller(
-            batch, pipeline_config, ode_transition=ode_transition
+            batch,
+            pipeline_config,
+            ode_transition=ode_transition,
+            generator=[torch.Generator().manual_seed(i) for i in range(2)],
         )
         sample = torch.randn(2, 4, 8, 8)
         model_output = torch.randn_like(sample)
@@ -303,7 +305,6 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             sample=sample,
             current_sigma=torch.tensor(0.6),
             next_sigma=torch.tensor(0.4),
-            generator=None,
             step_index=0,
         )
         self.assertTrue(torch.equal(prev_0, sample * 2))
@@ -314,7 +315,6 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             sample=sample,
             current_sigma=torch.tensor(0.6),
             next_sigma=torch.tensor(0.4),
-            generator=[torch.Generator().manual_seed(i) for i in range(2)],
             step_index=1,
         )
         self.assertEqual(ode_calls, [0])
@@ -336,7 +336,6 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=torch.Generator(device=sample.device).manual_seed(2),
             step_index=2,
         )
 
@@ -452,16 +451,17 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         for sde_type in ("sde", "cps"):
             for seed in (0, 1, 2, 3):
                 batch = self._build_batch(sde_type=sde_type, shape=shape)
+                # The controller draws its variance noise from the request
+                # generator; a twin generator reproduces it for the reference.
                 current_rollout_controller = _make_rollout_controller(
-                    batch, pipeline_config
+                    batch,
+                    pipeline_config,
+                    generator=torch.Generator(device="cpu").manual_seed(seed + 100),
                 )
 
                 g = torch.Generator(device="cpu").manual_seed(seed)
                 model_output = torch.randn(shape, generator=g, dtype=torch.float32)
                 sample = torch.randn(shape, generator=g, dtype=torch.float32)
-                # The controller draws its variance noise from the request
-                # generator; a twin generator reproduces it for the reference.
-                noise_generator = torch.Generator(device="cpu").manual_seed(seed + 100)
                 variance_noise = torch.randn(
                     shape,
                     generator=torch.Generator(device="cpu").manual_seed(seed + 100),
@@ -474,7 +474,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     sample=sample,
                     current_sigma=current_sigma,
                     next_sigma=next_sigma,
-                    generator=noise_generator,
                     step_index=2,
                 )
                 log_prob_sum, elem_count = (
@@ -563,7 +562,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 sample=sample,
                 current_sigma=current_sigma,
                 next_sigma=next_sigma,
-                generator=g,
                 step_index=2,
             )
             log_prob_sum, _count = (
@@ -602,9 +600,10 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             rollout_return_step_indices=None,
             latents=torch.empty(shape, dtype=torch.float32),
         )
-        current_rollout_controller = _make_rollout_controller(batch, pipeline_config)
-
         g = torch.Generator(device="cpu").manual_seed(0)
+        current_rollout_controller = _make_rollout_controller(
+            batch, pipeline_config, generator=g
+        )
         sample = torch.randn(shape, generator=g, dtype=torch.float32)
         model_output = torch.randn(shape, generator=g, dtype=torch.float32)
         current_sigma = torch.tensor(0.6, dtype=torch.float32)
@@ -619,7 +618,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=g,
             step_index=0,
         )
         self.assertTrue(torch.equal(g.get_state(), generator_state))
@@ -633,7 +631,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=g,
             step_index=1,
         )
         self.assertFalse(torch.equal(g.get_state(), generator_state))
@@ -674,7 +671,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             )
             # Step i records the timestep value i, so the timesteps name the steps kept.
             for i in range(4):
-                current_rollout_controller._maybe_append_dit_trajectory_step(
+                current_rollout_controller.record_trajectory_step(
                     latents=lat, timestep_value=torch.tensor(float(i)), step_index=i
                 )
             self.assertEqual(
