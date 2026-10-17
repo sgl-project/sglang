@@ -2432,6 +2432,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
+        quant_config = getattr(self, "quant_config", None)
+        is_gptq = (
+            quant_config is not None
+            and getattr(quant_config, "quant_method", None) == "gptq"
+        )
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         bare_backbone = False
@@ -2476,7 +2482,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if (
+                    is_gptq
+                    and "visual" not in name
+                    and name.endswith(".bias")
+                    and name not in params_dict
+                ):
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
@@ -2495,7 +2506,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if (
+                    is_gptq
+                    and "visual" not in name
+                    and name.endswith(".bias")
+                    and name not in params_dict
+                ):
                     continue
                 if name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
@@ -2518,7 +2534,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if bare_backbone and self.pp_group.is_last_rank:
             self._load_decision_readout()
             loaded_params.add("lm_head.weight")
-        if isinstance(self.pooler, JointSchemaPooler):
+        if isinstance(getattr(self, "pooler", None), JointSchemaPooler):
             self._load_joint_head()
             loaded_params.update(
                 f"pooler.head.{name}" for name, _ in self.pooler.head.named_parameters()
@@ -2734,6 +2750,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
             return True
 
+        quant_config = getattr(self, "quant_config", None)
+        is_gptq = (
+            quant_config is not None
+            and getattr(quant_config, "quant_method", None) == "gptq"
+        )
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -2797,7 +2819,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    is_gptq
+                    and "visual" not in name
+                    and name.endswith(ignore_suffixes)
+                    and name not in params_dict
+                ):
                     continue
 
                 if name not in params_dict:
@@ -2918,7 +2945,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"model.visual.", r"visual.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        is_gptq
+                        and "visual" not in name
+                        and name.endswith(ignore_suffixes)
+                        and name not in params_dict
+                    ):
                         continue
 
                     if name in params_dict.keys():
