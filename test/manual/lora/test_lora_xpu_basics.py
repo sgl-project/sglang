@@ -52,7 +52,7 @@ from sglang.test.test_utils import (
     empty_gpu_cache,
 )
 
-DENSE_BACKENDS = [*BACKENDS, "torch_native"]
+DENSE_BACKENDS = [*BACKENDS, "torch_native", "intel_xpu"]
 
 MEM_FRACTION_STATIC = 0.80
 MAX_NEW_TOKENS = 16
