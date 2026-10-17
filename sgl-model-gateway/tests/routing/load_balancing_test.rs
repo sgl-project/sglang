@@ -239,6 +239,100 @@ mod cache_aware_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Sum every sample of `name` whose label set contains `label`.
+    fn prom_sum(exposition: &str, name: &str, label: &str) -> f64 {
+        exposition
+            .lines()
+            .filter(|l| l.starts_with(name) && l[name.len()..].starts_with('{'))
+            .filter(|l| l.contains(label))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// End to end over HTTP: slow mock workers behind the real router, scraped
+    /// from the real Prometheus exporter. Concurrent requests sharing a prefix
+    /// pile onto the worker that holds it until the balance thresholds trip,
+    /// and the reuse the load-balance branch gives up must then be exported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_cache_aware_load_balance_branch_is_measured() {
+        use smg::observability::metrics::{start_prometheus, PrometheusConfig};
+
+        const PROM_PORT: u16 = 29190;
+        start_prometheus(PrometheusConfig {
+            port: PROM_PORT,
+            host: "127.0.0.1".to_string(),
+            duration_buckets: None,
+        });
+
+        let mut config = TestRouterConfig::cache_aware(3190);
+        config.policy = smg::config::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 2,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        };
+        let ctx =
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(19190, 2, 300))
+                .await;
+        let app = ctx.create_app().await;
+
+        let shared_prefix = "You are a coding agent. ".repeat(40);
+        let requests = (0..24).map(|i| {
+            let app = app.clone();
+            let payload = json!({
+                "text": format!("{shared_prefix} turn {i}"),
+                "stream": false
+            });
+            async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap();
+                app.oneshot(req).await.unwrap().status()
+            }
+        });
+        let statuses = futures::future::join_all(requests).await;
+        assert!(statuses.iter().all(|s| *s == StatusCode::OK));
+
+        let exposition = reqwest::get(format!("http://127.0.0.1:{PROM_PORT}/metrics"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        for line in exposition
+            .lines()
+            .filter(|l| l.starts_with("smg_cache_aware_"))
+        {
+            println!("{line}");
+        }
+
+        let lb = r#"branch="load_balance""#;
+        assert!(
+            prom_sum(&exposition, "smg_cache_aware_policy_branch_total", lb) > 0.0,
+            "load-balance branch never ran"
+        );
+        assert!(
+            prom_sum(&exposition, "smg_cache_aware_match_rate_count", lb) > 0.0,
+            "match rate not recorded on the load-balance branch"
+        );
+        assert!(
+            exposition.contains("smg_cache_aware_match_rate_bucket{"),
+            "match rate exported as a summary, not a histogram"
+        );
+        let given_up = prom_sum(&exposition, "smg_cache_aware_matched_chars_total", lb);
+        let inspected = prom_sum(&exposition, "smg_cache_aware_input_chars_total", lb);
+        assert!(
+            given_up > 0.0 && given_up <= inspected,
+            "reuse given up: matched={given_up} input={inspected}"
+        );
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]

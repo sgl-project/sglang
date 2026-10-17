@@ -72,7 +72,35 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
+use crate::{
+    core::{Worker, WorkerType, UNKNOWN_MODEL_ID},
+    observability::metrics::Metrics,
+};
+
+/// Execution branch for cache-aware routing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Branch {
+    CacheHit,
+    CacheMissMinLoad,
+    LoadBalance,
+    StaleTenantFallback,
+    NoTreeRandom,
+    NoHealthyWorkers,
+}
+
+impl Branch {
+    #[inline]
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::CacheMissMinLoad => "cache_miss_min_load",
+            Self::LoadBalance => "load_balance",
+            Self::StaleTenantFallback => "stale_tenant_fallback",
+            Self::NoTreeRandom => "no_tree_random",
+            Self::NoHealthyWorkers => "no_healthy_workers",
+        }
+    }
+}
 
 /// Tag used to isolate prefill/decode/regular worker pools in the cache_aware tree key.
 ///
@@ -137,6 +165,12 @@ impl CacheAwarePolicy {
                         let tree_key = tree_ref.key();
                         let tree = tree_ref.value();
                         tree.evict_tenant_by_size(max_tree_size);
+
+                        let model_label =
+                            tree_key.split_once("::").map(|x| x.1).unwrap_or(tree_key);
+                        for (tenant_url, chars) in tree.get_tenant_char_count() {
+                            Metrics::set_cache_aware_tree_chars(model_label, &tenant_url, chars);
+                        }
 
                         debug!(
                             "Cache eviction completed for {}, max_size: {}",
@@ -350,6 +384,15 @@ impl CacheAwarePolicy {
 
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
+
+                // Measure the reuse this branch gives up, before the insert below makes
+                // the prompt match itself. Without this the match-rate metrics only see
+                // the balanced path, and a deployment that trips the balance thresholds
+                // often reports almost no samples. Read-only, so eviction order and later
+                // routing are unchanged.
+                let (matched, input) = tree.prefix_match_counts(text);
+                Self::record_match(Branch::LoadBalance, matched, input);
+
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
@@ -380,6 +423,65 @@ impl CacheAwarePolicy {
 
         Some(min_load_idx)
     }
+
+    /// Record the best-prefix match seen at a decision, labelled by the branch that ran.
+    fn record_match(branch: Branch, matched: usize, input: usize) {
+        let rate = if input == 0 {
+            0.0
+        } else {
+            matched as f64 / input as f64
+        };
+        Metrics::record_cache_aware_match_rate(branch.as_str(), rate);
+        Metrics::record_cache_aware_prefix_chars(branch.as_str(), matched, input);
+    }
+
+    /// Emit per-worker decision snapshot (DEBUG-gated).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_decision_snapshot(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        tree: &Tree,
+        text: &str,
+        selected_url: &str,
+        branch: Branch,
+        match_rate: f32,
+        headers: Option<&http::HeaderMap>,
+    ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+
+        let request_id = headers
+            .and_then(|h| h.get("x-request-id"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let input_chars = text.chars().count();
+        let candidates: Vec<(String, usize, f32, usize)> = healthy_indices
+            .iter()
+            .map(|&idx| {
+                let w = &workers[idx];
+                let matched = tree.prefix_match_tenant_len(text, w.url());
+                let rate = if input_chars == 0 {
+                    0.0
+                } else {
+                    matched as f32 / input_chars as f32
+                };
+                (w.url().to_string(), matched, rate, w.load())
+            })
+            .collect();
+
+        debug!(
+            request_id = request_id,
+            branch = branch.as_str(),
+            match_rate = match_rate as f64,
+            input_chars = input_chars,
+            selected = selected_url,
+            candidates = ?candidates,
+            "cache_aware decision snapshot (per-candidate: url, matched_chars, matched_rate, load)"
+        );
+    }
 }
 
 #[async_trait]
@@ -393,6 +495,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
+            Metrics::record_worker_cache_aware_policy_branch(Branch::NoHealthyWorkers.as_str());
             return None;
         }
 
@@ -413,6 +516,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
+            Metrics::record_worker_cache_aware_policy_branch(Branch::LoadBalance.as_str());
             return self.select_worker_min_load(
                 workers,
                 &request_text,
@@ -440,8 +544,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
+            let is_cache_hit = match_rate > self.config.cache_threshold;
+            let match_branch = if is_cache_hit {
+                Branch::CacheHit
+            } else {
+                Branch::CacheMissMinLoad
+            };
+
             // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let selected_idx = if is_cache_hit {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
                 let tenant_url: &str = &result.tenant;
                 workers
@@ -467,6 +578,20 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
+                let branch = match_branch;
+                Self::record_match(branch, result.matched_char_count, result.input_char_count);
+
+                self.emit_decision_snapshot(
+                    workers,
+                    &healthy_indices,
+                    &tree,
+                    text,
+                    workers[idx].url(),
+                    branch,
+                    match_rate,
+                    info.headers,
+                );
+
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 
@@ -486,11 +611,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
+                Metrics::record_worker_cache_aware_policy_branch(branch.as_str());
                 return Some(idx);
             }
 
             // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if match_rate > self.config.cache_threshold {
+            if is_cache_hit {
                 let tenant_url: &str = &result.tenant;
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
@@ -509,8 +635,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             }
 
             // Fallback to first healthy worker
+            Self::record_match(
+                Branch::StaleTenantFallback,
+                result.matched_char_count,
+                result.input_char_count,
+            );
+            Metrics::record_worker_cache_aware_policy_branch(Branch::StaleTenantFallback.as_str());
             healthy_indices.first().copied()
         } else {
+            Metrics::record_worker_cache_aware_policy_branch(Branch::NoTreeRandom.as_str());
             warn!(
                 "cache_aware: no tree found for key '{}', falling back to random \
                  worker selection — pool tree was not seeded \
@@ -560,6 +693,20 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[test]
+    fn test_branch_as_str_stable() {
+        // Metric label values are part of the observability contract; keep them stable.
+        assert_eq!(Branch::CacheHit.as_str(), "cache_hit");
+        assert_eq!(Branch::CacheMissMinLoad.as_str(), "cache_miss_min_load");
+        assert_eq!(Branch::LoadBalance.as_str(), "load_balance");
+        assert_eq!(
+            Branch::StaleTenantFallback.as_str(),
+            "stale_tenant_fallback"
+        );
+        assert_eq!(Branch::NoTreeRandom.as_str(), "no_tree_random");
+        assert_eq!(Branch::NoHealthyWorkers.as_str(), "no_healthy_workers");
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
