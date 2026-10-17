@@ -201,8 +201,8 @@ class EncoderScheduler:
             )
             raise
 
-    async def _collect_batch(self) -> List[PendingRequest]:
-        batch = [await self.pending_queue.get()]
+    async def _collect_batch(self, first: PendingRequest) -> List[PendingRequest]:
+        batch = [first]
         first_modality = Modality.from_str(batch[0].request.get("modality", "image"))
         should_yield = (
             self.coalesce_same_turn
@@ -225,7 +225,9 @@ class EncoderScheduler:
         while True:
             batch: List[PendingRequest] = []
             try:
-                batch = await self._collect_batch()
+                # Own the dequeued request before coalescing can yield or fail.
+                batch = [await self.pending_queue.get()]
+                batch = await self._collect_batch(batch[0])
                 groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
                 for p in batch:
                     groups[

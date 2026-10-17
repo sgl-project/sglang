@@ -44,7 +44,7 @@ def test_collect_batch_yields_for_concurrent_image_request_without_fixed_wait():
             await scheduler.pending_queue.put(second)
 
         producer = asyncio.create_task(enqueue_after_worker_yields())
-        batch = await scheduler._collect_batch()
+        batch = await scheduler._collect_batch(await scheduler.pending_queue.get())
         await producer
 
         assert batch == [first, second]
@@ -64,8 +64,42 @@ def test_collect_batch_respects_max_batch_size():
         for request in requests:
             await scheduler.pending_queue.put(request)
 
-        assert await scheduler._collect_batch() == requests[:2]
+        first = scheduler.pending_queue.get_nowait()
+        assert await scheduler._collect_batch(first) == requests[:2]
         assert scheduler.pending_queue.get_nowait() is requests[2]
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("modality", ["image", "audio"])
+def test_stop_rejects_request_dequeued_before_coalescing(modality):
+    async def run_test():
+        scheduler = EncoderScheduler(
+            encoder=None,
+            send_sockets=[],
+            max_batch_size=8,
+            coalesce_same_turn=True,
+        )
+        requests = [_pending(modality) for _ in range(2)]
+        for request in requests:
+            await scheduler.pending_queue.put(request)
+
+        scheduler.start()
+        # The worker dequeues the first request, then yields to coalesce arrivals.
+        # Stop it before it can drain the second request or dispatch the batch.
+        await asyncio.sleep(0)
+        try:
+            assert scheduler.pending_queue.qsize() == 1
+        finally:
+            await scheduler.stop()
+
+        errors = [
+            request.future.exception() if request.future.done() else None
+            for request in requests
+        ]
+        assert all(isinstance(error, RuntimeError) for error in errors)
+        assert all(str(error) == "EncoderScheduler stopped" for error in errors)
+        assert scheduler.pending_queue.empty()
 
     asyncio.run(run_test())
 
