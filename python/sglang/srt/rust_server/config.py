@@ -24,6 +24,9 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
 )
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.utils.common import build_server_info
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
 if TYPE_CHECKING:
@@ -128,6 +131,7 @@ def _build_server_args(
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        launch_server_info=_launch_server_info(scheduler),
         load_snapshot_path=shm_writer.path if shm_writer else None,
         load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
@@ -141,6 +145,29 @@ def _build_server_args(
             else None
         ),
     )
+
+
+def _launch_server_info(scheduler: Scheduler) -> str:
+    """The `/server_info` fields Python's HTTP server reports that are fixed
+    at launch, as a JSON object: the resolved `server_args`,
+    `launch_command`, `kv_events`, and the scheduler's init info less what is
+    only known once initialization finishes (`startup_time`, which the Rust
+    server reports per request, and the gRPC `kv_event_sources`). Watermark
+    secrets are redacted as Python's HTTP and gRPC frontends redact them."""
+    scheduler_info = {
+        "status": "ready",
+        "max_total_num_tokens": scheduler.max_total_num_tokens,
+        "max_req_input_len": scheduler.max_req_input_len,
+    }
+    info = msgspec_to_builtins(
+        redact_watermark_secrets(
+            build_server_info(scheduler.server_args, scheduler_info)
+        )
+    )
+    # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
+    # router reads this key to pick its protocol.
+    info["enable_http2"] = False
+    return json.dumps(info, default=str)
 
 
 def _partition_cores(

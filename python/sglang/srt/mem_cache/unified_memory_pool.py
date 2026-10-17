@@ -760,7 +760,7 @@ class UnifiedKVPool:
 class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     """MHA KV pool whose per-layer `k_buffer`/`v_buffer` are token-major views
     into a `UnifiedKVPool`: `(num_pages * ps, head_num, head_dim)` with the whole
-    entry as slot stride, indexed by the physical token id. `move_kv_cache`
+    entry as slot stride, indexed by the physical token id. `move_physical_pages`
     relocates whole page envelopes.
     """
 
@@ -823,17 +823,28 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate slots by whole page envelope (`tgt_loc`/`src_loc` are
-        physical token ids)."""
+        physical token ids, in whole page-major runs)."""
         if tgt_loc.numel() == 0:
             return
+        ps = self.page_size
+        self.move_physical_pages(
+            tgt_loc.view(-1, ps)[:, 0] // ps, src_loc.view(-1, ps)[:, 0] // ps, ps
+        )
+
+    def move_physical_pages(
+        self, tgt_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        """Copy whole page envelopes `src_pages` -> `tgt_pages`: disjoint sets of
+        physical page ids, in pages of `page_size` slots (compaction moves)."""
+        assert page_size == self.page_size, (
+            f"page ids of {page_size}-slot pages passed to a pool whose envelope "
+            f"holds {self.page_size} slots"
+        )
         # The envelope view below starts at byte 0, so this sub-pool must be
         # anchored there; a non-zero anchor moves another sub-pool's bytes, and
         # the ids stay in range so nothing downstream notices.
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
-        ps = self.page_size
-        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
-        src_pages = src_loc.view(-1, ps)[:, 0] // ps
-        with record_function("UnifiedMHA.move_kv_cache"):
+        with record_function("UnifiedMHA.move_physical_pages"):
             copy_pages(
                 self._unified_buffer._raw,
                 tgt_pages,
@@ -894,7 +905,7 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     into a `UnifiedKVPool`: `(num_pages * ps, 1, kv_cache_dim)` with the whole
     entry as slot stride, indexed by the physical token id (`translate_kv_loc`
     of the virtual id), so the stock `MLATokenToKVPool` read/write methods work
-    on them unmodified. `move_kv_cache` relocates whole page envelopes.
+    on them unmodified. `move_physical_pages` relocates whole page envelopes.
     """
 
     requires_physical_write_loc = True
@@ -967,17 +978,28 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
 
-        `tgt_loc`/`src_loc` are physical token ids: both compaction paths
-        expand page ids into page-major-ordered token runs
+        `tgt_loc`/`src_loc` are physical token ids in whole page-major runs
         (`pages[:, None] * ps + offsets`), relied on here to recover the page
-        lists. One contiguous envelope copy replaces the per-layer strided moves.
+        lists.
         """
         if tgt_loc.numel() == 0:
             return
         ps = self.page_size
-        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
-        src_pages = src_loc.view(-1, ps)[:, 0] // ps
-        with record_function("UnifiedMLA.move_kv_cache"):
+        self.move_physical_pages(
+            tgt_loc.view(-1, ps)[:, 0] // ps, src_loc.view(-1, ps)[:, 0] // ps, ps
+        )
+
+    def move_physical_pages(
+        self, tgt_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        """Copy whole page envelopes `src_pages` -> `tgt_pages`: disjoint sets of
+        physical page ids, in pages of `page_size` slots (compaction moves). One
+        contiguous envelope copy replaces the per-layer strided moves."""
+        assert page_size == self.page_size, (
+            f"page ids of {page_size}-slot pages passed to a pool whose envelope "
+            f"holds {self.page_size} slots"
+        )
+        with record_function("UnifiedMLA.move_physical_pages"):
             copy_pages(
                 self._unified_buffer._raw,
                 tgt_pages,
@@ -1113,10 +1135,17 @@ class UnifiedMambaPool(MambaPool):
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Cross-pool physical-move contract, implemented by every pool the
-        # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
-        # takes (src, dst), hence the swap.
+        # Ids are PHYSICAL slots; `MambaPool.copy_from` takes (src, dst), hence
+        # the swap.
         MambaPool.copy_from(self, src_loc, tgt_loc)
+
+    def move_physical_pages(
+        self, tgt_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        # Cross-pool physical-move contract, implemented by every pool the
+        # MultiEndedAllocator wraps. A state slot is one page.
+        assert page_size == 1, f"mamba state pages are single slots, got {page_size}"
+        self.move_kv_cache(tgt_pages, src_pages)
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as
