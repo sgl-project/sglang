@@ -191,14 +191,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
+        self.language_model_only = bool(getattr(config, "language_model_only", False))
 
         text_config = config.text_config
 
         prefix = add_prefix("model", prefix)
 
         # Vision/audio encoders + their projection embedders are only consumed
-        # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        # at the input-embedding stage, so they live on the first PP rank only
+        # and are omitted entirely for standalone text serving.
+        if self.pp_group.is_first_rank and not self.language_model_only:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -929,6 +931,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 continue
 
             name = re.sub(r"^model\.", "", name)
+
+            if self.language_model_only and name.startswith(
+                ("vision_tower.", "embed_vision.")
+            ):
+                continue
 
             if pp_filter_load_weight(
                 name,
