@@ -1573,8 +1573,17 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
         self.assertEqual(kwargs["negative_metadata_mode"], "same")
 
     def test_input_stage_resolves_a_reordered_subset_with_captions(self):
+        from sglang.multimodal_gen.runtime.server_args import (
+            server_args as server_args_module,
+        )
+
         deployment = parse_multiview_deployment_config(_transformer_config())
-        stage = Cosmos3MultiviewInputStage(deployment)
+        with mock.patch.object(
+            server_args_module,
+            "_global_server_args",
+            SimpleNamespace(comfyui_mode=False),
+        ):
+            stage = Cosmos3MultiviewInputStage(deployment)
 
         def batch_for(params, is_warmup=False):
             return SimpleNamespace(sampling_params=params, is_warmup=is_warmup)

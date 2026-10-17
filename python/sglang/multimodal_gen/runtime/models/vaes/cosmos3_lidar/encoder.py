@@ -11,7 +11,7 @@ ship next to them in ``lidar_vae/`` are ignored.
 
 Parameter names mirror the exported ``lidar_vae/diffusion_pytorch_model.safetensors``
 so the state dict loads without remapping. Spatial neighborhood attention runs
-as a compiled FlexAttention block mask (``cosmos3_lidar_neighborhood_attention``);
+as a compiled FlexAttention block mask (``neighborhood_attention.py``);
 ``SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN=1`` selects NATTEN's ``na2d`` instead.
 """
 

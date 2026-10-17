@@ -3,7 +3,7 @@
 
 Inference-only implementation of the Multiview-AV visibility rules on top of
 the public PyTorch FlexAttention API, with an optional FlashAttention-4 CuTe
-backend (see ``cosmos3_multiview_fa4``). Ported from the vLLM-Omni reference
+backend (see ``multiview_fa4.py``). Ported from the vLLM-Omni reference
 implementation; the training code is a behavioral oracle, not a source. One
 mask that counts every permitted key once, on either kernel.
 
