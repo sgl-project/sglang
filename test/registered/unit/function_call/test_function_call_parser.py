@@ -514,6 +514,38 @@ class TestPythonicDetector(unittest.TestCase):
             [str(w.message) for w in caught],
         )
 
+    def test_signed_number_arguments_keep_the_call(self):
+        """A signed number such as -5 or +1.5 must not drop the tool call.
+
+        Python parses -5 as a unary minus applied to 5, not as a constant."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="set_temperature",
+                    parameters={
+                        "properties": {
+                            "value": {"type": "integer"},
+                            "offset": {"type": "number"},
+                        },
+                    },
+                ),
+            )
+        ]
+        result = self.detector.detect_and_parse(
+            "[set_temperature(value=-5, offset=+1.5)]", tools
+        )
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"value": -5, "offset": 1.5}
+        )
+        self.assertEqual(result.normal_text, "")
+
+        # A sign on a non-number is still not a literal; the call is skipped.
+        result = self.detector.detect_and_parse('[set_temperature(value=-"5")]', tools)
+        self.assertEqual(result.calls, [])
+
     def test_parse_streaming_no_brackets(self):
         """Test parsing text with no brackets (no tool calls)."""
         text = "This is just normal text without any tool calls."
