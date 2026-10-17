@@ -1,5 +1,6 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
-//! (+ `/model_info` alias), `/weights_checker`, backed by typed operations on
+//! (+ `/model_info` alias), `/flush_cache`, `/weights_checker`, backed by typed
+//! operations on
 //! [`crate::api_server::core::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
@@ -7,8 +8,8 @@
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::State,
+    body::{Body, Bytes},
+    extract::{Query, State, rejection::QueryRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -33,6 +34,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // alias).
         .route("/get_model_info", get(model_info))
         .route("/model_info", get(model_info))
+        .route("/flush_cache", get(flush_cache).post(flush_cache))
         .route("/weights_checker", get(check_weights).post(check_weights))
 }
 
@@ -97,6 +99,62 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
                 .into_response()
         }
     }
+}
+
+#[derive(Deserialize)]
+struct FlushCacheQuery {
+    #[serde(default)]
+    timeout: f64,
+}
+
+/// `GET|POST /flush_cache?timeout=<s>` — the scheduler flushes its caches in
+/// its own loop, after waiting up to `timeout` seconds for running requests to
+/// finish. Python's status and plain-text body: 200 once flushed, 400 with the
+/// scheduler's reason otherwise.
+async fn flush_cache(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<FlushCacheQuery>, QueryRejection>,
+) -> Response {
+    let timeout = match query {
+        Ok(Query(query)) if query.timeout >= 0.0 => query.timeout,
+        Ok(_) => {
+            return native_error(
+                StatusCode::BAD_REQUEST,
+                "timeout must be greater than or equal to 0",
+                false,
+            );
+        }
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let outcome = match state.core.flush_cache(timeout).await {
+        Ok(outcome) => outcome,
+        Err(CoreError::Unavailable) => {
+            return native_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable",
+                false,
+            );
+        }
+        Err(error) => return native_error(error.http_status(), &error.to_string(), false),
+    };
+    let (status, body) = if outcome.success {
+        (
+            StatusCode::OK,
+            "Cache flushed.\nPlease check backend logs for more details. (When there are \
+             running or waiting requests, the operation will not be performed.)\n"
+                .to_owned(),
+        )
+    } else if outcome.message.is_empty() {
+        (StatusCode::BAD_REQUEST, "Flush cache failed.\n".to_owned())
+    } else {
+        (StatusCode::BAD_REQUEST, outcome.message)
+    };
+    // Python's bare `Response(content=...)`: no content type.
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response
 }
 
 /// Python's `CheckWeightsReqInput` body, every field optional.
@@ -434,6 +492,103 @@ mod tests {
             "uncontracted scheduler fields must not silently become public API"
         );
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// `/flush_cache` relays one `FlushCacheReqInput` carrying the query
+    /// timeout and answers with Python's status and plain-text body; a
+    /// negative timeout is refused before anything reaches the scheduler.
+    #[tokio::test]
+    async fn flush_cache_relays_the_scheduler_outcome() {
+        for (method, uri, timeout, outcome, status, body) in [
+            (
+                "POST",
+                "/flush_cache?timeout=30",
+                30.0,
+                (true, ""),
+                StatusCode::OK,
+                "Cache flushed.\nPlease check backend logs for more details. (When there \
+                 are running or waiting requests, the operation will not be performed.)\n",
+            ),
+            (
+                "GET",
+                "/flush_cache",
+                0.0,
+                (false, "Timed out waiting for idle state."),
+                StatusCode::BAD_REQUEST,
+                "Timed out waiting for idle state.",
+            ),
+            (
+                "POST",
+                "/flush_cache",
+                0.0,
+                (false, ""),
+                StatusCode::BAD_REQUEST,
+                "Flush cache failed.\n",
+            ),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let response = tokio::spawn(
+                routes().with_state(state).oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            );
+            let TmEvent::Intake {
+                request: runtime_request,
+                admission,
+            } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("flush_cache must submit one control request");
+            };
+            assert!(admission.try_accept());
+            let RequestKind::Control(control) = &runtime_request.kind else {
+                panic!("flush_cache must submit a control request");
+            };
+            let header = control.encode().unwrap();
+            let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+            assert_eq!(header[0].as_str(), Some("FlushCacheReqInput"));
+            assert_eq!(header[3].as_f64(), Some(timeout), "{uri}");
+
+            let mut payload = Vec::new();
+            rmpv::encode::write_value(
+                &mut payload,
+                &rmpv::Value::Map(vec![
+                    (rmpv::Value::from("rid"), rmpv::Value::from("x")),
+                    (rmpv::Value::from("http_worker_ipc"), rmpv::Value::Nil),
+                    (rmpv::Value::from("success"), rmpv::Value::from(outcome.0)),
+                    (rmpv::Value::from("message"), rmpv::Value::from(outcome.1)),
+                ]),
+            )
+            .unwrap();
+            runtime_request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(payload)))
+                .unwrap();
+
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), status, "{uri}");
+            assert!(response.headers().get(CONTENT_TYPE).is_none());
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body);
+        }
+
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/flush_cache?timeout=-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
     }
 
     /// `/weights_checker` relays one `CheckWeightsReqInput` carrying the body's
