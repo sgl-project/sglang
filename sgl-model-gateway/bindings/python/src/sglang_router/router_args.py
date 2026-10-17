@@ -61,6 +61,9 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
+    cache_aware_prefill_backlog_rate: float = 0.0
+    cache_aware_prefill_backlog_hop_factor: float = 4.0
+    cache_aware_prefill_backlog_hop_scale: float = 200000.0
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -336,6 +339,24 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-aware-prefill-backlog-rate",
+            type=float,
+            default=RouterArgs.cache_aware_prefill_backlog_rate,
+            help="Estimated prefill throughput per worker in uncached input chars/s. When > 0, cache-aware selects PD prefill workers by estimated queued uncached input plus the request's uncached input. 0 disables",
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-aware-prefill-backlog-hop-factor",
+            type=float,
+            default=RouterArgs.cache_aware_prefill_backlog_hop_factor,
+            help="Base weight of a request's uncached chars in cache-aware prefill backlog selection (>= 1.0)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-aware-prefill-backlog-hop-scale",
+            type=float,
+            default=RouterArgs.cache_aware_prefill_backlog_hop_scale,
+            help="Backlog in chars that adds 1.0 to the uncached-chars weight in cache-aware prefill backlog selection. 0 keeps the weight constant",
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",

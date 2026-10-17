@@ -37,6 +37,26 @@
     to the least busy worker when the system is detected to be imbalanced. Ties
     are randomly broken.
 
+    3. Prefill Backlog (PD prefill pools, opt-in)
+    -------------------------------------------
+    worker.load() is a poor signal for prefill workers: it counts requests rather than
+    prefill work, and for streaming PD requests it only counts a request once the prefill
+    has responded. Bursts and long cold prompts can then pile onto one prefill worker while
+    another idles. With prefill_backlog.rate > 0, prefill selection instead keeps a
+    router-local estimate of each worker's queued uncached input (chars), charged with the
+    uncached part of every request routed there and drained at `rate` chars/s, and picks
+
+        argmin_w  backlog_w + f_w * uncached_w,   f_w = hop_factor + backlog_w / hop_scale
+
+    where uncached_w is the request's input minus its prefix match on w. Ties go to the
+    longer match, then the lower load(), then at random. Effects:
+    - each choice is charged at once, so a burst spreads before any request completes;
+    - a cold or long prompt goes to the shortest queue;
+    - a session leaves its worker only when that queue exceeds another by about f times
+      its cached prefix; f grows with the target's backlog, so a saturated pair does not
+      trade sessions back and forth.
+    The backlog is local to this router instance and is not synchronized over mesh.
+
     Configuration Parameters:
     ------------------------
     1. cache_threshold: (float, 0.0 to 1.0)
@@ -58,12 +78,20 @@
     5. max_tree_size: (integer)
     Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
     during the next eviction cycle.
+
+    6. prefill_backlog: (PrefillBacklogConfig, disabled by default)
+    Backlog-aware selection for PD prefill pools (strategy 3 above).
 */
 
-use std::sync::Arc;
+use std::{
+    cmp::{Ordering, Reverse},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use rand::{seq::IteratorRandom, Rng};
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
@@ -114,6 +142,22 @@ pub struct CacheAwarePolicy {
     trees: Arc<DashMap<String, Arc<Tree>>>,
     mesh_sync: OptionalMeshSyncManager,
     _eviction_task: Option<PeriodicTask>,
+    /// Prefill worker URL -> estimated queued uncached chars; only used when
+    /// `config.prefill_backlog` is enabled. A missing entry means an empty queue.
+    prefill_backlog: Mutex<std::collections::HashMap<String, BacklogEntry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BacklogEntry {
+    chars: f64,
+    updated_at: Instant,
+}
+
+impl BacklogEntry {
+    fn drained(&self, now: Instant, rate: f64) -> f64 {
+        let elapsed = now.saturating_duration_since(self.updated_at);
+        (self.chars - rate * elapsed.as_secs_f64()).max(0.0)
+    }
 }
 
 impl CacheAwarePolicy {
@@ -154,6 +198,7 @@ impl CacheAwarePolicy {
             trees,
             mesh_sync: None,
             _eviction_task: eviction_task,
+            prefill_backlog: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -204,6 +249,7 @@ impl CacheAwarePolicy {
         if let Some(tree) = self.trees.get(&tree_key) {
             tree.remove_tenant(worker.url());
         }
+        self.prefill_backlog.lock().remove(worker.url());
     }
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
@@ -212,6 +258,7 @@ impl CacheAwarePolicy {
         for tree_ref in self.trees.iter() {
             tree_ref.value().remove_tenant(url);
         }
+        self.prefill_backlog.lock().remove(url);
     }
 
     /// Restore tree state from mesh store
@@ -380,6 +427,97 @@ impl CacheAwarePolicy {
 
         Some(min_load_idx)
     }
+
+    /// Backlog-aware selection for a prefill pool; see "Prefill Backlog" in the module docs.
+    fn select_prefill_by_backlog(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: &str,
+        healthy_indices: &[usize],
+        tree: &Tree,
+        tree_key: &str,
+        now: Instant,
+    ) -> Option<usize> {
+        let cfg = &self.config.prefill_backlog;
+        let input_chars = text.chars().count();
+        // Walk the tree before taking the backlog lock.
+        let matched: Vec<usize> = healthy_indices
+            .iter()
+            .map(|&idx| {
+                if input_chars == 0 {
+                    0
+                } else {
+                    tree.prefix_match_tenant_char_count(text, workers[idx].url())
+                }
+            })
+            .collect();
+
+        let mut rng = rand::rng();
+        let mut backlog = self.prefill_backlog.lock();
+        // Ordering key: lower cost, then longer match, then lower load, then random.
+        type Key = (f64, Reverse<usize>, usize, u32);
+        let mut best: Option<(Key, usize, usize, f64)> = None; // (key, idx, matched, queued)
+        for (&idx, &matched) in healthy_indices.iter().zip(&matched) {
+            let queued = backlog
+                .get(workers[idx].url())
+                .map_or(0.0, |e| e.drained(now, cfg.rate));
+            let uncached = input_chars.saturating_sub(matched) as f64;
+            let factor = cfg.hop_factor
+                + if cfg.hop_scale > 0.0 {
+                    queued / cfg.hop_scale
+                } else {
+                    0.0
+                };
+            let key = (
+                queued + factor * uncached,
+                Reverse(matched),
+                workers[idx].load(),
+                rng.random::<u32>(),
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(best_key, ..)| key.partial_cmp(best_key) == Some(Ordering::Less))
+            {
+                best = Some((key, idx, matched, queued));
+            }
+        }
+        let (_, idx, matched, queued) = best?;
+        let charged = queued + input_chars.saturating_sub(matched) as f64;
+        backlog.insert(
+            workers[idx].url().to_string(),
+            BacklogEntry {
+                chars: charged,
+                updated_at: now,
+            },
+        );
+        drop(backlog);
+
+        debug!(
+            "cache_aware prefill backlog: selected {} (matched {}/{} chars, backlog {:.0} chars)",
+            workers[idx].url(),
+            matched,
+            input_chars,
+            charged
+        );
+        self.insert_and_sync(tree, tree_key, text, workers[idx].url());
+        workers[idx].increment_processed();
+        Some(idx)
+    }
+
+    fn insert_and_sync(&self, tree: &Tree, tree_key: &str, text: &str, worker_url: &str) {
+        tree.insert(text, worker_url);
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            use smg_mesh::tree_ops::TreeInsertOp;
+            let op = TreeOperation::Insert(TreeInsertOp {
+                text: text.to_string(),
+                tenant: worker_url.to_string(),
+            });
+            let mesh_key = Self::normalize_mesh_model_id(tree_key);
+            if let Err(e) = mesh_sync.sync_tree_operation(mesh_key.to_string(), op) {
+                warn!("Failed to sync tree insert operation to mesh: {}", e);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -400,6 +538,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // so every healthy worker here belongs to the same pool and same model.
         let pivot = workers[healthy_indices[0]].as_ref();
         let tree_key = tree_key_for_worker(pivot);
+
+        if self.config.prefill_backlog.is_enabled()
+            && matches!(pivot.worker_type(), WorkerType::Prefill { .. })
+        {
+            if let Some(tree) = self.trees.get(&tree_key).map(|e| e.value().clone()) {
+                return self.select_prefill_by_backlog(
+                    workers,
+                    request_text.unwrap_or(""),
+                    &healthy_indices,
+                    &tree,
+                    &tree_key,
+                    Instant::now(),
+                );
+            }
+        }
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -558,8 +711,13 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        config::PrefillBacklogConfig,
+        core::{BasicWorkerBuilder, WorkerType},
+    };
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
@@ -634,6 +792,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            prefill_backlog: Default::default(),
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -673,6 +832,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0,
             max_tree_size: 10000,
+            prefill_backlog: Default::default(),
         });
 
         let num_workers = 5;
@@ -1637,5 +1797,200 @@ mod tests {
             assert!(prefill_ca.trees.is_empty());
             assert!(decode_ca.trees.is_empty());
         }
+    }
+
+    fn backlog_policy(rate: f64) -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            prefill_backlog: PrefillBacklogConfig {
+                rate,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn backlog_pick(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        text: &str,
+        now: Instant,
+    ) -> usize {
+        let healthy = get_healthy_worker_indices(workers);
+        let key = tree_key_for_worker(workers[healthy[0]].as_ref());
+        let tree = policy.trees.get(&key).unwrap().value().clone();
+        policy
+            .select_prefill_by_backlog(workers, text, &healthy, &tree, &key, now)
+            .unwrap()
+    }
+
+    fn set_backlog(policy: &CacheAwarePolicy, url: &str, chars: f64, now: Instant) {
+        policy.prefill_backlog.lock().insert(
+            url.to_string(),
+            BacklogEntry {
+                chars,
+                updated_at: now,
+            },
+        );
+    }
+
+    fn backlog_of(policy: &CacheAwarePolicy, url: &str, now: Instant) -> Option<f64> {
+        let rate = policy.config.prefill_backlog.rate;
+        policy
+            .prefill_backlog
+            .lock()
+            .get(url)
+            .map(|e| e.drained(now, rate))
+    }
+
+    /// Cold requests are charged at once, so a burst splits evenly before any of
+    /// them completes, and a long cold prompt goes to the shorter queue.
+    #[tokio::test]
+    async fn test_prefill_backlog_spreads_cold_requests() {
+        let policy = backlog_policy(10_000.0);
+        let workers = vec![
+            make_prefill("http://p0:8000"),
+            make_prefill("http://p1:8000"),
+        ];
+        policy.init_workers(&workers);
+        let now = Instant::now();
+
+        let mut counts = [0; 2];
+        for i in 0..40u8 {
+            let text = format!("{}{}", char::from(b'0' + i), "x".repeat(999));
+            counts[backlog_pick(&policy, &workers, &text, now)] += 1;
+        }
+        assert_eq!(counts, [20, 20]);
+
+        set_backlog(&policy, "http://p0:8000", 300_000.0, now);
+        set_backlog(&policy, "http://p1:8000", 100_000.0, now);
+        assert_eq!(
+            backlog_pick(&policy, &workers, &"g".repeat(500_000), now),
+            1
+        );
+        assert_eq!(backlog_pick(&policy, &workers, &"h".repeat(1_000), now), 0);
+    }
+
+    /// A shared preamble pins every request to one worker under the default policy
+    /// (and for decode pools even with the backlog enabled); with the backlog enabled
+    /// a prefill burst spills over once the preamble holder's queue grows.
+    #[tokio::test]
+    async fn test_prefill_backlog_shared_prefix_burst() {
+        let preamble = "p".repeat(20_000);
+        let texts: Vec<String> = (0..40u8)
+            .map(|i| format!("{preamble}{}{}", char::from(b'0' + i), "s".repeat(4_999)))
+            .collect();
+
+        async fn spread(
+            policy: CacheAwarePolicy,
+            workers: Vec<Arc<dyn Worker>>,
+            texts: &[String],
+        ) -> [usize; 2] {
+            policy.init_workers(&workers);
+            let mut counts = [0; 2];
+            for text in texts {
+                let info = SelectWorkerInfo {
+                    request_text: Some(text),
+                    ..Default::default()
+                };
+                counts[policy.select_worker(&workers, &info).await.unwrap()] += 1;
+            }
+            counts
+        }
+
+        let prefill = || {
+            vec![
+                make_prefill("http://p0:8000"),
+                make_prefill("http://p1:8000"),
+            ]
+        };
+        let decode = vec![make_decode("http://d0:8000"), make_decode("http://d1:8000")];
+
+        let off = spread(backlog_policy(0.0), prefill(), &texts).await;
+        assert!(off.contains(&40), "default policy should pin: {off:?}");
+        let decode_on = spread(backlog_policy(1.0), decode, &texts).await;
+        assert!(
+            decode_on.contains(&40),
+            "decode pool changed: {decode_on:?}"
+        );
+        let on = spread(backlog_policy(1.0), prefill(), &texts).await;
+        assert!(on.iter().all(|&c| c >= 10), "burst did not spread: {on:?}");
+    }
+
+    /// A session moves off its worker only when the queue gap outweighs recomputing
+    /// its cached prefix, and the weight grows with the target's own backlog.
+    #[tokio::test]
+    async fn test_prefill_backlog_session_affinity() {
+        let session = "c".repeat(50_000);
+        let next_turn = format!("{session}{}", "n".repeat(1_000));
+        let pick = |backlog_a: f64, backlog_b: f64, hop_scale: f64| {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                prefill_backlog: PrefillBacklogConfig {
+                    rate: 1.0,
+                    hop_scale,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let workers = vec![make_prefill("http://a:8000"), make_prefill("http://b:8000")];
+            policy.init_workers(&workers);
+            let key = tree_key_for_worker(workers[0].as_ref());
+            policy
+                .trees
+                .get(&key)
+                .unwrap()
+                .insert(&session, "http://a:8000");
+            let now = Instant::now();
+            set_backlog(&policy, "http://a:8000", backlog_a, now);
+            set_backlog(&policy, "http://b:8000", backlog_b, now);
+            backlog_pick(&policy, &workers, &next_turn, now)
+        };
+
+        assert_eq!(pick(100_000.0, 0.0, 200_000.0), 0, "small gap: stay");
+        assert_eq!(pick(400_000.0, 0.0, 200_000.0), 1, "idle target: move");
+        assert_eq!(
+            pick(1_400_000.0, 1_000_000.0, 200_000.0),
+            0,
+            "saturated: stay"
+        );
+        assert_eq!(
+            pick(1_400_000.0, 1_000_000.0, 0.0),
+            1,
+            "constant weight moves"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefill_backlog_drains_and_prunes() {
+        let policy = backlog_policy(10_000.0);
+        let workers = vec![
+            make_prefill("http://p0:8000"),
+            make_prefill("http://p1:8000"),
+        ];
+        policy.init_workers(&workers);
+        let t0 = Instant::now();
+
+        let idx = backlog_pick(&policy, &workers, &"a".repeat(50_000), t0);
+        let other = backlog_pick(&policy, &workers, &"b".repeat(10_000), t0);
+        assert_eq!(other, 1 - idx);
+        let url = workers[idx].url();
+        assert_eq!(backlog_of(&policy, url, t0), Some(50_000.0));
+        let after_2s = backlog_of(&policy, url, t0 + Duration::from_secs(2)).unwrap();
+        assert!((after_2s - 30_000.0).abs() < 1e-6);
+        assert_eq!(
+            backlog_of(&policy, url, t0 + Duration::from_secs(60)),
+            Some(0.0)
+        );
+
+        // One healthy worker and an empty prompt: no panic, and nothing is charged.
+        workers[other].set_healthy(false);
+        assert_eq!(backlog_pick(&policy, &workers, "", t0), idx);
+        assert_eq!(backlog_of(&policy, url, t0), Some(50_000.0));
+
+        policy.remove_worker(workers[idx].as_ref());
+        assert_eq!(backlog_of(&policy, url, t0), None);
+        policy.remove_worker_by_url(workers[other].url());
+        assert!(policy.prefill_backlog.lock().is_empty());
     }
 }

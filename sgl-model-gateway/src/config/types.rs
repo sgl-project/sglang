@@ -265,6 +265,9 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        /// Backlog-aware prefill selection; disabled by default.
+        #[serde(default)]
+        prefill_backlog: PrefillBacklogConfig,
     },
 
     #[serde(rename = "power_of_two")]
@@ -320,6 +323,51 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+}
+
+/// Backlog-aware prefill worker selection for the `cache_aware` policy.
+///
+/// Applies to PD prefill pools only. The router keeps a per-worker estimate of the
+/// uncached input it has sent but the worker has not yet prefilled, drained at `rate`,
+/// and picks the prefill worker with the lowest `backlog + factor * uncached_chars`,
+/// where `factor = hop_factor + backlog / hop_scale`. All quantities are in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PrefillBacklogConfig {
+    /// Estimated prefill throughput of one worker, in uncached input chars per second.
+    /// 0 disables backlog-aware selection.
+    #[serde(default)]
+    pub rate: f64,
+    /// Base weight of a request's uncached chars on a candidate worker (>= 1.0).
+    #[serde(default = "default_prefill_backlog_hop_factor")]
+    pub hop_factor: f64,
+    /// Backlog in chars that adds 1.0 to the weight; 0 keeps the weight at `hop_factor`.
+    #[serde(default = "default_prefill_backlog_hop_scale")]
+    pub hop_scale: f64,
+}
+
+impl Default for PrefillBacklogConfig {
+    fn default() -> Self {
+        Self {
+            rate: 0.0,
+            hop_factor: default_prefill_backlog_hop_factor(),
+            hop_scale: default_prefill_backlog_hop_scale(),
+        }
+    }
+}
+
+impl PrefillBacklogConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.rate > 0.0
+    }
+}
+
+// Defaults tuned on one 2-prefill deployment serving long multi-turn sessions.
+fn default_prefill_backlog_hop_factor() -> f64 {
+    4.0
+}
+
+fn default_prefill_backlog_hop_scale() -> f64 {
+    200_000.0
 }
 
 fn default_prefix_token_count() -> usize {
@@ -812,6 +860,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            prefill_backlog: Default::default(),
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -833,6 +882,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            prefill_backlog: Default::default(),
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -855,6 +905,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            prefill_backlog: Default::default(),
         };
 
         match cache_aware {
@@ -864,6 +915,7 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                prefill_backlog: _,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
@@ -1257,6 +1309,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_backlog: Default::default(),
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1287,6 +1340,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                prefill_backlog: Default::default(),
             }),
             decode_policy: None,
         };
@@ -1343,6 +1397,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            prefill_backlog: Default::default(),
         };
 
         match pd.get_prefill_policy(&main_policy) {

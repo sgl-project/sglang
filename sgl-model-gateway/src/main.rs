@@ -7,9 +7,9 @@ use smg::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
-        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
+        PostgresConfig, PrefillBacklogConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_POOL_IDLE_TIMEOUT_SECS, DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -169,6 +169,20 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
+
+    /// Estimated prefill throughput per worker in uncached input chars/s for cache-aware
+    /// backlog-aware prefill selection in PD mode (0 = disabled)
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    cache_aware_prefill_backlog_rate: f64,
+
+    /// Base weight of a request's uncached chars in cache-aware prefill backlog selection
+    #[arg(long, default_value_t = 4.0, help_heading = "Routing Policy")]
+    cache_aware_prefill_backlog_hop_factor: f64,
+
+    /// Backlog in chars that adds 1.0 to the uncached-chars weight in cache-aware prefill
+    /// backlog selection (0 = constant weight)
+    #[arg(long, default_value_t = 200000.0, help_heading = "Routing Policy")]
+    cache_aware_prefill_backlog_hop_scale: f64,
 
     /// Maximum idle time in seconds before eviction (for manual policy)
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
@@ -766,6 +780,11 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                prefill_backlog: PrefillBacklogConfig {
+                    rate: self.cache_aware_prefill_backlog_rate,
+                    hop_factor: self.cache_aware_prefill_backlog_hop_factor,
+                    hop_scale: self.cache_aware_prefill_backlog_hop_scale,
+                },
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
