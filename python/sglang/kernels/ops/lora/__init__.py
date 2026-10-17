@@ -111,6 +111,8 @@ del _mod, _fn, _op
 _ENGINE_CUTE_DSL_KERNELS = (
     "prepare_masked_bf16",
     "prepare_contiguous_bf16",
+    "prepare_masked_fp8",
+    "prepare_contiguous_fp8",
 )
 for _fn in _ENGINE_CUTE_DSL_KERNELS:
     register_kernel(
