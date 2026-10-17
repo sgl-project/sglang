@@ -1,4 +1,4 @@
-"""Serializable configuration for an explicitly selected external linker.
+"""Serializable configuration for the dynamic linker backend.
 
 Keep validation free of backend and device imports: argument parsing also runs
 in the frontend, while the plugin is imported only in the cache-owning worker.
@@ -17,7 +17,7 @@ class UnifiedCacheLinkerConfig:
     linker_extra_config: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> UnifiedCacheLinkerConfig:
+    def from_dict(cls, value: dict[str, Any] | None) -> UnifiedCacheLinkerConfig:
         flag = "--unified-cache-external-linker-config"
         if not isinstance(value, dict):
             raise ValueError(f"{flag} must be a JSON object.")

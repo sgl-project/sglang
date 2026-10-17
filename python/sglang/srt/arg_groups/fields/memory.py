@@ -211,18 +211,19 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            choices=["mooncake", "mori", "dynamic"],
         ),
     ] = "mooncake"
     unified_cache_external_linker_config: A[
         Optional[Dict[str, Any]],
         Arg(
             help=(
-                "JSON object selecting an out-of-tree UnifiedCacheLinker: "
-                "linker (class name), linker_module_path (Python module), and "
-                "optional linker_extra_config (object). Requires "
-                "--enable-unified-cache-external-linker and takes precedence "
-                "over --unified-cache-external-linker-backend."
+                "JSON configuration for the selected linker backend. Built-in "
+                "backends accept storage options directly. The dynamic backend "
+                "requires linker (class name), linker_module_path (Python "
+                "module), and optional linker_extra_config (object). May be "
+                "supplied while the linker is disabled. For built-in backends, "
+                "replaces --hicache-storage-backend-extra-config when provided."
             ),
             type_parser=json.loads,
         ),

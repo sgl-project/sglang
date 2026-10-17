@@ -294,6 +294,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             ctx.server_args,
             ctx.params,
             components={"full"},
+            extra_config=None,
         )
         cache.init_cache_linker.assert_called_once_with(linker)
         ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value.register_layer_transfer_counter.assert_called_once_with(

@@ -11,9 +11,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.srt.arg_groups.hicache_hook import handle_hicache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.unified_cache.linker_config import UnifiedCacheLinkerConfig
 from sglang.srt.mem_cache.unified_cache.linker_factory import (
     create_unified_cache_linker,
@@ -58,14 +66,18 @@ class TestExternalLinkerConfig(unittest.TestCase):
                 "--model-path",
                 "dummy",
                 "--enable-unified-cache-external-linker",
+                "--unified-cache-external-linker-backend",
+                "dynamic",
                 "--unified-cache-external-linker-config",
                 json.dumps(_CONFIG),
             ]
         )
         self.assertEqual(parsed.unified_cache_external_linker_config, _CONFIG)
+        self.assertEqual(parsed.unified_cache_external_linker_backend, "dynamic")
         args = ServerArgs(
             model_path="dummy",
             enable_unified_cache_external_linker=True,
+            unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config=_CONFIG,
         )
         # Validation must not import the plugin in the frontend.
@@ -76,6 +88,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
 
     def test_invalid_config(self):
         for value in (
+            None,
             [],
             "{}",
             {},
@@ -88,9 +101,76 @@ class TestExternalLinkerConfig(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 UnifiedCacheLinkerConfig.from_dict(value)
 
+    def test_disabled_linker_accepts_config_without_importing_plugin(self):
+        for backend, config in (
+            ("dynamic", _CONFIG),
+            ("dynamic", None),
+            ("mooncake", {"master_server_address": "localhost:50051"}),
+            ("mori", {}),
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                enable_unified_cache_external_linker=False,
+                unified_cache_external_linker_backend=backend,
+                unified_cache_external_linker_config=config,
+                disable_radix_cache=True,
+            )
+            with (
+                self.subTest(backend=backend, config=config),
+                patch(
+                    "importlib.import_module",
+                    side_effect=AssertionError("plugin import"),
+                ),
+            ):
+                handle_hicache(args)
+
+    def test_builtin_config_with_mooncake_mla_dedup(self):
+        for backend in ("mooncake", "mori"):
+            args = ServerArgs(
+                model_path="dummy",
+                enable_unified_cache_external_linker=True,
+                unified_cache_external_linker_backend=backend,
+                unified_cache_external_linker_config={"backend_option": "value"},
+                enable_linker_mla_dedup=backend == "mooncake",
+            )
+            with (
+                self.subTest(backend=backend),
+                patch(
+                    "importlib.import_module",
+                    side_effect=AssertionError("plugin import"),
+                ),
+            ):
+                handle_hicache(args)
+
+    def test_invalid_config_in_server_args(self):
+        for backend in ("dynamic", "mooncake", "mori"):
+            for enabled in (False, True):
+                for config in ([], "{}", 1):
+                    with (
+                        self.subTest(backend=backend, enabled=enabled, config=config),
+                        self.assertRaisesRegex(ValueError, "must be a JSON object"),
+                    ):
+                        handle_hicache(
+                            ServerArgs(
+                                model_path="dummy",
+                                enable_unified_cache_external_linker=enabled,
+                                unified_cache_external_linker_backend=backend,
+                                unified_cache_external_linker_config=config,
+                            )
+                        )
+        for config in (None, {}, {"linker": "MissingModule"}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                handle_hicache(
+                    ServerArgs(
+                        model_path="dummy",
+                        enable_unified_cache_external_linker=True,
+                        unified_cache_external_linker_backend="dynamic",
+                        unified_cache_external_linker_config=config,
+                    )
+                )
+
     def test_conflicting_server_args(self):
         for overrides in (
-            {"enable_unified_cache_external_linker": False},
             {"enable_hierarchical_cache": True},
             {"hicache_storage_backend": "file"},
             {"enable_linker_mla_dedup": True},
@@ -100,6 +180,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
             fields = dict(
                 model_path="dummy",
                 enable_unified_cache_external_linker=True,
+                unified_cache_external_linker_backend="dynamic",
                 unified_cache_external_linker_config=_CONFIG,
             )
             fields.update(overrides)
@@ -121,6 +202,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
     def _create(self, **config):
         with get_context().override_server_args(
             enable_unified_cache_external_linker=True,
+            unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config={**_CONFIG, **config},
         ):
             return create_unified_cache_linker("args", "params", components={"full"})
@@ -154,7 +236,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
             with self.assertRaisesRegex(ImportError, "missing plugin dependency"):
                 self._create()
 
-    def test_builtins_keep_constructor_contract(self):
+    def test_builtin_selection_and_private_config(self):
         for backend, target in (
             (
                 "mooncake",
@@ -165,21 +247,101 @@ class TestExternalLinkerFactory(unittest.TestCase):
                 "sglang.srt.mem_cache.storage.umbp.umbp_direct_linker.UMBPDirectLinker",
             ),
         ):
-            with (
-                self.subTest(backend=backend),
-                get_context().override_server_args(
-                    unified_cache_external_linker_config=None,
-                    unified_cache_external_linker_backend=backend,
-                ),
-                patch(target) as constructor,
-            ):
-                result = create_unified_cache_linker(
-                    "args", "params", components={"full"}
+            # Even plugin-shaped config must not override the selected backend.
+            for config in (None, {}, {"backend_option": {"value": 1}}, _CONFIG):
+                with (
+                    self.subTest(backend=backend, config=config),
+                    get_context().override_server_args(
+                        unified_cache_external_linker_config=config,
+                        unified_cache_external_linker_backend=backend,
+                    ),
+                    patch(target) as constructor,
+                ):
+                    result = create_unified_cache_linker(
+                        "args", "params", components={"full"}
+                    )
+                    constructor.assert_called_once_with(
+                        "args", "params", components={"full"}, extra_config=config
+                    )
+                    self.assertIs(result, constructor.return_value)
+                    passed_config = constructor.call_args.kwargs["extra_config"]
+                    if config is not None:
+                        self.assertIsNot(passed_config, config)
+                    if config and "backend_option" in config:
+                        passed_config["backend_option"]["value"] = 2
+                        self.assertEqual(config["backend_option"]["value"], 1)
+
+    def test_dynamic_requires_config_in_worker(self):
+        with (
+            get_context().override_server_args(
+                unified_cache_external_linker_backend="dynamic",
+                unified_cache_external_linker_config=None,
+            ),
+            self.assertRaisesRegex(ValueError, "must be a JSON object"),
+        ):
+            create_unified_cache_linker("args", "params", components={"full"})
+
+
+class TestBuiltinLinkerConfig(unittest.TestCase):
+    def test_storage_receives_selected_config(self):
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((2, 8), dtype=torch.uint8)]],
+            layer_mapping={0: 0},
+            page_size=1,
+            rows_are_pages=False,
+        )
+        group = DevicePoolGroup([pool], num_layers=1, page_size=1)
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(),
+            page_size=1,
+        )
+        legacy = {"master_server_address": "legacy:50051"}
+        for backend, module_path in (
+            ("mooncake", "mooncake_store.mooncake_direct_linker"),
+            ("mori", "umbp.umbp_direct_linker"),
+        ):
+            module = importlib.import_module(
+                f"sglang.srt.mem_cache.storage.{module_path}"
+            )
+            for config in (None, {}, {"master_server_address": "selected:50051"}):
+                with (
+                    self.subTest(backend=backend, config=config),
+                    get_context().override_server_args(
+                        unified_cache_external_linker_backend=backend,
+                        unified_cache_external_linker_config=config,
+                        hicache_storage_backend_extra_config=json.dumps(legacy),
+                    ),
+                    patch.object(
+                        module, "resolve_hybrid_device_pool_group", return_value=group
+                    ),
+                    patch.object(
+                        module.torch.distributed, "is_initialized", return_value=False
+                    ),
+                    # Stop before opening a store or starting device work.
+                    patch.object(
+                        module,
+                        "HiCacheStorageConfig",
+                        side_effect=RuntimeError("storage boundary"),
+                    ) as storage_config,
+                    self.assertRaisesRegex(RuntimeError, "storage boundary"),
+                ):
+                    create_unified_cache_linker("args", params, components={"full"})
+                passed = storage_config.call_args.kwargs["extra_config"]
+                expected = legacy if config is None else config
+                self.assertEqual(
+                    passed.get("master_server_address"),
+                    expected.get("master_server_address"),
                 )
-                constructor.assert_called_once_with(
-                    "args", "params", components={"full"}
-                )
-                self.assertIs(result, constructor.return_value)
+                if backend == "mori":
+                    self.assertIs(passed["ssd_enabled"], False)
+                    self.assertNotIn("ssd_enabled", expected)
+                if config == {}:
+                    self.assertNotIn("master_server_address", passed)
 
 
 if __name__ == "__main__":

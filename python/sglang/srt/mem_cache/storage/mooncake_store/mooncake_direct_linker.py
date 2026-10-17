@@ -4,6 +4,7 @@ import hashlib
 import logging
 import threading
 from concurrent.futures import Future
+from copy import deepcopy
 from queue import Empty, Queue
 
 import torch
@@ -99,6 +100,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        extra_config=None,
         storage=None,
     ):
         self.page_size = params.page_size
@@ -120,9 +122,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
-        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        if extra_config is None:
+            extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+                get_memory().hicache_storage_backend_extra_config
+            )
+        extra_config = deepcopy(extra_config)
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,

@@ -26,7 +26,8 @@ def create_unified_cache_linker(
     components: set[ComponentType],
 ) -> UnifiedCacheLinker:
     memory = get_memory()
-    if memory.unified_cache_external_linker_config is not None:
+    backend = memory.unified_cache_external_linker_backend
+    if backend == "dynamic":
         config = UnifiedCacheLinkerConfig.from_dict(
             memory.unified_cache_external_linker_config
         )
@@ -56,7 +57,6 @@ def create_unified_cache_linker(
             extra_config=deepcopy(config.linker_extra_config),
         )
 
-    backend = memory.unified_cache_external_linker_backend
     if backend == "mooncake":
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
             MooncakeDirectLinker,
@@ -71,4 +71,9 @@ def create_unified_cache_linker(
         linker_cls = UMBPDirectLinker
     else:
         raise ValueError(f"Unknown unified cache external linker backend: {backend!r}")
-    return linker_cls(server_args, params, components=components)
+    return linker_cls(
+        server_args,
+        params,
+        components=components,
+        extra_config=deepcopy(memory.unified_cache_external_linker_config),
+    )
