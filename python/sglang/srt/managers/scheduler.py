@@ -1106,6 +1106,11 @@ class Scheduler(
         tic = time.perf_counter()
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
+        if self.enable_unified_memory:
+            # The first compaction move must not happen while serving with a
+            # full pool (see MultiEndedAllocator.prewarm_compaction); prewarm it
+            # before graph capture and KV sizing account for its memory.
+            self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
@@ -6010,7 +6015,7 @@ class Scheduler(
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
-        freeze_gc("Scheduler")
+        freeze_gc("Scheduler", recv_req.gc_threshold)
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
