@@ -560,14 +560,10 @@ class HiCacheController:
 
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
+            storage_backend, model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
+        # Rank-replicated caches have one writer per storage namespace.
+        self.backup_skip = not self.storage_config.is_storage_owner
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -700,6 +696,7 @@ class HiCacheController:
 
     def _generate_storage_config(
         self,
+        storage_backend: str,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
@@ -741,6 +738,19 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        use_shared_cp_storage = (
+            storage_backend == "file"
+            and is_compressed_mla_model
+            and bool(
+                getattr(
+                    self.mem_pool_device,
+                    "supports_hicache_shared_cp_storage",
+                    False,
+                )
+            )
+            and attn_cp_size > 1
+            and parallel.pp_size == 1
+        )
         model_name = storage_model_name(model_name, self.storage_host_pool)
 
         return HiCacheStorageConfig(
@@ -759,6 +769,7 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
+            use_shared_cp_storage=use_shared_cp_storage,
         )
 
     def reset(self):
