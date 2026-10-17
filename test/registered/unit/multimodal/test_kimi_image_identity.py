@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    MultiModalityDataPaddingPatternTokenPairs,
     embed_mm_inputs,
     get_new_expanded_mm_items,
 )
@@ -267,6 +268,21 @@ class TestKimiImageIdentity(CustomTestCase):
         self.assertEqual(padded[0], 0)
         self.assertEqual(padded[7], 2)
         self.assertEqual(item.padding_sequence(6), list(padded[1:7]))
+
+    def test_wide_pads_fill_token_pairs_without_mutating_input(self):
+        item = _image_item([1, 4, 4])
+        item.set_identity(kimi_image_identity("sha256:" + "cd" * 32, [1, 4, 4]))
+        mm_inputs = MultimodalInputs(mm_items=[item])
+        tokens = array("q", [0, 10, 9, 9, 9, 9, 9, 9, 11, 2])
+        original = tokens[:]
+        padded = MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens(
+            tokens, mm_inputs
+        )
+        self.assertEqual(list(padded[2:8]), item.padding_sequence(6))
+        self.assertEqual(list(padded[:2]), [0, 10])
+        self.assertEqual(list(padded[8:]), [11, 2])
+        self.assertEqual(mm_inputs.data_offsets, [1])
+        self.assertEqual(tokens, original)
 
     def test_wide_identity_survives_msgspec_roundtrip(self):
         item = MultimodalDataItem(modality=Modality.IMAGE)
