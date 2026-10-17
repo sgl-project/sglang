@@ -216,7 +216,14 @@ class DeltaSession:
         with self._lock:
             session.result = result
             session.state = "APPLIED"
-            return self.status()
+            receipt = self.status()
+            # Keep the paused IPC acknowledgement small; resume/status retain
+            # the full result, including preparation and application metrics.
+            receipt["result"] = {
+                "applied": result["applied"],
+                "target_version": result["target_version"],
+            }
+            return receipt
 
     @profiling.annotate("gpu_delta.scheduler.resume")
     def resume(self, resume: Callable[[int], None], keep_pause: bool = False) -> dict:

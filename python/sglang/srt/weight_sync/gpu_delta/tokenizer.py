@@ -32,6 +32,13 @@ class GpuDeltaTokenizerControl:
 
     async def request(self, obj):
         try:
+            self.manager.auto_create_handle_loop()
+            if get_serving().tokenizer_worker_num != 1:
+                return {
+                    "success": False,
+                    "message": "GPU delta requires one Python tokenizer worker",
+                    "participants": [],
+                }
             if isinstance(obj, UpdateWeightsFromGpuDeltaReqInput):
                 return await self._update(obj)
             if isinstance(obj, ClearGpuDeltaStateReqInput):
@@ -155,13 +162,6 @@ class GpuDeltaTokenizerControl:
         )
 
     async def _request(self, obj):
-        self.manager.auto_create_handle_loop()
-        if get_serving().tokenizer_worker_num != 1:
-            return {
-                "success": False,
-                "message": "GPU delta requires one Python tokenizer worker",
-                "participants": [],
-            }
         results = await self.communicator(obj)
         participants = [result.participant for result in results]
         success = all(result.success for result in results)

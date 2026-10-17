@@ -73,9 +73,19 @@ def reply(control, obj, state, rank=0):
     )
 
 
-def test_update_waits_for_every_rank_before_apply_and_resume(control, publication):
+def test_update_waits_for_every_rank_before_apply_and_resume(
+    control, publication, monkeypatch
+):
     async def run():
         facade, _, versions = control
+        setup_calls = []
+        facade.manager.auto_create_handle_loop = lambda: setup_calls.append("loop")
+
+        def serving():
+            setup_calls.append("workers")
+            return SimpleNamespace(tokenizer_worker_num=1)
+
+        monkeypatch.setattr(tokenizer, "get_serving", serving)
         sent = asyncio.Queue()
         facade.communicator._send = sent.put_nowait
         facade.communicator.set_fan_out(2)
@@ -108,6 +118,7 @@ def test_update_waits_for_every_rank_before_apply_and_resume(control, publicatio
         assert versions == ["7"] and sent.empty()
         assert [r["state"] for r in result["applied_participants"]] == ["APPLIED"] * 2
         assert [r["state"] for r in result["participants"]] == ["RESUMED"] * 2
+        assert setup_calls == ["loop", "workers"]
 
     asyncio.run(asyncio.wait_for(run(), timeout=2))
 
@@ -278,6 +289,20 @@ def test_update_preserves_receipts_options_and_failure_boundaries(
             )
 
     asyncio.run(run())
+
+
+def test_public_request_rejects_multiple_tokenizer_workers_before_dispatch(
+    control, publication, monkeypatch
+):
+    facade, sent, versions = control
+    monkeypatch.setattr(
+        tokenizer, "get_serving", lambda: SimpleNamespace(tokenizer_worker_num=2)
+    )
+    result = asyncio.run(
+        facade.request(io.UpdateWeightsFromGpuDeltaReqInput(**publication))
+    )
+    assert not result["success"] and "one Python tokenizer worker" in result["message"]
+    assert sent == versions == [] and not facade.manager.is_pause
 
 
 @pytest.mark.parametrize("phase", ["prepare", "apply"])

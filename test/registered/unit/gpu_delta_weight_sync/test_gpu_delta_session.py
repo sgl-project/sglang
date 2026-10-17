@@ -33,7 +33,12 @@ class Payload:
         self.applications += 1
         if self.fail:
             raise RuntimeError("device verdict failed after a possible write")
-        return {"applied": True, "verification": "manifest-sha256-and-decoder-status"}
+        return {
+            "applied": True,
+            "target_version": self.target_version,
+            "verification": "manifest-sha256-and-decoder-status",
+            "timings": {"host_prepare_s": 0.25},
+        }
 
     def close(self):
         self.closed.set()
@@ -60,6 +65,7 @@ class Backend:
         assert self.ready.wait(5)
         if self.error:
             raise self.error
+        self.payload.target_version = args[2]["target_version"]
         return self.payload
 
 
@@ -261,8 +267,23 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
         now[0] = 20_000_000_000
 
     receipt = session.apply(fence, lambda: None, lambda: True)
+    assert receipt["state"] == "APPLIED"
+    assert receipt["identity"] == session.identity
+    assert receipt["result"] == {"applied": True, "target_version": 1}
+    full_result = session.status()["result"]
+    assert full_result["timings"] == {"host_prepare_s": 0.25}
     now[0] = 60_000_000_000
     resumed = session.resume(lambda _: None)
+    assert resumed["result"] == full_result
+    assert {
+        k: v
+        for k, v in receipt.items()
+        if k not in {"state", "result", "scheduler_timing"}
+    } == {
+        k: v
+        for k, v in resumed.items()
+        if k not in {"state", "result", "scheduler_timing"}
+    }
     assert resumed["scheduler_timing"] == {
         "clock": "monotonic_ns",
         "pause_started_ns": 10_000_000_000,
@@ -524,7 +545,11 @@ def test_update_owns_pause_fence_retract_and_resume_order(
 
     def apply():
         events.append("apply")
-        return {"applied": True}
+        return {
+            "applied": True,
+            "target_version": 1,
+            "timings": {"host_prepare_s": 0.25},
+        }
 
     def resume(obj):
         assert not obj.torch_empty_cache
@@ -578,12 +603,15 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         assert result.rid == "apply-rid" and scheduler._engine_paused
         expected = ["fence", "retract"] + (["flush"] if flush_cache else []) + ["apply"]
         assert result.success and events == expected
+        assert result.participant["generation_paused"]
+        assert result.participant["result"] == {"applied": True, "target_version": 1}
         result = wrapped(
             delta_io.ResumeGpuDeltaReqInput(
                 session_id="p", keep_pause=keep_pause, weight_version=weight_version
             )
         )
         assert result.success and result.participant["state"] == "RESUMED"
+        assert result.participant["result"]["timings"] == {"host_prepare_s": 0.25}
         expected += [("version", "1" if weight_version is None else weight_version)] + (
             [] if keep_pause else ["resume"]
         )

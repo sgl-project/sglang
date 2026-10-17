@@ -65,7 +65,7 @@ endpoints are an internal interface to Miles:
 | Endpoint | Purpose |
 | --- | --- |
 | `get_gpu_delta_info` | Admit the receiver and return its canonical plan, original participants and version. |
-| `update_weights_from_gpu_delta` | Prepare, apply and resume one publication, returning both phase receipts and server timings. |
+| `update_weights_from_gpu_delta` | Prepare, apply and resume one publication, returning compact APPLIED acknowledgements, full RESUMED receipts and server timings. |
 | `get_gpu_delta_status` | Inspect the identified session without repeating its update. |
 | `clear_gpu_delta_state` | Release retained delta resources while preserving weights and committed version. |
 
@@ -116,7 +116,9 @@ checkpoint. Miles negotiates its new participants and submits the base-relative
 publication through the same update endpoint. The publication path must be visible
 to all ranks. Delta resources are retained by default (`release_state=false`);
 `release_state=true` clears them after successful activation while retaining the
-APPLIED/RESUMED receipts in the response.
+APPLIED/RESUMED receipts in the response. Explicit `clear_gpu_delta_state` remains
+available independently. Cleanup uses the same all-rank close/cache-release barriers
+and is excluded from the returned activation phase timings.
 
 ## Payload and cache contracts
 
@@ -225,8 +227,12 @@ SHA authentication. Exact file extent/identity, path containment, Zstd output
 length and native decode checks still apply.
 
 CPU timings, bytes and counters remain available for W&B independently of NVTX.
-Receipts contain no diagnostic CUDA timing events. Host spans are nested and worker
-sums overlap; do not add them or infer device bandwidth from host durations.
+The paused APPLIED acknowledgement retains identity, publication provenance, state,
+scheduler timing and `result.applied`/`result.target_version`. Full metrics stay in
+the session and are returned by RESUMED and status, avoiding their serialization
+before the all-rank apply barrier. Receipts contain no diagnostic CUDA timing
+events. Host spans are nested and worker sums overlap; do not add them or infer
+device bandwidth from host durations.
 
 | Receipt fields | Interpretation |
 | --- | --- |
