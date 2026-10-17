@@ -7,6 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple, Union
 
 import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
 
@@ -401,6 +402,7 @@ class RustMmProcessor:
         running request's inter-token latency."""
         import msgspec
         import torch
+
         from sglang.srt.managers.schedule_batch import (
             MultimodalProcessorOutput,
         )
@@ -448,6 +450,7 @@ class RustMmProcessor:
     def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
         import numpy as np
         import torch
+
         from sglang.srt.managers.mm_utils import ShmPointerMMData
         from sglang.srt.managers.schedule_batch import MultimodalDataItem
 

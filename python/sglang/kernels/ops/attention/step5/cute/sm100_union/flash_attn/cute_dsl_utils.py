@@ -1,12 +1,12 @@
 # Copyright (c) 2025, Tri Dao.
 
-import os
 import itertools
+import os
 import pathlib
 import shutil
-from typing import Tuple
-from functools import partial, lru_cache
 from dataclasses import dataclass, fields
+from functools import lru_cache, partial
+from typing import Tuple
 
 import torch
 
@@ -19,7 +19,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
-
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -39,7 +38,9 @@ torch2cute_dtype_map = {
 
 @lru_cache
 def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(
+        cluster_size=cluster_size
+    )
 
 
 @lru_cache
@@ -61,12 +62,18 @@ class ParamsBase:
 
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
+        constexpr_fields = {
+            n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)
+        }
         non_constexpr_fields = {
             n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
         }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
+        for (name, field), n_items in zip(
+            non_constexpr_fields.items(), self._values_pos
+        ):
+            non_constexpr_fields[name] = cutlass.new_from_mlir_values(
+                field, values[:n_items]
+            )
             values = values[n_items:]
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
@@ -97,12 +104,18 @@ class ArgumentsBase(JitArgument):
 
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
+        constexpr_fields = {
+            n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)
+        }
         non_constexpr_fields = {
             n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
         }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
+        for (name, field), n_items in zip(
+            non_constexpr_fields.items(), self._values_pos
+        ):
+            non_constexpr_fields[name] = cutlass.new_from_mlir_values(
+                field, values[:n_items]
+            )
             values = values[n_items:]
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
@@ -139,7 +152,9 @@ def cute_compile_patched(*args, **kwargs):
         output = cute_compile_og(*args, **kwargs)
     finally:
         if cubin_path is not None:
-            cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
+            cutlass.base_dsl.runtime.cuda.load_cubin_module_data = (
+                load_cubin_module_data_og
+            )
             cutlass.base_dsl.runtime.cuda.load_cubin_module = load_cubin_module_og
     if cubin_path is not None:
         if pathlib.Path(cubin_path).exists() and extract is not None:

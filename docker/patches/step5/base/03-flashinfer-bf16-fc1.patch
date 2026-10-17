@@ -1,26 +1,26 @@
 --- a/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
 +++ b/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
 @@ -109,7 +109,8 @@
- 
+
  template <typename KernelParams>
  __global__ void activationKernel(KernelParams params) {
 -  using Type = typename KernelParams::Type;
 +  using TypeIn = typename KernelParams::TypeIn;
 +  using TypeOut = typename KernelParams::TypeOut;
- 
+
  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
    // immediately trigger the secondary kernel when using PDL, then wait on primary
 @@ -135,7 +136,7 @@
          float x1 = (float)params.inPtr[baseIdx];
          float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
- 
+
 -        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
 +        TypeOut out = (TypeOut)gatedSilu(params, permutedIdx, x1, x2);
- 
+
          int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
          params.outPtr[outIdx] = out;
 @@ -247,7 +248,8 @@
- 
+
  template <typename KernelParams>
  __global__ void activationDeepSeekKernel(KernelParams params) {
 -  using Type = typename KernelParams::Type;
@@ -32,7 +32,7 @@
 @@ -321,8 +323,11 @@
                (int64_t)permutedIdx +
                (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
- 
+
 -          scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
 -          scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
 +          // In explicit BF16 FC1 mode inDqSfsPtr is nullptr: read BF16 directly (scale 1).
@@ -53,9 +53,9 @@
        }
      }
 @@ -425,8 +430,15 @@
- 
+
      const dim3 grid(gridSizeX, gridSizeY, data.topK);
- 
+
 -    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
 -                      DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
 +    if (data.mUseBf16Input) {
@@ -83,7 +83,7 @@
            int const expandedIdx = tokenIdx * params.topK + k;
            int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
 +          if (permutedIdx < 0) continue;
- 
+
            int const idx_in = tokenIdx + params.numTokens * scaleIdx;
            int const idx_out = permutedIdx + params.totalNumPaddedTokens[0] * scaleIdx;
 --- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
@@ -151,7 +151,7 @@
                                           workspace.total_max_padded_tokens},
                                          dl_float32, hidden_states.device());
 @@ -4290,7 +4312,13 @@
- 
+
      workspace.hidden_states_scale_linear = nullptr;
      workspace.gemm1_output = gemm1_output.data_ptr();
 -    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
@@ -171,7 +171,7 @@
    bool diag_return_activation_{false};
 +  Tensor permuted_hidden_states;
 +  Tensor permuted_hidden_states_scale;
- 
+
   public:
    // Override to handle pre-computed routing.
 @@ -4493,7 +4523,11 @@
@@ -218,7 +218,7 @@
 +            false /* usePerChannelScalingGemm1 */, false /* usePerChannelScalingGemm2 */,
 +            fc1_output_dtype == 1);
        }
- 
+
        auto cfgs = moe_runner->getValidConfigIndices(
 @@ -5644,7 +5684,8 @@
      int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
@@ -251,7 +251,7 @@
      set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
      args->silu_clamp_mode = silu_clamp_mode;
 +    args->fc1_output_dtype = fc1_output_dtype;
- 
+
      // Create and initialize launcher for this tile size
      auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
 @@ -6156,7 +6207,7 @@
@@ -354,7 +354,7 @@
               usePerTokenScalingGemm1, usePerTokenScalingGemm2, usePerChannelScalingGemm1,
 -             usePerChannelScalingGemm2) {}
 +             usePerChannelScalingGemm2, fc1OutputBf16) {}
- 
+
  void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                          bool const enablePdl, moe::dev::convertsf::Data& convertSfData,
 @@ -519,6 +524,7 @@
@@ -362,7 +362,7 @@
    activationData.tileTokensDim = workspace.ProjUpTileN;
    activationData.siluClampMode = args.silu_clamp_mode;
 +  activationData.mUseBf16Input = args.fc1_output_dtype == 1;
- 
+
    // Setup finalize data
    if (args.do_finalize) {
 @@ -702,8 +708,30 @@
@@ -402,7 +402,7 @@
 @@ -102,16 +102,31 @@
      FLASHINFER_WARN("Unsupported numTokensPerCta");                                                \
    }
- 
+
 +#define LAUNCH_ACTIVATION_TYPED(data, typeIn, typeOut, numTokensPerCta, kernel, numBlocks,   \
 +                                      numThreads, smemSize, stream)                               \
 +  if (numTokensPerCta == 4) {                                                                     \
@@ -456,25 +456,25 @@
 +  using TypeOut = TypeOut_;
    static constexpr int32_t NumTokensPerCta = NumTokensPerCta_;
    static constexpr bool UsePdl = UsePdl_;
- 
+
 -  Type const* inPtr;
 -  Type* outPtr;
 +  TypeIn const* inPtr;
 +  TypeOut* outPtr;
- 
+
    float* inDqSfsPtr = nullptr;
    float* outDqSfsPtr = nullptr;
 @@ -223,8 +242,8 @@
    static KernelParams setKernelParams(Data const& data) {
      KernelParams params;
- 
+
 -    params.inPtr = (Type*)data.inPtr;
 -    params.outPtr = (Type*)data.outPtr;
 +    params.inPtr = (TypeIn*)data.inPtr;
 +    params.outPtr = (TypeOut*)data.outPtr;
      params.inDqSfsPtr = data.inDqSfsPtr;
      params.outDqSfsPtr = data.outDqSfsPtr;
- 
+
 --- a/data/include/flashinfer/trtllm/fused_moe/runner.h
 +++ b/data/include/flashinfer/trtllm/fused_moe/runner.h
 @@ -337,6 +337,9 @@
@@ -485,7 +485,7 @@
 +  // uses the NoRoute dsFp8 cubins with a pre-permuted activation input).
 +  int64_t fc1_output_dtype{0};
    float* gemm2_bias = nullptr;
- 
+
    ActivationType activation_type = ActivationType::Swiglu;
 @@ -469,12 +472,13 @@
           bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weight_layout,
@@ -500,7 +500,7 @@
 -         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
 +         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false,
 +         bool fc1OutputBf16 = false);
- 
+
    void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
             cudaStream_t stream, int64_t configIndex, bool enable_pdl);
 --- a/fused_moe/backends/trtllm/sm100_runner.py
@@ -527,7 +527,7 @@
              bool(self.use_per_token_scaling),
 +            int(self.fc1_output_dtype),
          )
- 
+
      def _make_tuning_config(
 @@ -226,6 +229,7 @@
              self.use_per_token_scaling,
@@ -568,7 +568,7 @@
              diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
          )
 +        _check_fc1_output_dtype_int(fc1_output_dtype, fp8_quantization_type, activation_type)
- 
+
          moe_runner = TrtllmMoERunner(
              moe_op,
 @@ -3137,6 +3139,7 @@
@@ -577,7 +577,7 @@
              num_fused_shared_experts=num_fused_shared_experts,
 +            fc1_output_dtype=fc1_output_dtype,
          )
- 
+
          moe_inputs = MoeRunnerInputs(
 @@ -3188,6 +3191,7 @@
              "silu_clamp_mode": silu_clamp_mode,
@@ -657,8 +657,8 @@
 +                "fc1_output_dtype=1 (BF16 FC1) is only supported for activation_type=Swiglu, "
 +                f"got activation_type={activation_type}."
 +            )
- 
- 
+
+
  @flashinfer_api(trace=trtllm_bf16_moe_trace)
 @@ -5832,6 +5888,7 @@
      silu_clamp_mode: Optional[str] = None,
@@ -667,7 +667,7 @@
 +    fc1_output_dtype: Optional[str] = None,
  ) -> Union[List[torch.Tensor], torch.Tensor]:
      r"""FP8 block-scaled MoE operation.
- 
+
 @@ -6013,6 +6070,9 @@
      _normalize_diag_return(
          diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
@@ -684,7 +684,7 @@
          diag_return_activation,
 +        fc1_output_dtype_int,
      )
- 
+
      if do_finalize:
 @@ -6103,6 +6164,7 @@
      silu_clamp_mode: Optional[str] = None,
@@ -693,7 +693,7 @@
 +    fc1_output_dtype: Optional[str] = None,
  ) -> Union[List[torch.Tensor], torch.Tensor]:
      r"""Pre-routed FP8 block-scaled MoE operation.
- 
+
 @@ -6269,6 +6331,9 @@
      _normalize_diag_return(
          diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
@@ -702,7 +702,7 @@
 +        fc1_output_dtype, fp8_quantization_type, activation_type
 +    )
      topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
- 
+
      result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
 @@ -6314,6 +6379,7 @@
          silu_clamp_mode_int,
@@ -710,5 +710,5 @@
          diag_return_activation,
 +        fc1_output_dtype_int,
      )
- 
+
      if do_finalize and gemm1_lora_delta is None:

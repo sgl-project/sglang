@@ -103,7 +103,7 @@ void atomicadd_f32_with_policy_and_pred(void* global_addr, const float &data, in
         "setp.eq.u32 p, %3, 1;\n\t"
         "@p red.relaxed.gpu.global.add.L2::cache_hint.f32 [%1], %0, %2; \n\t"
         "}"
-        : 
+        :
         : "f"(data),
           "l"((int64_t)global_addr), "l"(cache_policy), "r"(pred)
     );
@@ -156,5 +156,5 @@ void trap() {
             : "l"(global_addr), "l"(src_as_uint64_ptr[0]), "l"(src_as_uint64_ptr[1]) \
         ); \
     }
-    
+
 }

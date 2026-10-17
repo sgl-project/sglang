@@ -682,10 +682,7 @@ mod python {
                 PyImageSource::Bytes(b) => crate::driver::ImageSource::Bytes(b),
             })
             .collect();
-        let input = crate::driver::MmInput {
-            input_ids,
-            images,
-        };
+        let input = crate::driver::MmInput { input_ids, images };
         let packed = py
             .detach(move || {
                 let proc = Step3VlProcessor::from_spec_json(&spec_json)?;

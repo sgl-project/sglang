@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import msgspec
 import torch
+
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,

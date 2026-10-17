@@ -233,7 +233,10 @@ class _FakeStep5VL:
     def named_parameters(self, remove_duplicate=True):
         return [
             *self.vision.items(),
-            *(("language_model." + n, p) for n, p in self.language_model.params.items()),
+            *(
+                ("language_model." + n, p)
+                for n, p in self.language_model.params.items()
+            ),
         ]
 
     def load_weights(self, weights):

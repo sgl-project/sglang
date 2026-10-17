@@ -47,7 +47,7 @@
 @@ -1258,6 +1258,13 @@
      return weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
    }
- 
+
 +  bool uses_fp32_logits_routing() const {
 +    return static_cast<RoutingMethodType>(routing_method_type) ==
 +           RoutingMethodType::SigmoidBiasOrderedRenorm;
@@ -59,7 +59,7 @@
      return routing_input_mode_ == RoutingInputMode::UnpackedPrecomputed;
    }
 @@ -1398,6 +1405,16 @@
- 
+
      if (routing_bias.has_value()) {
        check_routing_bias_shape();
 +    }
@@ -74,11 +74,11 @@
 +          << "SigmoidBiasOrderedRenorm routing only supports num_experts <= 384.";
      }
    }
- 
+
 @@ -4020,7 +4037,13 @@
                                    gemm1_bias_type, norm_topk_prob);
    }
- 
+
 +  bool supports_fp32_logits_routing() const override { return true; }
 +
    void check_routing() const override {
@@ -90,7 +90,7 @@
        TVM_FFI_ICHECK_EQ(expert_indices.ndim(), 2) << "expert_indices must be 2D.";
        TVM_FFI_ICHECK_EQ(expert_indices.size(0), hidden_states.size(0))
 @@ -4131,12 +4154,23 @@
- 
+
      bool has_precomputed_weights = has_precomputed(expert_weights);
      if (!has_precomputed_weights) {
 -      // Allocate the routing-output buffer as bf16 to match the kernel's output
@@ -124,7 +124,7 @@
 @@ -253,6 +253,57 @@
    }
  };
- 
+
 +static __device__ inline float sigmoid_precise(float x) {
 +  float const e = expf(-fabsf(x));
 +  float const r = 1.0f / (1.0f + e);
@@ -182,7 +182,7 @@
 @@ -529,6 +580,95 @@
    }
  };
- 
+
 +struct ScaledOrderedSumNormalizePostprocess {
 +  static constexpr bool kSupportsBlockPerToken = true;
 +  static constexpr bool kSupportsLaneOwnedTopK = true;
@@ -285,7 +285,7 @@
 +struct PolicyTraits<SigmoidBiasPrecisePreprocess, ScaledOrderedSumNormalizePostprocess> {
 +  using Pairs = TierList<Tier<128, 8>, Tier<256, 8>, Tier<384, 8>>;
  };
- 
+
  /// None + Sigmoid (TopKSigmoid: TopK -> Sigmoid).
 @@ -1042,7 +1187,11 @@
  // string for diagnostics.
@@ -308,7 +308,7 @@
    SigmoidBias,  // Apply sigmoid(score) + bias for topK selection (DeepSeek-style)
 +  SigmoidBiasPrecise,
  };
- 
+
  enum class RoutingPostprocessType {
 @@ -383,6 +384,7 @@
    Sigmoid,             // Apply sigmoid on top-K scores (selection ranks the raw logits)
@@ -316,7 +316,7 @@
    ScaledSumNormalize,  // Recover sigmoid scores, normalize by sum and scale (DeepSeek-style)
 +  ScaledOrderedSumNormalize,
  };
- 
+
  ////////////////////////////////////////////////////////////////////////////////////////////////////
 --- a/data/include/flashinfer/trtllm/fused_moe/runner.h
 +++ b/data/include/flashinfer/trtllm/fused_moe/runner.h
@@ -326,5 +326,5 @@
    Unspecified = 10,
 +  SigmoidBiasOrderedRenorm = 11,
  };
- 
+
  inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,

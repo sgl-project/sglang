@@ -1928,7 +1928,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.scheduler = SimpleNamespace(
                 kv_checksum_computer=None,
-                    disagg_decode_prealloc_queue=SimpleNamespace(aux_states=[]),
+                disagg_decode_prealloc_queue=SimpleNamespace(aux_states=[]),
                 batch_result_processor=SimpleNamespace(
                     _maybe_update_reasoning_tokens=lambda req, token_id: None
                 ),

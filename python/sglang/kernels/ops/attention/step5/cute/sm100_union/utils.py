@@ -1,19 +1,19 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-import operator
 import inspect
 import math
+import operator
 from typing import Callable, Optional, Tuple, Type, Union
-import torch
+
 import cutlass
 import cutlass.cute as cute
-
-from cutlass import Float16, Float32, Int32, Int16, Int64, Uint8, Uint32
-from cutlass.base_dsl.typing import Int128
-from cutlass.cutlass_dsl import T, dsl_user_op
+import torch
+from cutlass import Float16, Float32, Int16, Int32, Int64, Uint8, Uint32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass.base_dsl.typing import Int128
 from cutlass.cute.runtime import from_dlpack as cute_from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 from torch import Tensor
 
 _FLOAT8_ELEMENT_MAP = {}
@@ -51,7 +51,9 @@ def normalize_group_quant_scale_format(
         return aliases[normalized]
     except KeyError as err:
         supported = ", ".join(sorted(set(aliases.values())))
-        raise ValueError(f"Unsupported scale_format={scale_format!r}; expected one of {supported}.") from err
+        raise ValueError(
+            f"Unsupported scale_format={scale_format!r}; expected one of {supported}."
+        ) from err
 
 
 def group_quant_scale_format_code(scale_format: str) -> int:
@@ -65,7 +67,9 @@ def group_quant_scale_format_code(scale_format: str) -> int:
 
 
 def _tma_aligned_size(x: int, element_size: int) -> int:
-    return ((x + (16 // element_size) - 1) // (16 // element_size)) * (16 // element_size)
+    return ((x + (16 // element_size) - 1) // (16 // element_size)) * (
+        16 // element_size
+    )
 
 
 def make_group_quant_packed_ue8m0_scale_tensor(
@@ -90,7 +94,9 @@ def make_group_quant_packed_ue8m0_scale_tensor(
             device=device,
             dtype=torch.uint8,
         )
-        scales = storage.view(torch.int32).reshape(packed_groups, aligned_rows).mT[:rows, :]
+        scales = (
+            storage.view(torch.int32).reshape(packed_groups, aligned_rows).mT[:rows, :]
+        )
         return scales, storage, 2
 
     raise ValueError(f"Unsupported packed UE8M0 scale_format={scale_format!r}.")
@@ -152,8 +158,8 @@ def _mark_compact_dynamic(
     leading_dim: int,
     divisibility: int = 1,
 ) -> cute.Tensor:
-    use_inferred_stride_order = (
-        raw_x.ndim == 2 and ((raw_x.stride(0) == 1) ^ (raw_x.stride(1) == 1))
+    use_inferred_stride_order = raw_x.ndim == 2 and (
+        (raw_x.stride(0) == 1) ^ (raw_x.stride(1) == 1)
     )
     try:
         if use_inferred_stride_order:
@@ -308,13 +314,18 @@ def shuffle_sync(
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
-        val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+        val_i32[i] = cute.arch.shuffle_sync(
+            val_i32[i], offset, mask_and_clamp=mask_and_clamp
+        )
     return val[0]
 
 
 @cute.jit
 def block_reduce(
-    val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0
+    val: cute.Numeric,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    init_val: cute.Numeric = 0.0,
 ) -> cute.Numeric:
     """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)"""
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
@@ -330,14 +341,14 @@ def block_reduce(
 
 
 @dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+def elem_pointer(
+    x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None
+) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
 @dsl_user_op
-def load_int64(
-    tensor: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None
-) -> Int64:
+def load_int64(tensor: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> Int64:
     ptr = elem_pointer(tensor, coord, loc=loc, ip=ip).align(8)
     int_ptr = cute.make_ptr(
         Int64,
@@ -404,14 +415,14 @@ def pack_int64x2_to_int128(
         ip=ip,
     )
     vec_i128 = vector.bitcast(T.vector(1, T.i(128)), vec_i64)
-    packed = vector.extract(vec_i128, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    packed = vector.extract(
+        vec_i128, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+    )
     return Int128(packed)
 
 
 @dsl_user_op
-def pack_uint8x2_to_int16(
-    val_lo: Uint8, val_hi: Uint8, *, loc=None, ip=None
-) -> Int16:
+def pack_uint8x2_to_int16(val_lo: Uint8, val_hi: Uint8, *, loc=None, ip=None) -> Int16:
     vec_u8 = vector.from_elements(
         T.vector(2, T.i8()),
         (
@@ -422,7 +433,9 @@ def pack_uint8x2_to_int16(
         ip=ip,
     )
     vec_i16 = vector.bitcast(T.vector(1, T.i16()), vec_u8)
-    packed = vector.extract(vec_i16, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    packed = vector.extract(
+        vec_i16, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+    )
     return Int16(packed)
 
 
@@ -435,7 +448,9 @@ def bitcast_f32_to_u32(v: Float32, *, loc=None, ip=None) -> Uint32:
         ip=ip,
     )
     vec_i32 = vector.bitcast(T.vector(1, T.i32()), vec_f32)
-    bits = vector.extract(vec_i32, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    bits = vector.extract(
+        vec_i32, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+    )
     return Uint32(bits)
 
 
@@ -448,7 +463,9 @@ def bitcast_u32_to_f32(v: Uint32, *, loc=None, ip=None) -> Float32:
         ip=ip,
     )
     vec_f32 = vector.bitcast(T.vector(1, T.f32()), vec_i32)
-    out = vector.extract(vec_f32, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    out = vector.extract(
+        vec_f32, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+    )
     return Float32(out)
 
 
@@ -468,7 +485,9 @@ def pack_int16x4_to_int64(
         ip=ip,
     )
     vec_i64 = vector.bitcast(T.vector(1, T.i64()), vec_i16)
-    packed = vector.extract(vec_i64, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    packed = vector.extract(
+        vec_i64, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+    )
     return Int64(packed)
 
 
@@ -628,7 +647,9 @@ def atomic_add_fp32(a: Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) ->
 
 
 @dsl_user_op
-def atomic_max_nonnegative_f32(a: Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+def atomic_max_nonnegative_f32(
+    a: Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> None:
     # Non-negative finite f32 values have the same ordering as their u32 bit patterns.
     llvm.inline_asm(
         None,
@@ -742,7 +763,9 @@ def block_or_cluster_reduce(
     if cutlass.const_expr(mbar_ptr is None):
         return block_reduce(val, op, reduction_buffer, init_val=init_val)
     else:
-        return cluster_reduce(val, op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val)
+        return cluster_reduce(
+            val, op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val
+        )
 
 
 @cute.jit
@@ -763,7 +786,9 @@ def row_reduce(
         val = x
     warp_op = {
         cute.ReductionOp.ADD: operator.add,
-        cute.ReductionOp.MAX: cute.arch.fmax if cutlass.const_expr(x.dtype == Float32) else max,
+        cute.ReductionOp.MAX: cute.arch.fmax
+        if cutlass.const_expr(x.dtype == Float32)
+        else max,
         cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
@@ -776,9 +801,9 @@ def row_reduce(
         hook_fn()
     if cutlass.const_expr(reduction_buffer is not None):
         warps_per_row, cluster_n = reduction_buffer.shape[1]
-        assert (
-            cluster_n == 1 or mbar_ptr is not None
-        ), "mbar_ptr must be provided for cluster reduction"
+        assert cluster_n == 1 or mbar_ptr is not None, (
+            "mbar_ptr must be provided for cluster reduction"
+        )
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
             val = block_or_cluster_reduce(
                 val, warp_op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val
@@ -815,13 +840,13 @@ def online_softmax_reduce(
         hook_fn()
     if cutlass.const_expr(reduction_buffer is not None):
         rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
-        assert (
-            cluster_n == 1 or mbar_ptr is not None
-        ), "mbar_ptr must be provided for cluster reduction"
+        assert cluster_n == 1 or mbar_ptr is not None, (
+            "mbar_ptr must be provided for cluster reduction"
+        )
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-            assert (
-                reduction_buffer.element_type == cutlass.Int64
-            ), "reduction_buffer must be of type cute.Int64"
+            assert reduction_buffer.element_type == cutlass.Int64, (
+                "reduction_buffer must be of type cute.Int64"
+            )
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
             row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
             if cutlass.const_expr(mbar_ptr is None):
@@ -831,7 +856,9 @@ def online_softmax_reduce(
                 max_x_single_warp = -Float32.inf
                 sum_exp_x = 0.0
                 if lane_idx < warps_per_row:
-                    max_x_single_warp, sum_exp_x = i64_to_f32x2(reduction_buffer[row_idx, lane_idx])
+                    max_x_single_warp, sum_exp_x = i64_to_f32x2(
+                        reduction_buffer[row_idx, lane_idx]
+                    )
                 max_x_final = warp_reduce(max_x_single_warp, cute.arch.fmax)
                 sum_exp_x *= exp2f((max_x_single_warp - max_x_final) * log2_e)
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
@@ -845,16 +872,23 @@ def online_softmax_reduce(
                         num_warps = rows_per_block * warps_per_row
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             mbar_ptr,
-                            num_warps * cluster_n * reduction_buffer.element_type.width // 8,
+                            num_warps
+                            * cluster_n
+                            * reduction_buffer.element_type.width
+                            // 8,
                         )
                 if lane_idx < cluster_n:
                     store_shared_remote(
                         f32x2_to_i64(max_x, sum_exp_x),
-                        elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+                        elem_pointer(
+                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))
+                        ),
                         mbar_ptr,
                         peer_cta_rank_in_cluster=lane_idx,
                     )
-                cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr, phase=phase if phase is not None else 0
+                )
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
                 max_x_single_warp = cute.make_fragment(num_iter, Float32)
                 max_x_single_warp.fill(-Float32.inf)
@@ -883,7 +917,9 @@ def online_softmax_reduce(
 
 
 @dsl_user_op
-def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
+def fmin(
+    a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None
+) -> Float32:
     a_ir = Float32(a).ir_value(loc=loc, ip=ip)
     b_ir = Float32(b).ir_value(loc=loc, ip=ip)
     positional_params = tuple(
@@ -1028,7 +1064,9 @@ def prmt(a: int | Int32, b: int | Int32, c: int | Int32, *, loc=None, ip=None) -
 @cute.jit
 def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
     assert t.element_type.width == 16
-    assert cute.size(t.shape) % 4 == 0, "Tensor size must be a multiple of 4 for b16 permutation"
+    assert cute.size(t.shape) % 4 == 0, (
+        "Tensor size must be a multiple of 4 for b16 permutation"
+    )
     t_u32 = cute.recast_tensor(t, Int32)
 
     quad_idx = cute.arch.lane_idx() % 4
@@ -1052,8 +1090,12 @@ def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
         upper, lower = t_u32[i * 2 + 0], t_u32[i * 2 + 1]
         upper0 = upper if lane_03 else lower
         lower0 = lower if lane_03 else upper
-        upper0 = cute.arch.shuffle_sync(upper0, offset=upper_idx, mask_and_clamp=mask_and_clamp)
-        lower0 = cute.arch.shuffle_sync(lower0, offset=lower_idx, mask_and_clamp=mask_and_clamp)
+        upper0 = cute.arch.shuffle_sync(
+            upper0, offset=upper_idx, mask_and_clamp=mask_and_clamp
+        )
+        lower0 = cute.arch.shuffle_sync(
+            lower0, offset=lower_idx, mask_and_clamp=mask_and_clamp
+        )
         t_u32[i * 2 + 0] = prmt(upper0, lower0, selector_upper)
         t_u32[i * 2 + 1] = prmt(upper0, lower0, selector_lower)
 
@@ -1063,19 +1105,27 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
     tApA = cute.make_fragment(
         cute.make_layout(
-            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            (
+                cute.size(tAcA, mode=[0, 1]),
+                cute.size(tAcA, mode=[1]),
+                cute.size(tAcA, mode=[2]),
+            ),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
         ),
         cutlass.Boolean,
     )
     for rest_v in cutlass.range_constexpr(tApA.shape[0]):
         for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+            tApA[rest_v, 0, rest_k] = cute.elem_less(
+                tAcA[(0, rest_v), 0, rest_k][1], limit
+            )
     return tApA
 
 
 @cute.jit
-def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric) -> None:
+def fill_oob(
+    tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric
+) -> None:
     """Fill out-of-bounds values in shared memory tensor.
 
     Args:
@@ -1101,20 +1151,28 @@ def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
     )
     vec_i64x1 = vector.bitcast(T.vector(1, T.i64()), vec_f32x2)
     res = cutlass.Int64(
-        vector.extract(vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+        vector.extract(
+            vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+        )
     )
     return res
 
 
 @dsl_user_op
 def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
-    vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
+    vec_i64x1 = vector.from_elements(
+        T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip
+    )
     vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
     res0 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+        vector.extract(
+            vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+        )
     )
     res1 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
+        vector.extract(
+            vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip
+        )
     )
     return res0, res1
 
@@ -1125,7 +1183,10 @@ def cvt_fp32x2_to_e4m3x2(
 ) -> cutlass.Int16:
     packed = llvm.inline_asm(
         T.i16(),
-        [Float32(val_hi).ir_value(loc=loc, ip=ip), Float32(val_lo).ir_value(loc=loc, ip=ip)],
+        [
+            Float32(val_hi).ir_value(loc=loc, ip=ip),
+            Float32(val_lo).ir_value(loc=loc, ip=ip),
+        ],
         "cvt.rn.satfinite.e4m3x2.f32 $0, $1, $2;",
         "=h,f,f",
         has_side_effects=False,
@@ -1136,9 +1197,7 @@ def cvt_fp32x2_to_e4m3x2(
 
 
 @dsl_user_op
-def cvt_e4m3x2_to_f32x2(
-    packed: Int16, *, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
+def cvt_e4m3x2_to_f32x2(packed: Int16, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     packed_f16x2 = llvm.inline_asm(
         Int32.mlir_type,
         [Int16(packed).ir_value(loc=loc, ip=ip)],
@@ -1159,10 +1218,14 @@ def cvt_e4m3x2_to_f32x2(
         ip=ip,
     )
     val_lo_f16 = Float16(
-        vector.extract(vec_f16x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+        vector.extract(
+            vec_f16x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip
+        )
     )
     val_hi_f16 = Float16(
-        vector.extract(vec_f16x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
+        vector.extract(
+            vec_f16x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip
+        )
     )
     return Float32(val_lo_f16), Float32(val_hi_f16)
 
@@ -1183,12 +1246,14 @@ def store_fp8x2(
 
 
 @dsl_user_op
-def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+def domain_offset_i64(
+    coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
+) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(
-        flat_stride
-    ), "Coordinate and stride must have the same length"
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
@@ -1218,7 +1283,9 @@ def coord_offset_i64(
 
 
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(
+    val: cutlass.Int32, lane: Optional[cutlass.Int32] = None
+) -> cutlass.Int32:
     if cutlass.const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
@@ -1247,7 +1314,10 @@ def convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
             *acc_layout_col_major.shape[3:],
         ),
         stride=(
-            (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
+            (
+                acc_layout_col_major.stride[0][1],
+                acc_layout_col_major.stride[1],
+            ),  # MMA_M
             (
                 acc_layout_col_major.stride[0][0],
                 *acc_layout_col_major.stride[0][2:],
@@ -1295,7 +1365,9 @@ def sm90_get_smem_load_op(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(is_m_major, 4), elem_ty_c, loc=loc, ip=ip
         )
     else:
-        return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), elem_ty_c, loc=loc, ip=ip)
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), elem_ty_c, loc=loc, ip=ip
+        )
 
 
 torch2cute_dtype_map = {

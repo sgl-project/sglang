@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
+
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -17,7 +19,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 

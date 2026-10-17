@@ -1,12 +1,14 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-from typing import Tuple, Optional
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.seqlen_info import SeqlenInfoQK
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.seqlen_info import (
+    SeqlenInfoQK,
+)
 
 
 @dataclass(frozen=True)
@@ -30,12 +32,16 @@ class BlockInfo:
         num_splits: cutlass.Int32 = 1,
     ) -> Tuple[Int32, Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
-        if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
+        if const_expr(
+            self.is_causal or (self.is_local and self.window_size_right is not None)
+        ):
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
-            n_idx_right = n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
+            n_idx_right = (
+                n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
+            )
             n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
         n_block_min = 0
         if const_expr(self.is_local and self.window_size_left is not None):
@@ -49,25 +55,31 @@ class BlockInfo:
             if const_expr(self.split_kv_len is not None):
                 effective_n_blocks = n_block_max - n_block_min
                 n_blocks_per_split_target = cutlass.max(
-                    Int32(1), Int32((self.split_kv_len + self.tile_n - 1) // self.tile_n)
+                    Int32(1),
+                    Int32((self.split_kv_len + self.tile_n - 1) // self.tile_n),
                 )
                 actual_num_splits = cutlass.max(
                     Int32(1),
-                    cutlass.min(num_splits, effective_n_blocks // n_blocks_per_split_target),
+                    cutlass.min(
+                        num_splits, effective_n_blocks // n_blocks_per_split_target
+                    ),
                 )
             else:
                 actual_num_splits = num_splits
             num_n_blocks_per_split = (
                 cutlass.Int32(0)
                 if n_block_max <= n_block_min
-                else (n_block_max - n_block_min + actual_num_splits - 1) // actual_num_splits
+                else (n_block_max - n_block_min + actual_num_splits - 1)
+                // actual_num_splits
             )
             n_block_min = n_block_min + split_idx * num_n_blocks_per_split
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
 
     @cute.jit
-    def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
+    def get_m_block_min_max(
+        self, seqlen_info: SeqlenInfoQK, n_block: Int32
+    ) -> Tuple[Int32, Int32]:
         m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal):

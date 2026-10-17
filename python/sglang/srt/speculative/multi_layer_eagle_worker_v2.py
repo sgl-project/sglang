@@ -20,6 +20,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -98,7 +99,6 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.profile_utils import build_step_span_name
 

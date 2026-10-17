@@ -269,7 +269,6 @@ def get_processor(
     # Checkpoints with language_model_only=True are text-only despite their
     # multimodal-family config; route to tokenizer instead of the mm processor.
     if getattr(config, "language_model_only", False):
-
         return get_tokenizer(
             tokenizer_name,
             *args,

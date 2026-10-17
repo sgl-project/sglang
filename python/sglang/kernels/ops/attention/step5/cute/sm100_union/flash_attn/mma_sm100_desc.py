@@ -116,7 +116,9 @@ def to_C_format(cutlass_type) -> int:
         return CFormat.F32
     if cutlass_type is cutlass.Int32:
         return CFormat.S32
-    raise TypeError(f"Unsupported CUTLASS scalar type for accumulator: {cutlass_type!r}")
+    raise TypeError(
+        f"Unsupported CUTLASS scalar type for accumulator: {cutlass_type!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +187,12 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
         op.acc_dtype,
         op.shape_mnk[0],
         op.shape_mnk[1],
-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        Major.K
+        if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+        else Major.MN,
+        Major.K
+        if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
+        else Major.MN,
     )
 
 
@@ -229,7 +235,9 @@ def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
     raise ValueError("Unsupported swizzle triple for UMMA smem descriptor")
 
 
-def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major) -> int:
+def make_smem_desc_base(
+    layout: cute.Layout, swizzle: cute.Swizzle, major: Major
+) -> int:
     """
     Convert a 2-D *shared-memory* Cute layout into the Blackwell 64-bit
     smem-descriptor, without the smem start address.
@@ -253,16 +261,23 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
 
     if major is Major.MN:
         swizzle_atom_k_size = 4 if layout_type is LayoutType.SWIZZLE_128B_BASE32B else 8
-        canonical_layout = cute.logical_divide(layout, (swizzle_atom_mn_size, swizzle_atom_k_size))
+        canonical_layout = cute.logical_divide(
+            layout, (swizzle_atom_mn_size, swizzle_atom_k_size)
+        )
         if not cute.is_congruent(canonical_layout, ((1, 1), (1, 1))):
-            raise ValueError("Not a canonical UMMA_MN Layout: Expected profile failure.")
+            raise ValueError(
+                "Not a canonical UMMA_MN Layout: Expected profile failure."
+            )
         stride_00 = canonical_layout.stride[0][0]
         if layout_type is not LayoutType.SWIZZLE_NONE and stride_00 != 1:
             raise ValueError("Not a canonical UMMA_MN Layout: Expected stride failure.")
         stride_10 = canonical_layout.stride[1][0]
         if stride_10 != swizzle_atom_mn_size:
             raise ValueError("Not a canonical UMMA_MN Layout: Expected stride failure.")
-        stride_01, stride_11 = canonical_layout.stride[0][1], canonical_layout.stride[1][1]
+        stride_01, stride_11 = (
+            canonical_layout.stride[0][1],
+            canonical_layout.stride[1][1],
+        )
         if layout_type is LayoutType.SWIZZLE_NONE:
             stride_byte_offset, leading_byte_offset = stride_01, stride_11
         else:
@@ -271,7 +286,9 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
         if layout_type == LayoutType.SWIZZLE_128B_BASE32B:
             raise ValueError("SWIZZLE_128B_BASE32B is invalid for Major-K")
         if not cute.size(layout.shape[0]) % 8 == 0:
-            raise ValueError("Not a canonical UMMA_K Layout: Expected MN-size multiple of 8.")
+            raise ValueError(
+                "Not a canonical UMMA_K Layout: Expected MN-size multiple of 8."
+            )
         canonical_layout = cute.logical_divide(layout, (8, 2))
         if not cute.is_congruent(canonical_layout, ((1, 1), (1, 1))):
             raise ValueError("Not a canonical UMMA_K Layout: Expected profile failure.")

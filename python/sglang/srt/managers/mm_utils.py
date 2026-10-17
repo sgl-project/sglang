@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from torch import nn
+
 from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule
@@ -56,7 +58,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
-from torch import nn
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log

@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Set, Union
 
 import torch
+from transformers import PretrainedConfig
+from transformers.utils import cached_file
+
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
@@ -42,8 +45,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
-from transformers import PretrainedConfig
-from transformers.utils import cached_file
 
 logger = logging.getLogger(__name__)
 

@@ -8,9 +8,9 @@ which are skipped entirely. This is a temporary solution intended to be replaced
 by a more robust preprocessing kernel in the future.
 """
 
-from typing import Tuple, Optional, Callable, List, NamedTuple
-import torch
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
+import torch
 
 # placeholder
 Config = type("Config", (), {})
@@ -44,7 +44,9 @@ def _expand_sparsity_tensor(
     needs_expand = tensor.shape != expected_shape
     if not needs_expand:
         return tensor
-    can_expand = all(map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape))
+    can_expand = all(
+        map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape)
+    )
     if not can_expand:
         raise ValueError(
             f"{tensor_name} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
@@ -68,11 +70,17 @@ def _check_and_expand_block(
     if cnt.dtype != torch.int32 or idx.dtype != torch.int32:
         raise ValueError(f"{name}_block tensors must have dtype torch.int32")
     if cnt.device != idx.device:
-        raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
+        raise ValueError(
+            f"{name}_block_cnt and {name}_block_idx must be on the same device"
+        )
     if not cnt.is_cuda or not idx.is_cuda:
         raise ValueError(f"{name}_block tensors must live on CUDA")
-    expanded_cnt = _expand_sparsity_tensor(cnt, expected_count_shape, f"{name}_block_cnt")
-    expanded_idx = _expand_sparsity_tensor(idx, expected_index_shape, f"{name}_block_idx")
+    expanded_cnt = _expand_sparsity_tensor(
+        cnt, expected_count_shape, f"{name}_block_cnt"
+    )
+    expanded_idx = _expand_sparsity_tensor(
+        idx, expected_index_shape, f"{name}_block_idx"
+    )
     return expanded_cnt, expanded_idx
 
 
@@ -83,7 +91,9 @@ def normalize_block_sparse_tensors(
     expected_index_shape: Tuple[int, int, int, int],
 ) -> BlockSparseTensorsTorch:
     if tensors.mask_block_cnt is None or tensors.mask_block_idx is None:
-        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
+        raise ValueError(
+            "mask_block_cnt and mask_block_idx must be provided for block sparsity."
+        )
 
     mask_cnt, mask_idx = _check_and_expand_block(
         "mask",
@@ -93,7 +103,9 @@ def normalize_block_sparse_tensors(
         expected_index_shape,
     )
     if mask_cnt is None or mask_idx is None:
-        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
+        raise ValueError(
+            "mask_block_cnt and mask_block_idx must be provided for block sparsity."
+        )
 
     full_cnt, full_idx = _check_and_expand_block(
         "full",
@@ -117,7 +129,9 @@ def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
     return any(t is not None for t in (tensors.full_block_cnt, tensors.mask_block_cnt))
 
 
-def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[BlockSparseTensors]:
+def to_cute_block_sparse_tensors(
+    tensors: BlockSparseTensorsTorch,
+) -> Optional[BlockSparseTensors]:
     if not is_block_sparsity_enabled(tensors):
         return None
 
@@ -142,7 +156,10 @@ def compute_block_sparsity(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     aux_tensors: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[
-    Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
 ]:
     """
     Computes block sparsity tensors from a given masking function.
@@ -172,7 +189,9 @@ def compute_block_sparsity(
 
     if cu_seqlens_q is not None:
         # Handle variable-length sequences
-        return _compute_varlen_sparsity(config, mask_mod_flex, device, cu_seqlens_q, cu_seqlens_k)
+        return _compute_varlen_sparsity(
+            config, mask_mod_flex, device, cu_seqlens_q, cu_seqlens_k
+        )
     else:
         # Handle fixed-length sequences
         return _compute_sparsity(config, device, aux_tensors)
@@ -198,10 +217,14 @@ def _compute_sparsity(
         (config.batch_size, config.nheads, n_blocks_q), device=device, dtype=torch.int32
     )
     full_block_idx = torch.zeros(
-        (config.batch_size, config.nheads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+        (config.batch_size, config.nheads, n_blocks_q, n_blocks_k),
+        device=device,
+        dtype=torch.int32,
     )
     mask_block_idx = torch.zeros(
-        (config.batch_size, config.nheads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+        (config.batch_size, config.nheads, n_blocks_q, n_blocks_k),
+        device=device,
+        dtype=torch.int32,
     )
 
     # --- Identity Mask ---
@@ -237,11 +260,13 @@ def _compute_sparsity(
 
         q_starts = q_block_indices * config.tile_m
         q_ends = torch.minimum(
-            (q_block_indices + 1) * config.tile_m, torch.tensor(config.seqlen_q, device=device)
+            (q_block_indices + 1) * config.tile_m,
+            torch.tensor(config.seqlen_q, device=device),
         )
         k_starts = k_block_indices * config.tile_n
         k_ends = torch.minimum(
-            (k_block_indices + 1) * config.tile_n, torch.tensor(config.seqlen_k, device=device)
+            (k_block_indices + 1) * config.tile_n,
+            torch.tensor(config.seqlen_k, device=device),
         )
 
         # Expand dims for broadcasting: (n_blocks_q, 1) and (1, n_blocks_k)
@@ -277,10 +302,14 @@ def _compute_sparsity(
             partial_indices = k_block_indices[is_partial[q_block_idx]]
             if len(partial_indices) > 0:
                 mask_block_cnt[:, :, q_block_idx] = len(partial_indices)
-                mask_block_idx[:, :, q_block_idx, : len(partial_indices)] = partial_indices
+                mask_block_idx[:, :, q_block_idx, : len(partial_indices)] = (
+                    partial_indices
+                )
 
     elif config.mask_mod_name == "document":
-        raise NotImplementedError("Block sparsity for document masking not yet implemented")
+        raise NotImplementedError(
+            "Block sparsity for document masking not yet implemented"
+        )
 
     return full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx
 
@@ -316,10 +345,14 @@ def _compute_varlen_sparsity(
 
     # Pre-allocate padded output tensors
     full_block_cnt = torch.zeros(
-        (config.batch_size, config.nheads, max_m_blocks), device=device, dtype=torch.int32
+        (config.batch_size, config.nheads, max_m_blocks),
+        device=device,
+        dtype=torch.int32,
     )
     mask_block_cnt = torch.zeros(
-        (config.batch_size, config.nheads, max_m_blocks), device=device, dtype=torch.int32
+        (config.batch_size, config.nheads, max_m_blocks),
+        device=device,
+        dtype=torch.int32,
     )
     full_block_idx = torch.zeros(
         (config.batch_size, config.nheads, max_m_blocks, max_n_blocks),
@@ -369,7 +402,9 @@ def _compute_varlen_sparsity(
             _compute_causal_varlen_blocks(**common_args)
         elif config.mask_mod_name == "sliding_window":
             window_size = getattr(config, "window_size", 1024)
-            _compute_sliding_window_varlen_blocks(**common_args, window_size=window_size)
+            _compute_sliding_window_varlen_blocks(
+                **common_args, window_size=window_size
+            )
         elif config.mask_mod_name == "identity":
             _compute_identity_varlen_blocks(
                 full_block_cnt,
@@ -420,7 +455,8 @@ def _classify_varlen_block(
 
     is_full = is_full_fn(m_start_local, m_end_local, n_start_local, n_end_local)
     is_partial = (
-        is_partial_fn(m_start_local, m_end_local, n_start_local, n_end_local) and not is_full
+        is_partial_fn(m_start_local, m_end_local, n_start_local, n_end_local)
+        and not is_full
     )
 
     # Any block that touches the sequence boundary is partial because it requires masking.
@@ -448,8 +484,8 @@ def _compute_causal_varlen_blocks(
     **kwargs,
 ):
     """Computes causal block sparsity for a single varlen sequence."""
-    is_full_fn = lambda m_start, m_end, n_start, n_end: (m_start >= n_end - 1)
-    is_partial_fn = lambda m_start, m_end, n_start, n_end: (m_end - 1 >= n_start)
+    is_full_fn = lambda m_start, m_end, n_start, n_end: m_start >= n_end - 1
+    is_partial_fn = lambda m_start, m_end, n_start, n_end: m_end - 1 >= n_start
 
     for m_local in range(n_blocks_q):
         full_blocks, partial_blocks = [], []
@@ -504,11 +540,11 @@ def _compute_sliding_window_varlen_blocks(
     **kwargs,
 ):
     """Computes sliding window block sparsity for a single varlen sequence."""
-    is_full_fn = lambda m_start, m_end, n_start, n_end: (n_end - 1 <= m_start) and (
-        n_start >= m_start - window_size + 1
+    is_full_fn = lambda m_start, m_end, n_start, n_end: (
+        (n_end - 1 <= m_start) and (n_start >= m_start - window_size + 1)
     )
-    is_partial_fn = lambda m_start, m_end, n_start, n_end: not (
-        (n_start > m_end - 1) or (n_end - 1 < m_start - window_size + 1)
+    is_partial_fn = lambda m_start, m_end, n_start, n_end: (
+        not ((n_start > m_end - 1) or (n_end - 1 < m_start - window_size + 1))
     )
 
     for m_local in range(n_blocks_q):
@@ -556,7 +592,10 @@ def _compute_identity_varlen_blocks(
 ):
     """Computes identity (all-attend) block sparsity for a single varlen sequence."""
     n_blocks_global = torch.arange(
-        first_n_block_global, first_n_block_global + n_blocks_k, device=device, dtype=torch.int32
+        first_n_block_global,
+        first_n_block_global + n_blocks_k,
+        device=device,
+        dtype=torch.int32,
     )
     for m_local in range(n_blocks_q):
         full_block_cnt[seq_idx, :, m_local] = n_blocks_k
@@ -600,7 +639,10 @@ def _compute_generic_varlen_blocks(
                     (m_start_local, n_end_local - 1),
                     (m_end_local - 1, n_start_local),
                     (m_end_local - 1, n_end_local - 1),
-                    ((m_start_local + m_end_local) // 2, (n_start_local + n_end_local) // 2),
+                    (
+                        (m_start_local + m_end_local) // 2,
+                        (n_start_local + n_end_local) // 2,
+                    ),
                 ]
 
                 unmasked_count = sum(
@@ -610,18 +652,20 @@ def _compute_generic_varlen_blocks(
                 )
 
                 n_block_global = first_n_block_global + n_local
-                if unmasked_count == len(sample_positions):  # All samples unmasked -> full
+                if unmasked_count == len(
+                    sample_positions
+                ):  # All samples unmasked -> full
                     full_blocks.append(n_block_global)
                 elif unmasked_count > 0:  # Some unmasked -> partial
                     partial_blocks.append(n_block_global)
 
             if full_blocks:
                 full_block_cnt[seq_idx, h_q, m_local] = len(full_blocks)
-                full_block_idx[seq_idx, h_q, m_local, : len(full_blocks)] = torch.tensor(
-                    full_blocks, device=device
+                full_block_idx[seq_idx, h_q, m_local, : len(full_blocks)] = (
+                    torch.tensor(full_blocks, device=device)
                 )
             if partial_blocks:
                 mask_block_cnt[seq_idx, h_q, m_local] = len(partial_blocks)
-                mask_block_idx[seq_idx, h_q, m_local, : len(partial_blocks)] = torch.tensor(
-                    partial_blocks, device=device
+                mask_block_idx[seq_idx, h_q, m_local, : len(partial_blocks)] = (
+                    torch.tensor(partial_blocks, device=device)
                 )

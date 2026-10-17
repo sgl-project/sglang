@@ -1,15 +1,19 @@
-from typing import Type
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
+from typing import Type
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
+from cutlass.cute.nvgpu import cpasync
 
 from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import utils
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.fast_math import FastDivmod
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.cute_dsl_utils import ParamsBase
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.cute_dsl_utils import (
+    ParamsBase,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.fast_math import (
+    FastDivmod,
+)
 
 
 @dataclass
@@ -84,7 +88,9 @@ class PagedKVManager(ParamsBase):
             order=(1, 0),
         )
         val_layout = cute.make_layout((1, async_copy_elems))
-        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
+        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(
+            atom_async_copy, thr_layout, val_layout
+        )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
         page_entry_per_thread = n_block_size // num_threads
 
@@ -107,7 +113,9 @@ class PagedKVManager(ParamsBase):
         else:
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
-            tVpV = utils.predicate_k(tVcV, limit=mV_paged.shape[0 if v_gmem_transposed else 1])
+            tVpV = utils.predicate_k(
+                tVcV, limit=mV_paged.shape[0 if v_gmem_transposed else 1]
+            )
 
         return PagedKVManager(
             mPageTable,
@@ -148,11 +156,18 @@ class PagedKVManager(ParamsBase):
             )
             row_idx = n_block * self.n_block_size + row
 
-            page_idx, page_offset = self.page_size_divmod.divmod(row_idx + self.leftpad_k)
+            page_idx, page_offset = self.page_size_divmod.divmod(
+                row_idx + self.leftpad_k
+            )
 
             is_valid = (
-                (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
-            ) and row_idx < self.seqlen_k and page_idx < self.max_num_pages_per_seq
+                (
+                    (i + 1) * self.num_threads <= self.n_block_size
+                    or row < self.n_block_size
+                )
+                and row_idx < self.seqlen_k
+                and page_idx < self.max_num_pages_per_seq
+            )
             raw_page = self.mPageTable[page_idx] if is_valid else -1
             # Graph-capture dummy inputs may contain placeholder block-table
             # entries outside the allocated KV cache. Treat those rows as
@@ -189,7 +204,9 @@ class PagedKVManager(ParamsBase):
         )
 
         if const_expr(K_or_V == "V"):
-            sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
+            sX_pi = cute.make_tensor(
+                sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0])
+            )
         return sX_pi
 
     @cute.jit
@@ -205,7 +222,9 @@ class PagedKVManager(ParamsBase):
             ki = tXcX[0, 0, k][1] // self.async_copy_elems
             mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
             tXsX_k = tXsX[None, m, k]
-            mX_paged_cur_copy_ki = cute.make_tensor(mX_paged_cur_copy_ki.iterator, tXsX_k.layout)
+            mX_paged_cur_copy_ki = cute.make_tensor(
+                mX_paged_cur_copy_ki.iterator, tXsX_k.layout
+            )
             cute.copy(
                 self.gmem_tiled_copy_KV,
                 mX_paged_cur_copy_ki,
@@ -224,14 +243,20 @@ class PagedKVManager(ParamsBase):
         else:
             sX_pi = self._flatten_smem_sm100(sX, K_or_V)
 
-        head_dim = self.head_dim_v_padded if const_expr(K_or_V == "V") else self.head_dim_padded
+        head_dim = (
+            self.head_dim_v_padded
+            if const_expr(K_or_V == "V")
+            else self.head_dim_padded
+        )
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
         tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
 
         seqlenk_row_limit = (
-            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
+            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0]
+            if n_block >= 0
+            else 0
         )
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             page_is_valid = self.tPrPageValid[m // self.gmem_threads_per_row] != 0
@@ -245,8 +270,13 @@ class PagedKVManager(ParamsBase):
                 width=self.gmem_threads_per_row,
             )
             x_gmem_ptr = cute.make_ptr(
-                self.mK_paged.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+                self.mK_paged.element_type,
+                x_ptr_i64,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
             )
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
-            mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
+            mX_paged_cur_copy = cute.tiled_divide(
+                mX_paged_cur, (self.async_copy_elems,)
+            )
             self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)

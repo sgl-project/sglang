@@ -33,9 +33,9 @@
            absOutArr[tokenInCtaIdx] = fabsf(out);
          }
 @@ -393,6 +409,72 @@
- 
+
  ////////////////////////////////////////////////////////////////////////////////////////////////////
- 
+
 +// Step5 BF16 FC1: one warp owns one routed token's 128-element scale block.
 +// The route predicate is warp-uniform. No CTA-wide reduction or shared scale
 +// exchange is needed, so absent routes leave before all activation arithmetic.
@@ -106,9 +106,9 @@
    if (data.mDtypeElt == tg::Dtype::E2m1) {
      // Note: this should be unreachable because the options are checked beforehand.
 @@ -430,7 +512,17 @@
- 
+
      const dim3 grid(gridSizeX, gridSizeY, data.topK);
- 
+
 -    if (data.mUseBf16Input) {
 +    bool const useWarpActivation =
 +        data.mUseBf16Input && data.inDqSfsPtr == nullptr && (data.innerDim == 3072 || data.innerDim == 768) &&
@@ -125,9 +125,9 @@
        LAUNCH_ACTIVATION_TYPED(data, cutlass::bfloat16_t, cutlass::float_e4m3_t, numTokensPerCta,
                                activationDeepSeekKernel, grid,
 @@ -678,7 +770,116 @@
- 
+
  ////////////////////////////////////////////////////////////////////////////////////////////////////
- 
+
 +
 +template <typename KernelParams>
 +__global__ void permuteVectorKernel(KernelParams params) {

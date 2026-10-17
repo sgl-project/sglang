@@ -32,7 +32,7 @@
 @@ -3915,6 +3930,18 @@
    }
  };
- 
+
 +/** Clone one 2D launcher-owned buffer into an independent tensor on the given stream. */
 +static Tensor cloneLauncherTensor2D(Tensor const& src, cudaStream_t stream) {
 +  TVM_FFI_ICHECK_EQ(src.ndim(), 2) << "diagnostic clone expects a 2D tensor.";
@@ -58,7 +58,7 @@
 +    diag_return_fc1_ = fc1;
 +    diag_return_activation_ = activation;
 +  }
- 
+
    void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
              int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
 @@ -4387,6 +4420,8 @@
@@ -67,7 +67,7 @@
    Fp8QuantizationType quantization_type;
 +  bool diag_return_fc1_{false};
 +  bool diag_return_activation_{false};
- 
+
   public:
    // Override to handle pre-computed routing.
 @@ -4446,6 +4481,25 @@
@@ -124,7 +124,7 @@
                     norm_topk_prob);
      launcher->set_routing_replay_out(routing_replay_out);
 +    launcher->set_diag_return(diag_return_fc1, diag_return_activation);
- 
+
      launchers_map[curr_tile_N] = std::move(launcher);
    }
 --- a/fused_moe/backends/trtllm/sm100_runner.py
@@ -157,7 +157,7 @@
 +        _normalize_diag_return(
 +            diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
          )
- 
+
          moe_runner = TrtllmMoERunner(
 @@ -3181,6 +3186,8 @@
              "valid_hidden_size": valid_hidden_size,
@@ -217,8 +217,8 @@
 +            "diag_return_fc1/diag_return_activation are only supported for "
 +            f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
 +        )
- 
- 
+
+
  @flashinfer_api(trace=trtllm_bf16_moe_trace)
 @@ -5792,6 +5830,8 @@
      gemm1_bias: Optional[torch.Tensor] = None,
@@ -228,7 +228,7 @@
 +    diag_return_activation: bool = False,
  ) -> Union[List[torch.Tensor], torch.Tensor]:
      r"""FP8 block-scaled MoE operation.
- 
+
 @@ -5970,6 +6010,9 @@
      silu_clamp_mode_int = _normalize_silu_clamp_mode(
          silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
@@ -246,7 +246,7 @@
 +        diag_return_fc1,
 +        diag_return_activation,
      )
- 
+
      if do_finalize:
 @@ -6056,6 +6101,8 @@
      valid_hidden_size: Optional[int] = None,
@@ -256,7 +256,7 @@
 +    diag_return_activation: bool = False,
  ) -> Union[List[torch.Tensor], torch.Tensor]:
      r"""Pre-routed FP8 block-scaled MoE operation.
- 
+
 @@ -6219,6 +6266,9 @@
      silu_clamp_mode_int = _normalize_silu_clamp_mode(
          silu_clamp_mode, fp8_quantization_type, activation_type, gemm1_clamp_limit
@@ -265,7 +265,7 @@
 +        diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
 +    )
      topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
- 
+
      result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
 @@ -6262,6 +6312,8 @@
          valid_hidden_size,
@@ -274,7 +274,7 @@
 +        diag_return_fc1,
 +        diag_return_activation,
      )
- 
+
      if do_finalize and gemm1_lora_delta is None:
 --- a/fused_moe/shared/inputs.py
 +++ b/fused_moe/shared/inputs.py

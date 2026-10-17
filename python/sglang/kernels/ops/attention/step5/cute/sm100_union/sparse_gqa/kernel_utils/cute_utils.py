@@ -6,15 +6,19 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 import torch
-
 from cutlass import Float32, const_expr
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack as cute_from_dlpack
-from sglang.kernels.ops.attention.step5.cute.sm100_union.sparse_gqa.kernel_utils.fp_compat import fmax_f32
-from sglang.kernels.ops.attention.step5.cute.sm100_union.utils import torch2cute_dtype_map, warp_reduce
+from cutlass.cutlass_dsl import T, dsl_user_op
 
+from sglang.kernels.ops.attention.step5.cute.sm100_union.sparse_gqa.kernel_utils.fp_compat import (
+    fmax_f32,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.utils import (
+    torch2cute_dtype_map,
+    warp_reduce,
+)
 
 _SPARSE_GQA_METADATA_DTYPES = {
     torch.uint8: cutlass.Uint8,
@@ -71,7 +75,9 @@ def make_fake_tensor_like_with_dynamic_dim(
         else (() if dynamic_shape_dim is None else (int(dynamic_shape_dim),))
     )
     stride = [
-        cute.sym_int(divisibility=divisibility) if idx in dynamic_stride_dims else int(v)
+        cute.sym_int(divisibility=divisibility)
+        if idx in dynamic_stride_dims
+        else int(v)
         for idx, v in enumerate(tensor.stride())
     ]
     # Equivalent to the fork's descriptor shim, without mutating CUTLASS classes.
@@ -79,13 +85,18 @@ def make_fake_tensor_like_with_dynamic_dim(
         raise ValueError("Dynamic layout leading dimension must have stride 1")
     order = tensor.dim_order()
     from cutlass.cute.typing import SymInt
+
     for mode in shape_modes:
-        for dim in order[:order.index(mode)]:
+        for dim in order[: order.index(mode)]:
             if not isinstance(stride[dim], SymInt):
                 stride[dim] = cute.sym_int(divisibility=divisibility)
     return cute.runtime.make_fake_tensor(
-        _cutlass_dtype_from_torch_with_metadata(tensor.dtype) if dtype is None else dtype,
-        _shape_with_dynamic_dims(tensor.shape, dynamic_shape_dim, dynamic_shape_dims, divisibility),
+        _cutlass_dtype_from_torch_with_metadata(tensor.dtype)
+        if dtype is None
+        else dtype,
+        _shape_with_dynamic_dims(
+            tensor.shape, dynamic_shape_dim, dynamic_shape_dims, divisibility
+        ),
         tuple(stride),
         assumed_align=int(alignment),
     )
@@ -106,7 +117,9 @@ def convert_from_dlpack(
     divisibility: int = 1,
     enable_tvm_ffi: bool = True,
 ) -> cute.Tensor:
-    dynamic_shape_mode = leading_dim if dynamic_shape_mode is None else dynamic_shape_mode
+    dynamic_shape_mode = (
+        leading_dim if dynamic_shape_mode is None else dynamic_shape_mode
+    )
     desc = cute_from_dlpack(
         tensor,
         assumed_align=int(alignment),
@@ -121,7 +134,9 @@ def convert_from_dlpack(
 
 def device_cache_key(device: torch.device) -> tuple[str, int | None]:
     if device.type == "cuda":
-        index = device.index if device.index is not None else torch.cuda.current_device()
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
         return (device.type, int(index))
     return (device.type, None)
 
@@ -220,7 +235,9 @@ def _acc_layout_to_mn_view_layout(
     return cute.composition(acc_layout, cute.make_layout(shape, stride=stride))
 
 
-def make_acc_tensor_mn_view_from_mma(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
+def make_acc_tensor_mn_view_from_mma(
+    acc: cute.Tensor, transpose: bool = False
+) -> cute.Tensor:
     return cute.make_tensor(
         acc.iterator, _acc_layout_to_mn_view_layout(acc.layout, transpose=transpose)
     )
@@ -265,7 +282,11 @@ def transpose_first_two_modes_view(a: cute.Tensor) -> cute.Tensor:
 
 @dsl_user_op
 def elem_pointer_i64_offset(
-    x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None  # noqa: ARG001
+    x: cute.Tensor,
+    coord: cute.Coord,
+    *,
+    loc=None,
+    ip=None,  # noqa: ARG001
 ) -> cute.Pointer:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(x.stride)
@@ -296,7 +317,9 @@ def shuffle_sync(
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
-        val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+        val_i32[i] = cute.arch.shuffle_sync(
+            val_i32[i], offset, mask_and_clamp=mask_and_clamp
+        )
     return val[0]
 
 
@@ -342,7 +365,11 @@ def fmax_reduce(
     local_max[0] = fmax_f32(local_max[0], local_max[1])
     local_max[2] = fmax_f32(local_max[2], local_max[3])
     local_max[0] = fmax_f32(local_max[0], local_max[2])
-    return local_max[0] if const_expr(init_val is None) else fmax_f32(local_max[0], init_val)
+    return (
+        local_max[0]
+        if const_expr(init_val is None)
+        else fmax_f32(local_max[0], init_val)
+    )
 
 
 @cute.jit
@@ -357,7 +384,12 @@ def fadd_reduce(
 
 @dsl_user_op
 def _vector_copy_atom_with_explicit_width(
-    dtype: type[cutlass.Numeric], num_copy_elems: int, is_async: bool = False, *, loc=None, ip=None  # noqa: ARG001
+    dtype: type[cutlass.Numeric],
+    num_copy_elems: int,
+    is_async: bool = False,
+    *,
+    loc=None,
+    ip=None,  # noqa: ARG001
 ) -> cute.CopyAtom:
     num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
@@ -376,7 +408,9 @@ def vector_copy_with_explicit_width(
     ip=None,
     **kwargs,
 ) -> None:
-    copy_atom = _vector_copy_atom_with_explicit_width(src.element_type, num_copy_elems, is_async)
+    copy_atom = _vector_copy_atom_with_explicit_width(
+        src.element_type, num_copy_elems, is_async
+    )
     cute.copy(copy_atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
 
 
@@ -398,16 +432,28 @@ def async_copy_hi_lo_pair_with_explicit_width(
     elif const_expr(num_copy_elems == 2):
         vec_layout = cute.make_layout((2,), stride=(1,))
     else:
-        raise ValueError(f"sparse_gqa hi/lo async copy supports only 2, 4, or 8 elems, got {num_copy_elems}")
+        raise ValueError(
+            f"sparse_gqa hi/lo async copy supports only 2, 4, or 8 elems, got {num_copy_elems}"
+        )
     src_vec_lo = cute.make_tensor(src_ptr_lo, vec_layout)
     dst_vec_lo = cute.make_tensor(dst_ptr_lo, vec_layout)
     vector_copy_with_explicit_width(
-        src_vec_lo, dst_vec_lo, num_copy_elems=num_copy_elems, is_async=True, loc=loc, ip=ip
+        src_vec_lo,
+        dst_vec_lo,
+        num_copy_elems=num_copy_elems,
+        is_async=True,
+        loc=loc,
+        ip=ip,
     )
     src_vec_hi = cute.make_tensor(src_ptr_hi, vec_layout)
     dst_vec_hi = cute.make_tensor(dst_ptr_hi, vec_layout)
     vector_copy_with_explicit_width(
-        src_vec_hi, dst_vec_hi, num_copy_elems=num_copy_elems, is_async=True, loc=loc, ip=ip
+        src_vec_hi,
+        dst_vec_hi,
+        num_copy_elems=num_copy_elems,
+        is_async=True,
+        loc=loc,
+        ip=ip,
     )
 
 

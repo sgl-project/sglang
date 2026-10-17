@@ -1,8 +1,8 @@
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
@@ -67,7 +67,9 @@ def st_release(lock_ptr: cute.Pointer, val: Int32, *, loc=None, ip=None) -> None
 
 
 @dsl_user_op
-def atom_add_i32(lock_ptr: cute.Pointer, val: Int32, *, loc=None, ip=None) -> cutlass.Int32:
+def atom_add_i32(
+    lock_ptr: cute.Pointer, val: Int32, *, loc=None, ip=None
+) -> cutlass.Int32:
     lock_ptr_i64 = lock_ptr.toint(loc=loc, ip=ip).ir_value()
     old = llvm.inline_asm(
         T.i32(),
@@ -144,7 +146,9 @@ def launch_dependents(*, loc=None, ip=None) -> None:
 
 
 @cute.jit
-def wait_eq(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: Int32) -> None:
+def wait_eq(
+    lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: Int32
+) -> None:
     flag_ptr = lock_ptr + flag_offset
     if thread_idx == 0:
         read_val = Int32(0)
@@ -154,7 +158,10 @@ def wait_eq(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, v
 
 @cute.jit
 def arrive_inc(
-    lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: cutlass.Constexpr[Int32]
+    lock_ptr: cute.Pointer,
+    thread_idx: int | Int32,
+    flag_offset: int,
+    val: cutlass.Constexpr[Int32],
 ) -> None:
     flag_ptr = lock_ptr + flag_offset
     if thread_idx == 0:

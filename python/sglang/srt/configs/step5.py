@@ -16,7 +16,7 @@ from sglang.srt.configs.step3p7 import Step3p7VisionEncoderConfig
 # Step5 architecture values are validated by public test fixtures.
 
 
-def get_step5_text_config(config: PretrainedConfig) -> "Step5Config | None":
+def get_step5_text_config(config: PretrainedConfig) -> Step5Config | None:
     """Resolve the Step5 backbone in a text checkpoint or a Step3.7 VLM."""
     text_config = getattr(config, "text_config", config)
     return text_config if isinstance(text_config, Step5Config) else None

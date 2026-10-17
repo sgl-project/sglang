@@ -1,10 +1,11 @@
-import unittest
 import json
+import unittest
+
 import torch
 from flashinfer.fused_moe import trtllm_bf16_routed_moe
 from flashinfer.fused_moe.core import (
-    convert_to_block_layout,
     _maybe_get_cached_w3_w1_permute_indices,
+    convert_to_block_layout,
 )
 from flashinfer.tllm_enums import ActivationType
 

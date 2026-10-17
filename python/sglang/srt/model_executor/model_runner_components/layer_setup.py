@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import msgspec
-from sglang.srt.configs.step5 import Step5LayerSelection, get_step5_text_config
 from torch import nn
+
+from sglang.srt.configs.step5 import Step5LayerSelection, get_step5_text_config
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

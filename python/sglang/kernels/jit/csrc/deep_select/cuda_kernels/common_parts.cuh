@@ -286,18 +286,18 @@ public:
     using ValueT = Config::ValueT;
     using OutIdxT = Config::OutIdxT;
     static_assert(std::is_same_v<ValueT, nv_bfloat16> || std::is_same_v<ValueT, float>);
-    
+
     static constexpr uint32_t PLACEHOLDER_U32 = std::is_same_v<ValueT, nv_bfloat16> ? 0xff80 : 0xff800000; // -INF
-    static constexpr uint64_t PLACEHOLDER_B64 = std::is_same_v<ValueT, nv_bfloat16> ? 0xff80ff80ff80ff80 : 0xff800000ff800000; 
+    static constexpr uint64_t PLACEHOLDER_B64 = std::is_same_v<ValueT, nv_bfloat16> ? 0xff80ff80ff80ff80 : 0xff800000ff800000;
     static constexpr uint64_t PLACEHOLDER_PAIR = (uint64_t)PLACEHOLDER_U32 << 32;
-    
+
     static constexpr uint32_t TARGET_OCCUPANCY = Config::target_occupancy;
     static constexpr uint32_t NUM_THREADS = Config::num_threads;
     static constexpr uint32_t NUM_WARPS = NUM_THREADS / 32;
     static constexpr uint32_t MAX_TOPK = Config::max_topk;
     static_assert(NUM_THREADS == 256 || NUM_THREADS == 512);
 
-    static constexpr uint32_t NUM_ELEMS_PER_128b = 16 / sizeof(ValueT); 
+    static constexpr uint32_t NUM_ELEMS_PER_128b = 16 / sizeof(ValueT);
     static constexpr uint32_t NUM_UINT32_PER_128b = 4;
     static constexpr uint32_t NUM_ELEMS_PER_ROUND = Config::elements_per_round;
     static constexpr uint32_t NUM_ELEMS_PER_THREAD_PER_ROUND = NUM_ELEMS_PER_ROUND / NUM_THREADS;   // TODO Unify "values", "elements", and "elems" to "elems"
@@ -306,7 +306,7 @@ public:
     static constexpr uint32_t ELEMS_PER_THREAD_PER_ROUND_MASK = NUM_ELEMS_PER_THREAD_PER_ROUND - 1;
     // NUM_128b_PER_THREAD_PER_ROUND is the canonical name; no separate NUM_UNITS alias is kept.
 
-    static_assert(NUM_ELEMS_PER_THREAD_PER_ROUND == 16); 
+    static_assert(NUM_ELEMS_PER_THREAD_PER_ROUND == 16);
 
     // Each segment/window contains this many elements. It is the granularity used by both the
     // pseudo-random visit order and the sorted-index epilogue.
@@ -314,10 +314,10 @@ public:
     static_assert(NUM_ELEMS_PER_SEG == 512);
     // The last NUM_TAIL_ELEMS elements of a row are always visited in their original order.
     // 4096 keeps the tail small enough to fit alongside the init-window perm segments.
-    static constexpr uint32_t NUM_TAIL_ELEMS = 4096;  
-    static constexpr uint32_t NUM_TAIL_SEGS = NUM_TAIL_ELEMS / NUM_ELEMS_PER_SEG; 
+    static constexpr uint32_t NUM_TAIL_ELEMS = 4096;
+    static constexpr uint32_t NUM_TAIL_SEGS = NUM_TAIL_ELEMS / NUM_ELEMS_PER_SEG;
     // The init window is 32 KiB of input data
-    static constexpr uint32_t NUM_ELEMS_IN_INIT_WINDOW = 32768 / sizeof(ValueT); 
+    static constexpr uint32_t NUM_ELEMS_IN_INIT_WINDOW = 32768 / sizeof(ValueT);
     static constexpr uint32_t NUM_INIT_ROUNDS_MAX = NUM_ELEMS_IN_INIT_WINDOW / NUM_ELEMS_PER_ROUND;
     static_assert(NUM_ELEMS_IN_INIT_WINDOW % NUM_ELEMS_PER_ROUND == 0);
     static_assert(NUM_ELEMS_IN_INIT_WINDOW % NUM_ELEMS_PER_SEG == 0);
@@ -326,13 +326,13 @@ public:
     static_assert(NUM_ELEMS_PER_ROUND % NUM_ELEMS_PER_SEG == 0);
     static_assert(NUM_ELEMS_PER_SEG % NUM_ELEMS_PER_128b == 0);
     static constexpr uint32_t NUM_128b_PER_SEG = NUM_ELEMS_PER_SEG / NUM_ELEMS_PER_128b;
-    static_assert(NUM_THREADS % NUM_128b_PER_SEG == 0); 
+    static_assert(NUM_THREADS % NUM_128b_PER_SEG == 0);
     static_assert(NUM_128b_PER_SEG % 32 == 0); // every lane in a warp should in the same seg
-    
+
     static constexpr uint32_t NUM_ISSUE_WARPS = NUM_SEGS_PER_ROUND < 4 ? NUM_SEGS_PER_ROUND : 4;
     static constexpr uint32_t NUM_SEGS_PER_ISSUE_WARP = NUM_SEGS_PER_ROUND / NUM_ISSUE_WARPS;
     static_assert(NUM_SEGS_PER_ROUND % NUM_ISSUE_WARPS == 0);
-    static_assert(NUM_TAIL_SEGS % NUM_ISSUE_WARPS == 0);   
+    static_assert(NUM_TAIL_SEGS % NUM_ISSUE_WARPS == 0);
     static_assert(NUM_WARPS >= NUM_ISSUE_WARPS);
 
     static constexpr uint32_t NUM_TMA_LOAD_BUFS = Config::tma_buffer_depth;
@@ -380,7 +380,7 @@ public:
                 "the init window must fit in the extra pairs region");
     static_assert(NUM_EXTRA_SLOTS * sizeof(uint64_t) / sizeof(uint32_t) >= MAX_VOCAB_SIZE / NUM_ELEMS_PER_SEG,
                 "the index sort's window delta table must fit in the extra pairs region");
-    // array `incoming_topk_pairs` will be used as 
+    // array `incoming_topk_pairs` will be used as
     //     1. tma buffer during init phase
     //     2. extra array during main phase
     //     3. windows_delta counter during epilogue phase
@@ -401,7 +401,7 @@ public:
     static_assert(NUM_SEGS_PER_ROUND == NUM_WARPS);
     static_assert(NUM_SEGS_PER_ROUND >= NUM_TAIL_SEGS);
     static_assert(NUM_ELEMS_PER_SEG % (Config::elements_per_round/NUM_WARPS) == 0);
-    
+
     struct TmaParams {
         CUtensorMap tensor_map;
     };
@@ -455,21 +455,21 @@ public:
         return ((linear_id % perm_len) * perm_mul + PERM_ADD_BASE) % perm_len;
     }
 
-    static __device__ __forceinline__ 
+    static __device__ __forceinline__
     void advance_perm_state(uint32_t &state, uint32_t stride, uint32_t perm_len) {
         state += stride;
         if (state >= perm_len) state -= perm_len;
     }
 
-    static __device__ __forceinline__ 
+    static __device__ __forceinline__
     uint32_t sw_msk(uint32_t e) {
         return (e >> SWIZZLE_SHIFT) & SWIZZLE_MASK;
     }
-    static __device__ __forceinline__ 
+    static __device__ __forceinline__
     uint32_t sw_elem(uint32_t e) {
         return e ^ sw_msk(e);
     }
-    static __device__ __forceinline__ 
+    static __device__ __forceinline__
     uint32_t sw_b128(uint32_t u) {
         return u ^ ((u >> 3) & (7));
     }
@@ -488,7 +488,7 @@ public:
             warp_cnt[warp_idx] = warp_total_packed;
         }
         __syncthreads();
-        
+
         uint32_t off_lane_packed = warp_level_exclusive_prefix_sum(cnt_packed, lane_idx);
         uint32_t stored_warp_packed = lane_idx < NUM_WARPS ? warp_cnt[lane_idx] : 0u;
         uint32_t off_warp_packed = __reduce_add_sync(0xFFFFFFFF, lane_idx < warp_idx ? stored_warp_packed : 0u);
@@ -554,7 +554,7 @@ public:
             CUTE_UNROLL
             for (uint32_t k = 1; k < 8; ++k)
                 j += (uint32_t)(suffix_count[k] >= topk);
-            
+
             // A depth-3 SEL tree picking suffix_count[j+1] by the bits of j
             // j is the bucket that contains the top-k element
             uint32_t b0 = (j & 1) ? suffix_count[2] : suffix_count[1], b1 = (j & 1) ? suffix_count[4] : suffix_count[3];
@@ -583,7 +583,7 @@ public:
 
     // Clean every bucket counter using 16-byte shared-memory writes.
     // Need to be called by all threads.
-    static __device__ __forceinline__ 
+    static __device__ __forceinline__
     void clear_reconstruct_histograms(SharedMemoryPlanBase &smem, uint32_t thread_idx) {
         static_assert((2 * NUM_RECONSTRUCT_BUCKET_SLOTS) % 4 == 0);
         __int128_t zero = (__int128_t)0ull;
@@ -738,7 +738,7 @@ public:
         uint32_t* window_scatter_delta = (uint32_t*)smem.incoming_topk_pairs;
         ValueT* smem_value_buf = (ValueT*)smem.surviving_topk_pairs[staging_buf_idx];
         uint32_t* smem_index_buf = (uint32_t*)(smem.surviving_topk_pairs[staging_buf_idx] + MAX_TOPK * (uint32_t)sizeof(ValueT) / 8);
-        
+
         // Index-sort shuffle: each window's selected candidates are already sorted and contiguous;
         // only the whole window groups are in visit order, so reorder them by their window id.
         if constexpr (SORT_BY_INDEX) if (!is_already_sorted_in_index) {
@@ -932,7 +932,7 @@ public:
     static __device__ __forceinline__
     void histogram_radix_lsb_for_pivot_msb(uint32_t *bucket_counter, uint32_t pivot_hi8, const nv_bfloat162 (&packed_values)[N], uint32_t num_packed_values) {
         uint32_t bucket1_base = cute::cast_smem_ptr_to_uint(bucket_counter);
-        // Every elements in the pivot bucket must have the same sign, so we can use this information to optimize instead of 
+        // Every elements in the pivot bucket must have the same sign, so we can use this information to optimize instead of
         bool bucket_negative = pivot_hi8 < 0x80;
         uint32_t orig_pivot_hi8 = bucket_negative ? 0xFF - pivot_hi8 : pivot_hi8 - 0x80;    // Un-distort
         uint32_t raw_hi8_x2 = (orig_pivot_hi8 << 16) | orig_pivot_hi8;
@@ -1139,7 +1139,7 @@ public:
     // `topk`, but can be smaller in a cluster CTA whose local range has fewer real elements.
     template<bool USE_CLUSTER_ADDRESSING, typename IsWarpActiveF>
     static __device__ __forceinline__
-    uint32_t scan_segs(const TmaParams &tma_params, SharedMemoryPlanBase &smem, 
+    uint32_t scan_segs(const TmaParams &tma_params, SharedMemoryPlanBase &smem,
                        uint32_t batch_idx, uint32_t end_vocab_idx, uint32_t topk,
                        uint32_t warp_idx, uint32_t lane_idx,
                        uint32_t num_perm_segs,                  // The number of segments to be permuted, globally
@@ -1186,7 +1186,7 @@ public:
         // Init phase
         if (num_local_elems_padded != 0) {
             // Issue copy: Copy the tail and the first few segments, result in init_buf[0: NUM_ELEMS_IN_INIT_WINDOW] (or init_buf[0: ])
-            ValueT *init_buf = (ValueT*)smem.incoming_topk_pairs; 
+            ValueT *init_buf = (ValueT*)smem.incoming_topk_pairs;
             if (cute::elect_one_sync()) {
                 if (num_local_tail_elems_padded != 0) {
                     issue_tma_copy.template operator()<true, true>(0);
@@ -1209,7 +1209,7 @@ public:
                     }
                 }
             }
-            
+
             if (num_perm_segs != 0 && num_local_tail_elems_padded != 0) {
                 Base::fill_padded_tail_segments(init_buf, num_local_tail_elems);
                 __syncthreads();
@@ -1268,7 +1268,7 @@ public:
             // selection must degrade to "select all real elements": cap the K used in the pivot /
             // quota computation at the real count
             uint32_t effective_topk = min(topk, num_real_init_elems);
-            auto [pivot_value_x2_bits, start_pos_in_collector, eq_quota, cnt_nan] = 
+            auto [pivot_value_x2_bits, start_pos_in_collector, eq_quota, cnt_nan] =
                 compute_pivot_and_quota<USE_CLUSTER_ADDRESSING, NUM_UINT32_IN_INIT_WINDOW_PER_THREAD, 4>(effective_topk, init_values, num_my_elems / 2, warp_idx, lane_idx, smem);
             // The init census walks the thread's whole slice of the window, i.e. every element of the init
             // window exactly once, so NaNs inside the window are caught here.
@@ -1307,7 +1307,7 @@ public:
             threshold_x2_bits = pivot_value_x2_bits;
         }
         __syncthreads();
-    
+
 
         uint32_t linear_segment_start =
             local_start_seg_idx
@@ -1356,7 +1356,7 @@ public:
             histogram_radix_msb(smem.reconstruct_bucket_counter[0], values, num_my_units);
             __syncthreads();
 
-            auto [pivot_value_x2_bits, out_prefix, eq_quota, cnt_nan] = 
+            auto [pivot_value_x2_bits, out_prefix, eq_quota, cnt_nan] =
                 compute_pivot_and_quota<USE_CLUSTER_ADDRESSING>(topk, values, num_my_units, warp_idx, lane_idx, smem);
             // Every NaN that the main loop collected is part of the buffer this census just walked (the hit
             // test is `.gtu`, so NaN always becomes an incomer).
@@ -1414,8 +1414,8 @@ public:
                     asm volatile (
                         "{\n"
                         ".reg .b32 r0, r1, ind, nib;\n"
-                        "set.gtu.s32.bf16x2 r0, %1, %3;\n"   // .gtu: NaN always counts as a hit, so every NaN reaches the incoming buffer and the census below reports it. 
-                        "set.gtu.s32.bf16x2 r1, %2, %3;\n"   // `set` with .s32 fills the corresponding 16bit to 0xFFFF (-1) when the condition holds. We use `prmt` to extract one bit from each 
+                        "set.gtu.s32.bf16x2 r0, %1, %3;\n"   // .gtu: NaN always counts as a hit, so every NaN reaches the incoming buffer and the census below reports it.
+                        "set.gtu.s32.bf16x2 r1, %2, %3;\n"   // `set` with .s32 fills the corresponding 16bit to 0xFFFF (-1) when the condition holds. We use `prmt` to extract one bit from each
                         "prmt.b32 ind, r0, r1, 0x7531;\n"
                         "dp4a.s32.s32 nib, ind, 0xF8FCFEFF, 0;\n"   // ind's bytes are 0x00/0xFF, so with signed byte weights each hit contributes 1/2/4/8
                         "mad.lo.u32 %0, %0, 16, nib;\n"
@@ -1434,16 +1434,16 @@ public:
                 smem.warp_cnt[warp_idx] = warp_total_hits;
             }
             __syncthreads();
-            
+
             static_assert(NUM_WARPS <= 32);
             uint32_t stored_warp_hits = lane_idx < NUM_WARPS ? smem.warp_cnt[lane_idx] : 0u;
             uint32_t num_total_hits_in_this_round = __reduce_add_sync(0xFFFFFFFF, stored_warp_hits);
-            
+
             uint32_t seg_elem_base = current_permuted_segment * NUM_ELEMS_PER_SEG + offset_in_segment;
 
             // Element e of this thread's slice lives at smem_read_offset + (e ^ chunk_swizzle_mask)
             uint32_t elem_addr_base = cute::cast_smem_ptr_to_uint(buf + smem_read_offset);
-            
+
             // Start the first hit's smem load before the prefix scan / count exchange below, so that its
             // latency (and the barrier wait) overlaps with them instead of delaying the first store.
             uint32_t first_hit_e = hit_mask != 0 ? __ffs(hit_mask) - 1u : 0u;
@@ -1462,7 +1462,7 @@ public:
                 lane_prefix += (uint32_t)__popc(bit) << k;
             }
 
-            uint32_t dst_slot = 
+            uint32_t dst_slot =
                 num_incomers +
                 __reduce_add_sync(0xFFFFFFFF, lane_idx < warp_idx ? stored_warp_hits : 0u) +
                 lane_prefix;

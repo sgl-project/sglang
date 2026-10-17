@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
@@ -65,6 +66,7 @@ if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             import flashinfer.norm
+
             from sglang.srt.utils.custom_op import register_custom_op
 
             def _layernorm_fake_impl(

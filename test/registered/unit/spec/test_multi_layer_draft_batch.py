@@ -35,7 +35,9 @@ class TestMultiLayerDraftBatch(CustomTestCase):
         mode = (
             ForwardMode.IDLE
             if idle
-            else ForwardMode.EXTEND if prefill else ForwardMode.DRAFT_EXTEND_V2
+            else ForwardMode.EXTEND
+            if prefill
+            else ForwardMode.DRAFT_EXTEND_V2
         )
         hidden = torch.arange(tokens * 2, dtype=torch.float32).reshape(tokens, 2)
         batch = SimpleNamespace(

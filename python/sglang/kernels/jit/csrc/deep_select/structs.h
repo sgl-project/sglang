@@ -32,7 +32,7 @@ struct TopkSelectArgs {
     bool return_value;
     int idx_oob_fill_value;
     float value_oob_fill_value;
-    bool abort_when_nan_found;      
+    bool abort_when_nan_found;
 
     uint64_t shared_memory_size_per_sm;
     cudaStream_t stream;

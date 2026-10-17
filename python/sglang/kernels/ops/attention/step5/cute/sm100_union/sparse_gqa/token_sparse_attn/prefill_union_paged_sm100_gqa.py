@@ -18,14 +18,29 @@ import torch
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import cpasync
 
-from sglang.kernels.ops.attention.step5.cute.compile_cache import cached_compile_function
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import copy_utils, utils as flash_utils
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.block_sparsity import BlockSparseTensors
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.flash_fwd_sm100 import FlashAttentionForwardSm100
-from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.mask import AttentionMask, mask_r2p
-from sglang.kernels.ops.attention.step5.cute.sm100_union.sparse_gqa.kernel_utils import cute_utils as sparse_utils
+from sglang.kernels.ops.attention.step5.cute.compile_cache import (
+    cached_compile_function,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import (
+    copy_utils,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn import (
+    utils as flash_utils,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.block_sparsity import (
+    BlockSparseTensors,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.flash_fwd_sm100 import (
+    FlashAttentionForwardSm100,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.flash_attn.mask import (
+    AttentionMask,
+    mask_r2p,
+)
+from sglang.kernels.ops.attention.step5.cute.sm100_union.sparse_gqa.kernel_utils import (
+    cute_utils as sparse_utils,
+)
 from sglang.kernels.ops.attention.step5.cute.sm100_union.utils import elem_pointer
-
 
 SUPPORTED_Q_HEADS = (8, 16)
 DEFAULT_Q_HEADS = 16
@@ -46,7 +61,7 @@ UNION_EXACT_KERNEL_REVISION = 10
 def _debug_validate_schedule(
     union_counts: torch.Tensor,
     union_phys_indices: torch.Tensor,
-    workspace: "Sm100UnionExactPrefillWorkspace",
+    workspace: Sm100UnionExactPrefillWorkspace,
     *,
     physical_region_count: int,
 ) -> None:
@@ -67,9 +82,9 @@ def _debug_validate_schedule(
     invalid_blocks = (
         (block_counts < 0) | (block_counts > int(workspace.max_blocks))
     ).sum()
-    block_columns = torch.arange(
-        int(workspace.max_blocks), device=block_counts.device
-    )[None, :]
+    block_columns = torch.arange(int(workspace.max_blocks), device=block_counts.device)[
+        None, :
+    ]
     active_blocks = block_columns < block_counts[:, None]
     invalid_indices = (
         active_blocks
@@ -111,7 +126,9 @@ class Sm100UnionExactPrefillWorkspace:
 
     @property
     def max_blocks(self) -> int:
-        return (int(self.max_union_windows) + REGIONS_PER_BLOCK - 1) // REGIONS_PER_BLOCK
+        return (
+            int(self.max_union_windows) + REGIONS_PER_BLOCK - 1
+        ) // REGIONS_PER_BLOCK
 
     @property
     def q_group(self) -> int:
@@ -143,9 +160,9 @@ def make_sm100_union_exact_prefill_workspace(
         block_counts=torch.empty((groups,), dtype=torch.int32, device=device),
         # The final column carries the exact region count for the gather producer.
         # Generic SM100 block-sparse consumers only visit the first max_blocks columns.
-        block_indices=torch.arange(
-            max_blocks + 2, dtype=torch.int32, device=device
-        ).expand(groups, -1).clone(),
+        block_indices=torch.arange(max_blocks + 2, dtype=torch.int32, device=device)
+        .expand(groups, -1)
+        .clone(),
         # Keep all four BlockSparseTensors fields materialized. CuTeDSL drops
         # intermediate None values while rebuilding the aggregate ABI.
         full_block_counts=torch.zeros((groups,), dtype=torch.int32, device=device),
@@ -182,21 +199,31 @@ def _make_schedule_kernel(max_blocks: int, q_group: int):
         tid = cute.arch.thread_idx()[0]
         count = mUnionCounts[group]
         if tid == 0:
-            mBlockCounts[group] = (
-                count + Int32(REGIONS_PER_BLOCK - 1)
-            ) // Int32(REGIONS_PER_BLOCK)
+            mBlockCounts[group] = (count + Int32(REGIONS_PER_BLOCK - 1)) // Int32(
+                REGIONS_PER_BLOCK
+            )
             mBlockIndices[group, Int32(max_blocks)] = count
             valid_rows = mWorkQLen[group] - mWorkQLocal[group]
-            valid_rows = cutlass.select_(valid_rows < Int32(q_group), valid_rows, Int32(q_group))
+            valid_rows = cutlass.select_(
+                valid_rows < Int32(q_group), valid_rows, Int32(q_group)
+            )
             last_position = Int32(-1)
             if valid_rows > Int32(0):
                 last_position = mWorkQGlobal[mWorkQLocal[group]] + valid_rows - Int32(1)
             last_window = cutlass.select_(count > Int32(0), count - Int32(1), Int32(0))
             last_logical = mUnionLogical[group, last_window]
             token_limit = count * Int32(REGION_TOKENS)
-            if (count > Int32(0)) & (last_logical == last_position // Int32(REGION_TOKENS)):
-                token_limit = (count - Int32(1)) * Int32(REGION_TOKENS) + last_position % Int32(REGION_TOKENS) + Int32(1)
-            mBlockIndices[group, Int32(max_blocks + 1)] = cutlass.select_(valid_rows > Int32(0), token_limit, Int32(0))
+            if (count > Int32(0)) & (
+                last_logical == last_position // Int32(REGION_TOKENS)
+            ):
+                token_limit = (
+                    (count - Int32(1)) * Int32(REGION_TOKENS)
+                    + last_position % Int32(REGION_TOKENS)
+                    + Int32(1)
+                )
+            mBlockIndices[group, Int32(max_blocks + 1)] = cutlass.select_(
+                valid_rows > Int32(0), token_limit, Int32(0)
+            )
         mask_word_count = int(max_blocks) * q_group
         for chunk in cutlass.range_constexpr(
             (mask_word_count + SCHEDULE_THREADS - 1) // SCHEDULE_THREADS
@@ -208,7 +235,9 @@ def _make_schedule_kernel(max_blocks: int, q_group: int):
                 q_valid = mWorkQLocal[group] + q_slot < mWorkQLen[group]
                 word = Uint32(0)
                 for region_in_block in cutlass.range_constexpr(REGIONS_PER_BLOCK):
-                    window = block_idx * Int32(REGIONS_PER_BLOCK) + Int32(region_in_block)
+                    window = block_idx * Int32(REGIONS_PER_BLOCK) + Int32(
+                        region_in_block
+                    )
                     window_valid = window < count
                     safe_window = cutlass.select_(window_valid, window, Int32(0))
                     exact_bits = mExactMaskBits[group, safe_window]
@@ -241,13 +270,15 @@ def _make_schedule_kernel(max_blocks: int, q_group: int):
             last_window = limit // Int32(REGION_TOKENS) - Int32(1)
             has_last = limit >= Int32(REGION_TOKENS)
             safe_last = cutlass.select_(has_last, last_window, Int32(0))
-            current_region_in_union = (
-                has_last
-                & (mUnionLogical[group, safe_last] == q_global // Int32(REGION_TOKENS))
+            current_region_in_union = has_last & (
+                mUnionLogical[group, safe_last] == q_global // Int32(REGION_TOKENS)
             )
             exact_limit = cutlass.select_(
                 current_region_in_union,
-                limit - Int32(REGION_TOKENS) + q_global % Int32(REGION_TOKENS) + Int32(1),
+                limit
+                - Int32(REGION_TOKENS)
+                + q_global % Int32(REGION_TOKENS)
+                + Int32(1),
                 limit,
             )
             mCausalTokenLimits[group, q_slot] = cutlass.select_(
@@ -305,17 +336,13 @@ def _get_compiled_schedule(
     device_key: tuple[str, int | None],
 ):
     device = sparse_utils.device_from_cache_key(device_key)
-    max_blocks = (
-        int(max_union_windows) + REGIONS_PER_BLOCK - 1
-    ) // REGIONS_PER_BLOCK
+    max_blocks = (int(max_union_windows) + REGIONS_PER_BLOCK - 1) // REGIONS_PER_BLOCK
     counts = torch.empty((1,), dtype=torch.int32, device=device)
     metadata = torch.empty(
         (1, int(max_union_windows)), dtype=torch.int32, device=device
     )
     block_counts = torch.empty((1,), dtype=torch.int32, device=device)
-    block_indices = torch.empty(
-        (1, max_blocks + 2), dtype=torch.int32, device=device
-    )
+    block_indices = torch.empty((1, max_blocks + 2), dtype=torch.int32, device=device)
     exact_region_words = torch.empty(
         (1, max_blocks, int(q_group)),
         dtype=torch.int32,
@@ -450,7 +477,15 @@ class _UnionExactAttentionMask(AttentionMask):
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
     ) -> None:
-        del mask_seqlen, mask_causal, mask_local, mask_mod, batch_idx, head_idx, fastdiv_mods
+        del (
+            mask_seqlen,
+            mask_causal,
+            mask_local,
+            mask_mod,
+            batch_idx,
+            head_idx,
+            fastdiv_mods,
+        )
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         tScS = thr_mma.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
@@ -547,7 +582,11 @@ class _UnionExactFlashAttentionForwardSm100(FlashAttentionForwardSm100):
         m_block: Int32,
         aux_tensors: list,
     ) -> Int32:
-        return m_block * Int32(self.q_group) + aux_tensors[6][m_block] - aux_tensors[5][m_block]
+        return (
+            m_block * Int32(self.q_group)
+            + aux_tensors[6][m_block]
+            - aux_tensors[5][m_block]
+        )
 
     @cute.jit
     def _load_union_kv(
@@ -687,9 +726,7 @@ class _UnionExactFlashAttentionForwardSm100(FlashAttentionForwardSm100):
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[
-                None, None, head_idx
-            ]
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             mQ_cur = cute.domain_offset(
                 ((0, self.output_row_offset(m_block, aux_tensors)), 0), mQ_cur
             )
@@ -717,12 +754,15 @@ class _UnionExactFlashAttentionForwardSm100(FlashAttentionForwardSm100):
                     m_block,
                     Int32(cute.size(mBlockIndices.shape[3]) - 2),
                 ]
-                union_token_limit = mBlockIndices[batch_idx, head_idx, m_block, Int32(cute.size(mBlockIndices.shape[3]) - 1)]
-                source_row = (
-                    (tidx % Int32(GATHER_THREADS_PER_ROW))
-                    * Int32(num_load_threads // GATHER_THREADS_PER_ROW)
-                    + tidx // Int32(GATHER_THREADS_PER_ROW)
-                )
+                union_token_limit = mBlockIndices[
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    Int32(cute.size(mBlockIndices.shape[3]) - 1),
+                ]
+                source_row = (tidx % Int32(GATHER_THREADS_PER_ROW)) * Int32(
+                    num_load_threads // GATHER_THREADS_PER_ROW
+                ) + tidx // Int32(GATHER_THREADS_PER_ROW)
                 for offset in cutlass.range(block_count, unroll=1):
                     sparse_block = mBlockIndices[
                         batch_idx,
@@ -740,8 +780,10 @@ class _UnionExactFlashAttentionForwardSm100(FlashAttentionForwardSm100):
                     source_physical_region = mUnionPhys4d[
                         batch_idx, head_idx, m_block, safe_source_window
                     ]
-                    source_valid = source_window_valid & (source_union_token < union_token_limit) & (
-                        source_physical_region >= Int32(0)
+                    source_valid = (
+                        source_window_valid
+                        & (source_union_token < union_token_limit)
+                        & (source_physical_region >= Int32(0))
                     )
                     safe_source_region = cutlass.select_(
                         source_valid, source_physical_region, Int32(0)
@@ -825,9 +867,7 @@ def _get_compiled_union_exact(
             f"expected {UNION_EXACT_KERNEL_REVISION}"
         )
     device = sparse_utils.device_from_cache_key(device_key)
-    max_blocks = (
-        int(max_union_windows) + REGIONS_PER_BLOCK - 1
-    ) // REGIONS_PER_BLOCK
+    max_blocks = (int(max_union_windows) + REGIONS_PER_BLOCK - 1) // REGIONS_PER_BLOCK
     q_group = M_BLOCK // int(q_heads)
     torch_dtype = torch.bfloat16 if dtype == cutlass.BFloat16 else torch.float16
     q = torch.empty(
@@ -862,20 +902,12 @@ def _get_compiled_union_exact(
         dtype=torch.int32,
         device=device,
     )
-    causal_token_limits = torch.empty(
-        (1, q_group), dtype=torch.int32, device=device
-    )
+    causal_token_limits = torch.empty((1, q_group), dtype=torch.int32, device=device)
     union_phys4d = union_phys.view(1, 1, 1, int(max_union_windows))
 
-    fq = _make_dynamic_fake(
-        q, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2)
-    )
-    fk = _make_dynamic_fake(
-        k, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2)
-    )
-    fv = _make_dynamic_fake(
-        v, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2)
-    )
+    fq = _make_dynamic_fake(q, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2))
+    fk = _make_dynamic_fake(k, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2))
+    fv = _make_dynamic_fake(v, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2))
     fout = _make_dynamic_fake(
         out, dynamic_shape_dims=(1,), dynamic_stride_dims=(0, 1, 2)
     )
@@ -916,9 +948,7 @@ def _get_compiled_union_exact(
     f_work_q_local = _make_dynamic_fake(
         work_q_local, dynamic_shape_dims=(0,), alignment=4
     )
-    f_work_q_len = _make_dynamic_fake(
-        work_q_len, dynamic_shape_dims=(0,), alignment=4
-    )
+    f_work_q_len = _make_dynamic_fake(work_q_len, dynamic_shape_dims=(0,), alignment=4)
     f_block_counts = _make_dynamic_fake(
         block_counts,
         dynamic_shape_dims=(2,),
@@ -1179,13 +1209,9 @@ def _token_wise_flash_attn_prefill_union_sm100_gqa_impl(
     lse4 = lse.transpose(0, 1).unsqueeze(0) if lse is not None else None
     blocksparse = BlockSparseTensors(
         workspace.block_counts.view(1, 1, groups),
-        workspace.block_indices.view(
-            1, 1, groups, workspace.max_blocks + 2
-        ),
+        workspace.block_indices.view(1, 1, groups, workspace.max_blocks + 2),
         workspace.full_block_counts.view(1, 1, groups),
-        union_phys_indices.view(
-            1, 1, groups, int(workspace.max_union_windows)
-        ),
+        union_phys_indices.view(1, 1, groups, int(workspace.max_union_windows)),
     )
     aux = [
         union_phys_indices,

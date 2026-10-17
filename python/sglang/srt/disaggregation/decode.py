@@ -128,7 +128,6 @@ from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
-from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 

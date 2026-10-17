@@ -3,7 +3,7 @@
 @@ -31,6 +31,7 @@
      # Unspecified
      Unspecified = (10,)
- 
+
 +    SigmoidBiasOrderedRenorm = (11,)
      # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
      # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
