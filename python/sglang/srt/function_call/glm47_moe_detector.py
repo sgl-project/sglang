@@ -298,6 +298,43 @@ def parse_arguments(
         return json_value, False
 
 
+_ARG_VALUE_HEAD_REGEX = re.compile(r"(?:\\n|\s)*<arg_value>")
+
+
+# Yields (start, end, key, value) exactly as re.finditer would for
+# `<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>` (DOTALL).
+# Linear on purpose: that regex rescans to the end from every unpaired `<arg_key>`.
+def iter_arg_pair_matches(text: str):
+    # A key ends at the first `</arg_key>` that is followed by a value opener.
+    heads = []
+    close = text.find("</arg_key>")
+    while close != -1:
+        head = _ARG_VALUE_HEAD_REGEX.match(text, close + len("</arg_key>"))
+        if head is not None:
+            heads.append((close, head.end()))
+        close = text.find("</arg_key>", close + 1)
+
+    head_idx = 0
+    start = text.find("<arg_key>")
+    while start != -1:
+        key_start = start + len("<arg_key>")
+        while head_idx < len(heads) and heads[head_idx][0] < key_start:
+            head_idx += 1
+        if head_idx == len(heads):
+            return
+        key_end, value_start = heads[head_idx]
+        value_end = text.find("</arg_value>", value_start)
+        if value_end == -1:
+            return
+        end = value_end + len("</arg_value>")
+        yield start, end, text[key_start:key_end], text[value_start:value_end]
+        start = text.find("<arg_key>", end)
+
+
+def find_arg_pairs(text: str) -> List[Tuple[str, str]]:
+    return [(key, value) for _, _, key, value in iter_arg_pair_matches(text)]
+
+
 class Glm47MoeDetector(BaseFormatDetector):
     """
     Detector for GLM-4.7 and GLM-5 models.
@@ -310,13 +347,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.use_full_assistant_constraint = False
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
         self.func_detail_regex = re.compile(
             r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
-        )
-        self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
-            re.DOTALL,
         )
         self._last_arguments = ""
         self.current_tool_id = -1
@@ -343,6 +375,18 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._sent_empty_object = False  # Reset empty object sent status
         self._buffer_arguments = None
 
+    def _iter_tool_call_spans(self, text: str):
+        # Linear scan on purpose: a `<tool_call>.*?</tool_call>` finditer rescans
+        # to the end from every opening tag when the end tag never arrives.
+        start = text.find("<tool_call>")
+        while start != -1:
+            end = text.find("</tool_call>", start + len("<tool_call>"))
+            if end == -1:
+                return
+            end += len("</tool_call>")
+            yield start, end
+            start = text.find("<tool_call>", end)
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         return self.bot_token in text
@@ -363,11 +407,12 @@ class Glm47MoeDetector(BaseFormatDetector):
         last_end = 0
 
         # Find all tool call matches
-        for match in re.finditer(self.func_call_regex, text, re.DOTALL):
+        blocks = list(self._iter_tool_call_spans(text))
+        for block_start, block_end in blocks:
             # Add text before this tool call
-            if match.start() > last_end:
-                normal_text_parts.append(text[last_end : match.start()])
-            last_end = match.end()
+            if block_start > last_end:
+                normal_text_parts.append(text[last_end:block_start])
+            last_end = block_end
 
         # Add any remaining text after the last tool call
         if last_end < len(text):
@@ -377,7 +422,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         normal_text = "".join(normal_text_parts).strip()
 
         # Parse tool calls
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        match_result_list = [text[b:e] for b, e in blocks]
         calls = []
         try:
             for match_result in match_result_list:
@@ -389,7 +434,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
-                    pairs = self.func_arg_regex.findall(func_args)
+                    pairs = find_arg_pairs(func_args)
                     # Parse arguments using shared method
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
 
@@ -658,7 +703,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         if self._buffer_arguments:
             arguments = self._parse_argument_pairs(
-                self.func_arg_regex.findall(func_args_raw), func_name, tools
+                find_arg_pairs(func_args_raw), func_name, tools
             )
             serialized = json.dumps(arguments, ensure_ascii=False)
             calls.append(
@@ -698,7 +743,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         if func_args_raw:
             try:
-                pairs = self.func_arg_regex.findall(func_args_raw)
+                pairs = find_arg_pairs(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
                     self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
