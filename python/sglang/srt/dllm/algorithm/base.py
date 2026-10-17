@@ -37,6 +37,7 @@ class DllmAlgorithm:
     reuse_forward_metadata: bool = False
     supported_attention_backends: Tuple[str, ...] = ()
     capture_input_preparation: bool = False
+    config_keys: Tuple[str, ...] = ()
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
@@ -54,6 +55,29 @@ class DllmAlgorithm:
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
         """Apply launch-time constraints owned by an algorithm."""
+
+    @classmethod
+    def validate_config(cls, config: dict[str, Any]) -> None:
+        cls._validate_config_keys(
+            config, ("block_size", "capture_input_preparation") + cls.config_keys
+        )
+
+    @classmethod
+    def _validate_config_keys(
+        cls,
+        config: dict[str, Any],
+        supported_keys: Tuple[str, ...],
+        *,
+        prefix: str = "",
+    ) -> None:
+        unknown_keys = sorted(
+            f"{prefix}{key}" for key in config if key not in supported_keys
+        )
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown configuration keys for {cls.__name__}: "
+                + ", ".join(unknown_keys)
+            )
 
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:

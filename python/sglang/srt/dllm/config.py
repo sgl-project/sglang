@@ -150,6 +150,8 @@ class DllmConfig:
             if not isinstance(algorithm_config, dict):
                 raise ValueError("The dLLM algorithm config must be a YAML mapping")
 
+            algorithm_cls.validate_config(algorithm_config)
+
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
