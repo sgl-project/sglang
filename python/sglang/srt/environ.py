@@ -1951,6 +1951,12 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3 gfx950 MoE pre-route: one FP8 launch computes the router logits,
+    # the latent down-projection and the shared gate-up for 1 to 4 tokens.
+    SGLANG_OPT_HIP_K3_MOE_PREROUTE_FP8 = EnvBool(False)
+    # With the pre-route on, run 2- and 4-token decode through the cooperative
+    # kernel, which returns the shared expert already SiTU-activated.
+    SGLANG_OPT_HIP_K3_PREROUTE_PREACTIVATED_SHARED = EnvBool(False)
     # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
     # falls back to AITER, "sglang" and "aiter" pin one source.
     SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
