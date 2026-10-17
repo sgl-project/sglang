@@ -4929,45 +4929,16 @@ class MLATokenToKVPool(KVCache):
         commit_lens: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        layer_id_override: Optional[int] = None,
     ):
-        """Commit each request's accepted prefix using the ordinary MLA writer.
+        """Write the first commit_lens[i] rows of each loc_2d [bs, n] row.
 
-        The sources contain one normalized latent and one rotated shared RoPE
-        key per token. Rejected rows target the reserved padding slot, which the
-        existing MLA scatter skips, keeping shapes static for CUDA graphs.
+        The other rows go to the reserved padding slot 0, which keeps shapes
+        static and avoids a host sync on commit_lens.
         """
-        if loc_2d.ndim != 2:
-            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
-        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
-            raise ValueError("commit_lens must match the loc_2d batch size.")
-        num_rows = loc_2d.numel()
-        expected_nope = (num_rows, 1, self.kv_lora_rank)
-        expected_rope = (num_rows, 1, self.qk_rope_head_dim)
-        if cache_k_nope.shape != expected_nope or cache_k_rope.shape != expected_rope:
-            raise ValueError(
-                "MLA prefix commit requires compressed latent/shared RoPE rows: "
-                f"expected {expected_nope} and {expected_rope}, got "
-                f"{tuple(cache_k_nope.shape)} and {tuple(cache_k_rope.shape)}."
-            )
-        if self.qk_rope_head_dim == 0:
-            raise NotImplementedError("MLA prefix commit requires a RoPE key.")
-        if num_rows == 0:
-            return
-        device = self.kv_buffer[0].device
-        loc_2d = loc_2d.to(device=device, dtype=torch.int64, non_blocking=True)
-        commit_lens = commit_lens.to(
-            device=device, dtype=torch.int32, non_blocking=True
-        )
-        row_offsets = torch.arange(loc_2d.shape[1], device=device)
-        valid_mask = row_offsets[None, :] < commit_lens[:, None]
-        loc = torch.where(valid_mask, loc_2d, 0).reshape(-1)
+        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        loc = torch.where(offsets < commit_lens[:, None], loc_2d, 0).reshape(-1)
         self.set_mla_kv_buffer(
-            layer,
-            KVWriteLoc(loc, physical=True),
-            cache_k_nope,
-            cache_k_rope,
-            layer_id_override=layer_id_override,
+            layer, KVWriteLoc(loc, physical=True), cache_k_nope, cache_k_rope
         )
 
     def get_mla_kv_buffer(
