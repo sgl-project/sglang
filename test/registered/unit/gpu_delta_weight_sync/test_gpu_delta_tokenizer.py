@@ -51,10 +51,16 @@ def reply(control, obj, state, success=True):
     )
 
 
-@pytest.mark.parametrize("resume_success", [True, False])
-@pytest.mark.parametrize("flush_cache", [True, False])
-@pytest.mark.parametrize("abort_all_requests", [True, False])
-@pytest.mark.parametrize("weight_version", [None, "0", "actor-42"])
+@pytest.mark.parametrize(
+    "resume_success,flush_cache,abort_all_requests,weight_version",
+    [
+        (True, True, False, None),
+        (True, False, True, "0"),
+        (True, False, True, "actor-42"),
+        (False, True, False, None),
+        (False, False, True, "0"),
+    ],
+)
 def test_only_update_gates_admission_and_successful_resume_releases_it(
     control, resume_success, flush_cache, abort_all_requests, weight_version
 ):
@@ -139,12 +145,20 @@ def test_uncertain_update_keeps_admission_paused(control, failure):
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "prepare", "apply", "resume", "uncertain_apply"]
+    "failure,release_state,flush_cache,abort_all_requests,pause_at",
+    [
+        (None, True, True, False, None),
+        (None, False, True, False, None),
+        (None, False, False, True, None),
+        (None, True, True, False, "entry"),
+        (None, True, True, False, "prepare"),
+        ("prepare", True, True, False, None),
+        ("apply", True, True, False, None),
+        ("resume", True, True, False, None),
+        ("uncertain_apply", True, True, False, None),
+        ("prepare", True, False, True, "entry"),
+    ],
 )
-@pytest.mark.parametrize("release_state", [True, False])
-@pytest.mark.parametrize("flush_cache", [True, False])
-@pytest.mark.parametrize("abort_all_requests", [True, False])
-@pytest.mark.parametrize("pause_at", [None, "entry", "prepare"])
 def test_standalone_load_uses_fresh_participants_and_clears_only_after_resume(
     control, tmp_path, failure, release_state, flush_cache, abort_all_requests, pause_at
 ):

@@ -260,9 +260,23 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
     }
 
 
-@pytest.mark.parametrize("local_control,ep_joiner", [(True, False), (False, True)])
-def test_describe_rejects_unsynchronized_control_topologies(
-    monkeypatch, local_control, ep_joiner
+@pytest.mark.parametrize(
+    "override,ep_joiner,message",
+    [
+        (
+            {"enable_dp_attention_local_control_broadcast": True},
+            False,
+            "global control",
+        ),
+        ({}, True, "global control"),
+        ({"attn_tp_size": 2}, False, "TP1/CP1/DCP1"),
+        ({"attn_cp_size": 2}, False, "TP1/CP1/DCP1"),
+        ({"attn_dcp_size": 2}, False, "TP1/CP1/DCP1"),
+        ({"pp_size": 2}, False, "TP1/CP1/DCP1"),
+    ],
+)
+def test_describe_rejects_unsupported_control_topologies(
+    monkeypatch, override, ep_joiner, message
 ):
     from sglang.srt import runtime_context
 
@@ -270,7 +284,16 @@ def test_describe_rejects_unsynchronized_control_topologies(
         runtime_context,
         "get_parallel",
         lambda: SimpleNamespace(
-            enable_dp_attention_local_control_broadcast=local_control
+            **(
+                dict(
+                    enable_dp_attention_local_control_broadcast=False,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    attn_dcp_size=1,
+                    pp_size=1,
+                )
+                | override
+            )
         ),
     )
     monkeypatch.setattr(
@@ -279,7 +302,7 @@ def test_describe_rejects_unsynchronized_control_topologies(
         lambda: SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=ep_joiner)),
     )
     control = GpuDeltaSchedulerControl(SimpleNamespace())
-    with pytest.raises(ValueError, match="global control broadcast"):
+    with pytest.raises(ValueError, match=message):
         control._describe("engine-0")
     assert control.session is None
 
@@ -303,6 +326,7 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
         lambda: SimpleNamespace(
             attn_tp_size=1,
             attn_cp_size=1,
+            attn_dcp_size=1,
             pp_size=1,
             enable_dp_attention_local_control_broadcast=False,
         ),
@@ -435,7 +459,8 @@ def test_clear_cannot_discard_an_unsettled_update(make_session, state):
     assert not backend.payload.closed.is_set()
 
 
-def test_clear_surfaces_failed_async_release_before_backend_close(make_session):
+@pytest.mark.parametrize("next_operation", ["clear", "prepare"])
+def test_failed_async_release_prevents_resource_reuse(make_session, next_operation):
     session, backend = make_session()
     applied(session, backend)
 
@@ -444,8 +469,19 @@ def test_clear_surfaces_failed_async_release_before_backend_close(make_session):
 
     backend.payload.release_and_close = fail_release
     session.resume(lambda _: None)
-    with pytest.raises(OSError, match="state release failed"):
-        session.clear()
+    if next_operation == "clear":
+        with pytest.raises(OSError, match="state release failed"):
+            session.clear()
+    else:
+        backend.started.clear()
+        session.prepare(
+            request([session.identity])
+            | dict(session_id="publication-2", base_version=1, target_version=2)
+        )
+        receipt = wait_state(session, "FAILED")
+        assert "state release failed" in receipt["message"]
+        assert not backend.started.is_set()
+        assert backend.payload.applications == 1
     assert session.version == 1 and not backend.closed
     assert session.backend is backend
 
@@ -569,8 +605,14 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         session._executor.shutdown(wait=True)
 
 
-def test_describe_binds_published_scheduler_ranks(monkeypatch):
-    rank = 7
+@pytest.mark.parametrize(
+    "tp_size,dp_size,attn_dp_size,world_rank,dp_rank",
+    [(8, 1, 8, 7, 7), (1, 2, 1, 0, 1), (1, 1, 1, 0, None)],
+    ids=["attention-dp", "replica-dp", "singleton"],
+)
+def test_describe_binds_published_scheduler_ranks(
+    monkeypatch, tp_size, dp_size, attn_dp_size, world_rank, dp_rank
+):
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
@@ -582,13 +624,13 @@ def test_describe_binds_published_scheduler_ranks(monkeypatch):
         publish(
             ServerArgs(
                 model_path="dummy",
-                tp_size=8,
-                dp_size=8,
-                ep_size=8,
-                enable_dp_attention=True,
+                tp_size=tp_size,
+                dp_size=dp_size,
+                attn_dp_size=attn_dp_size,
+                ep_size=tp_size,
             ),
             role="test",
-            ranks=SpawnRanks(world_rank=rank, dp_rank=rank),
+            ranks=SpawnRanks(world_rank=world_rank, dp_rank=dp_rank),
         )
         runner = SimpleNamespace(
             model=object(),
@@ -654,8 +696,8 @@ def test_describe_binds_published_scheduler_ranks(monkeypatch):
             "host_cache_id": "shared-host-test",
             "pid": 0,
             "start_ticks": 456,
-            "tp_rank": rank,
-            "dp_rank": rank,
+            "tp_rank": world_rank,
+            "dp_rank": 0 if dp_rank is None else dp_rank,
             "pp_rank": 0,
         }
         assert receipt["state"] == "IDLE" and receipt["version"] == 0

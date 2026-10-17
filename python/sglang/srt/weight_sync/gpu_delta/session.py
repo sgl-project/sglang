@@ -153,6 +153,10 @@ class DeltaSession:
     def _prepare(self, session: _Session) -> None:
         prepared = None
         try:
+            # The FIFO worker has finished the previous release. Propagate its
+            # failure before reusing buffers or replacing its completion future.
+            if self._release_future is not None:
+                self._release_future.result()
             req = session.request
             prepared = self.backend.prepare(
                 req["manifest_path"], req["manifest_sha256"], req
@@ -341,14 +345,17 @@ class GpuDeltaSchedulerControl:
             raise ValueError(
                 "GPU delta requires the global control broadcast without EP scale joiners"
             )
-        # The existing reply transport emits one reply per attention-DP rank.
-        # Reject hidden TP/CP/PP followers rather than claiming full coverage.
+        # The existing reply transport emits one reply per DP route.
+        # Reject hidden TP/CP/PP followers and unsupported DCP consumer caches.
         if (
             parallel.attn_tp_size != 1
             or parallel.attn_cp_size != 1
+            or parallel.attn_dcp_size != 1
             or parallel.pp_size != 1
         ):
-            raise ValueError("GPU delta currently requires attention TP1/CP1 and PP1")
+            raise ValueError(
+                "GPU delta currently requires attention TP1/CP1/DCP1 and PP1"
+            )
         if scheduler.enable_lora or str(scheduler.disaggregation_mode.value) != "null":
             raise ValueError(
                 "GPU delta currently requires no LoRA and no disaggregation"
@@ -381,7 +388,7 @@ class GpuDeltaSchedulerControl:
                 "pid": os.getpid(),
                 "start_ticks": start_ticks,
                 "tp_rank": parallel.tp_rank,
-                "dp_rank": parallel.attn_dp_rank,
+                "dp_rank": 0 if parallel.dp_rank is None else parallel.dp_rank,
                 "pp_rank": parallel.pp_rank,
             }
             backend = GpuDeltaBackend(runner, identity)

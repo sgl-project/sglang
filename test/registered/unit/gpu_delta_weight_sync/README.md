@@ -48,8 +48,8 @@ Fixed topology is required when routed experts are bound: expert TP=1, no
 presharded canonical checkpoint, EPLB, redundant experts or elastic joiners. The
 selected FlashInfer runner must match its dispatcher. Dense-only mappings do not
 need a MoE configuration. Ordinary globally ordered control broadcast is required;
-local broadcast, LoRA, disaggregated serving, unsupported attention/pipeline
-parallelism, shared IPC weight storage and HPC-Ops derived-weight caches are
+local broadcast, LoRA, disaggregated serving, attention TP/CP/DCP or pipeline
+widths above one, shared IPC weight storage and HPC-Ops derived-weight caches are
 rejected at admission. Delta application adds no distributed collectives.
 
 ## Ownership and lifecycle

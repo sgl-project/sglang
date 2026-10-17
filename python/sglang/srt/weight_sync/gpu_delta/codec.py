@@ -192,10 +192,7 @@ class NvcompDecoder:
 
     def _allocate_workspace(self, geometry) -> DecodeWorkspace:
         """One DE stream shares scratch; statuses/sizes belong to two slots."""
-        from sglang.srt.weight_sync.gpu_delta.memory import (
-            device_empty,
-            require_de_capable,
-        )
+        from sglang.srt.weight_sync.gpu_delta.memory import device_empty
 
         maximum_count = max((batch[0] for batch in geometry), default=0)
         temporary = max((self.temporary_bytes(batch) for batch in geometry), default=0)
@@ -206,13 +203,6 @@ class NvcompDecoder:
         )
         if temporary and workspace.temporary.data_ptr() % self.alignments.temp:
             raise ValueError("Misaligned decoder workspace")
-        for tensor in (
-            workspace.temporary,
-            workspace.actual_sizes,
-            workspace.statuses,
-        ):
-            if tensor.numel():
-                require_de_capable(tensor.data_ptr())
         return workspace
 
     def _frame_geometry(self, table, counts, input_base, input_bytes):
@@ -282,10 +272,7 @@ class NvcompDecoder:
         until the DE stream drains. Only input/size rows are uploaded now;
         ``bind_outputs`` fills output pointers under the serving pause.
         """
-        from sglang.srt.weight_sync.gpu_delta.memory import (
-            device_empty,
-            require_de_capable,
-        )
+        from sglang.srt.weight_sync.gpu_delta.memory import device_empty
 
         if (
             host_input.device.type != "cpu"
@@ -309,7 +296,6 @@ class NvcompDecoder:
             host_rows[1:3] = table[1:3]
             metadata = device_empty(host.shape, dtype=torch.int64, device=self.device)
             if metadata.numel():
-                require_de_capable(metadata.data_ptr())
                 metadata[:3].copy_(host[:3], non_blocking=True)
         return PreparedDecodePlan(
             self,
