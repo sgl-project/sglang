@@ -39,6 +39,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -5508,7 +5509,7 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(cities, ["NYC", "LA"])
 
 
-class TestGemma4Detector(unittest.TestCase):
+class TestGemma4Detector(CustomTestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -5648,6 +5649,63 @@ class TestGemma4Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "get_time")
         self.assertEqual(result.normal_text, "Some text ")
+
+    def test_null_and_exponent_argument_types(self):
+        """Bare nulls and exponent numbers retain their JSON types in both modes."""
+        cases = [
+            (
+                'limit:null,values:[null,{nested:null},[null]],text:<|"|>null<|"|>',
+                {
+                    "limit": None,
+                    "values": [None, {"nested": None}, [None]],
+                    "text": "null",
+                },
+            ),
+            (
+                "x:-3,y:2.5,tolerance:1e-05,large:1e+21,upper:-2E+3,zero:0e0,"
+                "values:[0,-0.5,{nested:2E3},[1e+21]],exact:true,other:false,"
+                'text:<|"|>1e-05<|"|>,bare:hello,malformed:1e-',
+                {
+                    "x": -3,
+                    "y": 2.5,
+                    "tolerance": 1e-05,
+                    "large": 1e21,
+                    "upper": -2e3,
+                    "zero": 0.0,
+                    "values": [0, -0.5, {"nested": 2e3}, [1e21]],
+                    "exact": True,
+                    "other": False,
+                    "text": "1e-05",
+                    "bare": "hello",
+                    "malformed": "1e-",
+                },
+            ),
+        ]
+        for args, expected in cases:
+            text = f"<|tool_call>call:get_weather{{{args}}}<tool_call|>"
+            for chunk_size in (None, 1, 7, len(text)):
+                with self.subTest(args=args, chunk_size=chunk_size):
+                    self.detector = Gemma4Detector()
+                    if chunk_size is None:
+                        result = self.detector.detect_and_parse(text, self.tools)
+                        self.assertEqual(len(result.calls), 1)
+                        self.assertEqual(result.calls[0].name, "get_weather")
+                        self.assertEqual(result.calls[0].tool_index, 0)
+                        parameters = result.calls[0].parameters
+                    else:
+                        chunks = [
+                            text[i : i + chunk_size]
+                            for i in range(0, len(text), chunk_size)
+                        ]
+                        normal_text, calls = self._collect_streaming(chunks)
+                        self.assertEqual(normal_text, "")
+                        self.assertEqual(list(calls), [0])
+                        self.assertEqual(calls[0]["name"], "get_weather")
+                        parameters = calls[0]["parameters"]
+                    actual = json.loads(parameters)
+                    self.assertEqual(actual, expected)
+                    for key in expected:
+                        self.assertIs(type(actual[key]), type(expected[key]))
 
     def test_parse_gemma4_args_empty(self):
         self.assertEqual(_parse_gemma4_args(""), {})
