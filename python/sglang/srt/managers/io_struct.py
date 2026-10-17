@@ -1924,6 +1924,14 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class GetSchedulerIdleReqInput(BaseReq, kw_only=True):
+    """Internal barrier probe used while abort-mode pause drains requests."""
+
+
+class GetSchedulerIdleReqOutput(BaseReq, kw_only=True):
+    is_idle: bool
+
+
 class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
