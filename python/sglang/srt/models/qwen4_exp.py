@@ -2641,12 +2641,6 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         return loaded_params
 
-    def precompile_kernels_after_loading(self) -> None:
-        from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
-
-        if precompile_splitk_tactics():
-            logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         text_config = getattr(config, "text_config", config)

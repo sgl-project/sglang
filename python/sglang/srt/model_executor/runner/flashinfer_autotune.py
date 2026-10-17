@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -144,7 +145,12 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or get_bf16_gemm_backend().is_cutedsl()
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:
