@@ -178,7 +178,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 model_config_of(server_args).hf_config.model_type == "deepseek_v41",
             ),
             (
-                "--enable-decoder-swa-bounded-replay",
+                "decoder SWA bounded replay",
                 cfg.enable_decoder_swa_bounded_replay,
             ),
             ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
@@ -373,37 +373,49 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "DeepSeek-V4.1; longer contexts run eager prefill."
         )
 
-    if cfg.enable_decoder_swa_bounded_replay:
-        # Late layers see a per-request tail slice, not the captured prefill shape.
-        # The breakable backend is admitted: the tail switch runs as eager breaks and
-        # the tail is a fixed-capacity row block inside the captured segments.
-        incompatible = (
-            (
-                "the prefill CUDA graph",
-                cfg.cuda_graph_config.prefill.backend
-                not in (Backend.DISABLED, Backend.BREAKABLE),
-            ),
-            # Late-layer communication uses one row count per attention-DP rank.
-            # Attention TP/CP shards need a separate tail padding layout.
-            (
-                "DP attention other than attention TP 1 with supported MoE backends",
-                attn_dp_enabled_of(cfg)
-                and not (
-                    cfg.attn_dp_size == cfg.tp_size
-                    and cfg.attn_cp_size == 1
-                    and (
-                        (get_platform().is_hip and cfg.moe_a2a_backend == "none")
-                        or (
-                            get_platform().is_cuda
-                            and cfg.moe_a2a_backend in ("none", "megamoe")
-                        )
+    incompatible = (
+        (
+            "the prefill CUDA graph",
+            cfg.cuda_graph_config.prefill.backend
+            not in (Backend.DISABLED, Backend.BREAKABLE),
+        ),
+        (
+            "DP attention other than attention TP 1 with supported MoE backends",
+            attn_dp_enabled_of(cfg)
+            and not (
+                cfg.attn_dp_size == cfg.tp_size
+                and cfg.attn_cp_size == 1
+                and (
+                    (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                    or (
+                        get_platform().is_cuda
+                        and cfg.moe_a2a_backend in ("none", "megamoe")
                     )
-                ),
+                )
             ),
-        )
-        for feature, enabled in incompatible:
-            if enabled:
+        ),
+    )
+    if cfg.enable_decoder_swa_bounded_replay:
+        for feature, unsupported in incompatible:
+            if unsupported:
                 raise ValueError(
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+        return
+
+    if cfg.enable_decoder_swa_bounded_replay is False:
+        return
+
+    enabled = (
+        (get_platform().is_cuda or get_platform().is_hip)
+        and cfg.disaggregation_mode == "null"
+        and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
+        and not any(enabled for _, enabled in incompatible)
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v41_features",
+        enable_decoder_swa_bounded_replay=enabled,
+    )
+    logger.info("DeepSeek-V4.1 decoder SWA bounded replay resolved to %s", enabled)

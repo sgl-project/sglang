@@ -2635,9 +2635,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         layer.mega_l1_weights = l1_pair
         layer.mega_l2_weights = l2_pair
-        layer.mega_l1_alphas = l1_alphas
-        layer.mega_l2_alphas = l2_alphas
-        layer.mega_l2_act_scales = l2_act_scales
+        # Parameters, so EPLB moves each expert's values with its weights.
+        for name, value in (
+            ("mega_l1_alphas", l1_alphas),
+            ("mega_l2_alphas", l2_alphas),
+            ("mega_l2_act_scales", l2_act_scales),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
         # Free the checkpoint layout.
         layer.w13_weight.data = l1_pair[0]
         layer.w13_weight_scale.data = l1_pair[1]
