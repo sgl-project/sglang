@@ -360,6 +360,7 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
                 corrected_logits=draft_logits,
                 greedy_mask=greedy_mask,
                 temperatures=torch.ones(batch, device=DEVICE),
+                greedy_draft=False,
             ),
             sampling_info=SimpleNamespace(
                 is_all_greedy=False,

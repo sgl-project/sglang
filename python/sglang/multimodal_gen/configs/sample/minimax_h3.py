@@ -8,6 +8,9 @@ import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_REFERENCE_RESIZE_MODES,
+)
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
 
@@ -25,8 +28,7 @@ def _optional_unit_float(value: Any, field_name: str) -> float | None:
 
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
-    # The video/audio sigma schedules include both interval endpoints.
-    min_num_inference_steps: ClassVar[int] = 2
+    min_num_inference_steps: ClassVar[int] = 1
 
     height: int = 512
     width: int = 896
@@ -49,6 +51,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
+    reference_resize_mode: str = field(default="diffusers")
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -63,6 +66,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "output_mode",
                 "imgvid_cond_noise_aug_for_inference",
                 "audio_cond_noise_aug_for_inference",
+                "reference_resize_mode",
             }
         )
 
@@ -280,6 +284,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 scalar seed plus output index must fit the "
                 "signed int64 upper bound"
             )
+        self.reference_resize_mode = str(self.reference_resize_mode).strip().lower()
+        if self.reference_resize_mode not in MINIMAX_H3_REFERENCE_RESIZE_MODES:
+            raise ValueError(
+                "reference_resize_mode must be one of {'match', 'max', 'diffusers'}, "
+                f"got {self.reference_resize_mode!r}"
+            )
 
     def build_request_extra(self, *, _seed_override: int | None = None) -> dict:
         _optional_unit_float(
@@ -348,14 +358,15 @@ class MiniMaxH3SamplingParams(SamplingParams):
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
     """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
 
-    num_inference_steps: int = 9
+    num_inference_steps: int = 8
     quality: str = "lossless"
 
     def _validate(self) -> None:
         super()._validate()
-        if self.num_inference_steps != 9:
+        if self.num_inference_steps != 8:
             raise ValueError(
-                "FastH3 is distilled for exactly nine sigma grid points (eight DiT "
+                "FastH3 is distilled for exactly eight inference steps (nine sigma "
+                "grid points, eight DiT "
                 f"forwards); got num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )

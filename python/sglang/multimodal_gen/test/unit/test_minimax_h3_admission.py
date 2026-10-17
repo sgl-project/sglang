@@ -34,6 +34,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    prequeue,
+    reference_encoding,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -337,6 +341,133 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         )
 
 
+def test_reference_resize_mode_is_declared_as_video_request_extra():
+    assert (
+        "reference_resize_mode" in MiniMaxH3SamplingParams.video_request_extra_fields()
+    )
+
+
+def test_video_adapter_lowers_reference_resize_mode():
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        conditions=[
+            {
+                "type": "image",
+                "uri": "file:///reference.png",
+                "role": "reference",
+            }
+        ],
+        target=TARGET,
+        reference_resize_mode="match",
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request,
+        {"prompt": request.prompt, "seed": request.seed},
+    )
+
+    assert lowered["reference_resize_mode"] == "match"
+
+
+def test_video_adapter_does_not_override_default_reference_resize_mode():
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        conditions=[
+            {
+                "type": "image",
+                "uri": "file:///reference.png",
+                "role": "reference",
+            }
+        ],
+        target=TARGET,
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request,
+        {"prompt": request.prompt, "seed": request.seed},
+    )
+
+    assert "reference_resize_mode" not in lowered
+
+
+def test_sampling_params_normalizes_reference_resize_mode_and_defaults_to_diffusers():
+    assert MiniMaxH3SamplingParams().reference_resize_mode == "diffusers"
+    assert (
+        MiniMaxH3SamplingParams(reference_resize_mode=" MATCH ").reference_resize_mode
+        == "match"
+    )
+
+
+@pytest.mark.parametrize("bad_mode", ["unknown", "", None, 1])
+def test_sampling_params_rejects_invalid_reference_resize_mode(bad_mode):
+    with pytest.raises(ValueError, match="reference_resize_mode"):
+        MiniMaxH3SamplingParams(reference_resize_mode=bad_mode)
+
+
+@pytest.mark.parametrize(
+    ("sampling_params", "expected_mode"),
+    [
+        (SimpleNamespace(reference_resize_mode="match"), "match"),
+        (SimpleNamespace(), "diffusers"),
+    ],
+)
+def test_prequeue_forwards_reference_resize_mode_and_target_canvas(
+    sampling_params, expected_mode
+):
+    material = SimpleNamespace(
+        condition_index=0,
+        condition_type="image",
+        material_chain="image.reference_preserve",
+        start_time_seconds=0.0,
+        uri="file:///reference.png",
+    )
+    plan = SimpleNamespace(
+        materials=(material,),
+        shape={
+            "geometry": "resolved_v2",
+            "width": 960,
+            "height": 544,
+            "fps": 24,
+            "frame_count": 124,
+        },
+        task="ref2va",
+    )
+    batch = SimpleNamespace(extra={}, sampling_params=sampling_params)
+    resolved_reference_shape = {
+        "geometry": "reference_image_resolved",
+        "width": 960,
+        "height": 544,
+    }
+
+    with (
+        patch.object(prequeue, "minimax_h3_plan_from_batch", return_value=plan),
+        patch.object(
+            prequeue,
+            "minimax_h3_probe_material",
+            return_value={"display_width": 1920, "display_height": 1080},
+        ),
+        patch.object(prequeue, "_replace_plan_shape", return_value=plan),
+        patch.object(
+            reference_encoding,
+            "minimax_h3_resolve_reference_image_shape",
+            return_value=resolved_reference_shape,
+        ) as resolve_reference_shape,
+    ):
+        assert prequeue.minimax_h3_prepare_for_queue(batch) is plan
+
+    resolve_reference_shape.assert_called_once_with(
+        width=1920.0,
+        height=1080.0,
+        canvas_width=960,
+        canvas_height=544,
+        mode=expected_mode,
+    )
+    assert batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY][0] == {
+        **resolved_reference_shape,
+        "condition_index": 0,
+    }
+
+
 @pytest.mark.parametrize("bad_quality", ["ultra", "draft", "", 1])
 def test_video_adapter_rejects_invalid_quality(bad_quality):
     request = VideoGenerationsRequest(
@@ -367,6 +498,7 @@ def _quality_server_args():
         enable_breakable_cuda_graph=False,
         enable_torch_compile=False,
         is_dit_layerwise_offload_selected=False,
+        lora_path=None,
         minimax_h3_adaln_online=False,
         performance_mode="speed",
         quantization=None,
@@ -451,6 +583,21 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
             stage.forward(batch, server_args)
 
         batch.num_inference_steps = 9
+        with pytest.raises(ValueError, match="9 AdaLN plans.*slab holds 8"):
+            stage.forward(batch, server_args)
+
+        batch.num_inference_steps = 8
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 1
+        assert stage.forward(batch, server_args) is batch
+
+        batch.num_inference_steps = 0
+        with pytest.raises(ValueError, match="num_inference_steps >= 1"):
+            stage.forward(batch, server_args)
+
+        server_args.minimax_h3_adaln_online = False
+        batch.num_inference_steps = 50
         assert stage.forward(batch, server_args) is batch
 
 
@@ -541,6 +688,32 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lora_path", "larryvrh/MiniMax-H3-Turbo-Lora"),
+        ("transformer_weights_path", "/weights/dit.safetensors"),
+    ],
+)
+def test_quality_admission_rejects_substituted_dit_weights(field, value):
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+    ):
+        config.validate_quality_deployment(server_args)
+        setattr(server_args, field, value)
+        with pytest.raises(ValueError, match=field):
+            config.validate_quality_deployment(server_args)
 
 
 def test_validate_server_args_requires_packed_varlen_backend():

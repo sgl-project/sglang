@@ -551,6 +551,45 @@ def test_masked_fused():
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
 
 
+@pytest.mark.parametrize("column_major", [False, True])
+def test_sorted_rows(column_major):
+    """Sorted MoE layout (TMA down input): rows the MoE GEMM never reads are
+    skipped, every other row is bit-identical to the flat kernel. hidden=512 is
+    one warp per row (4 groups), so each padding row is skipped as a whole."""
+    torch.manual_seed(11)
+    num_valid, block_m, num_blocks, hidden = 300, 16, 40, 512
+    rows = num_blocks * block_m + 7
+    num_post = (num_blocks - 3) * block_m
+    sorted_ids = torch.randint(0, num_valid, (rows,), dtype=torch.int32, device="cuda")
+    sorted_ids[torch.rand(rows, device="cuda") < 0.3] = num_valid
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+
+    ref_q = torch.zeros(rows, hidden, device="cuda", dtype=fp8_dtype)
+    ref_s = _alloc_scale((rows, hidden), column_major=column_major, scale_ue8m0=False)
+    per_token_group_quant(x, ref_q, ref_s, G)
+    x_q = torch.full_like(ref_q.view(torch.uint8), 0x7F).view(fp8_dtype)
+    x_s = _alloc_scale((rows, hidden), column_major=column_major, scale_ue8m0=False)
+    x_s.fill_(float("nan"))
+    per_token_group_quant(
+        x,
+        x_q,
+        x_s,
+        G,
+        sorted_token_ids=sorted_ids,
+        num_tokens_post_padded=torch.tensor(
+            [num_post], dtype=torch.int32, device="cuda"
+        ),
+        num_valid_tokens=num_valid,
+    )
+
+    row = torch.arange(rows, device="cuda")
+    kept = (row < num_post) & (sorted_ids < num_valid)
+    assert torch.equal(x_q.view(torch.uint8)[kept], ref_q.view(torch.uint8)[kept])
+    assert torch.equal(x_s[kept], ref_s[kept])
+    assert (x_q.view(torch.uint8)[~kept] == 0x7F).all(), "padding row written"
+    assert torch.isnan(x_s[~kept]).all(), "padding scale written"
+
+
 NON_FINITE_CASES = get_ci_test_range(
     list(
         itertools.product(
