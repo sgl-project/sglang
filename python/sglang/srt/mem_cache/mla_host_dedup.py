@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -17,9 +18,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_device_module, is_cuda
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 
 # These backends tolerate buffer-less host pools on non-source ranks.
@@ -51,18 +53,26 @@ def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
 
 
 class MLAHostDedupBroadcaster:
-    """Layerwise MLA/DSA broadcast over a dedicated NCCL group."""
+    """Layerwise MLA/DSA broadcast over a dedicated NCCL group.
+
+    With ``rotate_owners``, layer slot ``s`` (each KV layer, then each layer that
+    holds index keys) is owned and broadcast by dedup rank ``s % size``;
+    otherwise every layer comes from the source rank.
+    """
 
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
         group: torch.distributed.ProcessGroup,
         src_global_rank: int,
+        rotate_owners: bool = False,
     ):
         self.device_pool = device_pool
         self.group = group
         self.src_global_rank = src_global_rank
-        self.is_src = mla_dedup_rank_and_size()[0] == 0
+        self.dedup_rank, dedup_size = mla_dedup_rank_and_size()
+        self.is_src = self.dedup_rank == 0
+        self.owner_size = dedup_size if rotate_owners else None
         self.layer_num = device_pool.layer_num
         self.device = device_pool.device
         self.chunk_tokens = envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.get()
@@ -82,11 +92,18 @@ class MLAHostDedupBroadcaster:
         if isinstance(device_pool, DSATokenToKVPool):
             self.idx_bufs = device_pool.index_k_with_scale_buffer
             self.idx_elem = math.prod(self.idx_bufs[0].shape[1:]) or 1
+            # Index rows are pages: cover the same tokens as the KV staging.
+            idx_rows = max(
+                1, self.layer_num * self.chunk_tokens // device_pool.page_size
+            )
             self.idx_staging = torch.empty(
-                self.layer_num * self.chunk_tokens * self.idx_elem,
+                idx_rows * self.idx_elem,
                 dtype=self.idx_bufs[0].dtype,
                 device=self.device,
             )
+            # Shared-topk layers hold a 0-row placeholder and no index keys.
+            live = [i for i, buf in enumerate(self.idx_bufs) if buf.shape[0] > 0]
+            self.idx_ordinal = {layer: i for i, layer in enumerate(live)}
         logger.info(
             "MLA host-dedup broadcast chunk configured: base_tokens=%d, "
             "effective_layer_tokens=%d",
@@ -100,6 +117,7 @@ class MLAHostDedupBroadcaster:
         device_pool,
         tp_group: torch.distributed.ProcessGroup,
         attn_tp_group: Optional[torch.distributed.ProcessGroup],
+        **kwargs,
     ) -> MLAHostDedupBroadcaster:
         """Build and initialize the NCCL group before host-pool allocation."""
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
@@ -111,7 +129,7 @@ class MLAHostDedupBroadcaster:
         group = create_custom_parallel_group(
             group_ranks=list(group_ranks), backend="nccl"
         )
-        broadcaster = cls(device_pool, group, src_global_rank=group_ranks[0])
+        broadcaster = cls(device_pool, group, src_global_rank=group_ranks[0], **kwargs)
         broadcaster._warmup_group()
         return broadcaster
 
@@ -164,16 +182,24 @@ class MLAHostDedupBroadcaster:
             indices,
             self.device_pool.kv_cache_dim,
             layer_id,
+            owner=self._owner(layer_id),
         )
         if self.idx_bufs is not None:
             assert page_idx is not None
+            ordinal = self.idx_ordinal.get(layer_id)
+            if ordinal is None:
+                return
             self._bcast_layer(
                 self.idx_bufs,
                 self.idx_staging,
                 page_idx,
                 self.idx_elem,
                 layer_id,
+                owner=self._owner(self.layer_num + ordinal),
             )
+
+    def _owner(self, slot: int) -> Optional[int]:
+        return None if self.owner_size is None else slot % self.owner_size
 
     def _bcast_layer(
         self,
@@ -182,8 +208,14 @@ class MLAHostDedupBroadcaster:
         target,
         elem,
         layer_id: int,
+        owner: Optional[int] = None,
     ) -> None:
-        """Broadcast one layer in chunks using the shared staging buffer."""
+        """Broadcast one layer in chunks using the shared staging buffer.
+
+        ``owner`` is the dedup rank holding this layer; None means the source rank.
+        """
+        is_src = self.is_src if owner is None else owner == self.dedup_rank
+        root = {"src": self.src_global_rank} if owner is None else {"group_src": owner}
         n = target.shape[0]
         rows_per_chunk = staging.numel() // elem
         assert rows_per_chunk > 0
@@ -195,12 +227,10 @@ class MLAHostDedupBroadcaster:
             idx = target[start : start + cur]
             chunk = staging[: cur * elem]
             chunk_rows = chunk.view(cur, *row_shape)
-            if self.is_src:
+            if is_src:
                 torch.index_select(layer_buf, 0, idx, out=chunk_rows)
-            torch.distributed.broadcast(
-                chunk, src=self.src_global_rank, group=self.group
-            )
-            if not self.is_src:
+            torch.distributed.broadcast(chunk, group=self.group, **root)
+            if not is_src:
                 layer_buf.index_copy_(0, idx, chunk_rows)
 
     def destroy(self) -> None:
@@ -213,6 +243,15 @@ class MLAHostDedupBroadcaster:
         self.group = None
 
 
+class _PendingLoad(msgspec.Struct):
+    """A load-back whose layers the forward broadcasts as it reaches them."""
+
+    device_indices: torch.Tensor
+    finish_event: Any
+    prepared: Optional[tuple[torch.Tensor, Optional[torch.Tensor]]] = None
+    next_layer: int = 0
+
+
 @dataclass
 class MLAHostDedupContext:
     """All state owned by the optional MLA host-dedup path."""
@@ -222,6 +261,8 @@ class MLAHostDedupContext:
     prefetch_completion_sync_groups: Optional[List[torch.distributed.ProcessGroup]]
     producer_stream: Optional[object] = None
     last_write_finish_event: Optional[object] = None
+    # Load-backs by HiCache layer-done counter index, for broadcast_ready_layers.
+    pending_loads: dict[int, _PendingLoad] = field(default_factory=dict)
 
     @property
     def is_src(self) -> bool:
@@ -229,7 +270,37 @@ class MLAHostDedupContext:
 
     @property
     def is_dummy_rank(self) -> bool:
-        return not self.is_src
+        return self.broadcaster.owner_size is None and not self.is_src
+
+    def start_load(
+        self, *, index: int, device_indices: torch.Tensor, finish_event: Any
+    ) -> None:
+        """Queue load-back ``index``; its ack ``finish_event`` is recorded again
+        after the last broadcast, so waiting on the load waits on the broadcasts."""
+        self.pending_loads[index] = _PendingLoad(device_indices, finish_event)
+
+    def broadcast_ready_layers(self, index: int, threshold: int) -> None:
+        """Layer-wait hook: broadcast load ``index``'s layers up to ``threshold``.
+
+        Runs on the forward stream right after its wait for that layer's H2D copy,
+        so each layer is broadcast once, in order, at the same point of the
+        forward on every rank, and later layers keep loading meanwhile.
+        """
+        load = self.pending_loads.get(index)
+        if load is None:
+            return
+        broadcaster = self.broadcaster
+        if load.prepared is None:
+            load.prepared = broadcaster.prepare_broadcast(
+                load.device_indices, device_module.current_stream()
+            )
+        last = min(threshold, broadcaster.layer_num - 1)
+        for layer_id in range(load.next_layer, last + 1):
+            broadcaster.broadcast_loaded_layer(layer_id, load.prepared)
+        load.next_layer = max(load.next_layer, last + 1)
+        if load.next_layer == broadcaster.layer_num:
+            load.finish_event.record()
+            del self.pending_loads[index]
 
     def destroy(self) -> None:
         self.broadcaster.destroy()
@@ -252,16 +323,34 @@ def maybe_create_mla_host_dedup_context(
     attn_tp_group: Optional[torch.distributed.ProcessGroup],
     storage_backend: Optional[str],
     enabled: bool = False,
+    rotate_owners: bool = False,
 ) -> Optional[MLAHostDedupContext]:
-    """Create dedup state before host allocation, or preserve the original path."""
+    """Create dedup state before host allocation, or preserve the original path.
+
+    ``rotate_owners``: each layer's host copy lives on one rank in turn, instead
+    of all on the source rank (see MLAHostDedupBroadcaster).
+    """
     if not enabled:
         return None
     if not mla_host_dedup_eligible(kv_cache, storage_backend):
         return None
-    if mla_dedup_rank_and_size()[1] <= 1:
+    size = mla_dedup_rank_and_size()[1]
+    if size <= 1:
         return None
+    if rotate_owners:
+        layer_nums = [kv_cache.layer_num]
+        if isinstance(kv_cache, DSATokenToKVPool):
+            idx_bufs = kv_cache.index_k_with_scale_buffer
+            layer_nums.append(sum(buf.shape[0] > 0 for buf in idx_bufs))
+        if min(layer_nums) < size:
+            logger.warning(
+                "MLA host dedup inactive: %s layers < %d ranks", layer_nums, size
+            )
+            return None
 
-    broadcaster = MLAHostDedupBroadcaster.build(kv_cache, tp_group, attn_tp_group)
+    broadcaster = MLAHostDedupBroadcaster.build(
+        kv_cache, tp_group, attn_tp_group, rotate_owners=rotate_owners
+    )
     prefetch_hits_sync_groups = None
     prefetch_completion_sync_groups = None
     if storage_backend is not None:
