@@ -254,6 +254,9 @@ class MambaComponent(TreeComponent):
             )
         host_indices = host_pool.alloc(1)
         if host_indices is None:
+            self.cache.evict_host(1, ComponentType.MAMBA)
+            host_indices = host_pool.alloc(1)
+        if host_indices is None:
             raise RuntimeError(
                 "Not enough host memory for a mamba host-only checkpoint"
             )

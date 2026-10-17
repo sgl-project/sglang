@@ -107,6 +107,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # unless --enable-linear-replayssm is set.
         self.replayssm_write_pos_list = None
         self.replayssm_force_flush_list = None
+        self.replayssm_ring_indices_list = None
         self.query_start_loc_list = []
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
@@ -190,6 +191,11 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices
         )
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
+        replayssm_ring_indices = None
+        if self._replayssm_request_ring():
+            replayssm_ring_indices = forward_batch.req_pool_indices[:bs].to(
+                dtype=torch.int32
+            )
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -344,6 +350,7 @@ class MambaAttnBackendBase(AttentionBackend):
             logical_num_tokens=logical_num_tokens,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
+            replayssm_ring_indices=replayssm_ring_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
@@ -592,6 +599,25 @@ class MambaAttnBackendBase(AttentionBackend):
             return False
         return bool(mamba_pool.enable_linear_replayssm)
 
+    def _replayssm_request_ring(self) -> bool:
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        return bool(getattr(mamba_pool, "replayssm_request_ring", False))
+
+    def _fill_replayssm_ring_indices(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        num_padding: int = 0,
+    ) -> Optional[torch.Tensor]:
+        if not self.replayssm_ring_indices_list:
+            return None
+        buf = self.replayssm_ring_indices_list[bs - 1]
+        n = min(bs, int(req_pool_indices.shape[0]))
+        buf[:n].copy_(req_pool_indices[:n].to(dtype=buf.dtype))
+        if num_padding:
+            buf[bs - num_padding : bs].fill_(-1)
+        return buf
+
     def _replayssm_track_flush_mask(
         self, seq_lens_cpu: torch.Tensor, bs: int
     ) -> torch.Tensor:
@@ -617,6 +643,9 @@ class MambaAttnBackendBase(AttentionBackend):
         # refreshed in-place each replay; sized like state_indices_list. None when off.
         self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
         self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
+        self.replayssm_ring_indices_list = (
+            [] if self._replayssm_request_ring() else None
+        )
         # int64 to match DecodeInputBuffers.mamba_track_indices + the track-save
         # kernel's int64 index load. Refreshed in-place by _replay_metadata.
         self.mamba_track_indices_buf = torch.zeros(
@@ -635,6 +664,10 @@ class MambaAttnBackendBase(AttentionBackend):
             if self.replayssm_force_flush_list is not None:
                 self.replayssm_force_flush_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
+                )
+            if self.replayssm_ring_indices_list is not None:
+                self.replayssm_ring_indices_list.append(
+                    torch.full((i + 1,), -1, dtype=torch.int32, device=self.device)
                 )
             self.query_start_loc_list.append(
                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
@@ -669,12 +702,19 @@ class MambaAttnBackendBase(AttentionBackend):
         assert max_num_tokens % max_bs == 0, (
             f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         )
+        self.replayssm_ring_indices_list = (
+            [] if self._replayssm_request_ring() else None
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if self.replayssm_ring_indices_list is not None:
+                self.replayssm_ring_indices_list.append(
+                    torch.full((i + 1,), -1, dtype=torch.int32, device=self.device)
+                )
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
@@ -724,6 +764,9 @@ class MambaAttnBackendBase(AttentionBackend):
             if self.replayssm_force_flush_list is not None
             else None
         )
+        replayssm_ring_indices = self._fill_replayssm_ring_indices(
+            bs, req_pool_indices
+        )
 
         if forward_mode.is_target_verify() and self.topk > 1:
             # retrieve_* are None during capture, so skip the copy.
@@ -735,6 +778,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
         else:
             return ForwardMetadata(
@@ -742,6 +786,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
 
     def _replay_metadata(
@@ -932,6 +977,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=self._fill_replayssm_ring_indices(
+                    bs, req_pool_indices, num_padding
+                ),
             )
         else:
             return ForwardMetadata(
@@ -940,6 +988,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=self._fill_replayssm_ring_indices(
+                    bs, req_pool_indices, num_padding
+                ),
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -1560,6 +1611,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                 commit_kda_replayssm_after_verify,
             )
 
+            ring_indices = None
+            if getattr(mamba_pool, "replayssm_request_ring", False):
+                ring_indices = req_pool_indices[:request_number]
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
@@ -1569,6 +1623,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_steps_to_track=mamba_steps_to_track,
                 src_indices_raw=src_indices_raw,
                 null_block_id=-1,
+                ring_indices=ring_indices,
             )
             return
 
