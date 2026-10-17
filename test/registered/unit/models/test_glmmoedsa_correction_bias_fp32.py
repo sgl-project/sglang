@@ -24,7 +24,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 GLM_MAIN_ARCH = "GlmMoeDsaForCausalLM"
 GLM_NEXTN_ARCH = "GlmMoeDsaForCausalLMNextN"  # draft head, rewritten in model_config.py
-NON_GLM_ARCH = "DeepseekV3ForCausalLM"
 
 # Biases spanning a ~0.5-wide window around 34: distinct in fp32 (fp32 ULP ~4e-6
 # there), but within ~2-3 bf16 bins (bf16 ULP 0.25 at magnitude 34).
@@ -36,7 +35,7 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
     """Behavioral guard on the production dtype block in MoEGate.__init__.
 
     Fails on pre-fix code (GlmMoeDsa was downcast to bf16 like every other aiter
-    fp8 model); passes once the arch-gate skips the downcast for GlmMoeDsa.
+    fp8 model); passes now that the bias is always fp32.
     """
 
     def _build_gate(self, arch: str) -> MoEGate:
@@ -47,7 +46,7 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
             architectures=[arch],
         )
         quant_config = SimpleNamespace(get_name=lambda: "fp8")
-        # Force the aiter fp8 path (the branch that downcasts to bf16 for non-GLM);
+        # Force the aiter fp8 path (the branch that used to downcast to bf16);
         # _is_cpu=False avoids the AMX PackWeightMethod branch so the test is
         # deterministic across CPU and GPU CI runners.
         import sglang.srt.models.deepseek_v2 as dv2
@@ -63,12 +62,6 @@ class TestMoEGateCorrectionBiasDtype(CustomTestCase):
         # Guards the NextN draft head: the "GlmMoeDsa" substring must cover it too.
         gate = self._build_gate(GLM_NEXTN_ARCH)
         self.assertEqual(gate.e_score_correction_bias.dtype, torch.float32)
-
-    def test_non_glm_still_downcasts_bf16(self):
-        # Blast-radius guard: the fix must not widen dtype for other aiter models.
-        # Fails if the gate is accidentally made too broad (e.g. always-skip).
-        gate = self._build_gate(NON_GLM_ARCH)
-        self.assertEqual(gate.e_score_correction_bias.dtype, torch.bfloat16)
 
 
 class TestIsGlmMoeDsaHelper(CustomTestCase):
