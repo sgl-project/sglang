@@ -1067,6 +1067,7 @@ class TestTriFactorySizing(unittest.TestCase):
                             ),
                             device=_DEV,
                             kv_cache_dtype=torch.float16,
+                            kv_cache_dtype_str="float16",
                             page_size=1,
                             is_draft_worker=False,
                             use_mla_backend=False,
@@ -1075,6 +1076,11 @@ class TestTriFactorySizing(unittest.TestCase):
                             forward_stream=None,
                             # Spec off: no draft region to fuse.
                             _fused_draft_for_mamba_factory=lambda: None,
+                        )
+                        configurator._unified_scale_block_size = (
+                            cfg.KVCacheConfigurator._unified_scale_block_size.__get__(
+                                configurator
+                            )
                         )
                         # Run the production configurator AND factory. Reverting
                         # either top-level flag forwarding must break cleanup.

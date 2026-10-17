@@ -6,6 +6,8 @@ so a poisoned slot 0 defeats probability masking (0 * NaN = NaN in PV).
 Asserts require slot 0 to stay exactly zero, so finite-garbage writes fail too.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -26,12 +28,12 @@ def _make_pool(**kwargs):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
 
     return MHATokenToKVPoolMXFP8(
-        size=4 * PS,
+        size=kwargs.pop("size", 4 * PS),
         page_size=PS,
         dtype=torch.float8_e4m3fn,
         head_num=NHKV,
         head_dim=HD,
-        layer_num=1,
+        layer_num=kwargs.pop("layer_num", 1),
         device=DEV,
         enable_memory_saver=False,
         **kwargs,
@@ -106,6 +108,69 @@ def test_fused_quant_store_path_skips_reserved_slot():
     assert not torch.isnan(valid).any() and valid.abs().sum() > 0, (
         "fused valid write lost"
     )
+
+
+@requires_sm100
+def test_unified_fused_quant_store_matches_packed_pool():
+    """BF16 without descales must write strided payload and interleaved scales."""
+    from sglang.srt.mem_cache.unified_memory_pool import (
+        MHASubPoolSpec,
+        UnifiedKVPool,
+        build_unified_mha_pool,
+    )
+
+    torch.manual_seed(7)
+    spec = MHASubPoolSpec(
+        name="full",
+        layer_num=2,
+        head_num=NHKV,
+        head_dim=HD,
+        store_dtype=torch.uint8,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        scale_block_size=32,
+        grow_direction="down",
+    )
+    buffer = UnifiedKVPool(
+        total_bytes=8 * PS * spec.entry_bytes(),
+        sub_pool_specs=[spec, replace(spec, name="swa", grow_direction="up")],
+        device=DEV,
+        enable_memory_saver=False,
+        page_size=PS,
+    )
+    unified = build_unified_mha_pool(
+        unified_buffer=buffer,
+        sub_pool_name="full",
+        page_size=PS,
+        enable_alt_stream=False,
+    )
+    packed = _make_pool(size=unified.size, layer_num=2, enable_alt_stream=False)
+    assert not unified.k_buffer[0].is_contiguous()
+    assert not unified.v_buffer[0].is_contiguous()
+    # Compare every byte, including untouched slots and neighboring layers.
+    for pool in (unified, packed):
+        for buf in (
+            pool.k_buffer + pool.v_buffer + pool.k_scale_buffer + pool.v_scale_buffer
+        ):
+            buf.view(torch.uint8).zero_()
+
+    loc = torch.tensor([0, PS, PS + 31, PS + 32, 2 * PS - 1, 2 * PS], device=DEV)
+    for layer_id in range(2):
+        # Model K/V may themselves be strided views of a shared projection.
+        kv = torch.randn(len(loc), 2, NHKV, HD, dtype=torch.bfloat16, device=DEV)
+        k, v = kv.unbind(1)
+        k[0] = float("nan")
+        v[0] = float("nan")
+        layer = _Layer()
+        layer.layer_id = layer_id
+        unified.set_kv_buffer(layer, loc, k, v)
+        # Use independent quantization + store as the reference, rather than
+        # the same fused kernel, so quantization and scale writes are checked.
+        packed.set_kv_buffer(layer, loc, *_quantize(k, v))
+
+        for name in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer"):
+            for actual, expected in zip(getattr(unified, name), getattr(packed, name)):
+                assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    _assert_slot0_zero(unified)
 
 
 @requires_sm100
