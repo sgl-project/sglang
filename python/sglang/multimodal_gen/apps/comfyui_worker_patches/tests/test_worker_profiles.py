@@ -1,4 +1,4 @@
-"""Worker lifecycle, failure propagation and instance isolation."""
+"""Worker lifecycle, failure propagation and H3 compatibility constraints."""
 
 import multiprocessing as mp
 import os
@@ -11,15 +11,10 @@ import pytest
 from sglang.multimodal_gen.apps import comfyui_worker_patches as patches
 
 
-@pytest.fixture(autouse=True)
-def registered_test_profile(monkeypatch):
-    monkeypatch.setitem(patches.PROFILES, "test_v1", "test_provider")
-
-
 def test_registered_names_only():
     assert patches.canonical_profiles(None) == ()
-    assert patches.canonical_profiles(["test_v1"] * 2) == ("test_v1",)
-    for names in (["arbitrary.module:run"], "test_v1", [None]):
+    assert patches.canonical_profiles(["h3_comfyui_v1"] * 2) == ("h3_comfyui_v1",)
+    for names in (["arbitrary.module:run"], "h3_comfyui_v1", [None]):
         with pytest.raises(ValueError, match="Unknown"):
             patches.canonical_profiles(names)
 
@@ -27,7 +22,34 @@ def test_registered_names_only():
 def test_composition_rejected(monkeypatch):
     monkeypatch.setitem(patches.PROFILES, "other", "other")
     with pytest.raises(ValueError, match="one worker patch"):
-        patches.canonical_profiles(["test_v1", "other"])
+        patches.canonical_profiles(["h3_comfyui_v1", "other"])
+
+
+def test_wrong_family_rejected():
+    with pytest.raises(ValueError, match="model_type"):
+        patches.validate_options(["h3_comfyui_v1"], "flux", {})
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        {"num_gpus": 2},
+        {"enable_torch_compile": True},
+        {"enable_cuda_graph": True},
+        {"quantization": "fp8"},
+        {"cache_mode": "cache_dit"},
+        {"attention_backend": "sage_attn"},
+        {"component_attention_backends": {"transformer": "fa"}},
+        {"lora_path": "unreviewed.safetensors"},
+    ],
+)
+def test_unsupported_contract_rejected(option):
+    with pytest.raises(ValueError):
+        patches.validate_options(
+            ["h3_comfyui_v1"],
+            "minimax_h3",
+            {"attention_backend": "torch_sdpa"} | option,
+        )
 
 
 def test_default_launch_and_restore_on_failure(monkeypatch):
@@ -39,7 +61,7 @@ def test_default_launch_and_restore_on_failure(monkeypatch):
         assert module.bootstrap_scheduler_process is original
     with (
         pytest.raises(RuntimeError, match="launch failed"),
-        patches.scheduler_profiles(["test_v1"]),
+        patches.scheduler_profiles(["h3_comfyui_v1"]),
     ):
         assert module.bootstrap_scheduler_process is not original
         raise RuntimeError("launch failed")
@@ -112,3 +134,27 @@ def test_real_spawn_installs_after_load_or_aborts(fail):
             process.terminate()
             process.join(10)
         parent.close()
+
+
+def test_bound_helper_does_not_change_class_or_other_instances():
+    from sglang.multimodal_gen.apps.comfyui_worker_patches.h3 import bind_with_globals
+
+    class Example:
+        def run(self):
+            return os.getpid()
+
+    patched, original = Example(), Example()
+    function = Example.run
+    bind_with_globals(
+        patched, "run", {"os": types.SimpleNamespace(getpid=lambda: -123)}
+    )
+    assert patched.run() == -123
+    assert original.run() == os.getpid()
+    assert Example.run is function
+
+
+def test_h3_dynamic_lora_rejected():
+    from sglang.multimodal_gen.apps.comfyui_worker_patches.h3 import _reject_lora
+
+    with pytest.raises(ValueError, match="LoRA"):
+        _reject_lora("adapter")

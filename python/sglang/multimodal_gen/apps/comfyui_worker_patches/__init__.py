@@ -9,7 +9,7 @@ from functools import partial, wraps
 from importlib import import_module
 
 # Version is part of the name (and therefore the generator's reuse key).
-PROFILES = {}
+PROFILES = {"h3_comfyui_v1": "h3"}
 _STARTUP_LOCK = threading.RLock()
 
 
