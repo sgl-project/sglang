@@ -39,10 +39,10 @@ docker run --gpus all \
     sglang serve <use args below>
 ```
 
-**AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
+**AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 10 version.
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013
+docker pull lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261016
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013 \
+    lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261016 \
     sglang serve <use args below>
 ```
 
@@ -224,7 +224,12 @@ Agentic replay is a different workload: long-context prompts, multi-turn session
 
 Two commands follow, one per concurrency range. TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two GPUs also run DP attention with TP MoE.
 
-**TP2 or TP4, concurrency 1–32:** TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare. A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency. Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
+**TP2 or TP4, concurrency 1–32:**
+
+- TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
+- A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency.
+- Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
+- Concurrency ≤ 16 uses the same low-latency path as §3's Low-Latency card (`--monokernel-backend amd` and `--disable-shared-experts-fusion`, as in the command below); at concurrency 32 swap those two flags for `--enforce-shared-experts-fusion`.
 
 The braced values in the command follow concurrency:
 
@@ -250,6 +255,8 @@ TRITON_HIP_USE_ASYNC_COPY=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
 SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
 SGLANG_OPT_HIP_FLYDSL_MXFP8=1 \
+SGLANG_HIP_FP4_INDEXER_ROWGROUP=1 \
+SGLANG_HIP_DSV41_INDEX_K_PAGE8=1 \
 HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=2 \
 sglang serve \
@@ -259,7 +266,8 @@ sglang serve \
   --ep-size 1 \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
-  --enforce-shared-experts-fusion \
+  --monokernel-backend amd \
+  --disable-shared-experts-fusion \
   --fp8-gemm-backend aiter \
   --cuda-graph-backend-prefill disabled \
   --mem-fraction-static {mem-fraction-static} \
@@ -295,6 +303,8 @@ TRITON_HIP_USE_ASYNC_COPY=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
 SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
 SGLANG_OPT_HIP_FLYDSL_MXFP8=1 \
+SGLANG_HIP_FP4_INDEXER_ROWGROUP=1 \
+SGLANG_HIP_DSV41_INDEX_K_PAGE8=1 \
 HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=5 \
 SGLANG_SHARED_EXPERT_TP1=1 \
