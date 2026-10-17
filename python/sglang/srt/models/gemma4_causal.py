@@ -1191,7 +1191,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config, defer_xpu_verify_logits=True)
 
         # tie_word_embeddings ties lm_head to embed_tokens, but with PP those
         # tensors live on opposite ranks (first vs last).  In the PP > 1 case

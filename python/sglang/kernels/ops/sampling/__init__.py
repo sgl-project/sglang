@@ -100,7 +100,13 @@ def top_p_renorm_probs(
     return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(probs, top_p)
 
 
-__all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]
+__all__ = [
+    "cake_softmax",
+    "softmax",
+    "top_k_renorm_probs",
+    "top_p_renorm_probs",
+    "softcap_argmax",
+]
 
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
@@ -125,3 +131,24 @@ register_kernel(
         ),
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="sampling.softcap_argmax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.softcap_argmax_triton:softcap_argmax",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="BF16 [rows, vocab] to first-token argmax after FP32 softcap",
+        ),
+    )
+)
+
+
+def softcap_argmax(logits: torch.Tensor, softcap=None, sanitize=False):
+    """Return first-token argmax without materializing FP32 vocabulary logits."""
+    return get_kernel("sampling.softcap_argmax", KernelBackend.TRITON)(
+        logits, softcap=softcap, sanitize=sanitize
+    )
