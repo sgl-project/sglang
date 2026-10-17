@@ -14,6 +14,7 @@
 
 import logging
 import re
+from types import MethodType
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -24,6 +25,7 @@ from transformers import (
     PreTrainedModel,
 )
 
+from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
@@ -34,6 +36,7 @@ from sglang.kernels.ops.moe.gemma4_routing import (
     gemma_routing_post_topk,
 )
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
@@ -46,6 +49,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -56,6 +60,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -84,7 +89,134 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
-Gemma4MLP = Gemma3MLP
+class Gemma4MLP(Gemma3MLP):
+    def __init__(
+        self,
+        hidden_size,
+        intermediate_size,
+        hidden_activation,
+        quant_config=None,
+        prefix="",
+        reduce_results=True,
+    ):
+        super().__init__(
+            hidden_size,
+            intermediate_size,
+            hidden_activation,
+            quant_config,
+            prefix,
+            reduce_results,
+        )
+        self._xpu_gelu_mul_lut = None
+        self._xpu_gelu_mul_device = None
+        self._xpu_gate_up_activation_dispatch = None
+        self._xpu_gate_up_default_activation_forward = None
+        self.register_buffer("_xpu_gate_up_gelu_table", None, persistent=False)
+        if (
+            quant_config is None
+            and hidden_size == 1536
+            and intermediate_size in (6144, 12288)
+            and get_parallel().tp_size == 1
+            and get_fused_op_backend() is None
+            and torch.xpu.is_available()
+            and "B70" in torch.xpu.get_device_name(torch.xpu.current_device())
+        ):
+            if (
+                type(self.act_fn) is GeluAndMul
+                and self.act_fn.approximate == "tanh"
+                and getattr(self.act_fn.dispatch_forward, "__func__", None)
+                is BaseFusedOp.dispatch_forward
+            ):
+                # Resolve the standard platform dispatch before graph capture.
+                # Calling its hardware queries from forward breaks Dynamo when
+                # fusion means the standalone activation has never cached it.
+                selected = self.act_fn.dispatch_forward()
+                self._xpu_gate_up_activation_dispatch = BaseFusedOp.dispatch_forward
+                self._xpu_gate_up_default_activation_forward = getattr(
+                    selected, "__func__", None
+                )
+                if (
+                    self._xpu_gate_up_default_activation_forward
+                    is GeluAndMul.forward_xpu
+                ):
+                    from sglang.kernels.ops.activation import bf16_gelu_tanh_mul_lut
+
+                    self._xpu_gelu_mul_lut = bf16_gelu_tanh_mul_lut
+                    self._xpu_gelu_mul_device = torch.device(
+                        "xpu", torch.xpu.current_device()
+                    )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        projection = self.gate_up_proj
+        if (
+            x.ndim == 2
+            and x.shape[0] == 4096
+            and self._xpu_gelu_mul_lut is not None
+            and self._xpu_gate_up_gelu_table is not None
+            and type(projection) is MergedColumnParallelLinear
+            and type(projection.quant_method) is UnquantizedLinearMethod
+            and type(self.act_fn) is GeluAndMul
+            and self.act_fn.approximate == "tanh"
+            and get_fused_op_backend() is None
+            and isinstance(self.act_fn.dispatch_forward, MethodType)
+            and self.act_fn.dispatch_forward.__func__
+            is self._xpu_gate_up_activation_dispatch
+            and (
+                (
+                    self.act_fn._forward_method is None
+                    and self._xpu_gate_up_default_activation_forward
+                    is GeluAndMul.forward_xpu
+                )
+                or (
+                    isinstance(self.act_fn._forward_method, MethodType)
+                    and self.act_fn._forward_method.__func__ is GeluAndMul.forward_xpu
+                )
+            )
+            and isinstance(self.act_fn.forward_xpu, MethodType)
+            and self.act_fn.forward_xpu.__func__ is GeluAndMul.forward_xpu
+            and isinstance(self.act_fn._forward_impl, MethodType)
+            and self.act_fn._forward_impl.__func__ is GeluAndMul._forward_impl
+            and isinstance(self.act_fn.forward, MethodType)
+            and self.act_fn.forward.__func__ is GeluAndMul.forward
+            and isinstance(projection.forward, MethodType)
+            and projection.forward.__func__ is MergedColumnParallelLinear.forward
+            and isinstance(projection.quant_method.apply, MethodType)
+            and projection.quant_method.apply.__func__ is UnquantizedLinearMethod.apply
+            and not projection._forward_hooks
+            and not projection._forward_pre_hooks
+            and not self.act_fn._forward_hooks
+            and not self.act_fn._forward_pre_hooks
+            and not torch.nn.modules.module._global_forward_hooks
+            and not torch.nn.modules.module._global_forward_pre_hooks
+            and projection.bias is None
+            and x.shape[1] == 1536
+            and x.device.type == "xpu"
+            and x.device == self._xpu_gelu_mul_device
+            and self._xpu_gate_up_gelu_table.device == x.device
+            and self._xpu_gate_up_gelu_table.dtype == torch.bfloat16
+            and self._xpu_gate_up_gelu_table.shape == (65536,)
+            and self._xpu_gate_up_gelu_table.is_contiguous()
+            and not self._xpu_gate_up_gelu_table.requires_grad
+            and x.dtype == torch.bfloat16
+            and projection.weight.dtype == torch.bfloat16
+            and projection.weight.device == x.device
+            and (
+                projection.weight.shape == (24576, 1536)
+                or projection.weight.shape == (12288, 1536)
+            )
+            and x.is_contiguous()
+            and projection.weight.is_contiguous()
+            and not x.requires_grad
+            and not projection.weight.requires_grad
+        ):
+            # Retain the original projection and its accumulation order.
+            x, _ = projection(x)
+            x = self._xpu_gelu_mul_lut(x, self._xpu_gate_up_gelu_table)
+            x, _ = self.down_proj(x)
+            return x
+        return super().forward(x)
+
+
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
 
 
@@ -978,6 +1110,67 @@ class Gemma4TextModel(PreTrainedModel):
         self.layers_to_capture = []
         self.post_init()
 
+    def _initialize_xpu_gate_up_lut(self):
+        # Model-owned, nonpersistent storage; initialize after loading weights and
+        # before graph capture. Reloads reuse the allocation captured by graphs.
+        eligible = [
+            module
+            for module in self.modules()
+            if type(module) is Gemma4MLP
+            and module._xpu_gelu_mul_lut is not None
+            and module.gate_up_proj.weight.device.type == "xpu"
+            and module.gate_up_proj.weight.dtype == torch.bfloat16
+        ]
+        if not eligible:
+            return
+        device = eligible[0].gate_up_proj.weight.device
+        table = getattr(self, "_xpu_gate_up_lut_owner", None)
+        if table is None or table.device != device or table.dtype != torch.bfloat16:
+            from sglang.kernels.ops.activation import GeluTanhAndMulOp
+
+            with torch.xpu.device(device):
+                if torch.xpu.is_current_stream_capturing():
+                    raise RuntimeError("GELU table must be initialized before capture")
+                values = (
+                    torch.arange(65536, dtype=torch.int32, device=device)
+                    .to(torch.int16)
+                    .view(torch.bfloat16)
+                )
+                inputs = torch.cat([values, torch.ones_like(values)]).unsqueeze(0)
+                # Store the actual native BF16 GELU intermediate for every bit
+                # pattern; FP32 GELU values would change output rounding.
+                table = GeluTanhAndMulOp().forward_aot(inputs).flatten()
+            self.register_buffer("_xpu_gate_up_lut_owner", table, persistent=False)
+        for module in eligible:
+            if module.gate_up_proj.weight.device == device:
+                module.register_buffer(
+                    "_xpu_gate_up_gelu_table", table, persistent=False
+                )
+
+    def _assert_xpu_gate_up_lut_initialized(self):
+        expected = [
+            module
+            for module in self.modules()
+            if type(module) is Gemma4MLP
+            and module._xpu_gelu_mul_lut is not None
+            and module.gate_up_proj.weight.device.type == "xpu"
+            and module.gate_up_proj.weight.dtype == torch.bfloat16
+        ]
+        if not expected:
+            return
+        table = getattr(self, "_xpu_gate_up_lut_owner", None)
+        assert table is not None, "Loaded Gemma4 text owner has no GELU lookup table"
+        assert table.shape == (65536,) and table.dtype == torch.bfloat16
+        assert table.is_contiguous() and not table.requires_grad
+        assert all(
+            module._xpu_gate_up_gelu_table is table
+            and table.device == module.gate_up_proj.weight.device
+            for module in expected
+        ), "GELU table not propagated to loaded MLPs"
+        logger.debug(
+            "Initialized Gemma4 BF16 gate/up GELU table for %d layers", len(expected)
+        )
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -1479,6 +1672,8 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 names = sorted(p for p in unloaded_params if pred(p))
                 if names:
                     logger.log(level, "%s: %s", msg, names)
+        self.model._initialize_xpu_gate_up_lut()
+        self.model._assert_xpu_gate_up_lut_initialized()
         return loaded_params
 
     def _shard_weight(
