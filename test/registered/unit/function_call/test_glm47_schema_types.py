@@ -241,6 +241,35 @@ class TestGlm47SchemaTypes(unittest.TestCase):
                 {"value": raw},
             )
 
+    def test_python_set_literals_stay_json_serializable(self):
+        # ast.literal_eval reads these values as Python sets.
+        self.check_arguments(
+            {"properties": {"value": {"type": "number"}}}, {"value": "{1, 2}"}
+        )
+        raw = '{"env:prod", "service:web"}'
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="inspect",
+                    parameters={"properties": {"value": {"type": "array"}}},
+                ),
+            )
+        ]
+        text = (
+            f"<tool_call>inspect<arg_key>value</arg_key><arg_value>{raw}"
+            "</arg_value></tool_call>"
+        )
+        calls = Glm47MoeDetector().detect_and_parse(text, tools).calls
+        self.assertEqual(json.loads(calls[0].parameters), {"value": raw})
+        detector = Glm47MoeDetector()
+        detector.parse_streaming_increment(text, tools)
+        # The chat endpoint serializes these arguments when a stream finishes.
+        self.assertEqual(
+            json.loads(json.dumps(detector.prev_tool_call_arr[0]["arguments"])),
+            {"value": raw},
+        )
+
     def test_numeric_prefix_does_not_commit_to_invalid_json(self):
         tools = [
             Tool(
