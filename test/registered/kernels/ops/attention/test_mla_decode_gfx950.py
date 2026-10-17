@@ -4,8 +4,10 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.mla_decode_epilogue import mla_decode_epilogue
 from sglang.kernels.ops.attention.mla_decode_prep import mla_qk_prep
 from sglang.kernels.ops.attention.mla_split_reduce import mla_split_reduce
+from sglang.kernels.ops.attention.mla_v_up_gate import mla_v_up_gate
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -118,6 +120,64 @@ class TestMlaDecodeGfx950(CustomTestCase):
             )
             with self.subTest(splits=splits[:2], max_q=max_q):
                 self.assertEqual(_beyond_ulp(got[:, :H], want[:, :H]), 0)
+
+    @torch.inference_mode()
+    def test_v_up_gate_matches_bmm_then_gate(self):
+        """One launch keeps the bmm's and the gate's bf16 rounding points, with
+        w_vc held as the transposed view the model stores."""
+        g = torch.Generator(device="cuda").manual_seed(0)
+        w_vc = (torch.randn(H, V, L, generator=g, device="cuda") / L**0.5).bfloat16()
+        w_vc = w_vc.transpose(1, 2)
+        for tokens in (1, 4, 16, 64):
+            attn = torch.randn(tokens, HP, L, generator=g, device="cuda").bfloat16()[
+                :, :H
+            ]
+            gate = torch.randn(tokens, H * V, generator=g, device="cuda").bfloat16()
+            y = torch.bmm(attn.transpose(0, 1), w_vc).transpose(0, 1).flatten(1)
+            want = (
+                y.float() * torch.sigmoid(gate.float()).bfloat16().float()
+            ).bfloat16()
+            with self.subTest(tokens=tokens):
+                self.assertEqual(_beyond_ulp(mla_v_up_gate(attn, w_vc, gate), want), 0)
+                self.assertEqual(_beyond_ulp(mla_v_up_gate(attn, w_vc, None), y), 0)
+
+    @torch.inference_mode()
+    def test_epilogue_matches_split_reduce_then_v_up_gate(self):
+        """One launch must reproduce the backend's split combine followed by the
+        W_vc + gate kernel within one bf16 ulp: single-query and 4-row verify
+        tiles, rows stage 1 finalized, and rows with more splits than the
+        program's tile (combined in chunks)."""
+        cases = (
+            ([37, 0, 128, 5], 1, ()),
+            ([128, 3], 4, ()),
+            ([64, 128, 7, 1], 4, (1,)),
+            ([128] * 16, 4, ()),
+        )
+        for splits, max_q, uncovered in cases:
+            t = _partials(splits, max_q, uncovered, seed=len(splits) + max_q)
+            for gate in (t["gate"], None):
+                o_ref = t["o"].clone()
+                mla_split_reduce(
+                    t["partial"],
+                    t["lse"],
+                    t["indptr"],
+                    t["fmap"],
+                    t["pmap"],
+                    max_q,
+                    o_ref,
+                    H,
+                )
+                want = mla_v_up_gate(o_ref[:, :H, :], t["w"], gate)
+                got = mla_decode_epilogue(
+                    t["partial"], t["lse"], t["indptr"], t["fmap"], t["pmap"], t["o"],
+                    t["w"], gate, max_q=max_q,
+                )  # fmt: skip
+                with self.subTest(
+                    splits=splits[:4], max_q=max_q, gated=gate is not None
+                ):
+                    self.assertLessEqual(
+                        _beyond_ulp(got, want), max(got.numel() // 1000, 1)
+                    )
 
 
 if __name__ == "__main__":

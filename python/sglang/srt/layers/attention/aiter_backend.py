@@ -1492,7 +1492,12 @@ class AiterAttnBackend(AttentionBackend):
     def _forward_verify_split_mla(
         self, q_nope, q_rope, k_nope, k_rope, layer, forward_batch, save_kv_cache
     ):
-        from sglang.kernels.ops.attention import mla_decode_prep, mla_split_reduce
+        from sglang.kernels.ops.attention import (
+            mla_decode_epilogue,
+            mla_decode_prep,
+            mla_split_reduce,
+        )
+        from sglang.srt.layers.attention import mla_epilogue_handoff
 
         assert save_kv_cache, "split MLA q/k always writes its KV rows"
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1514,7 +1519,12 @@ class AiterAttnBackend(AttentionBackend):
         k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
         q_descale = self._unit_q_scale(q_pad.device) if fp8_q else k_descale
         kv_flat = k_buffer.view(-1, 1, 1, layer.qk_head_dim)
-        if q_pad.shape[0] > mla_split_reduce.MAX_ROWS:
+        rows = q_pad.shape[0]
+        defers = (
+            mla_epilogue_handoff.defers(layer)
+            and mla_decode_epilogue.MIN_ROWS <= rows <= mla_decode_epilogue.MAX_ROWS
+        )
+        if rows > mla_split_reduce.MAX_ROWS and not defers:
             kwargs = self._mla_verify_decode_kwargs(layer, k_descale)
             kwargs["q_scale"] = q_descale
             mla_decode_fwd(q_pad, kv_flat, o, **kwargs)
@@ -1562,7 +1572,7 @@ class AiterAttnBackend(AttentionBackend):
             0,
             True,  # causal
         )
-        mla_split_reduce.mla_split_reduce(
+        deferred = mla_epilogue_handoff.DeferredMlaReduce(
             logits,
             attn_lse,
             md.reduce_indptr,
@@ -1571,7 +1581,18 @@ class AiterAttnBackend(AttentionBackend):
             max_q,
             o,
             layer.tp_q_head_num,
+            # -1 / None: aiter plans the splits; the epilogue chunks past its tile.
+            (
+                self.max_split_per_batch
+                if (self.max_split_per_batch or 0) > 0
+                else mla_decode_epilogue.MAX_SPLITS
+            ),
         )
+        if defers:
+            # The model's epilogue combines the partials with W_vc and the gate.
+            mla_epilogue_handoff.defer(deferred)
+        else:
+            deferred.finish()
         return o[:, : layer.tp_q_head_num, :]
 
     def _mla_decode_fwd_with_head_pad(
