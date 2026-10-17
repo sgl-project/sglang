@@ -105,6 +105,10 @@ class FakeKVSender(BaseKVSender):
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric()
 
+    def mark_prefill_chunk_ready(self) -> None:
+        # Warmup and health checks have no decode peer.
+        pass
+
     def mark_prefill_complete(self) -> None:
         # Warmup and health checks use a fake sender even with a real PD manager.
         # They have no decode peer to admit or notify.

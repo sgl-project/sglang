@@ -193,6 +193,13 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def mark_prefill_chunk_ready(self) -> None:
+        """Publish allocation readiness after accepting the first prefill chunk.
+
+        This does not signal transfer completion or allow decode execution.
+        """
+        raise NotImplementedError
+
     def mark_prefill_complete(self) -> None:
         """Publish retained final-prefill KV for an enabled allocation policy."""
         raise NotImplementedError

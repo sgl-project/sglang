@@ -326,6 +326,12 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
         self.generate("The capital of France is")
 
 
+class TestFirstChunkAllocation(TestPrefillCompleteAllocation):
+    """Run the same multi-chunk, prefix, abort and retraction checks for first_chunk."""
+
+    policy = "first_chunk"
+
+
 class TestPrefillCompleteRetry(_PrefillCompleteServer):
     extra_prefill_env = {"SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB": "1"}
 
@@ -345,6 +351,10 @@ class TestPrefillCompleteRetry(_PrefillCompleteServer):
         self._run_concurrent_requests()
         self.assertGreaterEqual(self._retry_count() - before, 8)
         self._flush_when_idle()
+
+
+class TestFirstChunkRetry(TestPrefillCompleteRetry):
+    policy = "first_chunk"
 
 
 class TestPrefillCompleteTimeout(_PrefillCompleteServer):

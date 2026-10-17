@@ -464,7 +464,7 @@ class PrefillBootstrapQueue:
         return (
             req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
             or get_disagg().disaggregation_decode_allocation_policy
-            == "prefill_complete"
+            in ("first_chunk", "prefill_complete")
         ) and not (
             _uses_write_through_cache(self.scheduler.tree_cache)
             and req.swa_branching_seqlen is not None
@@ -1026,6 +1026,13 @@ class SchedulerDisaggregationPrefillMixin:
                     == "prefill_complete"
                 ):
                     req.disagg_kv_sender.mark_prefill_complete()
+                elif (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    == "first_chunk"
+                ):
+                    # For a single-chunk prefill, accept the final token and
+                    # sidecars before publishing readiness, just as above.
+                    req.disagg_kv_sender.mark_prefill_chunk_ready()
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
@@ -1072,6 +1079,16 @@ class SchedulerDisaggregationPrefillMixin:
                             last_prefill_chunk=False,
                         )
                         logprob_pt += num_input_logprobs
+
+                if (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    == "first_chunk"
+                ):
+                    # The result copy is complete and abort/yield checks have
+                    # passed. Repeated chunks are idempotent at the sender.
+                    # Destination admission is independent of the final-token
+                    # and whole-transfer completion barriers.
+                    req.disagg_kv_sender.mark_prefill_chunk_ready()
 
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
@@ -1153,8 +1170,7 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                 elif (
                     poll == KVPoll.Bootstrapping
-                    and get_disagg().disaggregation_decode_allocation_policy
-                    != "prefill_complete"
+                    and get_disagg().disaggregation_decode_allocation_policy == "early"
                     and self.req_to_token_pool.available_size() == 0
                     and (
                         self.waiting_queue
@@ -1381,8 +1397,7 @@ class SchedulerDisaggregationPrefillMixin:
                     # bootstrap failed
                     self.chunked_req = None
                 elif (
-                    get_disagg().disaggregation_decode_allocation_policy
-                    != "prefill_complete"
+                    get_disagg().disaggregation_decode_allocation_policy == "early"
                     and self.has_bootstrapped_waiting_req()
                 ):
                     # optimistic request yields to waiting requests
@@ -1721,8 +1736,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.storage_prefetch_last_match_len = yielded_prefix_len or None
         if (
             req.prefill_attempt_count >= max_attempts
-            and get_disagg().disaggregation_decode_allocation_policy
-            != "prefill_complete"
+            and get_disagg().disaggregation_decode_allocation_policy == "early"
         ):
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
