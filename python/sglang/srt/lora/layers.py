@@ -1020,13 +1020,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self,
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
+        *,
+        experts_shared_outer_loras: bool = False,
+        max_lora_rank: Optional[int] = None,
     ):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
         lora_backend.is_moe_lora = True
 
-        self.experts_shared_outer_loras: bool = False
+        # Match the factor layout and physical rank allocated by the memory pool.
+        self.experts_shared_outer_loras: bool = experts_shared_outer_loras
+        self._max_lora_rank = max_lora_rank
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
@@ -1055,10 +1060,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        # Use the runner selected by the quant method so per-format backend resolution
-        # stays identical between base and LoRA forwards.
+        # Explicit LoRA engines take precedence over the base layer's vendor runner.
         global_backend = get_moe_runner_backend()
-        if base_layer.runner is not None:
+        if (
+            global_backend.is_lora()
+            or global_backend.is_experimental_sgl_trtllm()
+            or global_backend.is_experimental_sgl_marlin()
+        ):
+            runner_backend = global_backend
+        elif base_layer.runner is not None:
             runner_backend = base_layer.runner.runner_backend
         elif not global_backend.is_auto():
             runner_backend = global_backend
@@ -1083,6 +1093,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 "--moe-runner-backend lora_cutedsl, lora_triton, or lora_marlin; "
                 "mixing new and legacy LoRA backends is unsupported"
             )
+        if runner_backend.is_lora():
+            self._initialize_moe_lora_execution(base_layer)
+            return
+
         if runner_backend.is_experimental_sgl_trtllm():
             from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
                 init_experimental_sgl_trtllm_lora,
@@ -1130,6 +1144,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 base_layer, runner_backend
             )
 
+    def _initialize_moe_lora_execution(self, base_layer: FusedMoE) -> None:
+        """Bind plans and providers once, using the pool's factor layout and rank."""
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        # lora_* runners pair only with triton_v2, which owns the shared workspace.
+        self._moe_lora_runner = MoeLoraRunner.from_layer(
+            base_layer,
+            workspace=self.lora_backend.lora_workspace,
+            is_shared_outer=self.experts_shared_outer_loras,
+            physical_rank=self._max_lora_rank,
+        )
+        # Keep dispatch, combine, and distributed reduction in the base layer.
+        self._base_run_moe_core = base_layer.run_moe_core
+        base_layer.run_moe_core = self._run_moe_core_with_lora
+
     def set_lora_info(
         self,
         gate_up_lora_a_weights: torch.Tensor,
@@ -1143,6 +1172,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
+
+    def _get_moe_lora_batch(self):
+        from sglang.srt.lora.moe.runner import MoeLoraBatch
+
+        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
+        return MoeLoraBatch(
+            gate_up_lora_a=self.gate_up_lora_a_weights,
+            gate_up_lora_b=self.gate_up_lora_b_weights,
+            down_lora_a=self.down_lora_a_weights,
+            down_lora_b=self.down_lora_b_weights,
+            token_lora_mapping=batch_info.token_slots[: batch_info.num_tokens],
+            use_cuda_graph=batch_info.use_cuda_graph,
+            is_prefill=batch_info.is_prefill,
+        )
 
     def _get_lora_info(self):
         """Build the legacy engine's batch payload."""
@@ -1202,8 +1245,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
-        # DP-attention idle forward: no batch_info, run the base MoE path.
-        if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
+        # The lora_* path replaces run_moe_core inside the base forward.
+        if (
+            self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None
+            or self._lora_runner_backend.is_lora()
+        ):
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch
@@ -1211,6 +1257,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
+
+    def _run_moe_core_with_lora(self, dispatch_output):
+        if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
+            return self._base_run_moe_core(dispatch_output=dispatch_output)
+        return self._moe_lora_runner.run(dispatch_output, self._get_moe_lora_batch())
 
     def _forward_with_lora(
         self,
@@ -1371,11 +1422,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, lora_backend: BaseLoRABackend
+    layer: nn.Module,
+    lora_backend: BaseLoRABackend,
+    *,
+    experts_shared_outer_loras: bool = False,
+    max_lora_rank: Optional[int] = None,
 ) -> BaseLayerWithLoRA:
+    if isinstance(layer, FusedMoE):
+        return FusedMoEWithLoRA(
+            layer,
+            lora_backend,
+            experts_shared_outer_loras=experts_shared_outer_loras,
+            max_lora_rank=max_lora_rank,
+        )
+    # Inkling QKVR needs custom LoRA-B slicing despite being a merged linear.
+    if getattr(layer, "is_inkling_qkvr", False):
+        return InklingQKVRLinearWithLoRA(layer, lora_backend)
+
     supported_layer_types = {
         # the order matters
-        FusedMoE: FusedMoEWithLoRA,
         ParallelLMHead: ParallelLMHeadWithLoRA,
         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
         ReplicatedLinear: ReplicatedLinearWithLoRA,
@@ -1384,14 +1449,9 @@ def get_lora_layer(
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
         RowParallelLinear: RowParallelLinearWithLoRA,
     }
-    # Inkling's fused qkvr needs replication-aware LoRA-B slicing (see InklingQKVRLinear);
-    # it IS a MergedColumnParallelLinear, so this must precede the isinstance loop.
-    if getattr(layer, "is_inkling_qkvr", False):
-        return InklingQKVRLinearWithLoRA(layer, lora_backend)
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(layer, lora_backend)
-            return ret
+            return lora_layer_type(layer, lora_backend)
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
 
 

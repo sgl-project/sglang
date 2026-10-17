@@ -177,6 +177,60 @@ def check_lora_server_args(server_args: Any):
             "--lora-drain-wait-threshold must be non-negative."
         )
 
+    check_lora_moe_runner_args(server_args)
+
+
+def check_lora_moe_runner_args(server_args: Any):
+    """Reject unsupported LoRA MoE configurations before layer attachment."""
+    cfg = resolving_view(server_args)
+    if (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_moe_runner_backend is not None
+        and cfg.speculative_moe_runner_backend.startswith("lora")
+    ):
+        # Draft models have no LoRA adapters.
+        raise ValueError(
+            f"--speculative-moe-runner-backend {cfg.speculative_moe_runner_backend} "
+            "is not supported: the LoRA MoE runner serves adapter traffic on the "
+            "target model"
+        )
+    backend = cfg.moe_runner_backend
+    if not backend.startswith("lora"):
+        return
+    if not cfg.enable_lora:
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires --enable-lora (or --lora-paths)"
+        )
+    if cfg.lora_backend != "triton_v2":
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires --lora-backend triton_v2"
+        )
+    _check_v2_lora_modes(cfg, f"--moe-runner-backend {backend}")
+    # Layer attachment checks the specific weight layout within each scheme.
+    if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
+        raise ValueError(
+            f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
+            f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
+        )
+    if cfg.moe_a2a_backend != "none":
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires Standard dispatch, "
+            f"got --moe-a2a-backend {cfg.moe_a2a_backend}"
+        )
+    if cfg.ep_join_mode is not None:
+        raise ValueError(
+            f"--moe-runner-backend {backend} does not yet support elastic EP"
+        )
+    if (
+        cfg.enable_eplb
+        or cfg.init_expert_location != "trivial"
+        or cfg.ep_num_redundant_experts > 0
+    ):
+        raise ValueError(
+            f"--moe-runner-backend {backend} currently requires trivial expert placement "
+            "without EPLB or redundant experts"
+        )
+
 
 def check_lora_speculative_compatibility(server_args: Any):
     """Validate LoRA + speculative decoding combinations.
