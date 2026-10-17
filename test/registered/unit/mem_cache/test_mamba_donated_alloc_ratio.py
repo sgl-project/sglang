@@ -11,7 +11,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
+    TreeLock,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
@@ -160,6 +161,46 @@ class TestMambaRatioEnvGate(unittest.TestCase):
             r(extra_buffer=True, lazy=False, disable_overlap=False), 4
         )  # overlap
 
+    def test_lazy_donation_releases_only_its_prefix_state(self):
+        from sglang.srt import runtime_context as rc
+
+        for slots_per_req in (3, 4):
+            with self.subTest(slots_per_req=slots_per_req):
+                component, cache, _ = _build_peak(slots_per_req * N, lock_prefixes=True)
+                cache.allocator.alloc((slots_per_req - 2) * N)
+                nodes = {node.id: node for node in cache.prefix_nodes}
+                full = _RecordingComp(ComponentType.FULL, 2)
+                cache.components = (full, component)
+                cache.node_by_id = nodes.__getitem__
+                cache._assert_receipt_anchor = UnifiedTreeCore._assert_receipt_anchor
+                cache._update_evictable_leaf_sets = lambda _: None
+                cache._release_components = MethodType(
+                    UnifiedTreeCore._release_components, cache
+                )
+                cache.dec_lock_ref = MethodType(UnifiedTreeCore.dec_lock_ref, cache)
+                with rc.get_context().override_server_args(
+                    disable_radix_cache=False,
+                    mamba_radix_cache_strategy="extra_buffer_lazy",
+                ):
+                    for node in nodes.values():
+                        req = SimpleNamespace(
+                            lock=TreeLock(node.id, DecLockRefParams(node_id=node.id))
+                        )
+                        released = len(full.released)
+                        self.assertEqual(cache.allocator.free_ids, [])
+                        self.assertIsNotNone(component._alloc_mamba_slot(req))
+                        self.assertEqual(
+                            node.component_data[ComponentType.MAMBA].lock_ref, 0
+                        )
+                        self.assertEqual(
+                            req.lock.receipt.skipped_lock_components,
+                            (ComponentType.MAMBA,),
+                        )
+                        self.assertEqual(len(full.released), released)
+                        cache.dec_lock_ref(req.lock.node, req.lock.receipt)
+                        self.assertEqual(len(full.released), released + 1)
+                    self.assertEqual(len(full.released), N)
+
 
 class _RecordingComp:
     """Fake tree component: records the dec params it is asked to release with."""
@@ -172,7 +213,7 @@ class _RecordingComp:
     def eviction_priority(self, is_leaf):
         return self._priority
 
-    def release_component_lock(self, node, params):
+    def release_component_lock(self, node, params, lock_host=False):
         self.released.append(params)
 
     def release_window_lock(  # SWA only
