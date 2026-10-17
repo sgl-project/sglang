@@ -10,6 +10,8 @@ import logging
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 
@@ -92,6 +94,30 @@ def maybe_assert_sum(tensor: torch.Tensor, expected: int, msg: str = "") -> None
     torch._assert_async(tensor.sum() == expected, msg)
 
 
+# Device assertions must remain enabled independently of TRITON_DEBUG.
+@triton.jit(debug=True, do_not_specialize=["columns", "blocks_per_row", "stride_row"])
+def assert_no_nan_kernel(
+    tensor,
+    columns,
+    blocks_per_row,
+    stride_row,
+    stride_col,
+    STRIDED: tl.constexpr,
+    MESSAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    block = tl.program_id(0)
+    if STRIDED:
+        row = (block // blocks_per_row).to(tl.int64)
+        cols = (block % blocks_per_row).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        offsets = row * stride_row + cols * stride_col
+    else:
+        cols = block.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        offsets = cols
+    values = tl.load(tensor + offsets, cols < columns, 0)
+    tl.device_assert(values == values, MESSAGE)
+
+
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
     if not (
@@ -103,7 +129,36 @@ def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     # capture_hidden_mode=NULL paths (STANDALONE speculative decoding).
     if tensor is None:
         return
-    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
+    message = f"NaN detected! {msg}"
+    # torch.compile can eliminate the read-only Triton call, losing its assertion.
+    if torch.compiler.is_compiling() or not (
+        tensor.is_cuda
+        and tensor.is_floating_point()
+        and (tensor.is_contiguous() or tensor.ndim == 2)
+    ):
+        torch._assert_async(~torch.any(torch.isnan(tensor)), message)
+        return
+    if tensor.numel():
+        if tensor.is_contiguous():
+            rows, columns, stride_row, stride_col = 1, tensor.numel(), 0, 1
+        else:
+            rows, columns = tensor.shape
+            stride_row, stride_col = tensor.stride()
+            if 0 < stride_row < stride_col:
+                rows, columns = columns, rows
+                stride_row, stride_col = stride_col, stride_row
+        blocks_per_row = triton.cdiv(columns, 1024)
+        assert_no_nan_kernel[(rows * blocks_per_row,)](
+            tensor,
+            columns,
+            blocks_per_row,
+            stride_row,
+            stride_col,
+            not tensor.is_contiguous(),
+            message,
+            1024,
+            num_warps=4,
+        )
 
 
 def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
