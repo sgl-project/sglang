@@ -84,6 +84,9 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self.prompt_text_is_lossy = chat_serving._prompt_text_round_trip_is_lossy
         self.decision_config = self.tokenizer_manager.model_config.decision_config
         self.joint_head_config = self.tokenizer_manager.model_config.joint_head_config
+        self.compact_decision_readout = getattr(
+            self.tokenizer_manager.model_config, "compact_decision_readout", False
+        )
         tokenizer = self.tokenizer_manager.tokenizer
         # Other tokenizers skip the shortcut in _encode_labels and check the full prompt.
         self.added_tokens = (
@@ -155,7 +158,10 @@ class OpenAIServingDecisions(OpenAIServingBase):
     def _validate_server(self, model: str) -> Optional[str]:
         """Refuse servers this route cannot render faithfully."""
         route = self.route
-        if not self.tokenizer_manager.is_generation:
+        if (
+            not self.tokenizer_manager.is_generation
+            and not self.compact_decision_readout
+        ):
             return f"{route} requires a generation model"
         if self.tokenizer_manager.tokenizer is None:
             return f"{route} requires the server tokenizer"
