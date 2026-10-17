@@ -980,6 +980,44 @@ def commit_mamba_states_after_verify(
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
 
+    # UBTree KDA factorized verify: all tree-node outputs were computed without
+    # materializing per-node [V,K] states. Replay only the sampled
+    # root-to-node accept path, then perform the existing conv rollback.
+    if (
+        mamba_pool is not None
+        and getattr(mamba_pool, "factorized_kda_tree", False) is True
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            commit_kda_tree_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+        factor_cache_indices = torch.arange(
+            accept_lens.shape[0], dtype=torch.int32, device=accept_lens.device
+        )
+        commit_kda_tree_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            factor_cache_indices=factor_cache_indices,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
+            tree_width=draft_token_num,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
+        )
+        return
+
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
     # track slot, so no SSM scatter or force-flush is needed here.

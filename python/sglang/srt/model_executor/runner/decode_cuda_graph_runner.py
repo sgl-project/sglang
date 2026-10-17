@@ -713,6 +713,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        can_run_hook = getattr(
+            self.model_runner.spec_algorithm, "can_run_cuda_graph", None
+        )
+        if can_run_hook is not None and not can_run_hook(
+            forward_batch, is_draft_worker=self.model_runner.is_draft_worker
+        ):
+            return False
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -1679,6 +1687,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return output
 
     def get_spec_info(self, num_tokens: int):
+        custom_builder = getattr(
+            self.model_runner.spec_algorithm,
+            "create_cuda_graph_verify_input",
+            None,
+        )
+        if custom_builder is not None:
+            spec_info = custom_builder(
+                custom_mask=self.buffers.custom_mask,
+                num_tokens_per_req=self.captured_req_width,
+                is_draft_worker=self.model_runner.is_draft_worker,
+            )
+            if spec_info is not None:
+                return spec_info
+
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()

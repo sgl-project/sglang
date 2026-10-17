@@ -274,15 +274,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Preload tree attention data if needed
     if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-        token_indices = tl.arange(0, NP2_T)
-        mask_retrieve = token_indices < T
-        retrieve_parent_token_base = (
-            retrieve_parent_token_ptr
-            + (i_n * stride_retrieve_parent_token_seq)
-            + token_indices * stride_retrieve_parent_token_token
-        )
-        parent_idx_tokens = tl.load(
-            retrieve_parent_token_base, mask=mask_retrieve, other=0
+        retrieve_parent_token_base = retrieve_parent_token_ptr + (
+            i_n * stride_retrieve_parent_token_seq
         )
 
     # Prepare intermediate state cache index if enabled. int64: the buffer is
@@ -298,8 +291,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+                parent_step_idx = tl.load(
+                    retrieve_parent_token_base
+                    + step_idx * stride_retrieve_parent_token_token
                 )
                 step_offset = parent_step_idx * HV * K * V
                 cache_ptr = (
@@ -528,6 +522,479 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+@triton.jit
+def fused_sigmoid_gating_delta_rule_tree_transform_kernel(
+    A_log,
+    a,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    lower_bound,
+    k,
+    v,
+    b,
+    cu_seqlens,
+    processed_k,
+    processed_decay,
+    processed_beta,
+    factor_cache_indices,
+    tree_rawv,
+    tree_rawk,
+    tree_g,
+    tree_beta,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    stride_a,
+    stride_k,
+    stride_v,
+    stride_b,
+    TREE_WIDTH: tl.constexpr,
+    CACHE_TREE_WIDTH: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    CACHE_TREE_FACTORS: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    """Precompute node-local transforms once for all descendant factor walks."""
+    i_nt, i_hv = tl.program_id(0), tl.program_id(1)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    i_n = i_nt // TREE_WIDTH
+    node_idx = i_nt % TREE_WIDTH
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    active = node_idx < eos - bos
+    token_idx = bos + node_idx
+    o_k = tl.arange(0, BK)
+    mask_k = o_k < K
+
+    b_rawk = tl.load(
+        k + token_idx * stride_k + i_h * K + o_k,
+        mask=active & mask_k,
+        other=0.0,
+    ).to(tl.float32)
+    b_k = b_rawk
+    if USE_QK_L2NORM_IN_KERNEL:
+        b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+    b_a = tl.load(
+        a + token_idx * stride_a + i_hv * K + o_k,
+        mask=active & mask_k,
+        other=0.0,
+    ).to(tl.float32)
+    b_b = tl.load(
+        b + token_idx * stride_b + i_hv,
+        mask=active,
+        other=0.0,
+    ).to(tl.float32)
+    b_A_log = tl.load(A_log + i_hv).to(tl.float32)
+    b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
+    x = b_a + b_dt_bias
+    if USE_LOWER_BOUND:
+        b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+    else:
+        beta_x = softplus_beta * x
+        softplus_x = tl.where(
+            beta_x <= softplus_threshold,
+            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            x,
+        )
+        b_g = -tl.exp(b_A_log) * softplus_x
+    b_decay = tl.exp(b_g)
+    b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+    transform_base = (i_n * HV * TREE_WIDTH + i_hv * TREE_WIDTH + node_idx) * K
+    tl.store(processed_k + transform_base + o_k, b_k, mask=active & mask_k)
+    tl.store(processed_decay + transform_base + o_k, b_decay, mask=active & mask_k)
+    tl.store(
+        processed_beta + (i_n * HV + i_hv) * TREE_WIDTH + node_idx,
+        b_beta,
+        mask=active,
+    )
+
+    if CACHE_TREE_FACTORS:
+        factor_slot = tl.load(factor_cache_indices + i_n).to(tl.int64)
+        if factor_slot >= 0:
+            b_rawv = tl.load(
+                v + token_idx * stride_v + i_hv * V + o_k,
+                mask=active & mask_k,
+                other=0.0,
+            )
+            tl.store(
+                tree_rawv
+                + factor_slot * stride_rawv_slot
+                + (i_hv * CACHE_TREE_WIDTH + node_idx) * V
+                + o_k,
+                b_rawv,
+                mask=active & mask_k,
+            )
+            tl.store(
+                tree_g
+                + factor_slot * stride_g_slot
+                + (i_hv * CACHE_TREE_WIDTH + node_idx) * K
+                + o_k,
+                b_g,
+                mask=active & mask_k,
+            )
+            if i_hv % (HV // H) == 0:
+                tl.store(
+                    tree_rawk
+                    + factor_slot * stride_rawk_slot
+                    + (i_h * CACHE_TREE_WIDTH + node_idx) * K
+                    + o_k,
+                    b_rawk,
+                    mask=active & mask_k,
+                )
+            tl.store(
+                tree_beta
+                + factor_slot * stride_beta_slot
+                + i_hv * CACHE_TREE_WIDTH
+                + node_idx,
+                b_beta,
+                mask=active,
+            )
+
+
+@triton.jit
+def fused_sigmoid_gating_delta_rule_tree_factor_kernel(
+    A_log,
+    a,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    lower_bound,
+    q,
+    k,
+    v,
+    b,
+    cu_seqlens,
+    retrieve_parent_token_ptr,
+    tree_depths_ptr,
+    processed_k,
+    processed_decay,
+    processed_beta,
+    tree_query_factors,
+    tree_value_factors,
+    factor_cache_indices,
+    tree_rawv,
+    tree_rawk,
+    tree_g,
+    tree_beta,
+    stride_rawv_slot: tl.constexpr,
+    stride_rawk_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_beta_slot: tl.constexpr,
+    stride_retrieve_parent_token_seq: tl.constexpr,
+    stride_retrieve_parent_token_token: tl.constexpr,
+    stride_tree_depth_seq: tl.constexpr,
+    stride_tree_depth_token: tl.constexpr,
+    scale,
+    stride_a,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_b,
+    TREE_WIDTH: tl.constexpr,
+    CACHE_TREE_WIDTH: tl.constexpr,
+    MAX_DEPTH: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BT: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    CACHE_TREE_FACTORS: tl.constexpr,
+    USE_DYNAMIC_DEPTH: tl.constexpr,
+    USE_PRECOMPUTED_TRANSFORMS: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    """Build value-independent factors for all root-to-node KDA paths.
+
+    For one update, S' = A S + u v^T where
+      A = (I - beta k k^T) diag(exp(g)), u = beta k.
+    Walking a node's path backwards transforms its output query with A^T and
+    emits one scalar coefficient for each ancestor value.  No [K, V] state is
+    materialized for proposal nodes.
+    """
+    i_nt, i_hv = tl.program_id(0), tl.program_id(1)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    i_n = i_nt // TREE_WIDTH
+    node_idx = i_nt % TREE_WIDTH
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    node_active = node_idx < eos - bos
+
+    o_k = tl.arange(0, BK)
+    o_t = tl.arange(0, BT)
+    mask_k = o_k < K
+    mask_t = o_t < TREE_WIDTH
+    factor_row = ((i_n * HV + i_hv) * TREE_WIDTH + node_idx) * TREE_WIDTH
+    b_value_factors = tl.zeros([BT], dtype=tl.float32)
+
+    token_idx = bos + node_idx
+    b_q = tl.load(
+        q + token_idx * stride_q + i_h * K + o_k,
+        mask=node_active & mask_k,
+        other=0.0,
+    ).to(tl.float32)
+    if USE_QK_L2NORM_IN_KERNEL:
+        b_q /= tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_x = b_q * scale
+
+    b_A_log = tl.load(A_log + i_hv).to(tl.float32)
+    b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
+    current_idx = node_idx.to(tl.int64)
+    path_active = node_active
+    if USE_DYNAMIC_DEPTH:
+        # tree_depth is zero-based, while the factor walk includes the node itself.
+        # A runtime loop avoids executing masked exp/log/sqrt work for the
+        # MAX_DEPTH - actual_path_length tail of shallow nodes.
+        path_length = (
+            tl.load(
+                tree_depths_ptr
+                + i_n * stride_tree_depth_seq
+                + node_idx * stride_tree_depth_token,
+                mask=node_active,
+                other=-1,
+            ).to(tl.int32)
+            + 1
+        )
+    else:
+        path_length = MAX_DEPTH
+    path_step = 0
+    while (path_step < path_length) & path_active:
+        path_active = path_active & (current_idx >= 0) & (current_idx < TREE_WIDTH)
+        safe_idx = tl.maximum(current_idx, 0)
+        current_token_idx = bos + safe_idx
+        if USE_PRECOMPUTED_TRANSFORMS:
+            transform_base = (i_n * HV * TREE_WIDTH + i_hv * TREE_WIDTH + safe_idx) * K
+            b_k = tl.load(
+                processed_k + transform_base + o_k,
+                mask=path_active & mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            b_decay = tl.load(
+                processed_decay + transform_base + o_k,
+                mask=path_active & mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            b_beta = tl.load(
+                processed_beta + (i_n * HV + i_hv) * TREE_WIDTH + safe_idx,
+                mask=path_active,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            b_k = tl.load(
+                k + current_token_idx * stride_k + i_h * K + o_k,
+                mask=path_active & mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            b_rawk = b_k
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_k /= tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_a = tl.load(
+                a + current_token_idx * stride_a + i_hv * K + o_k,
+                mask=path_active & mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            b_b = tl.load(
+                b + current_token_idx * stride_b + i_hv,
+                mask=path_active,
+                other=0.0,
+            ).to(tl.float32)
+            x = b_a + b_dt_bias
+            if USE_LOWER_BOUND:
+                b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+            else:
+                beta_x = softplus_beta * x
+                softplus_x = tl.where(
+                    beta_x <= softplus_threshold,
+                    (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                    x,
+                )
+                b_g = -tl.exp(b_A_log) * softplus_x
+            b_decay = tl.exp(b_g)
+            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if CACHE_TREE_FACTORS and not USE_PRECOMPUTED_TRANSFORMS:
+            if path_step == 0:
+                factor_slot = tl.load(factor_cache_indices + i_n).to(tl.int64)
+                if factor_slot >= 0:
+                    b_rawv = tl.load(
+                        v + current_token_idx * stride_v + i_hv * V + o_k,
+                        mask=mask_k,
+                        other=0.0,
+                    )
+                    tl.store(
+                        tree_rawv
+                        + factor_slot * stride_rawv_slot
+                        + (i_hv * CACHE_TREE_WIDTH + node_idx) * V
+                        + o_k,
+                        b_rawv,
+                        mask=mask_k,
+                    )
+                    tl.store(
+                        tree_g
+                        + factor_slot * stride_g_slot
+                        + (i_hv * CACHE_TREE_WIDTH + node_idx) * K
+                        + o_k,
+                        b_g,
+                        mask=mask_k,
+                    )
+                    if i_hv % (HV // H) == 0:
+                        tl.store(
+                            tree_rawk
+                            + factor_slot * stride_rawk_slot
+                            + (i_h * CACHE_TREE_WIDTH + node_idx) * K
+                            + o_k,
+                            b_rawk,
+                            mask=mask_k,
+                        )
+                    tl.store(
+                        tree_beta
+                        + factor_slot * stride_beta_slot
+                        + i_hv * CACHE_TREE_WIDTH
+                        + node_idx,
+                        b_beta,
+                    )
+        b_coefficient = b_beta * tl.sum(b_x * b_k)
+        b_value_factors += tl.where(path_active & (o_t == safe_idx), b_coefficient, 0.0)
+        # A^T x = diag(exp(g)) (x - k * (beta k^T x)).
+        b_next_x = b_decay * (b_x - b_k * b_coefficient)
+        b_x = tl.where(path_active, b_next_x, b_x)
+        current_idx = tl.load(
+            retrieve_parent_token_ptr
+            + i_n * stride_retrieve_parent_token_seq
+            + safe_idx * stride_retrieve_parent_token_token,
+            mask=path_active,
+            other=-1,
+        ).to(tl.int64)
+        path_step += 1
+
+    tl.store(tree_value_factors + factor_row + o_t, b_value_factors, mask=mask_t)
+    query_factor_ptr = (
+        tree_query_factors + ((i_n * HV + i_hv) * TREE_WIDTH + node_idx) * K + o_k
+    )
+    tl.store(query_factor_ptr, b_x, mask=node_active & mask_k)
+
+
+@triton.jit
+def fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel(
+    v,
+    o,
+    h0_source,
+    h0_indices,
+    stride_h0_source,
+    cu_seqlens,
+    tree_query_factors,
+    tree_value_factors,
+    stride_v,
+    TREE_WIDTH: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BT: tl.constexpr,
+    BM: tl.constexpr,
+    NM: tl.constexpr,
+    FACTORS_LOW_PRECISION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    """Recover every tree-node output from compact query/value factors."""
+    i_v, i_nm, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n = i_nm // NM
+    i_m = i_nm % NM
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    tree_size = eos - bos
+    state_idx = tl.load(h0_indices + i_n).to(tl.int64)
+    o_m = i_m * BM + tl.arange(0, BM)
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_m = o_m < tree_size
+    mask_t = o_t < tree_size
+    mask_k = o_k < K
+    mask_v = o_v < V
+
+    query_factor_ptr = (
+        tree_query_factors
+        + ((i_n * HV + i_hv) * TREE_WIDTH + o_m[:, None]) * K
+        + o_k[None, :]
+    )
+    b_query_factors = tl.load(
+        query_factor_ptr,
+        mask=mask_m[:, None] & mask_k[None, :],
+        other=0.0,
+    )
+    if not FACTORS_LOW_PRECISION:
+        b_query_factors = b_query_factors.to(tl.float32)
+    state_ptr = (
+        h0_source
+        + state_idx * stride_h0_source
+        + i_hv * K * V
+        + o_v[None, :] * K
+        + o_k[:, None]
+    )
+    b_state = tl.load(
+        state_ptr,
+        mask=(state_idx >= 0) & mask_k[:, None] & mask_v[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    if FACTORS_LOW_PRECISION:
+        b_state = b_state.to(tl.bfloat16)
+    b_o = tl.dot(b_query_factors, b_state, input_precision="ieee")
+
+    value_factor_ptr = (
+        tree_value_factors
+        + ((i_n * HV + i_hv) * TREE_WIDTH + o_m[:, None]) * TREE_WIDTH
+        + o_t[None, :]
+    )
+    b_value_factors = tl.load(
+        value_factor_ptr,
+        mask=mask_m[:, None] & mask_t[None, :],
+        other=0.0,
+    )
+    if not FACTORS_LOW_PRECISION:
+        b_value_factors = b_value_factors.to(tl.float32)
+    value_ptr = v + (bos + o_t[:, None]) * stride_v + i_hv * V + o_v[None, :]
+    b_values = tl.load(
+        value_ptr,
+        mask=mask_t[:, None] & mask_v[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    if FACTORS_LOW_PRECISION:
+        b_values = b_values.to(tl.bfloat16)
+    b_o += tl.dot(b_value_factors, b_values, input_precision="ieee")
+
+    output_ptr = o + ((bos + o_m[:, None]) * HV + i_hv) * V + o_v[None, :]
+    tl.store(
+        output_ptr,
+        b_o.to(output_ptr.dtype.element_ty),
+        mask=mask_m[:, None] & mask_v[None, :],
+    )
+
+
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -551,6 +1018,11 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    tree_depths: Optional[torch.Tensor] = None,
+    tree_max_depth: int = 0,
+    tree_query_factors: Optional[torch.Tensor] = None,
+    tree_value_factors: Optional[torch.Tensor] = None,
+    force_factorized_tree: bool = False,
     # fused ReplaySSM ring-write (spec verify). When cache_ring, each draft step
     # stores pre-norm k / raw v / gate / beta into these per-slot rings,
     # replacing the eager ring-write. Off by default -> decode unchanged.
@@ -565,6 +1037,17 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    factor_cache_indices: Optional[torch.Tensor] = None,
+    factor_num_warps: Optional[int] = None,
+    factor_num_stages: int = 2,
+    factor_verify_bv: Optional[int] = None,
+    factor_verify_bm: Optional[int] = None,
+    factor_verify_num_warps: Optional[int] = None,
+    factor_verify_num_stages: Optional[int] = None,
+    tree_processed_k: Optional[torch.Tensor] = None,
+    tree_processed_decay: Optional[torch.Tensor] = None,
+    tree_processed_beta: Optional[torch.Tensor] = None,
+    force_precomputed_tree_transforms: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -679,6 +1162,160 @@ def fused_sigmoid_gating_delta_rule_update(
     round_state_to_bf16 = match_cutedsl_decode and (
         initial_state_source is None or initial_state_source.dtype == torch.bfloat16
     )
+
+    use_factorized_tree = (
+        force_factorized_tree
+        and is_kda
+        and disable_state_update
+        and cu_seqlens is not None
+        and retrieve_parent_token is not None
+        and tree_max_depth > 0
+        and tree_query_factors is not None
+        and tree_value_factors is not None
+        and initial_state_source is not None
+        and initial_state_indices is not None
+    )
+    if use_factorized_tree:
+        # Factorized verify for the fixed-width UBTree path. It computes every
+        # node output without materializing per-node [V, K] states; the
+        # post-sampling tree commit folds only the accept path.
+        tree_width = retrieve_parent_token.shape[1]
+        assert N == 1, f"factorized tree verify supports only BS=1, got {N}"
+        assert tree_width in (32, 49), (
+            f"factorized tree verify supports only widths 32 and 49, got {tree_width}"
+        )
+        assert retrieve_parent_token.shape == (N, tree_width)
+        assert tree_query_factors.shape == (N, HV, tree_width, K)
+        assert tree_value_factors.shape == (N, HV, tree_width, tree_width)
+        assert tree_query_factors.dtype == tree_value_factors.dtype
+        assert tree_query_factors.dtype in (torch.float32, torch.bfloat16)
+        assert tree_query_factors.is_contiguous()
+        assert tree_value_factors.is_contiguous()
+        assert tree_max_depth <= 16
+        use_dynamic_depth = tree_depths is not None
+        if use_dynamic_depth:
+            assert tree_depths.shape == (N, tree_width)
+        use_precomputed_transforms = force_precomputed_tree_transforms
+        # Precompute outputs are consumed immediately by factor generation, so
+        # keep normal stream ordering for this pair instead of early PDL overlap.
+        factor_pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True}
+            if is_arch_support_pdl() and not use_precomputed_transforms
+            else {}
+        )
+        if use_precomputed_transforms:
+            assert tree_processed_k.shape == (N, HV, tree_width, K)
+            assert tree_processed_decay.shape == (N, HV, tree_width, K)
+            assert tree_processed_beta.shape == (N, HV, tree_width)
+        if factor_num_warps is None:
+            factor_num_warps = 2
+        if factor_verify_bv is None:
+            # M=32 on Ling3-Flash TP4 is occupancy-limited at BV=16.  Splitting
+            # V into BV=8 tiles lowers the verify kernel register footprint and
+            # wins despite doubling the V-grid.  Other widths keep their
+            # previously validated tile.
+            factor_verify_bv = 8 if tree_width == 32 else 32
+        assert factor_verify_bv in (8, 16, 32)
+        cache_tree_factors = cache_ring
+        if cache_tree_factors:
+            assert V == K, "factorized tree raw cache currently requires V == K"
+            assert factor_cache_indices is not None
+            assert max_cache_len >= tree_width
+        factor_grid = (N * tree_width, HV)
+        fused_sigmoid_gating_delta_rule_tree_factor_kernel[factor_grid](
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            cu_seqlens=cu_seqlens,
+            retrieve_parent_token_ptr=retrieve_parent_token,
+            tree_depths_ptr=tree_depths,
+            processed_k=tree_processed_k,
+            processed_decay=tree_processed_decay,
+            processed_beta=tree_processed_beta,
+            tree_query_factors=tree_query_factors,
+            tree_value_factors=tree_value_factors,
+            factor_cache_indices=factor_cache_indices,
+            tree_rawv=replayssm_rawv,
+            tree_rawk=replayssm_rawk,
+            tree_g=replayssm_g,
+            tree_beta=replayssm_beta,
+            stride_rawv_slot=stride_rawv_slot,
+            stride_rawk_slot=stride_rawk_slot,
+            stride_g_slot=stride_g_slot,
+            stride_beta_slot=stride_beta_slot,
+            stride_retrieve_parent_token_seq=retrieve_parent_token.stride(0),
+            stride_retrieve_parent_token_token=retrieve_parent_token.stride(1),
+            stride_tree_depth_seq=tree_depths.stride(0) if use_dynamic_depth else 0,
+            stride_tree_depth_token=tree_depths.stride(1) if use_dynamic_depth else 0,
+            scale=scale,
+            stride_a=stride_a,
+            stride_q=stride_q,
+            stride_k=stride_k,
+            stride_v=stride_v,
+            stride_b=stride_b,
+            TREE_WIDTH=tree_width,
+            CACHE_TREE_WIDTH=max_cache_len,
+            MAX_DEPTH=tree_max_depth,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BK=BK,
+            BT=triton.next_power_of_2(tree_width),
+            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+            USE_LOWER_BOUND=lower_bound is not None,
+            CACHE_TREE_FACTORS=cache_tree_factors,
+            USE_DYNAMIC_DEPTH=use_dynamic_depth,
+            USE_PRECOMPUTED_TRANSFORMS=use_precomputed_transforms,
+            num_warps=factor_num_warps,
+            num_stages=factor_num_stages,
+            **factor_pdl_kwargs,
+        )
+        factor_verify_nv = triton.cdiv(V, factor_verify_bv)
+        # Use the validated fixed-width schedules: one 32-row CTA for width 32
+        # and one 64-row CTA for width 49.
+        if factor_verify_bm is None:
+            factor_verify_bm = 32 if tree_width == 32 else 64
+        assert factor_verify_bm in (16, 32, 64)
+        if factor_verify_num_warps is None:
+            factor_verify_num_warps = 2 if tree_width == 32 else 8
+        if factor_verify_num_stages is None:
+            factor_verify_num_stages = 1 if tree_width == 32 else 3
+        factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
+        factor_verify_grid = (factor_verify_nv, N * factor_verify_nm, HV)
+        fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel[factor_verify_grid](
+            v=v,
+            o=o,
+            h0_source=initial_state_source,
+            h0_indices=initial_state_indices,
+            stride_h0_source=initial_state_source.stride(0),
+            cu_seqlens=cu_seqlens,
+            tree_query_factors=tree_query_factors,
+            tree_value_factors=tree_value_factors,
+            stride_v=stride_v,
+            TREE_WIDTH=tree_width,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=factor_verify_bv,
+            BT=triton.next_power_of_2(tree_width),
+            BM=factor_verify_bm,
+            NM=factor_verify_nm,
+            FACTORS_LOW_PRECISION=tree_query_factors.dtype != torch.float32,
+            num_warps=factor_verify_num_warps,
+            num_stages=factor_verify_num_stages,
+            **factor_pdl_kwargs,
+        )
+        return o.squeeze(0)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,

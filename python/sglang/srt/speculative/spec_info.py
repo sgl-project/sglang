@@ -475,6 +475,16 @@ def create_dummy_verify_input(
     """
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
+    custom_builder = getattr(spec_algorithm, "create_cuda_graph_verify_input", None)
+    if custom_builder is not None:
+        spec_info = custom_builder(
+            custom_mask=custom_mask,
+            num_tokens_per_req=num_tokens_per_req,
+            is_draft_worker=is_draft_worker,
+        )
+        if spec_info is not None:
+            return spec_info
+
     spec = get_spec_config()
 
     spec_info = None

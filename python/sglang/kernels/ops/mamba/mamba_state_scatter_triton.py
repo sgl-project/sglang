@@ -488,6 +488,293 @@ def fused_conv_window_scatter_with_mask(
     )
 
 
+@triton.jit
+def _fused_conv_tree_raw_commit_kernel(
+    raw_src_ptr,
+    dst_ptr,
+    state_indices_ptr,
+    factor_indices_ptr,
+    accept_index_ptr,
+    accept_lens_ptr,
+    track_indices_ptr,
+    track_nodes_ptr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    src_dim_stride,
+    src_win_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    dst_dim_stride,
+    dst_win_stride,
+    accept_row_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    dim: tl.constexpr,
+    KM1: tl.constexpr,
+    RAW_WIN: tl.constexpr,
+    TREE_WIDTH: tl.constexpr,
+    MAX_ACCEPT: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Restore accepted conv windows from one raw x per proposal-tree node.
+
+    One program owns all KM1 values for a feature lane. It loads the complete
+    pre-tree window before any in-place store, avoiding read/write races when
+    the primary destination is also the pre-tree source slot.
+    """
+    req = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    block = tl.program_id(2)
+    d = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask_d = d < dim
+
+    state_slot = tl.load(state_indices_ptr + req).to(tl.int64)
+    factor_slot = tl.load(factor_indices_ptr + req).to(tl.int64)
+    n_commit = tl.load(accept_lens_ptr + req).to(tl.int32)
+    if not (
+        (state_slot >= 0)
+        & (state_slot < dst_req_size)
+        & (factor_slot >= 0)
+        & (factor_slot < src_req_size)
+        & (n_commit > 0)
+    ):
+        return
+
+    old_base = (
+        dst_ptr
+        + layer * dst_layer_stride
+        + state_slot * dst_req_stride
+        + d * dst_dim_stride
+    )
+    # Load all old positions before writing any destination position. Each lane
+    # owns one feature, so no other lane can overwrite these values.
+    old0 = tl.load(old_base + 0 * dst_win_stride, mask=mask_d, other=0.0)
+    if KM1 >= 2:
+        old1 = tl.load(old_base + 1 * dst_win_stride, mask=mask_d, other=0.0)
+    if KM1 >= 3:
+        old2 = tl.load(old_base + 2 * dst_win_stride, mask=mask_d, other=0.0)
+    if KM1 >= 4:
+        old3 = tl.load(old_base + 3 * dst_win_stride, mask=mask_d, other=0.0)
+
+    row_base = req * accept_row_stride
+    request_node_base = req * TREE_WIDTH
+
+    # Optional prefix-cache snapshot: track_nodes stores the accepted local tree
+    # node, not its path ordinal. Recover the prefix length from accept_index.
+    if HAS_TRACK:
+        track_slot = tl.load(track_indices_ptr + req).to(tl.int64)
+        track_node = tl.load(track_nodes_ptr + req).to(tl.int64)
+        track_len = 0
+        for step in tl.static_range(MAX_ACCEPT):
+            active = step < n_commit
+            node = (
+                tl.load(accept_index_ptr + row_base + step, mask=active, other=-1).to(
+                    tl.int64
+                )
+                - request_node_base
+            )
+            track_len = tl.where(active & (node == track_node), step + 1, track_len)
+        valid_track = (
+            (track_node >= 0)
+            & (track_len > 0)
+            & (track_slot >= 0)
+            & (track_slot < dst_req_size)
+        )
+        track_base = (
+            dst_ptr
+            + layer * dst_layer_stride
+            + track_slot * dst_req_stride
+            + d * dst_dim_stride
+        )
+        for w in tl.static_range(KM1):
+            path_pos = track_len - KM1 + w
+            use_raw = valid_track & (path_pos >= 0) & (path_pos < track_len)
+            global_node = tl.load(
+                accept_index_ptr + row_base + path_pos,
+                mask=use_raw,
+                other=request_node_base,
+            ).to(tl.int64)
+            node = global_node - request_node_base
+            valid_raw = use_raw & (node >= 0) & (node < src_step_size)
+            raw = tl.load(
+                raw_src_ptr
+                + layer * src_layer_stride
+                + factor_slot * src_req_stride
+                + node * src_step_stride
+                + d * src_dim_stride
+                + RAW_WIN * src_win_stride,
+                mask=mask_d & valid_raw,
+                other=0.0,
+            )
+            old_idx = w + track_len
+            old = old0
+            if KM1 >= 2:
+                old = tl.where(old_idx == 1, old1, old)
+            if KM1 >= 3:
+                old = tl.where(old_idx == 2, old2, old)
+            if KM1 >= 4:
+                old = tl.where(old_idx == 3, old3, old)
+            value = tl.where(use_raw, raw, old)
+            tl.store(
+                track_base + w * dst_win_stride,
+                value,
+                mask=mask_d & valid_track,
+            )
+
+    # Primary committed state after the complete accept path.
+    main_base = (
+        dst_ptr
+        + layer * dst_layer_stride
+        + state_slot * dst_req_stride
+        + d * dst_dim_stride
+    )
+    for w in tl.static_range(KM1):
+        path_pos = n_commit - KM1 + w
+        use_raw = (path_pos >= 0) & (path_pos < n_commit)
+        global_node = tl.load(
+            accept_index_ptr + row_base + path_pos,
+            mask=use_raw,
+            other=request_node_base,
+        ).to(tl.int64)
+        node = global_node - request_node_base
+        valid_raw = use_raw & (node >= 0) & (node < src_step_size)
+        raw = tl.load(
+            raw_src_ptr
+            + layer * src_layer_stride
+            + factor_slot * src_req_stride
+            + node * src_step_stride
+            + d * src_dim_stride
+            + RAW_WIN * src_win_stride,
+            mask=mask_d & valid_raw,
+            other=0.0,
+        )
+        old_idx = w + n_commit
+        old = old0
+        if KM1 >= 2:
+            old = tl.where(old_idx == 1, old1, old)
+        if KM1 >= 3:
+            old = tl.where(old_idx == 2, old2, old)
+        if KM1 >= 4:
+            old = tl.where(old_idx == 3, old3, old)
+        value = tl.where(use_raw, raw, old)
+        tl.store(main_base + w * dst_win_stride, value, mask=mask_d)
+
+
+def fused_conv_tree_raw_commit_with_mask(
+    dst: torch.Tensor,
+    raw_src: torch.Tensor,
+    state_indices: torch.Tensor,
+    factor_indices: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    tree_width: int,
+    track_indices: torch.Tensor | None = None,
+    track_nodes: torch.Tensor | None = None,
+) -> None:
+    """Commit a proposal-tree conv state from raw per-node inputs.
+
+    ``raw_src`` reuses the dense intermediate-window allocation, but factorized
+    tree verify writes only slot ``K-2`` (the node's own pre-conv input). The
+    persistent ``dst`` remains the pre-tree window until this kernel commits the
+    sampled root-to-node path.
+    """
+    if dst.ndim != 4 or raw_src.ndim != 5:
+        raise ValueError(f"Unexpected ranks: {dst.ndim=} {raw_src.ndim=}")
+    if dst.shape[0] != raw_src.shape[0] or dst.shape[2:] != raw_src.shape[3:]:
+        raise ValueError(f"Conv shapes mismatch: {dst.shape=} {raw_src.shape=}")
+    if not (dst.is_cuda and raw_src.is_cuda and dst.device == raw_src.device):
+        raise ValueError("conv raw commit requires CUDA tensors on the same device")
+    if dst.dtype != raw_src.dtype:
+        raise ValueError(f"dtype mismatch: {dst.dtype=} {raw_src.dtype=}")
+    if not dst.is_contiguous():
+        raise ValueError("dst must be contiguous")
+    if any(x.ndim != 1 for x in (state_indices, factor_indices, accept_lens)):
+        raise ValueError("state_indices, factor_indices and accept_lens must be 1D")
+    batch = accept_lens.shape[0]
+    if batch != 1:
+        raise ValueError(
+            f"factorized UBTree conv commit supports only BS=1, got {batch}"
+        )
+    if not (
+        state_indices.shape[0] == factor_indices.shape[0] == batch
+        and accept_index.ndim == 2
+        and accept_index.shape[0] == batch
+    ):
+        raise ValueError("batch dimensions do not match")
+    has_track = track_indices is not None and track_nodes is not None
+    if (track_indices is None) != (track_nodes is None):
+        raise ValueError("track_indices and track_nodes must be provided together")
+    if has_track and (
+        track_indices.shape != accept_lens.shape
+        or track_nodes.shape != accept_lens.shape
+    ):
+        raise ValueError("track tensors must match accept_lens")
+    tensors = (state_indices, factor_indices, accept_index, accept_lens)
+    if has_track:
+        tensors += (track_indices, track_nodes)
+    if any((not x.is_cuda) or x.device != dst.device for x in tensors):
+        raise ValueError("all metadata tensors must be CUDA tensors on dst.device")
+    if any(not x.is_contiguous() for x in tensors):
+        raise ValueError("all metadata tensors must be contiguous")
+
+    # KDA stores conv state as [..., window, dim], while the causal-conv
+    # kernel consumes a transposed [..., dim, window] view. Support both using
+    # real strides; do not require an entry-contiguous layout here.
+    trailing = dst.shape[-2:]
+    window_axes = [
+        axis for axis, size in enumerate(trailing, start=2) if 1 <= size <= 4
+    ]
+    if len(window_axes) != 1:
+        raise ValueError(f"cannot identify conv window axis from {dst.shape=}")
+    win_axis = window_axes[0]
+    dim_axis = 5 - win_axis
+    km1 = dst.shape[win_axis]
+    dim = dst.shape[dim_axis]
+    if raw_src.shape[3:] != dst.shape[2:]:
+        raise ValueError(
+            f"Conv trailing shapes mismatch: {dst.shape=} {raw_src.shape=}"
+        )
+    if raw_src.shape[2] < tree_width:
+        raise ValueError("raw source does not cover tree_width")
+    block_size = min(triton.next_power_of_2(dim), 256)
+    grid = (batch, dst.shape[0], triton.cdiv(dim, block_size))
+    track_indices_t = track_indices if has_track else state_indices
+    track_nodes_t = track_nodes if has_track else accept_lens
+    _fused_conv_tree_raw_commit_kernel[grid](
+        raw_src,
+        dst,
+        state_indices,
+        factor_indices,
+        accept_index,
+        accept_lens,
+        track_indices_t,
+        track_nodes_t,
+        raw_src.stride(0),
+        raw_src.stride(1),
+        raw_src.stride(2),
+        raw_src.stride(dim_axis + 1),
+        raw_src.stride(win_axis + 1),
+        dst.stride(0),
+        dst.stride(1),
+        dst.stride(dim_axis),
+        dst.stride(win_axis),
+        accept_index.stride(0),
+        raw_src.shape[1],
+        raw_src.shape[2],
+        dst.shape[1],
+        dim=dim,
+        KM1=km1,
+        RAW_WIN=km1 - 1,
+        TREE_WIDTH=tree_width,
+        MAX_ACCEPT=accept_index.shape[1],
+        HAS_TRACK=has_track,
+        BLOCK_SIZE=block_size,
+    )
+
+
 _CONV_MULTI_MAX_TYPES = 8
 _CONV_MULTI_META_COLS = 12
 _conv_multi_meta_cache: dict = {}
@@ -791,20 +1078,54 @@ def fused_commit_track_indices(
     seq_lens: torch.Tensor | None,
     draft_token_num: int,
     mamba_track_interval: int,
+    *,
+    last_correct_out: torch.Tensor | None = None,
+    track_steps_out: torch.Tensor | None = None,
 ):
-    """Single-launch replacement for the eager verify-commit index math;
-    accept_index is [bs, tree_depth] but its values index bs * draft_token_num rows."""
+    """Single-launch replacement for the eager verify-commit index math.
+
+    ``accept_index`` is [bs, tree_depth] but its values index
+    ``bs * draft_token_num`` rows. Optional output tensors let CUDA-graph
+    callers reuse stable storage instead of allocating on every replay.
+    """
     accept_index = accept_index.contiguous()
     bs = accept_lens.shape[0]
-    last_correct_step_indices = torch.empty(
-        bs, dtype=torch.int64, device=accept_lens.device
-    )
+    if last_correct_out is None:
+        last_correct_step_indices = torch.empty(
+            bs, dtype=torch.int64, device=accept_lens.device
+        )
+    else:
+        if (
+            last_correct_out.ndim != 1
+            or last_correct_out.shape[0] < bs
+            or last_correct_out.dtype != torch.int64
+            or last_correct_out.device != accept_lens.device
+            or not last_correct_out.is_contiguous()
+        ):
+            raise ValueError(
+                "last_correct_out must be contiguous int64 CUDA storage for bs rows"
+            )
+        last_correct_step_indices = last_correct_out[:bs]
     has_track = seq_lens is not None
-    mamba_steps_to_track = (
-        torch.empty(bs, dtype=torch.int64, device=accept_lens.device)
-        if has_track
-        else last_correct_step_indices
-    )
+    if has_track:
+        if track_steps_out is None:
+            mamba_steps_to_track = torch.empty(
+                bs, dtype=torch.int64, device=accept_lens.device
+            )
+        else:
+            if (
+                track_steps_out.ndim != 1
+                or track_steps_out.shape[0] < bs
+                or track_steps_out.dtype != torch.int64
+                or track_steps_out.device != accept_lens.device
+                or not track_steps_out.is_contiguous()
+            ):
+                raise ValueError(
+                    "track_steps_out must be contiguous int64 CUDA storage for bs rows"
+                )
+            mamba_steps_to_track = track_steps_out[:bs]
+    else:
+        mamba_steps_to_track = last_correct_step_indices
     _fused_commit_track_indices_kernel[(bs,)](
         accept_index,
         accept_lens,

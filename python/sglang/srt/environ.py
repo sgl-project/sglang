@@ -1450,6 +1450,9 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
+    # Capture FA3 top-k target-verify metadata construction in the target graph;
+    # replay only stages the dynamic tree mask into a stable backend buffer.
+    SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)

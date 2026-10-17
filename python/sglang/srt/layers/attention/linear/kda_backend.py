@@ -4,6 +4,9 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention.fla.fused_kda_conv_tree_transform import (
+    fused_kda_conv_tree_transform,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -1221,12 +1224,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
+        intermediate_state_indices = select_verify_intermediate_state_indices(
+            self.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            self.req_to_token_pool.size,
+        )
         # ReplaySSM: intermediate_ssm is intentionally None (the ring + commit-time
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
         replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         replayssm_on = replayssm_rawv is not None
-        if intermediate_state_cache is None and not replayssm_on:
+        tree_rawv = getattr(mamba_cache_params, "tree_rawv", None)
+        verify_batch_size = query_start_loc.shape[0] - 1
+        if tree_rawv is not None and verify_batch_size != 1:
+            raise RuntimeError(
+                "factorized UBTree KDA verify supports only BS=1, got "
+                f"{verify_batch_size}"
+            )
+        tree_factorized_on = (
+            tree_rawv is not None
+            and verify_batch_size == 1
+            and retrieve_parent_token is not None
+            and retrieve_parent_token.shape[1] in (32, 49)
+            and fm.tree_max_depth > 0
+        )
+        if (
+            intermediate_state_cache is None
+            and not replayssm_on
+            and not tree_factorized_on
+        ):
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
@@ -1252,13 +1279,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             )
+        if tree_factorized_on:
+            ring_kwargs = dict(
+                cache_ring=True,
+                replayssm_rawv=tree_rawv,
+                replayssm_rawk=mamba_cache_params.tree_rawk,
+                replayssm_g=mamba_cache_params.tree_g,
+                replayssm_beta=mamba_cache_params.tree_beta,
+                factor_cache_indices=intermediate_state_indices,
+            )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout
@@ -1377,19 +1407,73 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
         mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
-        mixed_qkv_processed = causal_conv1d_update(
-            mixed_qkv_reshaped,
-            conv_states.transpose(-1, -2),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=cache_indices[:batch_size],
-            intermediate_conv_window=intermediate_conv_window_cache.transpose(-1, -2),
-            intermediate_state_indices=intermediate_state_indices[:batch_size],
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_parent_token=retrieve_parent_token,
+        conv_state_view = conv_states.transpose(-1, -2)
+        intermediate_conv_view = intermediate_conv_window_cache.transpose(-1, -2)
+        tree_transforms = None
+        use_fused_tree_conv = (
+            tree_factorized_on
+            and draft_token_num in (32, 49)
+            and fm.has_direct_parent
+            and isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)
+            and mixed_qkv_reshaped.dtype == torch.bfloat16
+            and conv_state_view.dtype == torch.bfloat16
+            and layer.conv_weights.dtype in (torch.bfloat16, torch.float32)
+            and (layer.bias is None or layer.bias.dtype == torch.bfloat16)
+            and layer.conv_weights.shape == (mixed_qkv_reshaped.shape[1], 4)
+            and layer.q_dim == layer.k_dim == layer.v_dim
+            and layer.num_q_heads == layer.num_v_heads
+            and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim
+            and layer.head_k_dim == 128
         )
+        if use_fused_tree_conv:
+            tree_transforms = (
+                self.kernel_dispatcher.triton_kernel.get_tree_transform_scratch(
+                    mixed_qkv_reshaped.device,
+                    batch_size,
+                    layer.num_v_heads,
+                    draft_token_num,
+                    layer.head_k_dim,
+                )
+            )
+            mixed_qkv_processed = fused_kda_conv_tree_transform(
+                x=mixed_qkv_reshaped,
+                conv_state=conv_state_view,
+                conv_weight=layer.conv_weights,
+                conv_bias=layer.bias,
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_view,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_parent_token=retrieve_parent_token,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                processed_k=tree_transforms[0],
+                processed_decay=tree_transforms[1],
+                processed_beta=tree_transforms[2],
+                factor_cache_indices=intermediate_state_indices[:batch_size],
+                tree_rawv=tree_rawv,
+                tree_rawk=mamba_cache_params.tree_rawk,
+                tree_g=mamba_cache_params.tree_g,
+                tree_beta=mamba_cache_params.tree_beta,
+                lower_bound=layer.lower_bound,
+            )
+        else:
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_state_view,
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_view,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+                direct_parent=fm.has_direct_parent,
+                save_tree_raw_only=tree_factorized_on,
+            )
         mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
             batch_size * draft_token_num, -1
         )
@@ -1423,8 +1507,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
+            tree_depths=fm.tree_depths,
+            tree_max_depth=fm.tree_max_depth,
             lower_bound=layer.lower_bound,
             **ring_kwargs,
+            **(
+                dict(
+                    tree_processed_k=tree_transforms[0],
+                    tree_processed_decay=tree_transforms[1],
+                    tree_processed_beta=tree_transforms[2],
+                    force_precomputed_tree_transforms=True,
+                )
+                if tree_transforms is not None
+                else {}
+            ),
             **(
                 dict(
                     zip(

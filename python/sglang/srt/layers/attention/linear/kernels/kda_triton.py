@@ -30,6 +30,44 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
 
+    def __init__(self):
+        # Per graph/batch-shape output factors. They are transient across layers,
+        # but retained by shape so CUDA graph replay observes stable addresses.
+        self._tree_factor_scratch = {}
+        self._tree_transform_scratch = {}
+
+    def get_tree_transform_scratch(self, device, n, hv, tree_width, k):
+        """Return graph-stable FP32 node transforms for fused tree conv."""
+        key = (device.index, n, hv, tree_width, k)
+        triple = self._tree_transform_scratch.get(key)
+        if triple is None:
+            triple = (
+                torch.empty((n, hv, tree_width, k), device=device, dtype=torch.float32),
+                torch.empty((n, hv, tree_width, k), device=device, dtype=torch.float32),
+                torch.empty((n, hv, tree_width), device=device, dtype=torch.float32),
+            )
+            self._tree_transform_scratch[key] = triple
+        return triple
+
+    def _get_tree_factor_scratch(self, q, v, query_start_loc, tree_width):
+        n = query_start_loc.shape[0] - 1
+        hv, k = v.shape[2], q.shape[-1]
+        key = (q.device.index, n, hv, tree_width, k)
+        pair = self._tree_factor_scratch.get(key)
+        if pair is None:
+            pair = (
+                torch.empty(
+                    (n, hv, tree_width, k), device=q.device, dtype=torch.float32
+                ),
+                torch.empty(
+                    (n, hv, tree_width, tree_width),
+                    device=q.device,
+                    dtype=torch.float32,
+                ),
+            )
+            self._tree_factor_scratch[key] = pair
+        return pair
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -173,6 +211,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: Optional[torch.Tensor],
+        tree_depths: Optional[torch.Tensor] = None,
+        tree_max_depth: int = 0,
         lower_bound: Optional[float] = None,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
@@ -182,6 +222,20 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        factorized_tree = (
+            retrieve_parent_token is not None
+            and cache_steps in (32, 49)
+            and tree_max_depth > 0
+            and cache_ring
+            and kwargs.get("factor_cache_indices") is not None
+        )
+        if factorized_tree:
+            tree_query_factors, tree_value_factors = self._get_tree_factor_scratch(
+                q, v, query_start_loc, cache_steps
+            )
+        else:
+            tree_query_factors = tree_value_factors = None
+
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
         # mirroring the GDN triton verify path. Reads the committed state, writes
         # per-draft-token intermediate states to the scratch buffer, does NOT mutate
@@ -208,12 +262,24 @@ class TritonKDAKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            tree_depths=tree_depths,
+            tree_max_depth=tree_max_depth,
+            tree_query_factors=tree_query_factors,
+            tree_value_factors=tree_value_factors,
+            force_factorized_tree=factorized_tree,
+            factor_cache_indices=kwargs.get("factor_cache_indices"),
             lower_bound=lower_bound,
             cache_ring=cache_ring,
             replayssm_rawv=replayssm_rawv,
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            tree_processed_k=kwargs.get("tree_processed_k"),
+            tree_processed_decay=kwargs.get("tree_processed_decay"),
+            tree_processed_beta=kwargs.get("tree_processed_beta"),
+            force_precomputed_tree_transforms=kwargs.get(
+                "force_precomputed_tree_transforms", False
+            ),
         )
 
     def extend(

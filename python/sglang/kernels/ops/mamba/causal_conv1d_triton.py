@@ -663,6 +663,8 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    HAS_DIRECT_PARENT: tl.constexpr,
+    SAVE_TREE_RAW_ONLY: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -734,7 +736,9 @@ def _causal_conv1d_update_kernel(
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    # STEP 2: assume state_len > seqlen
+    # STEP 2: assume state_len > seqlen. Factorized tree verify keeps the
+    # persistent pre-tree window intact; accept-path commit reconstructs the
+    # final window from raw node inputs after sampling.
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
     # The conv_state updates works in a sliding window manner,
@@ -782,7 +786,8 @@ def _causal_conv1d_update_kernel(
         conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
     )  # [BLOCK_M, BLOCK_N]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+    if not SAVE_TREE_RAW_ONLY:
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -801,19 +806,23 @@ def _causal_conv1d_update_kernel(
         idx_tokens = tl.arange(0, NP2_SEQLEN)  # [BLOCK_M]
         # Update parent mapping for all tokens at once using vectorized operations
         mask_retrieve = idx_tokens < seqlen
-        retrieve_next_token_base = (
-            retrieve_next_token_ptr
-            + (idx_seq * stride_retrieve_next_token_seq)
-            + idx_tokens * stride_retrieve_next_token_token
+        retrieve_parent_token_base = (
+            retrieve_parent_token_ptr + idx_seq * stride_retrieve_parent_token_seq
         )
-        retrieve_next_tokens = tl.load(retrieve_next_token_base, mask_retrieve)
-        retrieve_next_sibling_base = (
-            retrieve_next_sibling_ptr
-            + (idx_seq * stride_retrieve_next_sibling_seq)
-            + idx_tokens * stride_retrieve_next_sibling_token
-        )
-        retrieve_next_siblings = tl.load(retrieve_next_sibling_base, mask_retrieve)
-        parent_idx_tokens = tl.zeros((NP2_SEQLEN,), dtype=tl.int32)
+        if not HAS_DIRECT_PARENT:
+            retrieve_next_token_base = (
+                retrieve_next_token_ptr
+                + (idx_seq * stride_retrieve_next_token_seq)
+                + idx_tokens * stride_retrieve_next_token_token
+            )
+            retrieve_next_tokens = tl.load(retrieve_next_token_base, mask_retrieve)
+            retrieve_next_sibling_base = (
+                retrieve_next_sibling_ptr
+                + (idx_seq * stride_retrieve_next_sibling_seq)
+                + idx_tokens * stride_retrieve_next_sibling_token
+            )
+            retrieve_next_siblings = tl.load(retrieve_next_sibling_base, mask_retrieve)
+            parent_idx_tokens = tl.zeros((NP2_SEQLEN,), dtype=tl.int32)
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
     mask_w = idx_feats < dim
@@ -837,30 +846,29 @@ def _causal_conv1d_update_kernel(
         acc = acc_preload
 
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-            # set the parent index of the next token in the eagle tree
-            # next token's parent is the current token
-            retrieve_next_token_idx = tl.sum(
-                tl.where(idx_tokens == idx_token, retrieve_next_tokens, 0)
-            )
-            if retrieve_next_token_idx != -1:  # pad slot id
-                parent_idx_tokens = tl.where(
-                    idx_tokens == retrieve_next_token_idx,
-                    idx_token,
-                    parent_idx_tokens,
+            if not HAS_DIRECT_PARENT:
+                # Reconstruct parent indices for legacy EAGLE metadata.
+                retrieve_next_token_idx = tl.sum(
+                    tl.where(idx_tokens == idx_token, retrieve_next_tokens, 0)
                 )
-            # next token's parent is the parent of the current token
-            retrieve_sibling_token_idx = tl.sum(
-                tl.where(idx_tokens == idx_token, retrieve_next_siblings, 0)
-            )
-            if retrieve_sibling_token_idx != -1:  # pad slot id
-                parent_idx_token = tl.sum(
-                    tl.where(idx_tokens == idx_token, parent_idx_tokens, 0)
+                if retrieve_next_token_idx != -1:
+                    parent_idx_tokens = tl.where(
+                        idx_tokens == retrieve_next_token_idx,
+                        idx_token,
+                        parent_idx_tokens,
+                    )
+                retrieve_sibling_token_idx = tl.sum(
+                    tl.where(idx_tokens == idx_token, retrieve_next_siblings, 0)
                 )
-                parent_idx_tokens = tl.where(
-                    idx_tokens == retrieve_sibling_token_idx,
-                    parent_idx_token,
-                    parent_idx_tokens,
-                )
+                if retrieve_sibling_token_idx != -1:
+                    parent_idx_token = tl.sum(
+                        tl.where(idx_tokens == idx_token, parent_idx_tokens, 0)
+                    )
+                    parent_idx_tokens = tl.where(
+                        idx_tokens == retrieve_sibling_token_idx,
+                        parent_idx_token,
+                        parent_idx_tokens,
+                    )
             # tl.device_print("am", parent_idx_tokens)
 
             _idx_token = idx_token
@@ -891,30 +899,46 @@ def _causal_conv1d_update_kernel(
                         matrix_w = w_col0
 
                 if SAVE_INTERMEDIATE:
-                    # Save the window state after consuming this token
-                    # Layout: [seq(cache line), step, dim, win(K-1)]
+                    # Dense mode saves the full post-node window. The factorized
+                    # tree mode stores only this node's raw x in the last slot;
+                    # accept-path commit combines it with the untouched pre-tree
+                    # conv state. This removes ancestor/rejected-branch writes.
                     base_ptr = (
                         intermediate_conv_window_ptr
                         + intermediate_state_batch_coord * stride_inter_seq
                         + idx_token * stride_inter_step
                         + idx_feats * stride_inter_dim
                     )
-
-                    # store itself in KERNEL_WIDTH-2 slot, parent in KERNEL_WIDTH-3 slot, grand-parent in KERNEL_WIDTH-4 slot, ...
-                    if KERNEL_WIDTH - j - 2 >= 0:
-                        tl.store(
-                            base_ptr + (KERNEL_WIDTH - j - 2) * stride_inter_win,
-                            matrix_x,
-                            mask=mask_w,
-                        )
+                    if SAVE_TREE_RAW_ONLY:
+                        if j == 0:
+                            tl.store(
+                                base_ptr + (KERNEL_WIDTH - 2) * stride_inter_win,
+                                matrix_x,
+                                mask=mask_w,
+                            )
+                    else:
+                        # store itself in KERNEL_WIDTH-2 slot, parent in
+                        # KERNEL_WIDTH-3 slot, grand-parent in ...
+                        if KERNEL_WIDTH - j - 2 >= 0:
+                            tl.store(
+                                base_ptr + (KERNEL_WIDTH - j - 2) * stride_inter_win,
+                                matrix_x,
+                                mask=mask_w,
+                            )
 
                 acc += matrix_x * matrix_w
 
                 # move to parent for next iteration
                 if _idx_token > 0:
-                    _idx_token = tl.sum(
-                        tl.where(idx_tokens == _idx_token, parent_idx_tokens, 0)
-                    )
+                    if HAS_DIRECT_PARENT:
+                        _idx_token = tl.load(
+                            retrieve_parent_token_base
+                            + _idx_token * stride_retrieve_parent_token_token
+                        ).to(tl.int32)
+                    else:
+                        _idx_token = tl.sum(
+                            tl.where(idx_tokens == _idx_token, parent_idx_tokens, 0)
+                        )
                     x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
                     matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
                 else:
@@ -1008,7 +1032,7 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
         # fuse: store calculated retrieve_parent_token to tensor
-        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
+        if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK and not HAS_DIRECT_PARENT:
             tl.store(
                 retrieve_parent_token_ptr
                 + idx_seq * stride_retrieve_parent_token_seq
@@ -1032,6 +1056,8 @@ def causal_conv1d_update(
     retrieve_next_token: Optional[torch.Tensor] = None,
     retrieve_next_sibling: Optional[torch.Tensor] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    direct_parent: bool = False,
+    save_tree_raw_only: bool = False,
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
@@ -1224,6 +1250,8 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        HAS_DIRECT_PARENT=bool(direct_parent),
+        SAVE_TREE_RAW_ONLY=bool(save_tree_raw_only),
         **pdl_kwargs,
     )
     if unsqueeze:

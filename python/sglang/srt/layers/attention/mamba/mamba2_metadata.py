@@ -51,6 +51,11 @@ class ForwardMetadata:
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    tree_depths: Optional[torch.Tensor] = None
+    tree_max_depth: int = 0
+    # True when retrieve_parent_token was supplied by the proposal builder rather
+    # than reconstructed by causal-conv from child/sibling links.
+    has_direct_parent: bool = False
     # For prefill radix cache
     track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_h_src: Optional[torch.Tensor] = None

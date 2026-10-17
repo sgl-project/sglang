@@ -111,6 +111,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
+        self.tree_depth_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -169,6 +170,9 @@ class MambaAttnBackendBase(AttentionBackend):
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
+        tree_depths = None
+        tree_max_depth = 0
+        has_direct_parent = False
         track_conv_indices = None
         track_ssm_h_src = None
         track_chunk_idx = None
@@ -298,8 +302,23 @@ class MambaAttnBackendBase(AttentionBackend):
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
-                    # None during dummy run
-                    if retrieve_next_token is not None:
+                    direct_parent = getattr(
+                        forward_batch.spec_info, "retrieve_parent_token", None
+                    )
+                    if direct_parent is not None:
+                        retrieve_parent_token = direct_parent
+                        tree_depths = getattr(
+                            forward_batch.spec_info, "tree_depths", None
+                        )
+                        tree_max_depth = int(
+                            getattr(forward_batch.spec_info, "max_tree_depth", 0)
+                        )
+                        has_direct_parent = bool(
+                            getattr(
+                                forward_batch.spec_info, "uses_direct_parent", False
+                            )
+                        )
+                    elif retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
@@ -348,6 +367,9 @@ class MambaAttnBackendBase(AttentionBackend):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
+            tree_depths=tree_depths,
+            tree_max_depth=tree_max_depth,
+            has_direct_parent=has_direct_parent,
             track_conv_indices=track_conv_indices,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
@@ -407,6 +429,16 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
             spec_info.retrieve_next_sibling
         )
+        direct_parent = getattr(spec_info, "retrieve_parent_token", None)
+        if direct_parent is not None:
+            self.retrieve_parent_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+                direct_parent
+            )
+            live_depths = getattr(spec_info, "tree_depths", None)
+            if live_depths is not None:
+                self.tree_depth_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+                    live_depths
+                )
 
     def _init_track_conv_indices(
         self,
@@ -651,6 +683,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            self.tree_depth_list.append(
+                torch.zeros(
+                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                )
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -730,6 +767,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                tree_depths=self.tree_depth_list[bs - 1],
+                tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
+                has_direct_parent=bool(getattr(spec_info, "uses_direct_parent", False)),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -920,6 +960,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
+                direct_parent = getattr(spec_info, "retrieve_parent_token", None)
+                if direct_parent is not None:
+                    self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
+                        direct_parent
+                    )
+                    live_depths = getattr(spec_info, "tree_depths", None)
+                    if live_depths is not None:
+                        self.tree_depth_list[bs - 1][:bs_without_pad].copy_(live_depths)
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -927,6 +975,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                tree_depths=self.tree_depth_list[bs - 1],
+                tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
+                has_direct_parent=bool(getattr(spec_info, "uses_direct_parent", False)),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -1564,7 +1615,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
 
         # KDA fused-accept: the next verify seeds itself in-kernel from the
-        # accepted checkpoint slot (recurrent_kda's num_accepted_tokens), so the
+        # accept checkpoint slot (recurrent_kda's accept-token count), so the
         # SSM state never round-trips through `temporal` and only the conv
         # windows still need the accept rollback. Recording this round's accept
         # length is what selects that seed next round; chain layout only (see
