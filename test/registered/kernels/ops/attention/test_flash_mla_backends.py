@@ -619,8 +619,8 @@ class TestTouchedPageSplit(CustomTestCase):
         # bytes below are the ones the kernel writes into.
         dev = k_cache.device
         buffers = get_resources().buffers
-        split_key = f"flash_mla_sm120_split:{dev}"
-        mask_key = f"flash_mla_sm120_mask:{dev}"
+        split_key = f"flash_mla_sm120_split:{dev}:{num_pages * ratio}"
+        mask_key = f"flash_mla_sm120_mask:{dev}:{num_pages}"
         missing = object()
         for key in (split_key, mask_key):
             old = buffers.get(key, missing)
@@ -707,6 +707,87 @@ class TestTouchedPageSplit(CustomTestCase):
             bool((dst[ratio : 2 * ratio] == sentinel).all()),
             "sub-pages of untouched source page 1 were rewritten",
         )
+
+
+class TestPageSplitGraphBuffers(CustomTestCase):
+    """A graph captured on one SWA pool keeps its page-split buffers.
+
+    A target and a draft model split pools of different sizes. A graph
+    captured on the smaller one keeps writing the buffers it captured, so a
+    later eager split of a larger pool must not replace them: replays would
+    write freed memory while eager readers got buffers the graph never updates.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required")
+        cls.device = torch.device("cuda")
+
+    def test_larger_pool_keeps_captured_buffers(self):
+        buffers = get_resources().buffers
+        saved = {k: v for k, v in buffers.items() if k.startswith("flash_mla_sm120_")}
+        for key in saved:
+            del buffers[key]
+        try:
+            self._check_larger_pool_keeps_captured_buffers(buffers)
+        finally:
+            for key in [k for k in buffers if k.startswith("flash_mla_sm120_")]:
+                del buffers[key]
+            buffers.update(saved)
+
+    def _check_larger_pool_keeps_captured_buffers(self, buffers):
+        ratio = _PBS_SRC // _PBS_DST
+        small, _ = _build_kvcache(2, _PBS_SRC, device=self.device, seed=3)
+        large, _ = _build_kvcache(5, _PBS_SRC, device=self.device, seed=4)
+        small_u8, large_u8 = small.view(torch.uint8), large.view(torch.uint8)
+        small_ids = torch.tensor(
+            [_PBS_SRC + 7, -1], dtype=torch.int32, device=self.device
+        )
+        large_ids = torch.tensor(
+            [0, 4 * _PBS_SRC], dtype=torch.int32, device=self.device
+        )
+
+        def split_small():
+            return _split_kv_pages_to_64(small_u8, _PBS_SRC, touched_indices=small_ids)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            split_small()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            split_small()
+        captured = {k: v.data_ptr() for k, v in buffers.items()}
+
+        _split_kv_pages_to_64(large_u8, _PBS_SRC, touched_indices=large_ids)
+        for key, ptr in captured.items():
+            self.assertEqual(buffers[key].data_ptr(), ptr, f"{key} was replaced")
+
+        # Replay with a different touched page and new contents: the captured
+        # mask must select it and the captured output must receive it.
+        out = split_small()
+        small_ids[0] = 5
+        small_u8[0].copy_(large_u8[3])
+        graph.replay()
+        torch.cuda.synchronize()
+
+        src = large_u8[3].reshape(-1)
+        dst = out.reshape(out.shape[0], -1)
+        data_per_sub = _PBS_DST * _NOPE_ROPE_STRIDE
+        scale_per_sub = _PBS_DST * _SCALE_STRIDE
+        for sub in range(ratio):
+            scale_off = _PBS_SRC * _NOPE_ROPE_STRIDE + sub * scale_per_sub
+            expected = torch.cat(
+                [
+                    src[sub * data_per_sub : (sub + 1) * data_per_sub],
+                    src[scale_off : scale_off + scale_per_sub],
+                ]
+            )
+            torch.testing.assert_close(
+                dst[sub, :_BYTES_PER_DST_PAGE], expected, atol=0, rtol=0
+            )
 
 
 if __name__ == "__main__":
