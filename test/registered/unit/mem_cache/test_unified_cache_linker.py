@@ -33,6 +33,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -50,6 +53,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
@@ -884,6 +888,62 @@ def test_offload_skips_node_already_stored_by_tree_core():
     wrapper.offload_nodes([node.id])
 
     assert linker.queued_offloads == []
+
+
+class TestMooncakeSessionCleanup(CustomTestCase):
+    def test_partial_session_start_releases_successful_sessions(self):
+        """A missing key must not leave other sessions open in a failed load."""
+        for previous_batch in (False, True):
+            with self.subTest(previous_batch=previous_batch):
+                sessions = set()
+
+                def start_sessions(keys):
+                    statuses = [-1 if key == "missing" else 0 for key in keys]
+                    sessions.update(
+                        key for key, status in zip(keys, statuses) if status == 0
+                    )
+                    return statuses
+
+                store = SimpleNamespace(
+                    batch_get_session_start=start_sessions,
+                    batch_get_session_end=sessions.difference_update,
+                )
+                pool = SimpleNamespace(
+                    prepare_locations=list,
+                    get_prepared_layer_range_meta=lambda locations, layer: None,
+                )
+                linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+                linker.num_layers = 1
+                linker.storage = SimpleNamespace(
+                    store=store,
+                    _get_hybrid_page_component_keys=lambda keys, transfer: (keys, 1),
+                    _tag_keys=lambda keys: keys,
+                )
+                linker.pools = {PoolName.KV: pool, PoolName.SWA: pool}
+                linker.layer_done_counter = LayerWiseLoadCounter(1)
+                index = linker.layer_done_counter.update_producer()
+                transfers = []
+                if previous_batch:
+                    transfers.append(
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            keys=["earlier"],
+                            host_indices=torch.tensor([0]),
+                        )
+                    )
+                transfers.append(
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        keys=["present", "missing"],
+                        host_indices=torch.tensor([1, 2]),
+                    )
+                )
+
+                with self.assertLogs(MooncakeDirectLinker.__module__, level="ERROR"):
+                    linker.load_layer_wise(index, [transfers])
+
+                self.assertFalse(linker.layer_done_counter.finish(index))
+                self.assertEqual(sessions, set())
 
 
 def test_layer_counter_reports_failure_after_the_forward():
