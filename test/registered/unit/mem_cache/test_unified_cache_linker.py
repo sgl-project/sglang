@@ -1143,6 +1143,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
+    component.gates_prefix_match = not unified_kv
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}

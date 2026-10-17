@@ -234,6 +234,22 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_encoder_swa_bounded_replay:
+        return
+    if (
+        cfg.max_running_requests is None
+        or cfg.max_running_requests <= 0
+        or not cfg.chunked_prefill_size
+        or cfg.chunked_prefill_size < 128
+    ):
+        raise ValueError(
+            "encoder SWA replay requires --max-running-requests > 0 and at least "
+            "128 chunked prefill tokens per attention DP rank"
+        )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
@@ -268,7 +284,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            ("DP attention", attn_dp_enabled_of(cfg)),
             ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
@@ -282,15 +297,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 raise ValueError(
                     f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
                 )
-        if (
-            cfg.max_running_requests is None
-            or cfg.max_running_requests <= 0
-            or not cfg.chunked_prefill_size
-            or cfg.chunked_prefill_size < 128
-        ):
-            raise ValueError(
-                "encoder SWA replay requires explicit --max-running-requests and --chunked-prefill-size >= 128"
-            )
 
     unsupported = (
         (
