@@ -129,6 +129,11 @@ def _fused_moe_lora_kernel(
     expert_id = tl.load(expert_ids_ptr + ind, ind < max_loras * stride_el, -1)
     if expert_id == -1:
         return
+    # Routed experts beyond the LoRA stack (e.g. a fused shared expert appended
+    # to the routed set) have no adapter weights. Without this bound the
+    # expert_id * stride_be term below walks into the next adapter's slice.
+    if expert_id >= num_experts:
+        return
 
     # get a_ptr,b_ptr,c_ptr
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
