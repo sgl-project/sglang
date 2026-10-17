@@ -841,6 +841,13 @@ class NemotronHForCausalLM(nn.Module):
         "v_proj.v_scale": "attn.v_scale",
     }
 
+    def _map_checkpoint_weight_name(self, name: str) -> str:
+        name = replace_prefix(name, self.remap_prefix)
+        return replace_substrings(name, self.remap_substr)
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return "mtp" in self._map_checkpoint_weight_name(name)
+
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
             "backbone.": "model.",
@@ -1102,8 +1109,7 @@ class NemotronHForCausalLM(nn.Module):
         # memory systems (e.g. DGX Spark, 119 GB) the old buffered path
         # caused OOM: skeleton 81.6 GB + buffer 75 GB = 157 GB peak.
         for name, loaded_weight in weights:
-            name = replace_prefix(name, self.remap_prefix)
-            name = replace_substrings(name, self.remap_substr)
+            name = self._map_checkpoint_weight_name(name)
             if is_mtp:
                 # Keep the MTP draft layers (mtp.layers.*) and the shared
                 # embed_tokens / lm_head weights. The remap above already

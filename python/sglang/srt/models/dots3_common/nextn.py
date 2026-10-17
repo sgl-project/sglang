@@ -185,6 +185,25 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        if "rotary_emb.inv_freq" in name or name == "model.embed_tokens.weight":
+            return True
+        if name.startswith("model.mtp.embed_tokens."):
+            return False
+        base_layer_id = (
+            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+        )
+        return not any(
+            name == prefix or name.startswith(prefix + ".")
+            for prefix in (
+                f"model.layers.{layer_id}"
+                for layer_id in range(
+                    base_layer_id,
+                    base_layer_id + self.config.num_nextn_predict_layers,
+                )
+            )
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         weights = list(weights)
         self._mtp_loaded_embed = any(

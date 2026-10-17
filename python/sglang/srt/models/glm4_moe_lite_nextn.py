@@ -33,6 +33,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    is_unused_nextn_checkpoint_weight,
+)
 from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
@@ -176,6 +179,9 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_nextn_checkpoint_weight(name, self.config, is_nextn=True)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)

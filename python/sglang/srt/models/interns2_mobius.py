@@ -799,6 +799,9 @@ class InternS2MobiusForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     packed_modules_mapping = InternS2MobiusForCausalLM.packed_modules_mapping
     supported_lora_modules = InternS2MobiusForCausalLM.supported_lora_modules
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return _is_intentional_mobius_skip(name, self.config.tie_word_embeddings)
+
     def __init__(
         self,
         config: InternS2MobiusConfig,

@@ -202,6 +202,32 @@ class NextNDisabledConfig:
 NextNConfig = NextNEnabledConfig | NextNDisabledConfig
 
 
+def is_unused_nextn_checkpoint_weight(
+    name: str,
+    config: PretrainedConfig,
+    is_nextn: bool,
+    nextn_layer_id: Optional[int] = None,
+) -> bool:
+    """Role selection shared by DeepSeek/GLM loaders and checkpoint readers."""
+    if is_nextn:
+        layer_id = (
+            nextn_layer_id
+            if nextn_layer_id is not None
+            else (0 if config.num_hidden_layers == 1 else config.num_hidden_layers)
+        )
+        return (
+            not name.startswith(f"model.layers.{layer_id}")
+            or "shared_head.head" in name
+            or "embed_tokens" in name
+        )
+    if getattr(config, "num_nextn_predict_layers", 0) > 0 and name.startswith(
+        "model.layers"
+    ):
+        parts = name.split(".")
+        return len(parts) >= 3 and int(parts[2]) >= config.num_hidden_layers
+    return False
+
+
 class DeepseekV2WeightLoaderMixin:
     """Mixin for loading weights in DeepSeek V2/V3 models."""
 
@@ -223,6 +249,11 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether loading NextN speculative decoding weights
         """
         nextn_conf = self._initialize_nextn_conf(is_nextn)
+        nextn_layer_id = (
+            nextn_conf.nextn_layer_id
+            if isinstance(nextn_conf, NextNEnabledConfig)
+            else None
+        )
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
@@ -290,34 +321,22 @@ class DeepseekV2WeightLoaderMixin:
 
                 weight_names.append(name)
 
+                if is_unused_nextn_checkpoint_weight(
+                    name, self.config, is_nextn, nextn_layer_id
+                ):
+                    continue
                 match nextn_conf:
                     case NextNEnabledConfig(
                         nextn_layer_prefix=layer_prefix,
                         nextn_spec_weight_names=spec_weight_names,
                     ):
-                        if not name.startswith(layer_prefix):
-                            continue
-
-                        # Use shared head and embed weights from target model
-                        if "shared_head.head" in name or "embed_tokens" in name:
-                            continue
-
                         # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
                         if any(s in name for s in spec_weight_names):
                             name = name.replace(layer_prefix, "model")
                         else:
                             name = name.replace(layer_prefix, "model.decoder")
                     case NextNDisabledConfig():
-                        if hasattr(self.config, "num_nextn_predict_layers"):
-                            num_nextn_layers = self.config.num_nextn_predict_layers
-                            if num_nextn_layers > 0 and name.startswith("model.layers"):
-                                name_list = name.split(".")
-                                if (
-                                    len(name_list) >= 3
-                                    and int(name_list[2])
-                                    >= self.config.num_hidden_layers
-                                ):
-                                    continue
+                        pass
 
                 if _load_fused_expert_tensor(name, loaded_weight, params_dict):
                     continue

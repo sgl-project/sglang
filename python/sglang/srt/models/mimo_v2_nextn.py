@@ -275,6 +275,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             hidden_states_before_norm=hidden_states_before_norm,
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return name.startswith("model.layers.") and "mtp" not in name
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        layer_id = self.config.num_hidden_layers
+        return not name.startswith(
+            (
+                f"model.layers.{layer_id}.",
+                f"model.language_model.layers.{layer_id}.",
+            )
+        )
+
     def prepare_cp_inputs(self, forward_batch, **kwargs):
         # The worker has rotated the target's multimodal embeddings per request.
         # Fill each appended token while indices still address full sequences,
@@ -79,15 +88,10 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
     def load_weights(self, weights):
         if not hasattr(self, "fuse_qkv_a_proj"):
             self.fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
-        layer_id = self.config.num_hidden_layers
-        layer_prefixes = (
-            f"model.layers.{layer_id}.",
-            f"model.language_model.layers.{layer_id}.",
-        )
         nextn_weights = (
             (name, weight)
             for name, weight in weights
-            if name.startswith(layer_prefixes)
+            if not self.is_unused_checkpoint_weight(name)
         )
         return Glm5NextForConditionalGeneration.load_weights(
             self, nextn_weights, is_nextn=True

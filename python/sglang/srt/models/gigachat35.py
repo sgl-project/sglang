@@ -37,6 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    is_unused_nextn_checkpoint_weight,
 )
 from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
 from sglang.srt.runtime_context import get_parallel
@@ -654,6 +655,9 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_nextn_checkpoint_weight(name, self.config, False)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_nextn: bool = False

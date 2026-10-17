@@ -56,6 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.bailing_moe import is_unused_bailing_checkpoint_weight
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
@@ -1352,6 +1353,9 @@ class BailingMoELinearForCausalLM(nn.Module):
         else:
             return hidden_states
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return is_unused_bailing_checkpoint_weight(name, self.config, is_nextn=False)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False
     ) -> Set[str]:
@@ -1411,17 +1415,11 @@ class BailingMoELinearForCausalLM(nn.Module):
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         for name, loaded_weight in weights:
-            if name.startswith("model.mtp"):
+            if self.is_unused_checkpoint_weight(name):
                 continue
             layer_idx = None
             if "model.layers." in name:
                 layer_idx = int(name.split(".")[2])
-            if (
-                ("v_head" in name)
-                or ("inv_freq" in name)
-                or (self.config.tie_word_embeddings and "lm_head" in name)
-            ):
-                continue
 
             weight_names.append(name)
 
