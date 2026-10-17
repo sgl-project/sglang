@@ -249,5 +249,41 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                     load_decision_config(checkpoint, None)
 
 
+class TestAudioUnderstandableFlag(CustomTestCase):
+    """is_audio_understandable_model must key on the tower, not the attribute.
+
+    Non-audio variants of multimodal families ship a config.json entry with
+    audio_config: null. A presence check (hasattr) reads that as audio-capable
+    and lets audio requests reach a model with no audio tower, crashing the
+    scheduler. The flag must be True only when an audio config is present.
+    """
+
+    def _build(self, **config_kwargs):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlamaForCausalLM"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+                **config_kwargs,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(ServerArgs(model_path=checkpoint))
+
+    def test_missing_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build().is_audio_understandable_model)
+
+    def test_null_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build(audio_config=None).is_audio_understandable_model)
+
+    def test_present_audio_config_is_understandable(self):
+        self.assertTrue(
+            self._build(
+                audio_config={"num_mel_bins": 128}
+            ).is_audio_understandable_model
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
