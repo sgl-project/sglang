@@ -194,6 +194,31 @@ def test_table_rows_match_in_order(tmp_path):
         plan_module.load_plans.cache_clear()
 
 
+def test_routed_rows_of_the_blackwell_table():
+    # Only grouped shrink/expand reads routes; all_slots/per_row block values
+    # do not affect the route set built for a batch.
+    assert not DensePlan(
+        a_family=AFamily.ALL_SLOTS, b_family=BFamily.PER_ROW
+    ).needs_aligned_route
+    assert not DensePlan(
+        a_family=AFamily.PER_ROW, b_family=BFamily.PER_ROW
+    ).needs_aligned_route
+    plan_module.load_plans.cache_clear()
+    try:
+        table = plan_module.load_plans("sm100")
+        routed = {}
+        for row in table.rows:
+            plan = DensePlan(**row.spec.model_dump())
+            if plan.needs_aligned_route:
+                routed.setdefault(row.phase, set()).add(plan.block_size)
+        assert routed[Phase.DECODE] == {16}
+        # the route pads per slot, not per request, so a captured plan's
+        # capacity ignores the live request count at every block size
+        assert routed[Phase.PREFILL] == {16, 32, 64, 128}
+    finally:
+        plan_module.load_plans.cache_clear()
+
+
 def test_geometry_rows_do_not_leak_to_neighboring_sites(tmp_path):
     rows = {
         "rows": [
@@ -229,6 +254,34 @@ def test_geometry_rows_do_not_leak_to_neighboring_sites(tmp_path):
                     ).block_size
                     == expected
                 )
+    finally:
+        plan_module.load_plans.cache_clear()
+
+
+@pytest.mark.parametrize("architecture", ["default", "sm90", "sm100"])
+@pytest.mark.parametrize("phase", [Phase.DECODE, Phase.PREFILL])
+@pytest.mark.parametrize("kind", [DenseLoraKind.EMBEDDING, DenseLoraKind.LM_HEAD])
+@pytest.mark.parametrize("rank", [8, 32, 64, 128])
+def test_shipped_vocab_plans_keep_the_supported_execution_contract(
+    monkeypatch, architecture, phase, kind, rank
+):
+    # This is a serving contract, independent of any table-generation script.
+    monkeypatch.delenv("SGLANG_LORA_DENSE_CONFIG_DIR", raising=False)
+    plan_module.load_plans.cache_clear()
+    try:
+        table = DensePlanTable(architecture, max_rank=rank)
+        for tokens in (1, 16, 17, 1024):
+            for k, n in ((256, 131), (2048, 65536)):
+                plan = table.plan_for(kind, phase, tokens, k, n)
+                assert plan.a_family is AFamily.GROUPED
+                assert plan.b_family is BFamily.GROUPED
+                assert plan.overlap is Overlap.NONE
+                assert plan.block_size == (16 if phase is Phase.DECODE else 64)
+                assert plan.a_tiles.get("SPLIT_K", 1) == (
+                    4 if phase is Phase.DECODE else 1
+                )
+                assert plan == table.plan_for(kind, phase, tokens, k, 0)
+                assert plan == table.plan_for(kind, phase, tokens, 0, n)
     finally:
         plan_module.load_plans.cache_clear()
 
@@ -278,6 +331,33 @@ def test_windowed_sites_skip_all_slots_rows(tmp_path):
             assert sink.block_size == 32 and sink.overlap is Overlap.AB_DELTA
             # beyond the all_slots row's token bound both kinds take the same row
             assert table.plan_for(DenseLoraKind.LINEAR, Phase.DECODE, 64) == sink
+    finally:
+        plan_module.load_plans.cache_clear()
+
+
+def test_shipped_h200_table_serial_in_proj_exceptions():
+    """H200 in_proj_qkvz (K=2048, N=12288), pool ranks 33-64, uses serial block 16
+    through 2048 prefill tokens; other kinds and pool-16 selections are unchanged.
+    """
+    plan_module.load_plans.cache_clear()
+    try:
+        table = DensePlanTable("sm90", max_rank=64)
+        short = table.plan_for(DenseLoraKind.LINEAR, Phase.PREFILL, 512, 2048, 12288)
+        assert short.block_size == 16 and short.overlap is Overlap.NONE
+        longer = table.plan_for(DenseLoraKind.LINEAR, Phase.PREFILL, 2048, 2048, 12288)
+        assert longer.block_size == 16
+        assert (
+            table.plan_for(
+                DenseLoraKind.LINEAR, Phase.PREFILL, 4096, 2048, 12288
+            ).block_size
+            == 64
+        )
+        assert (
+            table.plan_for(
+                DenseLoraKind.LINEAR, Phase.PREFILL, 512, 2048, 9216
+            ).block_size
+            == 64
+        )
     finally:
         plan_module.load_plans.cache_clear()
 
