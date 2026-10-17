@@ -127,6 +127,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="mamba.fused_qwen4_varlen_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="mamba.fused_qwen4_verify_conv",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_verify_conv",

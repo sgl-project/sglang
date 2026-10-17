@@ -166,7 +166,20 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         context = SimpleNamespace(forward_batch=batch)
         capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
         pool = Mock(get_mamba_indices=lambda indices: indices)
-        cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
+        cases = [
+            (
+                [8],
+                [0] * 8,
+                list(range(8)),
+                [0, 8],
+            ),
+            (
+                [3, 0, 2, 3],
+                [0, 0, 0, 2, 2, 3, 3, 3],
+                [0, 1, 2, 0, 1, 0, 1, 2],
+                [0, 3, 3, 5, 8],
+            ),
+        ]
         with (
             patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
             patch.object(bcg, "_current_capture_var") as active,
@@ -175,7 +188,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             ),
         ):
             active.get.return_value = capture
-            for lengths, expected in cases:
+            for lengths, expected_reqs, expected_offsets, expected_starts in cases:
                 context.forward_batch = batch = SimpleNamespace(**vars(batch))
                 batch.extend_seq_lens = torch.tensor(lengths)
                 batch.extend_seq_lens_cpu = lengths
@@ -189,7 +202,11 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 else:
                     for replay in capture.cuda_graph._break_fns:
                         replay()
-                self.assertEqual(holder.batch.req_indices.tolist(), expected)
+                self.assertEqual(holder.batch.lengths.tolist(), lengths)
+                self.assertEqual(holder.batch.processed_tokens, sum(lengths))
+                self.assertEqual(holder.batch.req_indices.tolist(), expected_reqs)
+                self.assertEqual(holder.batch.token_offsets.tolist(), expected_offsets)
+                self.assertEqual(holder.batch.query_start_loc.tolist(), expected_starts)
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
         class Model:
