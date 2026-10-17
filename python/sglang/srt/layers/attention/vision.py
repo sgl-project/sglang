@@ -864,17 +864,17 @@ class VisionAscendAttention(nn.Module):
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
             cu = forward_metadata.cu_seqlens.to("cpu")
-            output = torch.empty_like(q)
+            output = torch.zeros_like(q)
             seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
-            output = kwargs["output_ws"]
+            output = kwargs["output_ws"].zero_()
             seq_len_arg = cu_seqlens
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device="cpu")
             seq_len_arg = cu_seqlens[1:].to(torch.int32)
-            output = torch.empty_like(q)
+            output = torch.zeros_like(q)
 
         _, num_heads, head_size = q.shape
         num_kv_heads = k.shape[1]
@@ -931,10 +931,8 @@ class VisionAscendAttention(nn.Module):
         )[0]
 
         if valid_indices is not None:
-            output.zero_()
             output.index_copy_(0, valid_indices, attn_output)
         elif output.shape[0] != total_tokens:
-            output.zero_()
             output[:total_tokens].copy_(attn_output)
         else:
             output = attn_output
