@@ -122,8 +122,8 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
         self.assertIs(get_radix_cache_factory("dupe"), factory)
         _publish(self, radix_cache_backend="dupe")
         worker = object()
-        prepare_radix_cache_worker(worker)
-        preparer.assert_called_once_with(worker)
+        prepare_radix_cache_worker(worker, True)
+        preparer.assert_called_once_with(worker, True)
 
     def test_registration_does_not_read_configuration_or_prepare_worker(self):
         factory, preparer = MagicMock(), MagicMock()
@@ -138,6 +138,21 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
         factory.assert_not_called()
         preparer.assert_not_called()
 
+    def test_invalid_preparer_does_not_reserve_backend_name(self):
+        with self.assertRaisesRegex(TypeError, "prepare_worker must be callable"):
+            register_radix_cache_backend(
+                "invalid", MagicMock(), prepare_worker=object()
+            )
+        self.assertIsNone(get_radix_cache_factory("invalid"))
+        self.assertNotIn("invalid", registered_radix_cache_backends())
+        factory, preparer = MagicMock(), MagicMock()
+        register_radix_cache_backend("invalid", factory, prepare_worker=preparer)
+        self.assertIs(get_radix_cache_factory("invalid"), factory)
+        _publish(self, radix_cache_backend="invalid")
+        worker = object()
+        prepare_radix_cache_worker(worker, False)
+        preparer.assert_called_once_with(worker, False)
+
 
 class TestPrepareRadixCacheWorker(_RegistryIsolationMixin, CustomTestCase):
     def test_uses_only_published_backend_before_cache_construction(self):
@@ -150,9 +165,9 @@ class TestPrepareRadixCacheWorker(_RegistryIsolationMixin, CustomTestCase):
             server_args=SimpleNamespace(radix_cache_backend="other")
         )
 
-        prepare_radix_cache_worker(worker)
+        prepare_radix_cache_worker(worker, False)
 
-        selected.assert_called_once_with(worker)
+        selected.assert_called_once_with(worker, False)
         other.assert_not_called()
         factory.assert_not_called()
 
@@ -164,14 +179,16 @@ class TestPrepareRadixCacheWorker(_RegistryIsolationMixin, CustomTestCase):
         for name in (None, "factory_only"):
             with self.subTest(backend=name):
                 _publish(self, radix_cache_backend=name)
-                prepare_radix_cache_worker(object())
+                prepare_radix_cache_worker(object(), True)
         unused.assert_not_called()
         factory.assert_not_called()
 
     def test_prepares_once_before_all_runners_on_every_worker_call(self):
         events = []
         register_radix_cache_backend(
-            "ordered", MagicMock(), prepare_worker=lambda worker: events.append(worker)
+            "ordered",
+            MagicMock(),
+            prepare_worker=lambda worker, capture: events.append((worker, capture)),
         )
         _publish(self, radix_cache_backend="ordered")
         for worker_number in range(2):
@@ -192,7 +209,7 @@ class TestPrepareRadixCacheWorker(_RegistryIsolationMixin, CustomTestCase):
                     self.assertEqual(
                         events,
                         [
-                            worker,
+                            (worker, capture),
                             (worker_number, 0, capture),
                             (worker_number, 1, capture),
                         ],

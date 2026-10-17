@@ -427,7 +427,7 @@ class TpModelWorker(BaseTpWorker):
         """Prepare the selected cache backend and initialize all runner graphs."""
         from sglang.srt.mem_cache.registry import prepare_radix_cache_worker
 
-        prepare_radix_cache_worker(self)
+        prepare_radix_cache_worker(self, capture_decode_cuda_graph)
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
