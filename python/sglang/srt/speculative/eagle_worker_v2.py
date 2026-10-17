@@ -1237,6 +1237,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    # eagle_sample's renorm ops run in this worker's verify path; the
+    # scheduler prewarms them at startup (sglang#43412).
+    verify_uses_eagle_sample = True
+
     def __init__(
         self,
         server_args: ServerArgs,

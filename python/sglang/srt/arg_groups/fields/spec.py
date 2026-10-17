@@ -122,6 +122,12 @@ class Spec(msgspec.Struct):
         "Use block verification for EAGLE/EAGLE3/NEXTN (requires topk=1) or for "
         "sampled DFLASH/DSPARK drafts, on CUDA or ROCm.",
     ] = False
+    speculative_sampling_renorm_fallback: A[
+        bool,
+        "If FlashInfer's speculative verify sampling ops fail to JIT-compile, "
+        "degrade the verify renorm to the in-tree triton kernels instead of "
+        "failing startup (or aborting the affected requests at request time).",
+    ] = False
     speculative_token_map: A[
         Optional[str],
         "The path of the draft model's small vocab table.",

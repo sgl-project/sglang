@@ -330,6 +330,7 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
+    SpecSamplingOpError,
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1987,8 +1988,15 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                try:
+                    result = self.run_batch(batch)
+                except SpecSamplingOpError as e:
+                    # A verify sampling op failed (e.g. a flashinfer JIT
+                    # build); abort this batch's requests, keep serving
+                    # (sglang#43412).
+                    self._abort_batch_on_spec_sampling_op_failure(batch, str(e))
+                else:
+                    self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -2047,11 +2055,21 @@ class Scheduler(
                         pass
 
             # Launch the current batch
+            spec_sampling_op_failed = False
             if batch:
-                batch_result = self.run_batch(batch)
-                # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
+                try:
+                    batch_result = self.run_batch(batch)
+                except SpecSamplingOpError as e:
+                    # A verify sampling op failed (e.g. a flashinfer JIT
+                    # build); abort this batch's requests, keep serving
+                    # (sglang#43412).
+                    spec_sampling_op_failed = True
+                    batch_result = None
+                    self._abort_batch_on_spec_sampling_op_failure(batch, str(e))
+                else:
+                    # Fence result processing behind this forward's shared reads.
+                    self._apply_war_barrier()
+                    self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -2066,7 +2084,7 @@ class Scheduler(
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.is_generation:
+            if self.is_generation and not spec_sampling_op_failed:
                 self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
@@ -5537,6 +5555,44 @@ class Scheduler(
             # Polling can run intake before the newest queued batch becomes last_batch.
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
+
+    def _abort_batch_on_spec_sampling_op_failure(
+        self, batch: ScheduleBatch, message: str
+    ):
+        """Abort every request in a batch whose verify sampling op failed.
+
+        The scheduler stays alive: greedy and non-speculative traffic keep
+        serving, and with --speculative-sampling-renorm-fallback armed, later
+        non-greedy verify batches degrade to the in-tree triton renorm.
+        Mirrors the beam-group abort in retract_decode(): mark each request,
+        release its resources, filter the batch, and report the abort to the
+        tokenizer (sglang#43412).
+        """
+        logger.error(
+            "Speculative verify sampling op failed; aborting %d request(s) "
+            "in the current batch (the server keeps serving): %s",
+            len(batch.reqs),
+            message,
+        )
+        reqs_to_abort = []
+        for idx in range(len(batch.reqs)):
+            req = batch.reqs[idx]
+            if req.to_finish is None:
+                req.to_finish = FINISH_ABORT(
+                    message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            # Every request is released and reported — a req that already
+            # carries a to_finish (e.g. an in-flight client abort) keeps its
+            # own reason instead of being silently dropped by the filter.
+            batch.release_req(idx, len(batch.reqs) - idx, offload_kv=False)
+            reqs_to_abort.append(req)
+        batch.filter_batch(keep_indices=[])
+        for req in reqs_to_abort:
+            self.ipc_channels.send_to_tokenizer.send_output(
+                _make_abort_req(req, finished_reason=req.to_finish.to_json()),
+                req,
+            )
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
