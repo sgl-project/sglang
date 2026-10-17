@@ -48,8 +48,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -989,9 +989,7 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
         )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
-        )
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0)
