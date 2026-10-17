@@ -2038,7 +2038,7 @@ class MMReceiverBase(ABC):
         existing FAIL channel. AbortReq is broadcast, so every TP rank does
         this and the status all-reduce stays consistent."""
         for waiting_req in self.waiting_list:
-            if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
+            if not (recv_req.abort_all or waiting_req.rid == recv_req.rid):
                 continue
             if waiting_req.status in (
                 WaitingMMRequestStatus.PENDING,
