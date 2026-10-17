@@ -83,6 +83,7 @@ class SimulationMode(Enum):
 @dataclass(slots=True)
 class RequestStats:
     rid: str = ""
+    session_id: Optional[str] = None
     last_event_time: float = 0.0
     input_length: int = 1
     output_length: int = 1
@@ -101,6 +102,11 @@ class RequestStats:
     queue_start: float = -1
     queue_end: float = -1
     created_time: float = -1
+    # False when the request carried no simulation metadata (the server's warm-up);
+    # its timing fields keep the -1 defaults above.
+    simulated: bool = False
+    # Set from the scheduler's own finish state, which honours max_new_tokens clamps.
+    finished: bool = False
     gen_token_latencies: list[float] = field(default_factory=list)
 
     def is_complete(self) -> bool:
