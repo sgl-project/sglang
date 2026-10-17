@@ -60,7 +60,8 @@ class DeviceType(str, Enum):
     HIP = "hip"
     NPU = "npu"  # Ascend NPU (torch_npu / sgl_kernel_npu)
     CPU = "cpu"
-    # TODO(RFC #29630): XPU / MUSA / ... as backends land.
+    XPU = "xpu"
+    # TODO(RFC #29630): MUSA / ... as backends land.
 
 
 class PlatformInfo(msgspec.Struct, frozen=True):
@@ -114,6 +115,9 @@ class PlatformInfo(msgspec.Struct, frozen=True):
                     cuda_arch_major=major,
                     cuda_arch_minor=minor,
                 )
+            xpu = getattr(torch, "xpu", None)
+            if xpu is not None and xpu.is_available():
+                return cls(device_type="xpu")
         except Exception:
             pass
         return cls()
@@ -132,7 +136,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     (``min_cuda_arch`` / ``max_cuda_arch`` apply only when ``device == CUDA``).
 
     The device-only cases are so common that they are exposed as class constants
-    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU``); use :meth:`cuda` for an
+    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU`` / ``.XPU``); use :meth:`cuda` for an
     arch-bounded CUDA requirement (e.g. ``CapabilityRequirement.cuda(
     min_sm=(10, 0))`` for SM100+).
     """
@@ -146,6 +150,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     CUDA: ClassVar[CapabilityRequirement]
     HIP: ClassVar[CapabilityRequirement]
     NPU: ClassVar[CapabilityRequirement]
+    XPU: ClassVar[CapabilityRequirement]
 
     @classmethod
     def cuda(
@@ -171,6 +176,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
 CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
 CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
 CapabilityRequirement.NPU = CapabilityRequirement(device=DeviceType.NPU)
+CapabilityRequirement.XPU = CapabilityRequirement(device=DeviceType.XPU)
 
 
 def capabilities_satisfied(
