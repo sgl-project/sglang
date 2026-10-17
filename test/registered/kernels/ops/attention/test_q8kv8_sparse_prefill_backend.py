@@ -386,7 +386,9 @@ def _patched_sparse_kernels(
         d_v,
         attn_sink,
         topk_length,
+        return_log2_lse=True,
     ):
+        assert return_log2_lse is False
         bf16_capture.record(
             q=q,
             kv=kv,
@@ -399,10 +401,7 @@ def _patched_sparse_kernels(
         out = torch.zeros(
             (q.shape[0], q.shape[1], d_v), dtype=torch.bfloat16, device=q.device
         )
-        meta = torch.zeros(
-            (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
-        )
-        return out, meta, meta
+        return out, None, None
 
     def fake_sparse_mla_q8kv8_prefill_fwd(
         *,

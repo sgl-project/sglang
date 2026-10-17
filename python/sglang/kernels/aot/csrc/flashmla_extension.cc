@@ -141,7 +141,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
-      "Tensor? topk_length=None) -> Tensor[]");
+      "Tensor? topk_length=None, bool return_log2_lse=True) -> Tensor?[]");
   m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
 
   m.def(
