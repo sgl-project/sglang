@@ -43,3 +43,7 @@ SGLang supports multimodal inputs for various model architectures. The `multimod
 The folder `token_in_token_out` shows how to perform inference, where we provide tokens and get tokens as response.
 
 * `token_in_token_out_{llm|vlm}_{engine|server}.py`: Shows how to perform token in, token out workflow for llm/vlm using either the engine or native API.
+
+## CPU prefix reuse
+
+* [cpu_prefix_reuse.py](cpu_prefix_reuse.py): Send a shared maintenance manual with changing observations; record full responses and cache usage. See [CPU setup and cache-on/off comparison](CPU_PREFIX_REUSE.md).
