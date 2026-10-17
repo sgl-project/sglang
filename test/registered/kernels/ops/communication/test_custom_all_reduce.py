@@ -63,12 +63,14 @@ TEST_SIZES = [
     32 * 1024,
     256 * 1024,
     2 * 1024 * 1024,
+    3 * 1024 * 1024 + 24,  # chunks not a multiple of world_size
     4 * 1024 * 1024,
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
+    AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
 USE_GRAPH_OPTIONS = [False, True]
