@@ -53,25 +53,25 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             batch_first=True,
             padding_value=self.orchestrator.vocab_size,
         )
+        # The sparse CUDA update uses direct addresses. Reject invalid IDs on
+        # the CPU before transfer, as the dense scatter did before this change.
+        if torch.any(
+            (padded_stop_token_ids_cpu < 0)
+            | (padded_stop_token_ids_cpu > self.orchestrator.vocab_size)
+        ):
+            raise RuntimeError("Stop token ID is out of vocabulary range")
         if pin_memory:
             padded_stop_token_ids_cpu = padded_stop_token_ids_cpu.pin_memory()
         padded_stop_token_ids = padded_stop_token_ids_cpu.to(
             self.orchestrator.device, non_blocking=True
         )
-        self.stop_token_penalties = torch.zeros(
-            size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
-            dtype=torch.float32,
-            device=self.orchestrator.device,
-        ).scatter_add_(
-            dim=1,
-            index=padded_stop_token_ids,
-            src=torch.full_like(
-                input=padded_stop_token_ids,
-                dtype=torch.float32,
-                fill_value=float("-inf"),
-                device=self.orchestrator.device,
-            ),
-        )[:, : self.orchestrator.vocab_size]
+        # Keep only stop-token entries, rather than a batch x vocabulary mask.
+        # Padding scatters a zero to token 0, so it never suppresses that token.
+        padding = padded_stop_token_ids == self.orchestrator.vocab_size
+        self.stop_token_ids = padded_stop_token_ids.masked_fill(padding, 0)
+        self.stop_token_penalties = torch.full_like(
+            padded_stop_token_ids, float("-inf"), dtype=torch.float32
+        ).masked_fill_(padding, 0.0)
 
         self.len_output_tokens = torch.zeros(
             size=(len(self.orchestrator.reqs()), 1),
@@ -83,14 +83,26 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens += 1
 
     def _apply(self, logits: torch.Tensor):
-        # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
-        # device-to-host sync every decode step; torch.where is a plain
-        # elementwise select with no sync (and no -inf*0=nan).
-        mask = self.len_output_tokens < self.min_new_tokens
-        logits.add_(torch.where(mask, self.stop_token_penalties, 0.0))
+        if logits.is_cuda:
+            from sglang.kernels.ops.sampling.min_new_tokens import (
+                apply_min_new_tokens_penalties,
+            )
+
+            apply_min_new_tokens_penalties(
+                logits,
+                self.stop_token_ids,
+                self.stop_token_penalties,
+                self.len_output_tokens,
+                self.min_new_tokens,
+            )
+        else:
+            mask = self.len_output_tokens < self.min_new_tokens
+            penalties = torch.where(mask, self.stop_token_penalties, 0.0)
+            logits.scatter_add_(1, self.stop_token_ids, penalties.to(logits.dtype))
 
     def _filter(self, keep_indices: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[keep_indices]
+        self.stop_token_ids = self.stop_token_ids[keep_indices]
         self.stop_token_penalties = self.stop_token_penalties[keep_indices]
         self.len_output_tokens = self.len_output_tokens[keep_indices]
 
@@ -98,15 +110,32 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.min_new_tokens = torch.cat(
             [self.min_new_tokens, their.min_new_tokens], dim=0
         )
-        self.stop_token_penalties = torch.cat(
-            [self.stop_token_penalties, their.stop_token_penalties], dim=0
-        )
+        # Independently prepared batches can have different stop-list widths.
+        width = max(self.stop_token_ids.shape[1], their.stop_token_ids.shape[1])
+        for name in ("stop_token_ids", "stop_token_penalties"):
+            ours, theirs = getattr(self, name), getattr(their, name)
+            setattr(
+                self,
+                name,
+                torch.cat(
+                    [
+                        torch.nn.functional.pad(ours, (0, width - ours.shape[1])),
+                        torch.nn.functional.pad(theirs, (0, width - theirs.shape[1])),
+                    ],
+                    dim=0,
+                ),
+            )
         self.len_output_tokens = torch.cat(
             [self.len_output_tokens, their.len_output_tokens], dim=0
         )
 
     # Explicit resource cleanup to aid GC and free CUDA memory promptly
     def _teardown(self) -> None:
-        for name in ("min_new_tokens", "stop_token_penalties", "len_output_tokens"):
+        for name in (
+            "min_new_tokens",
+            "stop_token_ids",
+            "stop_token_penalties",
+            "len_output_tokens",
+        ):
             if hasattr(self, name):
                 delattr(self, name)
