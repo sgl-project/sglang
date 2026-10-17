@@ -11,6 +11,7 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm import try_sm120_fp8_linear
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import (
@@ -663,8 +664,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         if isinstance(x, tuple):
             x, input_scale, out_dtype = x
         if self.use_sm120_fp8 and out_dtype in (None, torch.bfloat16):
-            from sglang.kernels.ops.gemm import try_sm120_fp8_linear
-
             output = try_sm120_fp8_linear(
                 x,
                 layer.weight,

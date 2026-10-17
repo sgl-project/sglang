@@ -95,6 +95,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -220,8 +221,6 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     """
     if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
         return
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
-
     if not (
         isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
         and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
@@ -239,8 +238,16 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
 
 def _fuse_norm_input_quant(norm: GemmaRMSNorm, linear: nn.Module) -> None:
     """Quantize ``linear``'s input inside ``norm`` when it is static FP8 or NVFP4 W4A4."""
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
-
+    # LoRA needs the unquantized activation. DP/CP and sequence-parallel
+    # boundaries may gather after the norm, and those gathers take tensors.
+    if (
+        get_lora().enable_lora
+        or get_lora().lora_paths
+        or is_dp_attention_enabled()
+        or get_parallel().attn_cp_size > 1
+        or get_parallel().enable_layernorm_sp
+    ):
+        return
     if isinstance(linear.quant_method, ModelOptFp4LinearMethod):
         linear._accepts_prequantized_fp4 = True
     norm.fuse_input_quant(linear)

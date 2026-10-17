@@ -27,6 +27,18 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+)
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    ModelOptFp8LinearMethod,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -432,29 +444,15 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
 
 
 def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
-    try:
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-    except ImportError:
-        Fp8LinearMethod = ()
     if isinstance(quant_method, Fp8LinearMethod):
         return not (
             getattr(quant_method, "block_quant", False)
             or getattr(quant_method, "use_mxfp8", False)
             or getattr(quant_method, "use_marlin", False)
         )
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
 
     if isinstance(quant_method, ModelOptFp8LinearMethod):
         return not quant_method.use_marlin
-    try:
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-            CompressedTensorsLinearMethod,
-        )
-        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-            CompressedTensorsW8A8Fp8,
-        )
-    except ImportError:
-        return False
     if isinstance(quant_method, CompressedTensorsLinearMethod):
         scheme = getattr(linear, "scheme", None)
         return isinstance(scheme, CompressedTensorsW8A8Fp8) and getattr(
@@ -466,8 +464,6 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 def _nvfp4_input_global_scale(linear) -> Optional[torch.Tensor]:
     """Return the activation global scale of an NVFP4 W4A4 ModelOpt ``linear``
     that consumes a pre-quantized ``(fp4, block_scale)`` input; otherwise ``None``."""
-    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
     quant_method = linear.quant_method
     if not (

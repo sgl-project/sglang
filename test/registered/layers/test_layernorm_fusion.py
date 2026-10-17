@@ -3,7 +3,20 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+import sglang.srt.layers.layernorm as ln_mod
+from sglang.kernels.ops.gemm import try_sm120_fp8_linear
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+from sglang.srt.layers.layernorm import (
+    GemmaRMSNorm,
+    RMSNorm,
+    _flashinfer_rmsnorm_fp4quant_available,
+    _flashinfer_rmsnorm_quant_available,
+)
+from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear_bmm_flashinfer,
+    flashinfer_per_tensor_fp8_supported,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,7 +68,6 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
-        from sglang.srt.layers.layernorm import _flashinfer_rmsnorm_quant_available
 
         if not _flashinfer_rmsnorm_quant_available:
             raise unittest.SkipTest("flashinfer rmsnorm_quant is not available")
@@ -127,7 +139,6 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
 
     def test_forward_cuda_quant_linear_dispatch(self):
         """forward_cuda routes to the fused path only when applicable."""
-        import sglang.srt.layers.layernorm as ln_mod
 
         torch.manual_seed(self.SEED)
         hidden_size, num_tokens = 512, 32
@@ -192,7 +203,6 @@ class TestGemmaRMSNormInputQuantFusion(CustomTestCase):
         return layer, x, residual
 
     def _run_fused(self, layer, x, residual, fp8_scale=None, fp4_scale=None):
-        import sglang.srt.layers.layernorm as ln_mod
 
         orig = ln_mod._fp8_static_input_scale, ln_mod._nvfp4_input_global_scale
         ln_mod._fp8_static_input_scale = lambda linear: fp8_scale
@@ -211,7 +221,6 @@ class TestGemmaRMSNormInputQuantFusion(CustomTestCase):
         return out[0], out[1], ref[0], ref[1]
 
     def test_fp8(self):
-        from sglang.srt.layers.layernorm import _flashinfer_rmsnorm_quant_available
 
         if not _flashinfer_rmsnorm_quant_available:
             self.skipTest("flashinfer rmsnorm_quant is not available")
@@ -236,8 +245,6 @@ class TestGemmaRMSNormInputQuantFusion(CustomTestCase):
                 self.assertGreater(cos.item(), 0.999)
 
     def test_nvfp4(self):
-        from sglang.srt.layers.layernorm import _flashinfer_rmsnorm_fp4quant_available
-        from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
         if not _flashinfer_rmsnorm_fp4quant_available or fp4_quantize is None:
             self.skipTest("flashinfer rmsnorm_fp4quant / fp4_quantize not available")
@@ -293,7 +300,6 @@ class TestPrequantizedFp8Linear(CustomTestCase):
         torch.set_default_device("cuda")
 
     def _operands(self):
-        from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
         torch.manual_seed(0)
         x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
@@ -304,10 +310,6 @@ class TestPrequantizedFp8Linear(CustomTestCase):
         return x, q, input_scale, weight, weight_scale
 
     def test_flashinfer_bmm(self):
-        from sglang.srt.layers.quantization.fp8_utils import (
-            apply_fp8_linear_bmm_flashinfer,
-            flashinfer_per_tensor_fp8_supported,
-        )
 
         if not flashinfer_per_tensor_fp8_supported():
             self.skipTest("flashinfer bmm_fp8 is not supported here")
@@ -322,7 +324,6 @@ class TestPrequantizedFp8Linear(CustomTestCase):
     def test_sm12x_small_m(self):
         if torch.cuda.get_device_capability()[0] != 12:
             self.skipTest("SM12x only")
-        from sglang.kernels.ops.gemm import try_sm120_fp8_linear
 
         x, q, input_scale, weight, weight_scale = self._operands()
         input_scale = input_scale.reshape(1)

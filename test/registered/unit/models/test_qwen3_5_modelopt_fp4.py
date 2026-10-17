@@ -11,17 +11,84 @@ Covers three things:
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER
+from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, _fuse_norm_input_quant
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestNormInputQuantCompatibility(CustomTestCase):
+    def test_tensor_consumers_keep_unquantized_input(self):
+        cases = (
+            ({}, {}, False, True),
+            ({}, {"tp_size": 2}, False, True),
+            ({"enable_lora": True}, {}, False, False),
+            ({"lora_paths": ["adapter"]}, {}, False, False),
+            ({}, {}, True, False),
+            ({}, {"attn_cp_size": 2}, False, False),
+            ({}, {"enable_layernorm_sp": True}, False, False),
+        )
+        for lora_args, parallel_args, dp_attention, fuse in cases:
+            with self.subTest(lora=lora_args, parallel=parallel_args, dp=dp_attention):
+                lora = SimpleNamespace(
+                    **({"enable_lora": False, "lora_paths": None} | lora_args)
+                )
+                parallel = SimpleNamespace(
+                    **(
+                        {"tp_size": 1, "attn_cp_size": 1, "enable_layernorm_sp": False}
+                        | parallel_args
+                    )
+                )
+                norm = GemmaRMSNorm(16)
+                linear = SimpleNamespace(
+                    quant_method=ModelOptFp4LinearMethod.__new__(
+                        ModelOptFp4LinearMethod
+                    )
+                )
+                x = torch.randn(2, 16)
+                quantized = (torch.zeros(2, 8, dtype=torch.uint8), torch.ones(128, 4))
+                with (
+                    patch("sglang.srt.models.qwen3_5.get_lora", return_value=lora),
+                    patch(
+                        "sglang.srt.models.qwen3_5.get_parallel", return_value=parallel
+                    ),
+                    patch(
+                        "sglang.srt.models.qwen3_5.is_dp_attention_enabled",
+                        return_value=dp_attention,
+                    ),
+                    patch.object(
+                        norm, "_forward_with_input_quant", return_value=quantized
+                    ) as quant,
+                    patch.object(
+                        norm, "_forward_impl", side_effect=norm.forward_native
+                    ),
+                ):
+                    _fuse_norm_input_quant(norm, linear)
+                    out = norm.forward_cuda(x)
+                if fuse:
+                    self.assertIs(out, quantized)
+                    quant.assert_called_once()
+                    self.assertTrue(linear._accepts_prequantized_fp4)
+                else:
+                    quant.assert_not_called()
+                    self.assertFalse(
+                        getattr(linear, "_accepts_prequantized_fp4", False)
+                    )
+                    self.assertIsInstance(out, torch.Tensor)
+                    torch.testing.assert_close(out, norm.forward_native(x))
 
 
 class TestModelOptFp4AttentionExclusion(CustomTestCase):

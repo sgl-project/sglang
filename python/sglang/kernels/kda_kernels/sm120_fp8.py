@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
-if TYPE_CHECKING:
-    import torch
+import torch
 
+from sglang.kernels.jit.utils.deps import get_cutlass_include_paths
+from sglang.kernels.kda_kernels.sm120_fp8_skinny_gemm_sm120 import (
+    _run_sm120_fp8_skinny_gemm_quantized,
+)
+from sglang.kernels.ops.gemm.sm120_fp8_gemv import (
+    sm120_fp8_gemv,
+    use_sm120_fp8_gemv,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
 
 _SUPPORTED_KDA_M = (2, 4, 8, 9)
 
@@ -33,16 +41,12 @@ _KDA_PRODUCTION_SHAPES = frozenset(
 
 @functools.cache
 def _device_capability(device: torch.device) -> tuple[int, int]:
-    import torch
-
     return torch.cuda.get_device_capability(device)
 
 
 @functools.cache
 def _has_kda_runtime() -> bool:
     try:
-        from sglang.kernels.jit.utils.deps import get_cutlass_include_paths
-
         get_cutlass_include_paths()
         return True
     except (ModuleNotFoundError, RuntimeError):
@@ -56,8 +60,6 @@ def _supports_common(
     output_scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
 ) -> bool:
-    import torch
-
     if (
         input.device.type != "cuda"
         or input.ndim != 2
@@ -103,8 +105,6 @@ def try_sm120_fp8_linear(
     """Run the best qualified SM12x FP8 small-M kernel, or return ``None``.
 
     An fp8 ``input`` is taken as already quantized with ``input_scale``."""
-    import torch
-
     if not _supports_common(
         input,
         weight,
@@ -124,8 +124,6 @@ def try_sm120_fp8_linear(
     n = weight.shape[1]
     use_native_gemv = False
     if m == 1:
-        from sglang.kernels.ops.gemm.sm120_fp8_gemv import use_sm120_fp8_gemv
-
         use_native_gemv = use_sm120_fp8_gemv(m, n, k)
 
     use_kda_gemm = (
@@ -137,20 +135,12 @@ def try_sm120_fp8_linear(
     if not use_native_gemv and not use_kda_gemm:
         return None
 
-    from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
-
     if input.dtype == torch.float8_e4m3fn:
         quantized = input
     else:
         quantized, _ = static_quant_fp8(input, input_scale, repeat_scale=False)
     if use_native_gemv:
-        from sglang.kernels.ops.gemm.sm120_fp8_gemv import sm120_fp8_gemv
-
         return sm120_fp8_gemv(quantized, weight.t(), output_scale.reshape(1))
-
-    from sglang.kernels.kda_kernels.sm120_fp8_skinny_gemm_sm120 import (
-        _run_sm120_fp8_skinny_gemm_quantized,
-    )
 
     return _run_sm120_fp8_skinny_gemm_quantized(quantized, weight, output_scale)
 
