@@ -1303,10 +1303,13 @@ sglang generate \
 
 ## MXFP4 Offline Quantization (msmodelslim)
 
-Pre-quantized MXFP4 weights exported by msmodelslim are auto-detected via
-`quant_model_description.json` (`W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` scheme).
-Use `wan_repack.py` to convert the quantized weights to Diffusers format, then load
-the converted model with `--model-path`:
+For Wan checkpoints quantized offline with msmodelslim, SGLang detects
+`W4A4_MXFP4` or `W4A4_MXFP4_DUALSCALE` per layer from `quant_model_description.json`.
+Run on Ascend 950PR/DT with CANN and torch_npu exposing the required MXFP operators.
+
+Use `python/sglang/multimodal_gen/tools/wan_repack.py` with the ModelSlim conversion
+command above to preserve the exported FP4 values, scales, and activation smoothing.
+Load the converted Diffusers directory without `--quantization`:
 
 ```bash
 sglang generate \
@@ -1315,7 +1318,37 @@ sglang generate \
   --save-output
 ```
 
-The offline MXFP4 checkpoint stores weights in an FP8 container and includes dual-level
-scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
-`mul_scale` is loaded and applied before activation quantization to keep activations
-aligned with the calibrated weights.
+The repacker accepts numeric FP8 containers or packed `uint8` weights and produces
+packed FP4 `[out, in/2]` with `weight_scale` `[out, in/32]`. Dual-scale layers also
+require `weight_dual_scale` `[out, in/512, 1]`. Single-level weights use ND layout;
+dual-scale weights require NZ. Each TP input partition must be divisible by 64 or
+512, respectively. Both `div.mul_scale` and `mul_scale` descriptors are accepted:
+single-level layers apply smoothing once before quantization; dual-scale layers
+pass it as `smooth_scale` to the quantization operator.
+
+Existing ModelSlim diffusion checkpoints with numeric FP8 containers `[out, in]`
+also load directly: the loader packs their FP4 values before dtype conversion and
+tensor-parallel slicing. Already-packed FP4 bytes and genuine MXFP8 weights retain
+their existing loading paths.
+
+Single-level layers follow MindIE-SD's schedule: W4A8 for the first two and last two
+denoising steps, and W4A4 otherwise. A 40-step run uses W4A8 at zero-based indices
+0, 1, 38, and 39 to retain higher activation precision at the ends of denoising.
+Checkpoint entries in `timestep_policy.w4a4_linear` override this schedule; set
+`{"default": "W4A4"}` there for W4A4 throughout. Dual-scale layers stay W4A4 and
+reject W4A8 switching.
+
+### Linear backward compatibility
+
+Wan's settings apply only to its kernel instances. Existing SRT LLM defaults remain:
+
+| Linear path | Weight layout | Activation rounding | Matmul bias |
+| --- | --- | --- | --- |
+| SRT offline `W4A4_MXFP4` | ND | `round` | FP32, original shape |
+| SRT offline `W4A8_MXFP` | FP4-aware NZ | Operator default | FP32, original shape |
+| Wan offline single-level W4A4 | ND | `rint`, `scale_alg=2`, `dst_type_max=7.25` by default | FP32, original shape |
+| Wan offline single-level W4A8 | Same ND weights | Operator default | BF16, 1D bias expanded to `[1, out]` |
+
+SRT online `--quantization mxfp4` and diffusion online `--quantization mxfp4_npu`
+retain their separate dual-level paths. CPU checks can verify dispatch and operator
+arguments; numerical accuracy, video quality, and performance require target-NPU validation.

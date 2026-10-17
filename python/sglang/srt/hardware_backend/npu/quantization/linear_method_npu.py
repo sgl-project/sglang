@@ -620,6 +620,8 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     difference is that it quantizes BF16/FP16 weights to FP4 at load time instead
     of loading them from a msmodelslim checkpoint. ``group_size`` is fixed at 32
     by the ``W4A8_MXFP`` export format.
+
+    Wan reuses apply with ND weights. Its kernel instance opts into BF16 [1, N] bias.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -667,8 +669,12 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        if bias is not None:
+            # Wan W4A8 expects BF16 bias with a batch dimension; SRT uses FP32.
+            use_wan_bias = getattr(self, "use_wan_bias", False)
+            bias = bias.to(torch.bfloat16 if use_wan_bias else torch.float32)
+            if use_wan_bias and bias.ndim == 1:
+                bias = bias.unsqueeze(0)
 
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
@@ -690,25 +696,16 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """NPU W4A4 online quantization: single-level MXFP4.
+    """Shared single-level W4A4 linear kernel for Ascend 950.
 
-    True W4(weight) A4(activation): both weights and activations are quantised to
-    single-level MXFP4 (``float4_e2m1fn_x2``), unlike the W4A8 path which keeps FP8
-    activations. All NPU ops go through ``torch.ops.npu.*`` (no top-level
-    ``torch_npu``) and the fp4 dtype comes from ``_get_float4_e2m1fn_x2_dtype()``.
-
-    Weight quantization (process_weights_after_loading):
-        BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)
-        → (packed FP4 [out, in//2], UE8M0 block scale) → transpose [in//2, out]
-
-    Inference (apply):
-        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)  (A4)
-        → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
-                           group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
-
-    Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
-    torch_npu exposing ``float4_e2m1fn_x2``.
+    Offline ModelSlim schemes reuse apply; direct callers can also quantize
+    BF16/FP16 weights at load time. Packed ND weights are [in/2, out], with
+    UE8M0 scales [in/64, out, 2]. Inference dynamically quantizes activations
+    to FP4, using round by default; Wan opts into rint on its kernel instance.
+    The online SRT --quantization mxfp4 route uses the dual-level subclass.
     """
+
+    activation_round_mode = "round"
 
     def create_weights(
         self,
@@ -804,7 +801,10 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
         # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
         qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=fp4_dtype, round_mode="round"
+            x_2d,
+            dst_type=fp4_dtype,
+            round_mode=self.activation_round_mode,
+            **getattr(layer, "mxfp4_quant_kwargs", {}),
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
@@ -834,18 +834,15 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
-    [out, in//32]). The weight is transposed and the scale reshaped to 3D; it then
-    shares the online :class:`NPUSingleLevelMXFP4LinearMethod` matmul (``apply``)
-    exactly — only the weight source differs (msmodelslim checkpoint vs online RTN).
+    [out, in/32]). The weight remains ND and is transposed for matmul.
+    Wan selects MindIE's activation rounding on its kernel instance.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        # The checkpoint is already packed two-FP4-per-byte. Preserve the strided
-        # transpose used by the online path.
-        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
+        layer.weight = Parameter(weight.transpose(-1, -2), requires_grad=False)
 
         weight_scale = layer.weight_scale.data
         if not weight_scale.is_npu:
