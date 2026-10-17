@@ -31,7 +31,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, ceil_div, is_cuda, is_hip, is_npu
 
 if is_cuda():
     try:
@@ -61,7 +61,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,42 @@ def _mqa_logits_row_chunks(
         slice(start, min(start + rows_per_chunk, num_rows))
         for start in range(0, num_rows, rows_per_chunk)
     )
+
+
+def _extend_logits_elems(forward_batch: ForwardBatch, kpool: int) -> int:
+    """Query rows times pooled keys over the batch's requests; 0 without host lengths."""
+    if forward_batch.seq_lens_cpu is None or forward_batch.extend_seq_lens_cpu is None:
+        return 0
+    return sum(
+        int(q_len) * (int(seq_len) // kpool)
+        for q_len, seq_len in zip(
+            forward_batch.extend_seq_lens_cpu, forward_batch.seq_lens_cpu.tolist()
+        )
+    )
+
+
+def _indexer_row_split_group(*, num_rows: int, logits_elems: int):
+    """The attention-TP group to split indexer rows over, or None to score all rows.
+
+    Inputs are identical on every rank of the group, so all ranks agree.
+    """
+    min_elems = envs.SGLANG_DSA_INDEXER_ROW_SPLIT_MIN_ELEMS.get()
+    if min_elems <= 0 or logits_elems < min_elems:
+        return None
+    if (
+        capture_mode.is_capture_mode
+        or torch.cuda.is_current_stream_capturing()
+        or is_in_breakable_cuda_graph()
+    ):
+        return None
+    parallel = get_parallel()
+    # Under context parallelism the ranks hold different rows.
+    if parallel.attn_cp_size > 1:
+        return None
+    group = parallel.attn_tp_group
+    if group.world_size == 1 or num_rows < 4 * group.world_size:
+        return None
+    return group
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -1090,9 +1126,87 @@ class IndexerKPool(MultiPlatformOp):
         topk_row_starts: Optional[torch.Tensor],
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
+        logits_elems: int,
     ) -> torch.Tensor:
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
+        rows_kwargs = dict(
+            q_fp8=q_fp8,
+            weights=weights,
+            kv_fp8=kv_fp8,
+            logits_starts=logits_starts,
+            logits_ends=logits_ends,
+            pool_lens=pool_lens,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            page_table_row_index=page_table_row_index,
+            topk_offsets=topk_offsets,
+            topk_row_starts=topk_row_starts,
+        )
+        num_rows = row_chunks[-1].stop
+        group = (
+            None
+            if kv_fp8 is None
+            else _indexer_row_split_group(num_rows=num_rows, logits_elems=logits_elems)
+        )
+        if group is None:
+            return self._kpool_topk_rows(
+                **rows_kwargs, row_chunks=row_chunks, row_base=0, out_rows=out_rows
+            )
+
+        # The same independence lets each rank score a contiguous share of the
+        # rows; the gathered shares equal one pass on every rank. Shares differ
+        # by at most one row and are padded to the largest for the gather.
+        world = group.world_size
+        bounds = [r * num_rows // world for r in range(world + 1)]
+        share = ceil_div(num_rows, world)
+        lo, hi = bounds[group.rank_in_group], bounds[group.rank_in_group + 1]
+        local_chunks = tuple(
+            slice(max(c.start, lo), min(c.stop, hi))
+            for c in row_chunks
+            if c.start < hi and c.stop > lo
+        )
+        local = self._kpool_topk_rows(
+            **rows_kwargs, row_chunks=local_chunks, row_base=lo, out_rows=share
+        )
+        gathered = torch.empty(
+            (group.world_size * share, local.shape[1]),
+            dtype=local.dtype,
+            device=local.device,
+        )
+        group.all_gather_into_tensor(gathered, local)
+        num_out_rows = num_rows if out_rows is None else out_rows
+        result = torch.full(
+            (num_out_rows, gathered.shape[1]),
+            -1,
+            dtype=gathered.dtype,
+            device=gathered.device,
+        )
+        for r in range(world):
+            result[bounds[r] : bounds[r + 1]] = gathered[
+                r * share : r * share + bounds[r + 1] - bounds[r]
+            ]
+        return result
+
+    def _kpool_topk_rows(
+        self,
+        *,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_fp8: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        logits_starts: Optional[torch.Tensor],
+        logits_ends: torch.Tensor,
+        pool_lens: torch.Tensor,
+        seq_lens: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        page_table_row_index: Optional[torch.Tensor],
+        topk_offsets: Optional[torch.Tensor],
+        topk_row_starts: Optional[torch.Tensor],
+        row_chunks: Tuple[slice, ...],
+        row_base: int,
+        out_rows: Optional[int],
+    ) -> torch.Tensor:
+        """Top-k of ``row_chunks``, returned as rows ``row_base`` onward."""
         single_chunk = len(row_chunks) == 1
         topk_result = None
         for rows in row_chunks:
@@ -1139,14 +1253,16 @@ class IndexerKPool(MultiPlatformOp):
             del logits
             if topk_result is None:
                 # Rows past the last chunk are padding, matching out_rows.
-                num_out_rows = row_chunks[-1].stop if out_rows is None else out_rows
+                num_out_rows = (
+                    row_chunks[-1].stop - row_base if out_rows is None else out_rows
+                )
                 topk_result = torch.full(
                     (num_out_rows, topk_chunk.shape[1]),
                     -1,
                     dtype=topk_chunk.dtype,
                     device=topk_chunk.device,
                 )
-            topk_result[rows] = topk_chunk
+            topk_result[rows.start - row_base : rows.stop - row_base] = topk_chunk
         assert topk_result is not None
         return topk_result
 
@@ -1227,6 +1343,7 @@ class IndexerKPool(MultiPlatformOp):
                 num_rows=n_real, num_cols=total_k_rows, device=device
             ),
             out_rows=total_q,
+            logits_elems=_extend_logits_elems(forward_batch, self.index_kpool),
         )
 
     def _get_topk_ragged_kpool(
@@ -1473,6 +1590,7 @@ class IndexerKPool(MultiPlatformOp):
                     num_rows=q_len, num_cols=pool_seq_len, device=q_fp8.device
                 ),
                 out_rows=None,
+                logits_elems=q_len * pool_seq_len,
             )
 
             topk_result[q_slice] = local_topk
