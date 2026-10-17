@@ -42,11 +42,14 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildPageTablePositions,
     ExpandPrefillCausally,
     late_layer_tail_layout,
+    late_layer_tail_lens,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
+    BuildDsparkSwaRingIndices,
     ComputeDsparkWindowGather,
+    swa_ring_rows,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -105,7 +108,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -127,6 +135,7 @@ if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -941,6 +950,48 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _late_layer_whole_extend(
+    *,
+    extend_lens: List[int],
+    logprob_start_lens: Optional[List[int]],
+    full_hidden_states: bool,
+) -> Optional[List[bool]]:
+    """Requests that run their whole extend with plain windows under decoder SWA
+    bounded replay: those that read prompt rows (prompt logprobs, or every hidden
+    state outside DSpark, whose draft reads tail rows only). None when no request
+    in the batch does."""
+    if full_hidden_states:
+        return [True] * len(extend_lens)
+    if logprob_start_lens is None:
+        return None
+    whole = [start < n for start, n in zip(logprob_start_lens, extend_lens)]
+    return whole if any(whole) else None
+
+
+def late_layer_whole_extend(
+    forward_batch: ForwardBatch, *, dspark: bool
+) -> Optional[List[bool]]:
+    """`_late_layer_whole_extend` of a forward batch. dspark comes from the server:
+    a capture batch carries DSpark's FULL capture mode without its spec_algorithm."""
+    return _late_layer_whole_extend(
+        extend_lens=forward_batch.extend_seq_lens_cpu,
+        logprob_start_lens=(
+            forward_batch.extend_logprob_start_lens_cpu
+            if forward_batch.return_logprob
+            else None
+        ),
+        full_hidden_states=forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+        and not dspark,
+    )
+
+
+def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
+    assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
+    if t.shape[0] == num_rows:
+        return t
+    return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
+
+
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -983,9 +1034,6 @@ class DSV4Metadata:
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
-    # Captured with the late layers on a tail block (decoder SWA bounded replay
-    # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
-    prefill_graph_tail: bool = False
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
@@ -1103,8 +1151,10 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
+    folds_encoder_swa_replay: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
+    mega_attn: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1134,6 +1184,7 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.encoder_replay = False
+        self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -1192,11 +1243,7 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_capacity: Optional[int] = None
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
-        # Prefill CUDA graph tail block (bounded replay inside the graph): row
-        # capacity, persistent index/location buffers, held metadata per block size.
-        self._bcg_tail_capacity: Optional[int] = None
-        self._bcg_tail_buffers: Optional[tuple] = None
-        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
+        self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1568,11 +1615,44 @@ class DeepseekV4AttnBackend(
             return False
         if self.enable_decoder_swa_bounded_replay:
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-            if extend_lens_cpu is not None:
-                tail_rows = sum(min(SWA_WINDOW, int(n)) for n in extend_lens_cpu)
-                if tail_rows > self._prefill_graph_tail_capacity():
-                    return False
+            if extend_lens_cpu is not None and not self._prefill_graph_fits_late_tail(
+                extend_lens_cpu,
+                late_layer_whole_extend(
+                    forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+                ),
+            ):
+                return False
         return True
+
+    def vote_prefill_cuda_graph(self, batch: ScheduleBatch) -> bool:
+        """`can_run_prefill_cuda_graph`'s late-layer tail check judged from the
+        schedule batch, for the DP prefill-graph vote: no rank replays the graph
+        while another runs the step eagerly."""
+        if not self.enable_decoder_swa_bounded_replay:
+            return True
+        full_hidden_states = (
+            get_server_return_hidden_states_mode() == CaptureHiddenMode.FULL
+            or any(
+                req.return_hidden_states_mode == CaptureHiddenMode.FULL
+                for req in batch.reqs
+            )
+        ) and not self.model_runner.spec_algorithm.is_dspark()
+        whole_extend = _late_layer_whole_extend(
+            extend_lens=batch.extend_lens,
+            logprob_start_lens=(
+                batch.extend_logprob_start_lens if batch.return_logprob else None
+            ),
+            full_hidden_states=full_hidden_states,
+        )
+        return self._prefill_graph_fits_late_tail(batch.extend_lens, whole_extend)
+
+    def _prefill_graph_fits_late_tail(
+        self, extend_lens: List[int], whole_extend: Optional[List[bool]]
+    ) -> bool:
+        tail_lens = late_layer_tail_lens(
+            [int(n) for n in extend_lens], SWA_WINDOW, whole_extend
+        )
+        return sum(tail_lens) <= self._prefill_graph_tail_capacity()
 
     def _prefill_graph_tail_capacity(self) -> int:
         """Rows the late layers run over inside the prefill CUDA graph: every
@@ -1620,8 +1700,6 @@ class DeepseekV4AttnBackend(
         for_prefill_graph: bool = False,
         max_seq_len_override: Optional[int] = None,
     ) -> DSV4Metadata:
-        # Each request contributes only its last SWA_WINDOW extend tokens, with the
-        # window floored at the tail start: window KV before it is never written here.
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
@@ -1631,7 +1709,16 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu.tolist(),
             tail_len=SWA_WINDOW,
             device=device,
+            whole_extend=late_layer_whole_extend(
+                forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+            ),
         )
+        if self.encoder_row_floor is not None:
+            # Folded hits: a tail row never reads below its request's replay start.
+            swa_replay_start = torch.maximum(
+                swa_replay_start,
+                self.encoder_row_floor[token_indices].to(swa_replay_start.dtype),
+            )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
@@ -1864,13 +1951,24 @@ class DeepseekV4AttnBackend(
             get_local_dp_buffer_len(),
         )
         tail = tail_metadata.late_layer_tail
-        # Inside the prefill CUDA graph the tail block is padded to a fixed capacity;
-        # the eager breaks (attention, low-ratio sources) clip their inputs to the
-        # batch's non-padded count, so point it at the real tail rows while the
-        # late layers run.
-        saved = saved + (forward_batch.global_num_token_non_padded_cpu,)
+        saved = saved + (
+            forward_batch.global_num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded,
+            forward_batch.num_token_non_padded,
+        )
         if tail.real_rows_count is not None:
             forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+            non_padded = forward_batch.global_num_token_non_padded
+            if non_padded is not None:
+                if self._bcg_tail_num_token_non_padded is None:
+                    self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
+                bound = torch.clamp(
+                    non_padded,
+                    max=tail.real_rows_count,
+                    out=self._bcg_tail_num_token_non_padded,
+                )
+                forward_batch.global_num_token_non_padded = bound
+                forward_batch.num_token_non_padded = bound
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
@@ -1912,9 +2010,13 @@ class DeepseekV4AttnBackend(
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
             non_padded,
+            non_padded_gpu,
+            local_non_padded,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
         forward_batch.global_num_token_non_padded_cpu = non_padded
+        forward_batch.global_num_token_non_padded = non_padded_gpu
+        forward_batch.num_token_non_padded = local_non_padded
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
@@ -2289,7 +2391,10 @@ class DeepseekV4AttnBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            if self.token_to_kv_pool.request_window is None:
+            if (
+                self.token_to_kv_pool.request_window is None
+                and self.token_to_kv_pool.swa_req_ring_size is None
+            ):
                 metadata.core_attn_metadata.swa_out_cache_loc = (
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
                         out_cache_loc
@@ -2327,6 +2432,13 @@ class DeepseekV4AttnBackend(
                 )
                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
+                if self.token_to_kv_pool.swa_req_ring_size is not None:
+                    metadata.core_attn_metadata.swa_out_cache_loc = (
+                        self._dspark_swa_ring_out_cache_loc(
+                            seq_lens_casual=seq_lens_casual,
+                            req_pool_indices_repeated=req_pool_indices_repeated,
+                        )
+                    )
                 if self.trtllm_attn:
                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
 
@@ -2541,6 +2653,7 @@ class DeepseekV4AttnBackend(
             return
 
         self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2669,6 +2782,16 @@ class DeepseekV4AttnBackend(
             request_window_layout=request_layout,
         )
 
+    @staticmethod
+    def _compressor_out_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Slot 0 for folded replay rows: their main KV, compressed groups and index
+        keys are cached, so the compressors write only the new rows."""
+        loc = forward_batch.out_cache_loc
+        keep = forward_batch.encoder_swa_compress_rows
+        if keep is None:
+            return loc
+        return torch.zeros_like(loc).index_copy_(0, keep, loc[keep])
+
     def _build_forward_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -2769,7 +2892,7 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=self._compressor_out_loc(forward_batch),
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -3546,6 +3669,7 @@ class DeepseekV4AttnBackend(
         # to True. Paged attention under active CP needs the page indices.
         return (
             self.trtllm_attn
+            or self.mega_attn
             or self.tail_forward_metadata is not None
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
@@ -3622,8 +3746,9 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 1, 2, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
         **_,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
@@ -3722,10 +3847,19 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
+            use_mega_paged = cos_sin_cache is not None and self._mega_paged_prefill(
+                forward_batch,
+                num_qo_tokens=q.shape[0],
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                num_heads=q.shape[-2],
+            )
+
             # The tail stays dense: its window floor lives in swa_page_indices,
             # which the sparse chunk cache ignores.
             if (
                 self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
+                and not use_mega_paged
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
@@ -3747,6 +3881,23 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                    cos_sin_cache=cos_sin_cache,
+                )
+
+            if cos_sin_cache is not None:
+                return self._forward_mega_decode(
+                    q=q.squeeze(1),
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices.squeeze(1),
+                    positions=match_num_queries(core_attn_metadata.positions, value=0),
+                    cos_sin_cache=cos_sin_cache,
+                    attn_sink=attn_sink,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=None
+                    if extra_indices is None
+                    else extra_indices.squeeze(1),
+                    extra_topk_lengths=extra_topk_lengths,
                 )
 
             if (
@@ -3854,7 +4005,8 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
-    ) -> torch.Tensor:
+        cos_sin_cache: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
@@ -3912,6 +4064,17 @@ class DeepseekV4AttnBackend(
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
         kv = workspace
+
+        if cos_sin_cache is not None:
+            return self._forward_mega_prefill(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                positions=core_attn_metadata.positions[: q_flat.shape[0]],
+                cos_sin_cache=cos_sin_cache,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
@@ -4205,6 +4368,7 @@ class DeepseekV4AttnBackend(
 
         raw_positions = prep.positions_casual
         request_layout = None
+        swa_out_cache_loc = None
         if self.token_to_kv_pool.request_window is not None:
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
@@ -4218,6 +4382,12 @@ class DeepseekV4AttnBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
+            elif swa_replay_start is None and self.encoder_row_floor is not None:
+                # Folded replay: hits floor every row at their replay start;
+                # MLP-sync padding rows follow the real ones with floor 0.
+                swa_replay_start = _pad_rows(
+                    self.encoder_row_floor, num_rows=raw_positions.shape[0]
+                )
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
@@ -4227,6 +4397,7 @@ class DeepseekV4AttnBackend(
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
+            swa_out_cache_loc = request_layout.write_loc
         elif dspark_block_size is not None:
             assert (
                 self.is_dspark_draft
@@ -4249,6 +4420,11 @@ class DeepseekV4AttnBackend(
                 )
             else:
                 swa_page_indices, swa_topk_lengths = dspark_swa_buffers
+            if self.token_to_kv_pool.swa_req_ring_size is not None:
+                swa_out_cache_loc = self._dspark_swa_ring_out_cache_loc(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                )
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(
                 req_to_token=self.req_to_token,
@@ -4282,9 +4458,7 @@ class DeepseekV4AttnBackend(
             present_ratios=self.present_ratios,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
-            swa_out_cache_loc=(
-                request_layout.write_loc if request_layout is not None else None
-            ),
+            swa_out_cache_loc=swa_out_cache_loc,
         )
 
         if need_compress:
@@ -4318,6 +4492,17 @@ class DeepseekV4AttnBackend(
         out_loc: torch.Tensor,
         block_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pool = self.token_to_kv_pool
+        if pool.swa_req_ring_size is not None:
+            return BuildDsparkSwaRingIndices.execute(
+                seq_lens_casual=seq_lens_casual,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                valid_from=pool.swa_req_ring_valid_from,
+                ring_size=pool.swa_req_ring_size,
+                block_size=block_size,
+                swa_window=SWA_WINDOW,
+                page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+            )
         gather = ComputeDsparkWindowGather.execute(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -4338,6 +4523,17 @@ class DeepseekV4AttnBackend(
             page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
         )
         return swa_page_indices, swa_topk_lengths
+
+    def _dspark_swa_ring_out_cache_loc(
+        self, *, seq_lens_casual: torch.Tensor, req_pool_indices_repeated: torch.Tensor
+    ) -> torch.Tensor:
+        """Ring rows the draft block writes: row ``i`` sits at position
+        ``seq_lens_casual[i] - 1`` of its request."""
+        return swa_ring_rows(
+            req_pool_indices_repeated,
+            seq_lens_casual.to(torch.int64) - 1,
+            self.token_to_kv_pool.swa_req_ring_size,
+        ).to(torch.int32)
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
