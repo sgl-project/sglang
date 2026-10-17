@@ -1644,7 +1644,8 @@ class CommonKVManager(BaseKVManager):
         if info.attn_cp_size == 1 and info.enable_kv_cache_sharding:
             # KV pages striped over the registered TP ranks (MLA attn-TP, or CP-TP
             # group sharing's CP ranks): pull from all (None marks every real sender).
-            assert self.attn_tp_size == info.attn_tp_size, (
+            # MLA decode keeps the full latent, so its attn TP / DP need not match.
+            assert self.is_mla_backend or self.attn_tp_size == info.attn_tp_size, (
                 "KV cache sharding requires equal prefill/decode attn TP "
                 f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
             )

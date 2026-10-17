@@ -201,6 +201,7 @@ class PyNcclCommunicator:
         output_tensor: torch.Tensor,
         input_tensor: torch.Tensor,
         sizes: Optional[list[int]] = None,
+        stream: Optional[torch.cuda.Stream] = None,
     ):
         if self.disabled:
             return
@@ -211,7 +212,8 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
-        stream = self._resolve_stream()
+        if stream is None:
+            stream = self._resolve_stream()
 
         if sizes is not None:
             split_offset = 0
