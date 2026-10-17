@@ -156,6 +156,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 ].long()
                 // ratio
             )
+            compressed_locs = pool.translate_qsa_compressed_locs(
+                layer_id, compressed_locs
+            )
             parts.append(compressed_buffer.index_select(0, compressed_locs))
         compressed_keys = (
             torch.cat(parts, dim=0)
@@ -206,17 +209,21 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 or self.graph_compressed_lengths is None
             ):
                 raise RuntimeError("QSA CUDA graph decode metadata is incomplete")
+            page_table = pool.translate_qsa_page_table(
+                layer_id, self.graph_compressed_page_table
+            )
             return (
                 compressed_cache,
-                self.graph_compressed_page_table,
+                page_table,
                 self.graph_compressed_lengths,
                 self.graph_compressed_page_table.shape[1]
                 * pool.qsa_compressed_page_size,
             )
         if self.decode_page_table is not None and self.decode_lengths is not None:
+            page_table = pool.translate_qsa_page_table(layer_id, self.decode_page_table)
             return (
                 compressed_cache,
-                self.decode_page_table,
+                page_table,
                 self.decode_lengths,
                 self.decode_page_table.shape[1] * pool.qsa_compressed_page_size,
             )
@@ -225,6 +232,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             compress_ratio=self.compress_ratio,
             sequence_lengths=self.sequence_lengths,
             token_slot_table=self.token_slot_table,
+        )
+        compressed_page_table = pool.translate_qsa_page_table(
+            layer_id, compressed_page_table
         )
         return (
             compressed_cache,

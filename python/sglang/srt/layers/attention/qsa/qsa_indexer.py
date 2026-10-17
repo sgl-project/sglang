@@ -246,6 +246,7 @@ class QSAIndexer(MultiPlatformOp):
         if source_rope is None:
             source_rope = pool.qsa_rope_position_buffer
         compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        write_locs = pool.translate_qsa_compressed_locs(self.layer_id, write_locs)
         qsa_index_k_compress_store(
             source_keys.reshape(source_keys.shape[0], -1)
             .contiguous()
@@ -713,9 +714,12 @@ class QSAIndexer(MultiPlatformOp):
             state_stored=state_stored,
         )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
-            compressed_cache, page_table, compressed_lengths, max_model_len = (
-                indexer_metadata.get_decode_mqa_inputs(self.layer_id)
-            )
+            (
+                compressed_cache,
+                page_table,
+                compressed_lengths,
+                max_model_len,
+            ) = indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -727,9 +731,12 @@ class QSAIndexer(MultiPlatformOp):
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
             )
 
-        compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
-        )
+        (
+            compressed_keys,
+            row_starts,
+            row_ends,
+            sequence_lengths,
+        ) = indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()

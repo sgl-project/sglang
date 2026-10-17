@@ -681,7 +681,7 @@ class Scheduler(
 
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
-        self.init_dsa_kpool_truncation_align()
+        self.init_sparse_index_truncation_align()
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
@@ -1722,27 +1722,37 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
-    def init_dsa_kpool_truncation_align(self):
-        """Kpool compress-write asserts chunked extends start on pool boundaries.
-        Use the LCM to preserve any existing deterministic-inference alignment."""
+    def init_sparse_index_truncation_align(self):
+        """Align chunk boundaries required by compressed sparse-index pools.
+
+        Both DeepSeek DSA and compressed QSA build one persistent index row from
+        a fixed-size group of input tokens. A non-final prefill chunk therefore
+        must not split such a group. Use the LCM to preserve any deterministic-
+        inference alignment already selected by the attention backend.
+        """
         from sglang.srt.configs.model_config import (
             get_dsa_index_kpool,
             is_deepseek_dsa,
         )
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 
-        if not is_deepseek_dsa(self.model_config.hf_config):
-            return
+        required_alignments = []
+        if is_deepseek_dsa(self.model_config.hf_config):
+            dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
+            if dsa_index_kpool > 1:
+                required_alignments.append(dsa_index_kpool)
 
-        dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
-        if dsa_index_kpool <= 1:
-            return
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if qsa_profile is not None and qsa_profile.compress_ratio > 1:
+            required_alignments.append(qsa_profile.compress_ratio)
 
-        if self.truncation_align_size is None:
-            self.truncation_align_size = dsa_index_kpool
-        else:
-            self.truncation_align_size = math.lcm(
-                self.truncation_align_size, dsa_index_kpool
-            )
+        for alignment in required_alignments:
+            if self.truncation_align_size is None:
+                self.truncation_align_size = alignment
+            else:
+                self.truncation_align_size = math.lcm(
+                    self.truncation_align_size, alignment
+                )
 
     def check_truncation_align_fits_chunk(self):
         """A chunk shorter than the alignment truncates to zero tokens, so a prompt
@@ -4113,7 +4123,10 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req,
+                truncation_align_size=self.truncation_align_size,
+            )
 
         if self.enable_lora:
             running_loras = {

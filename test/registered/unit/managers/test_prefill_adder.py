@@ -1796,6 +1796,60 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual((req.prefix_len, req.extend_end), (0, 200))
         self.assertIn(req, adder.can_run_list)
 
+    def test_add_chunked_req_aligns_only_non_final_continuations(self):
+        # Mirror the production failure at a smaller scale. The request starts
+        # from an aligned radix/chunk prefix. An allocation-limited continuation
+        # offers 75 tokens, which must be shortened to 72 so the next QSA prefix
+        # remains divisible by its compression ratio. The final 78-token chunk
+        # is not shortened and may end at an arbitrary prompt length.
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=100_000,
+            rem_chunk=75,
+            extend_input_len=214,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        req.prefix_len = 64
+
+        result = adder.add_chunked_req(req, truncation_align_size=4)
+
+        self.assertIs(result, req)
+        self.assertEqual((req.prefix_len, req.extend_end), (64, 136))
+        self.assertEqual(req.extend_len, 72)
+
+        final_adder, final_req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=100_000,
+            rem_chunk=8192,
+            extend_input_len=214,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        final_req.prefix_len = 136
+
+        final_result = final_adder.add_chunked_req(final_req, truncation_align_size=4)
+
+        self.assertIsNone(final_result)
+        self.assertEqual((final_req.prefix_len, final_req.extend_end), (136, 214))
+        self.assertEqual(final_req.extend_len, 78)
+
+    def test_add_chunked_req_defers_when_alignment_cannot_fit(self):
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=64,
+            rem_swa=100_000,
+            rem_chunk=3,
+            extend_input_len=100,
+            is_hybrid_swa=False,
+            full_available=100_000,
+        )
+        req.prefix_len = 64
+
+        result = adder.add_chunked_req(req, truncation_align_size=4)
+
+        self.assertIs(result, req)
+        self.assertNotIn(req, adder.can_run_list)
+
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
         adder.can_run_list = [

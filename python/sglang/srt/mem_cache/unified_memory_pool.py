@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
+from sglang.srt.mem_cache.layout.page_major import build_page_major_qsa_mha_views
 from sglang.srt.mem_cache.layout.token_major import (
     ROW_ALIGN_BYTES,
     DenseEntryLayout,
@@ -62,6 +63,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
     write_loc_is_physical,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -232,6 +234,54 @@ class MHASubPoolSpec(SubPoolSpec):
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
+
+
+@dataclass(frozen=True, kw_only=True)
+class QSAMHASubPoolSpec(MHASubPoolSpec):
+    """Full-attention page envelope carrying compressed QSA index keys."""
+
+    qsa_index_kv_heads: int
+    qsa_index_head_dim: int
+    qsa_compress_ratio: int
+    qsa_store_dtype: torch.dtype = torch.bfloat16
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.qsa_index_kv_heads > 0
+        assert self.qsa_index_head_dim > 0
+        assert self.qsa_compress_ratio > 0
+        assert self.draft_region is None, "QSA draft state requires a private pool"
+
+    def qsa_row_bytes(self) -> int:
+        return (
+            self.qsa_index_kv_heads
+            * self.qsa_index_head_dim
+            * self.qsa_store_dtype.itemsize
+        )
+
+    def host_entry_bytes(self) -> int:
+        qsa_bytes = self.qsa_row_bytes() * self.layer_num
+        assert qsa_bytes % self.qsa_compress_ratio == 0
+        return super().host_entry_bytes() + qsa_bytes // self.qsa_compress_ratio
+
+    def layer_page_bytes(self, page_size: int) -> int:
+        assert page_size % self.qsa_compress_ratio == 0
+        return (
+            page_size * (self.k_row_bytes() + self.v_row_bytes())
+            + (page_size // self.qsa_compress_ratio) * self.qsa_row_bytes()
+        )
+
+    def qsa_page_index(
+        self, full_page: torch.Tensor, layer_offset: int, page_size: int
+    ) -> torch.Tensor:
+        compressed_page_size = page_size // self.qsa_compress_ratio
+        qsa_page_bytes = compressed_page_size * self.qsa_row_bytes()
+        byte_offset = (
+            full_page * self.page_bytes(page_size)
+            + layer_offset * self.layer_page_bytes(page_size)
+            + page_size * (self.k_row_bytes() + self.v_row_bytes())
+        )
+        return byte_offset // qsa_page_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -502,6 +552,7 @@ class UnifiedKVPool:
         # MHA: (k_buffer, v_buffer); MLA: [per-layer views];
         # Mamba: (conv_state_list, temporal_state)
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
+        self._qsa_mha_views: Dict[str, torch.Tensor] = {}
         self._mla_views: Dict[str, List[torch.Tensor]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
 
@@ -519,7 +570,26 @@ class UnifiedKVPool:
             self._max_slots[spec.name] = max_slots
             self._anchor_bytes[spec.name] = anchor
             self._min_slot_index[spec.name] = min_slot_index
-            if isinstance(spec, MHASubPoolSpec):
+            if isinstance(spec, QSAMHASubPoolSpec):
+                k, v, qsa = build_page_major_qsa_mha_views(
+                    self._raw,
+                    layer_num=spec.layer_num,
+                    head_num=spec.head_num,
+                    head_dim=spec.head_dim,
+                    v_head_dim=spec.v_head_dim,
+                    store_dtype=spec.store_dtype,
+                    qsa_index_kv_heads=spec.qsa_index_kv_heads,
+                    qsa_index_head_dim=spec.qsa_index_head_dim,
+                    qsa_store_dtype=spec.qsa_store_dtype,
+                    qsa_compress_ratio=spec.qsa_compress_ratio,
+                    page_size=page_size,
+                    num_pages=max_slots // page_size,
+                    anchor_bytes=anchor,
+                    page_stride_bytes=spec.page_bytes(page_size),
+                )
+                self._mha_views[spec.name] = (k, v)
+                self._qsa_mha_views[spec.name] = qsa
+            elif isinstance(spec, MHASubPoolSpec):
                 self._mha_views[spec.name] = self._build_mha_views(
                     spec,
                     anchor,
@@ -674,6 +744,9 @@ class UnifiedKVPool:
 
     def mha_views_for(self, name: str) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         return self._mha_views[name]
+
+    def qsa_mha_view_for(self, name: str) -> torch.Tensor:
+        return self._qsa_mha_views[name]
 
     def mla_views_for(self, name: str) -> List[torch.Tensor]:
         return self._mla_views[name]
@@ -898,6 +971,71 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             "prefix-valid commit is unsupported under the unified layout "
             "(_set_kv_buffer_prefix_valid_impl assumes token-id indexing)."
         )
+
+
+class UnifiedQSAMHATokenToKVPool(UnifiedMHATokenToKVPool):
+    """Unified Full-KV pool whose movable pages also contain QSA index keys."""
+
+    def __init__(self, **kwargs):
+        unified_buffer = kwargs["unified_buffer"]
+        sub_pool_name = kwargs["sub_pool_name"]
+        spec = unified_buffer.spec(sub_pool_name)
+        assert isinstance(spec, QSAMHASubPoolSpec)
+        self._qsa_spec = spec
+        self.qsa_compressed_flat = unified_buffer.qsa_mha_view_for(sub_pool_name)
+        super().__init__(**kwargs)
+
+    def qsa_buffers(self) -> List[torch.Tensor]:
+        # Each layer addresses the same global flat view after translating its
+        # compressed row/page ids to the layer's region in the page envelope.
+        return [self.qsa_compressed_flat] * self._qsa_spec.layer_num
+
+    def _store_kv_layer(
+        self,
+        layer_idx: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        # QSA preserves explicit [page, offset] dimensions and performs its
+        # own virtual->physical translation in QwenSparseAttnBackend.
+        pages = loc.long() // self.page_size
+        offsets = loc.long() % self.page_size
+        self.k_buffer[layer_idx][pages, offsets] = cache_k
+        self.v_buffer[layer_idx][pages, offsets] = cache_v
+
+    def translate_qsa_compressed_locs(
+        self, layer_offset: int, loc: torch.Tensor
+    ) -> torch.Tensor:
+        cps = self.page_size // self._qsa_spec.qsa_compress_ratio
+        full_page = loc.long() // cps
+        within_page = loc.long() % cps
+        qsa_page = self._qsa_spec.qsa_page_index(
+            full_page, layer_offset, self.page_size
+        )
+        return qsa_page * cps + within_page
+
+    def translate_qsa_page_table(
+        self, layer_offset: int, page_table: torch.Tensor
+    ) -> torch.Tensor:
+        translated = self._qsa_spec.qsa_page_index(
+            page_table.long(), layer_offset, self.page_size
+        )
+        return translated.to(page_table.dtype)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+        ps = self.page_size
+        assert tgt_loc.numel() % ps == 0 and src_loc.numel() == tgt_loc.numel()
+        tgt_pages = tgt_loc.reshape(-1, ps)[:, 0].long() // ps
+        src_pages = src_loc.reshape(-1, ps)[:, 0].long() // ps
+        page_bytes = self._qsa_spec.page_bytes(ps)
+        raw_pages = self._unified_buffer._raw[
+            : self._unified_buffer.max_slots(self._sub_pool_name) // ps * page_bytes
+        ].view(-1, page_bytes)
+        with record_function("UnifiedQSAMHA.move_kv_cache"):
+            raw_pages[tgt_pages] = raw_pages[src_pages].clone()
 
 
 class UnifiedMLATokenToKVPool(MLATokenToKVPool):
@@ -1303,6 +1441,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         pre_alloc_size: int = 0,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape=None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
@@ -1326,6 +1468,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
+            short_conv_layer_ids=short_conv_layer_ids,
+            short_conv_state_shape=short_conv_state_shape,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=ngram_eos_token_id,
         )
         self.size = size
         self.pre_alloc_size = pre_alloc_size
@@ -1353,26 +1499,28 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
-        if short_conv_layer_ids or ngram_context_len:
-            raise ValueError(
-                "Qwen4-Exp PLE side states are not supported with "
-                "--enable-unified-memory"
-            )
         from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 
         self.short_conv_pool = ShortConvPool(
-            size=0,
-            state_shape=None,
-            layer_ids=[],
-            dtype=torch.bfloat16,
+            size=self._shared_mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            state_shape=short_conv_state_shape,
+            layer_ids=short_conv_layer_ids or [],
+            dtype=cache_params.dtype.conv,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         self.ngram_pool = NGramPool(
-            size=0,
-            context_len=0,
-            eos_token_id=0,
+            size=self._shared_mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            context_len=ngram_context_len,
+            eos_token_id=ngram_eos_token_id,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
+        self.ple_window_cache = None
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
@@ -1390,6 +1538,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
+        if self.short_conv_pool.enabled:
+            self.mamba_pool.register_slot_state(self.short_conv_pool)
+        if self.ngram_pool.enabled:
+            self.mamba_pool.register_slot_state(self.ngram_pool)
         # Wired in by init_unified_mamba_pools once the mamba allocator exists.
         self.mamba_allocator = None
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
@@ -1425,6 +1577,12 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         """Virtual mamba ids -> physical slot ids."""
         return self.mamba_allocator.translate(virtual_ids).to(torch.int32)
 
+    def get_short_conv_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.translate_mamba_indices(self.get_mamba_indices(req_indices))
+
+    def get_ngram_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.translate_mamba_indices(self.get_mamba_indices(req_indices))
+
 
 class UnifiedHybridLinearKVPool(HybridLinearKVPool):
     """`HybridLinearKVPool` over unified sub-pools (full = Unified{MLA,MHA},
@@ -1435,6 +1593,49 @@ class UnifiedHybridLinearKVPool(HybridLinearKVPool):
         # per-layer entries to pair by layer id (the sender falls back to
         # positional pairing).
         return []
+
+
+class UnifiedQSAHybridLinearKVPool(QSATokenToKVPool):
+    """Compressed-QSA hybrid wrapper over a unified Full page envelope."""
+
+    # QwenSparseAttnBackend translates its write locations and page tables to
+    # physical QSA coordinates; the generic dense-id translator must defer.
+    backend_resolves_kv_indices = True
+
+    def translate_qsa_compressed_locs(self, layer_id, loc):
+        layer_offset = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.translate_qsa_compressed_locs(layer_offset, loc)
+
+    def translate_qsa_page_table(self, layer_id, page_table):
+        layer_offset = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.translate_qsa_page_table(layer_offset, page_table)
+
+    def get_kv_layer_ids(self):
+        return []
+
+    def translate_qsa_graph_metadata_(self, page_table, write_locs):
+        """Turn graph-kernel virtual Full ids into physical ids in-place."""
+        v2p = self._qsa_full_v2p_page_table
+        flat_pages = page_table.view(-1).long()
+        physical_pages = v2p.index_select(0, flat_pages).clamp_min_(0)
+        page_table.copy_(physical_pages.view_as(page_table))
+
+        ratio = self.qsa_compress_ratio
+        virtual_tokens = write_locs.long() * ratio
+        virtual_pages = virtual_tokens // self.page_size
+        offsets = virtual_tokens % self.page_size
+        physical_tokens = v2p.index_select(0, virtual_pages) * self.page_size + offsets
+        write_locs.copy_(physical_tokens.clamp_min_(0) // ratio)
+
+    def get_kv_size_bytes(self):
+        # The Full K/V and persistent compressed keys alias UnifiedKVPool and
+        # are logged there. Count only the per-request pending QSA state here.
+        pending = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.qsa_key_state_buffer_pool
+        )
+        pending += self.qsa_rope_position_buffer.numel() * 8
+        return pending, 0
 
 
 # ---------------------------------------------------------------------------
@@ -1529,6 +1730,11 @@ def init_unified_mamba_pools(
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
     unified_total_bytes: Optional[int] = None,
+    qsa_profile=None,
+    short_conv_layer_ids: Optional[List[int]] = None,
+    short_conv_state_shape=None,
+    ngram_context_len: int = 0,
+    ngram_eos_token_id: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -1556,6 +1762,20 @@ def init_unified_mamba_pools(
             qk_rope_head_dim=qk_rope_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=None if fused_draft is None else fused_draft.region,
+        )
+    elif qsa_profile is not None:
+        full_spec = QSAMHASubPoolSpec(
+            name="full",
+            layer_num=len(full_attention_layer_ids),
+            head_num=head_num,
+            head_dim=head_dim,
+            store_dtype=store_dtype,
+            grow_direction="down",
+            qsa_index_kv_heads=qsa_profile.kv_heads,
+            qsa_index_head_dim=qsa_profile.head_dim,
+            qsa_compress_ratio=qsa_profile.compress_ratio,
+            kv_cache_dtype=kv_cache_dtype,
             draft_region=None if fused_draft is None else fused_draft.region,
         )
     else:
@@ -1628,6 +1848,10 @@ def init_unified_mamba_pools(
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
         pre_alloc_size=decode_pre_alloc_size,
+        short_conv_layer_ids=short_conv_layer_ids,
+        short_conv_state_shape=short_conv_state_shape,
+        ngram_context_len=ngram_context_len,
+        ngram_eos_token_id=ngram_eos_token_id,
     )
     if use_mla_backend:
         # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous
@@ -1639,7 +1863,12 @@ def init_unified_mamba_pools(
             page_size=page_size,
         )
     else:
-        unified_full_kv_pool = UnifiedMHATokenToKVPool(
+        full_pool_cls = (
+            UnifiedQSAMHATokenToKVPool
+            if qsa_profile is not None
+            else UnifiedMHATokenToKVPool
+        )
+        unified_full_kv_pool = full_pool_cls(
             unified_buffer=shared_pool,
             sub_pool_name="full",
             page_size=page_size,
@@ -1649,7 +1878,7 @@ def init_unified_mamba_pools(
     full_attn_layer_ids_for_pool = (
         [0] if is_draft_worker else list(full_attention_layer_ids)
     )
-    token_to_kv_pool = UnifiedHybridLinearKVPool(
+    common_pool_kwargs = dict(
         page_size=page_size,
         size=max_total_num_tokens,
         dtype=kv_cache_dtype,
@@ -1659,10 +1888,23 @@ def init_unified_mamba_pools(
         device=device,
         mamba_pool=req_to_token_pool.mamba_pool,
         enable_memory_saver=enable_memory_saver,
-        use_mla=use_mla_backend,
         start_layer=start_layer,
         full_kv_pool=unified_full_kv_pool,
     )
+    if qsa_profile is not None:
+        token_to_kv_pool = UnifiedQSAHybridLinearKVPool(
+            **common_pool_kwargs,
+            qsa_index_kv_heads=qsa_profile.kv_heads,
+            qsa_index_head_dim=qsa_profile.head_dim,
+            qsa_compress_ratio=qsa_profile.compress_ratio,
+            qsa_token_topk=qsa_profile.budget,
+            num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            qsa_compressed_k_buffer_pool=unified_full_kv_pool.qsa_buffers(),
+        )
+    else:
+        token_to_kv_pool = UnifiedHybridLinearKVPool(
+            **common_pool_kwargs, use_mla=use_mla_backend
+        )
     allocator = UnifiedMambaTokenToKVPoolAllocator(
         unified_buffer=shared_pool,
         kvcache=token_to_kv_pool,
@@ -1678,6 +1920,8 @@ def init_unified_mamba_pools(
     full_pool.host_capacity_bytes = (
         max_total_num_tokens * allocator.full_attn_allocator.entry_bytes
     )
+    if qsa_profile is not None:
+        token_to_kv_pool._qsa_full_v2p_page_table = allocator.full_v2p_page_table
 
     mamba_slot_allocator = _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,

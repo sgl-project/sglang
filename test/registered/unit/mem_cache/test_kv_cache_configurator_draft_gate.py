@@ -53,6 +53,18 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, stage="weekly", runner_config="cpu")
 
 
+class TestQSADraftGate(CustomTestCase):
+    def test_qsa_uses_private_draft_pool(self):
+        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.spec_aux_config = SimpleNamespace()
+        cfg.model_config = SimpleNamespace(hf_text_config={})
+        with patch(
+            "sglang.srt.layers.attention.qsa.config.parse_qsa_profile",
+            return_value=object(),
+        ):
+            self.assertIsNone(cfg._fused_draft_decision().placement)
+
+
 class _FakeKVCache:
     def __init__(self, max_slots):
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)

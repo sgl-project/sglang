@@ -1093,7 +1093,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
@@ -1136,6 +1136,17 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated and truncation_align_size is not None:
+            # The next pass treats every token computed so far as its prefix.
+            # Keep non-final chunk lengths aligned so a compressed sparse-index
+            # group is never split across two extend forwards. The initial
+            # radix prefix is page-aligned, and compressed QSA requires its page
+            # size to be a ratio multiple, so preserving aligned chunk lengths
+            # preserves an aligned absolute prefix. The final chunk is allowed
+            # to end mid-group; decode completes it through the pending ring.
+            new_len = new_len // truncation_align_size * truncation_align_size
+            if new_len <= 0:
+                return req
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )

@@ -170,7 +170,6 @@ def launch_graph_metadata(
     pool,
     seq_offset=0,
 ) -> None:
-
     indexer = metadata.indexer_metadata
     max_pages = indexer.graph_compressed_page_table.shape[1]
     row_seq_lens = metadata.sequence_lengths
@@ -219,6 +218,13 @@ def launch_graph_metadata(
         MODE=mode,
         num_warps=1,
     )
+
+    translate = getattr(pool, "translate_qsa_graph_metadata_", None)
+    if translate is not None:
+        translate(
+            indexer.graph_compressed_page_table,
+            indexer.graph_write_locs,
+        )
 
 
 @triton.jit

@@ -897,8 +897,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 with self.subTest(mode=mode):
                     self._construct(*qwen4, disaggregation_mode=mode)
 
-            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
-                self._construct(*qwen4, enable_unified_memory=True)
             with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
                 self._construct(
                     *qwen4,
@@ -922,6 +920,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self._construct(
                     *qwen4, ple_offload_embedding=False, ple_offload_backend="file"
                 )
+
+    def test_qwen4_accepts_unified_memory_with_audited_backends(self):
+        """The QSA unified-pool implementation must survive the real model
+        override and resolution pipeline, not only the generic cache hook."""
+        with override_platform(is_cuda=True):
+            sa = self._construct(
+                "Qwen4ExpForConditionalGeneration",
+                "qwen4_exp",
+                # Qwen4-Exp fixes head_dim at 256 and defaults V to the same
+                # width. The shared mini fixture's MLA-only v_head_dim=16 would
+                # otherwise manufacture an asymmetric model that Qwen is not.
+                config_extra={"v_head_dim": 256},
+                enable_unified_memory=True,
+                attention_backend="triton",
+                linear_attn_prefill_backend="triton",
+            )
+        self.assertTrue(self._resolved(sa, "enable_unified_memory"))
 
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")

@@ -92,6 +92,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
+        full_kv_pool: Optional[object] = None,
+        qsa_compressed_k_buffer_pool: Optional[List[torch.Tensor]] = None,
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
@@ -124,6 +126,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
             use_mla=False,
             start_layer=start_layer,
             full_kv_pool_class=full_kv_pool_class,
+            full_kv_pool=full_kv_pool,
             quant_method=quant_method,
             post_capture_active=post_capture_active,
         )
@@ -202,26 +205,32 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_rope_position_buffer = torch.zeros(
                 (ring_slots, 3), dtype=torch.int64, device=device
             )
-            # One contiguous allocation behind per-layer views: every layer's
-            # compressed pages are addressable from a single base pointer.
-            self.qsa_compressed_flat = torch.zeros(
-                (
-                    len(full_attention_layer_ids),
-                    self.qsa_compressed_capacity
-                    * self.qsa_index_kv_heads
-                    * self.qsa_index_head_dim,
-                ),
-                dtype=self.qsa_compressed_dtype,
-                device=device,
-            )
-        self.qsa_compressed_k_buffer_pool = [
-            self.qsa_compressed_flat[layer_offset].view(
-                self.qsa_compressed_capacity,
-                self.qsa_index_kv_heads,
-                self.qsa_index_head_dim,
-            )
-            for layer_offset in range(len(full_attention_layer_ids))
-        ]
+            if qsa_compressed_k_buffer_pool is None:
+                self.qsa_compressed_flat = torch.zeros(
+                    (
+                        len(full_attention_layer_ids),
+                        self.qsa_compressed_capacity
+                        * self.qsa_index_kv_heads
+                        * self.qsa_index_head_dim,
+                    ),
+                    dtype=self.qsa_compressed_dtype,
+                    device=device,
+                )
+                self.qsa_compressed_k_buffer_pool = [
+                    self.qsa_compressed_flat[layer_offset].view(
+                        self.qsa_compressed_capacity,
+                        self.qsa_index_kv_heads,
+                        self.qsa_index_head_dim,
+                    )
+                    for layer_offset in range(len(full_attention_layer_ids))
+                ]
+            else:
+                if len(qsa_compressed_k_buffer_pool) != len(full_attention_layer_ids):
+                    raise ValueError(
+                        "external QSA compressed buffers must match full layers"
+                    )
+                self.qsa_compressed_flat = None
+                self.qsa_compressed_k_buffer_pool = qsa_compressed_k_buffer_pool
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
 
@@ -258,10 +267,21 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self._transfer_full_attention_id(layer_id)
         ]
 
+    def translate_qsa_compressed_locs(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> torch.Tensor:
+        return loc
+
+    def translate_qsa_page_table(
+        self, layer_id: int, page_table: torch.Tensor
+    ) -> torch.Tensor:
+        return page_table
+
     def set_qsa_compressed_k_buffer(
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
+        loc = self.translate_qsa_compressed_locs(layer_id, loc)
         buffer[loc.long()] = compressed_k.to(buffer.dtype)
 
     @staticmethod
