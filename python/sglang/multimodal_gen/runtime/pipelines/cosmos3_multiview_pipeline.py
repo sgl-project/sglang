@@ -64,54 +64,26 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         "scheduler",
     ]
 
-    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        """Stage order:
-
-        1. Cosmos3MultiviewInputStage - per-camera media, camera-major packing
-        2. Cosmos3MultiviewTokenizationStage - transfer prompt + WSM emphasis
-        3. Cosmos3MultiviewLatentStage - per-camera VAE encode, anchors, layout
-        4. Cosmos3TimestepPreparationStage - FlowUniPC timesteps (shift 10)
-        5. Cosmos3DenoisingStage - sequential text CFG with the multiview attention
-        6. Cosmos3MultiviewDecodingStage - per-camera VAE decode, camera-major,
-           plus LiDAR range-map decode for joint requests
-        """
-        pipeline_config = server_args.pipeline_config
-        if not isinstance(pipeline_config, Cosmos3MultiviewConfig):
-            raise TypeError(
-                "Cosmos3MultiviewPipeline requires Cosmos3MultiviewConfig, got "
-                f"{type(pipeline_config).__name__}; make the checkpoint's "
-                "model_index.json name Cosmos3MultiviewPipeline."
-            )
-        deployment = pipeline_config.multiview_deployment
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        deployment = server_args.pipeline_config.multiview_deployment
         if deployment is None:
             raise ValueError(
                 "Cosmos3MultiviewConfig did not resolve the checkpoint's multiview "
                 "deployment config; model_path must be set before stage creation."
             )
-        transformer = self.get_module("transformer")
-        if not isinstance(transformer, Cosmos3MultiviewTransformer):
-            raise TypeError(
-                "Cosmos3MultiviewPipeline loaded the wrong transformer type: "
-                f"{type(transformer).__name__}; transformer/config.json must set "
-                "backbone_type='cosmos3_multiview'."
-            )
-        vae = self.get_module("vae")
-        scheduler = self.get_module("scheduler")
-        requested = pipeline_config.resolved_multiview_backend()
-        backend = (
+        requested = server_args.pipeline_config.resolved_multiview_backend()
+        self.attention_backend = (
             resolve_masked_backend(get_local_torch_device())
             if requested == COSMOS3_MULTIVIEW_AUTO_BACKEND
             else requested
         )
         logger.info(
             "Cosmos3 multiview attention backend: %s (%s)",
-            backend,
+            self.attention_backend,
             "device default"
             if requested == COSMOS3_MULTIVIEW_AUTO_BACKEND
             else "pinned",
         )
-        lidar_encoder = None
-        lidar_decoder = None
         if deployment.supports_lidar:
             if envs.SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN:
                 if importlib.util.find_spec("natten") is None:
@@ -127,17 +99,24 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
                     "Cosmos3 LiDAR neighborhood attention: compiled FlexAttention "
                     "(fp32, IEEE); first LiDAR request compiles its three levels"
                 )
-            # The LiDAR range-map VAE is not a model_index component; it ships
-            # as lidar_vae/ next to the transformer and stays in FP32. Read it
-            # from the resolved snapshot directory: server_args.model_path may
-            # still be the Hub id when the checkpoint was downloaded.
-            lidar_encoder = Cosmos3LidarEncoder.from_pretrained(
-                self.model_path, deployment.lidar, get_local_torch_device()
-            )
-            lidar_decoder = Cosmos3LidarDecoder.from_pretrained(
-                self.model_path, deployment.lidar, get_local_torch_device()
-            )
+            for name, model_cls in (
+                ("lidar_encoder", Cosmos3LidarEncoder),
+                ("lidar_decoder", Cosmos3LidarDecoder),
+            ):
+                device = (
+                    "cpu"
+                    if server_args.should_start_component_on_cpu(name)
+                    else get_local_torch_device()
+                )
+                self.add_module(
+                    name,
+                    model_cls.from_pretrained(
+                        self.model_path, deployment.lidar, device
+                    ),
+                )
 
+    def add_multiview_input_stages(self, *, attention_backend: str) -> None:
+        deployment = self.server_args.pipeline_config.multiview_deployment
         self.add_stage(Cosmos3MultiviewInputStage(deployment))
         self.add_stage(
             Cosmos3MultiviewTokenizationStage(
@@ -146,13 +125,25 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         )
         self.add_stage(
             Cosmos3MultiviewLatentStage(
-                vae=vae,
-                transformer=transformer,
+                vae=self.get_module("vae"),
+                transformer=self.get_module("transformer"),
                 deployment=deployment,
-                lidar_encoder=lidar_encoder,
-                attention_backend=backend,
+                lidar_encoder=self.get_module("lidar_encoder"),
+                attention_backend=attention_backend,
             )
         )
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        if not isinstance(server_args.pipeline_config, Cosmos3MultiviewConfig):
+            raise TypeError("Cosmos3MultiviewPipeline requires Cosmos3MultiviewConfig")
+        transformer = self.get_module("transformer")
+        if not isinstance(transformer, Cosmos3MultiviewTransformer):
+            raise TypeError(
+                "Cosmos3MultiviewPipeline requires Cosmos3MultiviewTransformer"
+            )
+        vae = self.get_module("vae")
+        scheduler = self.get_module("scheduler")
+        self.add_multiview_input_stages(attention_backend=self.attention_backend)
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
         self.add_stage(
             Cosmos3DenoisingStage(
@@ -161,16 +152,19 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
         )
         self.add_stage(
             Cosmos3MultiviewDecodingStage(
-                vae, guardrails=False, sound_tokenizer=None, lidar_decoder=lidar_decoder
+                vae,
+                guardrails=False,
+                sound_tokenizer=None,
+                lidar_decoder=self.get_module("lidar_decoder"),
             )
         )
         logger.info(
             "Cosmos3 multiview pipeline stages created (%d cameras, backend=%s, "
             "cross-view window=%.2f s, lidar=%s)",
-            deployment.num_views,
-            backend,
-            deployment.cross_view_past_window_seconds,
-            deployment.supports_lidar,
+            server_args.pipeline_config.multiview_deployment.num_views,
+            self.attention_backend,
+            server_args.pipeline_config.multiview_deployment.cross_view_past_window_seconds,
+            server_args.pipeline_config.multiview_deployment.supports_lidar,
         )
 
 

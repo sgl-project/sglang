@@ -258,7 +258,9 @@ class TestSelectedHistory(unittest.TestCase):
             key[0, :, 0, 0].tolist(), [100, 100, 100, 103, 103, 103, 105, 105, 105]
         )
         self.assertEqual(value[0, ::tokens, 0, 0].tolist(), [0, -3, -5])
-        for bad in ([], [3, 0], [0, 0], [6], [-1]):
+        empty = SelectedHistory(archive, frame_ids=[], tokens_per_frame=tokens)
+        self.assertEqual(empty[0][0].shape[1], 0)
+        for bad in ([3, 0], [0, 0], [6], [-1]):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 SelectedHistory(archive, frame_ids=bad, tokens_per_frame=tokens)
 

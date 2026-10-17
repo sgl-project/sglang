@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos-Dreams realtime (tick) session: adapter, action control, and tick helpers."""
 
-import importlib.util
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -52,17 +50,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     block_frames,
     tick_action_rows,
 )
+from sglang.multimodal_gen.test.unit.test_cosmos_dreams import CHECKPOINT_ARTIFACT
 
-
-def _load_checkpoint_artifact() -> dict:
-    path = os.path.join(os.path.dirname(__file__), "test_cosmos_dreams.py")
-    spec = importlib.util.spec_from_file_location("test_cosmos_dreams_fixture", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.CHECKPOINT_ARTIFACT
-
-
-MANIFEST = parse_cosmos_dreams_manifest(_load_checkpoint_artifact())
+MANIFEST = parse_cosmos_dreams_manifest(CHECKPOINT_ARTIFACT)
 CAMERA = MANIFEST.action_contract.embodiments["camera_pose"]
 IDLE = idle_action_row(CAMERA)
 FORWARD = [0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]

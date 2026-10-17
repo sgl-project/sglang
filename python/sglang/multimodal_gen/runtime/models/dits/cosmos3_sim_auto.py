@@ -127,20 +127,21 @@ def _replay_layer_attention(
     return out, k, v
 
 
-def _gen_layer_forward(
-    layer: Cosmos3GenDecoderLayer, hidden: torch.Tensor, **attention_kwargs: Any
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    residual = hidden
-    attention_output, k, v = _replay_layer_attention(
-        layer.cross_attention, layer.input_layernorm(hidden), **attention_kwargs
-    )
-    hidden = residual + attention_output
-    hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
-    return hidden, k, v
+class Cosmos3SimAutoGenDecoderLayer(Cosmos3GenDecoderLayer):
+    def forward(
+        self, hidden: torch.Tensor, **attention_kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_output, k, v = _replay_layer_attention(
+            self.cross_attention, self.input_layernorm(hidden), **attention_kwargs
+        )
+        hidden = hidden + attention_output
+        return hidden + self.mlp(self.post_attention_layernorm(hidden)), k, v
 
 
 class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
     """Cosmos3 Nano multiview weights driven as a chunk-causal world model."""
+
+    _gen_layer_cls = Cosmos3SimAutoGenDecoderLayer
 
     def __init__(
         self,
@@ -421,8 +422,7 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 sp_check = SpCheck()
         current_kv: list[KVPair] = []
         for layer_idx, layer in enumerate(self.gen_layers):
-            hidden, k, v = _gen_layer_forward(
-                layer,
+            hidden, k, v = layer(
                 hidden,
                 cos_sin_cache=cos_sin_cache,
                 rope_positions=rope_positions,

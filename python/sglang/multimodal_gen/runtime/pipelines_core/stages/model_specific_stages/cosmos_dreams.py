@@ -1235,7 +1235,7 @@ def _history_view(
     otherwise the selected frames (None when nothing is selected yet)."""
     if frame_ids is None:
         return archive
-    if archive is None or not frame_ids:
+    if archive is None:
         return None
     return SelectedHistory(
         archive, frame_ids=frame_ids, tokens_per_frame=tokens_per_frame
@@ -1358,7 +1358,9 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 start_at_stage_entry=False,
             )
         ]
-        if self.overlap_vae_decode:
+        if self.overlap_vae_decode and not server_args.should_start_component_on_cpu(
+            "vae"
+        ):
             uses.append(ComponentUse(name, "vae", keep_ready_after_warmup=True))
         return uses
 
@@ -1371,7 +1373,11 @@ class CosmosDreamsRolloutStage(PipelineStage):
         return batch
 
     def _decode_queue(self, device: torch.device) -> "CausalDecodeQueue | None":
-        if not self.overlap_vae_decode or device.type != "cuda":
+        if (
+            not self.overlap_vae_decode
+            or device.type != "cuda"
+            or self.server_args.should_start_component_on_cpu("vae")
+        ):
             return None
         return CausalDecodeQueue(self.vae, device=device)
 

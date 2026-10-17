@@ -485,7 +485,7 @@ class SelectedHistory(Sequence):
             raise ValueError("SelectedHistory needs a non-empty archive.")
         stored = archive[0][0].shape[1] // tokens_per_frame
         ids = list(frame_ids)
-        if not ids or ids != sorted(set(ids)) or ids[0] < 0 or ids[-1] >= stored:
+        if ids != sorted(set(ids)) or (ids and (ids[0] < 0 or ids[-1] >= stored)):
             raise ValueError(
                 f"Selected frames must be ordered unique committed frames, got {ids} "
                 f"with {stored} committed."

@@ -236,16 +236,15 @@ def _joint_attention(
     return out, k, v
 
 
-def _gen_layer_forward(
-    layer: Cosmos3GenDecoderLayer, hidden: torch.Tensor, **attention_kwargs: Any
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    residual = hidden
-    attention_output, k, v = _joint_attention(
-        layer.cross_attention, layer.input_layernorm(hidden), **attention_kwargs
-    )
-    hidden = residual + attention_output
-    hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
-    return hidden, k, v
+class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
+    def forward(
+        self, hidden: torch.Tensor, **attention_kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_output, k, v = _joint_attention(
+            self.cross_attention, self.input_layernorm(hidden), **attention_kwargs
+        )
+        hidden = hidden + attention_output
+        return hidden + self.mlp(self.post_attention_layernorm(hidden)), k, v
 
 
 def project_actions(
@@ -291,6 +290,8 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
     time embedding on clean tokens). Control-video checkpoints carry no action
     tokens; their control clips enter as clean vision frames.
     """
+
+    _gen_layer_cls = CosmosDreamsGenDecoderLayer
 
     def __init__(
         self,
@@ -467,8 +468,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
                 text_kv[layer_idx],
                 None if history_kv is None else history_kv[layer_idx],
             )
-            hidden, k, v = _gen_layer_forward(
-                layer,
+            hidden, k, v = layer(
                 hidden,
                 prefix_k=prefix_k,
                 prefix_v=prefix_v,

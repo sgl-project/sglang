@@ -49,9 +49,11 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+    _history_view,
     actions_for_frames,
     append_kv_history,
     closest_canvas,
+    commit_clean_kv,
     crop_geometry_to_content,
     domains_for_frames,
     fit_image_to_canvas,
@@ -645,6 +647,27 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
 
 
 class TestCosmosDreamsKVHistory(unittest.TestCase):
+    def test_empty_retrieval_stays_empty_during_clean_commit(self):
+        kv = (torch.ones(1, 2, 1, 1), torch.ones(1, 2, 1, 1))
+        archive = [kv]
+        selected = _history_view(archive, [], tokens_per_frame=1)
+
+        def transformer(latent, timestep, *, history_kv, **kwargs):
+            self.assertEqual(history_kv[0][0].shape[1], 0)
+            return SimpleNamespace(current_kv=[(kv[0][:, :1], kv[1][:, :1])])
+
+        result = commit_clean_kv(
+            transformer,
+            torch.zeros(1, 1, 1, 1, 1),
+            history=archive,
+            read_history=selected,
+            dtype=torch.float32,
+            tokens_per_frame=1,
+            sink_frames=0,
+            window_frames=4,
+        )
+        self.assertEqual(result[0][0].shape[1], 3)
+
     @staticmethod
     def _frame_kv(frame: int, layers: int = 2, tokens_per_frame: int = 2):
         value = torch.full((1, tokens_per_frame, 1, 1), float(frame))

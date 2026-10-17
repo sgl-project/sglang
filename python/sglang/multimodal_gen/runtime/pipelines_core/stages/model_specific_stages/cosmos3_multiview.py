@@ -1145,6 +1145,9 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
                 )
             lidar_fps = float(deployment.lidar["fps"])
             lidar_tcf = int(deployment.lidar["temporal_compression_factor"])
+            self.begin_declared_component_use(
+                component_name="lidar_encoder", module=self.lidar_encoder
+            )
             lidar_control_latents = self.lidar_encoder(lidar_frames).to(
                 device=device, dtype=model_dtype
             )
@@ -1268,7 +1271,11 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        return [ComponentUse(self._component_stage_name(stage_name), "vae")]
+        name = self._component_stage_name(stage_name)
+        uses = [ComponentUse(name, "vae")]
+        if self.lidar_encoder is not None:
+            uses.append(ComponentUse(name, "lidar_encoder", start_at_stage_entry=False))
+        return uses
 
 
 class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
@@ -1292,6 +1299,20 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         super().__init__(vae, guardrails=guardrails, sound_tokenizer=sound_tokenizer)
         self.lidar_decoder = lidar_decoder
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        uses = super().component_uses(server_args, stage_name)
+        if self.lidar_decoder is not None:
+            uses.append(
+                ComponentUse(
+                    self._component_stage_name(stage_name),
+                    "lidar_decoder",
+                    start_at_stage_entry=False,
+                )
+            )
+        return uses
+
     def _decode_lidar(self, batch: Req, latents: torch.Tensor) -> dict[str, Any] | None:
         lidar_request = batch.sampling_params.resolved_lidar() or {}
         if not lidar_request.get("decode", False):
@@ -1303,8 +1324,11 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         projection = self.lidar_decoder.projection
         min_range_m = float(projection["min_range_m"])
         max_range_m = float(projection["max_range_m"])
-        with torch.no_grad():
-            clip = self.lidar_decoder(latents)[0].float().cpu()
+        with self.use_declared_component(
+            component_name="lidar_decoder", module=self.lidar_decoder
+        ):
+            with torch.no_grad():
+                clip = self.lidar_decoder(latents)[0].float().cpu()
         files: dict[str, str] = {}
         video_path = batch.output_file_path() if batch.save_output else None
         if video_path and get_world_rank() == 0:
