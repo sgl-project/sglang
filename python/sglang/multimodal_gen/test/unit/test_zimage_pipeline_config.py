@@ -4,7 +4,12 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import (
+    ZImagePipelineConfig,
+    zimage_postprocess_text,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
@@ -18,6 +23,249 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
 class TestZImagePipelineConfig(unittest.TestCase):
+    def _make_conditioning_batch(self, seq_lens, num_outputs, negative_seq_lens=None):
+        config = ZImagePipelineConfig()
+        config.vae_config.post_init()
+        batch = Req(
+            sampling_params=ZImageSamplingParams(
+                prompt="A" if len(seq_lens) == 1 else ["A", "B"],
+                num_outputs_per_prompt=num_outputs,
+                height=16,
+                width=16,
+            )
+        )
+        for negative, lengths in ((False, seq_lens), (True, negative_seq_lens)):
+            if lengths is None:
+                continue
+            hidden = (
+                torch.arange(len(lengths) * (max(lengths) + 2) * 4, dtype=torch.float32)
+                .reshape(len(lengths), max(lengths) + 2, 4)
+                .to(torch.bfloat16)
+            )
+            # Include tokenizer padding on both sides of the real text.
+            attention_mask = torch.zeros(hidden.shape[:2], dtype=torch.long)
+            for idx, length in enumerate(lengths):
+                attention_mask[idx, 1 : length + 1] = 1
+            conditioning = zimage_postprocess_text(
+                BaseEncoderOutput(hidden_states=(hidden, hidden, hidden)),
+                SimpleNamespace(attention_mask=attention_mask),
+            )
+            if isinstance(conditioning, TextConditioningOutput):
+                embeds = conditioning.prompt_embeds
+                mask = conditioning.prompt_embeds_mask
+                valid_lens = conditioning.prompt_seq_lens
+            else:
+                # Keep the legacy single-prompt output for pre-fix reproduction.
+                embeds = conditioning
+                mask = config.build_text_conditioning_mask(
+                    {}, attention_mask, embeds, 0
+                )
+                valid_lens = config.seq_lens_from_text_conditioning_mask(mask)
+            prefix = "negative_prompt" if negative else "prompt"
+            setattr(batch, f"{prefix}_embeds", [embeds])
+            setattr(batch, f"{prefix}_embeds_mask", [mask])
+            setattr(batch, f"{prefix}_seq_lens", [valid_lens])
+            setattr(
+                batch,
+                "negative_attention_mask" if negative else "prompt_attention_mask",
+                [mask.to(torch.long)],
+            )
+        return config, batch
+
+    def _patchify_conditioning(self, config, batch, *, negative=False):
+        model = ZImageTransformer2DModel.__new__(ZImageTransformer2DModel)
+        getter = (
+            config.get_neg_prompt_embeds if negative else config.get_pos_prompt_embeds
+        )
+        prepare = (
+            config.prepare_neg_cond_kwargs
+            if negative
+            else config.prepare_pos_cond_kwargs
+        )
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size",
+            return_value=1,
+        ):
+            kwargs = prepare(
+                batch, torch.device("cpu"), lambda ids: ids, torch.bfloat16
+            )
+        return model.patchify_and_embed(
+            [torch.zeros(4, 1, 2, 2) for _ in range(batch.batch_size)],
+            getter(batch),
+            patch_size=2,
+            f_patch_size=1,
+            caption_valid_lens=kwargs["caption_valid_lens"],
+        )
+
+    def test_single_prompt_multi_output_caption_contract(self):
+        config, batch = self._make_conditioning_batch([3], num_outputs=3)
+        self.assertIs(config.expand_conditioning_to_sample_batch(batch), batch)
+        images, captions, _, _, valid_lens, *_ = self._patchify_conditioning(
+            config, batch
+        )
+        self.assertEqual(images.shape, (3, 32, 16))
+        self.assertEqual(captions.shape, (3, 32, 4))
+        self.assertEqual(valid_lens.tolist(), [3, 3, 3])
+        self.assertEqual(batch.prompt_embeds[0].shape, (3, 3, 4))
+        torch.testing.assert_close(captions[0], captions[1], rtol=0, atol=0)
+        torch.testing.assert_close(captions[0], captions[2], rtol=0, atol=0)
+
+    def test_single_output_preserves_text_and_dtype(self):
+        config, batch = self._make_conditioning_batch([3], num_outputs=1)
+        embeds = batch.prompt_embeds[0]
+        mask = batch.prompt_embeds_mask[0]
+        self.assertEqual(embeds.shape, (1, 3, 4))
+        self.assertIs(config.expand_conditioning_to_sample_batch(batch), batch)
+        self.assertIs(batch.prompt_embeds[0], embeds)
+        self.assertIs(batch.prompt_embeds_mask[0], mask)
+        captions = config.get_pos_prompt_embeds(batch)
+        expected = torch.arange(4, 16).reshape(3, 4).to(torch.bfloat16)
+        torch.testing.assert_close(captions[0][:3], expected, rtol=0, atol=0)
+        torch.testing.assert_close(captions[0][3:], expected[-1:].repeat(29, 1))
+        self.assertEqual(captions[0].dtype, torch.bfloat16)
+        self.assertEqual(batch.prompt_attention_mask[0].dtype, torch.long)
+        self.assertEqual(mask.dtype, torch.bool)
+        self.assertEqual(self._patchify_conditioning(config, batch)[4].tolist(), [3])
+
+    def test_multi_output_expands_positive_and_negative_conditioning(self):
+        config, batch = self._make_conditioning_batch(
+            [3], num_outputs=3, negative_seq_lens=[33]
+        )
+        config.expand_conditioning_to_sample_batch(batch)
+        for negative, length in ((False, 3), (True, 33)):
+            prefix = "negative_prompt" if negative else "prompt"
+            embeds = getattr(batch, f"{prefix}_embeds")[0]
+            mask = getattr(batch, f"{prefix}_embeds_mask")[0]
+            self.assertEqual(embeds.shape, (3, length, 4))
+            self.assertEqual(mask.shape, (3, length))
+            self.assertTrue(mask.all())
+            self.assertEqual(mask.dtype, torch.bool)
+            self.assertEqual(embeds.dtype, torch.bfloat16)
+            self.assertEqual(
+                self._patchify_conditioning(config, batch, negative=negative)[
+                    4
+                ].tolist(),
+                [length] * 3,
+            )
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size",
+            return_value=1,
+        ):
+            kwargs = config.prepare_neg_cond_kwargs(
+                batch, torch.device("cpu"), lambda ids: ids, torch.bfloat16
+            )
+        self.assertEqual(kwargs["freqs_cis"][0].shape, (64, 3))
+        self.assertEqual(kwargs["freqs_cis"][1][0].tolist(), [65, 0, 0])
+
+    def test_multi_prompt_expansion_preserves_order_masks_and_lengths(self):
+        config, batch = self._make_conditioning_batch(
+            [2, 5], num_outputs=2, negative_seq_lens=[4, 1]
+        )
+        original = {
+            name: getattr(batch, name)[0].clone()
+            for name in (
+                "prompt_embeds",
+                "negative_prompt_embeds",
+                "prompt_attention_mask",
+                "negative_attention_mask",
+                "prompt_embeds_mask",
+                "negative_prompt_embeds_mask",
+            )
+        }
+        config.expand_conditioning_to_sample_batch(batch)
+        for name, value in original.items():
+            expanded = getattr(batch, name)[0]
+            torch.testing.assert_close(expanded, value[[0, 0, 1, 1]], rtol=0, atol=0)
+            self.assertEqual(expanded.dtype, value.dtype)
+            self.assertEqual(expanded.device, value.device)
+        self.assertEqual(batch.prompt_seq_lens, [[2, 2, 5, 5]])
+        self.assertEqual(batch.negative_prompt_seq_lens, [[4, 4, 1, 1]])
+        for negative, expected_lens in ((False, [2, 2, 5, 5]), (True, [4, 4, 1, 1])):
+            patched = self._patchify_conditioning(config, batch, negative=negative)
+            self.assertEqual(patched[1].shape, (4, 32, 4))
+            self.assertEqual(patched[4].tolist(), expected_lens)
+
+    def test_conditioning_expansion_is_idempotent(self):
+        config, batch = self._make_conditioning_batch(
+            [2, 5], num_outputs=2, negative_seq_lens=[4, 1]
+        )
+        config.expand_conditioning_to_sample_batch(batch)
+        fields = (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        )
+        original = {name: getattr(batch, name)[0] for name in fields}
+        config.expand_conditioning_to_sample_batch(batch)
+        for name, value in original.items():
+            self.assertIs(getattr(batch, name)[0], value)
+
+    def test_single_output_legacy_2d_getter_is_preserved(self):
+        config, batch = self._make_conditioning_batch([3], num_outputs=1)
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size",
+            return_value=1,
+        ):
+            batched_kwargs = config.prepare_pos_cond_kwargs(
+                batch, torch.device("cpu"), lambda ids: ids, torch.bfloat16
+            )
+        embeds = batch.prompt_embeds[0]
+        if embeds.ndim == 3:
+            embeds = embeds[0]
+        batch.prompt_embeds = [embeds]
+        config.expand_conditioning_to_sample_batch(batch)
+        self.assertIs(batch.prompt_embeds[0], embeds)
+        expected = torch.cat([embeds, embeds[-1:].repeat(29, 1)])
+        torch.testing.assert_close(
+            config.get_pos_prompt_embeds(batch)[0], expected, rtol=0, atol=0
+        )
+        with patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size",
+            return_value=1,
+        ):
+            legacy_kwargs = config.prepare_pos_cond_kwargs(
+                batch, torch.device("cpu"), lambda ids: ids, torch.bfloat16
+            )
+        for batched, legacy in zip(
+            batched_kwargs["freqs_cis"], legacy_kwargs["freqs_cis"]
+        ):
+            torch.testing.assert_close(batched, legacy, rtol=0, atol=0)
+
+    def test_multi_output_rejects_invalid_conditioning_dimensions(self):
+        for negative in (False, True):
+            field_name = "negative_prompt_embeds" if negative else "prompt_embeds"
+            for shape in ((1, 4), (3, 4), (1, 1, 3, 4), (2, 3, 4)):
+                with self.subTest(field=field_name, shape=shape):
+                    config, batch = self._make_conditioning_batch(
+                        [3], num_outputs=3, negative_seq_lens=[5]
+                    )
+                    setattr(batch, field_name, [torch.zeros(shape)])
+                    with self.assertRaisesRegex(ValueError, "shape|batch dim"):
+                        config.expand_conditioning_to_sample_batch(batch)
+
+    def test_multi_output_rejects_misaligned_masks_and_lengths(self):
+        for field_name in (
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        ):
+            with self.subTest(field=field_name):
+                config, batch = self._make_conditioning_batch(
+                    [3], num_outputs=3, negative_seq_lens=[5]
+                )
+                invalid = [3, 3] if "seq_lens" in field_name else torch.ones(2, 3)
+                setattr(batch, field_name, [invalid])
+                with self.assertRaisesRegex(ValueError, "expected 1.*3"):
+                    config.expand_conditioning_to_sample_batch(batch)
+
     def test_cfg_activation_and_default_negative_prompt(self):
         for cls in (ZImageSamplingParams, ZImageTurboSamplingParams):
             for scale in (0.0, 0.5, 1.0, 3.5):

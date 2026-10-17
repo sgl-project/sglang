@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
+)
 
 
 @dataclass
@@ -59,18 +62,11 @@ def zimage_preprocess_text(prompt: str):
 
 def zimage_postprocess_text(
     outputs: BaseEncoderOutput, _text_inputs
-) -> torch.Tensor | TextConditioningOutput:
-    """Return unpadded Z-Image text embeddings.
-
-    Batched outputs return TextConditioningOutput to preserve per-prompt text
-    lengths.
-    """
+) -> TextConditioningOutput:
+    """Return batched Z-Image text embeddings with per-prompt masks and lengths."""
     device = outputs.hidden_states[-2].device
     prompt_mask = _text_inputs.attention_mask.to(device).bool()
     hidden_states = outputs.hidden_states[-2]
-    if hidden_states.shape[0] == 1:
-        return hidden_states[0][prompt_mask[0]]
-
     split_hidden_states = [
         hidden_states[idx][prompt_mask[idx]] for idx in range(hidden_states.shape[0])
     ]
@@ -101,6 +97,35 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     SEQ_LEN_MULTIPLE: int = 32
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
+
+    def expand_conditioning_to_sample_batch(self, batch):
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+
+        # A sequence dimension must not be mistaken for the prompt batch.
+        for embeds in (batch.prompt_embeds, batch.negative_prompt_embeds):
+            if embeds is None:
+                continue
+            if torch.is_tensor(embeds):
+                embeds = [embeds]
+            if any(torch.is_tensor(embed) and embed.ndim != 3 for embed in embeds):
+                raise ValueError(
+                    "Z-Image multi-output text embeddings must have shape [batch, seq, dim]"
+                )
+
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "prompt_attention_mask",
+            "negative_attention_mask",
+            "prompt_embeds_mask",
+            "negative_prompt_embeds_mask",
+            "prompt_seq_lens",
+            "negative_prompt_seq_lens",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
