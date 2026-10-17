@@ -238,6 +238,16 @@ class RequestLogger:
             target.info(msg)
 
 
+def _sequence_to_string_truncated(data: Union[List, Tuple], max_length: int) -> str:
+    data = redact_watermark_secrets(data)
+    if all(isinstance(v, (int, float, bool, type(None))) for v in data):
+        return str(data)
+    items = ", ".join(_dataclass_to_string_truncated(v, max_length) for v in data)
+    if isinstance(data, tuple):
+        return f"({items},)" if len(data) == 1 else f"({items})"
+    return f"[{items}]"
+
+
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
@@ -254,12 +264,12 @@ def _dataclass_to_string_truncated(
         if len(data) > max_length:
             half_length = max_length // 2
             return (
-                str(redact_watermark_secrets(data[:half_length]))
+                _sequence_to_string_truncated(data[:half_length], max_length)
                 + " ... "
-                + str(redact_watermark_secrets(data[-half_length:]))
+                + _sequence_to_string_truncated(data[-half_length:], max_length)
             )
         else:
-            return str(redact_watermark_secrets(data))
+            return _sequence_to_string_truncated(data, max_length)
     elif isinstance(data, dict):
         data = redact_watermark_secrets(data)
         return (
@@ -302,7 +312,7 @@ def _transform_data_for_logging(
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
-            return list(data[:half_length]) + ["..."] + list(data[-half_length:])
+            data = list(data[:half_length]) + ["..."] + list(data[-half_length:])
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
         data = redact_watermark_secrets(data)
