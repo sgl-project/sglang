@@ -94,7 +94,12 @@ class _FakeKVCache:
         # buf[p] == virtual id currently stored at physical slot p (-1 if free).
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
 
-    def move_kv_cache(self, dst_loc: torch.Tensor, src_loc: torch.Tensor):
+    def move_physical_pages(
+        self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        slots = torch.arange(page_size, device=dst_pages.device)
+        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
+        src_loc = (src_pages[:, None] * page_size + slots).flatten()
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
@@ -1843,7 +1848,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
         mamba_kv.attach_allocator = lambda allocator: None
         # The physical-move contract for the mamba sub-pool (un-translated);
-        # _FakeKVCache already provides move_kv_cache, so nothing extra.
+        # _FakeKVCache already provides move_physical_pages, so nothing extra.
 
         class _FakeHybridLinearKVPool:
             full_kv_pool = full_kv
