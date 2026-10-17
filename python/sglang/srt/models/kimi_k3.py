@@ -6,6 +6,8 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import contextlib
+import functools
 import logging
 import os
 import re
@@ -173,6 +175,19 @@ if _use_fused_latent_tail:
 # The all-gather read's row limit; up to it the column tail's split-K partial GEMM
 # beats the replicated tail on MI350X.
 _COLUMN_TAIL_MAX_TOKENS = 64
+_use_aiter_gfx95 = _is_gfx95 and envs.SGLANG_USE_AITER.get()
+_fused_route_sort_max_tokens = (
+    envs.SGLANG_ROCM_K3_FUSED_ROUTE_SORT_MAX_TOKENS.get() if _use_aiter_gfx95 else 0
+)
+if _fused_route_sort_max_tokens > 0:
+    from sglang.kernels.ops.moe import kimi_k3_route_sort
+    from sglang.srt.layers.moe import moe_sort_handoff
+# aiter's tuned K3 A8W4 MoE rows (model_configs/kimik3_a8w4_tuned_fmoe.csv) all
+# sort with block_m 32; the handoff falls back to aiter's sort on a mismatch.
+_ROUTE_SORT_BLOCK_M = 32
+# The fused route+quant kernel quantizes on one workgroup: faster than aiter's quant
+# launch up to 8 tokens on MI350X.
+_ROUTE_QUANT_MAX_TOKENS = 8
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -215,6 +230,34 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _aiter_flydsl_params(m: int, n: int, k: int) -> Optional[dict]:
+    """Launch params of aiter's tuned bf16 FlyDSL kernel for [m, k] x [n, k]^T,
+    or None when the tuned table picks another backend for this shape."""
+    from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+    from aiter.tuned_gemm import get_GEMM_A16W16_config
+
+    bf16 = str(torch.bfloat16)
+    config = get_GEMM_A16W16_config(M=m, N=n, K=k, bias=False, dtype=bf16, otype=bf16)
+    if config.get("libtype") != "flydsl":
+        return None
+    p = get_flydsl_hgemm_kernel_params(config["kernelName"])
+    if p is None:
+        return None
+    return dict(
+        block_m=p["block_m"],
+        block_n=p["block_n"],
+        block_k=p["block_k"],
+        stages=p["stages"],
+        split_k=p["split_k"],
+        m_waves=p["m_waves"],
+        n_waves=p["n_waves"],
+        k_waves=p["k_waves"],
+        group_m=p["group_m"],
+        policy="ht" if p["use_half_tile_interleaved"] else "ft",
+    )
+
+
 def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -247,6 +290,19 @@ def _k3_bf16_gemm(
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
         return torch.mm(x, weight.t(), out=out, out_dtype=out.dtype)
+    if (
+        _use_aiter_gfx95
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and out.is_contiguous()
+    ):
+        # torch.mm(out=) lands on hipBLASLt; aiter's tuned FlyDSL kernel writes
+        # out= directly (the shared down GEMM into the all-reduce buffer).
+        params = _aiter_flydsl_params(x.shape[0], weight.shape[0], weight.shape[1])
+        if params is not None:
+            from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+
+            return flydsl_hgemm(x, weight, out=out, **params)
     return torch.mm(x, weight.t(), out=out)
 
 
@@ -1339,12 +1395,117 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
+    @cached_property
+    def _fused_route_sort_eligible(self) -> bool:
+        """gfx950: whether the router top-k and aiter's route sort may run as one
+        kernel (kernels/ops/moe/kimi_k3_route_sort.py), bypassing select_experts.
+        Its post-processing is a no-op here: K3 passes no padding mask or EPLB
+        dispatch info and fuses no shared experts into the top-k."""
+        if _fused_route_sort_max_tokens <= 0 or not self.use_latent_moe:
+            return False
+        cfg = self.topk.topk_config
+        if cfg.output_format not in (None, TopKOutputFormat.STANDARD):
+            return False
+        if get_moe_runner_backend().is_triton_kernels():
+            return False
+        if not (
+            cfg.scoring_func == "sigmoid"
+            and cfg.use_grouped_topk
+            and cfg.correction_bias is not None
+            and (cfg.num_expert_group or 1) == 1
+            and (cfg.topk_group or 1) == 1
+            and cfg.num_fused_shared_experts == 0
+            and cfg.custom_routing_function is None
+            and cfg.routed_scaling_factor in (None, 1.0)
+        ):
+            return False
+        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
+            return False
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        ):
+            return False
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            install_moe_sorting_handoff,
+        )
+
+        install_moe_sorting_handoff()
+        return True
+
+    @cached_property
+    def _fused_route_quant(self) -> bool:
+        """Also emit the MXFP8 stage-1 activations aiter's A8W4 experts quantize
+        right after the sort. A runner that quantizes differently never asks
+        the handoff for them, so a mismatch only wastes the fused quant."""
+        return envs.SGLANG_ROCM_K3_FUSED_ROUTE_QUANT.get()
+
+    def _fused_route_sort(
+        self,
+        router_logits: torch.Tensor,
+        latent: torch.Tensor,
+        routed_input: torch.Tensor,
+    ) -> Optional["kimi_k3_route_sort.RouteSortOutput"]:
+        """The router top-k and aiter's route sort of a decode batch as one
+        kernel, or None when it does not take the batch."""
+        if (
+            not self._fused_route_sort_eligible
+            or router_logits.shape[0] > _fused_route_sort_max_tokens
+        ):
+            return None
+        cfg = self.topk.topk_config
+        bias = cfg.correction_bias_for_dtype(router_logits.dtype)
+        if not kimi_k3_route_sort.covered(router_logits, bias, cfg.top_k):
+            return None
+        fuse_quant = (
+            self._fused_route_quant
+            and router_logits.shape[0] <= _ROUTE_QUANT_MAX_TOKENS
+        )
+        if fuse_quant and not kimi_k3_route_sort.quant_covered(routed_input):
+            return None
+        return kimi_k3_route_sort.route_sort(
+            router_logits,
+            bias,
+            topk=cfg.top_k,
+            block_m=_ROUTE_SORT_BLOCK_M,
+            model_dim=latent.shape[-1],
+            moe_buf=latent,
+            routed_scaling_factor=1.0,
+            renormalize=cfg.renormalize,
+            # The A8W4 experts quantize these rows first; fold that in too.
+            quant_input=routed_input if fuse_quant else None,
+        )
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
-            with zero_copy_context.set_moe_output(latent):
+            routes = self._fused_route_sort(router_logits, latent, routed_input)
+            if routes is None:
+                topk_output = self.topk(hidden_states, router_logits)
+                sort_ctx = contextlib.nullcontext()
+            else:
+                topk_output = build_precomputed_topk_output(
+                    routes.topk_weights,
+                    routes.topk_ids,
+                    self.topk.topk_config,
+                    self.layer_idx,
+                )
+                sort_ctx = moe_sort_handoff.stage(
+                    moe_sort_handoff.StagedSort(
+                        topk_ids=routes.topk_ids,
+                        block_m=_ROUTE_SORT_BLOCK_M,
+                        sorted_ids=routes.sorted_ids,
+                        sorted_weights=routes.sorted_weights,
+                        sorted_expert_ids=routes.sorted_expert_ids,
+                        num_valid_ids=routes.num_valid_ids,
+                        moe_buf=routes.moe_buf,
+                        quant_input=routed_input if routes.a1 is not None else None,
+                        a1=routes.a1,
+                        a1_scale=routes.a1_scale,
+                    )
+                )
+            with zero_copy_context.set_moe_output(latent), sort_ctx:
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
