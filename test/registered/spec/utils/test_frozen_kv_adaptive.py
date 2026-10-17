@@ -13,6 +13,7 @@ from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
     FrozenKVMTPDraftWorker,
     FrozenKVMTPWorkerV2,
 )
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -171,6 +172,7 @@ class TestFrozenAdaptive(unittest.TestCase):
         )
         result = worker._build_trivial_verify_input(batch)
         self.assertIsInstance(result, FrozenKVMTPVerifyInput)
+        self.assertEqual(result.spec_input_type, SpecInputType.FROZEN_KV_MTP_VERIFY)
         self.assertEqual(result.spec_steps, 0)
         self.assertEqual(result.draft_token_num, 1)
         self.assertEqual(result.max_tree_depth, 1)
@@ -178,9 +180,9 @@ class TestFrozenAdaptive(unittest.TestCase):
         self.assertTrue(torch.equal(result.draft_token, batch.spec_info.bonus_tokens))
         self.assertTrue(result.custom_mask.all())
         batch.forward_mode = NS(is_idle=lambda: True)
-        self.assertIsInstance(
-            worker._build_trivial_verify_input(batch), FrozenKVMTPVerifyInput
-        )
+        idle = worker._build_trivial_verify_input(batch)
+        self.assertIsInstance(idle, FrozenKVMTPVerifyInput)
+        self.assertEqual(idle.spec_input_type, SpecInputType.FROZEN_KV_MTP_VERIFY)
 
     def test_frozen_configuration_gate(self):
         cfg = NS(
