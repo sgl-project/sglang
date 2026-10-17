@@ -594,11 +594,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
+            if self.linker is not None and params.req is not None:
+                self.linker.cancel_lookup(params.req.rid)
             return result
         return self._match_tree(params)
 
     def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
+            if self.linker is not None and params.req is not None:
+                self.linker.cancel_lookup(params.req.rid)
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on

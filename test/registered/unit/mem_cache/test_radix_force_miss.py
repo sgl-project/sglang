@@ -44,6 +44,13 @@ class _StubReq:
 
 
 class TestZeroMatchResult(unittest.TestCase):
+    def test_force_miss_does_not_bypass_a_pending_lookup(self):
+        tree = RadixCache.create_simulated()
+        match = MatchResult(
+            0, tree.root_node, tree.root_node, tree.root_node, cache_lookup_pending=True
+        )
+        self.assertTrue(zero_match_result(tree, match).cache_lookup_pending)
+
     def test_zero_replaces_indices_and_nodes(self):
         tree = RadixCache.create_simulated()
         tree.insert(InsertParams(key=RadixKey(token_ids=array("q", [1, 2, 3, 4, 5]))))

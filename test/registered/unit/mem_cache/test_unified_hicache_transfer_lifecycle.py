@@ -512,6 +512,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.output_ids = []
         req.sampling_params = SimpleNamespace(max_new_tokens=PAGE, ignore_eos=False)
         req.host_hit_length = match.host_hit_length
+        req.cache_lookup_pending = match.cache_lookup_pending
         req.swa_host_hit_length = match.swa_host_hit_length
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
