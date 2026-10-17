@@ -852,6 +852,26 @@ class TestTokenizeDetokenize(CustomTestCase):
         self.assertEqual(no_tools_resp["tokens"], resp["tokens"])
         self.assertEqual(no_tools_resp["count"], resp["count"])
 
+    def test_tokenize_ignores_stream(self):
+        scenarios = [
+            (
+                self.tokenize_url,
+                {"model": self.model, "prompt": "Hello SGLang!"},
+            ),
+            (
+                self.openai_tokenize_url,
+                {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "Hello SGLang!"}],
+                },
+            ),
+        ]
+        for url, payload in scenarios:
+            with self.subTest(url=url):
+                expected = self._post_json(url, payload)
+                actual = self._post_json(url, {**payload, "stream": True})
+                self.assertEqual(actual, expected)
+
     def test_detokenize_roundtrip(self):
         text = "Verify detokenization round trip. यह डिटोकेनाइजेशन है"
         t0 = self._post_json(
