@@ -38,6 +38,19 @@ class FakeTokenizer:
         return list(self._template_ids) if tokenize else "<s>[INST]x[/INST]"
 
 
+class MarkerMappingTokenizer:
+    """Encodes a typed "[INST]" as the control token, as the patched mistral_common
+    tokenizer does for image requests; the chat template keeps it as literal text.
+    """
+
+    def encode(self, text, **kwargs):
+        return [3] if text == "[INST]" else list(text.encode())
+
+    def apply_chat_template(self, messages, tokenize=False, **kwargs):
+        text = messages[0]["content"]
+        return list(text.encode()) if tokenize else text
+
+
 def _server(tokenizer, auto_adds_specials=False):
     return SimpleNamespace(
         tokenizer_manager=SimpleNamespace(tokenizer=tokenizer),
@@ -67,6 +80,9 @@ class TestProbe(unittest.TestCase):
     def test_a_template_that_raises_keeps_the_text_path(self):
         tok = FakeTokenizer(text_ids=[1], template_ids=[1], raises=True)
         self.assertFalse(probe(_server(tok)))
+
+    def test_a_tokenizer_that_maps_typed_control_tokens_is_lossy(self):
+        self.assertTrue(probe(_server(MarkerMappingTokenizer())))
 
 
 class TestRenderAndEncode(unittest.TestCase):
