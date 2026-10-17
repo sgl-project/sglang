@@ -97,6 +97,10 @@ fn node_access_error(error: NodeAccessError) -> PyErr {
 fn tree_core_runtime_error(error: TreeCoreRuntimeError) -> PyErr {
     match error {
         TreeCoreRuntimeError::NodeAccess(error) => node_access_error(error),
+        error @ (TreeCoreRuntimeError::ComponentNotEnabled { .. }
+        | TreeCoreRuntimeError::InvalidComponentSizeDelta { .. }) => {
+            PyValueError::new_err(error.to_string())
+        }
         error => PyRuntimeError::new_err(error.to_string()),
     }
 }
@@ -256,6 +260,7 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::Kv => "kv",
         PoolName::Mamba => "mamba",
         PoolName::Swa => "swa",
+        PoolName::AuxiliarySwa => "auxiliary_swa",
         PoolName::Indexer => "indexer",
         PoolName::DeepseekV4C4 => "deepseek_v4_c4",
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
@@ -284,6 +289,7 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "kv" => Ok(PoolName::Kv),
         "mamba" => Ok(PoolName::Mamba),
         "swa" => Ok(PoolName::Swa),
+        "auxiliary_swa" => Ok(PoolName::AuxiliarySwa),
         "indexer" => Ok(PoolName::Indexer),
         "deepseek_v4_c4" => Ok(PoolName::DeepseekV4C4),
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
@@ -1007,6 +1013,8 @@ impl HostEvictionResultBinding {
     }
 }
 
+type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>);
+
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
 struct TreeCoreBinding<K: ChildKeyType> {
@@ -1373,6 +1381,49 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             })
             .map_err(node_access_error)?;
         Ok((frees_to_py(py, device_frees)?, frees_to_py(py, host_frees)?))
+    }
+
+    /// Adjust the component's reclaimable device size.
+    fn adjust_component_size(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        delta: i64,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        py.detach(|| {
+            self.core()
+                .adjust_component_size(node_id, component_type, delta)
+        })
+        .map_err(tree_core_runtime_error)
+    }
+
+    /// Collect paths under one tree lock.
+    fn collect_path_info(
+        &self,
+        py: Python<'_>,
+        end_node_ids: Vec<NodeId>,
+    ) -> PyResult<Vec<Vec<TreePathNodeInfoTuple>>> {
+        let paths = py
+            .detach(|| self.core().collect_path_info(&end_node_ids))
+            .map_err(tree_core_runtime_error)?;
+        Ok(paths
+            .into_iter()
+            .map(|path| {
+                path.into_iter()
+                    .map(|node| {
+                        (
+                            node.node_id,
+                            node.parent_id,
+                            node.path_start,
+                            node.path_end,
+                            node.full_value_len,
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     /// Store a component's device value on a node (the SWA rebuild write-back).
@@ -2153,9 +2204,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 KvCacheEvent::BlockRemoved {
                     block_hashes,
                     medium,
+                    extra_key,
                 } => {
-                    let item: Py<PyAny> =
-                        ("block_removed", block_hashes, medium.as_str()).into_py_any(py)?;
+                    let item: Py<PyAny> = (
+                        "block_removed",
+                        block_hashes,
+                        medium.as_str(),
+                        extra_key.map(|extra_key| extra_key.to_string()),
+                    )
+                        .into_py_any(py)?;
                     list.append(item)?;
                 }
                 KvCacheEvent::AllBlocksCleared => {
@@ -2874,6 +2931,28 @@ macro_rules! tree_core_binding {
                 params: &DecLockRefParamsBinding,
             ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
                 catch_native_panic(|| self.inner.dec_swa_lock_only(py, node_id, params))
+            }
+
+            /// Adjust the component's reclaimable device size.
+            fn adjust_component_size(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                delta: i64,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.adjust_component_size(py, node_id, component_type, delta)
+                })
+            }
+
+            /// Collect paths under one tree lock.
+            fn collect_path_info(
+                &self,
+                py: Python<'_>,
+                end_node_ids: Vec<NodeId>,
+            ) -> PyResult<Vec<Vec<TreePathNodeInfoTuple>>> {
+                catch_native_panic(|| self.inner.collect_path_info(py, end_node_ids))
             }
 
             /// Store a component's device value on a node (the SWA rebuild write-back).

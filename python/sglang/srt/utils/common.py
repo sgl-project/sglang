@@ -51,6 +51,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from ctypes import byref
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -540,7 +541,8 @@ def get_available_gpu_memory(
             # available due to not including cache memory. So we use the system available
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
-        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+        else:
+            free_gpu_memory, _ = torch.musa.mem_get_info(gpu_id)
     elif device == "mps":
         from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
@@ -581,6 +583,10 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
@@ -591,13 +597,29 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
-    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
-    if not tensor.is_cuda:
-        return tensor.to("cpu", non_blocking=True)
+    """Enqueue an accelerator-to-pinned-host copy on the current stream."""
+    if tensor.device.type == "cpu":
+        return tensor
+    if not is_pin_memory_available(tensor.device):
+        return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
-    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
     return host
 
 
@@ -3277,6 +3299,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
@@ -3659,13 +3682,16 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
         return None
 
     from sglang.srt.rust_extensions import load_rust_extension
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 
     grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
     return grpc_native.start_metadata_server(
         host=serving.host,
         port=serving.grpc_port,
         server_info_json=json.dumps(
-            msgspec_to_builtins(build_server_info(server_args, scheduler_info)),
+            msgspec_to_builtins(
+                redact_watermark_secrets(build_server_info(server_args, scheduler_info))
+            ),
             default=str,
         ),
     )
@@ -3677,9 +3703,10 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
     from sglang.srt.utils.network import NetworkAddress
 
-    app = FastAPI()
+    app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
     @app.get("/ping")
     async def ping():
@@ -4144,8 +4171,8 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             return True
         elif moe_a2a_backend.is_none():
             return True
-        elif moe_a2a_backend.is_flashinfer():
-            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
+            # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
             # replay different-sized graphs -> geometry mismatch -> illegal memory
@@ -4154,9 +4181,12 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif moe_a2a_backend.is_mori() and get_bool_env_var(
-            "SGLANG_MORI_RECV_BOUND", "false"
-        ):
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
+        elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
             # fan-in depends on what the *peers* send. Without a DP-synchronized
@@ -4425,7 +4455,9 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-def freeze_gc(context: str):
+def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
+    if gc_threshold is not None:
+        gc.set_threshold(*gc_threshold)
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -5122,6 +5154,59 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``SGLANG_FORCE_CONFIDENTIAL_COMPUTE``.
+    """
+    forced = envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.get()
+    if forced is not None:
+        return forced
+    if not is_cuda():
+        return False
+
+    try:
+        import pynvml
+    except ImportError:
+        logger.warning("pynvml not available; assuming Confidential Computing is off")
+        return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except pynvml.NVMLError:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 def init_cublas():
