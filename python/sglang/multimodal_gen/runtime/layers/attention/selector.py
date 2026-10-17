@@ -364,6 +364,18 @@ def get_attn_backend(
 
         candidate_backend = candidate_cls.get_enum()
         candidate_name = candidate_backend.name.lower()
+        explicit_candidate = selection_is_explicit and candidate_index == 0
+        if (
+            explicit_candidate
+            and allowed_fallback_reason is None
+            and candidate_backend != candidate
+        ):
+            if selection_error is None:
+                selection_error = ValueError(
+                    f"Requested attention backend '{candidate.name.lower()}' "
+                    f"resolved to '{candidate_name}' instead"
+                )
+            continue
         if is_cross_attention and candidate_backend.is_sparse:
             if selection_error is None:
                 selection_error = ValueError(
@@ -371,7 +383,6 @@ def get_attn_backend(
                     "cross-attention"
                 )
             continue
-        explicit_candidate = selection_is_explicit and candidate_index == 0
         if (
             automatic_backends
             and not explicit_candidate

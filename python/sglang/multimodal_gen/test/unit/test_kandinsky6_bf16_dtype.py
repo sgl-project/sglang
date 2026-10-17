@@ -36,7 +36,10 @@ from sglang.multimodal_gen.runtime.models.dits.kandinsky6 import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6.denoising import (
     Kandinsky6DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils import precision
 
@@ -71,8 +74,6 @@ def test_bf16_projection_accepts_fp32_conditioning(modulation):
 @pytest.mark.parametrize("lengths", [(7, None), (129, None), (193, 65), (17, 129)])
 @torch.no_grad()
 def test_attention_backend_dispatch_and_repeated_forward(monkeypatch, backend, lengths):
-    if backend == "FA" and torch.cuda.get_device_capability()[0] == 12:
-        pytest.skip("the platform currently resolves FA to SDPA on SM12.x")
     if backend == "SAGE_ATTN_3":
         if importlib.util.find_spec("sageattn3") is None:
             pytest.skip("requires the optional SageAttention3 extension")
@@ -85,7 +86,21 @@ def test_attention_backend_dispatch_and_repeated_forward(monkeypatch, backend, l
     )
     query_len, key_len = lengths
     selected = AttentionBackendEnum[backend]
+    resolved = current_platform.get_attn_backend_cls_str(selected, 128, torch.bfloat16)
     with global_force_attn_backend_context_manager(selected):
+        if backend == "FA" and resolved.endswith(".SDPABackend"):
+            with pytest.raises(
+                ValueError,
+                match="Requested attention backend 'fa' resolved to 'torch_sdpa' instead",
+            ):
+                Kandinsky6Attention(
+                    256,
+                    128,
+                    Kandinsky6Transformer3DModel._supported_attention_backends,
+                    kv_dim=128 if key_len is not None else None,
+                    is_cross_attention=key_len is not None,
+                )
+            return
         layer = Kandinsky6Attention(
             256,
             128,
