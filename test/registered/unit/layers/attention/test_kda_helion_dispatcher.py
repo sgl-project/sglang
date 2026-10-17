@@ -5,8 +5,12 @@ from unittest.mock import ANY, MagicMock, patch
 import torch
 
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+from sglang.srt.arg_groups.glm5_next_hook import apply_glm5_next_spec_backend_defaults
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+from sglang.srt.layers.attention.linear.kda_backend import (
+    KDAAttnBackend,
+    KDAKernelDispatcher,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -219,6 +223,91 @@ class TestHelionKDADispatcher(unittest.TestCase):
                 ):
                     handle_linear_attn_backend(args)
 
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_verify_backend"), expected
+                )
+
+
+class TestKDACuteDslVerifySelection(unittest.TestCase):
+    def test_cute_verify_gate_admits_sm90_and_sm100_only(self):
+        """Outside the gate, nv_cutedsl verify silently runs Triton instead."""
+        heads, dim, steps = 2, 128, 4
+        width = heads * dim
+        layer = SimpleNamespace(
+            bias=None,
+            lower_bound=-5.0,
+            num_q_heads=heads,
+            num_k_heads=heads,
+            num_v_heads=heads,
+            head_q_dim=dim,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            q_dim=width,
+            k_dim=width,
+            v_dim=width,
+            conv_weights=torch.zeros(3 * width, 4, dtype=torch.float32),
+        )
+        backend = KDAAttnBackend.__new__(KDAAttnBackend)
+        backend.kernel_dispatcher = KDAKernelDispatcher(
+            decode_backend=LinearAttnKernelBackend.TRITON,
+            prefill_backend=LinearAttnKernelBackend.TRITON,
+            verify_backend=LinearAttnKernelBackend.NV_CUTEDSL,
+        )
+        verify_args = dict(
+            layer=layer,
+            mixed_qkv=torch.zeros(steps, 3 * width, dtype=torch.bfloat16),
+            a=torch.zeros(1, steps, width, dtype=torch.bfloat16),
+            b=torch.zeros(1, steps, heads, dtype=torch.bfloat16),
+            draft_token_num=steps,
+            ragged_layout=None,
+            conv_states=torch.zeros(2, 3, 3 * width, dtype=torch.bfloat16),
+            ssm_states=torch.zeros(2, heads, dim, dim, dtype=torch.float32),
+            intermediate_state_cache=torch.zeros(
+                1, steps, heads, dim, dim, dtype=torch.float32
+            ),
+            intermediate_conv_window_cache=torch.zeros(
+                1, steps, 3, 3 * width, dtype=torch.bfloat16
+            ),
+            retrieve_parent_token=None,
+            replayssm_rawv=None,
+        )
+        for capability, admitted in (
+            ((9, 0), True),
+            ((10, 0), True),
+            ((8, 0), False),
+            ((12, 0), False),
+        ):
+            with (
+                self.subTest(capability=capability),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
+                    return_value=True,
+                ),
+                patch("importlib.util.find_spec", return_value=SimpleNamespace()),
+                patch("torch.cuda.get_device_capability", return_value=capability),
+            ):
+                self.assertIs(
+                    backend._can_run_dspark_cutedsl_mtp(**verify_args), admitted
+                )
+
+    def test_glm5_next_spec_defaults_verify_to_nv_cutedsl_on_sm100_and_sm90_ring(self):
+        sm90 = {"is_sm90": True, "is_sm100": False}
+        sm100 = {"is_sm90": False, "is_sm100": True}
+        other = {"is_sm90": False, "is_sm100": False}
+        for platform, ring, expected in (
+            (sm90, True, "nv_cutedsl"),
+            (sm90, False, None),
+            (sm100, False, "nv_cutedsl"),
+            (other, True, None),
+        ):
+            with self.subTest(platform=platform, ring=ring):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    enable_linear_replayssm_spec=ring,
+                )
+                with override_platform(**platform):
+                    apply_glm5_next_spec_backend_defaults(args)
                 self.assertEqual(
                     resolution_result(args, "linear_attn_verify_backend"), expected
                 )
