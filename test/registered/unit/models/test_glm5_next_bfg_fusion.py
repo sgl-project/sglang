@@ -1,15 +1,17 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -249,6 +251,166 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
                                     quant, PREFIX, packed, "fused_fg_b_proj"
                                 )
                             )
+
+
+class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        override = get_context().override_server_args(
+            device="cpu", enable_lora=False, lora_paths=None
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def make_attention(self, raw, gate):
+        _, tokens, heads, head_dim = raw.shape
+        attention = glm5_next.Glm5NextLinearAttention(
+            layer_idx=0,
+            hidden_size=heads * head_dim,
+            config=SimpleNamespace(
+                linear_attn_config={
+                    "head_dim": head_dim,
+                    "num_heads": heads,
+                    "short_conv_kernel_size": 4,
+                }
+            ),
+            prefix=PREFIX,
+        )
+        attention.do_fuse_qkvbfg = False
+        attention.forward_qkvbfg = lambda *_: (
+            torch.zeros(tokens, 3 * heads * head_dim),
+            torch.zeros(tokens, heads),
+            torch.zeros(tokens, heads * head_dim),
+            gate,
+        )
+        attention.o_proj.forward = lambda value: (value, None)
+        backend = Mock(return_value=raw)
+        attention.attn.forward = backend
+        return attention, backend
+
+    def test_output_norm_handoff_and_fallback(self):
+        torch.set_default_dtype(torch.float32)
+        tokens, heads, head_dim = 3, 2, 4
+        raw = torch.arange(tokens * heads * head_dim, dtype=torch.float32).reshape(
+            1, tokens, heads, head_dim
+        )
+        gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
+        attention, backend = self.make_attention(raw, gate)
+        attention.o_norm.forward = Mock(side_effect=lambda value, gate: value + 3)
+        hidden = torch.zeros(tokens, heads * head_dim)
+        for mode, consume in (
+            (ForwardMode.TARGET_VERIFY, True),
+            (ForwardMode.TARGET_VERIFY, False),
+            (ForwardMode.DECODE, False),
+            (ForwardMode.EXTEND, False),
+        ):
+            with self.subTest(mode=mode, consume=consume):
+                norm = attention.o_norm.forward
+                norm.reset_mock()
+                verify = mode == ForwardMode.TARGET_VERIFY
+
+                def run_backend(batch, **kwargs):
+                    attn = attention.attn
+                    if verify:
+                        self.assertIs(attn._k3_onorm_gate, gate)
+                        weight, eps = attn._k3_onorm_args
+                        self.assertIs(weight, attention.o_norm.weight)
+                        self.assertEqual(eps, attention.o_norm.eps)
+                        self.assertFalse(attn._k3_onorm_consumed)
+                        attn._k3_onorm_consumed = consume
+                    else:
+                        self.assertIsNone(attn._k3_onorm_gate)
+                        self.assertIsNone(attn._k3_onorm_args)
+                    return raw + 11 if consume else raw
+
+                backend.side_effect = run_backend
+                batch = SimpleNamespace(forward_mode=mode, attn_cp_metadata=None)
+                actual = attention(hidden, batch)
+                expected = (raw + (11 if consume else 3)).squeeze(0).flatten(-2)
+                torch.testing.assert_close(actual, expected)
+                if not consume:
+                    torch.testing.assert_close(
+                        norm.call_args.args[1], gate.unflatten(-1, (-1, head_dim))
+                    )
+                self.assertIsNone(attention.attn._k3_onorm_gate)
+                self.assertIsNone(attention.attn._k3_onorm_args)
+
+        backend.side_effect = RuntimeError("verify failed")
+        with self.assertRaisesRegex(RuntimeError, "verify failed"):
+            attention(
+                hidden,
+                SimpleNamespace(
+                    forward_mode=ForwardMode.TARGET_VERIFY, attn_cp_metadata=None
+                ),
+            )
+        self.assertIsNone(attention.attn._k3_onorm_gate)
+        self.assertIsNone(attention.attn._k3_onorm_args)
+
+    def test_verify_adapter_accepts_compact_and_k3_norm_arguments(self):
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+        tokens, heads, head_dim = 3, 2, 4
+        raw = (
+            torch.arange(1, tokens * heads * head_dim + 1)
+            .float()
+            .reshape(1, tokens, heads, head_dim)
+        )
+        gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
+        attention, _ = self.make_attention(raw, gate)
+        layer = attention.attn
+        layer.lower_bound = -5.0
+        norm_weight = torch.full((head_dim,), 1.25, dtype=torch.float32)
+        args = (norm_weight, attention.o_norm.eps)
+
+        def kernel(*, onorm_gate, onorm_weight, onorm_eps, **kwargs):
+            if onorm_weight is None:
+                return raw
+            return F.rms_norm(
+                raw, (head_dim,), onorm_weight, onorm_eps
+            ) * torch.sigmoid(onorm_gate)
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.kernels.ops.attention.kda_decode_mtp": SimpleNamespace(
+                    fused_kda_decode_mtp_dspark=kernel
+                )
+            },
+        ):
+            for handoff in ("compact", "k3", "none"):
+                with self.subTest(handoff=handoff):
+                    layer._k3_onorm_gate = gate
+                    layer._k3_onorm_args = args if handoff == "compact" else None
+                    layer._k3_fused_decode_args = (
+                        (torch.empty(0),) * 5 + args if handoff == "k3" else None
+                    )
+                    layer._k3_onorm_consumed = False
+                    output = KDAAttnBackend._run_dspark_cutedsl_mtp(
+                        layer=layer,
+                        mixed_qkv=torch.zeros(tokens, 3 * heads * head_dim),
+                        a=torch.zeros(1, tokens, heads * head_dim),
+                        b=torch.zeros(1, tokens, heads),
+                        conv_states=torch.zeros(1, 3, 3 * heads * head_dim),
+                        ssm_states=torch.zeros(1, heads, head_dim, head_dim),
+                        intermediate_state_cache=torch.zeros(
+                            1, tokens, heads, head_dim, head_dim
+                        ),
+                        intermediate_conv_window_cache=torch.zeros(
+                            1, tokens, 3, 3 * heads * head_dim
+                        ),
+                        intermediate_state_indices=torch.zeros(1, dtype=torch.int32),
+                        cache_indices=torch.zeros(1, dtype=torch.int32),
+                        query_start_loc=torch.tensor([0, tokens], dtype=torch.int32),
+                    )
+                    expected = raw
+                    if handoff != "none":
+                        expected = kernel(
+                            onorm_gate=gate.unflatten(-1, (-1, head_dim)).unsqueeze(0),
+                            onorm_weight=norm_weight,
+                            onorm_eps=attention.o_norm.eps,
+                        )
+                    torch.testing.assert_close(output, expected)
+                    self.assertEqual(layer._k3_onorm_consumed, handoff != "none")
 
 
 if __name__ == "__main__":

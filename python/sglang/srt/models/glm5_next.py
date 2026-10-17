@@ -566,7 +566,7 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.o_norm = FusedRMSNormGated(
-            self.head_dim, eps=rms_norm_eps, activation="sigmoid"
+            self.head_dim, eps=rms_norm_eps, activation="sigmoid", dtype=torch.float32
         )
         self.o_proj = RowParallelLinear(
             projection_size,
@@ -596,6 +596,9 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        self.attn._k3_onorm_args = None
+        self.attn._k3_onorm_gate = None
+        self.attn._k3_onorm_consumed = False
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -666,15 +669,29 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        core_attn_out = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=forget_gate,
-            b=beta,
-        )
+        fused_onorm = forward_batch.forward_mode.is_target_verify()
+        if fused_onorm:
+            self.attn._k3_onorm_args = (self.o_norm.weight, self.o_norm.eps)
+            self.attn._k3_onorm_gate = g_proj_states
+            self.attn._k3_onorm_consumed = False
 
-        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        try:
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta,
+            )
+        finally:
+            if fused_onorm:
+                self.attn._k3_onorm_args = None
+                self.attn._k3_onorm_gate = None
+
+        if fused_onorm:
+            fused_onorm = self.attn._k3_onorm_consumed
+        if not fused_onorm:
+            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         return cp_sequence_to_interleave_order(
