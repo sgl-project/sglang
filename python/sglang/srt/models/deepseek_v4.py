@@ -35,6 +35,8 @@ from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKE
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
+    WO_A_FUSED_INV_ROPE_MAX_TOKENS,
+    wo_a_bf16_fused_inv_rope,
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
@@ -1349,6 +1351,18 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+        )
+        self.use_fused_wo_a_sm90 = (
+            self.is_dsv41
+            and envs.SGLANG_OPT_DSV41_FUSED_WO_A_SM90.get()
+            and _is_cuda
+            and get_platform().is_sm90
+            and not self.wo_a_fp8
+            and self.wo_a.weight.dtype == torch.bfloat16
+            and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
+            # Measured on H100: split-K loses to einsum from 4 local groups.
+            and self.n_local_groups in (1, 2)
+            and self.o_lora_rank == 1024
         )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -2705,6 +2719,10 @@ class MQALayer(MqaAttentionBase):
             fuse_rope_wo_a = (
                 self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
+            fuse_rope_wo_a_sm90 = (
+                self.use_fused_wo_a_sm90
+                and 0 < o.shape[0] <= WO_A_FUSED_INV_ROPE_MAX_TOKENS
+            )
 
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
@@ -2717,7 +2735,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif inv_rope is None and not fuse_rope_wo_a:
+            elif inv_rope is None and not (fuse_rope_wo_a or fuse_rope_wo_a_sm90):
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
@@ -2739,6 +2757,13 @@ class MQALayer(MqaAttentionBase):
                     out_mxfp8=fuse_mxfp8_quant,
                 )
                 o = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
+            elif fuse_rope_wo_a_sm90:
+                o = wo_a_bf16_fused_inv_rope(
+                    o,
+                    self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1),
+                    torch.view_as_real(self.freqs_cis).flatten(1),
+                    positions,
+                )
             elif self.use_npu_arch35_mxfp8_wo_a:
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
                     o, dst_type=torch.float8_e4m3fn

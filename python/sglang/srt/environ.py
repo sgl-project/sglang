@@ -1738,6 +1738,9 @@ class Envs:
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
     # Emits MXFP8 when wo_b supports it, otherwise BF16.
     SGLANG_DSV41_FUSED_WO_A = EnvBool(True)
+    # SM90: fold inverse-RoPE into a single-launch split-K Triton wo_a for decode
+    # batches up to 16 tokens. Off until validated end to end on H200.
+    SGLANG_OPT_DSV41_FUSED_WO_A_SM90 = EnvBool(False)
     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
