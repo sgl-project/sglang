@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithmImpl,
+    load_optional_quest_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -21,11 +22,95 @@ logger = logging.getLogger(__name__)
 class QuestAlgorithm(BaseSparseAlgorithmImpl):
     """Quest page-wise sparse attention using bounding-box criticality."""
 
+    supports_fixed_cuda_graph_capacity = True
+
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
+        self.enable_cuda_graph_retrieval = config.sparse_extra_config.get(
+            "enable_cuda_graph_retrieval", True
+        )
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+
+    def update_representations(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        if not forward_batch.forward_mode.is_decode():
+            return super().update_representations(
+                layer_id,
+                req_pool_indices,
+                seq_lens,
+                k_buffer,
+                forward_batch,
+            )
+        if not self.should_update_representations(forward_batch):
+            return
+        return self._update_decode_representations(
+            layer_id,
+            req_pool_indices,
+            seq_lens,
+            k_buffer,
+            forward_batch,
+        )
+
+    def _update_decode_representations(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        kernel_module = None
+        if (
+            req_pool_indices.numel() >= 4
+            and k_buffer.is_cuda
+            and torch.version.hip is None
+            and k_buffer.ndim == 3
+            and k_buffer.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and 0 < self.page_size <= 128
+            and 0 < k_buffer.shape[-1] <= 256
+        ):
+            kernel_module = load_optional_quest_kernel(
+                "sglang.srt.mem_cache.sparsity.kernels.quest_page_update"
+            )
+        if kernel_module is not None:
+            tensors = (
+                req_pool_indices,
+                seq_lens,
+                self.req_to_token_pool.req_to_token,
+                self.states.repr_constructed,
+                self.states.last_constructed_page,
+            )
+            if all(tensor.device == k_buffer.device for tensor in tensors):
+                kernel_module.quest_update_page_representations_(
+                    req_pool_indices,
+                    seq_lens,
+                    self.req_to_token_pool.req_to_token,
+                    k_buffer,
+                    self.states.repr_constructed,
+                    self.states.last_constructed_page,
+                    self.page_k_min[layer_id],
+                    self.page_k_max[layer_id],
+                    self.page_valid[layer_id],
+                    self.page_size,
+                    advance_trackers=layer_id == self.end_layer - 1,
+                )
+                return
+
+        return super().update_representations(
+            layer_id,
+            req_pool_indices,
+            seq_lens,
+            k_buffer,
+            forward_batch,
+        )
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
@@ -78,25 +163,15 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         tok_start = pg_id * self.page_size
         tok_off = torch.arange(self.page_size, device=device).view(1, 1, -1)
         tok_pos = tok_start.unsqueeze(2) + tok_off
-        tok_mask = (
-            tok_pos
-            < (tok_start + self.page_size).clamp(max=seq_lens.unsqueeze(1)).unsqueeze(2)
-        ) & pg_mask.unsqueeze(2)
 
         phys_tok = req_to_token[
             reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
             tok_pos.clamp(0, req_to_token.shape[1] - 1),
         ].clamp(0, k_buffer.shape[0] - 1)
 
-        keys = k_buffer[phys_tok].to(torch.float32)
-        mask = tok_mask.unsqueeze(-1).unsqueeze(-1)
-
-        page_min = torch.where(mask, keys, torch.full_like(keys, float("inf"))).amin(
-            dim=2
-        )
-        page_max = torch.where(mask, keys, torch.full_like(keys, float("-inf"))).amax(
-            dim=2
-        )
+        keys = k_buffer[phys_tok].to(self.page_k_min[layer_id].dtype)
+        page_min = keys.amin(dim=2)
+        page_max = keys.amax(dim=2)
 
         phys_pg = (
             req_to_token[
@@ -117,6 +192,32 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
         self.page_valid[layer_id][target_pages] = True
 
+    def _optional_score_kernel(self, queries: torch.Tensor):
+        if (
+            not queries.is_cuda
+            or torch.version.hip is not None
+            or not self.page_k_min
+            or next(iter(self.page_k_min.values())).shape[-1] > 256
+        ):
+            return None
+        return load_optional_quest_kernel(
+            "sglang.srt.mem_cache.sparsity.kernels.quest_score"
+        )
+
+    def _retrieve_page_scores_batched(self, layer_id, queries, plan) -> torch.Tensor:
+        kernel_module = self._optional_score_kernel(queries)
+        if kernel_module is not None:
+            return kernel_module.quest_page_scores(
+                queries,
+                self.page_k_min[layer_id],
+                self.page_k_max[layer_id],
+                self.page_valid[layer_id],
+                plan.physical_pages,
+                active_mask=plan.active_mask,
+                history_page_counts=plan.recent_start,
+            )
+        return super()._retrieve_page_scores_batched(layer_id, queries, plan)
+
     def _retrieve_page_scores(
         self,
         layer_id: int,
@@ -124,12 +225,26 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         req_pool_indices: torch.Tensor,
         queries: torch.Tensor,
     ) -> torch.Tensor:
-        # Clamp pages to valid storage range
+        physical_pages = phys_pages
+        kernel_module = self._optional_score_kernel(queries)
+        if kernel_module is not None:
+            return kernel_module.quest_page_scores(
+                queries,
+                self.page_k_min[layer_id],
+                self.page_k_max[layer_id],
+                self.page_valid[layer_id],
+                physical_pages,
+            )
+
+        # Clamp pages to valid storage range for the portable fallback.
         phys_pages_clamped = phys_pages.clamp(0, self.page_k_min[layer_id].shape[0] - 1)
 
-        k_min = self.page_k_min[layer_id][phys_pages_clamped]
-        k_max = self.page_k_max[layer_id][phys_pages_clamped]
-        valid_mask = self.page_valid[layer_id][phys_pages_clamped]
+        k_min = self.page_k_min[layer_id][phys_pages_clamped].to(torch.float32)
+        k_max = self.page_k_max[layer_id][phys_pages_clamped].to(torch.float32)
+        valid_mask = self.page_valid[layer_id][phys_pages_clamped] & (
+            (physical_pages >= 0)
+            & (physical_pages < self.page_k_min[layer_id].shape[0])
+        )
         # Align query shape to KV heads.
         head_dim = k_min.shape[-1]
         if queries.dim() == 2:
@@ -139,7 +254,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                     f"Quest query hidden size {hidden} not divisible by head_dim {head_dim}"
                 )
             q_heads = hidden // head_dim
-            q = queries.view(bs, q_heads, head_dim)
+            q = queries.reshape(bs, q_heads, head_dim)
         elif queries.dim() == 3:
             q = queries
         else:
