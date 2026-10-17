@@ -65,6 +65,7 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -168,6 +169,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             "up_proj",
         ],
     }
+
+    # Checkpoint ignore lists name clippable linears `<proj>.linear`; fused
+    # qkv_proj/gate_up_proj are matched by shard name, which has no `.linear`.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            f".{proj}.linear": f".{proj}"
+            for proj in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")
+        }
+    )
 
     # LoRA specific attributes
     supported_lora_modules = [
