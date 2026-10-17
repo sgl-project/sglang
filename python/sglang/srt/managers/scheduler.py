@@ -185,6 +185,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromColocatedParamBytesReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -1086,9 +1087,7 @@ class Scheduler(
             self.draft_worker.init_hicache_draft_plan()
             # only now: allocating the draft's pools binds the target's embed and head into it
             for role, runner in self.draft_worker.weight_update_runners():
-                runner.remote_instance_weight_transporter.publish_rank_info(
-                    role=role
-                )
+                runner.remote_instance_weight_transporter.publish_rank_info(role=role)
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
@@ -1804,6 +1803,10 @@ class Scheduler(
                 (
                     UpdateWeightsFromIPCReqInput,
                     self.weight_updater.update_weights_from_ipc,
+                ),
+                (
+                    UpdateWeightsFromColocatedParamBytesReqInput,
+                    self.weight_updater.update_weights_from_colocated_param_bytes,
                 ),
                 (
                     UpdateWeightVersionReqInput,

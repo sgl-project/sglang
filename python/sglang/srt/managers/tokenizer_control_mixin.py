@@ -76,6 +76,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightsFromColocatedParamBytesReqInput,
+    UpdateWeightsFromColocatedParamBytesReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -120,6 +122,10 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    (
+        "update_weights_from_colocated_param_bytes",
+        UpdateWeightsFromColocatedParamBytesReqOutput,
+    ),
     ("update_weight_version", UpdateWeightVersionReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
@@ -672,6 +678,20 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def update_weights_from_colocated_param_bytes(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromColocatedParamBytesReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        assert get_parallel().dp_size == 1, (
+            "data-parallel replicas are not supported for colocated param-byte updates"
+        )
+        return await self._weight_update_session_call(
+            self.update_weights_from_colocated_param_bytes_communicator,
+            obj,
+            staged=self._weight_update_staged_session,
+        )
 
     async def update_weights_from_ipc(
         self: TokenizerManager,

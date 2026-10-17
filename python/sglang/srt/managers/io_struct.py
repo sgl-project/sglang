@@ -2108,6 +2108,21 @@ class UpdateWeightsFromIPCReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class UpdateWeightsFromColocatedParamBytesReqInput(BaseReq, kw_only=True):
+    """Pull parameter bytes, already in each rank's own layout, from the trainer process on the same GPU into the
+    published weight locations; runs inside a sync_base weight-update session (weight_sync/colocated_param_bytes.py)."""
+
+    # one node-local ZMQ socket per colocated trainer rank, over all engines; each TP rank picks its own GPU's
+    socket_paths_by_device_uuid: Dict[str, str]
+    # per receive: a silent trainer fails the sync instead of hanging the engine
+    timeout_s: float
+
+
+class UpdateWeightsFromColocatedParamBytesReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str

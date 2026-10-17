@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import msgspec
 import torch
+import zmq
 
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
@@ -40,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromColocatedParamBytesReqInput,
+    UpdateWeightsFromColocatedParamBytesReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -50,8 +53,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
+from sglang.srt.weight_sync.colocated_param_bytes import pull_param_bytes
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 logger = logging.getLogger(__name__)
@@ -132,6 +137,9 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
+    # to the colocated trainer; a PAIR socket does not reliably reconnect, so it is kept across syncs
+    _colocated_pull_socket: Optional[zmq.Socket] = None
+    _colocated_pull_socket_path: Optional[str] = None
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -395,6 +403,92 @@ class SchedulerWeightUpdaterManager:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+
+    def update_weights_from_colocated_param_bytes(
+        self, recv_req: UpdateWeightsFromColocatedParamBytesReqInput
+    ):
+        """Copy the param bytes the colocated trainer prepared in this rank's own layout into its published
+        weights; the session's end runs the post-load pass, as after a P2P write."""
+        if self._session is None or not self._session.sync_base:
+            return UpdateWeightsFromColocatedParamBytesReqOutput(
+                success=False,
+                message="update_weights_from_colocated_param_bytes must run inside a "
+                "sync_base weight-update session",
+            )
+        with self._observe_weight_load("colocated_param_bytes"):
+            error = self._pull_colocated_param_bytes(recv_req)
+            if error is not None:
+                logger.error(error)
+            # every rank reaches the gather, failed or not
+            errors = [None] * torch.distributed.get_world_size(group=self.tp_cpu_group)
+            torch.distributed.all_gather_object(errors, error, group=self.tp_cpu_group)
+            errors = [error for error in errors if error is not None]
+            return UpdateWeightsFromColocatedParamBytesReqOutput(
+                success=not errors, message="; ".join(errors) or "Success"
+            )
+
+    def _pull_colocated_param_bytes(
+        self, recv_req: UpdateWeightsFromColocatedParamBytesReqInput
+    ) -> Optional[str]:
+        runners = self._select_runners(self._session.selector)
+        unpublished = [
+            role
+            for role, runner in runners
+            if runner.remote_instance_weight_transporter.weight_locations is None
+        ]
+        if unpublished:
+            return f"runners {unpublished} published no weight locations; start the engine with --enable-engine-info-bootstrap"
+        device_uuid = current_platform.get_device_uuid(torch.cuda.current_device())
+        if device_uuid not in recv_req.socket_paths_by_device_uuid:
+            return f"no colocated trainer serves GPU {device_uuid}"
+        socket_path = recv_req.socket_paths_by_device_uuid[device_uuid]
+        try:
+            error = pull_param_bytes(
+                sock=self._get_colocated_pull_socket(
+                    socket_path=socket_path, timeout_s=recv_req.timeout_s
+                ),
+                device_uuid=device_uuid,
+                params_by_role={
+                    role: dict(runner.model.named_parameters())
+                    for role, runner in runners
+                },
+                published_nbytes_by_role={
+                    role: {
+                        name: numel * element_size
+                        for name, (
+                            _,
+                            numel,
+                            element_size,
+                        ) in runner.remote_instance_weight_transporter.weight_locations.items()
+                    }
+                    for role, runner in runners
+                },
+            )
+        except zmq.Again:
+            error = f"no message from the colocated trainer at {socket_path} within {recv_req.timeout_s}s"
+        if error is not None:
+            # a failed exchange can leave messages queued on the pair
+            self._close_colocated_pull_socket()
+        return error
+
+    def _get_colocated_pull_socket(
+        self, *, socket_path: str, timeout_s: float
+    ) -> zmq.Socket:
+        if self._colocated_pull_socket_path != socket_path:
+            self._close_colocated_pull_socket()
+        if self._colocated_pull_socket is None:
+            self._colocated_pull_socket = zmq.Context.instance().socket(zmq.PAIR)
+            self._colocated_pull_socket.setsockopt(zmq.LINGER, 0)
+            self._colocated_pull_socket.connect(socket_path)
+            self._colocated_pull_socket_path = socket_path
+        self._colocated_pull_socket.setsockopt(zmq.RCVTIMEO, int(timeout_s * 1000))
+        return self._colocated_pull_socket
+
+    def _close_colocated_pull_socket(self) -> None:
+        if self._colocated_pull_socket is not None:
+            self._colocated_pull_socket.close()
+        self._colocated_pull_socket = None
+        self._colocated_pull_socket_path = None
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
