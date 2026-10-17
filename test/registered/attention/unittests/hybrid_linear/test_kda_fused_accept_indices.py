@@ -136,6 +136,58 @@ class TestFusedAcceptPerForwardCache(CustomTestCase):
         self.assertIsNone(metadata.fused_accept_state_indices)
         self.assertIsNone(metadata.fused_accept_num_accepted)
 
+    def test_capture_rebuilds_warmup_indices_and_accept_lengths(self):
+        """Warmup and capture share metadata, but each must build its own lists.
+
+        Use CPU tensors to make a skipped capture-time build observable without
+        recording a CUDA graph: update the inputs after warmup and require the
+        next build to read them through the real KDA backend.
+        """
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        cases = (
+            ([3, 5], [[12, 13, 14, 15], [20, 21, 22, 23]], [1, 2]),
+            ([6, 3], [[24, 25, 26, 27], [12, 13, 14, 15]], [3, 1]),
+        )
+        for capture_slots, expected_indices, expected_lengths in cases:
+            with self.subTest(capture_slots=capture_slots):
+                # Bypass model loading; these methods only need CPU metadata.
+                backend = KDAAttnBackend.__new__(KDAAttnBackend)
+                slots = torch.tensor([3, 5], dtype=torch.int32)
+                query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32)
+                backend.accept_lens_pool = torch.tensor(
+                    [1, 1, 1, 2, 1, 4, 1, 1], dtype=torch.int32
+                )
+                backend.forward_metadata = ForwardMetadata(
+                    query_start_loc=query_start_loc, mamba_cache_indices=slots
+                )
+                forward_batch = ForwardBatch.__new__(ForwardBatch)
+                build_args = dict(
+                    cache_indices=slots,
+                    query_start_loc=query_start_loc,
+                    intermediate_state_cache=torch.empty(8, 4, 1),
+                    draft_token_num=4,
+                )
+
+                # The runner invokes this hook before both warmups and capture.
+                for _ in range(2):
+                    backend.init_forward_metadata_in_graph(forward_batch)
+                    _, warmup_lengths = backend._fused_accept_indices(**build_args)
+                    self.assertEqual(warmup_lengths.tolist(), [2, 4])
+
+                # Keep the same metadata and input storage, as the runner does.
+                slots.copy_(torch.tensor(capture_slots, dtype=torch.int32))
+                backend.accept_lens_pool.copy_(
+                    torch.tensor([1, 1, 1, 1, 1, 2, 3, 1], dtype=torch.int32)
+                )
+                backend.init_forward_metadata_in_graph(forward_batch)
+                indices, lengths = backend._fused_accept_indices(**build_args)
+
+                self.assertEqual(indices.tolist(), expected_indices)
+                self.assertEqual(lengths.tolist(), expected_lengths)
+
 
 if __name__ == "__main__":
     unittest.main()
