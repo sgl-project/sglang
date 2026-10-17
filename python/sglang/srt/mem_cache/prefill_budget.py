@@ -141,8 +141,8 @@ class PrefillBudget:
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available = min(chunk_limit, int(self.remaining_total))
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        # Park the continuation rather than take running decodes' headroom.
+        return available if available > 0 else None
 
     def fit_chunk(
         self,
