@@ -38,7 +38,10 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
 )
-from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -504,7 +507,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
-        and current_platform.is_cuda()
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q,
@@ -1008,15 +1011,14 @@ class MiniMaxH3Attention(nn.Module):
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
         self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
-            )
+            current_platform.is_cuda() or current_platform.is_rocm()
+        ) and can_use_fused_inplace_qknorm_rope(
+            arch.attention_head_dim,
+            rope_dim,
+            True,
+            _BF16_DTYPE,
+            cache_dtype=_BF16_DTYPE,
+            round_norm_before_rope=True,
         )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
