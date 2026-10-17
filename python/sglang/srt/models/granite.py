@@ -20,13 +20,14 @@
 """Inference-only Granite model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import GraniteConfig, PretrainedConfig
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -321,6 +322,7 @@ class GraniteModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture: List[int] = []
 
     def forward(
         self,
@@ -328,14 +330,20 @@ class GraniteModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
         residual = None
         hidden_states *= self.config.embedding_multiplier
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                if residual is None:
+                    aux_hidden_states.capture(hidden_states)
+                else:
+                    aux_hidden_states.capture(hidden_states + residual, owned=True)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -343,8 +351,12 @@ class GraniteModel(nn.Module):
                 forward_batch,
                 residual,
             )
+        if len(self.layers) in self.layers_to_capture:
+            aux_hidden_states.capture(hidden_states + residual, owned=True)
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class GraniteForCausalLM(nn.Module):
@@ -381,6 +393,7 @@ class GraniteForCausalLM(nn.Module):
             logit_scale = None
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -400,13 +413,35 @@ class GraniteForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         if not get_embedding:
             logits_processor_output: LogitsProcessorOutput = self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
             return logits_processor_output
         else:
             return self.pooler(hidden_states, forward_batch)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
