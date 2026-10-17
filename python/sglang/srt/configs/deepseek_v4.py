@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
-    """True = mxfp4-packed (U8/I8/F4), False = converted FP8 (F8_E4M3),
+    """True = mxfp4-packed (U8/I8/F4), False = converted FP8 (F8_E4M3) or
+    unquantized (BF16/F16/F32),
     None when the header isn't readable (HF slug not cached yet, etc.).
     Caller falls back to user default. Pure read; never mutates env.
     """
@@ -37,6 +38,11 @@ def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
     if dtype in ("U8", "I8", "F4"):
         return True
     if dtype == "F8_E4M3":
+        return False
+    # Unquantized checkpoints (e.g. training-exported BF16/F16/F32) carry no
+    # MXFP4 experts; route them to the unquantized path instead of falling
+    # back to the FP4-experts env default.
+    if dtype in ("BF16", "F16", "F32"):
         return False
     logger.warning(
         "Unexpected routed-expert safetensors dtype=%s for DeepSeek V4", dtype
