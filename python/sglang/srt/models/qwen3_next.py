@@ -63,8 +63,10 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     make_layers,
@@ -75,6 +77,8 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_fused_qk_logged_engage = False
+_fused_qk_logged_gluon = False
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -740,7 +744,71 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def _fused_qk_norm_rope_applies(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> bool:
+        """Static contract for the gfx95 TP4 prologue. Row coverage is separate."""
+        from sglang.kernels.ops.attention.qwen3_next_prologue import (
+            gluon_available,
+            prologue_kind,
+        )
+
+        global _fused_qk_logged_gluon
+        if (
+            not _is_hip
+            or not is_gfx95_supported()
+            or get_bool_env_var("SGLANG_DISABLE_QWEN3_NEXT_QK_NORM_ROPE")
+            or not isinstance(hidden_states, torch.Tensor)
+            or hidden_states.dtype != torch.bfloat16
+            or not self.attn_output_gate
+            or self.head_dim != 256
+            or self.num_heads != 4
+            or self.num_kv_heads != 1
+            or self.rotary_emb.rotary_dim != 64
+            or abs(float(self.q_norm.variance_epsilon) - 1.0e-6) > 1.0e-12
+        ):
+            return False
+        if not gluon_available() and not _fused_qk_logged_gluon:
+            logger.info(
+                "Qwen3-Next fused QK norm RoPE: Gluon is unavailable, "
+                "token counts above 8192 stay on the stock prepare"
+            )
+            _fused_qk_logged_gluon = True
+        return prologue_kind(num_tokens) is not None
+
+    def _forward_prepare_fused_qk_norm_rope(self, positions, hidden_states):
+        from sglang.kernels.ops.attention.qwen3_next_prologue import (
+            fused_qwen3_next_qk_norm_rope,
+        )
+
+        global _fused_qk_logged_engage
+        qkv, _ = self.qkv_proj(hidden_states)
+        rope = self.rotary_emb
+        rope._match_cos_sin_cache_dtype(qkv)
+        rope._ensure_cos_sin_cache_length(rope.max_position_embeddings - 1)
+        prepared = fused_qwen3_next_qk_norm_rope(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            positions,
+            rope.cos_sin_cache,
+            eps=self.q_norm.variance_epsilon,
+            rotary_dim=rope.rotary_dim,
+        )
+        if prepared is None:
+            raise RuntimeError("Fused QK norm RoPE was selected for an uncovered shape")
+        if not _fused_qk_logged_engage:
+            logger.info("Qwen3-Next fused QK norm RoPE engaged")
+            _fused_qk_logged_engage = True
+        return prepared
+
     def forward_prepare_native(self, positions, hidden_states):
+        if (
+            isinstance(hidden_states, torch.Tensor)
+            and hidden_states.ndim >= 1
+            and self._fused_qk_norm_rope_applies(hidden_states, hidden_states.shape[0])
+        ):
+            return self._forward_prepare_fused_qk_norm_rope(positions, hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
