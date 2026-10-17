@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -51,6 +52,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -447,6 +449,71 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         stashed.num_tokens_for_logprob_per_req = 1
         return stashed
 
+    def _no_host_sum_mask(self, batch: ScheduleBatch):
+        """Reuse the target mask with a CPU-known capacity, not a stale length.
+
+        Only the Triton graph path is audited here. Actual mask offsets still
+        come from GPU seq_lens; the bound controls only the initialized span.
+        The verify plan stream joins the forward stream before reading the
+        mask, and forward joins plan before the next iteration can overwrite it.
+        """
+        if not envs.SGLANG_FROZEN_KV_NO_HOST_SUM.get():
+            return None
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        target = self.target_worker.model_runner.attn_backend
+        if (
+            self.topk != 1
+            or self.cuda_graph_runner is None
+            or batch.seq_lens_cpu is not None
+            or type(target) is not TritonAttnBackend
+            or type(self.draft_attn_backend) is not TritonAttnBackend
+        ):
+            return None
+        mask = target.verify_mask
+        bs = batch.seq_lens.shape[0]
+        if (
+            mask is None
+            or mask.mode != TreeMaskMode.FULL_MASK
+            or not mask.fits(bs)
+            or len(batch.reqs) != bs
+        ):
+            return None
+        width = self.speculative_num_draft_tokens
+        capacity = 0
+        for req in batch.reqs:
+            # Keep the request-derived bound limited to ordinary text requests.
+            # Session history and multimodal expansion have separate lifecycles;
+            # retracted_stain survives re-prefill (is_retracted does not).
+            # Abort can replace origin_input_ids with a one-token stub while
+            # an earlier forward still carries the old sequence length.
+            if (
+                req.multimodal_inputs is not None
+                or req.session is not None
+                or req.session_id is not None
+                or req.input_embeds is not None
+                or req.retracted_stain
+                or req.to_finish is not None
+                or req.finished_reason is not None
+                or req.sampling_params.max_new_tokens is None
+            ):
+                return None
+            # Overlap may have one unpublished acceptance and one in-flight
+            # iteration. Reserve two tree widths beyond the output limit.
+            # The backend context limit also bounds every legal prefix.
+            capacity += min(
+                target.max_context_len,
+                len(req.origin_input_ids)
+                + req.sampling_params.max_new_tokens
+                + 2 * width,
+            )
+        numel = width * capacity + bs * width * width
+        # Tensor slicing silently truncates; fits(bs) alone does not check the
+        # actual storage size (or a mismatched draft width).
+        if numel > mask.buffer.numel():
+            return None
+        return mask.buffer[:numel]
+
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return FrozenKVMTPVerifyInput.create_idle_input(
@@ -470,7 +537,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        tree_mask_buf = self._no_host_sum_mask(batch)
+        with spec_stage_span("frozen_draft.length_sum"):
+            batch.seq_lens_sum = (
+                None if tree_mask_buf is not None else torch.sum(batch.seq_lens).item()
+            )
         batch.return_hidden_states = False
 
         forward_batch = ForwardBatch.init_new(
@@ -494,6 +565,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self.cuda_graph_runner.execute(forward_batch)
             )
         else:
+            # Do not extend the experiment to eager draft metadata planning.
+            if tree_mask_buf is not None:
+                batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+                forward_batch.seq_lens_sum = batch.seq_lens_sum
+                tree_mask_buf = None
             forward_batch.can_run_decode_cuda_graph = False
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
@@ -512,10 +588,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            0 if tree_mask_buf is not None else batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            tree_mask_buf=tree_mask_buf,
         )
 
         return FrozenKVMTPVerifyInput(

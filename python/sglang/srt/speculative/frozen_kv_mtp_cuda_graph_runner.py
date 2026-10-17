@@ -446,8 +446,12 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.frozen_kv_mtp_worker._init_frozen_kv_metadata_replay_cuda_graph(
             forward_batch,
             expanded_bs,
-            forward_batch.seq_lens_sum
-            + (expanded_bs - raw_expanded_bs) * self.seq_len_fill_value,
+            (
+                None
+                if forward_batch.seq_lens_sum is None
+                else forward_batch.seq_lens_sum
+                + (expanded_bs - raw_expanded_bs) * self.seq_len_fill_value
+            ),
         )
 
         self.raw_bs = raw_bs
