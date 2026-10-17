@@ -151,7 +151,7 @@ class FlowRolloutController:
         """
         if current_sigma.dim() != 0:
             raise ValueError("Rollout does not support per-token timesteps")
-        self._maybe_append_dit_trajectory_step(
+        self.record_trajectory_step(
             latents=sample, timestep_value=timestep, step_index=step_index
         )
         return self.flow_sde_sampling(
@@ -160,7 +160,6 @@ class FlowRolloutController:
             sample=sample,
             current_sigma=current_sigma,
             next_sigma=next_sigma,
-            generator=self.generator,
             step_index=step_index,
         )
 
@@ -186,23 +185,24 @@ class FlowRolloutController:
         self,
         batch: Any,
         model_output: torch.FloatTensor,
-        generator: Union[torch.Generator, list[torch.Generator]],
     ) -> torch.FloatTensor:
-        """Generate variance noise for rollout. If generator is a list, use generator[i] for the i-th batch item."""
-        assert generator is not None, "Generator must be provided"
+        """Generate variance noise for rollout from the request generator; a list
+        of generators gives one per batch item."""
+        assert self.generator is not None, "Generator must be provided"
 
         device = model_output.device
         dtype = model_output.dtype
         local_shape = tuple(model_output.shape)
 
         B = local_shape[0]
-        if isinstance(generator, torch.Generator):
+        if isinstance(self.generator, torch.Generator):
             assert B == 1, "Generator must be a list if batch size is not 1"
-            generator = [generator]
+            generators = [self.generator]
         else:
-            assert len(generator) == B, (
+            assert len(self.generator) == B, (
                 "Generator list must have the same length as batch size"
             )
+            generators = self.generator
 
         buffer = self._get_or_create_rollout_noise_buffer(
             self.latents_shape, device, dtype
@@ -211,7 +211,7 @@ class FlowRolloutController:
             torch.randn(
                 self.latents_shape,
                 out=buffer[i : i + 1],
-                generator=generator[i],
+                generator=generators[i],
             )
 
         sharded_noise = self.shard_for_sp(batch, buffer)
@@ -229,7 +229,6 @@ class FlowRolloutController:
         sample: torch.FloatTensor,
         current_sigma: torch.FloatTensor,
         next_sigma: torch.FloatTensor,
-        generator: torch.Generator,
         step_index: int,
     ) -> torch.Tensor:
         """Flow rollout step for log-prob / sampling (see FlowGRPO-style references).
@@ -265,9 +264,7 @@ class FlowRolloutController:
         if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = self._rollout_variance_noise(
-                batch, model_output, generator
-            )
+            variance_noise = self._rollout_variance_noise(batch, model_output)
             full_variance_noise = self.noise_buffer
             std_dev_t = (
                 torch.sqrt(
@@ -298,9 +295,7 @@ class FlowRolloutController:
         elif effective_sde_type == "cps":
             model_output = model_output.float()
             sample = sample.float()
-            variance_noise = self._rollout_variance_noise(
-                batch, model_output, generator
-            )
+            variance_noise = self._rollout_variance_noise(batch, model_output)
             full_variance_noise = self.noise_buffer
             std_dev_t = next_sigma * math.sin(self.noise_level * math.pi / 2)
             noise_std_dev = std_dev_t
@@ -397,7 +392,7 @@ class FlowRolloutController:
         rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
         return rollout_log_probs_tensor.cpu()
 
-    def _maybe_append_dit_trajectory_step(
+    def record_trajectory_step(
         self,
         latents: torch.Tensor,
         timestep_value: torch.Tensor,

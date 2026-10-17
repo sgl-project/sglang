@@ -170,20 +170,6 @@ def finalize_rollout_if_enabled(
     """
     if not batch.rollout:
         return
-    _collect_rollout_log_probs(batch)
-    # Append final denoised latent as the (T+1)-th entry (step_index=T),
-    # routed through the same filter so rollout_return_step_indices can
-    # include/exclude it.
-    batch.rollout_controllers[VISUAL_STREAM]._maybe_append_dit_trajectory_step(
-        latents=latents,
-        timestep_value=final_timestep,
-        step_index=num_inference_steps,
-    )
-    _finalize_rollout_env(batch=batch, pipeline_config=pipeline_config)
-    batch.rollout_controllers = {}
-
-
-def _collect_rollout_log_probs(batch: Req) -> None:
     current_rollout_controller = batch.rollout_controllers[VISUAL_STREAM]
     if batch.rollout_trajectory_data is None:
         batch.rollout_trajectory_data = RolloutTrajectoryData()
@@ -195,31 +181,32 @@ def _collect_rollout_log_probs(batch: Req) -> None:
             current_rollout_controller.collect_rollout_debug_tensors(batch)
         )
 
-
-def _finalize_rollout_env(*, batch: Req, pipeline_config: Any) -> None:
-    state = batch._rollout_denoising_env_state
-    if state is None:
-        return
-
-    env: RolloutDenoisingEnv | None = state["env"]
-    current_rollout_controller = batch.rollout_controllers[VISUAL_STREAM]
-    step_latents: list[torch.Tensor] = current_rollout_controller.step_latents
-    step_timesteps: list[torch.Tensor] = current_rollout_controller.step_timesteps
-
+    # Append final denoised latent as the (T+1)-th entry (step_index=T),
+    # routed through the same filter so rollout_return_step_indices can
+    # include/exclude it.
+    current_rollout_controller.record_trajectory_step(
+        latents=latents,
+        timestep_value=final_timestep,
+        step_index=num_inference_steps,
+    )
+    step_latents = current_rollout_controller.step_latents
     if step_latents:
-        step_latents_tensor = current_rollout_controller.gather_for_sp(
-            batch, torch.stack(step_latents, dim=1)
-        )
         batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
-            latents=step_latents_tensor.cpu(),
-            timesteps=torch.stack(step_timesteps, dim=0).cpu(),
+            latents=current_rollout_controller.gather_for_sp(
+                batch, torch.stack(step_latents, dim=1)
+            ).cpu(),
+            timesteps=torch.stack(
+                current_rollout_controller.step_timesteps, dim=0
+            ).cpu(),
             sigmas=current_rollout_controller.sigmas.detach().cpu().clone(),
             latent_step_indices=torch.tensor(
                 current_rollout_controller.step_latent_indices, dtype=torch.long
             ),
         )
 
-    if env is not None:
+    state = batch._rollout_denoising_env_state
+    if state is not None and state["env"] is not None:
+        env: RolloutDenoisingEnv = state["env"]
         env.pos_cond_kwargs = _kwargs_to_cpu(
             pipeline_config.gather_denoising_env_static_for_sp(
                 batch, state["pos_cond_kwargs_src"]
@@ -234,3 +221,4 @@ def _finalize_rollout_env(*, batch: Req, pipeline_config: Any) -> None:
         batch.rollout_trajectory_data.denoising_env = env
 
     batch._rollout_denoising_env_state = None
+    batch.rollout_controllers = {}
