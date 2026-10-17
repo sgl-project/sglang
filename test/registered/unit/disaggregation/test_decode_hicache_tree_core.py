@@ -75,11 +75,13 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         tree_cache.prefetch_from_storage.assert_called_once_with(
             req.cache_request_handle,
             22,
-            [4, 5],
+            [4, 5, 6, 7],
             "h2",
             ["h0", "h1"],
+            matched_prefix_tokens=[0, 1, 2, 3],
             extra_key="model",
             cache_salt="tenant-a",
+            storage_hit_end=6,
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):
