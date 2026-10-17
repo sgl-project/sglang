@@ -182,9 +182,12 @@ def fp8_paged_mqa_logits(
     schedule_metadata: torch.Tensor,
     max_seq_len: int,
     clean_logits: bool = False,
+    histogram: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``[rows, max_seq_len]`` logits of ``q_fp8`` ``[batch, next_n, heads, dim]``
-    (``next_n == 1`` on SM100), garbage past each row's context length."""
+    (``next_n == 1`` on SM100), garbage past each row's context length. With a
+    ``histogram`` (LiteTopK's, SM100 only) DeepGEMM adds each row's score counts to
+    it, and the logits stay BF16, as LiteTopK reads them."""
     import deep_gemm
 
     assert not clean_logits, "DeepGEMM no longer cleans MQA logits"
@@ -199,8 +202,9 @@ def fp8_paged_mqa_logits(
         schedule_metadata,
         max_seq_len,
         indices=paged_mqa_logits_indices(num_rows, kv_cache.device),
+        **({} if histogram is None else {"histogram": histogram}),
     )
-    return to_fp32_logits(logits)
+    return logits if histogram is not None else to_fp32_logits(logits)
 
 
 def get_paged_mqa_logits_metadata(

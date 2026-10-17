@@ -203,6 +203,14 @@ class PagedIndexerMetadata:
     topk_metadata_chunks: Optional[List[torch.Tensor]] = field(
         init=False, repr=False, default=None
     )
+    # The LiteTopK producer's schedule and request IDs (SGLANG_OPT_LITETOPK_DECODE),
+    # set once per decode / verify forward; decode reuses deep_gemm_metadata.
+    litetopk_schedule: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
+    litetopk_request_ids: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
 
     def __post_init__(self):
         if (
@@ -378,6 +386,8 @@ class PagedIndexerMetadata:
             "rows_per_chunk",
             "mqa_logits_budget_bytes",
             "topk_metadata_chunks",
+            "litetopk_schedule",
+            "litetopk_request_ids",
         ]
         copy_metadata(
             src=other,

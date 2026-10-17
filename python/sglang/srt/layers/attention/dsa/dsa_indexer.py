@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.attention.litetopk_decode import BF16_TOP2048, LiteTopKPlan
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
@@ -25,7 +26,10 @@ from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
     pack_ue8m0_x4,
     uses_mx_mqa_logits,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -33,6 +37,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -50,6 +55,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.litetopk_decode import (
+    LiteTopKDecode,
+    get_litetopk_decode,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -243,6 +252,25 @@ def _make_eager_idle_topk_result(
     )
 
 
+def _get_dsa_litetopk(
+    *,
+    n_heads: int,
+    head_dim: int,
+    index_topk: int,
+    forces_tokens: bool,
+    ue8m0_index_cache: bool,
+) -> Optional[LiteTopKDecode]:
+    if (
+        # Only DeepGEMM's SM100 (MXFP8) paged MQA logits on this cache count histograms.
+        not ue8m0_index_cache
+        or (n_heads, head_dim, index_topk) != (32, 128, BF16_TOP2048.topk)
+        # Forced init / local tokens edit scores after the producer counted them.
+        or forces_tokens
+    ):
+        return None
+    return get_litetopk_decode(BF16_TOP2048)
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -424,6 +452,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         self.index_k_scale_fmt = self.scale_fmt or (
             "ue8m0" if self.mx_mqa_logits else None
+        )
+        self.litetopk = _get_dsa_litetopk(
+            n_heads=self.n_heads,
+            head_dim=self.head_dim,
+            index_topk=self.index_topk,
+            forces_tokens=self.num_init_tokens > 0 or self.num_local_tokens > 0,
+            ue8m0_index_cache=self.ue8m0_index_cache,
         )
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
@@ -1341,6 +1376,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        litetopk_plan = self._litetopk_plan(
+            forward_batch, metadata, rows=q_offset, block_tables=block_tables
+        )
+        histogram = None if litetopk_plan is None else litetopk_plan.histogram
+
         # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
         def _chunked_fp8_paged_mqa_logits(
             q: torch.Tensor,
@@ -1365,6 +1405,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     mqa_schedule_metadata,
                     max_len,
                     clean_logits=clean_logits,
+                    **({} if histogram is None else {"histogram": histogram}),
                 )
             logits_chunks = []
             for start in range(0, batch_size, self.sm_count):
@@ -1373,16 +1414,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 chunk_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     chunk_context_lens, blocksize, self.sm_count
                 )
+                chunk_rows = slice(start * chunk_next_n, end * chunk_next_n)
                 logits_chunks.append(
                     resolve_fp8_paged_mqa_logits_fn()(
                         q[start:end],
                         kv_cache,
-                        w[start * chunk_next_n : end * chunk_next_n],
+                        w[chunk_rows],
                         chunk_context_lens,
                         block_table[start:end],
                         chunk_schedule_metadata,
                         max_len,
                         clean_logits=clean_logits,
+                        **(
+                            {}
+                            if histogram is None
+                            else {"histogram": histogram[chunk_rows]}
+                        ),
                     )
                 )
             return torch.cat(logits_chunks, dim=0)
@@ -1455,9 +1502,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if litetopk_plan is not None:
+            topk_result = litetopk_plan.select(
+                logits,
+                metadata.get_seqlens_expanded(),
+                block_tables,
+                out=logits.new_empty((q_offset, self.index_topk), dtype=torch.int32),
+            )
+        else:
+            # NOTE(dark): logits should be cleaned in topk_transform
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1469,6 +1524,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
+
+    def _litetopk_plan(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        *,
+        rows: int,
+        block_tables: torch.Tensor,
+    ) -> Optional[LiteTopKPlan]:
+        mode = forward_batch.forward_mode
+        if (
+            self.litetopk is None
+            or rows == 0
+            or not (mode.is_decode() or mode.is_target_verify())
+            # LiteTopK returns physical KV slots: the fused paged transform's contract.
+            or not isinstance(metadata, DSAIndexerMetadata)
+            # It replaces the sgl-kernel top-k only; other backends are explicit choices.
+            or not metadata.topk_backend.is_sgl_kernel()
+            or metadata.topk_transform_method != TopkTransformMethod.PAGED
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+            or metadata.force_unfused_topk
+            or metadata.get_seqlens_expanded().shape[0] != rows
+            or block_tables.shape[0] != rows
+        ):
+            return None
+        return self.litetopk.plan(rows)
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
