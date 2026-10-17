@@ -1,0 +1,70 @@
+{
+  "version": {
+    "generated_on": "NVIDIA B200",
+    "cutedsl": "4.6.2"
+  },
+  "buckets": {
+    "4": {
+      "token_width": 8
+    },
+    "8": {
+      "token_width": 8
+    },
+    "10": {
+      "token_width": 64
+    },
+    "16": {
+      "token_width": 64
+    },
+    "20": {
+      "token_width": 64
+    },
+    "32": {
+      "token_width": 64
+    },
+    "40": {
+      "token_width": 64
+    },
+    "48": {
+      "token_width": 64
+    },
+    "64": {
+      "token_width": 64
+    },
+    "80": {
+      "token_width": 128
+    },
+    "96": {
+      "token_width": 128
+    },
+    "128": {
+      "token_width": 128
+    },
+    "160": {
+      "token_width": 64
+    },
+    "192": {
+      "token_width": 64
+    },
+    "256": {
+      "token_width": 128
+    },
+    "320": {
+      "token_width": 128
+    }
+  },
+  "tiles": [
+    {
+      "token_width": 8,
+      "persistent_clusters": 128
+    },
+    {
+      "token_width": 64,
+      "persistent_clusters": 128
+    },
+    {
+      "token_width": 128,
+      "persistent_clusters": 128
+    }
+  ]
+}
