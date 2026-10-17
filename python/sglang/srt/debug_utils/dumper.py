@@ -1353,9 +1353,7 @@ class _SafeRegexWrapper:
         # Allow Python protocol dunders needed for calling/repr; block everything else.
         if name.startswith("__") and name.endswith("__"):
             return object.__getattribute__(self, name)
-        raise AttributeError(
-            f"Access to '{name}' is not allowed in filter expressions"
-        )
+        raise AttributeError(f"Access to '{name}' is not allowed in filter expressions")
 
 
 _FILTER_BUILTINS: dict[str, Any] = {
