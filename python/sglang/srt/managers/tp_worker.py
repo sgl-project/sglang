@@ -390,6 +390,8 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self.enable_spec = get_spec().speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+        # Striped host tier: gathers started loads at the forward entry.
+        self.hicache_load_drain = None
 
     def alloc_memory_pool(
         self,
@@ -544,6 +546,21 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def register_hicache_load_drain(self, drain) -> None:
+        self.hicache_load_drain = drain
+        drain.bind_forward_entry()
+
+    def drain_hicache_loads(self, batch: ScheduleBatch) -> None:
+        """Every TP rank, every batch, before any collective of the forward.
+
+        Only extend batches start loads, so only they pay the consensus;
+        errors must reach the scheduler crash path uncaught.
+        """
+        drain = self.hicache_load_drain
+        if drain is None or not batch.forward_mode.is_extend_without_speculative():
+            return
+        drain.drain()
+
     def register_hisparse_coordinator(self, coordinator):
         self.model_runner.hisparse_coordinator = coordinator
 
@@ -635,6 +652,7 @@ class TpModelWorker(BaseTpWorker):
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
+            self.drain_hicache_loads(batch)
 
             if get_exec().features.enable_encoder_swa_bounded_replay:
                 from sglang.srt.model_executor.encoder_swa_replay import (
@@ -776,6 +794,12 @@ class TpModelWorker(BaseTpWorker):
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        if self.hicache_load_drain is not None:
+            # No forward-entry gather here: peer-owned rows would be read stale.
+            raise NotImplementedError(
+                "Split prefill (PD multiplexing) does not support a striped "
+                "HiCache host tier"
+            )
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(
                 batch,

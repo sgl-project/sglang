@@ -41,6 +41,17 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
+from sglang.srt.mem_cache.pool_host.striped_host import (
+    StripedGatherExecutor,
+    StripedHostPlacement,
+    StripedLoadDrain,
+    StripedLoadPlan,
+    build_striped_load_plan,
+    collect_striped_plan_layers,
+    owned_rows_replicated,
+    plan_gathered,
+    validate_striped_host_group,
+)
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
@@ -205,6 +216,10 @@ class PrefetchSubmission:
 
 class HybridCacheController(BaseHiCacheController):
     is_kv_sharded: bool = False
+    # None keeps every rank's host tier a full replica (stock behavior).
+    host_stripe: Optional[StripedHostPlacement] = None
+    # Forward-entry gather of striped loads; loads are refused until installed.
+    striped_load_drain: Optional[StripedLoadDrain] = None
 
     def __init__(
         self,
@@ -225,11 +240,21 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        host_stripe: Optional[StripedHostPlacement] = None,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
             mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPool
         )
+        if host_stripe is not None:
+            self._validate_host_stripe(
+                host_stripe,
+                mem_pool_host,
+                tp_group=tp_group,
+                pp_group=pp_group,
+                host_memory_mode=host_memory_mode,
+            )
+        self.host_stripe = host_stripe
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
@@ -274,6 +299,117 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
+    @staticmethod
+    def _validate_host_stripe(
+        host_stripe: StripedHostPlacement,
+        mem_pool_host: Any,
+        *,
+        tp_group: torch.distributed.ProcessGroup,
+        pp_group: Optional[torch.distributed.ProcessGroup],
+        host_memory_mode: str,
+    ) -> None:
+        """Fail closed unless every TP rank holds a full device KV replica."""
+        validate_striped_host_group(mem_pool_host, host_stripe)
+        # The stripe group is the TP group the admission and gathers run on.
+        if (
+            torch.distributed.get_world_size(group=tp_group),
+            torch.distributed.get_rank(group=tp_group),
+        ) != (host_stripe.num_ranks, host_stripe.rank):
+            raise ValueError(
+                f"Striped host placement {host_stripe} does not match the TP group"
+            )
+        if pp_group is not None and torch.distributed.get_world_size(pp_group) > 1:
+            raise ValueError(
+                "A striped host tier does not support pipeline parallelism"
+            )
+        if host_memory_mode != "cache":
+            raise ValueError(
+                f"A striped host tier requires host memory mode 'cache', "
+                f"got {host_memory_mode!r}"
+            )
+
+    def backup_admission_is_collective(self) -> bool:
+        return self.host_stripe is not None
+
+    def install_striped_load_drain(
+        self, executor: StripedGatherExecutor, *, allow_orphans: bool = False
+    ) -> StripedLoadDrain:
+        """Loads are refused until the drain is registered with the TP worker;
+        ``allow_orphans`` only for PD-decode restores.
+        """
+        if self.host_stripe is None:
+            raise ValueError("A load drain needs a striped host tier")
+        if executor.placement.key() != self.host_stripe.key():
+            raise ValueError(
+                f"Gather executor placement {executor.placement} does not match "
+                f"the host stripe {self.host_stripe}"
+            )
+        self.striped_load_drain = StripedLoadDrain(
+            executor,
+            self.tp_group,
+            on_gathered=self._on_striped_load_gathered,
+            allow_orphans=allow_orphans,
+        )
+        self._striped_plans_by_producer: dict[int, StripedLoadPlan] = {}
+        return self.striped_load_drain
+
+    def _on_striped_load_gathered(self, plan: StripedLoadPlan, done_event) -> None:
+        # Peer rows land on the forward stream after the H2D event: frees and
+        # page moves must also wait for the gather (key is not a "load" key, so
+        # pending physical reservations are left alone).
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "striped_gather"), done_event
+        )
+
+    def _enqueue_striped_load(
+        self,
+        op: CacheOperation,
+        l2_transfers: list[L2Transfer],
+        h2d_done_event: Any,
+        producer_id: int,
+    ) -> Optional[StripedLoadPlan]:
+        if self.host_stripe is None:
+            return None
+        drain = self.striped_load_drain
+        if drain is None:
+            raise NotImplementedError(
+                "Loading from a striped host tier requires the forward-entry gather"
+            )
+        self._check_striped_load_devices(op)
+        plan = build_striped_load_plan(
+            self.host_stripe,
+            host_indices=op.host_indices,
+            device_indices=op.device_indices,
+            seq=drain.next_seq(),
+            layers=collect_striped_plan_layers(
+                l2_transfers, transfer_layer_id_max=self.transfer_layer_id_max
+            ),
+        )
+        drain.enqueue(plan, h2d_done_event)
+        self._striped_plans_by_producer[producer_id] = plan
+        return plan
+
+    def _check_striped_load_devices(self, op: CacheOperation) -> None:
+        """The gather reuses the anchor's device pages for every striped pool."""
+        for transfer in op.pool_transfers or []:
+            device = transfer.device_indices
+            if device is None or device is op.device_indices:
+                continue
+            if device.shape != op.device_indices.shape:
+                raise ValueError(
+                    f"Striped load of {transfer.name} moves {device.numel()} device "
+                    f"slots, the anchor {op.device_indices.numel()}"
+                )
+            torch._assert_async(
+                (device == op.device_indices).all(),
+                "Striped load pools must share the anchor's device slots",
+            )
+
+    def striped_load_gathered(self, consumer_index: int) -> bool:
+        if self.striped_load_drain is None:
+            return True
+        return plan_gathered(self._striped_plans_by_producer.get(consumer_index))
+
     def _start_storage_threads(self):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
@@ -316,6 +452,9 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if self.host_stripe is not None:
+            # L3 writes whole pages from TP0, which holds only its own stripe.
+            raise ValueError("A striped host tier does not support a storage backend.")
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):
@@ -368,6 +507,13 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        if self.host_stripe is not None:
+            # Validated stripe pools only: a late pool's peer rows are never gathered.
+            raise ValueError(
+                f"A striped host tier cannot register host pool {entry.name} "
+                "after the stack is built (e.g. a sidecar draft KV pool): its "
+                "peer-owned rows would never be gathered"
+            )
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
@@ -498,6 +644,9 @@ class HybridCacheController(BaseHiCacheController):
     def reset(self):
         self._stop_pp_prefetch_thread()
         super().reset()
+        if self.striped_load_drain is not None:
+            self.striped_load_drain.reset()
+            self._striped_plans_by_producer.clear()
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.clear()
             self.pp_prefetch_decisions.clear()
@@ -561,9 +710,13 @@ class HybridCacheController(BaseHiCacheController):
         flush: bool = True,
         start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
+        if self.host_stripe is not None:
+            self._check_striped_transfers(extra_pools)
         allocation = self.allocate_host_transfers(
             device_indices, extra_pools, start_owner=start_owner
         )
+        if self.host_stripe is not None:
+            allocation = self._agree_backup_admission(allocation)
         if allocation is None:
             return None
         host_indices, pool_transfers = allocation
@@ -580,6 +733,39 @@ class HybridCacheController(BaseHiCacheController):
         if flush:
             self.start_writing()
         return host_indices
+
+    def _check_striped_transfers(
+        self, extra_pools: Optional[list[PoolTransfer]]
+    ) -> None:
+        anchor_name = self.mem_pool_host.anchor_entry.name
+        for transfer in extra_pools or []:
+            if transfer.indices_from_pool != anchor_name:
+                raise ValueError(
+                    f"Striped host tier requires {transfer.name} to ride the "
+                    f"{anchor_name} host indices, got {transfer.indices_from_pool}"
+                )
+
+    def _agree_backup_admission(
+        self,
+        allocation: Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]],
+    ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
+        """MIN-agree a backup's host allocation across the stripe group.
+
+        The radix tree commits the returned host indices immediately, so a rank
+        whose allocation failed must veto the op everywhere; admitted ranks undo
+        their allocation exactly, keeping the logical host index identical.
+        """
+        admitted = torch.tensor([int(allocation is not None)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            admitted, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+        )
+        if allocation is None or admitted.item() == 1:
+            return allocation
+        host_indices, pool_transfers = allocation
+        self.mem_pool_host.anchor_entry.host_pool.rollback_alloc(host_indices)
+        for transfer in pool_transfers or []:
+            transfer.host_indices = None
+        return None
 
     def _uses_shared_host_domain(
         self, extra_pools: Optional[list[PoolTransfer]]
@@ -1003,6 +1189,11 @@ class HybridCacheController(BaseHiCacheController):
                     else 0
                 )
             num_bytes += num_slots * entry.host_pool.size_per_token
+        if self.host_stripe is not None and kv_tokens:
+            # Every striped pool rides the anchor's pages; this rank moves only
+            # the ones it owns.
+            owned = int(self.host_stripe.owned_mask(op.host_indices).sum())
+            num_bytes = num_bytes * owned // kv_tokens
         return num_bytes
 
     def load(
@@ -1019,6 +1210,11 @@ class HybridCacheController(BaseHiCacheController):
         or into caller-owned ``device_indices`` (kept on failure); side pools
         bind their device slots against ``anchor_indices`` (default: the KV
         destination rows)."""
+        if self.host_stripe is not None and self.striped_load_drain is None:
+            # Owned H2D alone leaves peer-owned device rows stale.
+            raise NotImplementedError(
+                "Loading from a striped host tier requires the forward-entry gather"
+            )
         need_load_kv = host_indices.numel() > 0
         caller_owned = device_indices is not None
 
@@ -1516,8 +1712,31 @@ class HybridCacheController(BaseHiCacheController):
         return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
 
     def _move_pool_indices(
-        self, host_pool, host_indices, device_indices, *, write_back_jit: bool
+        self,
+        host_pool,
+        host_indices,
+        device_indices,
+        *,
+        write_back_jit: bool,
+        owned_rows: Optional[
+            dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.host_stripe is not None
+            and host_pool is not self.mem_pool_host.anchor_entry.host_pool
+        ):
+            # The data-less anchor keeps logical ids; striped pools move owned pages.
+            if owned_rows is None:
+                owned_rows = {}
+            key = (id(host_indices), id(device_indices))
+            if key not in owned_rows:
+                owned_rows[key] = owned_rows_replicated(
+                    self.host_stripe,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            host_indices, device_indices = owned_rows[key]
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
         if write_back_jit and host_pool.can_use_write_back_jit:
@@ -1531,11 +1750,14 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         if self.is_kv_sharded:
             return self._move_kv_shard_indices(operation, write_back_jit=write_back_jit)
+        # Sidecars sharing the op's index tensors are narrowed once.
+        owned_rows: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         host_indices, device_indices = self._move_pool_indices(
             self.mem_pool_host.anchor_entry.host_pool,
             operation.host_indices,
             operation.device_indices,
             write_back_jit=write_back_jit,
+            owned_rows=owned_rows,
         )
         resolved_pool_transfers = None
         if operation.pool_transfers:
@@ -1547,6 +1769,7 @@ class HybridCacheController(BaseHiCacheController):
                         transfer.host_indices,
                         transfer.device_indices,
                         write_back_jit=write_back_jit,
+                        owned_rows=owned_rows,
                     )
                 )
                 # Tree-owned transfers keep their original radix-tree indices.

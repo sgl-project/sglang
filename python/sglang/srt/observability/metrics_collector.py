@@ -2603,6 +2603,40 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["pool"],
         )
 
+        # Striped host tier (--hicache-host-shard stripe); no samples otherwise.
+        self.stripe_loads = Counter(
+            name="sglang:hicache_stripe_loads_total",
+            documentation="Merged load-back ops served from the striped host "
+            "tier: each rank copied its owned pages host-to-device and "
+            "all-gathered the rest at the forward entry.",
+            labelnames=labels.keys(),
+        )
+        self.stripe_gather_bytes = Counter(
+            name="sglang:hicache_stripe_gather_bytes_total",
+            documentation="Peer-owned page bytes this rank received in "
+            "striped-load all-gathers (padding excluded). Per rank: with "
+            "balanced owners it is about (tp_size - 1) / tp_size of the "
+            "loaded pages' host bytes over all pools.",
+            labelnames=labels.keys(),
+        )
+        self.stripe_gather_duration_seconds = Histogram(
+            name="sglang:hicache_stripe_gather_duration_seconds",
+            documentation="Forward-stream span of one striped load's "
+            "all-gather (pack, gather and unpack of every chunk), after its "
+            "owned host-to-device copy finished. The forward that consumes the "
+            "load waits for it.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+        self.stripe_owner_imbalance = Histogram(
+            name="sglang:hicache_stripe_owner_imbalance",
+            documentation="k_max / mean(k) over the owner ranks of one striped "
+            "load's pages: 1 is balanced, tp_size is one owner. The gather pads "
+            "every rank to k_max pages.",
+            labelnames=labels.keys(),
+            buckets=[1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0, 8.0, 16.0],
+        )
+
         self.hicache_dropped_tokens = Counter(
             name="sglang:hicache_dropped_tokens_total",
             documentation="The number of logical device KV tokens destroyed "
@@ -2641,6 +2675,16 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(
             num_tokens
         )
+
+    def observe_striped_load(
+        self, *, gathered_bytes: int, gather_seconds: float, owner_imbalance: float
+    ) -> None:
+        self.stripe_loads.labels(**self.labels).inc()
+        self.stripe_gather_bytes.labels(**self.labels).inc(gathered_bytes)
+        self.stripe_gather_duration_seconds.labels(**self.labels).observe(
+            gather_seconds
+        )
+        self.stripe_owner_imbalance.labels(**self.labels).observe(owner_imbalance)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

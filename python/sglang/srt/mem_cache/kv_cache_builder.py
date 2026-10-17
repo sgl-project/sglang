@@ -305,6 +305,23 @@ def validate_decode_radix_cache(
         )
 
 
+def check_hicache_stripe_gather(params: CacheInitParams) -> None:
+    """Fail closed unless the load-gather executor matches --hicache-host-shard.
+
+    A stripe run without the executor (a target path that skipped
+    ModelRunner.alloc_memory_pool) would silently keep a full host replica
+    per rank, i.e. stock behavior under a "stripe" label.
+    """
+    host_shard = get_memory().hicache_host_shard
+    if (host_shard == "stripe") != (params.hicache_stripe_gather is not None):
+        raise ValueError(
+            f"--hicache-host-shard {host_shard} does not match the target "
+            "model runner's load-gather executor "
+            f"({type(params.hicache_stripe_gather).__name__}); it is built by "
+            "ModelRunner.maybe_init_hicache_stripe_gather"
+        )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -429,6 +446,7 @@ def build_kv_cache(
             and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             else ()
         ),
+        hicache_stripe_gather=tp_worker.model_runner.hicache_stripe_gather,
     )
     if params.swa_retain_window != sliding_window_size:
         logger.info(
@@ -437,6 +455,8 @@ def build_kv_cache(
             params.swa_retain_window,
             sliding_window_size,
         )
+
+    check_hicache_stripe_gather(params)
 
     tree_context = TreeCacheBuildContext(
         server_args=server_args,
@@ -467,6 +487,17 @@ def build_kv_cache(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
             )
+
+    if params.hicache_stripe_gather is not None and not (
+        isinstance(tree_cache, UnifiedRadixCache)
+        and tree_cache.cache_controller is not None
+        and tree_cache.cache_controller.striped_load_drain is not None
+    ):
+        # Any other cache would silently keep a full host replica per rank.
+        raise ValueError(
+            "--hicache-host-shard stripe requires the DeepSeek V4 HiCache "
+            f"stack, got {type(tree_cache).__name__}"
+        )
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):

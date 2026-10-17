@@ -72,6 +72,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,
+        validate_hicache_host_shard,
     )
 
     run_hook(handle_hicache_ratio_default, server_args)
@@ -369,6 +370,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # disable chunked prefill. Re-run the idempotent sharding gate over the
     # final resolving view.
     run_hook(handle_kv_cache_sharding, server_args)
+    # Over the final view too: parallel sizes and the PD mode are settled.
+    run_hook(validate_hicache_host_shard, server_args)
 
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)

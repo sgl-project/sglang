@@ -2125,6 +2125,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
             device="cpu",
             load_queue=[],
             _resolve_device_transfers=lambda *args, **kwargs: None,
+            host_stripe=None,
         )
         device = HybridCacheController.load(controller, host_indices=host)
         self.assertEqual(_page_classes(device), _page_classes(host))
