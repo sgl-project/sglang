@@ -689,14 +689,22 @@ class TpModelWorker(BaseTpWorker):
 
             # Delay sampling only for normal generation requests.
             # Keep the existing grammar behavior unchanged.
+            # Custom logit processors rebuild the token history from
+            # req.output_ids, which the overlap loop only commits for the
+            # previous batch before launch_batch_sample_if_needed() runs.
+            # Deferring their sampling keeps the invariant: when sampling the
+            # k-th token, req.output_ids contains exactly the first k-1 tokens.
             if (
                 self.enable_overlap
                 and not self.enable_spec
                 and (
                     forward_batch.sampling_info.grammars is not None
                     or (
-                        envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
-                        and not forward_batch.is_prefill_only
+                        not forward_batch.is_prefill_only
+                        and (
+                            forward_batch.sampling_info.has_custom_logit_processor
+                            or envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                        )
                     )
                 )
             ):
