@@ -26,8 +26,8 @@ from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -124,13 +124,12 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
             self.linear_proj = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in text_config.rope_parameters
-        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def _materialize_items(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return materialize_multimodal_features(
