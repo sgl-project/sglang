@@ -2002,9 +2002,25 @@ image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
+def ensure_rgb_image_tensor(image: torch.Tensor) -> torch.Tensor:
+    """Expand a single-channel CHW/HW image tensor to 3-channel RGB.
+
+    ``torchvision.io.decode_jpeg`` with the default unchanged mode keeps
+    grayscale JPEGs as ``[1, H, W]`` (or ``[H, W]``). Vision processors that
+    normalize with three RGB channel means then fail with a broadcast error.
+    """
+    if image.ndim == 2:
+        image = image.unsqueeze(0)
+    if image.ndim == 3 and image.shape[0] == 1:
+        image = image.expand(3, -1, -1).contiguous()
+    return image
+
+
 def smart_to_rgb(
     image: Union[torch.Tensor, Image.Image],
 ) -> Union[torch.Tensor, Image.Image]:
+    if isinstance(image, torch.Tensor):
+        return ensure_rgb_image_tensor(image)
     if not isinstance(image, Image.Image):
         return image
 
