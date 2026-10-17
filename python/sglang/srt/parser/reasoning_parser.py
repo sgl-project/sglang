@@ -36,6 +36,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     has_atem_markers,
     partial_marker_len,
 )
+from sglang.srt.parser.answer_frame import AnswerFrame, InklingAnswerFrame
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -116,6 +117,9 @@ class BaseReasoningFormatDetector:
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
+    def get_answer_frame(self) -> Optional[AnswerFrame]:
+        return None
 
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
@@ -1375,6 +1379,9 @@ class InklingDetector(BaseReasoningFormatDetector):
         del tokenizer
         # Native framing IDs differ from encoding their printed names as plain text.
         return [INKLING_SPECIAL_TOKEN_IDS[self.think_end_token]]
+
+    def get_answer_frame(self) -> Optional[AnswerFrame]:
+        return InklingAnswerFrame()
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""
