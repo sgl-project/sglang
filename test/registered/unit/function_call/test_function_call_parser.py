@@ -11,6 +11,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -3406,6 +3407,103 @@ class TestGlm47MoeDetector(unittest.TestCase):
         text = "<tool_call>invalid_func<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
+
+    def _stream(self, chunks):
+        calls, normal = {}, ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            normal += result.normal_text
+            for item in result.calls:
+                call = calls.setdefault(item.tool_index, {"name": "", "parameters": ""})
+                call["name"] += item.name or ""
+                call["parameters"] += item.parameters or ""
+        return normal, [calls[i] for i in sorted(calls)]
+
+    def test_streaming_invalid_tool_call_is_dropped(self):
+        """Streaming drops an undeclared name like detect_and_parse does, and the
+        next declared call still streams at index 0."""
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            normal, calls = self._stream(
+                [
+                    "<tool_call>invalid_func",
+                    "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+                    "</tool_call><tool_call>get_weather",
+                    "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+                    "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+                    "</tool_call>",
+                ]
+            )
+        self.assertEqual(normal, "")
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "name": "get_weather",
+                    "parameters": '{"city": "Shanghai", "date": "2024-06-28"}',
+                }
+            ],
+        )
+        self.assertEqual(self.detector.current_tool_id, 1)
+
+    def test_streaming_reasoning_text_as_tool_name_is_dropped(self):
+        """The malformed stream observed in production: a literal <tool_call> in
+        the reasoning reached this detector, so everything up to the first
+        <arg_key> (rest of the reasoning, </think>, visible text, the real
+        header) became the function name. It must not be streamed as a call."""
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            normal, calls = self._stream(
+                [
+                    "<tool_call>",
+                    ' followed by the function name."',
+                    "</think>The GLM parser looks for ",
+                    "<tool_call>",
+                    "get_weather",
+                    "<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+                    "</tool_call>",
+                ]
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(normal, "")
+        self.assertEqual(self.detector.prev_tool_call_arr, [])
+        self.assertEqual(self.detector.streamed_args_for_tool, [])
+
+    def test_streaming_unfinished_tool_call_text_is_released(self):
+        """Visible text that quotes <tool_call> never completes a call. detect_and_parse
+        returns it as text; streaming held it and then sent a nameless "{}" call."""
+        text = "The GLM parser looks for <tool_call> followed by the function name."
+        chunks = [text[:25], "<tool_call>", text[36:]]
+        normal, calls = self._stream(chunks)
+        end = self.detector.finish(self.tools)
+        self.assertEqual(calls, [])
+        self.assertEqual(normal + end.normal_text, text)
+        self.assertEqual(end.calls, [])
+        self.assertEqual(self.detector.prev_tool_call_arr, [])
+        self.assertEqual(self.detector.streamed_args_for_tool, [])
+        one_shot = Glm47MoeDetector().detect_and_parse(text, self.tools)
+        self.assertEqual((one_shot.normal_text, one_shot.calls), (text, []))
+
+    def test_streaming_finish_keeps_truncated_named_call(self):
+        """A call whose name already streamed is not turned back into text."""
+        _, calls = self._stream(
+            ["<tool_call>get_weather", "<arg_key>city</arg_key><arg_value>Bei"]
+        )
+        self.assertEqual(calls[0]["name"], "get_weather")
+        end = self.detector.finish(self.tools)
+        self.assertEqual((end.normal_text, end.calls), ("", []))
+        self.assertEqual(self.detector.prev_tool_call_arr[0]["name"], "get_weather")
+
+    def test_streaming_undeclared_tool_forwarded_when_enabled(self):
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            _, calls = self._stream(
+                [
+                    "<tool_call>invalid_func",
+                    "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+                    "</tool_call>",
+                ]
+            )
+        self.assertEqual(
+            calls, [{"name": "invalid_func", "parameters": '{"city": "Beijing"}'}]
+        )
 
     def test_partial_tool_call(self):
         """Test parsing a partial tool call that spans multiple chunks."""
