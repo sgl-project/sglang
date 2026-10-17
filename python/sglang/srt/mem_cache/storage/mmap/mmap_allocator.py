@@ -7,6 +7,7 @@ import mmap
 import os
 import uuid
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -31,6 +32,10 @@ try:
     ]
     _libc.munmap.restype = ctypes.c_int
     _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _libc.madvise.restype = ctypes.c_int
+    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    _libc.memset.restype = ctypes.c_void_p
+    _libc.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
 except OSError:
     _libc = None
 
@@ -42,7 +47,12 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+_MADV_DONTFORK = getattr(mmap, "MADV_DONTFORK", 10)
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
 _PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
+# Prefault chunks are aligned to the THP size so no 2 MB page straddles two
+# threads (a straddled page is still correct, just faulted as small pages).
+_THP_SIZE = 2 * 1024 * 1024
 
 
 @functools.cache
@@ -87,6 +97,65 @@ def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
     return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=_PROT_RW)
 
 
+def _mmap_private_parallel_prefaulted(alloc_bytes: int, num_threads: int) -> mmap.mmap:
+    """Private anonymous mapping, THP-backed, prefaulted by `num_threads` threads.
+
+    The default MAP_SHARED|MAP_ANONYMOUS mapping is shmem: every fault takes
+    the backing shmem file's locks, so prefaulting runs at ~2 GB/s however many
+    threads touch it, and shmem THP is off by default (shmem_enabled=never).
+    For a multi-hundred-GB HiCache pool that is minutes of startup per rank.
+
+    A private anonymous mapping faults without that contention and picks up
+    2 MB transparent hugepages under the common enabled=madvise policy, so the
+    prefault scales with threads (measured on B300: 80 GB/s with 32 threads
+    vs 2.5 GB/s for the shared mapping).
+
+    Why MAP_SHARED was used: a MAP_PRIVATE page goes copy-on-write in a forked
+    child, and a parent write after fork would move the parent off the page
+    cudaHostRegister pinned. MADV_DONTFORK removes the mapping from any child
+    altogether, so there is no COW to race with -- the same thing the CUDA
+    driver does for cudaHostAlloc memory. Consequence: a fork()ed child (not a
+    spawned one) cannot see this buffer.
+
+    Pages are prefaulted before return, as cudaHostRegister requires.
+    """
+    if _libc is None:
+        raise OSError("libc unavailable")
+    mm = mmap.mmap(
+        -1, alloc_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=_PROT_RW
+    )
+    base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+    if _libc.madvise(base, alloc_bytes, _MADV_DONTFORK) != 0:
+        errno = ctypes.get_errno()
+        mm.close()
+        raise OSError(errno, "madvise(MADV_DONTFORK): " + os.strerror(errno))
+    # Best effort: THP may be disabled on this host (enabled=never); the
+    # mapping is still correct with 4 KB pages, just slower to fault.
+    _libc.madvise(base, alloc_bytes, _MADV_HUGEPAGE)
+
+    chunk = max(_THP_SIZE, -(-alloc_bytes // max(num_threads, 1)))
+    chunk = -(-chunk // _THP_SIZE) * _THP_SIZE
+    ranges = [
+        (off, min(chunk, alloc_bytes - off)) for off in range(0, alloc_bytes, chunk)
+    ]
+
+    def _fault(rng):
+        off, size = rng
+        # Touch, don't MADV_POPULATE_WRITE: per-chunk populate measured 2.5-10
+        # GB/s on B300 vs 12+ GB/s for memset with the same 32 threads. ctypes
+        # releases the GIL around foreign calls, so the threads really fault in
+        # parallel. Writing zeros over zero-filled pages is harmless.
+        _libc.memset(base + off, 0, size)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+            list(pool.map(_fault, ranges))
+    except BaseException:
+        mm.close()
+        raise
+    return mm
+
+
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
     """Call mmap via libc with hugepage flags and return an owning ctypes array.
 
@@ -115,6 +184,13 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
     pre-faulted physical pages (otherwise pinning can race with COW or page
     faults and the device ends up reading stale data).
+
+    SGLANG_HICACHE_HOST_PARALLEL_ALLOC=1 swaps the plain (non-hugetlb) path for
+    a private, MADV_DONTFORK, THP-backed mapping prefaulted by
+    SGLANG_HICACHE_HOST_ALLOC_THREADS threads -- see
+    _mmap_private_parallel_prefaulted for why that is equally safe to pin and
+    an order of magnitude faster to fault. Any failure falls back to the
+    shared path.
 
     The tensor owns the mapping; munmap fires when the tensor is freed.
     """
@@ -164,6 +240,20 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
+    if envs.SGLANG_HICACHE_HOST_PARALLEL_ALLOC.get():
+        try:
+            mm = _mmap_private_parallel_prefaulted(
+                alloc_bytes, envs.SGLANG_HICACHE_HOST_ALLOC_THREADS.get()
+            )
+            return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(
+                dims
+            )
+        except OSError as e:
+            logger.error(
+                "Parallel private host allocation failed (%s); falling back to the "
+                "shared prefaulted mmap.",
+                e,
+            )
     mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
