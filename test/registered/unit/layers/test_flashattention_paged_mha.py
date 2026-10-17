@@ -20,11 +20,13 @@ with patch.dict(
 ):
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
+        _forward_splitkv_policy,
     )
     from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
         UnquantizedKVCacheMethod,
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -63,6 +65,49 @@ def _layer():
 
 
 class TestFlashAttentionPagedMHA(unittest.TestCase):
+    def test_target_verify_uses_decode_splitkv_policy_only_when_eligible(self):
+        common = {
+            "prefill_num_splits": 4,
+            "decode_num_splits": 0,
+        }
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.EXTEND,
+                target_verify_uses_decode_policy=True,
+                max_seqlen_k=1024,
+                **common,
+            ),
+            (4, None),
+        )
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                target_verify_uses_decode_policy=True,
+                max_seqlen_k=1024,
+                **common,
+            ),
+            (0, 1024),
+        )
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                target_verify_uses_decode_policy=False,
+                max_seqlen_k=1024,
+                **common,
+            ),
+            (4, None),
+        )
+        self.assertEqual(
+            _forward_splitkv_policy(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                prefill_num_splits=4,
+                decode_num_splits=1,
+                target_verify_uses_decode_policy=True,
+                max_seqlen_k=1024,
+            ),
+            (1, 1024),
+        )
+
     def test_get_paged_mha_kv_cache_supports_head_groups(self):
         backend = _backend()
         backend.token_to_kv_pool = SimpleNamespace(
