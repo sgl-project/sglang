@@ -589,8 +589,11 @@ class Cosmos3MultiviewConfig(Cosmos3Config):
         # around every attention call; the mask spans the whole camera-major
         # sequence, so ring attention and tensor parallelism are not supported.
         # CFG parallel composes with it: each branch runs on its own SP group.
-        for name in ("tp_size", "ring_degree"):
-            if int(getattr(server_args, name) or 1) > 1:
+        for name, value in (
+            ("tp_size", server_args.tp_size),
+            ("ring_degree", server_args.ring_degree),
+        ):
+            if int(value or 1) > 1:
                 raise ValueError(
                     f"Cosmos3 multiview does not support {name} > 1; use "
                     "--ulysses-degree for sequence parallelism and "

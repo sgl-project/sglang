@@ -5,6 +5,7 @@ against a dense masked GQA oracle, camera-major helpers, wrapped temporal
 positions, deployment-contract parsing, request validation, and registry
 wiring."""
 
+import builtins
 import copy
 import importlib.util
 import os
@@ -972,6 +973,22 @@ class TestMaskedBackendResolution(unittest.TestCase):
         ):
             self.assertEqual(resolve_masked_backend(None), "triton")
             available.assert_not_called()
+
+    def test_import_failure_logs_fallback_reason(self):
+        original_import = builtins.__import__
+
+        def import_dependency(name, *args, **kwargs):
+            if name == "cutlass":
+                raise ImportError("incompatible CuTe ABI")
+            return original_import(name, *args, **kwargs)
+
+        with (
+            mock.patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            mock.patch("builtins.__import__", side_effect=import_dependency),
+            self.assertLogs(self._AVAILABLE.rsplit(".", 1)[0], level="DEBUG") as logs,
+        ):
+            self.assertEqual(resolve_masked_backend(torch.device("cuda")), "triton")
+        self.assertIn("incompatible CuTe ABI", "\n".join(logs.output))
 
     def test_fa4_block_map_exists_for_hopper_and_blackwell(self):
         self.assertEqual(fa4_sparse_block_sizes(capability_major=9), (128, 128))
@@ -2038,10 +2055,6 @@ class TestRegistry(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestLidarNeighborhoodAttentionBackend(unittest.TestCase):
     """natten's eager FlexAttention fallback must be refused, never attempted."""
 
@@ -2164,3 +2177,7 @@ class TestLidarNeighborhoodAttentionFlex(unittest.TestCase):
         )
         ref = na2d(q, k, v, kernel_size=(5, 45), dilation=(1, 1), scale=1.0)
         torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-5)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -585,12 +585,12 @@ def _validate_action_contract(contract: CosmosDreamsActionContract) -> None:
             "Unsupported Cosmos-Dreams action contract schema_version="
             f"{contract.schema_version}; expected {ACTION_CONTRACT_SCHEMA_VERSION}."
         )
-    for name in (
-        "action_tokens_per_frame",
-        "model_action_dim",
-        "num_embodiment_domains",
+    for name, value in (
+        ("action_tokens_per_frame", contract.action_tokens_per_frame),
+        ("model_action_dim", contract.model_action_dim),
+        ("num_embodiment_domains", contract.num_embodiment_domains),
     ):
-        _require_positive(name, getattr(contract, name))
+        _require_positive(name, value)
     if not contract.embodiments:
         raise ValueError(
             "Cosmos-Dreams action contract must declare at least one embodiment."
@@ -640,12 +640,12 @@ def _validate_unified_action_contract(
             "Unsupported Cosmos-Dreams unified action contract schema_version="
             f"{contract.schema_version}; expected {UNIFIED_ACTION_CONTRACT_SCHEMA_VERSION}."
         )
-    for name in (
-        "action_tokens_per_frame",
-        "model_action_dim",
-        "num_embodiment_domains",
+    for name, value in (
+        ("action_tokens_per_frame", contract.action_tokens_per_frame),
+        ("model_action_dim", contract.model_action_dim),
+        ("num_embodiment_domains", contract.num_embodiment_domains),
     ):
-        _require_positive(name, getattr(contract, name))
+        _require_positive(name, value)
     expected_input = UnifiedInputContract(
         action_space=UNIFIED_ACTION_SPACE,
         action_dim=UNIFIED_ACTION_DIM,
@@ -789,16 +789,16 @@ def validate_cosmos_dreams_manifest(
             f"Unsupported Cosmos-Dreams artifact schema_version={manifest.schema_version}; "
             f"expected {COSMOS_DREAMS_SCHEMA_VERSION}."
         )
-    for name in (
-        "chunk_size",
-        "text_cache_max_len",
-        "latent_patch_size",
-        "vae_spatial_compression_factor",
-        "temporal_compression_factor",
-        "temporal_modality_margin",
-        "checkpoint_iteration",
+    for name, value in (
+        ("chunk_size", manifest.chunk_size),
+        ("text_cache_max_len", manifest.text_cache_max_len),
+        ("latent_patch_size", manifest.latent_patch_size),
+        ("vae_spatial_compression_factor", manifest.vae_spatial_compression_factor),
+        ("temporal_compression_factor", manifest.temporal_compression_factor),
+        ("temporal_modality_margin", manifest.temporal_modality_margin),
+        ("checkpoint_iteration", manifest.checkpoint_iteration),
     ):
-        _require_positive(name, getattr(manifest, name))
+        _require_positive(name, value)
     if manifest.window_frames is not None:
         _require_positive("window_frames", manifest.window_frames)
     if isinstance(manifest.sink_frames, bool) or manifest.sink_frames < 0:

@@ -116,8 +116,11 @@ class Cosmos3SimAutoConfig(Cosmos3Config):
         # Ulysses shards the chunk over ranks and trades tokens for heads around
         # every replay attention; the mask spans the whole chunk, so ring
         # attention and the K/V-gather exchange are not supported.
-        for name in ("ring_degree", "kv_gather_degree"):
-            if int(getattr(server_args, name) or 1) > 1:
+        for name, value in (
+            ("ring_degree", server_args.ring_degree),
+            ("kv_gather_degree", server_args.kv_gather_degree),
+        ):
+            if int(value or 1) > 1:
                 raise ValueError(
                     f"{type(self).__name__} does not support {name} > 1; pass "
                     "--ulysses-degree explicitly for sequence parallelism."

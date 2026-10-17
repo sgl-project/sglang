@@ -49,6 +49,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layo
     _validate_attention_scope,
     _validate_temporal_window,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 SPARSE_Q_BLOCK_SIZE = 64
 SPARSE_KV_BLOCK_SIZE = 64
@@ -118,7 +121,10 @@ def fa4_sparse_available(device: torch.device | None = None) -> bool:
     try:
         import cutlass  # noqa: F401
         import flash_attn.cute  # noqa: F401
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Cosmos3 FA4 unavailable; falling back to Triton: %s", exc, exc_info=True
+        )
         return False
     return True
 
