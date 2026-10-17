@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -21,6 +22,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     input_guard,
     is_intel,
 )
+from sglang.srt.utils import is_hip, rank0_log
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -31,6 +33,151 @@ if is_intel:
     )
 
 CHUNK_SIZE = 64
+
+# Optional FlyDSL (aiter) prefill state-matrix kernel. Drop-in for the Triton
+# `chunk_gated_delta_rule_fwd_h` (`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`),
+# ~1.5x faster at Qwen3.5 shapes on gfx950. Enable with SGLANG_GDN_PREFILL_FLYDSL=1
+# (HIP only), with a silent fallback to Triton whenever the kernel is unavailable
+# or the call does not match `_flydsl_fwd_h_eligible`.
+#
+# The kernel consumes SGLang's native GDN layouts directly -- token-major w/u
+# ([B, T, H, K/V], `wu_head_major=False`), token-major cumulative g ([B, T, H]),
+# VK-ordered state and the indexed state pool -- so `h` and `v_new` come back in
+# the Triton layouts with no transposes and no state gather/scatter.
+#
+# Caveat: unlike the Triton kernel, the FlyDSL indexed path has no `-1`
+# padded-slot guard; every row of `initial_state_indices` is dereferenced. Only
+# enable this for batches whose state slots are all live.
+_GDN_PREFILL_FLYDSL = os.getenv("SGLANG_GDN_PREFILL_FLYDSL", "0") == "1"
+_flydsl_fwd_h = None
+_flydsl_probed = False
+_flydsl_logged = set()
+
+
+def _log_flydsl_once(key: str, msg: str):
+    """Log a FlyDSL dispatch decision once per process, on rank 0.
+
+    The decision is identical for every call and every layer, so logging it
+    per call would flood the serving log.
+    """
+    if key not in _flydsl_logged:
+        _flydsl_logged.add(key)
+        rank0_log(msg)
+
+
+def _get_flydsl_fwd_h():
+    global _flydsl_fwd_h, _flydsl_probed
+    if _flydsl_probed:
+        return _flydsl_fwd_h
+    _flydsl_probed = True
+    if _GDN_PREFILL_FLYDSL and is_hip():
+        try:
+            # Importing aiter.ops.flydsl already raises when flydsl is missing
+            # or older than the minimum aiter supports.
+            from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+                chunk_gated_delta_rule_fwd_h_flydsl_opt,
+            )
+
+            _flydsl_fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_opt
+        except Exception as e:
+            _flydsl_fwd_h = None
+            rank0_log(
+                "GDN prefill: SGLANG_GDN_PREFILL_FLYDSL=1 but the aiter FlyDSL "
+                f"state-matrix kernel is unavailable ({e!r}); using Triton."
+            )
+    return _flydsl_fwd_h
+
+
+def _flydsl_fwd_h_reject_reason(
+    k, w, u, g, initial_state, initial_state_indices, cu_seqlens, inplace_update
+):
+    """Return why the FlyDSL kernel cannot serve this call, or None if it can.
+
+    Checks the kernel's preconditions without touching device memory. aiter's
+    own audit of these is behind `AITER_K5_OPT_CHECK` and off by default, so an
+    unchecked mismatch is a wrong-result or out-of-bounds bug rather than an
+    exception.
+    """
+    if k.dim() != 4 or w.dim() != 4 or u.dim() != 4:
+        return f"k/w/u must be 4-D, got {k.dim()}/{w.dim()}/{u.dim()}"
+    if not (k.dtype == w.dtype == u.dtype == torch.bfloat16):
+        return f"k/w/u must be bf16, got {k.dtype}/{w.dtype}/{u.dtype}"
+    if not (k.is_contiguous() and w.is_contiguous() and u.is_contiguous()):
+        return "k/w/u must be contiguous"
+
+    B, T, Hg, K = k.shape
+    H, V = u.shape[-2], u.shape[-1]
+    # Only the 16x16x16 bf16 MFMA tile is compiled.
+    if K != 128 or V != 128 or CHUNK_SIZE != 64:
+        return f"only K=V=128 and chunk_size=64 are compiled, got K={K} V={V}"
+    if H % Hg != 0:
+        return f"H ({H}) must be a multiple of Hg ({Hg})"
+    if w.shape != (B, T, H, K) or u.shape != (B, T, H, V):
+        return (
+            f"w/u must be token-major [B,T,H,K/V], got "
+            f"{tuple(w.shape)}/{tuple(u.shape)}"
+        )
+    # Varlen packs the whole batch into one row.
+    if cu_seqlens is not None and B != 1:
+        return f"varlen requires B=1, got B={B}"
+    # Scalar token-major g only; the per-channel gk path is not wired up here.
+    if g is None:
+        return "scalar g is required"
+    if g.dtype != torch.float32 or g.shape != (B, T, H):
+        return f"g must be fp32 [B,T,H]={(B, T, H)}, got {g.dtype} {tuple(g.shape)}"
+    # The indexed pool is the only state contract the kernel offers, and it
+    # requires the in-place write-back that `inplace_update` also asks for.
+    if initial_state is None or initial_state_indices is None:
+        return "an indexed state pool (initial_state + indices) is required"
+    if not inplace_update:
+        return "inplace_update=False is not supported by the indexed FlyDSL path"
+    if not initial_state.is_contiguous() or initial_state.dim() != 4:
+        return "the state pool must be contiguous and 4-D"
+    if initial_state.shape[1:] != (H, V, K):
+        return (
+            f"the state pool must be [pool,H,V,K] with (H,V,K)={(H, V, K)}, "
+            f"got {tuple(initial_state.shape)}"
+        )
+    return None
+
+
+def _chunk_gated_delta_rule_fwd_h_flydsl(
+    k,
+    w,
+    u,
+    g,
+    initial_state,
+    initial_state_indices,
+    cu_seqlens,
+    fwd_h_flydsl,
+):
+    """FlyDSL drop-in for `chunk_gated_delta_rule_fwd_h`.
+
+    Returns `(h, v_new)` in the Triton layouts -- `h` [B, NT, H, V, K] and
+    `v_new` [B, T, H, V] -- with the final state written straight back into the
+    `initial_state` pool slots, mirroring the Triton kernel's INPLACE_UPDATE.
+    """
+    h, v_new, _final_state = fwd_h_flydsl(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        output_final_state=True,
+        inplace_final_state=True,
+        chunk_size=CHUNK_SIZE,
+        cu_seqlens=cu_seqlens,
+        # g arrives as a natural-log cumsum, so the gate is exp, not exp2.
+        use_exp2=False,
+        wu_head_major=False,
+        g_head_major=False,
+        # RNE matches Triton's fp32 -> bf16 conversion. The kernel defaults to
+        # truncation instead, to stay bit-identical to aiter's HIP kernel.
+        bf16_convert_trunc=False,
+    )
+    # `_final_state` aliases `initial_state`, which the kernel already updated.
+    return h, v_new
 
 
 def chunk_gated_delta_rule_fwd(
@@ -60,17 +207,56 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
-    h, v_new = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        inplace_update=inplace_update,
+    fwd_h_flydsl = _get_flydsl_fwd_h()
+    reject_reason = (
+        _flydsl_fwd_h_reject_reason(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            inplace_update=inplace_update,
+        )
+        if fwd_h_flydsl is not None
+        else None
     )
+    if fwd_h_flydsl is not None and reject_reason is None:
+        _log_flydsl_once(
+            "hit",
+            "GDN prefill: using the aiter FlyDSL state-matrix kernel "
+            f"(token-major, H={u.shape[-2]} Hg={k.shape[-2]} K={k.shape[-1]} "
+            f"V={u.shape[-1]}).",
+        )
+        h, v_new = _chunk_gated_delta_rule_fwd_h_flydsl(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            fwd_h_flydsl=fwd_h_flydsl,
+        )
+    else:
+        if reject_reason is not None:
+            _log_flydsl_once(
+                "reject",
+                "GDN prefill: the aiter FlyDSL state-matrix kernel does not fit "
+                f"this call ({reject_reason}); using Triton.",
+            )
+        h, v_new = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            inplace_update=inplace_update,
+        )
     o = chunk_fwd_o(
         q=q,
         k=k,
