@@ -1493,7 +1493,8 @@ class DeepseekV4AttnBackend(
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
-            # A graph fixes its window groups: each request has a live row.
+            # Captured kernels read the window history by address, so a graph
+            # keeps one group per request slot, at most one per row.
             num_groups=(
                 min(self.req_to_token.shape[0], padded_num_tokens)
                 if graph_window
@@ -2663,8 +2664,6 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
-        self.encoder_replay = forward_batch.encoder_swa_replay
-        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2819,6 +2818,9 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ):
+        # make_core_attn_metadata reads the fold's window state from here.
+        self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -2932,8 +2934,6 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        self.encoder_replay = forward_batch.encoder_swa_replay
-        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2999,8 +2999,6 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
-        self.encoder_replay = metadata_batch.encoder_swa_replay
-        self.encoder_row_floor = metadata_batch.encoder_swa_row_floor
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,

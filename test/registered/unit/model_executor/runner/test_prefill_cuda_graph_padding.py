@@ -264,6 +264,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 votes = [
                     _local_prefill_cuda_graph_vote(
                         local_batch=batch,
+                        num_tokens=4,
                         prefill_graph_runner=runner,
                         coordinated_prefill=True,
                         breakable_prefill=True,
