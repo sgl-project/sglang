@@ -1,0 +1,554 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+// Vendored verbatim from Alibaba Cloud Tair KVCache Manager
+// (kv_cache_manager/protocol/protobuf/meta_service.proto, Apache-2.0) so the
+// KV Indexer's KVCM backend speaks the exact wire contract of a deployed
+// KVCM MetaService. Only three RPCs are used by this crate today
+// (RegisterInstance, ReportEvent, GetHostCacheState); the rest of the service
+// is kept so re-vendoring on KVCM upgrades stays a mechanical file copy with
+// no hand-edited subset to drift. Do not edit the definitions below.
+
+syntax = "proto3";
+
+package kv_cache_manager.proto.meta;
+
+option cc_generic_services = false;
+// HTTP handlers keep request/response messages on one request-scoped arena.
+// This is a C++ allocation policy only; it does not change the wire or JSON
+// representation of any MetaService message.
+option cc_enable_arenas = true;
+
+enum ErrorCode {
+    UNSPECIFIED = 0;
+    OK = 1;
+    UNSUPPORTED = 2;
+    INTERNAL_ERROR = 3;
+    SERVICE_NOT_READY = 4;
+    INVALID_ARGUMENT = 5;
+    DUPLICATE_ENTITY = 6; // 注册时如果发现模型信息不同，返回这个
+    REACH_MAX_ENTITY_CAPACITY = 7;
+    INSTANCE_NOT_EXIST = 8;
+    SERVER_NOT_LEADER = 9; // 高可用部署模式下，请求的接口只能在leader执行但请求的节点不是leader
+    NODE_NOT_REGISTERED = 10;
+    SNAPSHOT_IN_PROGRESS = 11;
+    reserved 12; // DELTA_IN_PROGRESS was removed: admitted deltas wait behind the snapshot gate.
+    SNAPSHOT_RATE_LIMITED = 13;
+    SNAPSHOT_REQUIRED = 14;
+
+    IO_ERROR = 20;
+    UNKNOWN_ERROR = 100;
+    ERROR_MAX = 65535;
+}
+
+message Status {
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+message CommonResponseHeader {
+    Status status = 1;
+    string request_id = 2;
+    string tracer_result = 3;
+}
+
+message CommonResponse { CommonResponseHeader header = 1; }
+
+enum StorageType {
+    ST_UNSPECIFIED = 0;
+    ST_3FS = 1;
+    ST_MOONCAKE = 2;
+    ST_TAIRMEMPOOL = 3;
+    ST_NFS = 4;
+    ST_VCNS_3FS = 5;
+    ST_DUMMY = 6;
+    ST_EVENT_REPORT_L1P5 = 7;
+    ST_EVENT_REPORT_L2 = 8;
+    ST_TAIRMEMPOOL_SSD = 9;
+}
+
+// ---- Cache event reporting ----
+//
+// ReportEvent is the ingestion API used by cache subscribers. A subscriber
+// normalizes engine-specific cache signals (for example RTP-LLM full cache
+// snapshots or vLLM KV events) into block-level mutations on one storage
+// system. `storage_type` names that large storage/cache system; `medium` is
+// a block-level cache-tier attribute. LocationSpec describes every cache
+// component of the block, including
+// full-attention and mamba-state specs.
+
+enum ReportEventType {
+    EVENT_UNSPECIFIED = 0;
+    // Optional startup signal. A fresh reporter, including one observed after
+    // KVCM restart, may also be lazily initialized by its first valid
+    // HEARTBEAT/ADD/DELETE/SNAPSHOT. REGISTER is required to clear a
+    // same-process HOST_DOWN or liveness-cleanup tombstone.
+    EVENT_NODE_REGISTER = 1;
+    EVENT_BLOCK_ADD = 2;     // Reporter stored a block in one location
+    EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
+    EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends one complete all-medium host snapshot
+}
+
+message NodeRegisterEventParams {
+    repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
+}
+
+message BlockAddEventParams {
+    // Signed int64 decimal, or unsigned uint64 decimal mapped to the same
+    // internal 64-bit key (e.g. UINT64_MAX is equivalent to -1).
+    string block_key = 1;
+    string uri = 2;       // deprecated, use specs instead
+    string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated LocationSpec specs = 4;
+}
+
+message BlockDeleteEventParams {
+    string block_key = 1;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Required component names to remove from this block location.
+    repeated string spec_names = 3;
+}
+
+message BlockSnapshotItem {
+    string block_key = 1;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated LocationSpec specs = 3;
+}
+
+message BlockSnapshotEventParams {
+    // Legacy single-medium form. New callers should set medium on every block.
+    string medium = 1 [deprecated = true];
+    // Complete block set for (instance_id, reporter host_ip_port), across every
+    // medium owned by the reporter. Empty means the host owns no blocks.
+    // Do not paginate.
+    repeated BlockSnapshotItem blocks = 2;
+}
+
+message HostDownEventParams {
+}
+
+message HeartbeatEventParams {
+    // KVCM only refreshes last_heartbeat; system_status is opaque observability data
+    map<string, string> system_status = 1;
+}
+
+message EventItem {
+    ReportEventType event_type = 1;
+    oneof event_params {
+        NodeRegisterEventParams node_register = 2;
+        BlockAddEventParams block_add = 3;
+        BlockDeleteEventParams block_delete = 4;
+        HostDownEventParams host_down = 5;
+        HeartbeatEventParams heartbeat = 6;
+        BlockSnapshotEventParams block_snapshot = 7;
+    }
+}
+
+message ReportEventRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string host_ip_port = 3;
+    repeated EventItem events = 4;
+    StorageType storage_type = 5; // required: declares the reporter's storage/event_report
+}
+
+message ReportEventResponse {
+    CommonResponseHeader header = 1;
+    // Non-empty only when partial failures happen.
+    repeated ErrorCode item_results = 2;
+    // Current process-local reconciliation generation for
+    // (instance_id, storage_type, reporter host_ip_port). The first
+    // ADD/DELETE may create it. After a successful full snapshot it is also
+    // the strict query-visibility generation; restart or snapshot failure
+    // temporarily falls back to soft visibility until a later snapshot.
+    string committed_snapshot_version = 3;
+    uint64 retry_after_ms = 4;
+    // Advisory: true while this process has no generation yet, and once on
+    // the ADD/DELETE request that lazily creates the first generation. The
+    // caller should schedule a full snapshot for reconciliation; realtime
+    // mutations remain accepted while that snapshot is pending.
+    bool snapshot_required = 5;
+    string extra_info = 6; // opaque JSON passed through from InstanceGroup
+}
+
+// 使用URI统一多种存储表示，由client或者connector负责解析
+// ThreeFSLocation: 3fs://na61_3fs_cluster_01/data_root/dir1/filename?offset=0&size=1024
+// MoonCakeLocation: mooncake://na61_mc_bucket_01/my_key1
+// TairMemPoolLocation: pace://na61_pace_cluster_?offset=0&size=200&node_id=worker.33&media_type=1
+// NfsLocation: file://nfs_01/data/dir1/filename?offset=1&size=1024
+message LocationSpec {
+    string name = 1; // 对应LocationSpecInfo中的name
+    string uri = 2;
+}
+
+message CacheLocation {
+    StorageType type = 1;
+    int32 spec_size = 2;
+    repeated LocationSpec location_specs = 3;
+}
+
+message LocationSpecInfo {
+    string name = 1; // 由外部确定，用于描述单个block内的多个分块。举例比如2TP部署，可以是有TP0、TP1。
+    int64 size = 2;
+}
+
+message ModelDeployment {
+    string model_name = 1;
+    string dtype = 2;             // torch的数据类型，比如FP8、BP8，TODO 对齐torch
+    bool use_mla = 3;             // latent attention，开启了之后只需要存两个矩阵
+    int32 tp_size = 4;            // 分多少tp，分partition
+    int32 dp_size = 5;            // 数据并行
+    string lora_name = 6;         // 可以传lora ckpt的hash
+    int32 pp_size = 7;            // Pipeline模式下使用，Pipeline数量
+    string extra = 8;             // 额外字段，用于标识模型，参与判断唯一标识校验
+    string user_data = 9;        // 用户自定义数据，不参与判断唯一标识校验
+    bool use_eagle_pop = 10;    // EaglePop 模式下 full attention 前缀长度减一
+}
+
+message LocationSpecGroup {
+    string name = 1;
+    repeated string spec_names = 2;
+}
+
+message InstanceInfo {
+    string quota_group_name = 1;
+    string instance_group_name = 2;
+    string instance_id = 3;
+    int32 block_size = 4;                              // 一个block有多少token
+    repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
+    ModelDeployment model_deployment = 6;
+    repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+}
+
+message LocalStorageSpec {}
+
+message DummyStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
+
+// 3fs
+message ThreeFSStorageSpec {
+    string cluster_name = 1;      // 3fs集群名
+    string mountpoint = 2;        // 挂载点 eg. /3fs/stage/3fs/
+    string root_dir = 3;          // 根目录,实际的文件目录是 mount_point/root_dir
+    int32 key_count_per_file = 4; // 多少个文件放在
+    bool touch_file_when_create = 5;
+}
+
+// vcns_3fs
+message VcnsThreeFSStorageSpec {
+    string cluster_name = 1;      // 3fs集群名
+    string mountpoint = 2;        // 挂载点 eg. /3fs/stage/3fs/
+    string root_dir = 3;          // 根目录,实际的文件目录是 mount_point/root_dir
+    int32 key_count_per_file = 4; // 多少个文件放在
+    bool touch_file_when_create = 5;
+    string remote_host = 6;
+    int32 remote_port = 7;
+    string meta_storage_uri = 8;
+}
+
+// moonCake mooncake-store/include/client.h
+message MooncakeStorageSpec {
+    string local_hostname = 1;       // Local host address (IP:Port)
+    string metadata_connstring = 2;  // Connection string for metadata service
+    string protocol = 3;             // Transfer protocol ("rdma" or "tcp")
+    string rdma_device = 4;          // Protocol-specific arguments
+    string master_service_entry = 5; // The entry of master server
+                                     // (IP:Port of master address for non-HA mode,
+                                     // etcd://IP:Port;IP:Port;...;IP:Port for HA mode)
+}
+
+message TairMemPoolStorageSpec {
+    string domain = 1; // tair mempool 的 meta service 挂载的域名（service_discovery_url 为空时直接用此 domain）
+    int32 timeout = 2; // 单位超时时间
+    reserved 3, 4; // 历史字段：enable_vipserver / vipserver_domain
+    reserved "enable_vipserver", "vipserver_domain";
+    // 服务发现 URL，统一抽象不同发现机制；空字符串表示不使用服务发现。
+    // 与 admin_service.proto 中 TairMemPoolStorageSpec.service_discovery_url 字段含义一致。
+    string service_discovery_url = 5;
+    int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
+}
+
+message NfsStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
+
+// 允许一个meta service服务对接多种存储系统
+message StorageConfig {
+    string global_unique_name = 1;
+    oneof storage_spec {
+        LocalStorageSpec local = 2;
+        ThreeFSStorageSpec threefs = 3;
+        MooncakeStorageSpec mooncake = 4;
+        TairMemPoolStorageSpec tair_mem_pool = 5;
+        NfsStorageSpec nfs = 6;
+        ThreeFSStorageSpec vcnsthreefs = 7;
+        DummyStorageSpec dummy = 9;
+    }
+    bool check_storage_available_when_open = 8;
+}
+
+message RegisterInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2;
+    string instance_id = 3;        // 代表一个模型的具体部署
+    int32 block_size = 4;          // 一个block有多少token
+    repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
+    ModelDeployment model_deployment = 6;
+    repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+}
+
+message RegisterInstanceResponse {
+    CommonResponseHeader header = 1;
+    string storage_configs = 2;
+    string extra_info = 3; // opaque JSON passed through from InstanceGroup
+}
+
+message GetInstanceInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2; // 代表一个模型的具体部署
+}
+
+message GetInstanceInfoResponse {
+    CommonResponseHeader header = 1;
+    string instance_group = 2;
+    InstanceInfo instance_info = 3;
+}
+
+message BoolMasksType { repeated bool values = 1; }
+message BlockMask {
+    oneof info {
+        int32 offset = 1;             // [0, offset) 被mask掉, [offset, +) 是可见的
+        BoolMasksType bool_masks = 2; // 需要和 blockKeys 数量相等
+    }
+}
+
+enum QueryType {
+    QT_UNSPECIFIED = 0;
+    QT_BATCH_GET = 1;
+    QT_PREFIX_MATCH = 2;
+    QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
+}
+
+message GetCacheLocationRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    BlockMask block_mask = 6; // 按前缀mask或者bool矩阵mask
+    int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
+    repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
+}
+
+message CacheLocationVector {
+    repeated CacheLocation locations = 1;
+}
+
+enum LocationSelectStrategy {
+    LSS_UNSPECIFIED = 0;
+    LSS_V6D_PREFIX = 1;
+    LSS_V6D_COVERAGE = 2;
+    LSS_WEIGHTED_RANDOM = 3;
+}
+
+message BackendLocationSelector {
+    StorageType backend_type = 1;
+    LocationSelectStrategy strategy = 2;
+}
+
+message GetCacheLocationsByBackendRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;              // 当前仅支持 QT_BATCH_GET
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    BlockMask block_mask = 6;
+    int32 sw_size = 7;
+    repeated string location_spec_names = 8;
+    repeated BackendLocationSelector backend_selectors = 9;
+}
+
+message GetCacheLocationsByBackendResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocationVector key_locations = 2;
+}
+
+message GetCacheLocationLenRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    int32 sw_size = 6;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
+}
+
+message GetCacheLocationResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocation locations = 2; // 多个key的列表
+}
+
+message GetCacheLocationLenResponse {
+    CommonResponseHeader header = 1;
+    int64 cache_location_len = 2; // 命中的key的数量
+}
+
+message GetCacheMetaRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
+    int32 detail_level = 6;   // 返回数据的详细级别，越大获取的信息越多，暂定为数字
+}
+
+message GetCacheMetaResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocation locations = 2; // 多个key的列表
+    repeated string metas = 3;            // 与请求key一一对应
+}
+
+// 在每次写入 cache 前, 需要调用这个接口获得CacheLocation信息
+message StartWriteCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+
+    // location_spec_group_names当前主要针对混合注意力场景，
+    // location_spec_group_names 如果为空则所有block都可以提供全部spec对应的kvcache数据。
+    // 如果不为空则长度应该等于block数量，用于指示每个block可以提供哪个spec group对应的kvcache数据。
+    // 例如每个4个block才存一个带linear attention的，则可以传入[Full, Full, Full, LinearAndFull, Full, ...]
+    repeated string location_spec_group_names = 5;
+    int32 write_timeout_seconds = 6; // seconds, 要在指定timeout内调用FinishWriteCacheRequest，否则服务端会将本次 Request 相关的 Meta 全释放掉
+    // 看情况添加一个已匹配block数量，提升metaservice性能，针对流式存储场景
+    int32 min_replica_count = 7; // 可用副本数 >= min_replica_count 才跳过写入，0 或未设置视为 1
+}
+
+message StartWriteCacheResponse {
+    CommonResponseHeader header = 1;
+    string write_session_id = 2;
+    BlockMask block_mask = 3;
+    repeated CacheLocation locations = 4;
+}
+
+// 写入为简单起见, 先设计为原子性接口, 全成功或全失败
+// 结束对指定 blockKeys 的写入(要保证所有 blockKeys 对应 value 都已完成写入),
+// 若客户端未调用该接口或写入长时间未完成,
+// 服务端会视为写入失败并将本次Request所有meta清除. 客户端调用完这个接口后,
+// 服务端还会对所有 blockKeys 进行检查
+message FinishWriteCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string write_session_id = 3;
+    BlockMask success_blocks = 4;
+    repeated CacheLocation locations = 5;
+}
+
+// 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况
+message RemoveCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5; // 对block_keys或者token_ids的mask
+}
+
+// Leader 节点信息，仅包含 Meta 服务连接信息，不暴露 Admin 端口
+message MetaNodeEndpoint {
+    string node_id = 1;
+    string host = 2;
+    int32 meta_rpc_port = 3;
+    int32 meta_http_port = 4;
+    string custom_info = 5;
+}
+
+message GetClusterInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message GetClusterInfoResponse {
+    CommonResponseHeader header = 1;
+    string self_node_id = 2;
+    string leader_node_id = 3;
+    // leader 节点信息查询失败时可能缺失，调用方应据此决定是否重试。
+    MetaNodeEndpoint leader_endpoint = 4;
+}
+
+enum TrimStrategy {
+    TS_UNSPECIFIED = 0;
+    TS_REMOVE_ALL_CACHE = 1;
+    TS_REMOVE_ALL_META = 2;
+    TS_TIMESTAMP = 3;
+}
+
+// 删除指定时间段的cache，用于处理发布前后错误数据；
+message TrimCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    TrimStrategy strategy = 3;
+    int32 begin_timestamp = 4; // TS_TIMESTAMP : 淘汰掉某个时间戳(写入)前所有数据
+    int32 end_timestamp = 5;   // TS_TIMESTAMP : 淘汰掉某个时间戳(写入)前所有数据
+}
+
+service MetaService {
+    // 客户端初始化注册信息接口, 由PD节点调用，也可以统一调用
+    // instanceId由模型部署信息hash而来
+    // 如果instanceId相同并且信息也相同则认为成功
+    rpc RegisterInstance(RegisterInstanceRequest) returns (RegisterInstanceResponse);
+    // 获取Instance的状态信息，用于决策是否不同部署复用kvcache，以及错误调试
+    rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
+    // 在排查问题时获取meta完整信息，明确的; TODO : 把这个挪到debug service中
+    rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
+    // 返回Cache的位置，由PD节点调用
+    rpc GetCacheLocation(GetCacheLocationRequest) returns (GetCacheLocationResponse);
+    // 返回命中的key的数量
+    rpc GetCacheLocationLen(GetCacheLocationLenRequest) returns (GetCacheLocationLenResponse);
+    // 准备开始写Cache，尝试获取写的位置，如果返回空，则代表不需要写Cache
+    rpc StartWriteCache(StartWriteCacheRequest) returns (StartWriteCacheResponse);
+    // 不论写Cache成功与否，都调用这个
+    rpc FinishWriteCache(FinishWriteCacheRequest) returns (CommonResponse);
+    // 删除指定key的cache，用于修复用户反馈的单query异常
+    rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
+    // 删除全部cache或者meta，允许指定时间
+    rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
+    // 查询集群信息（leader发现），任意节点均可处理
+    rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    // 推理节点上报事件（节点注册、Block 增删、节点宕机、心跳）
+    rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+    // 查询 instance 下所有 host 的 prefix match 结果
+    rpc GetHostCacheState(GetHostCacheStateRequest) returns (GetHostCacheStateResponse);
+    // 每个 key 的多个 Cache 位置（每种backend根据策略选择一个地址）
+    rpc GetCacheLocationsByBackend(GetCacheLocationsByBackendRequest) returns (GetCacheLocationsByBackendResponse);
+}
+
+// ---- GetHostCacheState ----
+
+message GetHostCacheStateRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
+    repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
+    int32 p2p_host_count = 6;              // 继续计算 P2P 的 local top host 数；未传或 0 表示只计算 local
+}
+
+message HostCacheMatch {
+    string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
+    int64 local = 2;           // 本地前缀匹配的 block 数
+    int64 p2p_1_fetch = 3;     // P2P 实际拉取的 spec 所属的去重 block key 数
+    int64 p2p_1_total_match = 4;   // p2p 后最终的前缀匹配的block数
+}
+
+message GetHostCacheStateResponse {
+    CommonResponseHeader header = 1;
+    repeated HostCacheMatch hosts = 2;
+}
