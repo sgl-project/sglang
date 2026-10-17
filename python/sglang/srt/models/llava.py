@@ -561,6 +561,8 @@ class LlavaLlamaForCausalLM(LlavaBaseForCausalLM):
 
 
 class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
+    DEFAULT_IMAGE_TOKEN_INDEX = 151646
+
     def __init__(
         self,
         config: LlavaConfig,
@@ -583,7 +585,7 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
         if getattr(self.config, "image_token_index", None) is None:
-            self.config.image_token_index = 151646
+            self.config.image_token_index = self.DEFAULT_IMAGE_TOKEN_INDEX
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = Qwen2ForCausalLM(
@@ -598,6 +600,8 @@ class LlavaQwenForCausalLM(LlavaBaseForCausalLM):
 
 
 class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
+    DEFAULT_IMAGE_TOKEN_INDEX = 32000
+
     def __init__(
         self,
         config: LlavaConfig,
@@ -620,7 +624,7 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
         if getattr(self.config, "image_token_index", None) is None:
-            self.config.image_token_index = 32000
+            self.config.image_token_index = self.DEFAULT_IMAGE_TOKEN_INDEX
 
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = MistralForCausalLM(

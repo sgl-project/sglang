@@ -1,8 +1,13 @@
 """Unit tests for model-specific server warmup inputs."""
 
+import asyncio
 import base64
 import struct
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
 
 from sglang.srt.entrypoints.http_server import (
     KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64,
@@ -10,6 +15,7 @@ from sglang.srt.entrypoints.http_server import (
     MINIMUM_PNG_PICTURE_BASE64,
     _get_vlm_warmup_image_base64,
 )
+from sglang.srt.entrypoints.warmup import prefill_shapes, voice_chat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -53,6 +59,47 @@ class TestVlmWarmupImage(CustomTestCase):
             _get_vlm_warmup_image_base64({"architectures": None}),
             MINIMUM_PNG_PICTURE_BASE64,
         )
+
+
+class TestWarmupTokenVocabulary(CustomTestCase):
+    def test_synthetic_warmups_respect_small_and_large_vocabularies(self):
+        # Pin the largest possible random token so a fixed 65536-token range
+        # cannot happen to pass for a smaller model's vocabulary.
+        for warmup in (voice_chat, prefill_shapes):
+            for vocab_size in (16, 100000):
+                with self.subTest(warmup=warmup.__name__, vocab_size=vocab_size):
+                    requests = []
+
+                    async def generate(request, _):
+                        requests.append(request)
+                        yield {}
+
+                    manager = SimpleNamespace(
+                        model_config=SimpleNamespace(
+                            vocab_size=vocab_size,
+                            hf_text_config=SimpleNamespace(vocab_size=vocab_size),
+                        ),
+                        generate_request=generate,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.entrypoints.warmup.np.random.randint",
+                            side_effect=lambda high, size: np.full(size, high - 1),
+                        ),
+                        patch(
+                            "sglang.srt.entrypoints.warmup.tqdm.trange",
+                            return_value=[1],
+                        ),
+                        patch(
+                            "sglang.srt.entrypoints.warmup.tqdm.tqdm",
+                            side_effect=lambda sizes, **kwargs: sizes[:1],
+                        ),
+                    ):
+                        asyncio.run(warmup("null", manager))
+                    self.assertEqual(len(requests), 1)
+                    tokens = requests[0].input_ids
+                    self.assertTrue(tokens)
+                    self.assertEqual(set(tokens), {min(65536, vocab_size) - 1})
 
 
 if __name__ == "__main__":

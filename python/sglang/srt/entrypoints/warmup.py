@@ -109,10 +109,13 @@ async def whisper_autodetect(
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     # this warms up the fused_moe triton kernels and caches them
     # if we don't do this we break real time inference for voice chat
+    token_upper_bound = min(
+        2**16, tokenizer_manager.model_config.hf_text_config.vocab_size
+    )
     for i in tqdm.trange(1, 512):
         size = i * 4
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=(np.random.randint(token_upper_bound, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 30,
                 "temperature": 0.8,
@@ -134,6 +137,9 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
     Uses power-of-2 sizes plus intermediate points to cover the shape space
     that fused_moe, attention extend, and other Triton kernels may encounter.
     """
+    token_upper_bound = min(
+        2**16, tokenizer_manager.model_config.hf_text_config.vocab_size
+    )
     page_size = 64
     sizes = set()
     base = 64
@@ -148,7 +154,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
     for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
         generate_req_input = GenerateReqInput(
-            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            input_ids=(np.random.randint(token_upper_bound, size=[size])).tolist(),
             sampling_params={
                 "max_new_tokens": 1,
                 "temperature": 0.0,

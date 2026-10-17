@@ -51,6 +51,26 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
+    def get_input_token_ids(self, modality: Modality) -> set[int]:
+        token_ids = super().get_input_token_ids(modality)
+        if (
+            modality == Modality.IMAGE
+            and getattr(self.hf_config, "image_token_index", None) is None
+        ):
+            # Legacy checkpoints may omit the marker. The tokenizer and model
+            # load separate configs, so share the model's fallback declaration.
+            for model in (LlavaQwenForCausalLM, LlavaMistralForCausalLM):
+                if model.__name__ in (self.hf_config.architectures or []):
+                    token_ids.add(model.DEFAULT_IMAGE_TOKEN_INDEX)
+        return token_ids
+
+    def get_input_token_ids_for_data(self, modality: Modality, data) -> set[int]:
+        # Both frame lists and this processor's precomputed dictionaries use
+        # the model's image marker, even when the frames represent a video.
+        if modality == Modality.IMAGE:
+            return self.get_input_token_ids(Modality.IMAGE)
+        return super().get_input_token_ids_for_data(modality, data)
+
     @staticmethod
     def _preprocess_image_task(
         image_input,
@@ -329,3 +349,6 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(self, *args, **kwargs):
         return await self.inner.process_mm_data_async(*args, **kwargs)
+
+    def get_input_token_ids_for_data(self, modality: Modality, data) -> set[int]:
+        return self.inner.get_input_token_ids_for_data(modality, data)
