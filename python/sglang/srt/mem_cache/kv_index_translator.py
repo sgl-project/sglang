@@ -466,13 +466,18 @@ class KVIndexTranslator:
         kv_start_idx: Optional[torch.Tensor] = None,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         token_mapping: Optional[torch.Tensor] = None,
+        num_token_blocks: int = 1,
     ) -> bool:
         """Fill ``out``'s CSR rows with the ``kind`` ids a paged wrapper plans
         over; return whether they are physical. Packed from the plan's table
         once a table reader has had it built, else gathered and translated
         straight into ``out``. ``False`` means still-VIRTUAL full-attention ids
         (a static pool, or DCP) for the caller to finish; a static SWA pool can
-        fuse its full->swa table into the gather as ``token_mapping``."""
+        fuse its full->swa table into the gather as ``token_mapping``.
+        ``num_token_blocks`` tiles each request's gather over that many
+        programs (any count is correct; size it with
+        ``spec_kv_index_token_blocks``); the packed-table build path has its
+        own parallelism and ignores it."""
         bs = int(seq_lens.numel())
         if self._reads_translated(kind) and not plan.has_read_table(kind):
             assert plan.is_read_by(self), (
@@ -504,7 +509,7 @@ class KVIndexTranslator:
         )
         assert src.v2p is None, "pack_read_stream: a table-less translating read"
         assert token_mapping is None or not src.is_translated
-        create_flashinfer_kv_indices_triton[(bs,)](
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             src.ids,
             src.row_ids[:bs],
             seq_lens,
@@ -513,6 +518,7 @@ class KVIndexTranslator:
             out,
             src.row_stride,
             ENTRY_PAGE_SIZE=src.entry_page_size,
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
             token_mapping=token_mapping,
         )
         return src.is_translated or token_mapping is not None

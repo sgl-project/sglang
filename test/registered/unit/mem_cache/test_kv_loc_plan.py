@@ -92,8 +92,11 @@ class _HostStreamGather:
         out,
         row_stride,
         ENTRY_PAGE_SIZE=1,
+        TOKEN_BLOCK_PARALLEL=False,
         token_mapping=None,
     ):
+        # TOKEN_BLOCK_PARALLEL only tiles the gather across programs; the
+        # host emulation writes each lane whole, so any value is correct.
         assert row_stride == ids.stride(0)
         for b in range(int(seq_lens.numel())):
             start = 0 if kv_start_idx is None else int(kv_start_idx[b])
