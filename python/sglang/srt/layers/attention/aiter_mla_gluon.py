@@ -61,12 +61,18 @@ def log_mla_gluon_capability(log: logging.Logger | None = None) -> None:
 
 
 def prefer_mla_gluon_decode(
-    *, head_pad_mode: str, num_head: int, kv_cache_dtype: torch.dtype
+    *,
+    head_pad_mode: str,
+    num_head: int,
+    kv_cache_dtype: torch.dtype,
+    q_dtype: torch.dtype | None = None,
 ) -> bool:
     return (
         head_pad_mode == "zero"
         and num_head == 12
         and kv_cache_dtype == fp8_dtype
+        # Gluon decode takes BF16 Q; an FP8 Q stays on the ASM decode path.
+        and (q_dtype is None or q_dtype == torch.bfloat16)
         and _gluon_fn() is not None
     )
 
