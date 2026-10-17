@@ -212,6 +212,7 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: CoreMetadata::default(),
+                    hicache: Default::default(),
                 },
             );
             Self {
@@ -545,6 +546,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: CoreMetadata::default(),
+                hicache: Default::default(),
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));

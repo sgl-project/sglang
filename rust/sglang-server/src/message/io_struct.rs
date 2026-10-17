@@ -106,6 +106,20 @@ control_messages! {
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
     }
+
+    /// Clear the HiCache storage backend.
+    ClearHiCacheReqInput {}
+
+    /// Detach the HiCache storage backend.
+    DetachHiCacheStorageReqInput {}
+
+    /// Attach a HiCache storage backend with optional configuration and policies.
+    AttachHiCacheStorageReqInput {
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+    }
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -163,6 +177,36 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             token_indices_to_pool: (),
             time_stats: (),
             cache_salt: req.cache_salt.as_deref(),
+        }
+    }
+}
+
+impl ClearHiCacheReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl DetachHiCacheStorageReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl AttachHiCacheStorageReqInput {
+    pub fn new(
+        rid: String,
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+    ) -> Self {
+        Self {
+            rid,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config_json,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
         }
     }
 }

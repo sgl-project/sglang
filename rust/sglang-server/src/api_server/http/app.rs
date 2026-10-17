@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 
-use super::{info, loads, metrics, native_api, openai};
+use super::{hicache, info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
 use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
@@ -82,7 +82,8 @@ pub async fn serve(
         .merge(info::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
-        .merge(openai::routes());
+        .merge(openai::routes())
+        .merge(hicache::routes());
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
     }

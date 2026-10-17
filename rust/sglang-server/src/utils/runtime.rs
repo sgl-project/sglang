@@ -313,6 +313,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
             metadata: crate::api_server::core::CoreMetadata::from(cfg.server_args.as_ref()),
+            hicache: cfg.server_args.as_ref().into(),
         },
     );
 
