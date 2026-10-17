@@ -53,6 +53,7 @@ PREFILL_CP_BCG_SUPPORTED_COMBINATIONS: set[
     tuple[ContextParallelStrategyKind, CPAttentionBackendKind]
 ] = {
     (ContextParallelStrategyKind.ZIGZAG, CPAttentionBackendKind.TRTLLM_MHA),
+    (ContextParallelStrategyKind.INTERLEAVE, CPAttentionBackendKind.DSA),
 }
 
 
@@ -76,7 +77,16 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     except ValueError:
         # Other backends (or an unresolved backend/strategy) cannot use CP BCG.
         return False
-    return combination in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS
+    if combination not in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS:
+        return False
+    if combination == (
+        ContextParallelStrategyKind.INTERLEAVE,
+        CPAttentionBackendKind.DSA,
+    ):
+        from sglang.srt.layers.cp.interleave_bcg import supports_interleave_bcg
+
+        return supports_interleave_bcg(server_args)
+    return True
 
 
 def enable_cp_bcg_capture(server_args: ServerArgs) -> bool:
@@ -123,6 +133,10 @@ class PrefillCPBCGInput:
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
+        if cls is PrefillCPBCGInput and get_cp_strategy().name == "interleave":
+            from sglang.srt.layers.cp.interleave_bcg import InterleaveCPBCGInput
+
+            return InterleaveCPBCGInput.create(runner)
         with torch.device(runner.device):
             return cls(
                 input_embeds=torch.zeros(
@@ -137,6 +151,13 @@ class PrefillCPBCGInput:
                     dtype=torch.int64,
                 ),
             )
+
+    def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
+        return True
+
+    def model_positions(self, forward_batch):
+        # No override: retain the runner's existing model/mRoPE selection.
+        return None
 
     def required_local_tokens(self, extend_seq_lens: Any) -> Optional[int]:
         """Return the largest aligned local shard, uniformly across CP ranks."""
