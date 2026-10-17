@@ -103,8 +103,36 @@ class DeepSeekV4Config(PretrainedConfig):
 
     compress_rope_theta: int = 40000
     compress_ratios: List[int] = field(default_factory=list)
+    kv_source_layer_ids: List[int] = field(default_factory=list)
+    index_source_layer_ids: List[int] = field(default_factory=list)
+    candidate_source_layer_id: int = -1
+    candidate_topk_blocks: int = 0
+    candidate_block_size: int = 0
+
+    engram_layer_ids: List[int] = field(default_factory=list)
+    engram_num_embeddings: List[int] = field(default_factory=list)
+    engram_max_ngram_size: int = 1
+    engram_vocab_size: int = 0
+    engram_n_heads: int = 0
+    engram_head_dim: int = 0
+    engram_pad_token_id: int = 2
+    engram_compressed_vocab_size: int = 0
+
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 1024
+    vision_min_pixels: int = 295936
+    vision_max_wh_ratio: Optional[int] = None
+    image_token_id: int = 129264
 
     n_hash_layers: int = 3
     hc_mult: int = 4
+    hc_pre_from_prev_sublayer: bool = False
+    q_head_norm: bool = True
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6

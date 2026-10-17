@@ -1,7 +1,7 @@
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency, DFlash2, and High Throughput TP4/EP4 recipes on four
-B200 GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
+Runs the Low Latency, DFlash2, and High Throughput TP4 recipes on four B200
+GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
 checks EAGLE speculative acceptance and single-request decode performance.
 """
 
@@ -29,8 +29,6 @@ GPU_IDLE_TIMEOUT = 120
 COMMON_SERVER_ARGS = [
     "--tp-size",
     "4",
-    "--ep-size",
-    "4",
     "--dsa-prefill-backend",
     "trtllm",
     "--dsa-decode-backend",
@@ -38,11 +36,11 @@ COMMON_SERVER_ARGS = [
     "--kv-cache-dtype",
     "fp8_e4m3",
     "--moe-runner-backend",
-    "deep_gemm",
+    "flashinfer_trtllm",
     "--reasoning-parser",
-    "glm45",
+    "auto",
     "--tool-call-parser",
-    "glm47",
+    "auto",
 ]
 
 
@@ -77,12 +75,14 @@ class TestGLM53FlashB200LowLatency(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
-    gsm8k_score_threshold = 0.93
-    # Match the established DSA+MTP accuracy workload. The generic 200-question,
-    # 5-shot defaults leave a single question worth 0.5 percentage points and
-    # make this tight quality floor unnecessarily sensitive to kernel numerics.
-    gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
+    gsm8k_score_threshold = 0.96
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    gsm8k_max_tokens = 8192
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
     accept_length_thres = 4.0
     bs_1_speed_thres = 250
     server_args = [
@@ -95,7 +95,6 @@ class TestGLM53FlashB200LowLatency(
         "1",
         "--speculative-num-draft-tokens",
         "6",
-        "--speculative-adaptive",
     ]
 
 
@@ -103,16 +102,19 @@ class TestGLM53FlashB200HighThroughput(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
-    gsm8k_score_threshold = 0.93
-    gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
+    gsm8k_score_threshold = 0.96
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    gsm8k_max_tokens = 8192
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
     server_args = [
         *COMMON_SERVER_ARGS,
-        "--enable-dp-attention",
-        "--dp-size",
+        "--attn-dp-size",
         "4",
-        "--moe-a2a-backend",
-        "deepep",
+        "--mm-enable-dp-encoder",
     ]
 
 
@@ -120,9 +122,14 @@ class TestGLM53FlashB200DFlash2(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
-    gsm8k_score_threshold = 0.93
-    gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
+    gsm8k_score_threshold = 0.96
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    gsm8k_max_tokens = 8192
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
     server_args = [
         *COMMON_SERVER_ARGS,
         "--speculative-algorithm",

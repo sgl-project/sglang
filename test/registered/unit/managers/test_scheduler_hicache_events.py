@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -22,6 +26,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.scheduler_stage_metrics = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
+        s.enable_lmcache = False
         s.enable_hicache_storage = True
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
@@ -30,7 +35,11 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
-            batch_is_full=False, is_prefill_only=False, is_empty=lambda: True
+            batch_is_full=False,
+            is_prefill_only=False,
+            is_empty=lambda: True,
+            batch_size=lambda: 0,
+            filter_batch=lambda: None,
         )
 
     def test_feature_gates(self):
@@ -114,12 +123,13 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
         s.pp_loop_size = 1
-        s.ps = SimpleNamespace(pp_size=2)
+        enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
-        s._pp_pd_get_bootstrapped_ids = Mock(return_value=[])
+        s.waiting_queue = []
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()
         s.get_new_batch_prefill = self.calls.admit

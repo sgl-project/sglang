@@ -296,6 +296,8 @@ def matmul_persistent(
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
     MIN_DEEPGEMM_DIM = 16
+    element_size = a.element_size()
+    deepgemm_tma_aligned = (N * element_size) % 16 == 0 and (K * element_size) % 16 == 0
 
     if (
         _ENABLE_MM_DEEPGEMM
@@ -305,6 +307,7 @@ def matmul_persistent(
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        and deepgemm_tma_aligned
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(
@@ -1027,6 +1030,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     else:
         from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
             npu_add_rms_norm_batch_invariant,
+            npu_fia_batch_invariant_get_max_workspace,
             npu_fused_infer_attention_score_batch_invariant,
             npu_log_softmax_batch_invariant,
             npu_matmul_batch_invariant,
@@ -1046,6 +1050,12 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
         )
         torch.ops.npu.npu_fused_infer_attention_score = (
             npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu.npu_fused_infer_attention_score = (
+            npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu._npu_fused_infer_attention_score_get_max_workspace = (
+            npu_fia_batch_invariant_get_max_workspace
         )
         torch_npu.npu_add_rms_norm = npu_add_rms_norm_batch_invariant
 

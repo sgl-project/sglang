@@ -34,6 +34,9 @@ _REQUEST_TIMEOUT = 120
 
 
 class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCase):
+    # This checkpoint can emit EOS on the first token.
+    pause_ignore_eos = True
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -46,9 +49,8 @@ class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCa
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "2",
-                "--enable-dp-attention",
                 "--enable-dp-attention-local-control-broadcast",
             ],
         )

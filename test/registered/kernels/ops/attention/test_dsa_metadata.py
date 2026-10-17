@@ -10,7 +10,7 @@ from sglang.kernels.ops.attention.dsa_metadata import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
@@ -27,10 +27,12 @@ def _dsa_seqlens(seqlens: torch.Tensor, topk: int) -> torch.Tensor:
     )
 
 
-def _real_page_table(page_table_1: torch.Tensor, real_page_size: int) -> torch.Tensor:
-    if real_page_size == 1:
+def _real_page_table(
+    page_table_1: torch.Tensor, physical_page_size: int
+) -> torch.Tensor:
+    if physical_page_size == 1:
         return page_table_1
-    return page_table_1[:, ::real_page_size] // real_page_size
+    return page_table_1[:, ::physical_page_size] // physical_page_size
 
 
 def _make_req_to_token(
@@ -59,7 +61,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         *,
         max_len: int,
         dsa_index_topk: int,
-        real_page_size: int,
+        physical_page_size: int,
     ):
         bs = len(seq_lens_values)
         pool_size = max(bs + 3, 8)
@@ -74,11 +76,11 @@ class TestDSAMetadataKernels(CustomTestCase):
         dsa_cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
         real_page_table = (
             torch.empty(
-                (bs, (max_len + real_page_size - 1) // real_page_size),
+                (bs, (max_len + physical_page_size - 1) // physical_page_size),
                 dtype=torch.int32,
                 device=self.device,
             )
-            if real_page_size > 1
+            if physical_page_size > 1
             else page_table_1
         )
 
@@ -95,7 +97,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             bs=bs,
             max_len=max_len,
             dsa_index_topk=dsa_index_topk,
-            real_page_size=real_page_size,
+            physical_page_size=physical_page_size,
         )
 
         expected_cache = seq_lens.to(torch.int32)
@@ -120,13 +122,13 @@ class TestDSAMetadataKernels(CustomTestCase):
         _assert_equal(
             dsa_cu_seqlens_k, _cu_seqlens(expected_dsa), "decode dsa_cu_seqlens_k"
         )
-        if real_page_size > 1:
+        if physical_page_size > 1:
             real_width = real_page_table.shape[1]
             real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
             real_live_mask = (
-                real_cols.view(1, -1) * real_page_size
+                real_cols.view(1, -1) * physical_page_size
             ) < expected_cache.view(-1, 1)
-            expected_real = _real_page_table(expected_page_table, real_page_size)
+            expected_real = _real_page_table(expected_page_table, physical_page_size)
             _assert_equal(
                 real_page_table[real_live_mask],
                 expected_real[real_live_mask],
@@ -139,7 +141,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         *,
         max_seqlen_k: int,
         dsa_index_topk: int,
-        real_page_size: int,
+        physical_page_size: int,
         next_n: int,
         fill_ctx_lens: bool,
     ):
@@ -168,12 +170,12 @@ class TestDSAMetadataKernels(CustomTestCase):
             torch.empty(
                 (
                     expanded_size,
-                    (max_seqlen_k + real_page_size - 1) // real_page_size,
+                    (max_seqlen_k + physical_page_size - 1) // physical_page_size,
                 ),
                 dtype=torch.int32,
                 device=self.device,
             )
-            if real_page_size > 1
+            if physical_page_size > 1
             else page_table_1
         )
         paged_mqa_ctx_lens_2d = (
@@ -196,7 +198,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             bs=bs,
             max_seqlen_k=max_seqlen_k,
             dsa_index_topk=dsa_index_topk,
-            real_page_size=real_page_size,
+            physical_page_size=physical_page_size,
             next_n=next_n,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
         )
@@ -231,13 +233,13 @@ class TestDSAMetadataKernels(CustomTestCase):
         _assert_equal(
             dsa_cu_seqlens_k, _cu_seqlens(expected_dsa), "target dsa_cu_seqlens_k"
         )
-        if real_page_size > 1:
+        if physical_page_size > 1:
             real_width = real_page_table.shape[1]
             real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
             real_live_mask = (
-                real_cols.view(1, -1) * real_page_size
+                real_cols.view(1, -1) * physical_page_size
             ) < row_kv_lens.view(-1, 1)
-            expected_real = _real_page_table(expected_page_table, real_page_size)
+            expected_real = _real_page_table(expected_page_table, physical_page_size)
             _assert_equal(
                 real_page_table[real_live_mask],
                 expected_real[real_live_mask],
@@ -256,7 +258,7 @@ class TestDSAMetadataKernels(CustomTestCase):
         *,
         max_seqlen_k: int,
         dsa_index_topk: int,
-        real_page_size: int,
+        physical_page_size: int,
         max_extend_len: int,
         max_total_len: int,
         static_extend_len: bool,
@@ -287,11 +289,14 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
         real_page_table = (
             torch.empty(
-                (max_total_len, (max_seqlen_k + real_page_size - 1) // real_page_size),
+                (
+                    max_total_len,
+                    (max_seqlen_k + physical_page_size - 1) // physical_page_size,
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
-            if real_page_size > 1
+            if physical_page_size > 1
             else page_table_1
         )
 
@@ -311,7 +316,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             total_len=total_len,
             max_seqlen_k=max_seqlen_k,
             dsa_index_topk=dsa_index_topk,
-            real_page_size=real_page_size,
+            physical_page_size=physical_page_size,
             max_extend_len=max_extend_len,
             max_total_len=max_total_len,
             static_extend_len=static_extend_len,
@@ -365,14 +370,14 @@ class TestDSAMetadataKernels(CustomTestCase):
             _cu_seqlens(expected_dsa),
             "draft dsa_cu_seqlens_k",
         )
-        if real_page_size > 1:
-            # Real-page column real_col maps to source column real_col*real_page_size.
+        if physical_page_size > 1:
+            # Real-page column real_col maps to source column real_col*physical_page_size.
             real_width = real_page_table.shape[1]
             real_cols = torch.arange(real_width, dtype=torch.int32, device=self.device)
             real_live_mask = (
-                real_cols.view(1, -1) * real_page_size
+                real_cols.view(1, -1) * physical_page_size
             ) < row_kv_lens.view(-1, 1)
-            expected_real = _real_page_table(expected_page_table, real_page_size)
+            expected_real = _real_page_table(expected_page_table, physical_page_size)
             _assert_equal(
                 real_page_table[:total_len][real_live_mask],
                 expected_real[real_live_mask],
@@ -380,25 +385,25 @@ class TestDSAMetadataKernels(CustomTestCase):
             )
 
     def test_decode_matches_eager_reference(self):
-        for real_page_size in (1, 64):
-            with self.subTest(real_page_size=real_page_size):
+        for physical_page_size in (1, 64):
+            with self.subTest(physical_page_size=physical_page_size):
                 self._check_decode(
                     [1, 7, 65, 513],
                     max_len=769,
                     dsa_index_topk=64,
-                    real_page_size=real_page_size,
+                    physical_page_size=physical_page_size,
                 )
 
     def test_target_verify_matches_eager_reference(self):
-        for real_page_size, fill_ctx_lens in ((1, False), (64, True)):
+        for physical_page_size, fill_ctx_lens in ((1, False), (64, True)):
             with self.subTest(
-                real_page_size=real_page_size, fill_ctx_lens=fill_ctx_lens
+                physical_page_size=physical_page_size, fill_ctx_lens=fill_ctx_lens
             ):
                 self._check_target_verify(
                     [5, 63, 128],
                     max_seqlen_k=257,
                     dsa_index_topk=64,
-                    real_page_size=real_page_size,
+                    physical_page_size=physical_page_size,
                     next_n=4,
                     fill_ctx_lens=fill_ctx_lens,
                 )
@@ -409,7 +414,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             [4, 4, 4],
             max_seqlen_k=193,
             dsa_index_topk=64,
-            real_page_size=1,
+            physical_page_size=1,
             max_extend_len=4,
             max_total_len=12,
             static_extend_len=True,
@@ -423,7 +428,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             [3, 5, 2],
             max_seqlen_k=193,
             dsa_index_topk=64,
-            real_page_size=64,
+            physical_page_size=64,
             max_extend_len=5,
             max_total_len=10,
             static_extend_len=False,
@@ -435,7 +440,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             [3, 5, 2],
             max_seqlen_k=193,
             dsa_index_topk=64,
-            real_page_size=64,
+            physical_page_size=64,
             max_extend_len=5,
             max_total_len=16,
             static_extend_len=False,
@@ -446,13 +451,13 @@ class TestDSAMetadataKernels(CustomTestCase):
             [],
             max_len=8,
             dsa_index_topk=64,
-            real_page_size=64,
+            physical_page_size=64,
         )
         self._check_target_verify(
             [],
             max_seqlen_k=8,
             dsa_index_topk=64,
-            real_page_size=64,
+            physical_page_size=64,
             next_n=4,
             fill_ctx_lens=True,
         )
@@ -461,7 +466,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             [],
             max_seqlen_k=8,
             dsa_index_topk=64,
-            real_page_size=64,
+            physical_page_size=64,
             max_extend_len=1,
             max_total_len=0,
             static_extend_len=True,
@@ -473,13 +478,13 @@ class TestDSAMetadataKernels(CustomTestCase):
             [1_000_000, 999_983],
             max_len=max_len,
             dsa_index_topk=4096,
-            real_page_size=64,
+            physical_page_size=64,
         )
         self._check_target_verify(
             [1_000_000],
             max_seqlen_k=max_len,
             dsa_index_topk=4096,
-            real_page_size=64,
+            physical_page_size=64,
             next_n=2,
             fill_ctx_lens=True,
         )
@@ -488,7 +493,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             [4],
             max_seqlen_k=max_len,
             dsa_index_topk=4096,
-            real_page_size=64,
+            physical_page_size=64,
             max_extend_len=4,
             max_total_len=4,
             static_extend_len=True,
@@ -501,13 +506,13 @@ class TestDSAMetadataKernels(CustomTestCase):
             seq_lens,
             max_len=1,
             dsa_index_topk=64,
-            real_page_size=1,
+            physical_page_size=1,
         )
         self._check_target_verify(
             seq_lens,
             max_seqlen_k=1,
             dsa_index_topk=64,
-            real_page_size=1,
+            physical_page_size=1,
             next_n=1,
             fill_ctx_lens=False,
         )
@@ -516,7 +521,7 @@ class TestDSAMetadataKernels(CustomTestCase):
             [1] * bs,
             max_seqlen_k=1,
             dsa_index_topk=64,
-            real_page_size=1,
+            physical_page_size=1,
             max_extend_len=1,
             max_total_len=bs,
             static_extend_len=True,

@@ -21,9 +21,11 @@
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
+import re
 import types
+from array import array
 from functools import partial
-from itertools import chain
+from itertools import chain, groupby
 from typing import (
     Any,
     Callable,
@@ -44,10 +46,12 @@ from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
     MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
@@ -67,7 +71,8 @@ from sglang.srt.models.minicpmv_vit import (
 )
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
-from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
 RawImageType = Union[Image.Image, torch.Tensor]
@@ -570,10 +575,15 @@ class Resampler4_5(BaseResampler):
         return x
 
 
+# 4.6+ ship their own ``model_type``; 4.7 checkpoints still carry a stale
+# numeric ``version``, so ``model_type`` must win.
+_MODEL_TYPE_VERSIONS = {"minicpmv4_6": (4, 6), "minicpmv4_7": (4, 7)}
+
+
 def get_version_by_config(config: PretrainedConfig) -> Tuple[int, ...]:
-    # 4.6 ships its own ``model_type`` instead of a numeric ``version``.
-    if getattr(config, "model_type", None) == "minicpmv4_6":
-        return 4, 6
+    model_type = getattr(config, "model_type", None)
+    if model_type in _MODEL_TYPE_VERSIONS:
+        return _MODEL_TYPE_VERSIONS[model_type]
 
     version_float = getattr(config, "version", None)
 
@@ -983,7 +993,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1149,7 +1159,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1319,7 +1329,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
@@ -1396,7 +1406,8 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        assert self.version == (4, 6)
+        assert self.version in ((4, 6), (4, 7))
+        self.capture_aux_hidden_states = False
         # ``Qwen3_5ForCausalLM`` returns plain hidden states (body only, no LM
         # head, no LogitsProcessor). Add them here so the downstream sampler
         # sees a ``LogitsProcessorOutput``. With ``tie_word_embeddings=True``
@@ -1421,9 +1432,13 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         prefix: str = "",
     ) -> nn.Module:
         # 4.6 nests the LLM config under ``text_config``.
-        return Qwen3_5ForCausalLM(
-            config=config.text_config, quant_config=quant_config, prefix=prefix
+        text_config = config.text_config
+        llm_cls = (
+            Qwen3_5MoeForCausalLM
+            if isinstance(text_config, Qwen3_5MoeTextConfig)
+            else Qwen3_5ForCausalLM
         )
+        return llm_cls(config=text_config, quant_config=quant_config, prefix=prefix)
 
     def forward(
         self,
@@ -1441,9 +1456,21 @@ class MiniCPMV4_6(MiniCPMBaseModel):
             forward_batch=forward_batch,
             **kwargs,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        # Qwen3.5 layers capture their input, i.e. the previous layer's output.
+        self.llm.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def init_vision_module(
         self,
@@ -1499,6 +1526,22 @@ class MiniCPMV4_6(MiniCPMBaseModel):
             result = torch.cat([item.feature for item in items])
             return result.reshape(-1, result.shape[-1])
 
+        # ``use_vit_merger`` is per request, and one batch can mix requests.
+        default = self.config.downsample_mode != "4x"
+        runs = groupby(
+            items,
+            key=lambda item: item.model_specific_data.get("use_vit_merger", default),
+        )
+        return torch.cat(
+            [
+                self._encode_patches(list(run), use_vit_merger)
+                for use_vit_merger, run in runs
+            ]
+        )
+
+    def _encode_patches(
+        self, items: List[MultimodalDataItem], use_vit_merger: bool
+    ) -> torch.Tensor:
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
             flatten_nested_list([item.tgt_size for item in items]), dim=0
@@ -1529,8 +1572,6 @@ class MiniCPMV4_6(MiniCPMBaseModel):
             patch_attn_mask.size(2), device=patch_attn_mask.device
         ).unsqueeze(0) < mask_shapes.unsqueeze(1)
 
-        use_vit_merger = getattr(self.config, "downsample_mode", "16x") != "4x"
-
         vision_embedding, tgt_sizes_out = self.vpm(
             all_pixel_values.type(dtype),
             patch_attention_mask=patch_attn_mask,
@@ -1544,16 +1585,9 @@ class MiniCPMV4_6(MiniCPMBaseModel):
     # source. sglang's dispatcher routes by ``get_{modality}_feature``.
     get_video_feature = get_image_feature
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
-        slice_start_id: int = image_inputs.slice_start_id
-        slice_end_id: int = image_inputs.slice_end_id
-
-        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            media_token_pairs, data_start_token_ids=[im_start_id]
-        )
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
+        # Every thumbnail / slice is its own item; pad each span with its own value.
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -1605,11 +1639,65 @@ class MiniCPMV4_6(MiniCPMBaseModel):
                 weight_loader(param, loaded_weight)
 
 
+# 4.7 checkpoints keep top-level ``llm`` / ``vpm`` / ``resampler`` / ``vit_merger``
+# names and store connector MLPs as ``nn.Sequential``.
+_V4_7_WEIGHT_PREFIXES = (
+    ("llm.model.", "model.language_model."),
+    ("llm.lm_head.", "lm_head."),
+    ("vit_merger.", "model.vision_tower.vit_merger."),
+    ("vpm.", "model.vision_tower."),
+    ("resampler.", "model.merger."),
+)
+
+
+def _v4_7_to_v4_6_weight_name(name: str) -> str:
+    for old, new in _V4_7_WEIGHT_PREFIXES:
+        if name.startswith(old):
+            name = new + name[len(old) :]
+            break
+    name = re.sub(r"^(model\.merger\.mlp\.\d+)\.mlp\.0\.", r"\1.linear_1.", name)
+    return re.sub(r"^(model\.merger\.mlp\.\d+)\.mlp\.2\.", r"\1.linear_2.", name)
+
+
+class MiniCPMV4_7(MiniCPMV4_6):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        rope_parameters = config.text_config.rope_parameters or {}
+        self.is_mrope_enabled = "mrope_section" in rope_parameters
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+        return super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        return super().load_weights(
+            (_v4_7_to_v4_6_weight_name(name), weight) for name, weight in weights
+        )
+
+
 _SUPPORT_VERSION = {
     (2, 6): MiniCPMV2_6,
     (4, 0): MiniCPMV4_0,
     (4, 5): MiniCPMV4_5,
     (4, 6): MiniCPMV4_6,
+    (4, 7): MiniCPMV4_7,
 }
 
 
@@ -1631,8 +1719,8 @@ class MiniCPMV:
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        # 4.6 nests a Qwen3.5 LLM under ``text_config``; every other version
-        # builds a dense LLM, for which the Qwen3.5 gate answers None.
+        # 4.6/4.7 nest a Qwen3.5 config (dense or MoE) under ``text_config``;
+        # older versions are dense, for which the Qwen3.5 gate answers None.
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
             getattr(hf_config, "text_config", hf_config), quant_config
         )
@@ -1645,11 +1733,12 @@ class MiniCPMV:
     ) -> None:
         super().__init__()
 
-        # 4.6 carries ``model_type == "minicpmv4_6"`` instead of a numeric
+        # 4.6+ carry their own ``model_type`` instead of a numeric
         # ``config.version``; older versionless configs keep the legacy
         # ``(2, 6)`` default.
-        if getattr(config, "model_type", None) == "minicpmv4_6":
-            version = (4, 6)
+        model_type = getattr(config, "model_type", None)
+        if model_type in _MODEL_TYPE_VERSIONS:
+            version = _MODEL_TYPE_VERSIONS[model_type]
         elif not hasattr(config, "version"):
             version = (2, 6)
         else:
@@ -1747,7 +1836,30 @@ class MiniCPMV:
 # ``__name__`` — resolves the canonical 4.6 architecture name through
 # ``MiniCPMV``'s version-dispatch factory.
 class MiniCPMV4_6ForConditionalGeneration(MiniCPMV):
+    # Only for the quant config: its ``ignore`` list names modules in either the
+    # HF or the native 4.7 layout (see _V4_7_WEIGHT_PREFIXES), while
+    # load_weights remaps checkpoint names itself.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={"self_attn.out_proj": "self_attn.proj"},
+        orig_to_new_prefix={
+            "model.language_model.": "llm.",
+            "model.vision_tower.": "vpm.",
+            "model.merger.": "resampler.",
+            "llm.model.": "llm.",
+            "llm.lm_head": "lm_head",
+            "vit_merger.": "vpm.vit_merger.",
+        },
+        orig_to_new_suffix={".mlp.0": ".linear_1", ".mlp.2": ".linear_2"},
+    )
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
+
+class MiniCPMV4_7ForConditionalGeneration(MiniCPMV4_6ForConditionalGeneration):
     pass
 
 
-EntryClass = [MiniCPMV, MiniCPMV4_6ForConditionalGeneration]
+EntryClass = [
+    MiniCPMV,
+    MiniCPMV4_6ForConditionalGeneration,
+    MiniCPMV4_7ForConditionalGeneration,
+]
