@@ -128,6 +128,9 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.multimodal.transport.npu_ipc import (
+    current_device as current_transport_device,
+)
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     DPCooperationInfo,
@@ -141,7 +144,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_npu
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -751,7 +754,7 @@ class MultimodalInputs:
                     and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
                 ):
                     if reconstruct_device is None:
-                        reconstruct_device = torch.cuda.current_device()
+                        reconstruct_device = current_transport_device()
                     mm_item.reconstruct(reconstruct_device)
         except BaseException:
             for mm_item in mm_items:
@@ -769,7 +772,11 @@ class MultimodalInputs:
                 try_add_to_buffer,
             )
 
-            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            device = (
+                current_transport_device()
+                if (is_npu() or torch.cuda.is_available())
+                else "cpu"
+            )
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()

@@ -141,8 +141,18 @@ def _encode_cuda_ipc_tensor_proxy(obj: CudaIpcTensorTransportProxy) -> object:
 def _decode_cuda_ipc_tensor_proxy(
     state: dict[str, object],
 ) -> CudaIpcTensorTransportProxy:
+    proxy_state = _from_msgpack_state(state["proxy_state"])
+    ipc_extra = proxy_state.get("ipc_extra") or {}
+    if ipc_extra.get("transport_mode") == "npu_ipc":
+        # The Ascend NPU IPC transport keeps its payload inside ``ipc_extra``
+        # and owns no pool lease, so it is rebuilt as its own proxy class.
+        from sglang.srt.multimodal.transport.npu_ipc import (
+            NpuIpcTensorTransportProxy,
+        )
+
+        return NpuIpcTensorTransportProxy.from_proxy_state(proxy_state)
     obj = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
-    obj.proxy_state = _from_msgpack_state(state["proxy_state"])
+    obj.proxy_state = proxy_state
     obj.reconstruct_tensor = None
     obj.sync_data_meta = _from_msgpack_state(state["sync_data_meta"])
     obj.sync_buffer = None

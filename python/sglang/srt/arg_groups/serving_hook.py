@@ -888,28 +888,42 @@ def handle_multimodal_feature_transport(server_args: Any):
         )
 
     if requested_transport == "cuda_ipc":
-        if not get_platform().is_cuda:
-            raise ValueError("--mm-feature-transport=cuda_ipc requires NVIDIA CUDA.")
+        is_cuda = get_platform().is_cuda
+        if not (is_cuda or get_platform().is_npu):
+            raise ValueError(
+                "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA or Ascend NPU."
+            )
         if cfg.nnodes != 1:
             raise ValueError(
                 "--mm-feature-transport=cuda_ipc only supports a single node."
             )
 
-        pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
         logger.info(
-            "Using CUDA IPC for multimodal features: reserving up to %d MiB "
-            "on base GPU %d across %d tokenizer worker(s). This reduces KV "
-            "cache headroom; a full pool falls back to CPU transport.",
-            pool_budget_mb,
+            "Using %s for multimodal features on base %s %d across %d "
+            "tokenizer worker(s)%s",
+            "CUDA IPC" if is_cuda else "device IPC (torch_npu memory sharing)",
+            "GPU" if is_cuda else "NPU",
             cfg.base_gpu_id,
             cfg.tokenizer_worker_num,
+            (
+                f"; reserving up to {envs.SGLANG_MM_FEATURE_CACHE_MB.get()} MiB. "
+                "This reduces KV cache headroom; a full pool falls back to CPU "
+                "transport."
+                if is_cuda
+                else " (no feature pool; features stay on device)."
+            ),
         )
-        logger.info(
-            "CUDA IPC pool-handle caching is %s. It reuses mappings to the "
-            "existing bounded pool without reserving another pool; set "
-            "SGLANG_USE_IPC_POOL_HANDLE_CACHE=0 to disable it.",
-            ("enabled" if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get() else "disabled"),
-        )
+        if is_cuda:
+            logger.info(
+                "CUDA IPC pool-handle caching is %s. It reuses mappings to the "
+                "existing bounded pool without reserving another pool; set "
+                "SGLANG_USE_IPC_POOL_HANDLE_CACHE=0 to disable it.",
+                (
+                    "enabled"
+                    if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+                    else "disabled"
+                ),
+            )
 
     declare_resolution(
         server_args,

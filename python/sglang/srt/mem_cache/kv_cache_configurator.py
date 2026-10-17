@@ -203,7 +203,10 @@ def mm_runtime_reservation_gb(
     if not is_multimodal:
         return 0.0
     reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
-    if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+    # Ascend NPU transports features through reduce_tensor/rebuild memory
+    # sharing and reserves no pool, so the budget must not be taken from the
+    # KV pool there.
+    if mm_feature_transport in ("cuda_ipc", "cuda_vmm") and not _is_npu:
         reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
     if reserved_mb > 0:
         logger.info(

@@ -86,6 +86,9 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.multimodal.transport.npu_ipc import (
+    current_device as current_transport_device,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
@@ -1483,9 +1486,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         device = self.visual.device
         device_index = device.index
-        if device.type == "cuda" and device_index is None:
-            device_index = torch.cuda.current_device()
-        if device.type == "cuda":
+        is_ipc_like_device = device.type in ("cuda", "npu")
+        if is_ipc_like_device and device_index is None:
+            device_index = current_transport_device()
+        if is_ipc_like_device:
             parallel = get_parallel()
             consumer_count = max(parallel.tp_size, 1)
 
@@ -1494,7 +1498,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         feature_offset = 0
         for index in indices:
             item = items[index]
-            if device.type == "cuda":
+            if is_ipc_like_device:
                 proxy = item.feature
                 model_specific_data = getattr(item, "model_specific_data", {})
                 pending_copy = model_specific_data.pop(
