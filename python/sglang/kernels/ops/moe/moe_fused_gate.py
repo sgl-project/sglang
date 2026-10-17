@@ -354,6 +354,7 @@ def moe_fused_gate(
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
+    router_stream_overlap: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -367,6 +368,8 @@ def moe_fused_gate(
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
     ``sqrtsoftplus_log1p`` evaluates sqrtsoftplus through ``log1p`` and ranks NaNs first
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
+    ``router_stream_overlap`` enables the small-router SM103 PDL exception when
+    the caller configures auxiliary streams for concurrent mHC/shared-expert work.
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
     """
@@ -466,7 +469,14 @@ def moe_fused_gate(
     num_warps = 1 if BLOCK_N <= 512 else 4
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
-    if use_pdl and scoring_func_int == 1 and N == 384 and K == 6 and M <= 8:
+    if (
+        use_pdl
+        and router_stream_overlap
+        and scoring_func_int == 1
+        and N == 384
+        and K == 6
+        and M <= 8
+    ):
         # On SM103, early-launching the small DSV4.1 target router increases
         # latency when it overlaps with mHC/shared-expert work. Use ordinary
         # stream dependencies; keep PDL for the draft router and larger batches.

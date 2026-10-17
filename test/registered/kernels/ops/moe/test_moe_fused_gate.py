@@ -15,7 +15,9 @@ tie-break choice) does not matter.
 
 from __future__ import annotations
 
+import importlib
 import sys
+from types import SimpleNamespace
 from typing import Tuple
 
 import pytest
@@ -102,6 +104,57 @@ def _make_inputs(M: int, num_experts: int, seed: int):
     scores = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
     bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
     return scores, bias
+
+
+@pytest.mark.parametrize(
+    "batch,overlap,arch,expected_pdl",
+    [
+        (1, False, (10, 3), True),
+        (8, False, (10, 3), True),
+        (1, True, (10, 3), False),
+        (8, True, (10, 3), False),
+        (9, True, (10, 3), True),
+        (1, True, (10, 0), True),
+    ],
+)
+def test_small_router_pdl_requires_stream_overlap(
+    monkeypatch, batch, overlap, arch, expected_pdl
+):
+    """The V4-Pro router shape must retain PDL without auxiliary stream overlap."""
+    module = importlib.import_module("sglang.kernels.ops.moe.moe_fused_gate")
+    kernel = module._router_triton_kernel
+    launches = []
+
+    class LaunchRecorder:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((kwargs["USE_PDL"], kwargs.get("launch_pdl", False)))
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(module, "_router_triton_kernel", LaunchRecorder())
+    monkeypatch.setattr(module, "is_arch_support_pdl", lambda: True)
+    monkeypatch.setattr(
+        module,
+        "get_jit_cuda_arch",
+        lambda: SimpleNamespace(major=arch[0], minor=arch[1]),
+    )
+    scores, bias = _make_inputs(batch, 384, seed=42)
+    kwargs = {"router_stream_overlap": True} if overlap else {}
+    weights, indices = moe_fused_gate(
+        scores, bias, topk=6, scoring_func="sqrtsoftplus", **kwargs
+    )
+    ref_weights, ref_indices = _reference_gate(
+        scores, bias, 6, "sqrtsoftplus", 0, True, 1.0, False
+    )
+    torch.testing.assert_close(
+        _scatter_by_expert(weights, indices, 384),
+        _scatter_by_expert(ref_weights, ref_indices, 384),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert launches == [(expected_pdl, expected_pdl)]
 
 
 # Keep CI coverage representative without exploding into a large cartesian grid.
