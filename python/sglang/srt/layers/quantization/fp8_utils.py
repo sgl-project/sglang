@@ -2381,6 +2381,36 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     return _use_aiter and output_size % 64 == 0
 
 
+def apply_fp8_linear_deterministic(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Static FP8 linear with one reduction schedule across batch sizes."""
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+    # The regular heuristic changes BLOCK_K with M. Keep the K reduction and
+    # output tiling fixed so cold prefill and prefix-cache hits agree.
+    output = triton_scaled_mm(
+        qinput,
+        weight,
+        x_scale,
+        weight_scale,
+        input.dtype,
+        bias,
+        block_size_m=32,
+        block_size_n=64,
+        block_size_k=128,
+        use_heuristic=False,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output.view(*output_shape)
+
+
 def apply_fp8_linear_bmm_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
