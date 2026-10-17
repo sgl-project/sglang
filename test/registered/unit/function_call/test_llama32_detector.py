@@ -93,6 +93,13 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "The weather is nice today.")
 
+    def test_non_tool_json_object_preserved(self):
+        text = '{"answer": 42, "reason": "computed"}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, '{"answer": 42, "reason": "computed"}')
+
+
     def test_multiple_json_objects(self):
         text = '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Beijing"}};{"name": "search", "arguments": {"query": "restaurants"}}'
         result = self.detector.detect_and_parse(text, self.tools)
