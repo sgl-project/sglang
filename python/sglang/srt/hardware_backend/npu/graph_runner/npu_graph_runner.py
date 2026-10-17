@@ -361,6 +361,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     bs=self.bs,
                     raw_bs=self.raw_bs,
                     num_tokens=self.bs * self.captured_req_width,
+                    global_num_tokens_cpu=self._global_num_tokens_for_graph(
+                        self.bs * self.captured_req_width
+                    ),
                     seq_len_fill_value=self.seq_len_fill_value,
                     capture_forward_mode=self.capture_forward_mode,
                     is_encoder_decoder=self.is_encoder_decoder,
