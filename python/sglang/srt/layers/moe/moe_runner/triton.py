@@ -67,6 +67,9 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # The down projection's scale block when it differs from block_shape: a TP
+    # shard that splits checkpoint blocks refines only the split dimension.
+    w2_block_shape: Optional[List[int]] = None
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
@@ -171,6 +174,7 @@ class TritonRunnerCore(MoeRunnerCore):
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            w2_block_shape=quant_info.w2_block_shape,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -257,6 +261,7 @@ def fused_experts_none_to_triton(
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            w2_block_shape=quant_info.w2_block_shape,
         )
 
     return StandardCombineInput(
@@ -305,6 +310,7 @@ def pre_permute_standard_to_triton(
         use_int4_w4a16=quant_info.use_int4_w4a16,
         per_channel_quant=quant_info.per_channel_quant,
         block_shape=quant_info.block_shape,
+        w2_block_shape=quant_info.w2_block_shape,
     )
 
     running_state["config"] = config
