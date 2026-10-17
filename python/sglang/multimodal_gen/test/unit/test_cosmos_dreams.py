@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos_dreams import (
+    CosmosDreamsRolloutStage,
     _history_view,
     actions_for_frames,
     append_kv_history,
@@ -69,6 +70,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resolve_geometry,
     sde_step_generator,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
@@ -1060,6 +1062,26 @@ class TestCosmosDreamsUnifiedContract(unittest.TestCase):
 
 
 class TestCosmosDreamsInferenceProfile(unittest.TestCase):
+    def test_offloaded_vae_uses_serial_decode(self):
+        with mock.patch.object(ServerArgs, "__post_init__", lambda self: None):
+            args = ServerArgs(model_path="unused", pipeline_config=CosmosDreamsConfig())
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.server_args = args
+        stage.overlap_vae_decode = True
+        for mode in ("component-offload", "snapshot-offload", "layerwise-offload"):
+            with self.subTest(mode=mode):
+                args.component_residency = {"vae": mode}
+                self.assertIsNone(stage._decode_queue(torch.device("cuda")))
+                self.assertEqual(
+                    [use.component_name for use in stage.component_uses(args)],
+                    ["transformer"],
+                )
+        args.component_residency = {"vae": "resident"}
+        self.assertEqual(
+            [use.component_name for use in stage.component_uses(args)],
+            ["transformer", "vae"],
+        )
+
     """Per-chunk sigma schedules and history length are deployment settings the
     artifact does not carry; the defaults must not change the exported rollout
     except for keeping the whole-clip history training used."""

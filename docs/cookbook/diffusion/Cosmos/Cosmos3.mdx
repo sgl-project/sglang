@@ -157,6 +157,10 @@ Transfer-Auto and Sim-Auto take a `multiview` object with `views`, each containi
 also accept `lidar`; set `lidar.decode=true` to return decoded range maps and previews.
 Outputs pack all frames of each camera consecutively, in request camera order.
 
+LiDAR uses built-in compiled FlexAttention by default. The optional NATTEN path
+requires a wheel matching your PyTorch/CUDA versions and
+`SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN=1`; it is not installed by default.
+
 Bimanual and Sim-Transfer support TP, but not SP or CFG parallelism. Transfer-Auto
 supports Ulysses without TP or Ring; Sim-Auto supports TP and Ulysses subject to
 the checkpoint's query/KV head divisibility, but not Ring or CFG parallelism.
