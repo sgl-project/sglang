@@ -134,9 +134,17 @@ class ExecFeatures(msgspec.Struct):
         "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
-        bool,
-        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
+            "for supported configurations. Not numerically equivalent to full "
+            "prefill; requests for prompt logprobs compute every prompt row. Use "
+            "--no-enable-decoder-swa-bounded-replay to retain full prefill, e.g. "
+            "for RL rollouts whose logprobs must match the trainer.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -352,8 +360,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
-                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "Skipped ops use FlashInfer's heuristic fallback."
             ),
             nargs="+",
         ),
