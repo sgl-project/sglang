@@ -158,7 +158,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
-    rollout_transition,
+    rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -1343,7 +1343,7 @@ class DenoisingStage(PipelineStage):
             {
                 "generator": batch.generator,
                 "eta": batch.eta,
-                "transition": rollout_transition(batch),
+                **rollout_step_kwargs(batch),
             },
         )
 
@@ -2124,7 +2124,7 @@ class DenoisingStage(PipelineStage):
             batch=batch,
             latents=ctx.latents,
             num_inference_steps=len(timesteps_cpu),
-            final_timestep=timesteps_cpu.new_zeros(()),
+            final_timestep=ctx.timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,
         )
         self._finalize_denoising_loop(ctx, batch, server_args)

@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
-    rollout_transition,
+    rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -1902,7 +1902,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     model_video,
                     step.t_device,
                     ctx.latents,
-                    transition=rollout_transition(batch),
+                    **rollout_step_kwargs(batch),
                     return_dict=False,
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
