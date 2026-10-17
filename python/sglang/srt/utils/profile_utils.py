@@ -19,6 +19,10 @@ from sglang.srt.model_executor.step_span_utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.field_validators import (
+    get_contained_path,
+    validate_filename_component,
+)
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
@@ -106,6 +110,15 @@ class ProfileManager:
         detailed_annotations: bool = False,
     ):
         self.detailed_annotations = detailed_annotations
+        try:
+            validate_filename_component(profile_prefix, "profile_prefix")
+            validate_filename_component(profile_id, "profile_id")
+            if profile_stages:
+                for stage in profile_stages:
+                    validate_filename_component(stage, "profile_stage")
+        except ValueError as e:
+            return ProfileReqOutput(success=False, message=str(e))
+
         # not supported yet
         assert start_step is None
         assert profile_by_stage, (
@@ -371,9 +384,8 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 + ".trace.json.gz"
             )
 
-            self.torch_profiler.export_chrome_trace(
-                os.path.join(self.output_dir, filename)
-            )
+            trace_path = get_contained_path(self.output_dir, filename)
+            self.torch_profiler.export_chrome_trace(trace_path)
         torch.distributed.barrier(self.cpu_group)
 
         # TODO: migrate `_merge_profile_traces`
