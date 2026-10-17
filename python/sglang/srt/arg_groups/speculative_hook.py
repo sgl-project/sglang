@@ -158,6 +158,19 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
+    # EAGLE/NEXTN to FROZEN_KV_MTP.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm})"
+        )
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(

@@ -61,6 +61,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
+    # skips cached-row compression for replay rows folded into the extend.
+    folds_encoder_swa_replay: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set
@@ -84,6 +87,12 @@ class AttentionBackend(ABC):
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
     kv_index_translator = None
+
+    def get_fused_kv_write_buffers(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
