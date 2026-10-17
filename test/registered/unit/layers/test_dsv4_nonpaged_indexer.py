@@ -2,6 +2,7 @@ import sys
 import unittest
 from itertools import product
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -775,7 +776,17 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                     self.assertEqual(result, 4096)
                     budget.assert_called_once_with(device_index=0, allow_sync=True)
 
-    def _build(self, *, num_rows: int, budget, use_topk_v2: bool):
+    def _build(
+        self,
+        *,
+        num_rows: int,
+        budget,
+        use_topk_v2: bool,
+        torch_fallback: bool = False,
+        sm120: bool = False,
+        hip: bool = False,
+        budget_mock: Optional[MagicMock] = None,
+    ):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=MagicMock(
@@ -788,13 +799,15 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         )
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_fallback),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
-            patch(f"{_METADATA}.is_hip", return_value=False),
+            patch(f"{_METADATA}.is_hip", return_value=hip),
             patch(f"{_METADATA}.is_xpu", return_value=False),
-            patch(f"{_METADATA}._IS_SM120", False),
+            patch(f"{_METADATA}._IS_SM120", sm120),
             patch.object(
-                PagedIndexerMetadata, "_mqa_logits_budget", return_value=budget
+                PagedIndexerMetadata,
+                "_mqa_logits_budget",
+                budget_mock or MagicMock(return_value=budget),
             ),
             patch(
                 "sglang.kernels.ops.attention.dsv4.plan_topk_v2",
@@ -866,6 +879,154 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         self.assertIsInstance(metadata.deep_gemm_metadata, torch.Tensor)
         deep_gemm.get_paged_mqa_logits_metadata.assert_called_once()
         plan_topk_v2.assert_called_once()
+
+    def test_torch_fallback_plans_rows_without_schedules(self):
+        # SGLANG_FP8_PAGED_MQA_LOGITS_TORCH (set by default on SM120) builds no
+        # DeepGEMM schedule, but the logits still need the budget's row chunks.
+        num_rows, budget = 4096, 512 << 20
+        metadata, deep_gemm, plan_topk_v2 = self._build(
+            num_rows=num_rows, budget=budget, use_topk_v2=True, torch_fallback=True
+        )
+        expected_rows = mqa_logits_rows_per_chunk(
+            num_rows=num_rows,
+            row_bytes=mqa_logits_row_bytes(_ISSUE_ALIGNED_COLS),
+            budget_bytes=budget,
+        )
+        chunks = list(iter_row_chunks(num_rows=num_rows, rows_per_chunk=expected_rows))
+        self.assertGreater(len(chunks), 1)
+        self.assertIsNone(metadata.deep_gemm_metadata)
+        deep_gemm.get_paged_mqa_logits_metadata.assert_not_called()
+        self.assertEqual(metadata.rows_per_chunk, expected_rows)
+        self.assertEqual(metadata.mqa_logits_budget_bytes, budget)
+        self.assertEqual(metadata.row_chunks(), [(rows, None) for rows in chunks])
+        self.assertEqual(len(metadata.topk_metadata_chunks), len(chunks))
+        plan_rows = [call.args[0] for call in plan_topk_v2.call_args_list]
+        self.assertEqual(
+            [r.shape[0] for r in plan_rows[1:]], [c.stop - c.start for c in chunks]
+        )
+
+    def test_torch_fallback_takes_the_sm120_row_cap(self):
+        num_rows = 5000
+        metadata, deep_gemm, _ = self._build(
+            num_rows=num_rows,
+            budget=None,
+            use_topk_v2=False,
+            torch_fallback=True,
+            sm120=True,
+        )
+        self.assertIsNone(metadata.deep_gemm_metadata)
+        deep_gemm.get_paged_mqa_logits_metadata.assert_not_called()
+        self.assertEqual(metadata.rows_per_chunk, 4096)
+        self.assertEqual(
+            [rows for rows, _ in metadata.row_chunks()],
+            [slice(0, 4096), slice(4096, num_rows)],
+        )
+
+    def test_hip_without_deep_gemm_metadata_keeps_the_single_call(self):
+        budget = MagicMock(return_value=512 << 20)
+        metadata, deep_gemm, _ = self._build(
+            num_rows=4096,
+            budget=None,
+            use_topk_v2=False,
+            hip=True,
+            budget_mock=budget,
+        )
+        self.assertIsNone(metadata.deep_gemm_metadata)
+        self.assertIsNone(metadata.rows_per_chunk)
+        self.assertIsNone(metadata.mqa_logits_budget_bytes)
+        budget.assert_not_called()
+        deep_gemm.get_paged_mqa_logits_metadata.assert_not_called()
+
+
+class TestPagedIndexerRowChunkLoop(CustomTestCase):
+    """The paged C4 indexer scores the metadata's row chunks one call at a time,
+    also when the kernel takes no DeepGEMM schedule (TileLang, torch)."""
+
+    def _run(self, *, rows_per_chunk: Optional[int]):
+        num_rows, cols = 5, 128
+        page_table = torch.zeros((num_rows, 2), dtype=torch.int32)
+        c4_seq_lens = torch.arange(1, num_rows + 1, dtype=torch.int32)
+        page_indices = torch.full((num_rows, 512), -1, dtype=torch.int32)
+
+        indexer_metadata = object.__new__(PagedIndexerMetadata)
+        indexer_metadata.page_size = 256
+        indexer_metadata.compressed_page_size = 64
+        indexer_metadata.page_table = page_table
+        indexer_metadata.compressed_seq_lens = c4_seq_lens
+        indexer_metadata.topk_metadata = torch.empty((0,))
+        indexer_metadata.deep_gemm_metadata = None
+        indexer_metadata.rows_per_chunk = rows_per_chunk
+        indexer_metadata.topk_metadata_chunks = None
+
+        backend = C4IndexerBackendMixin()
+        backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=MagicMock(
+                return_value=torch.zeros((3, 64 * 132), dtype=torch.uint8)
+            )
+        )
+        backend.forward_metadata = SimpleNamespace(
+            indexer_metadata=indexer_metadata,
+            core_metadata=SimpleNamespace(
+                positions=torch.arange(num_rows, dtype=torch.int64),
+                page_table=page_table,
+                c4_sparse_page_indices=page_indices,
+                c4_sparse_raw_indices=None,
+            ),
+        )
+        backend.hisparse_coordinator = None
+        backend._forward_prepare_normal = MagicMock(
+            return_value=(
+                torch.zeros((num_rows, 2, 128)),
+                torch.ones((num_rows, 2, 1)),
+            )
+        )
+        backend._get_nonpaged_indexer_plan = MagicMock(return_value=None)
+
+        def logits_for(q, *_):
+            return torch.zeros((q.shape[0], cols), dtype=torch.float32)
+
+        with (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+            patch(f"{_INDEXER}.get_global_indexer_capturer", return_value=None),
+            patch(
+                f"{_INDEXER}.get_platform",
+                return_value=SimpleNamespace(is_sm120=False),
+            ),
+            patch(
+                f"{_INDEXER}.fp8_paged_mqa_logits_torch", side_effect=logits_for
+            ) as logits_fn,
+            patch(f"{_INDEXER}.topk_transform_paged") as topk,
+        ):
+            backend.forward_c4_indexer(
+                x=torch.empty((num_rows, 1)),
+                q_lora=torch.empty((num_rows, 1)),
+                c4_indexer=SimpleNamespace(use_fp4_indexer=False, layer_id=0),
+                forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+            )
+        return logits_fn, topk, c4_seq_lens
+
+    def test_rows_per_chunk_without_schedules_runs_one_call_per_chunk(self):
+        logits_fn, topk, c4_seq_lens = self._run(rows_per_chunk=2)
+        expected = [slice(0, 2), slice(2, 4), slice(4, 5)]
+        self.assertEqual(logits_fn.call_count, len(expected))
+        self.assertEqual(topk.call_count, len(expected))
+        for call, rows in zip(logits_fn.call_args_list, expected):
+            self.assertEqual(call.args[0].shape[0], rows.stop - rows.start)
+            torch.testing.assert_close(call.args[3], c4_seq_lens[rows])
+            self.assertIsNone(call.args[5])
+        for call, rows in zip(topk.call_args_list, expected):
+            self.assertEqual(call.args[0].shape[0], rows.stop - rows.start)
+            torch.testing.assert_close(call.args[1], c4_seq_lens[rows])
+
+    def test_no_plan_keeps_the_single_call(self):
+        logits_fn, topk, c4_seq_lens = self._run(rows_per_chunk=None)
+        logits_fn.assert_called_once()
+        topk.assert_called_once()
+        torch.testing.assert_close(logits_fn.call_args.args[3], c4_seq_lens)
 
 
 class TestChunkedTopKMatchesUnchunked(CustomTestCase):
