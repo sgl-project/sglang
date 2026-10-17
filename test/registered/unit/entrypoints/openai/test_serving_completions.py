@@ -107,6 +107,21 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
 
+    def test_cache_id_and_load_cache_id_pass_through(self):
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=1,
+            cache_id="doc-42",
+            load_cache_id="doc-42",
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.cache_id, "doc-42")
+        self.assertEqual(internal.load_cache_id, "doc-42")
+        # The tokenizer manager forwards only cache_salt to the scheduler.
+        internal.normalize_batch_and_arguments()
+        self.assertEqual(internal.cache_salt, "doc-42")
+
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
             model="x",
