@@ -2854,6 +2854,49 @@ class TestGptOssDetector(unittest.TestCase):
         )
         self.assertFalse(self.detector.has_tool_call("no tool call here"))
 
+    def test_streaming_commentary_prefix_does_not_leak_or_drop_answer(self):
+        tool_call = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|constrain|>json<|message|>{"city":"SF"}<|call|>'
+        )
+        call_result = self.detector.parse_streaming_increment(tool_call, self.tools)
+        self.assertEqual(len(call_result.calls), 1)
+
+        self.assertEqual(
+            self.detector.parse_streaming_increment("comment", self.tools).normal_text,
+            "",
+        )
+        self.assertEqual(
+            self.detector.parse_streaming_increment("ary", self.tools).normal_text,
+            "",
+        )
+
+        normal_text = ""
+        for chunk in [
+            "<|start|>assistant<|channel|>final<|message|>",
+            "Co",
+            "mpare prices.",
+            "<|return|>",
+        ]:
+            normal_text += (
+                self.detector.parse_streaming_increment(chunk, self.tools).normal_text
+                or ""
+            )
+        self.assertEqual(normal_text, "Compare prices.")
+
+    def test_finish_flushes_unresolved_post_tool_prefix(self):
+        tool_call = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|constrain|>json<|message|>{"city":"SF"}<|call|>'
+        )
+        detector = GptOssDetector()
+        detector.parse_streaming_increment(tool_call, self.tools)
+        pending = detector.parse_streaming_increment("Co", self.tools)
+        self.assertEqual(pending.normal_text or "", "")
+
+        finished = detector.finish(self.tools)
+        self.assertEqual(finished.normal_text, "Co")
+
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
 
