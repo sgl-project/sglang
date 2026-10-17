@@ -1032,6 +1032,8 @@ class DSV4Metadata:
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
     prefill_shared_reads_snapshotted: bool = False
 
+    deep_gemm_prefill_geometry: dict = field(default_factory=dict)
+
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
     # Captured with the late layers on a tail block (decoder SWA bounded replay
@@ -1053,6 +1055,7 @@ class DSV4Metadata:
         )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.deep_gemm_prefill_geometry.clear()
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -1085,6 +1088,7 @@ class DSV4Metadata:
             )
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
+        self.deep_gemm_prefill_geometry.clear()
 
 
 @dataclass
@@ -3661,6 +3665,7 @@ class DeepseekV4AttnBackend(
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),
+            geometry_cache=self.forward_metadata.deep_gemm_prefill_geometry,
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):

@@ -158,9 +158,33 @@ def get_deep_gemm_decode_data(
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
-def get_deep_gemm_prefill_data(
+class DeepGEMMPrefillGeometry(msgspec.Struct, frozen=True):
+    """The batch-only part of the flattened-K prefill data, shared by the
+    indexer layers of one forward at the same compress ratio."""
+
+    compress_ratio: int
+    positions: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens_cpu: List[int]
+    rows_per_request: List[int]
+    lens_per_request: List[int]
+    k_slots: torch.Tensor
+    request_starts: torch.Tensor
+    compress_lens: torch.Tensor
+
+    def matches(self, inputs: PrefillInputs) -> bool:
+        return (
+            self.compress_ratio == inputs.compress_ratio
+            and self.positions is inputs.positions
+            and self.req_pool_indices is inputs.req_pool_indices
+            and self.seq_lens_cpu == inputs.seq_lens_cpu
+            and self.rows_per_request == inputs.rows_per_request
+        )
+
+
+def build_deep_gemm_prefill_geometry(
     inputs: PrefillInputs, req_to_token: torch.Tensor
-) -> Optional[DeepGEMMPrefillData]:
+) -> Optional[DeepGEMMPrefillGeometry]:
     """None when the chunk has no row or no visible compressed position."""
     ratio = inputs.compress_ratio
     pos = inputs.positions
@@ -184,23 +208,48 @@ def get_deep_gemm_prefill_data(
     )
     position = torch.arange(columns, device=device) - starts_dev[request]
     pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
-    q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=inputs.indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
+    return DeepGEMMPrefillGeometry(
+        compress_ratio=ratio,
         positions=pos,
-    )
-    return DeepGEMMPrefillData(
+        req_pool_indices=inputs.req_pool_indices,
+        seq_lens_cpu=inputs.seq_lens_cpu,
+        rows_per_request=inputs.rows_per_request,
+        lens_per_request=lens_per_request,
         k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
         request_starts=torch.repeat_interleave(
             starts_dev.to(torch.int32),
             inputs.rows_per_request_device.to(torch.int64),
             output_size=num_tokens,
         ),
-        lens_per_request=lens_per_request,
-        rows_per_request=inputs.rows_per_request,
         compress_lens=((pos + 1) // ratio).to(torch.int32),
+    )
+
+
+def get_deep_gemm_prefill_data(
+    inputs: PrefillInputs, req_to_token: torch.Tensor
+) -> Optional[DeepGEMMPrefillData]:
+    """None when the chunk has no row or no visible compressed position."""
+    cache = inputs.geometry_cache
+    geometry = cache.get(inputs.compress_ratio) if cache is not None else None
+    if geometry is None or not geometry.matches(inputs):
+        geometry = build_deep_gemm_prefill_geometry(inputs, req_to_token)
+        if cache is not None and geometry is not None:
+            cache[inputs.compress_ratio] = geometry
+    if geometry is None:
+        return None
+    q_fp4, q_sf, weights = _index_q_and_weights(
+        indexer=inputs.indexer,
+        x=inputs.x,
+        q_lora=inputs.q_lora,
+        freqs_cis=inputs.freqs_cis,
+        positions=inputs.positions,
+    )
+    return DeepGEMMPrefillData(
+        k_slots=geometry.k_slots,
+        request_starts=geometry.request_starts,
+        lens_per_request=geometry.lens_per_request,
+        rows_per_request=inputs.rows_per_request,
+        compress_lens=geometry.compress_lens,
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
