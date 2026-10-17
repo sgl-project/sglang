@@ -2369,6 +2369,61 @@ class TestQwen3CoderDetector(unittest.TestCase):
         ]
         self.detector = Qwen3CoderDetector()
 
+    def test_streaming_preserves_tags_outside_tool_calls(self):
+        texts = [
+            "The format is <parameter=location>Boston</parameter> okay?",
+            "Example: <function=get_current_weather></function>.",
+            "Closing tags: </function> </parameter> </tool_call>.",
+            "Incomplete syntax: <function= and <parameter=",
+        ]
+        for text in texts:
+            for split in range(len(text) + 1):
+                with self.subTest(text=text, split=split):
+                    detector = Qwen3CoderDetector()
+                    results = [
+                        detector.parse_streaming_increment(chunk, self.tools)
+                        for chunk in (text[:split], text[split:])
+                    ]
+                    self.assertEqual("".join(r.normal_text for r in results), text)
+                    self.assertEqual([c for r in results for c in r.calls], [])
+
+    def test_streaming_tags_around_multiple_tool_calls(self):
+        prefix = "Example: <function=get_current_weather></function>. "
+        suffix = " Use <parameter=location>Boston</parameter>. </tool_call>"
+        text = (
+            prefix
+            + "<tool_call><function=get_current_weather>"
+            + "<parameter=location>Paris</parameter></function></tool_call>"
+            + "<tool_call><function=sql_interpreter>"
+            + "<parameter=query>SELECT 1</parameter></function></tool_call>"
+            + suffix
+        )
+        for chunk_size in (1, 2, 7, len(text)):
+            with self.subTest(chunk_size=chunk_size):
+                detector = Qwen3CoderDetector()
+                results = [
+                    detector.parse_streaming_increment(
+                        text[i : i + chunk_size], self.tools
+                    )
+                    for i in range(0, len(text), chunk_size)
+                ]
+                self.assertEqual(
+                    "".join(r.normal_text for r in results), prefix + suffix
+                )
+                calls = [c for r in results for c in r.calls]
+                self.assertEqual(
+                    [(c.tool_index, c.name) for c in calls if c.name],
+                    [(0, "get_current_weather"), (1, "sql_interpreter")],
+                )
+                for index, expected in enumerate(
+                    ({"location": "Paris"}, {"query": "SELECT 1"})
+                ):
+                    arguments = "".join(
+                        c.parameters for c in calls if c.tool_index == index
+                    )
+                    self.assertEqual(json.loads(arguments), expected)
+                self.assertTrue(all(c.tool_index >= 0 for c in calls))
+
     # ==================== Basic Functionality Tests ====================
 
     def test_plain_text_only(self):
