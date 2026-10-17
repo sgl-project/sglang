@@ -313,7 +313,12 @@ class VoxtralForConditionalGeneration(nn.Module):
         for waveform in audio_waveforms:
             waveform = waveform.to(device=device, dtype=torch.float32)
             n_samples = waveform.shape[-1]
-            target_samples = chunk_samples * math.ceil(n_samples / chunk_samples)
+            # An empty waveform still occupies one chunk of [AUDIO] placeholder
+            # tokens (the processor's token count is at least one chunk), so
+            # encode it as one chunk of silence instead of crashing in stft.
+            target_samples = chunk_samples * max(
+                1, math.ceil(n_samples / chunk_samples)
+            )
             if target_samples > n_samples:
                 waveform = torch.nn.functional.pad(
                     waveform, (0, target_samples - n_samples)
