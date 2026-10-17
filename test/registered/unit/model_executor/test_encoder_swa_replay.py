@@ -171,6 +171,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.encoder_replay = False
         backend.encoder_row_floor = fx.folded.row_floor
+        backend.encoder_keep_rows = fx.folded.keep_rows
         backend.req_to_token = fx.req_to_token
         backend.page_size = 256
         backend.index_topk = 512
@@ -184,15 +185,10 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         )
         return backend
 
-    def test_tail_keeps_its_own_floor_under_fold(self):
-        """A prefix hit with both flags on builds the tail metadata; each tail row
-        is floored one window back or at its request's replay start, whichever is
-        later. It used to take the fold's per-row floor of all folded rows and
-        fail a row-count assert."""
-        fx = _Fixture()
+    def _forward_batch(self, fx):
         fb = fx.folded.batch
         seq_lens = fx.folded_seq_lens()
-        forward_batch = SimpleNamespace(
+        return SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=list(fb.extend_lens),
             seq_lens_cpu=torch.tensor(seq_lens),
@@ -201,11 +197,21 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             out_cache_loc=fb.out_cache_loc,
             positions=fx.folded_positions(),
         )
+
+    def _tail_metadata(self, backend, forward_batch):
         with (
             patch.object(DSV4AttnMetadata, "init_compression_metadata"),
             patch.object(DSV4AttnMetadata, "init_flashmla_related"),
         ):
-            metadata = self._backend(fx)._build_late_layer_tail_metadata(forward_batch)
+            return backend._build_late_layer_tail_metadata(forward_batch)
+
+    def test_tail_keeps_its_own_floor_under_fold(self):
+        """A prefix hit with both flags on builds the tail metadata; each tail row
+        is floored one window back or at its request's replay start, whichever is
+        later. It used to take the fold's per-row floor of all folded rows and
+        fail a row-count assert."""
+        fx = _Fixture()
+        metadata = self._tail_metadata(self._backend(fx), self._forward_batch(fx))
 
         # Tails: the miss's 40 rows, the last 128 of the 158-row hit (from 414,
         # above its replay start 384), and the whole 84-row hit (from 0).
@@ -223,6 +229,39 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         layout = metadata.core_attn_metadata.request_window_layout
         torch.testing.assert_close(layout.lengths, expected.lengths)
         torch.testing.assert_close(layout.indices, expected.indices)
+
+    def test_replay_rows_keep_their_cached_kv(self):
+        """Replay rows rebuild only the SWA window: the extend and its late-layer
+        tail give them the padding slot as write location, so the compressors
+        leave their cached main KV, compressed groups and index keys as written.
+        The fused compressors used to rewrite them on every prefix hit."""
+        fx = _Fixture()
+        fb = fx.folded.batch
+        backend = self._backend(fx)
+        forward_batch = self._forward_batch(fx)
+        replayed = torch.cat(
+            [
+                torch.arange(start, start + n) < prefix
+                for start, n, (_, prefix, _) in zip(
+                    fb.prefix_lens, fb.extend_lens, REQS
+                )
+            ]
+        )
+        expected = fb.out_cache_loc.masked_fill(replayed, 0)
+
+        # The tail holds 98 of the 158-row hit's replay rows and all 64 of the other's.
+        token_indices, _, _ = late_layer_tail_layout(
+            extend_lens_cpu=list(fb.extend_lens),
+            seq_lens_cpu=fx.folded_seq_lens(),
+            tail_len=SWA_WINDOW,
+            device=torch.device("cpu"),
+        )
+        tail_loc = self._tail_metadata(
+            backend, forward_batch
+        ).core_attn_metadata.raw_out_loc
+        self.assertEqual(int((tail_loc == 0).sum()), 98 + 64)
+        torch.testing.assert_close(tail_loc, expected[token_indices])
+        torch.testing.assert_close(backend._cache_write_loc(forward_batch), expected)
 
     def test_short_tail_floors_one_window_back(self):
         """A final chunk shorter than a window reads the rows the previous chunk's
