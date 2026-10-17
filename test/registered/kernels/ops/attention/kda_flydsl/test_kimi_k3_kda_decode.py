@@ -513,13 +513,74 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
         _run(inputs)
 
 
-def test_fused_kda_backend_is_opt_in(monkeypatch):
+def test_fused_kda_backend_is_opt_in():
+    from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override(""):
+        assert not kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
+        assert kda_fused_decode_aiter_hip.enabled()
+
+
+def test_aiter_source_resolves_rocm_aiter_6026_names(monkeypatch):
+    import sys
+    from types import ModuleType
+
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
-    assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
-    assert kda_fused_decode_aiter_hip.enabled()
+    def run(**kwargs):
+        return None
+
+    def supported(device=None):
+        return True
+
+    fake = ModuleType("aiter.ops.flydsl")
+    fake.flydsl_kda_decode_with_f_b = run
+    fake.is_flydsl_kda_decode_supported = supported
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", fake)
+    monkeypatch.setenv("SGLANG_K3_FLYDSL_SOURCE", "aiter")
+    assert kda_fused_decode_aiter_hip._ops() == (run, supported)
+
+    # aiter.ops.flydsl without ROCm/aiter#6026 leaves the fused backend off.
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", ModuleType("aiter.ops.flydsl"))
+    assert kda_fused_decode_aiter_hip._ops() == (None, None)
+
+
+@pytest.mark.parametrize("batch", [1, 8, 16])
+def test_vendored_and_aiter_f_b_decode_agree(batch: int) -> None:
+    flydsl = pytest.importorskip("aiter.ops.flydsl")
+    try:
+        aiter_decode = flydsl.flydsl_kda_decode_with_f_b
+    except AttributeError:
+        pytest.skip("aiter without ROCm/aiter#6026")
+    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+    vendored_inputs = _copy_inputs(seed)
+    aiter_inputs = _copy_inputs(seed)
+
+    vendored = _run_with_f_b(f_a, f_b_weight, vendored_inputs)
+    aiter_out = aiter_decode(
+        f_a=f_a,
+        f_b_weight=f_b_weight,
+        x=aiter_inputs.x,
+        conv_weight=aiter_inputs.conv_weight,
+        conv_bias=None,
+        conv_state=aiter_inputs.conv_state,
+        raw_beta=aiter_inputs.raw_beta,
+        A_log=aiter_inputs.A_log,
+        dt_bias=aiter_inputs.dt_bias,
+        lower_bound=_LOWER_BOUND,
+        state=aiter_inputs.state,
+        state_indices=aiter_inputs.state_indices,
+        output_gate=aiter_inputs.output_gate,
+        norm_weight=aiter_inputs.norm_weight,
+        norm_eps=_NORM_EPS,
+    )
+    torch.cuda.synchronize()
+
+    assert _relative_rmse(vendored, aiter_out) < 1e-3
+    assert _relative_rmse(vendored_inputs.state, aiter_inputs.state) < 1e-3
+    assert torch.equal(vendored_inputs.conv_state, aiter_inputs.conv_state)
 
 
 if __name__ == "__main__":
