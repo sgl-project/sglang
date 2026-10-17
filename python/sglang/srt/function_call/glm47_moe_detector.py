@@ -885,8 +885,15 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
 
             if arg_type == "string":
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
+                # The chat template writes string values raw, so valid JSON
+                # stays literal text. "hello" keeps its quotes.
+                try:
+                    json.loads(arg_value)
+                except (json.JSONDecodeError, ValueError):
+                    if isinstance(parsed_value, str):
+                        arguments[arg_key] = parsed_value
+                    else:
+                        arguments[arg_key] = arg_value
                 else:
                     arguments[arg_key] = arg_value
             elif arg_type is None:
