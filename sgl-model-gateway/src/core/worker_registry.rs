@@ -346,6 +346,7 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
+            worker.retire_metrics();
             worker.set_healthy(false);
             Metrics::remove_worker_metrics(worker.url());
 
@@ -731,8 +732,12 @@ pub struct WorkerRegistryStats {
 mod tests {
     use std::collections::HashMap;
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
     use super::*;
-    use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::core::{
+        circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, DPAwareWorkerBuilder,
+    };
 
     #[test]
     fn test_worker_registry() {
@@ -831,5 +836,92 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    fn render_metrics(f: impl FnOnce()) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    fn assert_gauge(output: &str, name: &str, worker: &str, value: &str) {
+        let line = format!("{name}{{worker=\"{worker}\"}} {value}");
+        assert!(
+            output.lines().any(|l| l == line),
+            "expected `{line}` in:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_removed_worker_metrics_not_overwritten_by_inflight_work() {
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..CircuitBreakerConfig::default()
+        };
+        // A late failure opens the breaker; a late success publishes consecutive successes
+        let workers: Vec<(Arc<dyn Worker>, bool)> = vec![
+            (
+                Arc::new(
+                    BasicWorkerBuilder::new("http://removed:8080")
+                        .circuit_breaker_config(cb_config.clone())
+                        .build(),
+                ),
+                false,
+            ),
+            (
+                Arc::new(
+                    DPAwareWorkerBuilder::new("http://removed-dp:8080", 1, 2)
+                        .circuit_breaker_config(cb_config)
+                        .build(),
+                ),
+                true,
+            ),
+        ];
+
+        for (worker, late_outcome) in workers {
+            let url = worker.url().to_string();
+            let output = render_metrics(|| {
+                let registry = WorkerRegistry::new();
+                let worker_id = registry.register(Arc::clone(&worker));
+                worker.increment_load();
+                worker.circuit_breaker().record_outcome(true);
+
+                registry.remove(&worker_id);
+
+                // A health check and a request that were in flight complete after removal
+                worker.set_healthy(true);
+                worker.increment_load();
+                worker.circuit_breaker().record_outcome(late_outcome);
+            });
+
+            assert_gauge(&output, "smg_worker_health", &url, "-1");
+            assert_gauge(&output, "smg_worker_cb_state", &url, "-1");
+            assert_gauge(&output, "smg_worker_requests_active", &url, "0");
+            assert_gauge(&output, "smg_worker_cb_consecutive_failures", &url, "0");
+            assert_gauge(&output, "smg_worker_cb_consecutive_successes", &url, "0");
+        }
+    }
+
+    #[test]
+    fn test_removed_worker_does_not_overwrite_replacement_metrics() {
+        let url = "http://reused:8080";
+        let output = render_metrics(|| {
+            let registry = WorkerRegistry::new();
+            let old: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+            let old_id = registry.register(Arc::clone(&old));
+            registry.remove(&old_id);
+
+            let new: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+            registry.register(Arc::clone(&new));
+            new.set_healthy(true);
+            new.increment_load();
+
+            old.set_healthy(false);
+            old.reset_load();
+        });
+
+        assert_gauge(&output, "smg_worker_health", url, "1");
+        assert_gauge(&output, "smg_worker_requests_active", url, "1");
     }
 }
