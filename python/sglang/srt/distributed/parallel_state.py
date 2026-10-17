@@ -289,6 +289,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
+    xpu_symm_mem_comm: Optional[Any]  # Intel XPU symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -460,6 +461,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.xpu_symm_mem import (
+            XpuSymmMemCommunicator,
+        )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
@@ -547,6 +551,14 @@ class GroupCoordinator:
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+        # Kept apart from torch_symm_mem_comm, which the Inkling kernels and the
+        # outplace path read as the CUDA communicator.
+        self.xpu_symm_mem_comm: Optional[XpuSymmMemCommunicator] = None
+        if self.use_torch_symm_mem_all_reduce and self.world_size > 1 and _is_xpu:
+            self.xpu_symm_mem_comm = XpuSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -727,7 +739,9 @@ class GroupCoordinator:
             # an opaque call and does not decompose it into _c10d_functional primitives
             # (which invoke sycl_event.wait() and break XPU graph capture).
             # Keeps the operation in-place; the all-reduce is performed by
-            # _all_reduce_in_place, which for XPU falls through to
+            # _all_reduce_in_place, which for XPU takes the symmetric-memory
+            # one-shot path for eligible payloads in a captured graph and
+            # otherwise falls through to
             # torch.distributed.all_reduce on self.device_group (the same group
             # used by xpu_communicator).
             inplace_all_reduce(input_, group_name=self.unique_name)
@@ -1073,6 +1087,7 @@ class GroupCoordinator:
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
+        xpu_symm_mem_comm = self.xpu_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
         elif (
@@ -1081,6 +1096,15 @@ class GroupCoordinator:
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)
+        elif (
+            xpu_symm_mem_comm is not None
+            and not xpu_symm_mem_comm.disabled
+            # Eager, its two Triton launches cost more than oneCCL at every
+            # size on Arc Pro B60; under graph replay it wins up to its ceiling.
+            and torch.xpu.is_current_stream_capturing()
+            and xpu_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            xpu_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 

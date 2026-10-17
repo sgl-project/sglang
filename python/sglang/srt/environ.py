@@ -1949,6 +1949,11 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # Payload ceiling for the Intel XPU symmetric-memory one-shot all-reduce;
+    # larger payloads fall back to the default collective. Unset uses the
+    # per-world-size default in XPU_SYMM_MEM_ALL_REDUCE_MAX_SIZES; set it where
+    # peer bandwidth differs from Arc Pro B60 over PCIe (e.g. Xe Link).
+    SGLANG_XPU_SYMM_MEM_MAX_BYTES = EnvInt(None)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

@@ -158,8 +158,11 @@ echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 # SYCL_CACHE_PERSISTENT=0: the SYCL runtime's persistent kernel cache mishandles
 # torch 2.13's XPU aten.topk kernel on compute-runtime 26.05 / IGC 2.28 -- reload
 # segfaults inside libsycl. Keep off until Intel ships a fix in newer runtimes.
+# SYS_PTRACE: torch symmetric-memory rendezvous imports peer allocations with
+# pidfd_getfd, which Docker's default seccomp profile blocks without it.
 docker run -dt \
   --shm-size 8g \
+  --cap-add SYS_PTRACE \
   --group-add 992 \
   ${VIDEO_GID:+--group-add "${VIDEO_GID}"} \
   ${RENDER_GID:+--group-add "${RENDER_GID}"} \
