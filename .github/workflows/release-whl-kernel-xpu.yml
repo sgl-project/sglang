@@ -86,10 +86,16 @@ jobs:
             sgl_kernel_xpu_release_build \
             /bin/bash -lc '
               set -exo pipefail
-              . /miniforge3/bin/activate
-              conda activate py${{ matrix.python-version }}
+              # Kernel release branches from before the uv switch build a Miniforge env, later ones a uv venv
+              if [[ -f /miniforge3/bin/activate ]]; then
+                . /miniforge3/bin/activate
+                conda activate py${{ matrix.python-version }}
+              else
+                source /opt/venv/bin/activate
+              fi
               source /opt/intel/oneapi/setvars.sh --force
               command -v patchelf || (apt-get update && apt-get install -y patchelf)
+              python -VV
               python scripts/build_rel_wheel.py
               ls -lh dist
             '
