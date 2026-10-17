@@ -32,7 +32,14 @@ from ..common.utils import (
         for nw in [4, 8]
         for ns in [2, 3, 4, 5]
     ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+    key=[
+        "BATCH_SIZE_BUCKET",
+        "gqa_group_size",
+        "head_dim",
+        "BLOCK_SIZE_N",
+        "PAGED_CONTIG",
+        "HAS_SINK",
+    ],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -457,6 +464,9 @@ def flash_decode_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
     )
+    if NUM_TOPK_CHUNKS == 1:
+        # A single chunk is already normalized; merging it is an identity.
+        return o_partial[0]
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
     _merge_topk_attn_out_kernel[merge_grid](
