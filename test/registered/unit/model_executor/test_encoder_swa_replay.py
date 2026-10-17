@@ -109,6 +109,24 @@ class _Fixture:
         return [p + n for p, n in zip(fb.prefix_lens, fb.extend_lens)]
 
 
+def _backend(fx):
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.encoder_replay = False
+    backend.encoder_row_floor = fx.folded.row_floor
+    backend.req_to_token = fx.req_to_token
+    backend.page_size = 256
+    backend.index_topk = 512
+    backend.present_ratios = (0,)
+    backend.low_ratios = ()
+    backend.has_c4 = backend.has_c128 = False
+    backend.trtllm_attn = False
+    backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
+    backend.token_to_kv_pool = SimpleNamespace(
+        request_window=SimpleNamespace(capacity=2 * SWA_WINDOW)
+    )
+    return backend
+
+
 class TestFoldedExtendRows(CustomTestCase):
     def test_mixed_hit_and_miss_fold_maps_every_row(self):
         """Hits extend from their replay start into their cached KV slots; every
@@ -134,9 +152,6 @@ class TestFoldedExtendRows(CustomTestCase):
         torch.testing.assert_close(
             folded.row_floor,
             torch.tensor([0] * 40 + [384] * 158 + [0] * 84),
-        )
-        torch.testing.assert_close(
-            folded.compress_skip, torch.tensor([0, 128, 64], dtype=torch.int32)
         )
         # Input logprobs cover the same tokens, so their row count is unchanged.
         self.assertEqual(fb.extend_logprob_start_lens, [40, 158, 69])
@@ -167,23 +182,6 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
     """Encoder SWA bounded replay combined with decoder SWA bounded replay:
     the late layers run only each request's last SWA_WINDOW folded rows."""
 
-    def _backend(self, fx):
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.encoder_replay = False
-        backend.encoder_row_floor = fx.folded.row_floor
-        backend.req_to_token = fx.req_to_token
-        backend.page_size = 256
-        backend.index_topk = 512
-        backend.present_ratios = (0,)
-        backend.low_ratios = ()
-        backend.has_c4 = backend.has_c128 = False
-        backend.trtllm_attn = False
-        backend.cuda_int32_kwargs = {"dtype": torch.int32, "device": "cpu"}
-        backend.token_to_kv_pool = SimpleNamespace(
-            request_window=SimpleNamespace(capacity=2 * SWA_WINDOW)
-        )
-        return backend
-
     def test_tail_keeps_its_own_floor_under_fold(self):
         """A prefix hit with both flags on builds the tail metadata; each tail row
         is floored one window back or at its request's replay start, whichever is
@@ -205,7 +203,7 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             patch.object(DSV4AttnMetadata, "init_compression_metadata"),
             patch.object(DSV4AttnMetadata, "init_flashmla_related"),
         ):
-            metadata = self._backend(fx)._build_late_layer_tail_metadata(forward_batch)
+            metadata = _backend(fx)._build_late_layer_tail_metadata(forward_batch)
 
         # Tails: the miss's 40 rows, the last 128 of the 158-row hit (from 414,
         # above its replay start 384), and the whole 84-row hit (from 0).
@@ -270,6 +268,91 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         torch.testing.assert_close(
             out.hidden_states, fx.batch.input_ids[expected][:, None].float()
         )
+
+
+class TestFoldedReplayCompressorWrites(CustomTestCase):
+    """Folded replay rows rebuild only their SWA window: their main KV, compressed
+    groups and index keys are cached, so the compressors write only the new rows."""
+
+    def _forward_batch(self, fx):
+        fb = fx.folded.batch
+        seq_lens = fx.folded_seq_lens()
+        lens = torch.tensor(fb.extend_lens)
+        return SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=len(fb.extend_lens),
+            spec_info=None,
+            max_seq_len_override=None,
+            extend_seq_lens=lens,
+            extend_seq_lens_cpu=list(fb.extend_lens),
+            extend_start_loc=torch.cumsum(lens, 0) - lens,
+            seq_lens_cpu=torch.tensor(seq_lens),
+            seq_lens=torch.tensor(seq_lens),
+            req_pool_indices=fb.req_pool_indices,
+            out_cache_loc=fb.out_cache_loc,
+            positions=fx.folded_positions(),
+            encoder_swa_compress_rows=fx.folded.keep_rows,
+        )
+
+    def _expected_out_loc(self, fx):
+        """Replay rows on the padding slot, new rows on their own KV slots."""
+        fb = fx.folded.batch
+        replayed = torch.cat(
+            [
+                torch.arange(start, start + n) < prefix
+                for start, n, (_, prefix, _) in zip(
+                    fb.prefix_lens, fb.extend_lens, REQS
+                )
+            ]
+        )
+        return fb.out_cache_loc.masked_fill(replayed, 0)
+
+    def test_extend_metadata_puts_replay_rows_on_the_padding_slot(self):
+        fx = _Fixture()
+        backend = _backend(fx)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=fx.req_to_token)
+        backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *_, **__: 0)
+        backend.is_dspark_draft = False
+        backend.topk = backend.speculative_num_steps = 0
+        with (
+            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+        ):
+            metadata = backend._build_forward_metadata(self._forward_batch(fx))
+
+        raw_out_loc = metadata.core_attn_metadata.raw_out_loc
+        self.assertEqual(int((raw_out_loc == 0).sum()), REPLAY_ROWS)
+        torch.testing.assert_close(raw_out_loc, self._expected_out_loc(fx))
+
+    def test_unfused_compressor_writes_each_row_at_its_own_slot(self):
+        fx = _Fixture()
+        backend = _backend(fx)
+        out_loc = self._expected_out_loc(fx)
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(c1_out_loc=out_loc, raw_out_loc=out_loc)
+        )
+        written = []
+        backend._low_ratio_write_group = lambda layer, kv, slots, pos, **_: (
+            written.append((kv, slots))
+        )
+        layer = SimpleNamespace(
+            compress_ratio=1,
+            layer_id=0,
+            compressor=SimpleNamespace(
+                use_fused_compress=False, project=lambda x: (x, None)
+            ),
+        )
+        fb = fx.folded.batch
+        req = fb.req_pool_indices.repeat_interleave(torch.tensor(fb.extend_lens))
+        rows = torch.arange(out_loc.shape[0], dtype=torch.float32)[:, None]
+        forward_batch = self._forward_batch(fx)
+        backend._low_ratio_compress(
+            layer, rows, req, forward_batch.positions, forward_batch
+        )
+
+        ((kv, slots),) = written
+        torch.testing.assert_close(kv, rows)
+        torch.testing.assert_close(slots, out_loc)
 
 
 class TestFoldMlpSync(CustomTestCase):
