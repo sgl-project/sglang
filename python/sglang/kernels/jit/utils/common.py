@@ -7,18 +7,19 @@ from typing import Any, Callable, Dict, List, Sequence, TypeVar
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.utils import is_in_ci
-
 F = TypeVar("F", bound=Callable[..., Any])
 T = TypeVar("T")
 
 
 def should_run_full_tests() -> bool:
+    from sglang.srt.environ import envs
+
     return envs.SGLANG_JIT_KERNEL_RUN_FULL_TESTS.get()
 
 
 def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
+    from sglang.utils import is_in_ci
+
     if should_run_full_tests():
         return full_range
     return ci_range if is_in_ci() else full_range
@@ -57,7 +58,7 @@ def is_hip_runtime() -> bool:
 
 @cache_once
 def is_musa_runtime() -> bool:
-    return hasattr(torch.version, "musa") and torch.version.musa is not None
+    return getattr(torch.version, "musa", None) is not None
 
 
 _REGISTERED_CLASSES: Dict[type, type] = {}
@@ -93,7 +94,7 @@ def aligned_new_empty(
     dtype: torch.dtype,
     device: torch.device,
     *,
-    alignment: int,
+    alignment_bytes: int,
 ) -> torch.Tensor:
     """An uninitialized tensor whose row stride is a multiple of `alignment` bytes.
 
@@ -102,11 +103,9 @@ def aligned_new_empty(
     Callers are kernels that state an alignment contract on a row address, such
     as a TMA descriptor or a vectorized load.
     """
-    assert len(shape) > 1
-    assert alignment % dtype.itemsize == 0, (
-        "alignment must be a whole number of elements"
-    )
-    step = alignment // dtype.itemsize
+    assert alignment_bytes <= 512, "Exceed torch cached allocator min alignment"
+    assert len(shape) >= 1 and alignment_bytes % dtype.itemsize == 0
+    step = alignment_bytes // dtype.itemsize
     last_dim = shape[-1]
     padded_last_dim = (last_dim + step - 1) // step * step
     aligned_shape = (*shape[:-1], padded_last_dim)

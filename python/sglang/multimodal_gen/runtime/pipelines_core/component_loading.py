@@ -15,8 +15,12 @@ def load_transformer_if_needed(stage: Any, server_args: ServerArgs) -> bool:
     """Load transformer onto stage if not marked loaded. Returns True if freshly loaded."""
     if server_args.model_loaded["transformer"]:
         return False
-    stage.transformer = TransformerLoader().load(
-        server_args.model_paths["transformer"], server_args, "transformer"
+    loader = TransformerLoader()
+    stage.transformer, _ = loader.load(
+        server_args.model_paths["transformer"],
+        server_args,
+        component_name="transformer",
+        transformers_or_diffusers=loader.expected_library,
     )
     return True
 

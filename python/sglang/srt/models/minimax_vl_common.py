@@ -17,7 +17,10 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -82,7 +85,16 @@ class MiniMaxVLMultiModalProjector(nn.Module):
         )
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             vision_hidden_size,
@@ -90,8 +102,7 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             bias=multimodal_projector_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_1",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
         assert projector_hidden_act == "gelu", (
             f"Only gelu activation is supported, got {projector_hidden_act}"
@@ -103,8 +114,7 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             bias=multimodal_projector_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_2",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
@@ -137,7 +147,16 @@ class MiniMaxVLPatchMerger(nn.Module):
         )
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             text_hidden_size * spatial_merge_size**2,
@@ -145,8 +164,7 @@ class MiniMaxVLPatchMerger(nn.Module):
             bias=patch_merge_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_1",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
         assert projector_hidden_act == "gelu", (
             f"Only gelu activation is supported, got {projector_hidden_act}"
@@ -158,8 +176,7 @@ class MiniMaxVLPatchMerger(nn.Module):
             bias=patch_merge_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_2",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
@@ -259,7 +276,16 @@ class CLIPEncoderLayer(nn.Module):
         self.embed_dim = config.hidden_size
         self.use_data_parallel = use_data_parallel
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
@@ -281,8 +307,7 @@ class CLIPEncoderLayer(nn.Module):
             config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.fc1",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
         hidden_act = getattr(config, "hidden_act", "gelu")
         assert hidden_act == "gelu", (
@@ -294,8 +319,7 @@ class CLIPEncoderLayer(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.fc2",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)

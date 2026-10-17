@@ -47,7 +47,7 @@ class ExternalLinker(UnifiedCacheLinker):
         pass
 
     lookup = load = start_layer_wise_loading = cancel_queued_load = noop
-    num_completed_loads = pop_completed_load = offload = noop
+    finish_layer_wise_loading = offload = noop
     num_completed_offloads = pop_completed_offload = reset = close = noop
 
 class AbstractLinker(UnifiedCacheLinker):
