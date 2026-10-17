@@ -172,6 +172,10 @@ class Gemma4MLP(Gemma3MLP):
                     and self.act_fn._forward_method.__func__ is GeluAndMul.forward_xpu
                 )
             )
+            and isinstance(self.act_fn.forward_xpu, MethodType)
+            and self.act_fn.forward_xpu.__func__ is GeluAndMul.forward_xpu
+            and isinstance(self.act_fn._forward_impl, MethodType)
+            and self.act_fn._forward_impl.__func__ is GeluAndMul._forward_impl
             and isinstance(self.act_fn.forward, MethodType)
             and self.act_fn.forward.__func__ is GeluAndMul.forward
             and isinstance(projection.forward, MethodType)

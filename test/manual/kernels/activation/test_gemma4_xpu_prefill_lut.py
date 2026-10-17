@@ -1,6 +1,7 @@
 """Real wide/narrow MLP prefill without the optional native gate GEMM API."""
 
 import unittest
+from types import MethodType
 
 import torch
 import torch.nn.functional as F
@@ -111,6 +112,31 @@ class TestGemma4PrefillLut(CustomTestCase):
                             )
 
                         mlp._xpu_gelu_mul_lut = forbidden_lookup
+                        # Replacements before the first standalone activation
+                        # must be selected by normal dispatch, not bypassed.
+                        for method_name in ("forward_xpu", "_forward_impl"):
+                            original = getattr(mlp.act_fn, method_name)
+                            calls = []
+
+                            def replacement(module, value):
+                                calls.append(method_name)
+                                return torch.zeros_like(value[..., :intermediate])
+
+                            setattr(
+                                mlp.act_fn,
+                                method_name,
+                                MethodType(replacement, mlp.act_fn),
+                            )
+                            mlp.act_fn._forward_method = None
+                            try:
+                                actual = mlp(x)
+                                torch.testing.assert_close(
+                                    actual, torch.zeros_like(actual), atol=0, rtol=0
+                                )
+                                self.assertEqual(calls, [method_name])
+                            finally:
+                                setattr(mlp.act_fn, method_name, original)
+                                mlp.act_fn._forward_method = None
                         observed = []
                         handle = mlp.act_fn.register_forward_hook(
                             lambda module, inputs, output: observed.append(output)
