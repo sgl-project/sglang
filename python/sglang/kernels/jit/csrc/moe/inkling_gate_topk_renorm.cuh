@@ -21,9 +21,30 @@ static constexpr int kInklingTopK = 6;
 static constexpr int kInklingTopPow2 = 8;
 static constexpr int kInklingWarpSize = 32;
 static constexpr int kInklingValuesPerLane = kInklingRoutedExperts / kInklingWarpSize;
-
 __device__ __forceinline__ float inkling_sigmoid(float x) {
   return 1.0f / (1.0f + __expf(-x));
+}
+
+// Replace raw selected/shared logits with sigmoid weights scaled by a common
+// factor, which cancels in the normalization. Unlike adding an epsilon, this
+// preserves their relative weights even when every raw sigmoid underflows.
+// sigmoid(x) = exp(min(x, 0)) / (1 + exp(-abs(x))). Subtracting the largest
+// min(x, 0) before exp keeps the sum in [0.5, 8] for finite input logits.
+__device__ __forceinline__ float inkling_gate_scaled_sigmoid_sum(float (&active)[kInklingTopPow2]) {
+  float max_logit = -FLT_MAX;
+#pragma unroll
+  for (int i = 0; i < kInklingTopPow2; ++i) {
+    max_logit = fmaxf(max_logit, active[i]);
+  }
+  const float shift = fminf(max_logit, 0.0f);
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kInklingTopPow2; ++i) {
+    const float x = active[i];
+    active[i] = __expf(fminf(x, 0.0f) - shift) / (1.0f + __expf(-fabsf(x)));
+    sum += active[i];
+  }
+  return sum;
 }
 
 __device__ __forceinline__ bool inkling_score_better(float score, int idx, float best_score, int best_idx) {
@@ -111,23 +132,19 @@ __launch_bounds__(kInklingWarpSize* WarpsPerBlock) __global__ void inkling_gate_
   float active[kInklingTopPow2];
 #pragma unroll
   for (int i = 0; i < kInklingTopK; ++i) {
-    active[i] = inkling_sigmoid(logits[row_base + selected_idx[i]]);
+    active[i] = logits[row_base + selected_idx[i]];
   }
 #pragma unroll
   for (int i = 0; i < kInklingSharedExperts; ++i) {
-    active[kInklingTopK + i] = inkling_sigmoid(logits[row_base + kInklingRoutedExperts + i]);
+    active[kInklingTopK + i] = logits[row_base + kInklingRoutedExperts + i];
   }
 
-  float sum = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kInklingTopPow2; ++i) {
-    sum += active[i];
-  }
-  const float scale = route_scale * global_scale[0] / sum;
+  const float inv_sum = 1.0f / inkling_gate_scaled_sigmoid_sum(active);
+  const float scale = route_scale * global_scale[0];
 
 #pragma unroll
   for (int i = 0; i < kInklingTopK; ++i) {
-    const float w = active[i] * scale;
+    const float w = (active[i] * inv_sum) * scale;
     if constexpr (ReturnPacked) {
       packed[row * kInklingTopK + i] = inkling_pack_routed(selected_idx[i], w);
     } else {
@@ -137,7 +154,7 @@ __launch_bounds__(kInklingWarpSize* WarpsPerBlock) __global__ void inkling_gate_
   }
 #pragma unroll
   for (int i = 0; i < kInklingSharedExperts; ++i) {
-    shared_w[row * kInklingSharedExperts + i] = active[kInklingTopK + i] * scale;
+    shared_w[row * kInklingSharedExperts + i] = (active[kInklingTopK + i] * inv_sum) * scale;
   }
 }
 
@@ -329,16 +346,11 @@ __device__ __forceinline__ void inkling_gate_row(
   float active[kInklingTopK + kInklingSharedExperts];
 #pragma unroll
   for (int k = 0; k < kInklingTopK; ++k) {
-    active[k] = inkling_sigmoid(sel_raw[k]);
+    active[k] = sel_raw[k];
   }
-  active[kInklingTopK] = inkling_sigmoid(sh0);
-  active[kInklingTopK + 1] = inkling_sigmoid(sh1);
-  float sum = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kInklingTopK + kInklingSharedExperts; ++i) {
-    sum += active[i];
-  }
-  const float scale = st.scale / sum;
+  active[kInklingTopK] = sh0;
+  active[kInklingTopK + 1] = sh1;
+  const float inv_sum = 1.0f / inkling_gate_scaled_sigmoid_sum(active);
 
   // Lane a < 8 owns active slot a (static-index select, then one store each).
   float my_active = 0.0f;
@@ -350,7 +362,7 @@ __device__ __forceinline__ void inkling_gate_row(
       my_idx = a < kInklingTopK ? sel_idx[a] : 0;
     }
   }
-  const float w = my_active * scale;
+  const float w = (my_active * inv_sum) * st.scale;
   if (lane < kInklingTopK) {
     if constexpr (kPacked) {
       packed[m * kInklingTopK + lane] = inkling_pack_routed(my_idx, w);
