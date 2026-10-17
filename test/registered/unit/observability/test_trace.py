@@ -320,6 +320,23 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.assertIsNotNone(ctx.root_span)
         ctx.trace_req_finish(ts=2000)
 
+    def test_span_names_leave_out_request_and_process_ids(self):
+        """Span names stay low-cardinality; the rid is recorded unchanged."""
+        pid = threading.get_native_id()
+        mod.threads_info[pid] = TraceThreadInfo(
+            "host", pid, "Scheduler", tp_rank=0, dp_rank=1, pp_rank=None
+        )
+        for role, root_name in [("unified", "Req"), ("decode", "decode Req")]:
+            ctx = TraceReqContext(rid="req_abc_123", role=role)
+            ctx.trace_req_start(ts=1000)
+
+            self.assertEqual(ctx.root_span.name, root_name)
+            self.assertEqual(ctx.root_span.attributes["rid"], "req_abc_123")
+            self.assertEqual(
+                ctx.thread_context.thread_span.name, "Scheduler [TP 0] [DP 1]"
+            )
+            ctx.trace_req_finish(ts=2000)
+
     def test_trace_slice_combined(self):
         """trace_slice() creates and ends a span in one call."""
         ctx = TraceReqContext(rid="req-1")
