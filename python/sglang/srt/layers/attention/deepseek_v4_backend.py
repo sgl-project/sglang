@@ -2907,6 +2907,10 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        if self.token_to_kv_pool.request_window is None and self.low_ratios == (1, 2):
+            graph_context_limit = _prefill_graph_max_seq_len()
+            if graph_context_limit is not None:
+                max_seq_len = min(max_seq_len, graph_context_limit)
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2916,6 +2920,8 @@ class DeepseekV4AttnBackend(
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
+        if self.token_to_kv_pool.request_window is None and self.low_ratios == (1, 2):
+            self._share_bcg_low_ratio_index_buffers(self.forward_metadata.core_metadata)
         self.forward_metadata.prefill_graph_tail = with_tail
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(forward_batch, max_seq_len)
@@ -2928,6 +2934,25 @@ class DeepseekV4AttnBackend(
                     forward_batch.out_cache_loc.shape[0], ratio
                 )
         return self.forward_metadata
+
+    def _share_bcg_low_ratio_index_buffers(self, core) -> None:
+        # BCG buckets replay serially. Share only full-metadata output buffers;
+        # both ratios must survive the later full-to-tail metadata transition.
+        # Keep old allocations alive if capture order ever grows the capacity.
+        pools = getattr(self, "_bcg_low_ratio_index_buffers", None)
+        if pools is None:
+            pools = self._bcg_low_ratio_index_buffers = {}
+        for ratio in (1, 2):
+            for kind in ("page", "raw"):
+                name = f"c{ratio}_sparse_{kind}_indices"
+                value = getattr(core, name)
+                if value is None:
+                    continue
+                key = (name, value.shape[1], value.dtype, value.device)
+                retained = pools.setdefault(key, [])
+                if not retained or retained[0].shape[0] < value.shape[0]:
+                    retained.insert(0, value)
+                setattr(core, name, retained[0][: value.shape[0]])
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -2971,6 +2996,10 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        if self.token_to_kv_pool.request_window is None and self.low_ratios == (1, 2):
+            graph_context_limit = _prefill_graph_max_seq_len()
+            if graph_context_limit is not None:
+                max_seq_len = min(max_seq_len, graph_context_limit)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
