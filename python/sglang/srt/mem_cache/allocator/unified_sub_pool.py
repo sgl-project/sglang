@@ -446,6 +446,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._lazy_max_moves_per_call = (
             envs.SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL.get()
         )
+        # A move-kernel launch copies at most this many pages; `_move_pages`
+        # issues a larger move as consecutive launches within the same call
+        # (see there). Bounded by the pool, which never has more pages.
+        max_pages_per_move = envs.SGLANG_COMPACTION_MAX_PAGES_PER_MOVE.get()
+        assert max_pages_per_move > 0, (
+            "SGLANG_COMPACTION_MAX_PAGES_PER_MOVE must be positive, got "
+            f"{max_pages_per_move}"
+        )
+        self._move_max_pages = min(max_pages_per_move, self.num_pages)
 
         # Epoch-keyed memos for the capacity views: pure between mutations, but
         # schedulers read them O(queue) times per step.
@@ -1466,24 +1475,59 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"[{self.sub_pool_name}] page copy while a move gate is closed"
         )
         v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
-
-        # Expand to PHYSICAL token granularity (the move kernel is
-        # token-granular over pool rows).
-        if self.pool_page_size == 1:
-            src_t, dst_t = src_pages, dst_pages
-        else:
-            ps = self.pool_page_size
-            offsets = torch.arange(ps, dtype=torch.int64, device=self.device)
-            src_t = (src_pages[:, None] * ps + offsets).reshape(-1)
-            dst_t = (dst_pages[:, None] * ps + offsets).reshape(-1)
-
-        # Un-translated copy: the public copy_from translates virtual ids,
-        # which we must NOT do here.
-        self._kvcache.move_kv_cache(dst_t, src_t)
+        self._move_pages(src_pages, dst_pages)
         self.virtual_to_physical[v_moved] = dst_pages
         self.physical_to_virtual[dst_pages] = v_moved
         self._inverse_history.append((src_pages, dst_pages, v_moved))
         return v_moved
+
+    def _move_pages(self, src_pages: torch.Tensor, dst_pages: torch.Tensor) -> None:
+        # Whole page envelopes by physical page id, at most `_move_max_pages`
+        # per launch, every launch issued in order on the current stream before
+        # this returns. Callers pass disjoint src/dst sets, so no launch reads
+        # a page another launch writes.
+        for start in range(0, src_pages.numel(), self._move_max_pages):
+            # Un-translated copy: the public copy_from translates virtual ids,
+            # which we must NOT do here.
+            self._kvcache.move_physical_pages(
+                dst_pages[start : start + self._move_max_pages],
+                src_pages[start : start + self._move_max_pages],
+                self.pool_page_size,
+            )
+
+    def prewarm_compaction(self) -> None:
+        """Run the compaction commit's first-use work once at startup, on the
+        reserved sink page 0, so that no serving-time compaction is the first
+        to compile, load or launch it.
+
+        A first use while serving stalls the scheduler on the page-copy kernel's
+        compile and load and on the first `.all()` reduction and `_assert_async`
+        of the commit. A kernel's first launch can also take device memory
+        outside every pool (a spilling kernel grows the context's local-memory
+        reservation), and an urgent compaction under a full pool then fails
+        with `Triton Error [CUDA]: out of memory`. Paid here, before KV sizing,
+        that memory is accounted like any other startup allocation.
+
+        The page-copy kernel specializes on neither the move size (a grid
+        dimension) nor the alignment of the page-id slices, so this launch
+        selects the variant every serving-time move of this sub-pool uses.
+        """
+        if torch.device(self.device).type != "cuda":
+            return
+        assert self.min_page_index >= 1, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}).prewarm_compaction needs "
+            "the reserved sink page 0"
+        )
+        # The sink page copied onto itself, listed twice: every byte written is
+        # the byte read, so the coinciding src/dst are harmless, and two entries
+        # make `.all()` launch the reduction kernel a real commit uses (it skips
+        # the kernel for one element).
+        sink = torch.zeros(2, dtype=torch.int64, device=self.device)
+        self._move_pages(sink, sink)
+        # The commit's p2v check; its page-table gather and writes are the ones
+        # alloc and free run, so they are warm before any compaction can exist.
+        torch._assert_async((sink >= 0).all(), "prewarm_compaction")
+        torch.cuda.current_stream().synchronize()
 
     # -- lazy compaction primitives --
 
@@ -1902,10 +1946,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         latest_event: Optional[torch.cuda.Event],
         released_fired: List[torch.Tensor],
     ) -> None:
-        """Issue ONE `move_kv_cache` plus ONE bulk v2p/p2v remap for the
-        accumulated `(src, dst)` pairs. Fired srcs accumulate in `released_fired`
-        (merged by `_flush` after its dst-slice); event-pending srcs route to
-        `_pending_reuse` for read-race gating.
+        """Issue the page copies (`_move_pages`) plus ONE bulk v2p/p2v remap for
+        the accumulated `(src, dst)` pairs. Fired srcs accumulate in
+        `released_fired` (merged by `_flush` after its dst-slice); event-pending
+        srcs route to `_pending_reuse` for read-race gating.
         """
         if not srcs:
             return
@@ -1920,17 +1964,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 (v_moveds_t >= 0).all(),
                 "invalid p2v mapping in MultiEndedAllocator._flush",
             )
-            # Expand to PHYSICAL token granularity (the move kernel is
-            # token-granular over pool rows).
-            if self.pool_page_size == 1:
-                src_t, dst_t = src_pages_t, dst_pages_t
-            else:
-                ps = self.pool_page_size
-                offsets = torch.arange(ps, dtype=torch.int64, device=self.device)
-                src_t = (src_pages_t[:, None] * ps + offsets).reshape(-1)
-                dst_t = (dst_pages_t[:, None] * ps + offsets).reshape(-1)
-            self._kvcache.move_kv_cache(dst_t, src_t)
-            # ONE bulk remap (single-writer on schedule_stream).
+            self._move_pages(src_pages_t, dst_pages_t)
+            # ONE bulk remap (single-writer on schedule_stream), issued after the
+            # copies on the same stream: work ordered after it sees moved pages.
             self.virtual_to_physical[v_moveds_t] = dst_pages_t
             self.physical_to_virtual[dst_pages_t] = v_moveds_t
             self.physical_to_virtual.index_fill_(0, src_pages_t, -1)

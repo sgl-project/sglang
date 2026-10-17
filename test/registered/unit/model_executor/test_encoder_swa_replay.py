@@ -23,6 +23,7 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
     _fold_batch,
     drop_folded_rows,
+    folded_replay_rows,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -47,6 +48,7 @@ def _tok(slot, pos):
 # a 64-token prefix (replay from 0) and its whole folded extend is its tail.
 REQS = [(1, 0, 40), (2, 512, 30), (3, 64, 20)]
 HITS = [(1, 384, 512), (2, 0, 64)]  # (batch index, replay start, prefix)
+REPLAY_ROWS = 128 + 64
 
 
 class _Fixture:
@@ -67,7 +69,9 @@ class _Fixture:
         rows = [(s, p, p + n) for s, p, n in REQS]
         self.extend_num_tokens = sum(n for _, _, n in REQS)
         self.batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
             reqs=reqs,
+            encoder_swa_reset=[True] * len(REQS),
             req_pool_indices=torch.tensor([s for s, _, _ in REQS]),
             prefix_lens=[p for _, p, _ in REQS],
             extend_lens=[n for _, _, n in REQS],
@@ -82,7 +86,7 @@ class _Fixture:
             # Slot 3 asks for input logprobs from its 6th new token on.
             extend_logprob_start_lens=[40, 30, 5],
             engram_history=None,
-            global_num_tokens=[self.extend_num_tokens],
+            global_num_tokens=[self.extend_num_tokens + REPLAY_ROWS],
             global_num_tokens_for_logprob=[1 + 1 + 15],
             can_run_decode_cuda_graph=False,
             can_run_dp_draft_cuda_graph=False,
@@ -116,6 +120,7 @@ class TestFoldedExtendRows(CustomTestCase):
         self.assertEqual(fb.prefix_lens, starts)
         self.assertEqual(fb.extend_lens, [40, 158, 84])
         self.assertEqual(fb.extend_num_tokens, 282)
+        self.assertEqual(folded_replay_rows(fx.batch), REPLAY_ROWS)
         spans = [(s, a, p + n) for (s, p, n), a in zip(REQS, starts)]
         torch.testing.assert_close(
             fb.input_ids,
@@ -148,6 +153,14 @@ class TestFoldedExtendRows(CustomTestCase):
         torch.testing.assert_close(
             out.hidden_states, fx.batch.input_ids[:, None].float()
         )
+
+    def test_replay_rows_follow_window_resets_only(self):
+        """A request that keeps its window (a later chunk) adds no replay rows."""
+        fx = _Fixture()
+        fx.batch.encoder_swa_reset = [False, False, True]
+        self.assertEqual(folded_replay_rows(fx.batch), 64)
+        fx.batch.forward_mode = ForwardMode.DECODE
+        self.assertEqual(folded_replay_rows(fx.batch), 0)
 
 
 class TestFoldWithDecoderSwaTail(CustomTestCase):
@@ -312,9 +325,8 @@ class TestFoldMlpSync(CustomTestCase):
             fb.prepare_mlp_sync_batch(runner)
 
     def test_folded_rows_count_in_mlp_sync_totals(self):
-        """The scheduler's gathered count covers the scheduled rows only. A folded
-        batch must sync its folded row count, or the padding to that count
-        shrinks input_ids (a negative pad); logprob rows keep their count."""
+        """The scheduler's gathered count includes the replay rows, so the folded
+        batch pads to exactly its own rows; logprob rows keep their count."""
         fx = _Fixture()
         fb = self._forward_batch(fx.folded.batch)
         self._mlp_sync(fb)
