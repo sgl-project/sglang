@@ -40,6 +40,137 @@ class _ContiguousRowStateStub(msgspec.Struct, kw_only=True):
     """Providers subclass the real row state, so the stub must be a Struct too."""
 
 
+class TestNvFp4PreparedQuantInfo(CustomTestCase):
+    def _layer(self, dtype=torch.bfloat16, intermediate=128, gated=True):
+        slices = 2 if gated else 1
+        return SimpleNamespace(
+            params_dtype=dtype,
+            w13_weight=torch.zeros((2, 4, 2 * slices * 128), dtype=torch.int32),
+            w2_weight=torch.zeros((2, 8, 128), dtype=torch.int32),
+            w13_weight_scale=torch.zeros(
+                (2, 4, slices * 128), dtype=torch.float8_e4m3fn
+            ),
+            w2_weight_scale=torch.zeros((2, 8, 64), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_2=torch.ones(2, dtype=dtype),
+            w2_weight_scale_2=torch.zeros(2, dtype=dtype),
+            moe_runner_config=SimpleNamespace(is_gated=gated),
+            num_local_experts=2,
+            intermediate_size_per_partition=intermediate,
+            hidden_size=64,
+        )
+
+    def test_padded_intermediate_keeps_the_logical_size(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        info = MoeLoraNvFp4MarlinQuantInfo.from_layer(
+            self._layer(intermediate=64, gated=False)
+        )
+        self.assertEqual(info.intermediate_size, 64)
+        self.assertEqual(info.w2_qweight.shape[1] * 16, 128)
+
+    def test_marlin_padding_is_local_and_cleared_each_call(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        source = (PROVIDER / "marlin_nvfp4.py").read_text()
+        methods = {}
+        for name in ("gateup", "down"):
+            exec(_function(source, name), methods)
+        for intermediate in (64, 128):
+            with self.subTest(intermediate=intermediate):
+                info = MoeLoraNvFp4MarlinQuantInfo.from_layer(
+                    self._layer(intermediate=intermediate, gated=False)
+                )
+                padded = (
+                    torch.empty((4, 128), dtype=torch.bfloat16)
+                    if intermediate < 128
+                    else None
+                )
+                state = SimpleNamespace(
+                    hidden_states=torch.empty((2, 64), dtype=torch.bfloat16),
+                    padded_intermediate=padded,
+                    num_tokens=2,
+                    num_pairs=4,
+                    top_k=2,
+                )
+                provider = SimpleNamespace(
+                    quant_info=info,
+                    _gate_up_slices=1,
+                    _padded_intermediate_size=128,
+                    _scalar_type_w13=None,
+                    _scalar_type_w2=None,
+                    _invoke=mock.Mock(
+                        side_effect=lambda a, out, *args, **kw: out.fill_(3)
+                    ),
+                )
+                output = torch.empty((4, intermediate), dtype=torch.bfloat16)
+                methods["gateup"](provider, state, output)
+                torch.testing.assert_close(output, torch.full_like(output, 3))
+                self.assertIs(
+                    provider._invoke.call_args.args[1],
+                    output if padded is None else padded,
+                )
+                self.assertEqual(provider._invoke.call_args.kwargs["size_n"], 128)
+                provider._invoke = mock.Mock()
+                for value in (1, 2):
+                    activation = torch.full_like(output, value)
+                    if padded is not None:
+                        padded.fill_(7)
+                    methods["down"](provider, state, activation, output)
+                    actual = provider._invoke.call_args.args[0]
+                    torch.testing.assert_close(actual[:, :intermediate], activation)
+                    self.assertEqual(provider._invoke.call_args.kwargs["size_k"], 128)
+                    if padded is None:
+                        self.assertIs(actual, activation)
+                    else:
+                        self.assertEqual(
+                            torch.count_nonzero(actual[:, intermediate:]).item(), 0
+                        )
+
+    def test_prepared_marlin_metadata_is_aliased_not_repacked(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        layer = self._layer()
+        info = MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
+        for field, source in (
+            ("w13_qweight", "w13_weight"),
+            ("w2_qweight", "w2_weight"),
+            ("w13_scales", "w13_weight_scale"),
+            ("w2_scales", "w2_weight_scale"),
+            ("w13_global_scale", "w13_weight_scale_2"),
+            ("w2_global_scale", "w2_weight_scale_2"),
+        ):
+            self.assertIs(getattr(info, field), getattr(layer, source))
+
+    def test_non_bf16_activations_fail_without_mutation(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        for dtype in (torch.float16, torch.float32):
+            layer = self._layer(dtype)
+            original = vars(layer).copy()
+            with (
+                self.subTest(dtype=dtype),
+                self.assertRaisesRegex(NotImplementedError, "BF16 activations"),
+            ):
+                MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
+            for name, value in original.items():
+                self.assertIs(getattr(layer, name), value)
+
+    def test_unprepared_weights_fail_without_mutation(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        for field in ("w13_weight", "w2_weight"):
+            layer = self._layer()
+            setattr(layer, field, getattr(layer, field).to(torch.uint8))
+            original = vars(layer).copy()
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "already-prepared"),
+            ):
+                MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
+            for name, value in original.items():
+                self.assertIs(getattr(layer, name), value)
+
+
 class TestProviderGeometry(CustomTestCase):
     def test_provider_constructs_every_builtin_capability_from_shared_constants(self):
         """Catch missing runtime imports in the attach-time registry builder."""

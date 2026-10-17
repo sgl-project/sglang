@@ -212,6 +212,11 @@ def check_lora_moe_runner_args(server_args: Any):
             f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
             f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
         )
+    if cfg.quantization == "modelopt_fp4" and backend != "lora_marlin":
+        raise ValueError(
+            f"--moe-runner-backend {backend} cannot run ModelOpt NVFP4 MoE; "
+            "use --moe-runner-backend lora_marlin"
+        )
     if cfg.moe_a2a_backend != "none":
         raise ValueError(
             f"--moe-runner-backend {backend} requires Standard dispatch, "
