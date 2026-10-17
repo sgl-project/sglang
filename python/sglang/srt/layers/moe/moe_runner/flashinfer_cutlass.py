@@ -18,13 +18,21 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    deployment_attn_dp_size,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_schedule,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
@@ -154,6 +162,22 @@ def _flashinfer_cutlass_fused_moe():
     from flashinfer.fused_moe.core import ActivationType
 
     return cutlass_fused_moe, ActivationType
+
+
+# Matches the default tune_max_num_tokens of FlashInfer's cutlass_fused_moe.
+_FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS = 8192
+
+
+# Tune range: the DP-gathered prefill chunk, capped at FlashInfer's default;
+# PD decode servers run no prefill, so they size it per call.
+def _cutlass_moe_tune_max_num_tokens(num_tokens: int) -> int:
+    if get_disagg().disaggregation_mode == "decode":
+        return next_power_of_2(num_tokens)
+    prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    return min(
+        prefill_tokens * deployment_attn_dp_size(),
+        _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS,
+    )
 
 
 def _activation_type(runner_config: MoeRunnerConfig):
@@ -312,7 +336,7 @@ def _run_flashinfer_cutlass(
         ep_rank=runner_config.moe_ep_rank,
         tp_size=runner_config.moe_tp_size,
         tp_rank=runner_config.moe_tp_rank,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
@@ -526,7 +550,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
             if quant_info.use_swiglu_step
             else ActivationType.Swiglu
         ),
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
         **humming_kwargs,
