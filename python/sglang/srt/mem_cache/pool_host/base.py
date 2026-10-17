@@ -11,6 +11,9 @@ from typing import Optional, TypeGuard
 
 import torch
 
+from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_write_back_jit_kernel,
+)
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -337,6 +340,42 @@ class HostKVCache(abc.ABC):
                 f"{self.device_row_stride_bytes} B apart. Use the JIT HiCache "
                 "kernels with a layer_first or page_first host layout."
             )
+
+    def _page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """Page ids of a page-aligned transfer's token runs.
+
+        The page-unified write-back addresses whole pages. Write-back is only
+        ever issued for complete pages, so taking every page_size-th token is
+        the page list, not a subsample.
+        """
+        return token_indices[:: self.page_size] // self.page_size
+
+    def _init_page_unified_staging(self) -> None:
+        """Device-side scratch the write-back relayouts into before the D2H.
+
+        Sized in whole pages: the copy that follows moves one contiguous page
+        block per page, which is what keeps it on the copy engine.
+        """
+        geometry = self.page_unified_layout
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_page_unified_write_back_jit_kernel(
+            group_bytes=geometry.group_bytes, is_mla=geometry.is_mla
+        )
+        if not self.can_use_write_back_jit:
+            row_kind = "latent" if geometry.is_mla else "head-group"
+            raise ValueError(
+                "the 'page_unified' host layout requires the staged "
+                "write-back JIT kernel, which could not be built for a "
+                f"{geometry.group_bytes}-byte {row_kind} row."
+            )
+        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
+        self.staging_buffer = torch.empty(
+            geometry.page_dims(self.staging_page_capacity),
+            dtype=self.dtype,
+            device=self._transfer_device,
+        )
 
     @abc.abstractmethod
     def get_size_per_token(self):
