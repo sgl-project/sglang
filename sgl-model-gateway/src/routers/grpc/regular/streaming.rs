@@ -89,6 +89,7 @@ impl StreamingProcessor {
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
+        reasoning_started_in_prefill: bool,
     ) -> Response {
         use bytes::Bytes;
         use tokio::sync::mpsc;
@@ -117,6 +118,7 @@ impl StreamingProcessor {
                             tokenizer_clone,
                             stop_params,
                             chat_request,
+                            reasoning_started_in_prefill,
                             &tx,
                         )
                         .await;
@@ -149,6 +151,7 @@ impl StreamingProcessor {
                             tokenizer_clone,
                             stop_params,
                             chat_request,
+                            reasoning_started_in_prefill,
                             &tx,
                         )
                         .await;
@@ -188,6 +191,7 @@ impl StreamingProcessor {
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_streaming_chunks(
         &self,
         mut grpc_stream: ProtoStream,
@@ -195,6 +199,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
+        reasoning_started_in_prefill: bool,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Metrics timing
@@ -362,6 +367,7 @@ impl StreamingProcessor {
                                 model,
                                 created,
                                 system_fingerprint,
+                                reasoning_started_in_prefill,
                             )
                             .await;
                         if let Some(chunk) = reasoning_chunk {
@@ -614,6 +620,7 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
         original_request: Arc<ChatCompletionRequest>,
+        reasoning_started_in_prefill: bool,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
         // Phase 1.5: Collect input_logprobs from prefill stream if requested
@@ -643,6 +650,7 @@ impl StreamingProcessor {
                 tokenizer,
                 stop_params,
                 original_request,
+                reasoning_started_in_prefill,
                 tx,
             )
             .await;
@@ -1105,6 +1113,7 @@ impl StreamingProcessor {
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
+        reasoning_started_in_prefill: bool,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
         // Create fresh parser for this index (not pooled, to avoid state pollution)
         reasoning_parsers.entry(index).or_insert_with(|| {
@@ -1112,6 +1121,7 @@ impl StreamingProcessor {
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
                 model,
+                reasoning_started_in_prefill,
             )
             .expect("Parser should be available - checked upfront");
             Arc::new(tokio::sync::Mutex::new(parser))
