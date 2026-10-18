@@ -397,6 +397,7 @@ pub struct ModelConfig {
     /// Reorg admission for groups that leave a limit unset: `--max-inflight-requests`
     /// and `--max-kv-usage`.
     pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
+    /// Per-worker circuit breaker; `None` under `--disable-circuit-breaker`.
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -730,8 +731,12 @@ pub struct CircuitBreakerConfig {
     pub cool_down_secs: u64,
 }
 
-/// Default circuit-breaker cool-down, applied when `--cb-threshold` is
-/// set without an explicit `--cb-cool-down-secs`.
+/// Default circuit-breaker threshold, without `--cb-threshold`.
+pub fn default_cb_threshold() -> NonZeroU32 {
+    NonZeroU32::new(3).expect("3 is non-zero")
+}
+
+/// Default circuit-breaker cool-down, without `--cb-cool-down-secs`.
 pub fn default_cb_cool_down() -> u64 {
     30
 }
