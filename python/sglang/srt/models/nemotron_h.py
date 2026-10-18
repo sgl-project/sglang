@@ -1160,11 +1160,11 @@ class NemotronHForCausalLM(nn.Module):
     def prepare_for_forward(self, forward_batch: ForwardBatch) -> None:
         if not getattr(self, "_use_nvfp4_phase_layout", False):
             return
-        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import Nvfp4LayoutCycle
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
             _flashinfer_autotune_active,
             _sm120_mtp_mma_supported,
         )
+        from sglang.srt.models.nemotron_h_nvfp4_layout import Nvfp4LayoutCycle
 
         cycle = getattr(self, "_nvfp4_layout", None)
         if cycle is None:
