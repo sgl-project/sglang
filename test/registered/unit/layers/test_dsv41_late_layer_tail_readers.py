@@ -1,6 +1,7 @@
 """Decoder SWA bounded replay: the rows the late layers run (whole extends for
 requests that read prompt rows) and how DP ranks learn each other's. CPU only."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -347,6 +348,56 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
         self.assertEqual(seen["req"], [3] * 8 + [5] * 12)
         self.assertEqual(seen["scored"], 20)
         self.assertEqual(seen["rows"], [6, 7, 17, 18, 19, 0, 0, 0])
+
+
+class _MetadataBuilt(Exception):
+    pass
+
+
+def _prefill_graph_tail_width(*, unbounded):
+    """The max_seq_len the late-layer tail's prefill-graph metadata is built at,
+    for one request of 1,024 new tokens after a 155,648-token cached prefix."""
+    seen = {}
+
+    def init_forward_metadata_prefill(**kwargs):
+        seen["max_seq_len"] = kwargs["max_seq_len"]
+        raise _MetadataBuilt
+
+    backend = SimpleNamespace(
+        encoder_row_floor=None,
+        model_runner=SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE),
+        _prefill_graph_tail_block_rows=lambda forward_batch: 256,
+        _prefill_graph_tail_buffers=lambda device, pos_dtype, loc_dtype: [
+            torch.zeros(256, dtype=torch.int64) for _ in range(5)
+        ],
+        _prefill_graph_context_unbounded=lambda: unbounded,
+        init_forward_metadata_prefill=init_forward_metadata_prefill,
+    )
+    seq_len = 155648 + 1024
+    forward_batch = SimpleNamespace(
+        extend_seq_lens_cpu=[1024],
+        extend_logprob_start_lens_cpu=None,
+        return_logprob=False,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        seq_lens_cpu=torch.tensor([seq_len]),
+        seq_lens=torch.tensor([seq_len]),
+        req_pool_indices=torch.tensor([3]),
+        positions=torch.arange(155648, seq_len),
+        out_cache_loc=torch.arange(1024),
+    )
+    with contextlib.suppress(_MetadataBuilt):
+        DeepseekV4AttnBackend._build_late_layer_tail_metadata(
+            backend, forward_batch, for_prefill_graph=True, max_seq_len_override=16384
+        )
+    return seen["max_seq_len"]
+
+
+class TestPrefillGraphTailWidth(CustomTestCase):
+    def test_tail_spans_the_live_context_when_any_context_replays(self):
+        self.assertEqual(_prefill_graph_tail_width(unbounded=True), 156672)
+
+    def test_tail_keeps_the_captured_width_otherwise(self):
+        self.assertEqual(_prefill_graph_tail_width(unbounded=False), 16384)
 
 
 if __name__ == "__main__":
