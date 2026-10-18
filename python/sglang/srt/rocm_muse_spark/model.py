@@ -54,12 +54,19 @@ from sglang.srt.rocm_muse_spark.layers import (
     QKVOGateParallelLinear,
 )
 from sglang.srt.rocm_muse_spark.muse_qk_norm import fused_qk_norm, qk_norm_supported
+from sglang.srt.rocm_muse_spark.muse_qkv_helpers import (
+    try_project_qkv_cache,
+    try_qk_rope_cache,
+)
 from sglang.srt.rocm_muse_spark.muse_router_gemv import (
     router_gemv,
     router_gemv_supported,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
+
+_MUSE_QK_ROPE_CACHE = os.environ.get("MUSE_QK_ROPE_CACHE", "0") == "1"
+_MUSE_FUSED_QKV_CACHE = os.environ.get("MUSE_FUSED_QKV_CACHE", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -439,31 +446,48 @@ class MuseSpark1xAttention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-        qkv, _ = self.qkv_proj(hidden_states)
-        split_sizes = [self.q_size, self.kv_size, self.kv_size]
-        if self.use_o_gate:
-            q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
+        projected = (
+            try_project_qkv_cache(self, positions, hidden_states, forward_batch)
+            if _MUSE_FUSED_QKV_CACHE and _MUSE_QK_ROPE_CACHE and _USE_FUSED_QK_NORM
+            else None
+        )
+        if projected is not None:
+            q, k, v, o_gate = projected
+            fused_qk = q, k
         else:
-            q, k, v = qkv.split(split_sizes, dim=-1)
-            o_gate = None
-        if self.use_qk_norm:
-            if _USE_FUSED_QK_NORM and qk_norm_supported(q, k, self.head_dim):
-                q, k = fused_qk_norm(
-                    q, k, self.head_dim, self.norm_eps, self.scale_query_by
-                )
+            qkv, _ = self.qkv_proj(hidden_states)
+            split_sizes = [self.q_size, self.kv_size, self.kv_size]
+            if self.use_o_gate:
+                q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
             else:
-                q = self._per_head_norm(q) * self.scale_query_by
-                k = self._per_head_norm(k)
-        if self.use_attn_temperature_tuning:
-            temperature = (
-                torch.log((positions.float() + 1.0) / self.temperature_floor)
-                * self.temperature_q_scale
-                + 1.0
-            ).clamp_min(1.0)
-            q = (q * temperature.unsqueeze(-1)).to(q.dtype)
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
-        output = self.attn(q, k, v, forward_batch)
+                q, k, v = qkv.split(split_sizes, dim=-1)
+                o_gate = None
+            fused_qk = (
+                try_qk_rope_cache(self, positions, q, k, v, forward_batch)
+                if _MUSE_QK_ROPE_CACHE and _USE_FUSED_QK_NORM
+                else None
+            )
+        if fused_qk is not None:
+            q, k = fused_qk
+        else:
+            if self.use_qk_norm:
+                if _USE_FUSED_QK_NORM and qk_norm_supported(q, k, self.head_dim):
+                    q, k = fused_qk_norm(
+                        q, k, self.head_dim, self.norm_eps, self.scale_query_by
+                    )
+                else:
+                    q = self._per_head_norm(q) * self.scale_query_by
+                    k = self._per_head_norm(k)
+            if self.use_attn_temperature_tuning:
+                temperature = (
+                    torch.log((positions.float() + 1.0) / self.temperature_floor)
+                    * self.temperature_q_scale
+                    + 1.0
+                ).clamp_min(1.0)
+                q = (q * temperature.unsqueeze(-1)).to(q.dtype)
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
+        output = self.attn(q, k, v, forward_batch, save_kv_cache=fused_qk is None)
         output = self._fused_o_norm_gate.forward(output, o_gate)
         output, _ = self.o_proj(output)
         return output
