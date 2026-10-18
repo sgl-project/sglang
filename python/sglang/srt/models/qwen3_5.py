@@ -535,6 +535,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
+        if _gdn_online_mxfp4:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
+
     @staticmethod
     def _override_weight_loader(param, loader):
         """Robustly override loader for:
@@ -700,23 +714,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(z.size(0), -1, self.head_v_dim)
 
         return query, key, value, z, b, a
-
-    def quantize_online_mxfp4(self) -> int:
-        """Quantize the BF16 projections named in SGLANG_ROCM_GDN_ONLINE_MXFP4."""
-        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
-            AiterMxfp4OnlineLinearMethod,
-        )
-
-        done = 0
-        for name in _gdn_online_mxfp4:
-            proj = getattr(self, name)
-            if (
-                isinstance(proj.quant_method, UnquantizedLinearMethod)
-                and proj.weight.dtype == torch.bfloat16
-            ):
-                AiterMxfp4OnlineLinearMethod.quantize_(proj)
-                done += 1
-        return done
 
     def finalize_fused_in_proj(self) -> None:
         """Prepare one BF16 or FP8 GEMM for both input projections.
@@ -1878,8 +1875,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             packed = mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
-                    # Quantize first, so that an MXFP4 in_proj_qkvz is not packed with in_proj_ba.
-                    mxfp4 += module.quantize_online_mxfp4()
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(

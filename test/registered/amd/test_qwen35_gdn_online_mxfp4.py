@@ -47,7 +47,10 @@ class TestQwen35GdnOnlineMxfp4(CustomTestCase):
 
                 layer = torch.nn.Module()
                 layer.weight = torch.nn.Parameter(w, requires_grad=False)
-                AiterMxfp4OnlineLinearMethod.quantize_(layer)
+                layer.quant_method = AiterMxfp4OnlineLinearMethod()
+                # The second call must not quantize the MXFP4 weight again.
+                layer.quant_method.process_weights_after_loading(layer)
+                layer.quant_method.process_weights_after_loading(layer)
                 y = layer.quant_method.apply(layer, x)
 
                 self.assertEqual(y.shape, (m, n))

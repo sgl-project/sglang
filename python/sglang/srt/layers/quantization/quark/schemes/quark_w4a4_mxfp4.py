@@ -770,6 +770,8 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
     """MXFP4 GEMM for a loaded BF16 linear that ``quantize_`` converts once.
 
+    A model sets this method on a BF16 linear after ``create_weights``. The
+    loader then calls ``process_weights_after_loading``, which runs ``quantize_``.
     ``quantize_`` stores the weight and its E8M0 scales preshuffled. Batches of
     at most ``PRESHUFFLE_MAX_M`` rows run the Triton preshuffled GEMM if AITER
     has a tuned config for (N, K). All other batches run the ASM ``gemm_a4w4``.
@@ -805,6 +807,10 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
 
     def create_weights(self, *args, **kwargs):
         raise NotImplementedError("use quantize_() on a loaded BF16 linear")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if layer.weight.dtype == torch.bfloat16:
+            self.quantize_(layer)
 
     def apply(
         self,
