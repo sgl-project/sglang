@@ -338,6 +338,9 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    # ASGI import string that multi-worker Uvicorn and Granian processes load;
+    # point it at an app that extends `http_server.app` with extra routes.
+    SGLANG_HTTP_SERVER_APP_PATH = EnvStr("sglang.srt.entrypoints.http_server:app")
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
@@ -419,6 +422,9 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
+    # that skips the per-layer load wait reads unloaded layers
+    SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES = EnvInt(0)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
@@ -569,6 +575,10 @@ class Envs:
     # Per-call move cap on a non-urgent lazy-compaction flush, so a large
     # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
     SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    # Max pages one compaction move-kernel launch copies (eager or lazy, urgent
+    # or not); a larger move is issued as consecutive launches of this size
+    # within the same compaction call.
+    SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -1378,7 +1388,7 @@ class Envs:
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
-    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
+    # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
@@ -1852,6 +1862,16 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+
+    # ===================================================================
+    # Muse Spark
+    # ===================================================================
+    SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR = EnvBool(True)
+    # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
+    SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
+    )
 
     # ===================================================================
     # MiniMax M3

@@ -100,8 +100,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -3761,8 +3761,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return self.mm_projector(image_embeds)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @property
     def start_layer(self) -> int:
