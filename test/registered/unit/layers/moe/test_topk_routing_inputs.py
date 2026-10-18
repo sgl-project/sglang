@@ -59,11 +59,13 @@ def _batch(real):
 def _placement():
     logical_to_physical = torch.tensor([[2, 0, 3, 1]], dtype=torch.int64)
     physical_to_logical = logical_to_physical.argsort(dim=-1)
+    all_physical = torch.full((1, 4, 4), -1, dtype=torch.int64)
+    all_physical[:, :, 0] = logical_to_physical
     return ExpertLocationMetadata(
         physical_to_logical_map=physical_to_logical,
         physical_to_logical_map_cpu=physical_to_logical.clone(),
-        logical_to_all_physical_map=logical_to_physical.unsqueeze(-1),
-        logical_to_all_physical_map_cpu=logical_to_physical.unsqueeze(-1).clone(),
+        logical_to_all_physical_map=all_physical,
+        logical_to_all_physical_map_cpu=all_physical.clone(),
         logical_to_all_physical_map_num_valid=torch.ones((1, 4), dtype=torch.int64),
         ep_size=1,
         logical_to_rank_dispatch_physical_map=logical_to_physical,
