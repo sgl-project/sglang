@@ -23,6 +23,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 class _ReadStream:
     reads_are_translated = False
+    window_kv_kind = IdSpaceKind.FULL
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
