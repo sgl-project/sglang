@@ -35,7 +35,12 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, Packed, pack
+from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
+    TEXT,
+    Packed,
+    StaticStreams,
+    pack,
+)
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
     Flux3ImagePackageConfig,
@@ -791,7 +796,7 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                 and batch.skip_softmax_params is None
                 and self.transformer.can_reuse_mode_blocks()
             ):
-                packed.static_hidden = {}
+                packed.static = StaticStreams()
             self._maybe_enable_cache_dit_and_torch_compile(num_steps, batch)
             with (
                 torch.inference_mode(),
