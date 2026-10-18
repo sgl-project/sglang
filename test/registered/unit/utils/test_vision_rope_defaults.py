@@ -6,6 +6,9 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 )
 
 from sglang.srt.utils.hf_transformers_patches import _patch_rope_parameters_validation
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestVisionRopeDefaults:
