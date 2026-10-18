@@ -46,7 +46,7 @@ python -m sglang.launch_server \
     --reasoning-parser qwen3
 ```
 
-The budget filter requires a grammar backend that supports token filtering. `xgrammar` is the default grammar backend, so no `--grammar-backend` flag is needed. Startup fails if a server-wide cap is set but the configured backend cannot filter tokens, and a per-request budget sent to such a server is rejected with an error.
+The budget filter requires a grammar backend that supports token filtering. `xgrammar` is the default grammar backend, so no `--grammar-backend` flag is needed. A per-request budget sent to a server that cannot enforce it is rejected with an error instead of being ignored.
 
 Enable `--reasoning-parser` so responses separate `reasoning_content` from the final answer (see [Reasoning Parser](/docs/advanced_features/separate_reasoning)). The token filter derives the thinking-end token ids from the parser's `think_end_token` through the tokenizer, so it is not tied to any hardcoded ids.
 
@@ -54,7 +54,9 @@ Enable `--reasoning-parser` so responses separate `reasoning_content` from the f
 
 - When the budget is spent during thinking, the vocab mask allows only the `</think>` token sequence, so the cap is exact. The model then produces the final answer.
 - Add `--enable-strict-thinking` to also block model-specific excluded tokens (for Qwen3, `<tool_call>`, `</tool_call>`, `<|im_end|>`, `<|endoftext|>`) during the thinking phase. The flag is not required for the budget itself.
-- To apply a server-wide cap to every request, set the environment variable `SGLANG_MAX_THINK_TOKENS` (default `-1`, no cap).
+- To apply a server-wide cap to every request, set the environment variable `SGLANG_MAX_THINK_TOKENS` (default `-1`, no cap). It requires `--reasoning-parser` and a token-filtering grammar backend; startup fails without them, and also with `--skip-tokenizer-init`.
+- A per-request budget on a constrained request (`json_schema`, `regex`, `ebnf`, `structural_tag`) is enforced when the compiled grammar filters thinking tokens. When it cannot, for example with a backend that cannot filter tokens or a grammar that owns the full assistant turn, the request is rejected.
+- UNO speculative decoding does not support grammar-enforced budgets: `SGLANG_MAX_THINK_TOKENS` fails startup and per-request budgets are rejected. The custom logit processor route below is unaffected.
 
 ### Native `/generate` API
 
@@ -98,7 +100,7 @@ print(response.choices[0].message.content)
 
 ## Hard budget with a custom logit processor
 
-When the grammar backend cannot be used, a custom logit processor can enforce the budget instead. Launch the server with `--enable-custom-logit-processor`:
+When the grammar backend cannot be used, a custom logit processor can enforce the budget instead. This route needs no grammar backend (it works with `--grammar-backend none`); `--reasoning-parser` only separates `reasoning_content` in the response. Launch the server with `--enable-custom-logit-processor`:
 
 ```bash Launch with custom logit processors
 python -m sglang.launch_server \
@@ -125,7 +127,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The processor counts the tokens generated after the `<think>` start token. Once the budget is reached, it first forces a newline token, then forces `</think>`. The model may emit its own `</think>` right after the forced one; this is harmless.
+When a request carries a custom logit processor, the processor owns `custom_params.thinking_budget` and the grammar token filter does not apply it. The processor counts the tokens generated after the `<think>` start token. Once the budget is reached, it first forces a newline token, then forces `</think>`. The model may emit its own `</think>` right after the forced one; this is harmless.
 
 ### Built-in processors
 

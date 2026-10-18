@@ -14,10 +14,11 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import get_parallel, get_serving, get_spec
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -41,7 +42,15 @@ class GrammarManager:
                 think_end_ids=scheduler.model_config.think_end_ids,
             )
         else:
+            if envs.SGLANG_MAX_THINK_TOKENS.get() >= 0:
+                raise ValueError(
+                    "SGLANG_MAX_THINK_TOKENS cannot be enforced with "
+                    "--skip-tokenizer-init because no grammar backend is created."
+                )
             self.grammar_backend = None
+        self.is_uno = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).is_uno()
 
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
@@ -113,6 +122,9 @@ class GrammarManager:
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
+        # A custom logit processor (e.g. ThinkingBudgetLogitProcessor) owns the budget.
+        if req.custom_logit_processor is not None:
+            return None
         custom_params = req.sampling_params.custom_params
         if not isinstance(custom_params, dict):
             return None
@@ -136,7 +148,28 @@ class GrammarManager:
         if thinking_budget is not None:
             req.grammar.max_think_tokens = thinking_budget
 
+    def _apply_constrained_reasoning_config(self, req: Req, key_type: str) -> None:
+        if self._get_request_thinking_budget(req) is not None and not (
+            isinstance(req.grammar, ReasonerGrammarObject)
+            and req.grammar.token_filter_fn is not None
+        ):
+            req.set_finish_with_abort(
+                f"thinking_budget cannot be enforced together with a {key_type} "
+                f"constraint on this server; it requires --reasoning-parser, a "
+                f"grammar backend that supports token filtering (e.g., xgrammar), "
+                f"and a constraint that does not own the full assistant turn"
+            )
+            return
+        self._apply_request_reasoning_config(req)
+
     def process_req_with_grammar(self, req: Req) -> bool:
+        if self.is_uno and self._get_request_thinking_budget(req) is not None:
+            req.set_finish_with_abort(
+                "thinking_budget is not supported with UNO speculative decoding "
+                "because it requires grammar decoding"
+            )
+            return False
+
         # Init grammar cache for this request
         add_to_grammar_queue = False
         if (
@@ -180,7 +213,7 @@ class GrammarManager:
                         )
                         req.set_finish_with_abort(error_msg)
                     else:
-                        self._apply_request_reasoning_config(req)
+                        self._apply_constrained_reasoning_config(req, key[0])
         else:
             thinking_budget = self._get_request_thinking_budget(req)
             grammar_obj = (
@@ -309,10 +342,11 @@ class GrammarManager:
                 )
                 req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-            self._apply_request_reasoning_config(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
+            else:
+                self._apply_constrained_reasoning_config(req, req.grammar_key[0])
 
         # Return failed requests
         for i in synced_failed_req_idxs:

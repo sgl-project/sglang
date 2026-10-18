@@ -363,6 +363,23 @@ def _thinking_token_filter_requested() -> bool:
     )
 
 
+def _check_env_thinking_budget_enforceable(
+    grammar_backend: Optional[BaseGrammarBackend], missing: str
+) -> None:
+    from sglang.srt.constrained.reasoner_grammar_backend import (
+        ReasonerGrammarBackend,
+    )
+
+    if envs.SGLANG_MAX_THINK_TOKENS.get() < 0 or isinstance(
+        grammar_backend, ReasonerGrammarBackend
+    ):
+        return
+    raise ValueError(
+        f"SGLANG_MAX_THINK_TOKENS requires {missing} so the thinking budget can "
+        f"be enforced; it would otherwise be silently ignored."
+    )
+
+
 def create_grammar_backend(
     server_args: ServerArgs,
     tokenizer,
@@ -374,9 +391,14 @@ def create_grammar_backend(
 
     # Custom grammar backend has the highest priority
     if name in GRAMMAR_BACKEND_REGISTRY:
-        return GRAMMAR_BACKEND_REGISTRY[name](
+        grammar_backend = GRAMMAR_BACKEND_REGISTRY[name](
             server_args, tokenizer, vocab_size, eos_token_ids
         )
+        _check_env_thinking_budget_enforceable(
+            grammar_backend,
+            missing=f"custom grammar backend '{name}' to return a ReasonerGrammarBackend",
+        )
+        return grammar_backend
 
     # Default grammar backends
     if name == "outlines":
@@ -458,4 +480,12 @@ def create_grammar_backend(
             enable_strict_thinking=get_serving().enable_strict_thinking,
         )
 
+    _check_env_thinking_budget_enforceable(
+        grammar_backend,
+        missing=(
+            "--reasoning-parser"
+            if not get_serving().reasoning_parser
+            else "the model's think-end token ids"
+        ),
+    )
     return grammar_backend
