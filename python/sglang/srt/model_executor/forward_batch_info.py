@@ -775,10 +775,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Replay of cached prefix tokens that rebuilds only their SWA rows.
     swa_recompute: bool = False
     # Encoder replay folded into the extend: per-row window floor [num_tokens]
-    # int64 (the request's replay start, 0 for other requests), and per-request
-    # leading replay rows the low-ratio compressors skip [bs] int32.
+    # int64 (the request's replay start, 0 for other requests).
     encoder_swa_row_floor: Optional[torch.Tensor] = None
-    encoder_swa_compress_skip: Optional[torch.Tensor] = None
     encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's

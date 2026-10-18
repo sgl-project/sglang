@@ -1135,9 +1135,21 @@ class UnifiedMambaPool(MambaPool):
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Ids are PHYSICAL slots; `MambaPool.copy_from` takes (src, dst), hence
-        # the swap.
-        MambaPool.copy_from(self, src_loc, tgt_loc)
+        # Compaction moves disjoint physical slots. Copy their whole envelopes
+        # without the conv/temporal gather temporary used by copy_from (COW).
+        # Sibling callbacks retain their own copy and scratch-allocation contracts.
+        if tgt_loc.numel() == 0:
+            return
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        copy_pages(
+            self._unified_buffer._raw,
+            tgt_loc,
+            src_loc,
+            self._unified_buffer.max_slots(self._sub_pool_name),
+            self._unified_buffer.mamba_spec(self._sub_pool_name).entry_bytes(),
+        )
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_loc, tgt_loc)
 
     def move_physical_pages(
         self, tgt_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
