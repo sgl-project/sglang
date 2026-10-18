@@ -23,9 +23,9 @@ from transformers import LlamaConfig
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -33,6 +33,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -241,15 +242,17 @@ class ArceeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
+        attn, ffn = self.stage_facts(layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
+
+    @staticmethod
+    def stage_facts(layer_id: int):
+        """The stages every Arcee layer declares, an attention and a dense FFN:
+        the model's shared declaration function (see make_layers)."""
+        return (declare_attn(), declare_ffn(sparse=False, next_layer_sparse=False))
 
     def forward(
         self,
@@ -287,6 +290,7 @@ class ArceeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -303,6 +307,7 @@ class ArceeModel(nn.Module):
                 config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
             ),
             prefix="model.layers",
+            stage_facts=ArceeDecoderLayer.stage_facts,
         )
 
         if self.pp_group.is_last_rank:
@@ -354,8 +359,7 @@ class ArceeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,

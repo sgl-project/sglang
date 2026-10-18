@@ -90,6 +90,17 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _prefill_attention_pairs(batch: ScheduleBatch) -> int:
+    """Causal query-key pairs: each chunk against its cached prefix, plus
+    the causal pairs within the chunk itself."""
+    return sum(
+        extend_len * prefix_len + extend_len * (extend_len + 1) // 2
+        for prefix_len, extend_len in zip(
+            batch.prefix_lens, batch.extend_lens, strict=True
+        )
+    )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -218,6 +229,13 @@ class SchedulerMetricsReporter:
         )
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
+        )
+        parallel = get_parallel()
+        # The max/mean token ratio is engine-wide; one scheduler reports it.
+        self.reports_dp_token_imbalance_ratio = (
+            parallel.attn_dp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
         )
         self._init_metrics()
         self._install_device_timer_on_runners()
@@ -418,7 +436,9 @@ class SchedulerMetricsReporter:
                 prefill_lengths.add(len(req.origin_input_ids))
             num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
             sum_prefill_tokens = stats.log_input_tokens if stats else 0
-            sum_prefill_kv_tokens = sum(len(req.prefix_indices) for req in prefill_reqs)
+            # Prefill reqs lead batch.reqs, so they own the head of prefix_lens;
+            # each req's own prefix was already advanced by result processing.
+            sum_prefill_kv_tokens = sum(batch.prefix_lens[: len(prefill_reqs)])
 
         decode_kv = WelfordAccumulator()
         if batch.forward_mode.is_mixed():
@@ -595,14 +615,6 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    @staticmethod
-    def _prefill_attention_pairs(batch) -> float:
-        """Causal query-key pairs: each chunk against its cached prefix, plus
-        the causal pairs within the chunk itself."""
-        prefix_pairs = sum(c * p for c, p in zip(batch.extend_lens, batch.prefix_lens))
-        within_chunk_pairs = sum(c * (c + 1) / 2.0 for c in batch.extend_lens)
-        return float(prefix_pairs + within_chunk_pairs)
-
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -610,7 +622,7 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        context_product = self._prefill_attention_pairs(batch)
+        context_product = float(_prefill_attention_pairs(batch))
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
@@ -989,7 +1001,7 @@ class SchedulerMetricsReporter:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
-            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
@@ -1114,6 +1126,16 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            self.current_scheduler_metrics_enabled
+            and (dp_balance_stats := batch.dp_balance_stats) is not None
+        ):
+            self.metrics_collector.observe_dp_balance(dp_balance_stats)
+            if self.reports_dp_token_imbalance_ratio:
+                self.metrics_collector.observe_dp_token_imbalance_ratio(
+                    dp_balance_stats
+                )
+
         if not isinstance(result, GenerationBatchResult):
             return
 
@@ -1397,7 +1419,7 @@ class SchedulerMetricsReporter:
         )
         host_reqs = (
             [req for req in transfer_queue if req.host_staged]
-            if get_disagg().disaggregation_decode_host_receive_threshold > 0
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1
             else []
         )
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(

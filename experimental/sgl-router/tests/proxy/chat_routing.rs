@@ -45,7 +45,10 @@ fn config_for(_worker_url: &str) -> Config {
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             dp_aware: false,
+            dp_rank_policy: Default::default(),
             bucket_config: None,
+            reorg_buckets: None,
+            reorg_admission: Default::default(),
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -67,13 +70,14 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
     let cfg = config_for(url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
+    let spec = WorkerSpec {
         id: WorkerId("w1".into()),
         url: url.to_string(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         ..Default::default()
-    });
+    };
+    let _ = registry.add_with_cb(spec, Some(Default::default()), WireProtocol::default());
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     // Per-request worker URLs flow from the registry through
     // `forward_*_to(&worker.url, ...)`; the proxy itself is URL-less.
@@ -247,7 +251,7 @@ async fn streaming_chunks_pass_through() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         res.headers().get("content-type").unwrap().to_str().unwrap(),
-        "text/event-stream"
+        "text/event-stream; charset=utf-8"
     );
 
     let bytes = res.into_body().collect().await.unwrap().to_bytes();

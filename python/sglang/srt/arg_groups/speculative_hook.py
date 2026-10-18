@@ -158,6 +158,41 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
+    # EAGLE/NEXTN to FROZEN_KV_MTP.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm})"
+        )
+
+    if cfg.speculative_use_block_verification:
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
+            raise ValueError(
+                "--speculative-use-block-verification only supports EAGLE / EAGLE3 / "
+                "NEXTN / DFLASH / DSPARK."
+            )
+        if cfg.device != "cuda":
+            raise ValueError(
+                "--speculative-use-block-verification only supports CUDA or ROCm."
+            )
+        # Block verification needs sampled proposals and their full distributions.
+        # The DFLASH family's sampled drafts always carry them.
+        if (
+            cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+            and not cfg.speculative_use_rejection_sampling
+        ):
+            declare_resolution(
+                server_args,
+                "handle_speculative_decoding",
+                speculative_use_rejection_sampling=True,
+            )
+
     # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
     # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
     # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
@@ -583,9 +618,9 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "xpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU or XPU device."
         )
 
     if cfg.attn_dp_size > 1:
@@ -868,6 +903,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
+            # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
+            if not current_platform.is_out_of_tree() and get_platform().is_sm100:
+                fallback_backend = "fa4"
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "

@@ -24,22 +24,22 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 @unittest.skipUnless(torch.cuda.is_available(), "Test requires CUDA")
 class TestDsaKpoolMultiPool(CustomTestCase):
     POOL_SIZE = 4
-    PAGE_SIZE = 64
-    SLOTS_PER_PAGE = 64
+    PAGE_SIZE = 256
+    INDEX_PAGE_SIZE = 64
     NUM_DRAFT_TOKENS = 6
 
     def _pool(self) -> SimpleNamespace:
         return SimpleNamespace(
             page_size=self.PAGE_SIZE,
             index_head_dim=INDEX_HEAD_DIM,
-            slots_per_page=self.SLOTS_PER_PAGE,
+            index_page_size=self.INDEX_PAGE_SIZE,
             index_kpool=self.POOL_SIZE,
             tail_extra_slots=self.NUM_DRAFT_TOKENS,
             quant_block_size=128,
         )
 
     def _empty_cache(self) -> torch.Tensor:
-        page_nbytes = self.SLOTS_PER_PAGE * INDEX_HEAD_DIM + self.SLOTS_PER_PAGE * 4
+        page_nbytes = self.INDEX_PAGE_SIZE * INDEX_HEAD_DIM + self.INDEX_PAGE_SIZE * 4
         return torch.zeros((1, page_nbytes), dtype=torch.uint8, device="cuda")
 
     def test_write_plan_records_every_candidate_pool(self):
@@ -51,7 +51,7 @@ class TestDsaKpoolMultiPool(CustomTestCase):
         plan = _alloc_kpool_write_plan_buffers(
             max_bs=batch_size,
             num_draft_tokens=num_draft_tokens,
-            pool_size=self.POOL_SIZE,
+            kpool=self.POOL_SIZE,
             device=torch.device("cuda"),
             is_verify=True,
         )
@@ -64,10 +64,10 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             dtype=torch.int32,
             device="cuda",
         )
-        real_page_table[:num_draft_tokens, 0] = 2
-        real_page_table[:num_draft_tokens, 4] = 3
-        real_page_table[num_draft_tokens:, 0] = 5
-        real_page_table[num_draft_tokens:, 4] = 6
+        real_page_table[:num_draft_tokens, 0] = 2 * self.POOL_SIZE
+        real_page_table[:num_draft_tokens, 4] = 3 * self.POOL_SIZE
+        real_page_table[num_draft_tokens:, 0] = 5 * self.POOL_SIZE
+        real_page_table[num_draft_tokens:, 4] = 6 * self.POOL_SIZE
 
         update_kpool_write_plan_cuda_graph(
             write_start=write_start,
@@ -79,9 +79,9 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             write_loc_out=plan.write_loc,
             pool_seqlens_per_q_out=plan.pool_seqlens_per_q,
             seqlens_per_q_out=plan.seqlens_per_q,
-            pool_size=self.POOL_SIZE,
+            kpool=self.POOL_SIZE,
             num_draft_tokens=num_draft_tokens,
-            slots_per_page=self.SLOTS_PER_PAGE,
+            index_page_size=self.INDEX_PAGE_SIZE,
         )
 
         torch.testing.assert_close(plan.req, req_pool_indices)
@@ -94,10 +94,10 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             plan.write_loc,
             torch.tensor(
                 [
-                    [2 * self.SLOTS_PER_PAGE, 2 * self.SLOTS_PER_PAGE + 1],
+                    [2 * self.INDEX_PAGE_SIZE, 2 * self.INDEX_PAGE_SIZE + 1],
                     [
-                        5 * self.SLOTS_PER_PAGE + 63,
-                        6 * self.SLOTS_PER_PAGE,
+                        5 * self.INDEX_PAGE_SIZE + 63,
+                        6 * self.INDEX_PAGE_SIZE,
                     ],
                 ],
                 dtype=torch.int64,

@@ -92,16 +92,17 @@ class TestAuxStorage(CustomTestCase):
     def boundary(self, stream, *, move=None):
         boundary = stub_plan()
         boundary.norm = None
-        stub_stage(boundary, StageKind.ATTENTION)._prepare_input = Mock(
-            return_value=(stream.residual, stream)
-        )
-        stub_stage(boundary, StageKind.ATTENTION).entry = lambda _: SimpleNamespace(
+        stage = stub_stage(boundary, StageKind.ATTENTION)
+        stage._prepare = Mock(return_value=(stream.residual, stream))
+        entry = SimpleNamespace(
             input_move=move,
+            input_retainable=False,
             capture_move=None,
             capture_move_allocates=False,
             capture_preserves_residual=None,
         )
-        return stub_stage(boundary, StageKind.ATTENTION)
+        stage._select = lambda hidden, batch: (hidden, SimpleNamespace(entry=entry))
+        return stage
 
     def test_packer_receives_borrowed_boundary_value_without_intermediate_clone(self):
         for callback in (False, True):
@@ -161,12 +162,12 @@ class TestAuxStorage(CustomTestCase):
         outputs = AuxHiddenStatePacker(1)
         stage = self.boundary(stream)
 
-        def prepare(value, stream, batch, **kwargs):
+        def prepare(value, stream, batch, steps, **kwargs):
             value.zero_()
             stream.write(value)
             return value, stream
 
-        stage._prepare_input = prepare
+        stage._prepare = prepare
         with patch.object(
             torch.Tensor, "clone", side_effect=AssertionError("extra clone")
         ):
@@ -185,9 +186,9 @@ class TestBoundCaptureOwnership(CustomTestCase):
             SumGroup,
             declare_attn,
             declare_ffn,
-            make_stages,
         )
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.test.boundary_fixtures import build_stages
         from sglang.test.communicator_patch import patch_communicator
 
         parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
@@ -244,7 +245,7 @@ class TestBoundCaptureOwnership(CustomTestCase):
                 side_effect=fused_kernel,
             ),
         ):
-            attn, ffn = make_stages(
+            attn, ffn = build_stages(
                 (declare_attn(), fixture.Norm()),
                 (declare_ffn(), norm, {"fusions": custom_fusions}),
                 previous=declare_ffn(),
