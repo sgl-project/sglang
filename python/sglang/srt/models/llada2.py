@@ -709,6 +709,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
         if self.use_block_routing:
             _require_block_routing_runner_compatibility(self.experts)
         # shared expert

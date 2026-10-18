@@ -102,8 +102,8 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
+    MoeRunnerBackendLike,
     get_moe_a2a_backend,
-    get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.moe.utils import (
@@ -268,6 +268,7 @@ class TopKConfig:
     # router's shared weights on the other standard path.
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
+    runner_backend: Optional[MoeRunnerBackendLike] = None
     scoring_func: str = "softmax"
     # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
     sqrtsoftplus_log1p: bool = False
@@ -662,6 +663,32 @@ class TopK(BaseFusedOp):
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
+    def bind_runner_backend(
+        self, runner_backend: Optional[MoeRunnerBackendLike]
+    ) -> None:
+        self.topk_config.runner_backend = runner_backend
+        self.topk_config.fused_gate_packed_ids &= (
+            runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
+        )
+        if self.topk_config.output_format is not None:
+            return
+        if runner_backend is not None and runner_backend.is_triton_kernels():
+            output_format = TopKOutputFormat.TRITON_KERNEL
+        elif runner_backend is not None and (
+            runner_backend.is_flashinfer_trtllm()
+            or runner_backend.is_flashinfer_mxfp4()
+            and not self.is_fp4_experts
+        ):
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if runner_backend.is_experimental_sgl_trtllm()
+                and get_lora().enable_lora
+                else TopKOutputFormat.BYPASSED
+            )
+        else:
+            output_format = TopKOutputFormat.STANDARD
+        self.topk_config.output_format = output_format
+
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         if self.enable_waterfill and self.waterfill_balancer is None:
             raise RuntimeError(
@@ -725,26 +752,10 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.STANDARD
         elif self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernels():
-            output_format = TopKOutputFormat.TRITON_KERNEL
-        # ===== TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_experimental_sgl_trtllm():
-            try:
-                use_standard_for_lora = bool(get_lora().enable_lora)
-            except ValueError:
-                use_standard_for_lora = False
-            output_format = (
-                TopKOutputFormat.STANDARD
-                if use_standard_for_lora
-                else TopKOutputFormat.BYPASSED
-            )
-        # ===== END TO BE REFACTORED ====
-        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
-        ):
-            output_format = TopKOutputFormat.BYPASSED
         else:
-            output_format = TopKOutputFormat.STANDARD
+            raise RuntimeError(
+                "TopK requires the owning experts' runner backend or an explicit output format."
+            )
 
         if (
             router_logits_partials is not None
@@ -1735,7 +1746,6 @@ def _fused_gate_emits_packed_ids(
     return (
         enabled
         and _fused_gate_masks_padded_rows(scoring_func)
-        and get_moe_runner_backend().is_flashinfer_mxfp4()
         and expert_location_dispatch_info is None
         and num_shared_topk_slots == 0
         and not routing_overridden
@@ -2747,7 +2757,8 @@ def select_experts(
             )
             padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
         elif (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            topk_config.runner_backend is not None
+            and topk_config.runner_backend.is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
             and correction_bias is None
         ):

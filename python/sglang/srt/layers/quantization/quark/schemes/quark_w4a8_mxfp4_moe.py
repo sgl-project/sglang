@@ -421,6 +421,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             raise NotImplementedError(
                 "QuarkW4A8MXFp4MoE is currently only supported with AITER."
             )
+        moe_runner_config.runner_backend = self.runner.runner_backend
 
     def apply_weights(
         self,

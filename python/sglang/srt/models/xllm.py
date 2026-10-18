@@ -942,6 +942,7 @@ class XllmSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # Shared expert (no gating — output added directly)
         num_shared_experts = getattr(config, "num_shared_experts", 0)

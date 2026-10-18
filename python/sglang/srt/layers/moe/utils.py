@@ -379,11 +379,9 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
-    if (
-        get_moe_runner_backend().is_flashinfer_cutedsl()
-        or get_moe_runner_backend().is_cutlass()
-        or get_moe_runner_backend().is_humming()
+    backend = self.runner_backend
+    if backend is not None and (
+        backend.is_flashinfer_cutedsl() or backend.is_cutlass() or backend.is_humming()
     ):
         return DispatcherOutputDtype.BF16
 

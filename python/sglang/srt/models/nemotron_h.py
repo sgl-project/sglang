@@ -290,6 +290,7 @@ class NemotronHMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
                 config,

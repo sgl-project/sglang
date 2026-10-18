@@ -339,6 +339,7 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
             # The layer-local shared path consumes the same post-attention input.
             inplace=False,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,

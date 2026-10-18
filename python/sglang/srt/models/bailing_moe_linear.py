@@ -318,6 +318,7 @@ class BailingMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=f"{prefix}.experts",
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.num_shared_experts > 0:
             intermediate_size = self.intermediate_size * self.num_shared_experts

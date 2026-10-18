@@ -552,6 +552,7 @@ class MiniMaxM2MoE(nn.Module):
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,

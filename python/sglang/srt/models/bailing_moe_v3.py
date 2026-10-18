@@ -598,6 +598,7 @@ class BailingMoE(nn.Module):
                 and getattr(quant_config, "is_fp4_experts", False)
             ),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,

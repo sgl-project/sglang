@@ -162,6 +162,7 @@ class Step3p5MoEMLP(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
             gemm1_clamp_limit=self.limit,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,

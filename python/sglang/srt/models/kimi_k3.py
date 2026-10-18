@@ -551,6 +551,7 @@ class KimiK3MoE(nn.Module):
                 else None
             ),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
         # the routed experts call below. K3 routes ALL batches through it when

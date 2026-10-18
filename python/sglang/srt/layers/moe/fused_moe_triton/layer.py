@@ -101,25 +101,24 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _deferred_finalize_info_logged = False
 
 
-def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
+def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
     return (
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and not getattr(
-                quant_method, "_moe_runner_backend", get_moe_runner_backend()
-            ).is_marlin()
+            and (runner_backend is None or not runner_backend.is_marlin())
         )
         or (
-            isinstance(quant_method, Fp8MoEMethod)
+            runner_backend is not None
             and (
-                get_moe_runner_backend().is_cutlass()
-                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                isinstance(quant_method, Fp8MoEMethod)
+                and (
+                    runner_backend.is_cutlass()
+                    or runner_backend.is_flashinfer_trtllm_routed()
+                )
+                or isinstance(quant_method, UnquantizedFusedMoEMethod)
+                and runner_backend.is_flashinfer_trtllm_routed()
             )
-        )
-        or (
-            isinstance(quant_method, UnquantizedFusedMoEMethod)
-            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
     )
 
@@ -203,6 +202,7 @@ def create_moe_dispatcher(
         or a2a_backend.is_pplx()
     ):
         return MaybeTboDeepEPDispatcher(
+            runner_backend=moe_runner_config.runner_backend,
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
@@ -574,6 +574,13 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
+        self.runner_backend = self.moe_runner_config.runner_backend
+        self._set_runner_flags()
+        self.supports_deferred_finalize = (
+            self.runner_backend is not None
+            and self.runner_backend.is_flashinfer_trtllm()
+            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
+        )
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
         )
@@ -591,14 +598,11 @@ class FusedMoE(torch.nn.Module):
         self.swiglu_alpha = gemm1_alpha
         self.swiglu_clamp_limit = gemm1_clamp_limit
 
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
+        if self.use_flashinfer_trtllm_moe:
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            _fuses_routed_scaling_factor_in_topk(self.quant_method)
+            _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
         )
 
         self.routing_method_type = routing_method_type
@@ -610,6 +614,20 @@ class FusedMoE(torch.nn.Module):
         self._dwdp_bound = False
 
         self.runner = self.quant_method.runner
+
+    def _set_runner_flags(self) -> None:
+        backend = self.runner_backend
+        self.enable_flashinfer_cutlass_moe = (
+            backend is not None and backend.is_flashinfer_cutlass()
+        )
+        self.use_flashinfer_mxfp4_moe = (
+            backend is not None and backend.is_flashinfer_mxfp4()
+        )
+        self.use_triton_kernels = backend is not None and backend.is_triton_kernels()
+        self.use_deep_gemm = backend is not None and backend.is_deep_gemm()
+        self.use_flashinfer_trtllm_moe = backend is not None and (
+            backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
+        )
 
     @property
     def num_global_routed_experts(self) -> int:

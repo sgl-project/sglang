@@ -273,6 +273,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # Router gate: description-driven quant. Only the offline ModelSlim path
         # (which carries a per-layer quant_model_description) may quantise the

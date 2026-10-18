@@ -470,6 +470,7 @@ class MiMoV2MoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         uses_mxfp4_runner = isinstance(
             self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod

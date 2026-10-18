@@ -126,6 +126,7 @@ class Llama4MoE(nn.Module):
             apply_router_weight_on_input=True,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_expert = LlamaMLP(
             hidden_size=config.hidden_size,

@@ -30,6 +30,7 @@ class _RecordingMoeAlltoAll:
 
 def _make_dispatcher(*, dispatch_type, max_num_tokens, quant_config):
     dispatcher = object.__new__(FlashinferDispatcher)
+    dispatcher.runner_backend = None
     dispatcher.dispatch_type = dispatch_type
     dispatcher.hidden_size = 128
     dispatcher.max_num_tokens = max_num_tokens

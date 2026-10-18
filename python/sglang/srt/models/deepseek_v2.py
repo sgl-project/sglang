@@ -821,6 +821,7 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
+            self.topk.bind_runner_backend(self.experts.runner_backend)
             self.routed_scaling_factor_fused_in_topk = (
                 is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
             )

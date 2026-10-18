@@ -222,6 +222,7 @@ class IQuestQ1MoEBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
