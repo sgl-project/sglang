@@ -395,6 +395,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
+        # Set when process_weights_after_loading preshuffles w13 for aiter's a8w4/a16w4 kernels.
+        self.aiter_gate_up_interleaved = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
@@ -993,6 +995,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 and gate_up_interleaved
             )
+            self.aiter_gate_up_interleaved = use_aiter_gu_interleave
             if use_aiter_gu_interleave:
                 layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
                 shuffled_w13_scale = shuffle_scale_a16w4(
@@ -1789,6 +1792,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            gate_up_interleaved=self.aiter_gate_up_interleaved,
             # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
             # uses gemm1_clamp_limit as linear_beta, which is forwarded by
             # the AITER runner and must not be treated as swiglu_limit.

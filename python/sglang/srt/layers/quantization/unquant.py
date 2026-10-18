@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -80,6 +81,24 @@ _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
 _A16W16_TRITON_NARROW_K = 512
 _A16W16_TRITON_NARROW_K_MAX_M = 512
+
+
+@functools.lru_cache(maxsize=None)
+def _aiter_tuned_a16w16(m: int, n: int, k: int, bias: bool) -> bool:
+    """Whether aiter's merged tuned table (configs/ + model_configs/) has a
+    measured row for this bf16 shape; untuned lookups return a default config
+    without the measured time."""
+    from aiter.tuned_gemm import get_GEMM_A16W16_config
+
+    config = get_GEMM_A16W16_config(
+        M=m,
+        N=n,
+        K=k,
+        bias=bias,
+        dtype=str(torch.bfloat16),
+        otype=str(torch.bfloat16),
+    )
+    return "us" in config
 
 
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -584,7 +603,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
-            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+            if (
+                _is_gfx95
+                and _prefer_triton_a16w16(x, layer.weight)
+                and not _aiter_tuned_a16w16(
+                    x.shape[0], *layer.weight.shape, bias is not None
+                )
+            ):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 

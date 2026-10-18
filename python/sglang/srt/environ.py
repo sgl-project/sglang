@@ -971,11 +971,41 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    # Kimi-K3 TP8 on gfx950: run the latent-MoE tail (latent RMSNorm, up-projection,
+    # shared + residual add) as one kernel for decode-sized batches.
+    SGLANG_ROCM_K3_FUSED_LATENT_TAIL = EnvBool(True)
+    # Run that tail column-parallel (each rank reads 1/8 of the replicated up_proj)
+    # and fuse its all-gather with the next layer's attention read, up to 64 tokens
+    # (LL collectives, layers/communication/k3_ll_comm_hip.py).
+    SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
+    # Complete the attention output's all-reduce, the residual add and the FFN-side
+    # read in one LL kernel for 4-token batches (EAGLE C1 verify).
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ = EnvBool(True)
+    # Kimi-K3 on gfx950: fuse the router top-k with aiter's MoE route sort for decode
+    # batches up to this many tokens; 0 disables.
+    SGLANG_ROCM_K3_FUSED_ROUTE_SORT_MAX_TOKENS = EnvInt(16)
+    # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at most 8
+    # tokens: past that its single quant workgroup costs more than a launch).
+    SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
+    # Split the MoE front's replicated router and latent down-projection by output
+    # columns (each rank reads 1/8 of them) and all-gather logits and latent, up to
+    # 64 tokens.
+    SGLANG_ROCM_K3_SPLIT_FRONT = EnvBool(True)
+    # Let the route sort's spare workgroups compute the next layer's attention-residual
+    # bank partials, so its fused reads only fold in the new stream.
+    SGLANG_ROCM_K3_ATTN_RES_BANK_PARTIALS = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # gfx950 KDA chunked prefill (K = V = 128): store the gated key chunk-major
+    # ([chunks, H, K, 64], tokens contiguous) for the state scan, with its tuned tile.
+    SGLANG_ROCM_KDA_CHUNK_MAJOR_SCAN = EnvBool(True)
+    # With it, extends of at most this many tokens run the scan that writes the output
+    # in the same pass (kernels/ops/attention/fla/kda_chunk_scan.py); 0 disables.
+    # Measured on MI350X: the launch it saves wins while the call is launch-bound.
+    SGLANG_ROCM_KDA_FUSED_OUTPUT_MAX_TOKENS = EnvInt(3072)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -1009,8 +1039,22 @@ class Envs:
     )
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
+    # gfx950, FP8 latent cache: an extend whose requests each add at most this many
+    # tokens after a cached prefix attends the latent cache with absorbed queries
+    # (kernels/ops/attention/mla_absorbed_extend.py) instead of expanding the prefix
+    # through kv_b_proj; 0 disables. Measured faster up to ~64 new tokens on MI350X.
+    SGLANG_ROCM_MLA_ABSORBED_EXTEND_MAX_TOKENS = EnvInt(64)
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # Per-request cap on those planned splits; unset gives a request every CU,
+    # which makes the split reduce the bottleneck for a lone long request.
+    SGLANG_AITER_MLA_MAX_SPLITS_PER_BATCH = EnvInt(None)
+    # gfx950: run the head-padded asm MLA target verify with a unit-scale fp8 query
+    # (the a8w8 kernel) instead of bf16, as the qlen > 4 path already does.
+    SGLANG_AITER_MLA_VERIFY_FP8_Q = EnvBool(True)
+    # Kimi-K3 on gfx950: combine the split MLA decode/verify partials, the W_vc
+    # up-projection and the output gate in one kernel for up to 64 query rows.
+    SGLANG_ROCM_K3_FUSED_MLA_EPILOGUE = EnvBool(True)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
@@ -1953,6 +1997,24 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3 prefill MoE on gfx950. SiTU MXFP4 MoE calls of at least this many tokens
+    # quantize activations to MXFP4 (aiter a4w4 on the gate/up-interleaved a8w4 weights)
+    # instead of MXFP8; 0 disables. 1025: aiter's K3 a4w4 table has an
+    # interleave-capable stage 1 from the 2048 bucket.
+    SGLANG_ROCM_K3_PREFILL_MOE_A4W4_MIN_TOKENS = EnvInt(1025)
+    # Run the merged MoE front of the prefill sizes where it is faster
+    # (kernels/ops/gemm/kimi_k3_front_situ.py) as one GEMM with the shared experts'
+    # SiTU in its epilogue.
+    SGLANG_ROCM_K3_FRONT_SITU = EnvBool(True)
+    # Batches of at least this many tokens reduce-scatter the MoE's [latent | shared]
+    # partials by rows, run the latent tail on this rank's rows and all-gather the
+    # stream; 0 disables.
+    SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS = EnvInt(4096)
+    # With the row-sharded tail, also complete the attention output's sum on this
+    # rank's rows (reduce-scatter), read the FFN input there and all-gather it.
+    SGLANG_ROCM_K3_ROW_SHARDED_ATTN_READ = EnvBool(True)
+    # Row-shard the attention side only from this many tokens (0: with the tail).
+    SGLANG_ROCM_K3_ROW_SHARDED_ATTN_MIN_TOKENS = EnvInt(0)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

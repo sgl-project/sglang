@@ -45,7 +45,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -971,6 +974,22 @@ class DeepseekMLARocmForwardMixin:
                 save_kv_cache=False,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        elif (
+            llama_4_scaling is None
+            and topk_indices is None
+            and not self._skip_rope_for_aiter_fused_mla()
+            and get_attn_backend().supports_split_mla_qk(forward_batch, self.attn_mqa)
+        ):
+            # The backend assembles q / k with its KV write in one kernel.
+            attn_output = self.attn_mqa(
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_pe,
+                k_rope=k_pe,
+            )
         else:
             if self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
@@ -1071,7 +1090,13 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = (
+                None
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI or is_kv_b_lora_active(self)
+                else self.fused_absorb_v_epilogue(attn_output)
+            )
+            if attn_bmm_output is None:
+                attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
