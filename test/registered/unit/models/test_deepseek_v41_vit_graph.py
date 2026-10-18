@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from sglang.srt.models.deepseek_v41_vit import assemble_image_span
+from sglang.srt.models.deepseek_v41_vit import _rms_norm, assemble_image_span, rms_norm
 from sglang.srt.multimodal.deepseek_v41_image_processing import image_token_types
 from sglang.srt.multimodal.deepseek_v41_vit_cuda_graph_runner import (
     DeepseekV41ViTCudaGraphRunner,
@@ -28,6 +28,18 @@ def test_assemble_image_span_matches_token_types(n_llm_h, n_llm_w):
     span = assemble_image_span(features, n_llm_h, n_llm_w, start, newline, end)
 
     assert torch.equal(span, expected)
+
+
+def test_rms_norm_matches_module():
+    # The compiled encoder norm must keep RMSNorm.forward_native's arithmetic.
+    norm = _rms_norm(16)
+    torch.nn.init.normal_(norm.weight)
+    x = torch.randn(5, 16, dtype=torch.bfloat16)
+
+    out = rms_norm._torchdynamo_orig_callable(x, norm.weight, norm.variance_epsilon)
+
+    assert out.dtype == x.dtype
+    assert torch.equal(out, norm.forward_native(x))
 
 
 class _FakeGraph:
