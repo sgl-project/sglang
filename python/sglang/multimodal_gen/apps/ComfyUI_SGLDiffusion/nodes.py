@@ -915,15 +915,15 @@ class SGLDiffusionServerUnsetLora:
 class SGLDWorkerStatus:
     @classmethod
     def INPUT_TYPES(s):
-        # Linking the sampler's output to "after_sampling" makes ComfyUI run this
-        # node once sampling has finished, so the metrics are from that run.
+        # Required so ComfyUI always runs this node after sampling has finished;
+        # otherwise it may run first and report the previous run.
         return {
-            "required": {"model": ("MODEL",)},
-            "optional": {
+            "required": {
+                "model": ("MODEL",),
                 "after_sampling": (
                     "LATENT",
-                    {"tooltip": "Connect the sampler output to read its metrics."},
-                )
+                    {"tooltip": "The sampler output; the status is read after it."},
+                ),
             },
         }
 
@@ -938,7 +938,7 @@ class SGLDWorkerStatus:
         # NaN never equals itself, so ComfyUI does not serve a cached status.
         return float("nan")
 
-    def show(self, model, after_sampling=None):
+    def show(self, model, after_sampling):
         try:
             text = SGLDiffusionGenerator.shared().status_text()
         except Exception as e:

@@ -20,7 +20,7 @@ from ..executors.minimax_h3 import (
 )
 from ..executors.qwen_image21 import QwenImage21Executor
 from ..executors.zimage import ZImageExecutor
-from ..options import PLUGIN_KEYS
+from ..options import ATTENTION_DISPLAY, INT8_GEMM_DISPLAY, PLUGIN_KEYS
 from .preflight import check_model_options, check_sgld_options
 
 logger = logging.getLogger(__name__)
@@ -268,25 +268,45 @@ _EXECUTOR_CLASSES = _load_executor_classes()
 
 _SHARED = None
 _ATEXIT_REGISTERED = False
-# SGLDOptions name -> ServerArgs field, read when the worker starts.
-_STATUS_FIELDS = {
-    "num_gpus": "num_gpus",
-    "tp_size": "tp_size",
-    "ulysses_degree": "ulysses_degree",
-    "ring_degree": "ring_degree",
-    "attention_backend": "attention_backend",
-    "quantization": "quantization",
-    "resident_layers": "dit_layerwise_resident_layers",
-    "prefetch_layers": "dit_offload_prefetch_size",
-}
 
 
-def _execution_mode(args) -> str:
-    if getattr(args, "enable_torch_compile", False):
-        return "torch_compile"
-    if getattr(args, "enable_breakable_cuda_graph", False):
-        return "cuda_graph"
-    return "eager"
+def _loader_settings(*, args, sgld_options: dict, int8_kernel: str, model_type) -> dict:
+    """The worker's loader-time settings, as SGLDOptions widget names and values.
+
+    Values come from ServerArgs, so they are what the worker runs; fields that do
+    not apply to the chosen mode are left out, as SGLDOptions ignores them too.
+    """
+    settings = {
+        "model_type": model_type,
+        "num_gpus": args.num_gpus,
+        # create_options only passes tp_size when parallel_mode is manual.
+        "parallel_mode": "manual" if "tp_size" in sgld_options else "auto",
+        "tp_size": args.tp_size,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "attention_backend": ATTENTION_DISPLAY.get(
+            args.attention_backend, args.attention_backend or "auto"
+        ),
+    }
+    if sgld_options.get("attention_backend_config"):
+        settings["attention_backend_config"] = sgld_options["attention_backend_config"]
+    settings["quantization"] = args.quantization or "none"
+    if args.quantization == "convrot_int8":
+        settings["int8_gemm"] = INT8_GEMM_DISPLAY.get(int8_kernel, int8_kernel)
+    if args.enable_torch_compile:
+        settings["execution_mode"] = "torch_compile"
+        settings["regional_compile"] = args.regional_compile
+    elif args.enable_breakable_cuda_graph:
+        settings["execution_mode"] = "cuda_graph"
+    else:
+        settings["execution_mode"] = "eager"
+    if args.dit_layerwise_offload:
+        settings["memory_mode"] = "layerwise_offload"
+        settings["resident_layers"] = args.dit_layerwise_resident_layers
+        settings["prefetch_layers"] = args.dit_offload_prefetch_size
+    else:
+        settings["memory_mode"] = "resident"
+    return settings
 
 
 def _cache_mode(executor) -> str:
@@ -429,14 +449,11 @@ class SGLDiffusionGenerator:
         args = self.generator.server_args
         executor = self.executor
         pids = [proc.pid for proc in self._worker_processes()]
-        loader = {
-            name: getattr(args, field, None) for name, field in _STATUS_FIELDS.items()
-        }
-        loader["execution_mode"] = _execution_mode(args)
-        loader["memory_mode"] = (
-            "layerwise_offload"
-            if getattr(args, "dit_layerwise_offload", False)
-            else "resident"
+        loader = _loader_settings(
+            args=args,
+            sgld_options=self.last_options["sgld_options"],
+            int8_kernel=self.last_options["int8_kernel"],
+            model_type=self.model_type,
         )
         lines = [
             f"model: {args.model_path} pipeline={args.pipeline_class_name}",
@@ -457,7 +474,10 @@ class SGLDiffusionGenerator:
         if metrics is None:
             lines.append("last DiT call: none yet")
         else:
-            lines.append(f"last DiT call: {metrics.total_duration_ms:.1f} ms")
+            lines.append(
+                f"last DiT call (one sampler step, or half of a CFG step): "
+                f"{metrics.total_duration_ms:.1f} ms"
+            )
             snapshot = metrics.memory_snapshots.get("after_forward")
             if snapshot is not None:
                 lines.append(

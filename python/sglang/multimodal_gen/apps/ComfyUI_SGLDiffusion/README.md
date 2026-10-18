@@ -141,15 +141,21 @@ DiT only. Text encoding and VAE stay in ComfyUI.
 ## Worker Status Node
 
 `SGLDiffusion Worker Status` (category `SGLDiffusion`) takes the SGLD `MODEL`
-and prints the model, worker liveness, and the worker's own `RequestMetrics` for
-the last DiT call (forward time and peak VRAM). Settings use the `SGLDOptions`
-names and come in two groups: loader settings (parallel layout, attention,
-quantization, execution and memory mode) are fixed until the worker restarts,
-while per-run settings (`cache_mode`, `cache_dit_params`) apply to the next
-request. Connect the sampler's output to `after_sampling` so the node runs after
-sampling and reports that run; it is never served from ComfyUI's cache. For
-per-stage timing set `SGLANG_DIFFUSION_STAGE_LOGGING=1`; for Prometheus metrics
-start the worker with `enable_metrics`.
+and the sampler's `LATENT` output (`after_sampling`), so it always runs after
+sampling and is never served from ComfyUI's cache. It prints the model, worker
+liveness, and the worker's own `RequestMetrics` for the last DiT call of that
+run: forward time and peak VRAM for one sampler step (with CFG, one of the
+step's two calls), not the whole run.
+
+Settings use the `SGLDOptions` widget names and values and come in two groups.
+Loader settings (model type, parallel layout, attention, quantization, execution
+and memory mode) are what the worker is running and stay fixed until it
+restarts; fields that do not apply to the chosen mode, such as
+`resident_layers` with `memory_mode=resident`, are left out. Per-run settings
+(`cache_mode`, `cache_dit_params`) apply to the next request.
+
+For per-stage timing set `SGLANG_DIFFUSION_STAGE_LOGGING=1`; for Prometheus
+metrics start the worker with `enable_metrics`.
 
 ## Architecture
 

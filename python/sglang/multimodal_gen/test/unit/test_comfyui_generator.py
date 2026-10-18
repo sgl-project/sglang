@@ -8,8 +8,12 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
-    _STATUS_FIELDS,
     SGLDiffusionGenerator,
+    _apply_cache_mode,
+)
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.options import (
+    PLUGIN_KEYS,
+    SGLDOptions,
 )
 
 
@@ -266,54 +270,97 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
     assert "cfg_parallel_degree" not in seen
 
 
-def _status_runtime(metrics=None):
+def _status_runtime(**widgets):
+    """A runtime whose worker was started from SGLDOptions(**widgets)."""
     from sglang.multimodal_gen.runtime.utils.perf_logger import (
         MemorySnapshot,
         RequestMetrics,
     )
 
+    options = SGLDOptions().create_options(**widgets)[0]
+    plugin = {k: options.pop(k) for k in PLUGIN_KEYS if k in options}
+    # ServerArgs defaults for the fields the status reads, then the loader's kwargs.
+    server_args = {
+        "num_gpus": 1,
+        "tp_size": 1,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "attention_backend": None,
+        "quantization": None,
+        "enable_torch_compile": False,
+        "regional_compile": False,
+        "enable_breakable_cuda_graph": False,
+        "dit_layerwise_offload": False,
+        "dit_layerwise_resident_layers": 0.0,
+        "dit_offload_prefetch_size": 0.0,
+    }
+    server_args.update((k, v) for k, v in options.items() if k in server_args)
     runtime = SGLDiffusionGenerator()
     runtime.generator = SimpleNamespace(
         server_args=SimpleNamespace(
             model_path="z.safetensors",
             pipeline_class_name="ZImagePipeline",
-            **{field: 1 for field in _STATUS_FIELDS.values()},
-            dit_layerwise_offload=False,
+            **server_args,
         )
     )
-    if metrics is None:
-        metrics = RequestMetrics(request_id="r")
-        metrics.total_duration_ms = 123.4
-        metrics.record_memory_snapshot(
-            "after_forward",
-            MemorySnapshot(
-                allocated_mb=1.0,
-                reserved_mb=2.0,
-                peak_allocated_mb=3000.0,
-                peak_reserved_mb=4000.0,
-            ),
-        )
-    runtime.executor = SimpleNamespace(
-        last_metrics=metrics,
-        enable_cache_dit=True,
-        enable_spectrum=False,
-        cache_dit_params={"max_warmup_steps": 2},
+    runtime.model_type = "zimage"
+    runtime.last_options = {
+        "sgld_options": options,
+        "int8_kernel": plugin.get("int8_kernel", "auto"),
+    }
+    metrics = RequestMetrics(request_id="r")
+    metrics.total_duration_ms = 123.4
+    metrics.record_memory_snapshot(
+        "after_forward",
+        MemorySnapshot(
+            allocated_mb=1.0,
+            reserved_mb=2.0,
+            peak_allocated_mb=3000.0,
+            peak_reserved_mb=4000.0,
+        ),
     )
+    runtime.executor = SimpleNamespace(last_metrics=metrics)
+    _apply_cache_mode(runtime.executor, plugin)
     runtime._worker_processes = lambda: [SimpleNamespace(pid=7, is_alive=lambda: True)]
     runtime._is_live = lambda: False
     return runtime
 
 
-def test_status_text_reads_server_args_and_request_metrics() -> None:
-    text = _status_runtime().status_text()
-    assert "pipeline=ZImagePipeline" in text
-    assert "NOT live pids=[7]" in text
-    assert "loader settings (fixed until the worker restarts)" in text
-    assert "tp_size=1" in text
-    assert "execution_mode=eager memory_mode=resident" in text
+def test_status_text_reports_sgldoptions_widget_values() -> None:
+    """Every loader widget a user sets reads back unchanged, under its own name."""
+    widgets = {
+        "num_gpus": 2,
+        "parallel_mode": "manual",
+        "tp_size": 2,
+        "attention_backend": "flash_attention",
+        "quantization": "convrot_int8",
+        "int8_gemm": "sglang_jit",
+        "execution_mode": "torch_compile",
+        "regional_compile": True,
+        "memory_mode": "layerwise_offload",
+        "resident_layers": 2,
+        "prefetch_layers": 1,
+    }
+    text = _status_runtime(
+        **widgets, cache_mode="cache_dit", cache_dit_tuning="manual"
+    ).status_text()
+    for name, value in widgets.items():
+        assert f" {name}={value}" in text
     assert "per-run settings (apply to the next request): cache_mode=cache_dit" in text
-    assert "max_warmup_steps" in text
-    assert "last DiT call: 123.4 ms" in text
+    assert "'max_warmup_steps': 4" in text
+
+
+def test_status_text_defaults_hide_fields_that_do_not_apply() -> None:
+    text = _status_runtime().status_text()
+    assert "NOT live pids=[7]" in text
+    assert (
+        "loader settings (fixed until the worker restarts): model_type=zimage "
+        "num_gpus=1 parallel_mode=auto tp_size=1 ulysses_degree=1 ring_degree=1 "
+        "attention_backend=auto quantization=none execution_mode=eager "
+        "memory_mode=resident\n"
+    ) in text
+    assert "cache_mode=off\n" in text
+    assert "123.4 ms" in text
     assert "peak allocated 3000 MiB, peak reserved 4000 MiB" in text
 
 
@@ -321,7 +368,7 @@ def test_status_text_before_first_call_and_without_worker() -> None:
     runtime = _status_runtime()
     runtime.executor.last_metrics = None
     assert "last DiT call: none yet" in runtime.status_text()
-    runtime.executor.enable_cache_dit = None
+    _apply_cache_mode(runtime.executor, {})
     assert "cache_mode=worker default" in runtime.status_text()
     assert "not started" in SGLDiffusionGenerator().status_text()
 
