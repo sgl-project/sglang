@@ -43,7 +43,6 @@ def vision_topk(
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
     if is_cuda():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
-        from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # Same admission as _fused_gate_emits_packed_ids: the shared-expert slots
         # rescaled below would rewrite weights after the router.
@@ -52,7 +51,8 @@ def vision_topk(
             num_shared_topk_slots == 0
             and expert_location_dispatch_info is None
             and not use_mega_moe
-            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            and config.runner_backend is not None
+            and config.runner_backend.is_flashinfer_mxfp4()
         ):
             packed_topk = torch.empty(
                 (logits.shape[0], config.top_k), dtype=torch.int32, device=logits.device

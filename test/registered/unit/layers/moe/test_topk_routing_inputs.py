@@ -17,8 +17,17 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat, fused_topk_torch_native
-from sglang.srt.layers.moe.utils import draft_model_build_scope, initialize_moe_config
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutputPacked,
+    TopK,
+    TopKOutputFormat,
+    fused_topk_torch_native,
+)
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    draft_model_build_scope,
+    initialize_moe_config,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -221,6 +230,48 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(output.topk_ids.tolist(), [[2, 4], [2, 4], [-1, -1], [-1, -1]])
         torch.testing.assert_close(output.topk_weights[:2, -1], torch.full((2,), 0.125))
         torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
+
+    def test_vision_packed_output_follows_built_runner(self):
+        """A requested MXFP4 fallback must not emit an unused packed-ID buffer."""
+        with get_context().override_server_args(moe_runner_backend="flashinfer_mxfp4"):
+            initialize_moe_config()
+            for backend in (
+                None,
+                MoeRunnerBackend.TRITON,
+                MoeRunnerBackend.FLASHINFER_MXFP4,
+            ):
+                with self.subTest(backend=backend):
+                    router = self._router(is_draft=True)
+                    router.bind_runner_backend(backend)
+                    moe = SimpleNamespace(
+                        topk=router,
+                        layer_id=0,
+                        config=SimpleNamespace(image_token_id=99),
+                        gate=SimpleNamespace(
+                            e_score_correction_bias=torch.zeros(4),
+                            e_score_correction_bias_vl=torch.zeros(4),
+                        ),
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.multimodal.dsv41.vl_routing.is_cuda",
+                            return_value=True,
+                        ),
+                        patch(
+                            "sglang.kernels.ops.moe.moe_fused_gate.moe_fused_gate",
+                            return_value=(
+                                torch.full((4, 2), 0.5),
+                                torch.tensor([[0, 1]], dtype=torch.int32).repeat(4, 1),
+                            ),
+                        ) as gate,
+                    ):
+                        output = vision_topk(moe, self.logits, input_ids=None)
+                    packed = gate.call_args.kwargs["packed_out"]
+                    expected_packed = backend == MoeRunnerBackend.FLASHINFER_MXFP4
+                    self.assertEqual(packed is not None, expected_packed)
+                    self.assertEqual(
+                        isinstance(output, StandardTopKOutputPacked), expected_packed
+                    )
 
     def test_vision_fake_algorithm_neutralizes_both_biases(self):
         with get_exec().moe.override(ep_dispatch_algorithm="fake"):
