@@ -39,12 +39,13 @@ also applies **admission control**, **failure handling**, and **retries**.
 ### 1.3 Example: load-aware routing
 
 The router tries each **bucket** that fits the request's length, ordered by SLO
-preference, capacity, then `rank`. In each bucket it drops the engines that fail
-**admission**, then picks the **less loaded of two engines sampled** from those
-that remain; when no engine admits the request it moves to the next bucket, and
-returns **503** when no bucket has one. If **dispatch** fails before
-any response and **retries** remain, it excludes that engine and restarts from
-the first bucket.
+preference, capacity, then `rank`; a request that fits no bucket is rejected
+with **400** before any engine is considered. In each bucket it drops the
+engines that fail **admission**, then picks the **less loaded of two engines
+sampled** from those that remain; when no engine admits the request it moves to
+the next bucket, and returns **503** when no bucket has one. If **dispatch**
+fails before any response and **retries** remain, it excludes that engine and
+restarts from the first bucket.
 
 **Load** is a vector of engine metrics compared field by field, and the first
 difference decides. For **unified and prefill** engines the order is estimated
@@ -55,7 +56,9 @@ then KV usage.
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"primaryColor": "#eaf3fb", "primaryTextColor": "#172b4d", "primaryBorderColor": "#345779", "lineColor": "#345779", "edgeLabelBackground": "#ffffff"}, "flowchart": {"curve": "stepAfter", "rankSpacing": 30, "nodeSpacing": 30}}}%%
 flowchart TD
-    R([Request]) --> B["1. Take next compatible bucket"]
+    R([Request]) --> L{"0. Fits any bucket's<br/>length limits?"}
+    L -->|no| Y(["400 to client"])
+    L -->|yes| B["1. Take next compatible bucket"]
     B --> A{"2. Any engine can admit<br/>the request?"}
     A -->|yes| S["3. Sample two admitted engines<br/>Pick the less loaded one"]
     S --> D["4. Dispatch to engine"]
@@ -67,7 +70,7 @@ flowchart TD
     T -.->|restart at first bucket| B
     classDef next fill:#fff5e6,stroke:#ac762c,color:#654516;
     classDef done fill:#e8f5ef,stroke:#46826a,color:#234d3c;
-    class T,X next;
+    class T,X,Y next;
     class E done;
 ```
 
@@ -114,6 +117,12 @@ Settings fall into these categories:
 | **Affinity** | When the preferred engine (prefix owner or session binding) wins over a normal engine | `--affinity-*`, `--cache-affinity-*`, `--session-id-header` | `affinity` |
 | **Admission** | Limits that make an engine reject a request | `--max-*` | `admission` |
 | **Buckets** | Which buckets a request fits and the order they are tried | `--bucket-config` | `max_input_tokens`, `max_context_tokens`, `rank`, ... |
+
+A group's `admission` block takes the flag names with underscores
+(`max_waiting_requests`, `max_pending_prefill_tokens`, `max_running_usage`,
+`max_kv_usage`), except `--max-in-flight`, whose key is `max_inflight_requests`.
+An `affinity` block takes `mode`, `balanced_by`, `load_factor` and `load_gap`;
+the last three require `"mode": "balanced"`.
 
 How policies apply to each group:
 
@@ -224,7 +233,8 @@ sgl-router --model-id qwen3 --chat-routing reorg \
   - `long` prefill overrides it with `power_of_two`.
   - Both decode groups use `power_of_two`.
 - **Affinity:** `short` prefill uses balanced mode with a load factor of 1.5.
-  `power_of_two` groups have no affinity settings.
+  `power_of_two` groups take no `affinity` block; setting one is rejected at
+  startup.
 - **Admission:**
   - `short` prefill engines reject requests while 32k or more uncached tokens
     are waiting.
