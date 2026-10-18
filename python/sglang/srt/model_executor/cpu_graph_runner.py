@@ -992,11 +992,15 @@ class CPUGraphRunner:
         with replay_context():
             with skip_ctx:
                 prepared_forward_batch = self.prepare_replay(forward_batch, skip=skip)
-                output = graphs[prepared_forward_batch.batch_size](
-                    prepared_forward_batch.input_ids,
-                    prepared_forward_batch.positions,
-                    prepared_forward_batch,
-                )
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend),
+                    forward_batch=prepared_forward_batch,
+                ):
+                    output = graphs[prepared_forward_batch.batch_size](
+                        prepared_forward_batch.input_ids,
+                        prepared_forward_batch.positions,
+                        prepared_forward_batch,
+                    )
         if forward_batch.batch_size in graphs:
             return output
 
