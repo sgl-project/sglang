@@ -275,7 +275,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
-def _flat_indexer_break(*, inside_tail, real, x_rows):
+def _flat_indexer_break(*, inside_tail, real, x_rows, with_tail=True):
     """Runs the candidate source's prefill-graph break; returns the request rows
     and positions it scored and the rows it handed to the consumers."""
     seen = {}
@@ -302,7 +302,7 @@ def _flat_indexer_break(*, inside_tail, real, x_rows):
 
     backend = SimpleNamespace(
         forward_metadata=tail_meta if inside_tail else full_meta,
-        tail_forward_metadata=tail_meta,
+        tail_forward_metadata=tail_meta if with_tail else None,
         _make_low_ratio_prefill_indexer_inputs=make_inputs,
         _prefill_graph_low_ratio_index_captured=lambda: False,
         prefill_candidates=SimpleNamespace(
@@ -348,6 +348,13 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
         self.assertEqual(seen["req"], [3] * 8 + [5] * 12)
         self.assertEqual(seen["scored"], 20)
         self.assertEqual(seen["rows"], [6, 7, 17, 18, 19, 0, 0, 0])
+
+    def test_idle_dp_rank_scores_its_fabricated_rows(self):
+        # An idle DP-attention rank replays on one dummy request over the bucket.
+        seen = _flat_indexer_break(inside_tail=False, real=0, x_rows=8, with_tail=False)
+        self.assertEqual(seen["scored"], 8)
+        self.assertEqual(seen["req"], [3] * 8)
+        self.assertEqual(seen["rows"], list(range(8)))
 
 
 class _MetadataBuilt(Exception):

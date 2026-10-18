@@ -3887,7 +3887,11 @@ class DeepseekV4AttnBackend(
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:
             real = x.shape[0]
-        assert real > 0, "prefill graph flat indexer on a batch without live rows"
+        if real == 0:
+            # An idle DP-attention rank replays on fabricated rows: one dummy
+            # request over the whole bucket, scored like main's captured indexer
+            # scored it. Nothing reads the result.
+            real = x.shape[0]
         # Rows of the metadata in use: the late-layer tail's when the candidate
         # source is the tail's first layer (decoder SWA bounded replay), whose
         # rows are not the leading rows of the extend.
