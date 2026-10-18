@@ -344,3 +344,25 @@ def test_shared_control_residuals_cross_the_request_once():
     double = kwargs["controlnet_block_samples"]
     assert len(double) == 19 and all(r is double[0] for r in double)
     torch.testing.assert_close(double[0], shared[0].to(torch.bfloat16))
+
+
+def test_shared_control_residuals_stay_shared_after_cfg_row_split():
+    """With batch > 1 (CFG, batch_size) the executor slices kwargs per row
+    before packing; the shared residual must still be one tensor per row."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        _slice_batch_row,
+    )
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
+        _pack_control,
+    )
+
+    shared = torch.randn(2, 64, 32)
+    own = torch.randn(2, 64, 32)
+    control = {"input": [shared] * 19, "output": [shared] * 37 + [own]}
+    for row in range(2):
+        packed = _pack_control(_slice_batch_row(control, row, 2), 1, 64)
+        tensors = packed["input"] + packed["output"]
+        assert len({id(t) for t in tensors}) == 2
+        assert all(t is tensors[0] for t in tensors[:56])
+        torch.testing.assert_close(tensors[0], shared[row : row + 1])
+        torch.testing.assert_close(tensors[-1], own[row : row + 1])
