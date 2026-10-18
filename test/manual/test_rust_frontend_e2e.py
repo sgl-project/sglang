@@ -72,7 +72,6 @@ def grpc_frames(call, api, stream):
         assert kind == "frame", f"gRPC generation error: {item!r}"
         frame = item.frame
         meta = frame.meta_info
-        assert meta.HasField("cached_tokens"), "api.v1 omitted cached_tokens"
         finish_kind = (
             meta.finish_reason.WhichOneof("kind")
             if meta.HasField("finish_reason")
@@ -88,9 +87,7 @@ def grpc_frames(call, api, stream):
                 "finish_reason": (
                     {"type": finish_kind} if finish_kind is not None else None
                 ),
-                "cached_tokens": (
-                    meta.cached_tokens if meta.HasField("cached_tokens") else None
-                ),
+                "cached_tokens": meta.cached_tokens,
             }
         }
         value["text" if api == "text" else "output_ids"] = (
