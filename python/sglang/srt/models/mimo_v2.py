@@ -1341,12 +1341,27 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
 
-    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+    def preprocess_mm_for_encoder(
+        self, mm_data, modality, config, *, image_processor=None
+    ):
         if self._encoder_processor is None:
             from sglang.srt.multimodal.processors.mimo_v2 import MiMoProcessor
 
+            # Normalization stats live in preprocessor_config.json, not hf_config.
+            if image_processor is None:
+                logger.warning(
+                    "No image processor is loaded; MiMo encoder preprocessing "
+                    "normalizes with the default OPENAI_CLIP image_mean/image_std."
+                )
+                image_mean = image_std = None
+            else:
+                image_mean = image_processor.image_mean
+                image_std = image_processor.image_std
             self._encoder_processor = MiMoProcessor.from_hf_config(
-                self.config, mm_config=config
+                self.config,
+                mm_config=config,
+                image_mean=image_mean,
+                image_std=image_std,
             )
         return self._encoder_processor.preprocess_for_encoder(mm_data, modality)
 
