@@ -63,6 +63,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
+                    dcp_size=1,
                     enable_aiter_allreduce_fusion=False,
                 ),
                 **options,
