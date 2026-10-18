@@ -150,7 +150,11 @@ class SystemPrefix:
         rest = self._render(
             messages_after_system[1:], add_generation_prompt=True, encode_kwargs=encode_kwargs
         )
-        if rest is not None and self._auto_prefix:
+        if rest is None:
+            # The per-request render failed (e.g. a template that rejects this
+            # message shape). Fall back to the caller's full-render path.
+            return None
+        if self._auto_prefix:
             # Strip the template's auto-injected default system block from the
             # head of the user render so `cached_sys + rest` matches a full render.
             ap = len(self._auto_prefix)

@@ -1140,7 +1140,10 @@ class PrefillAdder:
         ``StateStorage.pending_request_slots`` -- a warm request charges its
         running slot only (sentinel ping-pong buffer), a cold one the full
         running + tracking cost, so a cold request is never admitted on a
-        single free slot and then crash-allocating more.
+        single free slot and then crash-allocating more. Match-time COW
+        blindness does not apply here: a shared memory defers its COW slot
+        to admission, and the static pool budgets through
+        ``_mamba_slot_budget_for_req(fresh_cow=...)`` instead.
         """
         if not self.memory_budget.has_state_slots:
             return 0
@@ -1162,7 +1165,7 @@ class PrefillAdder:
             prefill_tokens=req.prefix_len + extend_input_len,
         )
 
-    def _mamba_slot_budget_for_req(self, req: Req) -> int:
+    def _mamba_slot_budget_for_req(self, req: Req, fresh_cow: bool = False) -> int:
         """Slot-count admission for the STATIC hybrid mamba pool (0 elsewhere).
 
         The static pool has no shared-gap token coupling, so
@@ -1175,8 +1178,17 @@ class PrefillAdder:
         boundary state is cached the budget admits up to the pool size again.
         0 on the shared pool (its slots are budgeted via the token reserve),
         for reqs that already hold a mamba slot, and on non-mamba / chunk-cache
-        paths (actual usage there is 1 slot per request, already covered)."""
-        if not self._static_mamba_slots or req.kv.mamba_pool_idx is not None:
+        paths (actual usage there is 1 slot per request, already covered).
+
+        ``fresh_cow`` is sampled by the scheduler BEFORE init_next_round_input:
+        the match-time COW sets ``req.kv.mamba_pool_idx`` before this budget runs,
+        so the ``pool_idx is None`` guard alone zeroes the charge for every
+        queued request — the budget never sees the COW's slot consumption and
+        rem stays high while the hard free list drains (the match-COW crash).
+        Without ``fresh_cow`` (other callers), fall back to the legacy guard."""
+        if not self._static_mamba_slots:
+            return 0
+        if not fresh_cow and req.kv.mamba_pool_idx is not None:
             return 0
         from sglang.srt.system_prompt import is_system_prefix_warm
 
@@ -1205,10 +1217,16 @@ class PrefillAdder:
         can't cover a worst-case (cold) request. 0 disables the pre-check
         (no mamba pool).
         """
-        if not (self._mamba_slot_cost or self._static_mamba_slots):
+        if not (self.memory_budget.state_slot_cost or self._static_mamba_slots):
             return 0
-        # Matches the slots alloc_req_slots actually allocates (1 + 2 overlap
-        # / 1 + 1 lazy); the worst case is a cold request.
+        if self.memory_budget.state_slot_cost:
+            # Shared pool: the pre-gate match COW allocates exactly ONE slot
+            # and the steady-state footprint is already covered by the token
+            # reserve — requiring the full cold factor here would withhold
+            # 1-2 slots of admission whenever the pool hovers near empty.
+            return 1
+        # Static pool: matches the slots alloc_req_slots actually allocates
+        # (1 + 2 overlap / 1 + 1 lazy); the worst case is a cold request.
         return 1 + self.tree_cache.req_to_token_pool.mamba_initial_tracking_slots
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -1976,7 +1994,11 @@ class PrefillAdder:
 
     @capacity_decision
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        mamba_fresh_cow: bool = False,
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
@@ -2156,7 +2178,10 @@ class PrefillAdder:
                     return AddReqResult.OTHER
 
             self._commit_prefill_admission(
-                req, admission, state_slots, self._mamba_slot_budget_for_req(req)
+                req,
+                admission,
+                state_slots,
+                self._mamba_slot_budget_for_req(req, fresh_cow=mamba_fresh_cow),
             )
 
         # This verdict controls the next candidate, not the committed request.

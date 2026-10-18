@@ -4867,6 +4867,14 @@ class Scheduler(
                 running_batch.batch_is_full = True
                 break
 
+            # Static-pool match COW: sample BEFORE init_next_round_input -- the
+            # match-time mamba COW sets req.kv.mamba_pool_idx, and the static
+            # slot budget keys on this pre-match sample (`mamba_fresh_cow`);
+            # budgeting on the post-match pool_idx would zero the charge for
+            # every queued request and the COW would drain the hard free list
+            # unbudgeted. (The shared pool defers its COW slot to admission, so
+            # it needs no sample.)
+            mamba_fresh_cow = req.kv.mamba_pool_idx is None
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
             # queued drops the copy its match staged.
@@ -4897,6 +4905,7 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+                mamba_fresh_cow=mamba_fresh_cow,
             )
 
             if self.enable_lora:
