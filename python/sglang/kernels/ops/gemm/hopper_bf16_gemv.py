@@ -76,14 +76,16 @@ def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
         and k % 512 == 0
         and 512 <= k <= _MAX_K
         and n % 8 == 0
-        # 96x5120 (12 CTAs of one-row warps) ran ~9% slower than cuBLAS on H200;
-        # the floor is untuned between 96 and 5120.
-        and 4096 <= n <= _MAX_N
+        and 64 <= n <= _MAX_N
     ):
         return False
+    # At K=5120, N=64..512 ran 7-10% slower than cuBLAS on H200;
+    # 64x512, 2048x4096 and 2048x17408 ran faster, 1024x4096 tied.
+    if k == 5120 and n <= 512:
+        return False
     # cuBLAS already runs at ~3.9 TB/s for mid-large N around 16K; the wins
-    # concentrate on mid-sized and odd N below that band and on very wide N.
-    # Measured on H200.
+    # concentrate where its tiling underutilizes DRAM (small/odd N) and very
+    # wide N. Measured on H200 against cuBLAS 12.x.
     return n < 12288 or n >= 32768
 
 
