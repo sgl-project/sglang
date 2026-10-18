@@ -7,9 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupBroadcaster
-from sglang.srt.utils import get_device_module
-
-device_module = get_device_module()
+from sglang.srt.platforms import current_platform
 
 
 class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
@@ -78,7 +76,7 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
                 continue
             indices, _ = prepared[name]
             if indices.is_cuda:
-                indices.record_stream(device_module.current_stream())
+                indices.record_stream(current_platform.current_stream())
             for buffers in self.buffers[name]:
                 self._bcast_layer(
                     buffers, self.kv_staging, indices, buffers[layer].shape[1], layer

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     count_pool_hits,
 )
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -73,7 +74,7 @@ class LayerLoadingEvent:
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
-        device_module.current_stream().wait_event(self.load_events[layer_index])
+        current_platform.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):

@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
@@ -862,7 +863,7 @@ class SchedulerPPMixin:
         p2p_work = []
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
-                self.device_module.current_stream().wait_event(ready_event)
+                current_platform.current_stream().wait_event(ready_event)
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
@@ -960,7 +961,7 @@ class SchedulerPPMixin:
             skipped_output_comm=True,
         )
         d2h_event = self.device_module.Event()
-        d2h_event.record(self.device_module.current_stream())
+        d2h_event.record(current_platform.current_stream())
         return None, batch_result, d2h_event
 
     def _pp_prep_batch_result(
@@ -1507,7 +1508,7 @@ class SchedulerPPMixin:
                         return_hidden_states=False,
                     )
                 else:
-                    d2h_event.record(self.device_module.current_stream())
+                    d2h_event.record(current_platform.current_stream())
 
         if send_first:
             send_output_work = _do_send()
@@ -1564,7 +1565,7 @@ class SchedulerPPMixin:
                     if _pp_can_skip_output_comm(target_send):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
-                        self.device_module.current_stream().wait_event(q_event)
+                        current_platform.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
@@ -1603,7 +1604,7 @@ class SchedulerPPMixin:
                         target_recv, mb_metadata[next_mb_id], next_pp_outputs
                     )
                     d2h_event = self.device_module.Event()
-                    d2h_event.record(self.device_module.current_stream())
+                    d2h_event.record(current_platform.current_stream())
 
         # ---- Execute communication ----
         if send_dict is not None and should_recv:
@@ -1657,7 +1658,7 @@ class SchedulerPPMixin:
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
+                event.record(current_platform.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

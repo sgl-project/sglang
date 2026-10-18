@@ -58,6 +58,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
@@ -206,7 +207,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                 eps=self.layer_norm_epsilon,
                 group_size=None,
                 norm_before_gate=True,
-                device=torch.get_device_module().current_device(),
+                device=current_platform.current_device(),
                 dtype=config.torch_dtype,
                 **(
                     {"activation": self.output_gate_type}
@@ -223,7 +224,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                     if self.output_gate_type is not None
                     else self.activation
                 ),
-                device=torch.get_device_module().current_device(),
+                device=current_platform.current_device(),
                 dtype=config.torch_dtype,
             )
         )

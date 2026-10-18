@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
-import torch
 import zmq
 
 if TYPE_CHECKING:
@@ -52,7 +51,8 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -502,7 +502,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 backend_params.setdefault("num_cpus", str(num_threads))
 
         def create_backend():
-            torch.get_device_module(get_device().device).set_device(self.kv_args.gpu_id)
+            current_platform.set_device(
+                current_platform.get_device(self.kv_args.gpu_id)
+            )
             return self.agent.create_backend(backend, backend_params)
 
         run_with_deadline(

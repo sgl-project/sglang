@@ -130,6 +130,26 @@ class TestDeviceMixin(CustomTestCase):
         cuda = _make_device_mixin(PlatformEnum.CUDA, "cuda", "cuda")
         self.assertFalse(cuda.is_out_of_tree())
 
+    def test_device_state_defaults_use_the_device_type_module(self):
+        mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
+        module = MagicMock()
+        with patch.object(
+            torch, "get_device_module", return_value=module
+        ) as get_device_module:
+            self.assertIs(mixin.current_device(), module.current_device.return_value)
+            self.assertIs(mixin.current_stream(), module.current_stream.return_value)
+            mixin.current_stream(3)
+            mixin.synchronize()
+            mixin.set_device("custom:1")
+        get_device_module.assert_called_with("custom")
+        module.current_stream.assert_called_with(3)
+        module.synchronize.assert_called_once_with()
+        module.set_device.assert_called_once_with("custom:1")
+
+    def test_get_device_default_builds_a_torch_device(self):
+        mixin = _make_device_mixin(PlatformEnum.CPU, "cpu", "cpu")
+        self.assertEqual(mixin.get_device(0), torch.device("cpu", 0))
+
     def test_pin_memory_default_is_conservative(self):
         mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
         self.assertFalse(mixin.is_pin_memory_available())

@@ -49,6 +49,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -238,7 +239,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.
         for _ in range(2):
-            self._device_module.synchronize()
+            current_platform.synchronize()
             self._tp_group.barrier()
             forward_fn()
             if post_warmup_hook is not None:

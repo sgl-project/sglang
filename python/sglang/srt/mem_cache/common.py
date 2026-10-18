@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -338,8 +339,7 @@ def backup_kv_cache(
             # The recompute payload carries token ids only; images would be lost.
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.
-        device = token_to_kv_pool_allocator.get_kvcache().device
-        torch.get_device_module(device).synchronize(device)
+        current_platform.synchronize()
         return True
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)

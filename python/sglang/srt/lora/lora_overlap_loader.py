@@ -8,6 +8,7 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class LoRAOverlapLoader:
             if event.query()
         ]
         for lora_id, event in completed_loads:
-            self.device_module.current_stream().wait_event(event)
+            current_platform.current_stream().wait_event(event)
             del self.lora_to_overlap_load_event[lora_id]
 
     def _try_start_overlap_load(

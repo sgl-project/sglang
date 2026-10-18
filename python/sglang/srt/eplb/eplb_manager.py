@@ -18,6 +18,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
@@ -117,7 +118,7 @@ class EPLBManager:
         enable_timing = self._rebalance_layers_per_chunk is None
 
         if enable_timing:
-            torch.get_device_module().synchronize()
+            current_platform.synchronize()
             time_start = time.time()
 
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
@@ -179,7 +180,7 @@ class EPLBManager:
 
         msg = f"[EPLBManager] rebalance end"
         if enable_timing:
-            torch.get_device_module().synchronize()
+            current_platform.synchronize()
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)

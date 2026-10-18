@@ -45,6 +45,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -119,7 +120,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     ) -> None:
         warmup_out = None
         for _ in range(2):
-            self._device_module.synchronize()
+            current_platform.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
                 warmup_out = forward_fn()

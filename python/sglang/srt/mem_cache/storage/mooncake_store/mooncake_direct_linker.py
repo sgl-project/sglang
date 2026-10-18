@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -260,7 +261,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     indices.setdefault(transfer.name, []).append(transfer.host_indices)
             prepared = broadcaster.prepare_broadcast(
                 {name: torch.cat(parts) for name, parts in indices.items()},
-                device_module.current_stream(),
+                current_platform.current_stream(),
             )
             if not broadcaster.is_src:
                 for layer in range(self.num_layers):
@@ -280,7 +281,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return
         first, prepared, ready_event = batch
         if first == 0:
-            device_module.current_stream().wait_event(ready_event)
+            current_platform.current_stream().wait_event(ready_event)
         # KV access may wait several times per layer, or skip sparse layers.
         # Launch each broadcast exactly once, in order, on the forward stream.
         for layer in range(first, threshold + 1):

@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -849,9 +850,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             )
 
         if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
+            current_platform.current_stream().wait_stream(self.plan_stream)
 
         self._apply_deferred_mamba_init_to_draft_pools(forward_batch)
         self._fill_boundary_kv_front_and_update_stash(

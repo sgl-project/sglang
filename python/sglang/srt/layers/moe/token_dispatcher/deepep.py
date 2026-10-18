@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -752,7 +753,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
-        self.device_module = torch.get_device_module()
         self.quant_config = {}
 
     def dispatch_a(
@@ -901,12 +901,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def combine_b(self, hidden_states, event, hook):
         overlap_args = self.overlap_args
         if overlap_args is not None:
-            overlap_args.stream.wait_stream(self.device_module.current_stream())
+            overlap_args.stream.wait_stream(current_platform.current_stream())
 
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         if overlap_args is not None:
-            self.device_module.current_stream().wait_stream(overlap_args.stream)
+            current_platform.current_stream().wait_stream(overlap_args.stream)
 
         return hidden_states
 

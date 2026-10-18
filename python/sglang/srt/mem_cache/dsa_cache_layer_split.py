@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
     maybe_detect_oob,
     unwrap_write_loc,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -452,7 +453,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     ) -> None:
         if not self.pending_remote_kv_broadcast:
             return
-        self.device_module.current_stream().wait_stream(self.kv_broadcast_stream)
+        current_platform.current_stream().wait_stream(self.kv_broadcast_stream)
         self.pending_remote_kv_broadcast = False
         if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
@@ -491,7 +492,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = layer_id
             return
 
-        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
+        self.kv_broadcast_stream.wait_stream(current_platform.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
             if layer_transfer_counter is not None and layer_transfer_idx is not None:
                 layer_transfer_counter.wait_until(layer_transfer_idx)

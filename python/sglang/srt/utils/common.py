@@ -619,7 +619,7 @@ def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
-    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
+    tensor.record_stream(current_platform.current_stream())
     return host
 
 
@@ -1348,8 +1348,8 @@ cached_device_index = -1
 def get_current_device_stream_fast():
     global cached_device_index
     if cached_device_index == -1:
-        cached_device_index = torch.get_device_module().current_device()
-    return torch.get_device_module().current_stream(cached_device_index)
+        cached_device_index = current_platform.current_device()
+    return current_platform.current_stream(cached_device_index)
 
 
 # ==============================================================================

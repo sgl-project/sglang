@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -749,7 +750,7 @@ class BaseRunner(ABC):
             )
             return logits_output_or_pp_proxy_tensors
 
-        torch.get_device_module(mr.device).synchronize()
+        current_platform.synchronize()
         get_parallel().tp_group.barrier()
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             with run_ctx or empty_context():

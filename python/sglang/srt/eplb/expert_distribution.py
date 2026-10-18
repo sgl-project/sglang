@@ -45,6 +45,7 @@ from sglang.srt.observability.metrics_collector import (
     ExpertDispatchCollector,
     resolve_collector_class,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
@@ -989,7 +990,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         if self._first_dump:
             self._first_dump = False
-            torch.get_device_module().empty_cache()
+            current_platform.empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM

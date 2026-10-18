@@ -10,6 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
@@ -180,7 +181,7 @@ class DFlashDraftInputV2(SpecInput):
 
         caller_stream = None
         if plan_stream is not None:
-            caller_stream = torch.get_device_module(batch.device).current_stream()
+            caller_stream = current_platform.current_stream()
 
         with plan_stream_ctx:
             if plan_stream is not None and caller_stream is not None:

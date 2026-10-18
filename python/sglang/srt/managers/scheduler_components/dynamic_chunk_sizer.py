@@ -18,10 +18,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
-from sglang.srt.utils.common import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -219,9 +219,8 @@ class DynamicChunkSizer:
             pp_proxy = PPProxyTensors(proxy_tensors)
 
             # Measure latency with device synchronization for accurate timing
-            device_module = get_device_module()
             # Synchronize before starting timing to ensure clean measurement
-            device_module.synchronize()
+            current_platform.synchronize()
 
             start = time.perf_counter()
             batch.prepare_for_extend()
@@ -246,7 +245,7 @@ class DynamicChunkSizer:
                 )
 
                 # Synchronize after forward to ensure GPU operations complete
-                device_module.synchronize()
+                current_platform.synchronize()
 
                 latency_seconds = time.perf_counter() - start
                 latency_ms = latency_seconds * 1e3  # Convert to milliseconds

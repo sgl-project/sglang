@@ -445,7 +445,9 @@ class ModelRunner:
                 validate_mps_runtime()
         try:
             if not is_mps_device:
-                torch.get_device_module(self.device).set_device(get_device().gpu_id)
+                current_platform.set_device(
+                    current_platform.get_device(get_device().gpu_id)
+                )
         except Exception:
             import os
 
