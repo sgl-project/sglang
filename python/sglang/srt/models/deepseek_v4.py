@@ -104,7 +104,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_swizzled_input,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -880,7 +883,7 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 class MqaAttentionBase(nn.Module):
     # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
-    ll_chain: Optional[low_latency.LowLatencyChain] = None
+    dsv41_ll_chain: Optional[low_latency.LowLatencyChain] = None
 
     def __init__(
         self,
@@ -1398,7 +1401,9 @@ class MQALayer(MqaAttentionBase):
         self.mega_wq_b_permuted = False
         # Resolved by setup_low_latency_decode(), once the weights and the TP push
         # plane are in place.
-        self.ll_chain: Optional[low_latency.LowLatencyChain] = None
+        self.dsv41_ll_chain: Optional[low_latency.LowLatencyChain] = None
+        self.q_lora_mxfp8 = False
+        self.wq_b_rope_table: Optional[torch.Tensor] = None
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1477,6 +1482,41 @@ class MQALayer(MqaAttentionBase):
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
         )
 
+    def _forward_low_latency(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        attn_sink: torch.Tensor,
+        *,
+        low_ratio: bool,
+        x_quant=None,
+    ) -> mhc.AttnOutput:
+        prepare = (
+            self._forward_prepare_low_ratio_multi_stream
+            if low_ratio
+            else self._forward_prepare_multi_stream
+        )
+        q = prepare(
+            x,
+            positions,
+            forward_batch,
+            attn_backend,
+            x_quant=x_quant,
+            skip_q_rope=False,
+        )
+        return mhc.AttnOutput(
+            self.dsv41_ll_chain.attention(
+                q=q,
+                attn_sink=attn_sink[: self.n_local_heads],
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+                attn_layer=self.attn_mqa,
+                compress_ratio=self.compress_ratio,
+            )
+        )
+
     def _forward_mega(
         self,
         q: torch.Tensor,
@@ -1484,35 +1524,11 @@ class MQALayer(MqaAttentionBase):
         attn_sink: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-        *,
-        use_low_latency: bool = False,
-        positions: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+    ) -> torch.Tensor:
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
 
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
-        if use_low_latency:
-            # The chain's attention takes the query in its per-head layout, so it
-            # precedes pack_query; its e4m3 rows say wo_b is still the post's.
-            # Under mega attention _compute_q_b leaves q un-roped (the mega kernel
-            # rotates it); this attention only folds the inverse RoPE on its output.
-            fused_rope_inplace(
-                q[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
-            return mhc.AttnOutput(
-                self.ll_chain.attention(
-                    q=q,
-                    attn_sink=attn_sink[: self.n_local_heads],
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                    attn_layer=self.attn_mqa,
-                    compress_ratio=self.compress_ratio,
-                )
-            )
         if not self.mega_wq_b_permuted:
             q = pack_query(q, kernel_num_heads)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
@@ -1596,42 +1612,45 @@ class MQALayer(MqaAttentionBase):
         self._accepts_mxfp8_swizzled_input = ok
         return ok
 
-    def _normalize_q_lora(
-        self, q: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
-        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
-        if _is_hip:
-            return _hip.q_norm_for_wq_b(self, q)
-        method = self.wq_b.quant_method
-        if (
+    def setup_wq_b_rope(self) -> None:
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.runtime_context import get_exec
+
+        if not (
             _is_cuda
             and self.is_dsv41
             and get_platform().is_blackwell
-            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
-            and q.ndim == 2
-            and 0 < q.shape[0] <= 8
-            and q.shape[1] == 1280
-            and q.stride(1) == 1
-            and getattr(method, "mxfp8_dense_backend", None)
-            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-            and (
-                getattr(method, "use_mxfp8", False)
-                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
-            )
+            and accepts_mxfp8_swizzled_input(self.wq_b)
+            and not is_batch_invariant_mode_enabled()
+            and not get_exec().deterministic.enable_deterministic_inference
         ):
-            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-            from sglang.srt.runtime_context import get_exec
+            return
+        self.q_lora_mxfp8 = True
+        if (
+            get_platform().is_sm100
+            and not self.mega_wq_b_permuted
+            and not self.q_head_norm
+            and tuple(self.wq_b.weight.shape) == (8192, 1280)
+        ):
+            self.wq_b_rope_table = torch.view_as_real(self.freqs_cis).flatten(1)
+            assert self.wq_b_rope_table.is_contiguous()
 
-            if not (
-                is_batch_invariant_mode_enabled()
-                or get_exec().deterministic.enable_deterministic_inference
-            ):
-                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+    def _normalize_q_lora(self, q: torch.Tensor):
+        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
+        if _is_hip:
+            return _hip.q_norm_for_wq_b(self, q)
+        num_tokens = q.shape[0]
+        if self.q_lora_mxfp8 and num_tokens > 0:
+            from sglang.kernels.ops.layernorm.rmsnorm_mxfp8_jit import rmsnorm_mxfp8
 
-                y, quant, scale = rmsnorm_mxfp8(
-                    q, self.q_norm.weight, self.q_norm.variance_epsilon
-                )
-                return y, Mxfp8SwizzledInput(quant, scale)
+            y, quant, scale = rmsnorm_mxfp8(
+                q,
+                self.q_norm.weight,
+                self.q_norm.variance_epsilon,
+                need_bf16=self.indexer is not None,
+                early_trigger=True,
+            )
+            return y, Mxfp8SwizzledInput(quant, scale)
         q = self.q_norm(q)
         return q, q
 
@@ -1651,10 +1670,33 @@ class MQALayer(MqaAttentionBase):
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        *,
+        skip_q_rope: Optional[bool] = None,
     ) -> torch.Tensor:
+        if skip_q_rope is None:
+            skip_q_rope = self.use_mega_attention
+        if (
+            not skip_q_rope
+            and self.wq_b_rope_table is not None
+            and isinstance(q, Mxfp8SwizzledInput)
+            and q.data.shape[0] <= 128
+            and (q_out is None or q_out.dtype == torch.bfloat16)
+        ):
+            from sglang.kernels.ops.attention.dsv4.low_latency.wq_b import wq_b_rope
+
+            num_tokens = q.data.shape[0]
+            return wq_b_rope(
+                q.data,
+                q.scales,
+                self.wq_b.weight,
+                self.wq_b.weight_scale_inv_swizzled,
+                self.wq_b_rope_table,
+                positions[:num_tokens],
+                out=q_out,
+            )
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_mega_attention:
+        if skip_q_rope:
             return q
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
@@ -1759,7 +1801,10 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        skip_q_rope: Optional[bool] = None,
     ) -> torch.Tensor:
+        if skip_q_rope is None:
+            skip_q_rope = self.use_mega_attention
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -1807,7 +1852,7 @@ class MQALayer(MqaAttentionBase):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out, skip_q_rope=skip_q_rope)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -1823,7 +1868,10 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        skip_q_rope: Optional[bool] = None,
     ) -> torch.Tensor:
+        if skip_q_rope is None:
+            skip_q_rope = self.use_mega_attention
         # Both side streams are joined before returning, and nothing they read is
         # released before the join.
         assert self.alt_streams is not None
@@ -1856,7 +1904,7 @@ class MQALayer(MqaAttentionBase):
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out, skip_q_rope=skip_q_rope)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
             with torch.cuda.stream(stream_sources):
@@ -2626,6 +2674,21 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        if (
+            defer_all_reduce
+            and self.dsv41_ll_chain is not None
+            and self.dsv41_ll_chain.is_active(forward_batch, x.shape[0])
+        ):
+            return self._forward_low_latency(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                attn_sink,
+                low_ratio=low_ratio_multi_stream,
+                x_quant=x_quant,
+            )
+
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2688,17 +2751,7 @@ class MQALayer(MqaAttentionBase):
 
         if self.use_mega_attention:
             o = self._forward_mega(
-                q,
-                kernel_num_heads,
-                attn_sink,
-                forward_batch,
-                attn_backend,
-                use_low_latency=(
-                    defer_all_reduce
-                    and self.ll_chain is not None
-                    and self.ll_chain.is_active(forward_batch, q.shape[0])
-                ),
-                positions=positions,
+                q, kernel_num_heads, attn_sink, forward_batch, attn_backend
             )
             return self._project_wo_b(o, defer_all_reduce)
 
@@ -2942,10 +2995,6 @@ class MQALayer(MqaAttentionBase):
         return self._project_wo_b(o, defer_all_reduce)
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
-        if isinstance(o, mhc.AttnOutput):
-            # The low-latency chain already holds wo_b; nothing to project.
-            return o
-
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 
         defer_all_reduce = defer_all_reduce and (
@@ -3510,7 +3559,7 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     def setup_low_latency_decode(self) -> None:
         """Resolve the attention's fused low-latency decode chain. Runs after the
         weights, the norm cache and the TP push plane are all in place."""
-        self.self_attn.ll_chain = low_latency.build_chain(
+        self.self_attn.dsv41_ll_chain = low_latency.build_chain(
             self.self_attn,
             fused_mhc_post=(
                 self.boundary_mhc_fusions
@@ -4957,7 +5006,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_low_latency_decode(self, *, rebuild_only: bool = False) -> None:
         if rebuild_only and not any(
             isinstance(module, DeepseekV4CudaDecoderLayer)
-            and module.self_attn.ll_chain is not None
+            and module.self_attn.dsv41_ll_chain is not None
             for module in self.modules()
         ):
             return
@@ -4965,8 +5014,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         for module in self.modules():
             if isinstance(module, DeepseekV4CudaDecoderLayer):
                 module.setup_low_latency_decode()
-                if module.self_attn.ll_chain is not None:
-                    chains.append(module.self_attn.ll_chain)
+                if module.self_attn.dsv41_ll_chain is not None:
+                    chains.append(module.self_attn.dsv41_ll_chain)
         if chains:
             log_info_on_rank0(
                 logger,
@@ -4992,6 +5041,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._setup_low_latency_decode()
 
         for module in self.modules():
+            if isinstance(module, MQALayer):
+                module.setup_wq_b_rope()
             if isinstance(
                 module, deepseek_v2.DeepseekV2MoE
             ) and should_fuse_mega_moe_shared_experts(module):

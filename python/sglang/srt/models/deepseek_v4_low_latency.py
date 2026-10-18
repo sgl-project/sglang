@@ -33,6 +33,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -91,6 +92,7 @@ class LowLatencyChain(msgspec.Struct, frozen=True):
         return (
             0 < num_tokens <= self.max_tokens
             and (mode.is_decode() or mode.is_target_verify())
+            and get_is_capture_mode()
             # The prefill piecewise graph breaks out to eager around the attention
             # and hands back a fixed bf16 buffer, which this chain does not produce.
             and not is_in_breakable_cuda_graph()
@@ -201,6 +203,7 @@ def build_chain(layer, *, fused_mhc_post: bool) -> Optional[LowLatencyChain]:
     ``mlp_reduce_scatter``), so the caller's gate needs only ``defer_all_reduce``.
     """
     from sglang.kernels.ops.communication.all_reduce_fusion import get_registered_comm
+    from sglang.srt.layers.quantization.mxfp8_input import accepts_mxfp8_swizzled_input
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
@@ -215,6 +218,9 @@ def build_chain(layer, *, fused_mhc_post: bool) -> Optional[LowLatencyChain]:
         # quantized wo_a operands this chain's wo_a reads.
         and layer.use_mega_attention
         and layer.mega_wo_a is not None
+        and layer.alt_streams is not None
+        and accepts_mxfp8_swizzled_input(layer.wq_b)
+        and layer.wq_b.quant_method.mxfp8_dense_backend.is_flashinfer_cutedsl()
         # 16 local heads keep wq_b's rows unpermuted, which is the per-head query
         # layout the attention kernel reads.
         and not layer.mega_wq_b_permuted
