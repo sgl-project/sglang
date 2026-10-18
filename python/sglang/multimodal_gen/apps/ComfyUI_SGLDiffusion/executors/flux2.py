@@ -46,6 +46,10 @@ def _pack_reference_latents(ref_latents, batch_size: int) -> torch.Tensor:
 class Flux2Adapter(ComfyUIModelAdapter):
     model_types = ("flux2",)
     pipeline_class_name = FLUX2_PIPELINE
+    # The ids carry the reference layout, so they are cached and keyed with the latent.
+    cached_extra_keys = ComfyUIModelAdapter.cached_extra_keys + (
+        "condition_image_latent_ids",
+    )
 
     @classmethod
     def pipeline_class_for(cls, model_config) -> str:
@@ -100,11 +104,6 @@ class Flux2Adapter(ComfyUIModelAdapter):
             batch_size, channels, ctx["height"], ctx["width"]
         )
         return out.to(device=x.device, dtype=x.dtype)
-
-    def drop_cached_fields(self, packed: PackedForward) -> None:
-        super().drop_cached_fields(packed)
-        # The worker caches these with image_latent, so they come back as a pair.
-        packed.extra_req.pop("condition_image_latent_ids", None)
 
 
 class Flux2Executor(SGLDiffusionExecutor):

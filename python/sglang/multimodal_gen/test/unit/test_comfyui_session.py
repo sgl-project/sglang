@@ -12,6 +12,9 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import FluxAdapter
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux2 import (
+    Flux2Adapter,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.minimax_h3 import (
     MiniMaxH3Adapter,
 )
@@ -273,6 +276,25 @@ def test_cond_key_covers_image_latent() -> None:
     ex.send(packed(ref_a))
     second = ex.send(packed(ref_b))
     assert torch.equal(second.image_latent, ref_b)
+    release_comfyui_session(ex.sid)
+
+
+def test_cond_key_covers_reference_layout() -> None:
+    """References with equal token values but a different layout must not share a key.
+
+    Otherwise the second cond is served the first cond's position ids.
+    """
+    ex = _Executor(Flux2Adapter())
+    x, t = torch.zeros(1, 128, 2, 2), torch.tensor([0.5])
+    ctx = torch.randn(1, 3, 16)
+    wide = torch.randn(1, 128, 1, 4)
+    square = wide.reshape(1, 128, 2, 2)
+    first = ex.send(ex.adapter.pack(x, t, ctx, ref_latents=[wide]))
+    second = ex.send(ex.adapter.pack(x, t, ctx.clone(), ref_latents=[square]))
+    assert torch.equal(first.image_latent, second.image_latent)
+    assert not torch.equal(
+        first.condition_image_latent_ids, second.condition_image_latent_ids
+    )
     release_comfyui_session(ex.sid)
 
 
