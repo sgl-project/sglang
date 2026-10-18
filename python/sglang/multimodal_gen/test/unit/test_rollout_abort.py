@@ -85,6 +85,23 @@ def test_abort_fans_out_to_every_replica():
     assert AbortReq in scheduler_client._CONTROL_REQ_TYPES
 
 
+def test_abort_reply_sums_num_aborted_across_replicas():
+    client = scheduler_client.AsyncSchedulerClient()
+    client.context = Mock()
+    client.request_logger = Mock()
+    client.server_args = Mock(scheduler_endpoints=["ep0", "ep1"])
+    replies = {
+        "ep0": OutputBatch(output={"success": True, "num_aborted": 0}),
+        "ep1": OutputBatch(output={"success": True, "num_aborted": 2}),
+    }
+    with patch.object(
+        client, "_forward_one", AsyncMock(side_effect=lambda ep, *_: replies[ep])
+    ):
+        out = asyncio.run(client.forward(AbortReq(request_ids=["a", "b"])))
+    # the request was queued on replica 1, so replica 0 alone would report 0
+    assert out.output == {"success": True, "num_aborted": 2}
+
+
 def test_aborted_rollout_returns_499_not_500():
     request = RolloutRequest(prompt="p", request_id="miles-0-1")
     with (

@@ -144,12 +144,16 @@ def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int
     return next(counter) % dp_size
 
 
-def _merge_fanout_results(results: list[Any]) -> Any:
+def _merge_fanout_results(batch: Any, results: list[Any]) -> Any:
     """One reply for a control op sent to every replica: the first error wins,
     because "succeeded" must mean succeeded everywhere."""
     for result in results:
         if isinstance(result, OutputBatch) and result.error:
             return result
+    if isinstance(batch, AbortReq):
+        # each replica only counts what it dropped from its own queue
+        num_aborted = sum(r.output.get("num_aborted", 0) for r in results)
+        return OutputBatch(output={**results[0].output, "num_aborted": num_aborted})
     return results[0]
 
 
@@ -201,7 +205,7 @@ class SchedulerClient:
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
-            output_batch = _merge_fanout_results(results)
+            output_batch = _merge_fanout_results(batch, results)
         else:
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
@@ -278,7 +282,7 @@ class AsyncSchedulerClient:
             results = [
                 await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
             ]
-            output_batch = _merge_fanout_results(results)
+            output_batch = _merge_fanout_results(batch, results)
         else:
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = await self._forward_one(
