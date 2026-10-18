@@ -3735,6 +3735,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
         )
 
+        # Retraction is a low-frequency, high-suspicion event for the mamba
+        # slot accounting: retracted reqs release their slots and re-allocate
+        # on the next prefill. Record the pool state right after for the
+        # [MambaAudit] trail.
+        if retracted_reqs and self.tree_cache.supports_mamba():
+            allocator = self.tree_cache.req_to_token_pool.mamba_allocator
+            logger.info(
+                "[MambaAudit] retract_decode: n=%d free=%d evictable=%d",
+                len(retracted_reqs),
+                allocator.schedulable_available_size(),
+                self.tree_cache.mamba_evictable_size(),
+            )
+
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod

@@ -241,14 +241,17 @@ class MambaComponent(TreeComponent):
                     # Admission (PrefillAdder static-pool budget) should have
                     # throttled before this point; reaching it means over-admit
                     # or a pool too small for --max-running-requests.
+                    _alloc = self.cache.req_to_token_pool.mamba_allocator
                     raise RuntimeError(
                         "Can not alloc mamba cache: match COW for the request's "
                         "running mamba slot failed even after evicting 1 "
-                        f"(free={self.cache.req_to_token_pool.mamba_allocator.schedulable_available_size()}). "
+                        f"(free={_alloc.schedulable_available_size()}, "
+                        f"evictable={self.cache.mamba_evictable_size()}). "
                         "The mamba pool is exhausted — with --system-prompt the "
                         "admission budget should throttle this; otherwise the "
                         "pool is too small for --max-running-requests, try "
-                        "increasing --mamba-full-memory-ratio."
+                        "increasing --mamba-full-memory-ratio. Check the last "
+                        "[MambaAudit] line for the slot-accounting snapshot."
                     )
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index

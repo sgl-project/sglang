@@ -36,10 +36,27 @@ class MambaSlotAllocator:
         self.device = device
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
+        # Lifetime counters for the scheduler's periodic slot audit
+        # ([MambaAudit] log lines): cumulated hard allocations / frees and how
+        # often the group pre-allocation over-requested and degraded to the
+        # per-request hard-alloc path.
+        self.stats_alloc_total = 0
+        self.stats_free_total = 0
+        self.stats_group_degraded = 0
         self.clear()
 
     def available_size(self) -> int:
         return len(self.free_slots)
+
+    def debug_stats(self) -> dict:
+        """Snapshot for the [MambaAudit] scheduler log line."""
+        return {
+            "size": self.size,
+            "free": len(self.free_slots),
+            "alloc_total": self.stats_alloc_total,
+            "free_total": self.stats_free_total,
+            "group_degraded": self.stats_group_degraded,
+        }
 
     def schedulable_available_size(self) -> int:
         """Planner-facing free count. Same as ``available_size`` for a static pool;
@@ -53,6 +70,12 @@ class MambaSlotAllocator:
             result = self._do_alloc(num_reqs)
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
+            else:
+                # Requested more than the hard free list holds: degrade to the
+                # per-request hard-alloc path (each match COW allocs 1). Counted
+                # for the audit — this is the regime where match COWs can drain
+                # the free list within one scheduling pass.
+                self.stats_group_degraded += 1
 
     def alloc_group_end(self):
         """Return any unused pre-allocated slots from the current group."""
@@ -74,11 +97,13 @@ class MambaSlotAllocator:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self.stats_alloc_total += need_size
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self.stats_free_total += free_index.numel()
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
