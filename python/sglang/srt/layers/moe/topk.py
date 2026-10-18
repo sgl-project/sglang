@@ -102,11 +102,11 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
-    MoeRunnerBackendLike,
     get_moe_a2a_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackendLike,
     has_per_rank_fused_shared_slots,
 )
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer

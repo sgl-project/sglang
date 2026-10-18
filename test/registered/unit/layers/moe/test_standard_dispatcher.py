@@ -148,6 +148,54 @@ class TestLayerRunnerDispatch(CustomTestCase):
             )
             self._assert_local_routes(config)
 
+    def test_fp8_fallback_keeps_dp_allgather_in_bf16(self):
+        """FP8 fallback experts still gather DP-local rows without FP4 quantization."""
+        captured = {}
+
+        class Group:
+            world_size = 2
+
+            def all_gatherv(self, payloads, sizes):
+                captured["payloads"] = payloads
+                captured["sizes"] = sizes
+                weights, ids, hidden = payloads
+                return [
+                    torch.cat([weights, weights]),
+                    torch.tensor([[0, 3], [2, 1]], dtype=ids.dtype),
+                    torch.cat([hidden, hidden + 1]),
+                ]
+
+        config = self._config()
+        config.runner_backend = MoeRunnerBackend.TRITON
+        dispatcher = StandardDispatcher(config)
+        hidden = torch.zeros((1, 4), dtype=torch.bfloat16)
+        topk = StandardTopKOutput(
+            torch.ones((1, 2)), torch.tensor([[0, 3]], dtype=torch.int32), None
+        )
+        with (
+            get_parallel().override(tp_group=Group()),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard."
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard.get_dp_global_num_tokens",
+                return_value=[1, 1],
+            ),
+        ):
+            output = dispatcher.dispatch(hidden, topk)
+        self.assertIs(captured["payloads"][2], hidden)
+        self.assertEqual(captured["sizes"], [1, 1])
+        self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
+        self.assertIsNone(output.hidden_states_scale)
+        self.assertTrue(
+            torch.equal(
+                output.topk_output.topk_ids,
+                torch.tensor([[-1, 1], [0, -1]], dtype=torch.int32),
+            )
+        )
+
     def test_topk_does_not_re_read_the_target_backend(self):
         """A constructed router keeps its layer's format across draft scopes."""
         topk = TopK(top_k=2, layer_id=0, allow_routed_experts_capture=False)

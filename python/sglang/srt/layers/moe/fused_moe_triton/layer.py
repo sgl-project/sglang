@@ -544,19 +544,7 @@ class FusedMoE(torch.nn.Module):
             and num_experts == 512
             and top_k == 10
         )
-        self.supports_deferred_finalize = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
-        )
-        global _deferred_finalize_info_logged
-        if not _deferred_finalize_info_logged:
-            _deferred_finalize_info_logged = True
-            logging.getLogger(__name__).debug(
-                "FlashInfer TRTLLM MoE deferred finalize is "
-                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
-                f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
-                f"quant_method={type(self.quant_method).__name__})."
-            )
+        self.supports_deferred_finalize = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -581,6 +569,16 @@ class FusedMoE(torch.nn.Module):
             and self.runner_backend.is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         )
+        global _deferred_finalize_info_logged
+        if not _deferred_finalize_info_logged:
+            _deferred_finalize_info_logged = True
+            logging.getLogger(__name__).debug(
+                "FlashInfer TRTLLM MoE deferred finalize is "
+                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"(moe_runner_backend={self.runner_backend}, "
+                f"quant_method={type(self.quant_method).__name__})."
+            )
+
         self.dispatcher = create_moe_dispatcher(
             self.moe_runner_config, quant_method=self.quant_method
         )
@@ -1244,10 +1242,7 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
-        elif isinstance(method, Fp8MoEMethod) and (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
+        elif isinstance(method, Fp8MoEMethod) and (self.use_flashinfer_trtllm_moe):
             # Drop the GPU mxfp8 shuffle-index cache on every reload for mxfp8 trtllm, trtllm_routed
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 clear_mxfp8_shuffle_index_cache,
@@ -1496,10 +1491,7 @@ class FusedMoE(torch.nn.Module):
         method = _weight_layout_method(self)
         if self.scheme is not None:
             method = self.scheme
-        if isinstance(method, Fp8MoEMethod) and (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
+        if isinstance(method, Fp8MoEMethod) and (self.use_flashinfer_trtllm_moe):
             # Drop the GPU mxfp8 shuffle-index cache on every reload for mxfp8 trtllm, trtllm_routed
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 clear_mxfp8_shuffle_index_cache,

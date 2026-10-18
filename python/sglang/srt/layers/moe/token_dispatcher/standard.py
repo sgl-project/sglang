@@ -158,7 +158,8 @@ class StandardDispatcher(BaseDispatcher):
 
         needs_dp_allgather = should_use_flashinfer_cutlass_moe_fp4_allgather()
         use_fp4_payload = (
-            self.enable_flashinfer_cutlass_moe
+            needs_dp_allgather
+            and self.enable_flashinfer_cutlass_moe
             and self.quant_config.get("input_global_scale") is not None
         )
         if needs_dp_allgather and not use_fp4_payload:
