@@ -1,4 +1,5 @@
 import logging
+from array import array
 from copy import deepcopy
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -27,8 +28,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -48,7 +49,6 @@ from sglang.srt.multimodal.mm_utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
-    get_parallel,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -723,14 +723,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
             CUDA IPC features are intentionally reconstructed after the image
             assignment.  Each image therefore crosses the tokenizer/scheduler
-            boundary once instead of once per TP rank.  The selected consumer
-            acknowledges the entire TP group so the bounded IPC pool remains
-            recyclable.
+            boundary once instead of once per TP rank. Unused ranks keep their
+            lease until request cleanup so cache eviction can re-run the encoder.
             """
-            # Match the configured TP consumer count captured when the
-            # tokenizer creates MmItemMemoryPool. A live attention subgroup
-            # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
@@ -739,9 +734,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             for image_index in image_indices:
                 item = items[image_index]
                 if device.type == "cuda":
-                    item.reconstruct(
-                        device_index, ipc_consumer_count=ipc_consumer_count
-                    )
+                    item.reconstruct(device_index)
                 feature = item.feature
                 if not isinstance(feature, torch.Tensor):
                     raise TypeError(
@@ -775,9 +768,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws)
         return mm_projection_auto(self.mm_projector, image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @property
     def start_layer(self) -> int:

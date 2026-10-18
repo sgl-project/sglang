@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Literal
 
 import torch
 
@@ -14,17 +14,136 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 logger = logging.getLogger(__name__)
 
+# GPT-2 style byte-level BPE decoder table (char -> raw byte). Byte-level BPE
+# vocab tokens are stored as a printable-char mapping of the raw UTF-8 bytes
+# (see openai/gpt-2 bytes_to_unicode); converting a token id back to its raw
+# bytes must go through this table, NOT through `token.encode()` on the
+# detokenized display string (that loses fragmentary bytes as U+FFFD).
+_BYTE_DECODER: dict[str, int] = {}
+
+# Tokenizer-level cache: once verified, we know whether *all* tokens from a
+# given tokenizer can safely use the byte decoder. Avoids per-token checks.
+_BYTE_LEVEL_TOKENIZERS: set = set()
+
+
+def _build_byte_decoder() -> dict[str, int]:
+    bs = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord(chr(0xA1)), ord(chr(0xAC)) + 1))
+        + list(range(ord(chr(0xAE)), ord(chr(0xFF)) + 1))
+    )
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8 + n)
+            n += 1
+    cs = [chr(c) for c in cs]
+    return dict(zip(cs, bs))
+
+
+def _is_byte_level_tokenizer(tokenizer) -> bool:
+    """Heuristically determine whether *tokenizer* uses GPT-2 byte-level BPE.
+
+    Only GPT-2 family (GPT2Tokenizer, Llama, Qwen, etc.) store vocabulary
+    tokens as the ``bytes_to_unicode`` printable-char mapping. SentencePiece
+    tokenizers (Mistral, Gemma, T5) store raw Unicode pieces, so applying the
+    byte decoder to them corrupts multi-byte characters.
+
+    We probe by checking ``is_byte_level`` (HuggingFace fast tokenizers) or
+    by verifying that a known multi-byte character (é, U+00E9) round-trips:
+    GPT-2 encodes it as a single byte-level piece ``chr(233)`` whose byte
+    decoder output [233] does NOT form valid UTF-8, while SentencePiece stores
+    the full character ``é`` whose UTF-8 is [195, 169].
+    """
+    tid = id(tokenizer)
+    if tid in _BYTE_LEVEL_TOKENIZERS:
+        return True
+
+    # Fast path: HuggingFace fast tokenizers expose is_byte_level.
+    is_bl = getattr(tokenizer, "is_byte_level", None)
+    if isinstance(is_bl, bool):
+        if is_bl:
+            _BYTE_LEVEL_TOKENIZERS.add(tid)
+        return is_bl
+
+    # Slow path: probe with a known é token.
+    global _BYTE_DECODER
+    if not _BYTE_DECODER:
+        _BYTE_DECODER = _build_byte_decoder()
+    try:
+        vocab_size = len(tokenizer.get_vocab())
+        # Sample a few tokens to check if all chars are byte-decodable.
+        sample_ids = [0, 1, 2, 3, vocab_size // 2, vocab_size - 2]
+        for sid in sample_ids:
+            if sid < 0 or sid >= vocab_size:
+                continue
+            piece = tokenizer.convert_ids_to_tokens(sid)
+            if piece is None or not piece:
+                continue
+            # If any char in the piece is NOT in the byte decoder table,
+            # this tokenizer does NOT use byte-level encoding.
+            if any(ch not in _BYTE_DECODER for ch in piece):
+                return False
+        # All sampled tokens are byte-decodable → likely byte-level BPE.
+        _BYTE_LEVEL_TOKENIZERS.add(tid)
+        return True
+    except Exception:
+        return False
+
+
+def token_id_to_bytes(tokenizer, token_id) -> list[int] | None:
+    """Raw bytes for a byte-level-BPE token id.
+
+    Returns the token's original bytes via the GPT-2 byte decoder, or None when
+    the token is not byte-level representable (e.g. special ids / non byte BPE
+    tokenizers like SentencePiece), so callers can fall back to the detokenized
+    display string.
+    """
+    if not _is_byte_level_tokenizer(tokenizer):
+        return None
+    global _BYTE_DECODER
+    if not _BYTE_DECODER:
+        _BYTE_DECODER = _build_byte_decoder()
+    try:
+        piece = tokenizer.convert_ids_to_tokens(token_id)
+    except Exception:
+        return None
+    if piece is None:
+        return None
+    out = bytearray()
+    for ch in piece:
+        b = _BYTE_DECODER.get(ch)
+        if b is None:
+            return None
+        out.append(b)
+    if not out:
+        return None
+    return list(out)
+
 
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,
     input_top_logprobs=None,
     output_top_logprobs=None,
+    tokenizer=None,
 ):
+    """Convert engine logprob triples to an OpenAI ``LogProbs`` object.
+
+    Each engine logprob item is a ``(logprob, token_id, token_text)`` triple.
+    ``token_text`` is a detokenized *display* string that loses fragmentary
+    byte-level tokens (a lone byte of a 4-byte char decodes to U+FFFD).  The
+    legacy completions surface has no per-token ``bytes`` field, so when
+    ``tokenizer`` is provided we render fragments losslessly as latin-1
+    (one char per raw byte), keeping the string channel reversible.
+    """
     ret_logprobs = LogProbs()
 
     def append_token_logprobs(token_logprobs):
-        for logprob, _, token_text in token_logprobs:
+        for logprob, token_id, token_text in token_logprobs:
+            token_text = _lossless_token_text(tokenizer, token_id, token_text)
             ret_logprobs.tokens.append(token_text)
             ret_logprobs.token_logprobs.append(logprob)
 
@@ -35,7 +154,10 @@ def to_openai_style_logprobs(
         for tokens in top_logprobs:
             if tokens is not None:
                 ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
+                    {
+                        _lossless_token_text(tokenizer, token_id, token_text): logprob
+                        for logprob, token_id, token_text in tokens
+                    }
                 )
             else:
                 ret_logprobs.top_logprobs.append(None)
@@ -52,13 +174,49 @@ def to_openai_style_logprobs(
     return ret_logprobs
 
 
+def _lossless_token_text(tokenizer, token_id, token_text):
+    """Return a lossless display string for one engine logprob triple.
+
+    Fragmentary byte-level tokens decode to U+FFFD in the display string.  When
+    we can recover the true raw bytes from the token id (byte-level BPE), we
+    validate that the recovered bytes do NOT form valid UTF-8 (a real fragment
+    never does), then render them as latin-1 so every byte round-trips.
+
+    Three safeguards address the reviewer's concerns:
+    1. Non-byte-level tokenizers (SentencePiece/Mistral) are detected and
+       skipped, so multi-byte characters like é are NOT corrupted to [233].
+    2. Legitimate U+FFFD text (e.g. GPT-2 token 4210 = bytes [239,191,189])
+       round-trips as valid UTF-8, so we keep the original display text.
+    3. The latin-1 representation is only applied to genuine fragments (bytes
+       that fail UTF-8 decode), avoiding key collisions in top_logprobs.
+    """
+    if token_text is not None and "\ufffd" not in token_text:
+        return token_text
+    if tokenizer is None or token_id is None:
+        return token_text if token_text is not None else ""
+    raw = token_id_to_bytes(tokenizer, token_id)
+    if raw is None:
+        return token_text if token_text is not None else ""
+    # Only treat as a fragment if the recovered bytes do NOT form valid UTF-8.
+    # A complete token whose display text happens to contain U+FFFD (e.g. token
+    # 4210 = bytes [239,191,189] = valid UTF-8 for U+FFFD) must be left alone.
+    try:
+        bytes(raw).decode("utf-8")
+        # Valid UTF-8 → this is NOT a fragment; keep the original display text.
+        return token_text if token_text is not None else ""
+    except UnicodeDecodeError:
+        pass
+    # Genuine fragment: render as latin-1 (one char per byte, lossless).
+    try:
+        return bytes(raw).decode("latin-1")
+    except Exception:
+        return token_text if token_text is not None else ""
+
+
 def process_hidden_states_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[List]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> list | None:
     """Process hidden states from a ret item in non-streaming response.
 
     Args:
@@ -78,9 +236,9 @@ def process_hidden_states_from_ret(
 
 
 def process_hidden_states_for_response(
-    hidden_states: Optional[List],
-    return_hidden_states: Union[bool, Literal["last"]],
-) -> Optional[List]:
+    hidden_states: list | None,
+    return_hidden_states: bool | Literal["last"],
+) -> list | None:
     """Format scheduler hidden states for OpenAI API responses."""
     if not return_hidden_states or hidden_states is None:
         return None
@@ -107,12 +265,9 @@ def should_include_usage(
 
 
 def process_routed_experts_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[str]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> str | None:
     """Process routed experts from a ret item in non-streaming response."""
     if not getattr(request, "return_routed_experts", False):
         return None
@@ -120,7 +275,7 @@ def process_routed_experts_from_ret(
 
 
 def cached_tokens_details_from_dict(
-    details: Dict[str, Any],
+    details: dict[str, Any],
 ) -> CachedTokensDetails:
     """Convert a raw cached_tokens_details dict to a CachedTokensDetails object."""
     if "storage" in details:
@@ -138,12 +293,9 @@ def cached_tokens_details_from_dict(
 
 
 def process_cached_tokens_details_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[CachedTokensDetails]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> CachedTokensDetails | None:
     """Process cached tokens details from a ret item in non-streaming response."""
     if not request.return_cached_tokens_details:
         return None
@@ -156,8 +308,8 @@ def process_cached_tokens_details_from_ret(
 
 
 def spec_tokens_details_from_meta_info(
-    meta_info: Dict[str, Any],
-) -> Optional[SpecTokensDetails]:
+    meta_info: dict[str, Any],
+) -> SpecTokensDetails | None:
     """Build speculative decoding details from canonical or legacy metrics."""
     details = dict(meta_info)
 
@@ -190,12 +342,9 @@ def spec_tokens_details_from_meta_info(
 
 
 def process_spec_tokens_details_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[SpecTokensDetails]:
+    ret_item: dict[str, Any],
+    request: ChatCompletionRequest | CompletionRequest,
+) -> SpecTokensDetails | None:
     """Process speculative decoding details from a response item."""
     if not getattr(request, "return_spec_tokens_details", False):
         return None
@@ -203,8 +352,8 @@ def process_spec_tokens_details_from_ret(
 
 
 def convert_embeds_to_tensors(
-    embeds: Optional[Union[List[Optional[List[List[float]]]], List[List[float]]]],
-) -> Optional[List[Optional[List[torch.Tensor]]]]:
+    embeds: list[list[list[float]] | None] | list[list[float]] | None,
+) -> list[list[torch.Tensor] | None] | None:
     """Convert nested float lists from the HTTP API to lists of tensors.
 
     Accepts either:

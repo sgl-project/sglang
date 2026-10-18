@@ -16,6 +16,8 @@ on:
           - ''
           - stage-a-unit-test-mlx
           - stage-b-e2e-test-mlx
+          - stage-a-unit-test-mps
+          - stage-b-e2e-test-mps
 
 concurrency:
   group: pr-test-mlx-${{ github.ref }}
@@ -160,6 +162,100 @@ jobs:
         run: |
           uv run python test/run_suite.py --hw mlx --suite stage-b-e2e-mlx
 
+  # Run the Torch MPS path without SGLANG_USE_MLX.
+  stage-a-unit-test-mps:
+    needs: [check-changes, pr-gate]
+    if: |
+      !cancelled() && (
+        (needs.pr-gate.result == 'success' &&
+          (needs.check-changes.outputs.main_package == 'true' ||
+           needs.check-changes.outputs.sgl_kernel == 'true')) ||
+        (github.event_name == 'workflow_dispatch' &&
+         inputs.target_stage == 'stage-a-unit-test-mps')
+      )
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SGLANG_IS_IN_CI: true
+      # Forbid HF downloads to enforce the model-free guarantee.
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
+
+      - name: Verify Apple Silicon runner
+        run: |
+          echo "uname -m: $(uname -m)"
+          python3 -c "import platform; assert platform.machine()=='arm64', platform.machine(); print('machine:', platform.machine(), 'system:', platform.system())"
+
+      - name: Install dependencies (srt_mps extra)
+        timeout-minutes: 30
+        run: |
+          test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
+          rm -f python/pyproject.toml
+          mv python/pyproject_other.toml python/pyproject.toml
+          uv venv
+          uv pip install -e "python[srt_mps,test]"
+
+      - name: Report torch version and MPS availability
+        run: |
+          uv run python -c "import torch; print('torch', torch.__version__, 'mps', torch.mps.is_available())"
+
+      - name: Run model-free MPS unit tests
+        timeout-minutes: 15
+        run: |
+          uv run python test/run_suite.py --hw mps --suite stage-a-unit-test-mps
+
+  stage-b-e2e-test-mps:
+    needs: [check-changes, pr-gate]
+    # Manual-only, same rationale as the MLX e2e stage above.
+    if: |
+      !cancelled() && inputs.target_stage == 'stage-b-e2e-test-mps'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 120
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
+
+      - name: Verify Apple Silicon runner
+        run: |
+          echo "uname -m: $(uname -m)"
+          python3 -c "import platform; assert platform.machine()=='arm64', platform.machine(); print('machine:', platform.machine(), 'system:', platform.system())"
+
+      - name: Install dependencies (srt_mps extra)
+        timeout-minutes: 30
+        run: |
+          test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
+          rm -f python/pyproject.toml
+          mv python/pyproject_other.toml python/pyproject.toml
+          uv venv --python 3.11
+          uv pip install -e "python[srt_mps,test]"
+
+      # Needs a warm HF cache or network and roughly 24 GB of unified memory.
+      - name: Run MPS e2e smoke tests
+        timeout-minutes: 90
+        run: |
+          uv run python test/run_suite.py --hw mps --suite stage-b-e2e-mps
+
   pr-test-mlx-finish:
     needs:
       [
@@ -167,6 +263,8 @@ jobs:
         check-changes,
         stage-a-unit-test-mlx,
         stage-b-e2e-test-mlx,
+        stage-a-unit-test-mps,
+        stage-b-e2e-test-mps,
       ]
     if: always()
     runs-on: ubuntu-latest

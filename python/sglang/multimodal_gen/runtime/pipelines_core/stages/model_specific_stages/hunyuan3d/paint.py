@@ -19,6 +19,7 @@ from PIL import Image
 from torch import nn
 from transformers import PreTrainedTokenizerBase
 
+from sglang.kernels.ops.diffusion import load_mesh_processor
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
@@ -180,10 +181,16 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             ComponentUse(stage_name, "delight_vae", phase="decode"),
         ]
 
-    @staticmethod
-    def _unwrap_mesh(mesh: Any) -> Any:
-        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_uv_wrap
+    def _unwrap_mesh(self, mesh: Any) -> Any:
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
+            mesh_simplify,
+            mesh_uv_wrap,
+        )
 
+        # xatlas time grows superlinearly with face count; the raw shape mesh
+        # has ~650k faces at the default octree resolution.
+        if self.config.paint_use_remesh:
+            mesh = mesh_simplify(mesh)
         return mesh_uv_wrap(mesh)
 
     @staticmethod
@@ -790,6 +797,9 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         del server_args
+        if batch.is_warmup:
+            # compile without exporting warmup meshes or textures
+            load_mesh_processor()
         if batch.is_warmup or batch.extra.get("_mesh_failed"):
             return OutputBatch(output_file_paths=[], metrics=batch.metrics)
 

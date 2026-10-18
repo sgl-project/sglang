@@ -2,6 +2,7 @@
 # Adapted from vllm-ascend: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/platform.py
 
 import os
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -9,7 +10,6 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
-    DeviceCapability,
     Platform,
     PlatformEnum,
 )
@@ -41,12 +41,16 @@ class NPUPlatformBase(Platform):
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
     @classmethod
-    def get_local_torch_device(cls) -> torch.device:
-        return torch.device(f"npu:{envs.LOCAL_RANK}")
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    def tensor_on_device(self, t: torch.Tensor) -> bool:
+        return t.is_npu
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
-        return None
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"npu:{envs.LOCAL_RANK}")
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -105,10 +109,6 @@ class NPUPlatformBase(Platform):
             free_gpu_memory = float(tensor.item())
 
         return free_gpu_memory / (1 << 30)
-
-    @classmethod
-    def log_warnings(cls) -> None:
-        pass
 
     @classmethod
     def get_current_memory_usage(
@@ -187,6 +187,13 @@ class NPUPlatformBase(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+
+    @classmethod
+    def get_all_to_all_communicator_cls(cls) -> str:
+        return (
+            "sglang.multimodal_gen.runtime.distributed.device_communicators."
+            "cpu_communicator.CpuCommunicator"
+        )
 
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:

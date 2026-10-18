@@ -168,15 +168,11 @@ class TestApplyWithAddend(CustomTestCase):
                 )
             elif route == "splitk":
                 enter(patch.object(unquant, "_enable_bf16_splitk_gemm", True))
-                enter(
-                    patch.object(
-                        unquant, "use_flashinfer_pr4266_bf16_gemm", lambda *a: True
-                    )
-                )
+                enter(patch.object(unquant, "use_bf16_splitk_gemm", lambda *a: True))
                 enter(
                     patch.object(
                         unquant,
-                        "_flashinfer_pr4266_bf16_gemm",
+                        "_bf16_splitk_gemm",
                         _fake_kernel(kernel_calls, route),
                     )
                 )
