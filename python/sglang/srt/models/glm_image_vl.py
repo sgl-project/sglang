@@ -35,9 +35,10 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -56,8 +57,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -907,7 +908,7 @@ class GlmImageTextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=UNFUSED_NORM_READOUT,
@@ -924,8 +925,6 @@ class GlmImageTextDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -971,17 +970,18 @@ class GlmImageTextModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.layers = nn.ModuleList(
-            [
-                GlmImageTextDecoderLayer(
-                    layer_id=i,
-                    config=config,
-                    quant_config=self.quant_config,
-                    prefix=add_prefix(f"layers.{i}", getattr(config, "prefix", "")),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    GlmImageTextDecoderLayer(
+                        layer_id=i,
+                        config=config,
+                        quant_config=self.quant_config,
+                        prefix=add_prefix(f"layers.{i}", getattr(config, "prefix", "")),
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -1081,8 +1081,7 @@ class GlmImageForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(logits_config)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Run vision encoder -> VQ-VAE encode -> embed_tokens on discrete indices."""

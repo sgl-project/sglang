@@ -61,6 +61,34 @@ def _cp_prefill(*, unified, gathered, kv_pool, **module_attrs):
 
 
 class TestDeepseekV4CPKVStore(unittest.TestCase):
+    def test_unified_fp8_pair_gathers_one_raw_byte_row(self):
+        # Rows 0 and 2 are local; row 1 comes from the peer rank.
+        global_nope = torch.arange(24, dtype=torch.uint8).view(3, 8)
+        global_rope = torch.arange(6, dtype=torch.bfloat16).view(3, 2)
+        local_nope, local_rope = global_nope[[0, 2]], global_rope[[0, 2]]
+        gathered = torch.cat((global_nope, global_rope.view(torch.uint8)), dim=-1)
+        forward_batch, stream = object(), object()
+
+        with mock.patch.object(
+            deepseek_v4, "cp_materialize_global_token_order", return_value=gathered
+        ) as materialize:
+            nope, rope = deepseek_v4._materialize_cp_unified_fp8_kv(
+                local_nope.view(torch.float8_e4m3fn), local_rope, forward_batch, stream
+            )
+
+        packed, gathered_batch, gathered_stream = materialize.call_args.args
+        self.assertTrue(
+            torch.equal(
+                packed, torch.cat((local_nope, local_rope.view(torch.uint8)), dim=-1)
+            )
+        )
+        self.assertIs(gathered_batch, forward_batch)
+        self.assertIs(gathered_stream, stream)
+        self.assertEqual(nope.dtype, torch.float8_e4m3fn)
+        self.assertTrue(nope.is_contiguous() and rope.is_contiguous())
+        self.assertTrue(torch.equal(nope.view(torch.uint8), global_nope))
+        self.assertTrue(torch.equal(rope, global_rope))
+
     def test_unified_cp_gathers_current_chunk_for_two_source_attention(self):
         q = torch.ones(2, 1, 2)
         local_kv = torch.arange(8, dtype=torch.float32).view(2, 4)

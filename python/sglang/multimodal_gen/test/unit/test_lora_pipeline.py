@@ -356,19 +356,49 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
     ]
 
 
-def test_view_merge_unmerges_by_inverse_without_owned_clone():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded):
     torch.manual_seed(0)
-    base = torch.nn.Linear(4, 4, bias=False)
+    base = torch.nn.Linear(4, 4, bias=False, dtype=dtype)
     original = base.weight.detach().clone()
     layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
     assert layer is not None
     assert layer._base_is_view
+    stored = base.weight.detach()
+    if offloaded:
+        base._packed_weight_cpu = stored
+        base.weight.data = torch.empty(1, dtype=dtype)
     A = torch.randn(2, 4)
     B = torch.randn(4, 2)
-    layer.set_lora_weights(A, B, strength=0.5, clear_existing=True, merge_weights=True)
-    assert layer.merged
+    layer.set_lora_weights(A, B, clear_existing=True, merge_weights=False)
     assert layer._base_is_view
-    torch.testing.assert_close(layer.base_layer.weight, original + 0.5 * (B @ A))
+    for strength in (1.0, 0.0, 0.5, 1.0):
+        layer.set_lora_weights(
+            A, B, strength=strength, clear_existing=True, merge_weights=True
+        )
+        assert layer.merged
+        assert not layer._base_is_view
+        torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+        if strength == 0:
+            torch.testing.assert_close(stored, original, rtol=0, atol=0)
+        else:
+            assert not torch.equal(stored, original)
     layer.unmerge_lora_weights()
-    torch.testing.assert_close(layer.base_layer.weight, original)
+    torch.testing.assert_close(stored, original, rtol=0, atol=0)
     assert not layer.merged
+
+
+def test_cached_merge_restores_untouched_base_view():
+    base = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+    original = base.weight.detach().clone()
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    layer.set_lora_weights(torch.ones(2, 4), torch.ones(4, 2), merge_weights=False)
+    layer.install_merged_weight(original + 2, base.weight.detach())
+    assert layer._base_is_view
+    torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+    layer.merge_lora_weights(strength=0.5)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(base.weight, original, rtol=0, atol=0)

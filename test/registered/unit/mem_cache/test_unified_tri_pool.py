@@ -24,6 +24,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    kv_mamba_slots,
+)
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -32,6 +35,12 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    DraftStateGeometry,
+    DraftStateRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
@@ -48,7 +57,7 @@ from sglang.test.unified_allocator_fixtures import (
 
 # Hermetic convention of this directory's pool tests: plain unittest.TestCase,
 # only ci_register imported (no heavy sglang.test.test_utils chain).
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
@@ -491,7 +500,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         allocator.free_group_begin()
         allocator.free_full_segment(full_indices, start_pos=0)
-        self.assertTrue(allocator.full_free_group)
+        self.assertTrue(allocator.full_page_reps_group)
 
         donor = allocator.mamba_full_cache_donor()
         self.assertIsNotNone(donor)
@@ -499,6 +508,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         self.assertEqual(allocator.free_group, [])
         self.assertEqual(allocator.free_page_reps_group, [])
+        self.assertEqual(allocator.full_page_reps_group, [])
         self.assertEqual(allocator.full_free_group, [])
         self.assertLess(
             allocator.full_attn_allocator.allocated_count(), allocated_before
@@ -975,11 +985,209 @@ class TestTriFactorySizing(unittest.TestCase):
             max_num_reqs=4,
             enable_memory_saver=False,
             enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer_lazy=False,
             disable_overlap_schedule=True,
             need_sort=False,
         )
         kw.update(over)
         return kw
+
+    def test_streaming_session_lazy_checkpoint_cleanup(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
+
+        for lazy_compaction in (None, False, True):
+            for ids in ((0, -1), (-1, 0), (-1, -1), (0, 1)):
+                with self.subTest(compaction=lazy_compaction, ids=ids):
+                    kw = self._factory_kwargs(
+                        enable_mamba_extra_buffer=True,
+                        enable_mamba_extra_buffer_lazy=True,
+                        lazy_compaction=lazy_compaction,
+                    )
+                    with get_parallel().override(attn_dcp_size=1):
+                        pool = init_unified_mamba_swa_pools(**kw).req_to_token_pool
+                    if lazy_compaction is None:
+                        pool = SimpleNamespace(
+                            mamba_allocator=MambaSlotAllocator(16, "cpu")
+                        )
+                    allocator = pool.mamba_allocator
+                    available = allocator.available_size()
+                    count = sum(i != -1 for i in ids)
+                    live = allocator.alloc(count + 1)
+                    track = live.new_full((2,), -1)
+                    for position, index in enumerate(ids):
+                        if index != -1:
+                            track[position] = live[index + 1]
+                    slot = SessionSlot(
+                        kv=ReqKvInfo(
+                            req_pool_idx=1,
+                            mamba_pool_idx=live[0],
+                            mamba_ping_pong_track_buffer=track,
+                        )
+                    )
+                    session = StreamingSession(SimpleNamespace(req_to_token_pool=pool))
+                    session.slots = {"test": slot}
+                    self.assertEqual(kv_mamba_slots(slot.kv), count + 1)
+                    session._free_slot_mamba(slot)
+                    self.assertEqual(kv_mamba_slots(slot.kv), 0)
+                    self.assertEqual(allocator.available_size(), available)
+                    session._free_slot_mamba(slot)
+                    self.assertEqual(allocator.available_size(), available)
+
+    def test_mamba_lazy_checkpoint_cleanup(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_parallel
+
+        for tri_pool in (False, True):
+            for lazy in (False, True):
+                for keep_checkpoint in (False, True):
+                    with self.subTest(
+                        tri_pool=tri_pool, lazy=lazy, keep=keep_checkpoint
+                    ):
+                        from sglang.srt.mem_cache import kv_cache_configurator as cfg
+
+                        kw = self._factory_kwargs()
+                        model = SimpleNamespace(
+                            get_num_kv_heads=lambda tp, dcp: 2,
+                            get_swa_num_kv_heads=lambda tp: 2,
+                            head_dim=4,
+                            v_head_dim=4,
+                            swa_head_dim=4,
+                            swa_v_head_dim=4,
+                            context_len=16,
+                            full_attention_layer_ids=[0],
+                            swa_attention_layer_ids=[1],
+                            sliding_window_size=8,
+                        )
+                        configurator = SimpleNamespace(
+                            mambaish_config=SimpleNamespace(
+                                mamba2_cache_params=kw["mamba2_cache_params"],
+                                full_attention_layer_ids=[0],
+                            ),
+                            model_config=model,
+                            layer_info=SimpleNamespace(
+                                swa_attention_layer_ids=[1],
+                                full_attention_layer_ids=[0],
+                                start_layer=0,
+                                end_layer=2,
+                            ),
+                            device=_DEV,
+                            kv_cache_dtype=torch.float16,
+                            page_size=1,
+                            is_draft_worker=False,
+                            use_mla_backend=False,
+                            is_hybrid_swa=tri_pool,
+                            is_hybrid_swa_compress=False,
+                            forward_stream=None,
+                            # Spec off: no draft region to fuse.
+                            _fused_draft_for_mamba_factory=lambda: None,
+                            _unified_swa_head_geometry=lambda: (
+                                cfg.KVCacheConfigurator._unified_swa_head_geometry(
+                                    configurator
+                                )
+                            ),
+                        )
+                        # Run the production configurator AND factory. Reverting
+                        # either top-level flag forwarding must break cleanup.
+                        with (
+                            get_parallel().override(attn_dcp_size=1, attn_tp_size=1),
+                            patch.object(
+                                cfg,
+                                "get_exec",
+                                return_value=SimpleNamespace(
+                                    features=SimpleNamespace(enable_memory_saver=False),
+                                    mamba=SimpleNamespace(
+                                        enable_mamba_extra_buffer=True,
+                                        enable_mamba_extra_buffer_lazy=lazy,
+                                    ),
+                                ),
+                            ),
+                            patch.object(
+                                cfg,
+                                "get_spec",
+                                return_value=SimpleNamespace(
+                                    speculative_num_draft_tokens=None,
+                                ),
+                            ),
+                            patch.object(
+                                cfg,
+                                "get_schedule",
+                                return_value=SimpleNamespace(
+                                    max_mamba_cache_size=4,
+                                    disable_overlap_schedule=False,
+                                    mamba_full_memory_ratio=None,
+                                ),
+                            ),
+                            patch.object(
+                                cfg,
+                                "get_disagg",
+                                return_value=SimpleNamespace(
+                                    disaggregation_mode="null",
+                                ),
+                            ),
+                            patch.object(
+                                cfg, "_should_enable_lazy_compaction", return_value=True
+                            ),
+                        ):
+                            if tri_pool:
+                                bundle = cfg.KVCacheConfigurator._init_unified_mamba_swa_pools(
+                                    configurator,
+                                    max_num_reqs=4,
+                                    full_max_total_num_tokens=64,
+                                    swa_max_total_num_tokens=32,
+                                )
+                            else:
+                                bundle = (
+                                    cfg.KVCacheConfigurator._init_unified_mamba_pools(
+                                        configurator,
+                                        max_num_reqs=4,
+                                        max_total_num_tokens=64,
+                                    )
+                                )
+                            pool = bundle.req_to_token_pool
+                        self.assertEqual(pool.enable_mamba_extra_buffer_lazy, lazy)
+                        allocator = pool.mamba_allocator
+                        initial_available = allocator.available_size()
+                        req = SimpleNamespace(
+                            kv=SimpleNamespace(
+                                req_pool_idx=0, mamba_pool_idx=allocator.alloc(1)[0]
+                            )
+                        )
+                        pool._alloc_ping_pong_buffer(req)
+                        buf = req.kv.mamba_ping_pong_track_buffer
+                        self.assertEqual(int((buf != -1).sum()), 1 if lazy else 2)
+                        if lazy:
+                            # A decode boundary replaces the old checkpoint and
+                            # leaves its ping-pong entry unallocated (-1).
+                            replacement = allocator.alloc(1)
+                            allocator.free(buf[:1].clone())
+                            pool.set_mamba_ping_pong_slot(req, 0, -1)
+                            pool.set_mamba_ping_pong_slot(req, 1, replacement[0])
+                        else:
+                            pool.set_mamba_ping_pong_slot(req, 1, buf[1])
+                        retained = buf[1:2].clone()
+                        with patch.object(
+                            allocator, "free", wraps=allocator.free
+                        ) as free:
+                            pool.free_mamba_cache(req, 1 if keep_checkpoint else None)
+                            for call in free.call_args_list:
+                                self.assertTrue(bool((call.args[0] >= 0).all()))
+                        self.assertEqual(
+                            allocator.available_size(),
+                            initial_available - int(keep_checkpoint),
+                        )
+                        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+                        if keep_checkpoint:
+                            self.assertTrue(
+                                bool((allocator.translate(retained) >= 0).all())
+                            )
+                            allocator.free(retained)
+                        self.assertEqual(allocator.available_size(), initial_available)
 
     def test_budget_sizing_and_boot_signature(self):
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -1015,6 +1223,61 @@ class TestTriFactorySizing(unittest.TestCase):
             + 4 * pool.spec("mamba").entry_bytes()
         )
         self.assertEqual(pool.total_bytes, want)
+
+    def test_full_side_carries_the_fused_draft_region(self):
+        """The boot solve prices the fused entry whenever a placement resolves,
+        so a factory that dropped the kwarg would allocate UNFUSED under that
+        price and under-budget the private draft pool."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(fused_draft=placement)
+        )
+        pool = bundle.unified_memory_pool
+        self.assertIs(pool.fused_draft, placement)
+        self.assertIs(pool.spec("full").draft_region, region)
+        self.assertIs(pool.require_draft_host_spec("full"), pool.spec("full"))
+        for other in ("swa", "mamba"):
+            self.assertIsNone(pool.spec(other).draft_region, other)
+
+    def _state_placement(self):
+        region = DraftStateRegion(
+            lane_num=2,
+            state=DraftStateGeometry(
+                conv_state_shapes=((3, 8),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(0, 0, 0),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        return FusedDraftPlacement.from_counts(
+            counts={"mamba": [1, 1]}, regions={"mamba": region}
+        )
+
+    def test_fused_draft_state_clone_shares_the_request_slot_space(self):
+        """A draft runner's req pool over the fused state block keeps the
+        target's request->slot mappings and slot allocator (the draft's slot
+        ids ARE the target's), and views only its own block."""
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(fused_draft=self._state_placement())
+        )
+        target = bundle.req_to_token_pool
+        clone = target.clone_for_fused_draft(layer_lanes={1: 1})
+        self.assertIs(
+            clone.req_index_to_mamba_index_mapping,
+            target.req_index_to_mamba_index_mapping,
+        )
+        self.assertIs(clone.mamba_allocator, target.mamba_allocator)
+        self.assertIs(clone.req_to_token, target.req_to_token)
+        self.assertEqual(clone.mamba_map, {1: 0})
+        conv = clone.mamba2_layer_cache(1).conv[0]
+        self.assertEqual(tuple(conv.shape), (target.mamba_pool.size + 1, 3, 8))
+        draft_conv, _ = bundle.unified_memory_pool.build_draft_state_views("mamba")
+        self.assertEqual(conv.data_ptr(), draft_conv[0][1].data_ptr())
 
     def test_bs1_floor_fails_loud_before_construction(self):
         """A budget far below one worst-case request must raise BEFORE any

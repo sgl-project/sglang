@@ -247,7 +247,6 @@ class ResBlock(nn.Module):
         padding_mode: str = "same",
     ):
         super().__init__()
-        self.dilations = dilations
         self.negative_slope = leaky_relu_negative_slope
 
         self.convs1 = nn.ModuleList(
