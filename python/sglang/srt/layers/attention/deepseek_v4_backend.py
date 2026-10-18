@@ -3885,13 +3885,16 @@ class DeepseekV4AttnBackend(
         if real is None:
             real = x.shape[0]
         assert real > 0, "prefill graph flat indexer on a batch without live rows"
-        req = token_req_indices(forward_batch, num_tokens=real)
+        # Rows of the metadata in use: the late-layer tail's when the candidate
+        # source is the tail's first layer (decoder SWA bounded replay), whose
+        # rows are not the leading rows of the extend.
+        req = self.forward_metadata.low_ratio_req_indices[:real]
         inputs = self._make_low_ratio_prefill_indexer_inputs(
             layer,
             x[:real],
             q_lora[:real],
             req,
-            forward_batch.positions[:real],
+            pos[:real],
             forward_batch,
             None,
         )
@@ -3905,10 +3908,16 @@ class DeepseekV4AttnBackend(
         )
         tail_meta = self.tail_forward_metadata
         tail = tail_meta.late_layer_tail if tail_meta is not None else None
-        if tail is not None and tail.scatter_indices is not None:
+        if (
+            tail is not None
+            and tail.scatter_indices is not None
+            and self.forward_metadata is not tail_meta
+        ):
+            # The source ran over the whole extend; the consumers run on the tail.
             rows = tail.token_indices
         else:
-            # whole bucket: live rows first, padding rows read row 0
+            # x holds the rows the consumers run on (the whole bucket, or the
+            # tail block): live rows first, padding rows read row 0
             rows = torch.arange(x.shape[0], device=x.device).clamp_max(real - 1)
         table = published.tail_rows(rows)
         out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
