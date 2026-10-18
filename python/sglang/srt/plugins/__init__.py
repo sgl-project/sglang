@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 PLATFORM_PLUGINS_GROUP = "sglang.srt.platforms"
 GENERAL_PLUGINS_GROUP = "sglang.srt.plugins"
 
+# The general plugin that --enable-nvidia-megakernel needs (sgl-nvidia-mega)
+NVIDIA_MEGAKERNEL_PLUGIN = "nvidia_megakernel"
+
 # Guard against multiple loads in the same process
 _plugins_loaded = False
 
@@ -98,6 +101,27 @@ def _get_excluded_dists() -> set[str]:
         return set()
     platform_eps = entry_points(group=PLATFORM_PLUGINS_GROUP)
     return {ep.dist.name for ep in platform_eps if ep.dist and ep.name != selected}
+
+
+def handle_nvidia_megakernel(server_args: Any) -> None:
+    """Fail at startup when --enable-nvidia-megakernel cannot load its plugin."""
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    if not resolving_view(server_args).enable_nvidia_megakernel:
+        return
+    name = NVIDIA_MEGAKERNEL_PLUGIN
+    if name not in {ep.name for ep in entry_points(group=GENERAL_PLUGINS_GROUP)}:
+        raise ValueError(
+            f"--enable-nvidia-megakernel needs the {name!r} plugin, which is not "
+            "installed. Install sgl-nvidia-mega "
+            "(https://github.com/sgl-project/sgl-nvidia-mega)."
+        )
+    allowed = envs.SGLANG_PLUGINS.get()
+    if allowed and name not in {x.strip() for x in allowed.split(",")}:
+        raise ValueError(
+            f"--enable-nvidia-megakernel needs the {name!r} plugin, but "
+            f"SGLANG_PLUGINS={allowed!r} does not list it."
+        )
 
 
 def load_plugins():

@@ -347,6 +347,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_monokernel, server_args)
 
+    from sglang.srt.plugins import handle_nvidia_megakernel
+
+    run_hook(handle_nvidia_megakernel, server_args)
+
     finalize_cuda_graph_prefill_max_context(server_args)
 
     # Capability adjustments can late-force a different attention backend or
