@@ -31,7 +31,6 @@ class TestEpScatter(CustomTestCase):
 
         def launch():
             # Poison the offsets every iteration, including inside graph replay.
-            # A test must not rely on the old racy kernel failing on every GPU.
             prefix_storage.fill_(poison)
             index_storage.fill_(poison)
             _fwd_kernel_ep_scatter_1[(counts.numel(),)](
@@ -92,6 +91,15 @@ class TestEpScatter(CustomTestCase):
                             padded = padded.clone()
                             padded[-1] += 2 * block_e
                             self._check_prefix(counts, padded, block_e, num_warps)
+
+    def test_prefix_tile_boundaries(self):
+        for block_e in (64, 128):
+            counts = torch.tensor(
+                [0, 1, block_e - 1, block_e, block_e + 1], dtype=torch.int32
+            )
+            padded = triton.cdiv(counts, block_e) * block_e
+            with self.subTest(block_e=block_e):
+                self._check_prefix(counts, padded, block_e, num_warps=8)
 
     def test_prefix_cuda_graph(self):
         block_e = 128
