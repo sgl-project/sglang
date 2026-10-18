@@ -6,7 +6,6 @@ from typing import Optional, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
@@ -796,27 +795,18 @@ def alloc_verify_window(
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
-    verify_cache_loc = assign_extend_cache_locs_func(
+    plan = model_runner.kv_index_translator.plan_uniform_extend(
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_w,
-        batch_size=bs,
-        draft_token_num=verify_w,
-        device=device,
+        seq_lens=prefix_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        width=verify_w,
     )
-    verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
+    verify_cache_loc = plan.write_virtual
     return VerifyWindow(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
-        verify_cache_loc_2d=verify_cache_loc_2d,
-        kv_loc_plan=model_runner.kv_index_translator.plan(
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=prefix_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            write_virtual=verify_cache_loc,
-            read_extent=verify_w,
-        ),
+        verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
+        kv_loc_plan=plan,
     )
 
 

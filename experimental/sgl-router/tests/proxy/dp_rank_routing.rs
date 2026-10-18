@@ -67,6 +67,7 @@ fn router(
             protocol: WireProtocol::default(),
             dp_ranks,
             openai: None,
+            grpc_port: None,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
@@ -315,6 +316,7 @@ async fn pd_generate_carries_each_rank_in_its_body() {
         p["bootstrap_room"].as_u64().unwrap() % 4
     );
     assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
+    assert_eq!(d["disagg_prefill_dp_rank"], p["routed_dp_rank"]);
 }
 
 /// The engine gives fan-out item i the room `room + i`, so one pinned prefill rank would break decode.
@@ -339,7 +341,8 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
             "{path}"
         );
         assert!(
-            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2),
+            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2)
+                && d.get("disagg_prefill_dp_rank").is_none(),
             "{path}"
         );
     }

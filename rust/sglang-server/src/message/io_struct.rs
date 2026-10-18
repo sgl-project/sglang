@@ -43,7 +43,7 @@ wire_struct! {
         lora_id: (),
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block. Everything after `extra_key` (the last
+        /// PD-disaggregation block. Everything after `cache_salt` (the last
         /// field emitted) has a msgspec default in Python and is omitted
         /// (short arrays decode with defaulted tails).
         bootstrap_host: Option<&'a str>,
@@ -54,13 +54,25 @@ wire_struct! {
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
         /// The scheduler decodes this header by position (Python's
-        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so the
-        /// fields between `disagg_prefill_dp_rank` and `extra_key` must be sent,
-        /// at their defaults, for `extra_key` to land in its slot.
+        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so
+        /// `routing_key` is sent at its default for the fields after it to land
+        /// in their slots.
         routing_key: (),
         require_reasoning: bool,
-        priority: (),
+        priority: Option<i64>,
         extra_key: Option<&'a str>,
+        /// Defaults, so `cache_salt`, the prefix cache's second key, lands in
+        /// its slot.
+        no_logs: bool,
+        return_bytes: bool,
+        return_entropy: bool,
+        need_wait_for_mm_inputs: (),
+        num_items_assigned: (),
+        encoder_urls: (),
+        multi_item_delimiter_indices: (),
+        token_indices_to_pool: (),
+        time_stats: (),
+        cache_salt: Option<&'a str>,
     }
 }
 
@@ -79,6 +91,12 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    /// `/flush_cache`'s control request: the scheduler flushes its caches in
+    /// its own loop, waiting up to `timeout_s` for running requests to drain.
+    FlushCacheReqInput {
+        timeout_s: Option<f64>,
+    }
 
     /// `/weights_checker`'s control request: every scheduler rank runs the
     /// weight checker's `action` on the runners `selector` names.
@@ -132,9 +150,19 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
             routing_key: (),
-            require_reasoning: false,
-            priority: (),
+            require_reasoning: req.require_reasoning,
+            priority: req.priority,
             extra_key: req.extra_key.as_deref(),
+            no_logs: false,
+            return_bytes: false,
+            return_entropy: false,
+            need_wait_for_mm_inputs: (),
+            num_items_assigned: (),
+            encoder_urls: (),
+            multi_item_delimiter_indices: (),
+            token_indices_to_pool: (),
+            time_stats: (),
+            cache_salt: req.cache_salt.as_deref(),
         }
     }
 }
@@ -142,6 +170,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl GetInternalStateReq {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+impl FlushCacheReqInput {
+    pub fn new(rid: String, timeout_s: Option<f64>) -> Self {
+        Self { rid, timeout_s }
     }
 }
 
@@ -197,6 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn flush_cache_req_msgpack_shape() {
+        let b = FlushCacheReqInput::new("7".into(), Some(30.0))
+            .encode()
+            .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            4,
+            "FlushCacheReqInput = [tag, rid, http_ipc, timeout_s]"
+        );
+        assert_eq!(arr[0].as_str(), Some("FlushCacheReqInput"));
+        assert_eq!(arr[1].as_str(), Some("7"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_f64(), Some(30.0));
+    }
+
+    #[test]
     fn check_weights_req_msgpack_shape() {
         let b = CheckWeightsReqInput::new(
             "7".into(),
@@ -247,9 +299,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 36 (through
-        // `extra_key`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 36, "header ends at extra_key");
+        // msgspec requires >= 14 (through `stream`); we emit 46 (through
+        // `cache_salt`). Trailing defaulted fields are omitted.
+        assert_eq!(arr.len(), 46, "header ends at cache_salt");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -281,9 +333,10 @@ mod tests {
 
     /// The PD block must land on Python's wire indices 25–31, with the filler
     /// block (17–24) holding its defaults — a shift here silently routes KV
-    /// transfers to the wrong host/room.
+    /// transfers to the wrong host/room. The cache keys and `require_reasoning`
+    /// follow at 33–45.
     #[test]
-    fn header_bootstrap_block_and_extra_key_are_positionally_aligned() {
+    fn header_bootstrap_block_and_cache_keys_are_positionally_aligned() {
         let req = GenerateRequest {
             rid: "r1".into(),
             text: Some("hi".into()),
@@ -295,6 +348,9 @@ mod tests {
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
             extra_key: Some("salt".into()),
+            cache_salt: Some("pepper".into()),
+            priority: Some(-2),
+            require_reasoning: true,
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -314,8 +370,15 @@ mod tests {
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
         assert!(arr[32].is_nil(), "routing_key at 32");
-        assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
-        assert!(arr[34].is_nil(), "priority at 34");
+        assert_eq!(arr[33].as_bool(), Some(true), "require_reasoning at 33");
+        assert_eq!(arr[34].as_i64(), Some(-2), "priority at 34");
         assert_eq!(arr[35].as_str(), Some("salt"), "extra_key at 35");
+        for (i, slot) in arr.iter().enumerate().take(39).skip(36) {
+            assert_eq!(slot.as_bool(), Some(false), "idx {i} must be false");
+        }
+        for (i, slot) in arr.iter().enumerate().take(45).skip(39) {
+            assert!(slot.is_nil(), "idx {i} must be a nil default");
+        }
+        assert_eq!(arr[45].as_str(), Some("pepper"), "cache_salt at 45");
     }
 }
