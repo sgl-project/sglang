@@ -35,7 +35,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu, is_xpu
+from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
@@ -1456,25 +1456,17 @@ class SchedulerPPMixin:
                 pp_outputs,
             )
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        # PP+spec also pairs by parity: its relay carries several extra GPU
-        # tensors (accept_lens, new_seq_lens, bonus tokens, next chain), and
-        # device-side P2P stays ordered on the stream, so enqueueing that many
-        # sends before any recv can form the same ring wait on CUDA. Parity
-        # makes rank 1 post its recv first, which breaks the cycle for any
-        # pp_size > 1.
-        needs_pairing = is_xpu() or self._pp_spec_relay
-        send_first = (not needs_pairing) or ((get_parallel().pp_rank % 2) == 0)
+        # Order send/recv by pp_rank parity (even: send->recv, odd: recv->send)
+        # on every backend. A device send only completes on its own while the
+        # peer's per-connection NCCL buffer has free slots (~8 ops over NVLink,
+        # ~2 over NET/IB, i.e. any cross-node PP); beyond that it waits for the
+        # peer's matching recv, and P2P ops are serialized on one stream per
+        # peer pair. With two microbatches in flight, if every rank sends first
+        # each rank's output sends queue ahead of the recv its peer's sends
+        # need, and the ring deadlocks. Parity gives each adjacent pair one
+        # rank that posts its recv first, which breaks the cycle for any
+        # pp_size > 1 (an odd ring still has at least one recv-first rank).
+        send_first = (get_parallel().pp_rank % 2) == 0
 
         def _do_send():
             return self._pp_send_output_to_next_stage(

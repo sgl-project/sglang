@@ -23,7 +23,7 @@ Native fused kernels are bit-close, not bit-exact, to the torch reference.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -97,6 +97,16 @@ TEXT = "text"
 
 
 @dataclass
+class StaticStreams:
+    """Request-owned work for streams whose tokens and timestep stay fixed."""
+
+    hidden: dict[str, Tensor] = field(default_factory=dict)
+    modulation: dict[str, TokenModulation] = field(default_factory=dict)
+    rope: dict[str, Flux3Rope] = field(default_factory=dict)
+    joint_rope: Flux3Rope | None = None
+
+
+@dataclass
 class Packed:
     """Mode-major tokens with per-sample bounds for segmented attention.
 
@@ -114,8 +124,8 @@ class Packed:
     timesteps_ref: Tensor | None = None
     # Request-owned positional tables; the ids do not change during denoising.
     rope: dict[str, Tensor] | None = None
-    # Eager-only reuse of invariant text/reference mode-block outputs.
-    static_hidden: dict[str, Tensor] | None = None
+    # Eager-only reuse of invariant text/reference computation.
+    static: StaticStreams | None = None
 
     @property
     def num_samples(self) -> int:
@@ -133,7 +143,7 @@ class Packed:
         timesteps = {}
         mode_indices = {}
         rope = None if self.rope is None else {}
-        static_hidden = None if self.static_hidden is None else {}
+        static = None if self.static is None else StaticStreams()
         for mode in self.data:
             bounds = self.mode_indices[mode][first:stop]
             start, end = bounds[0][0], bounds[-1][1]
@@ -144,14 +154,15 @@ class Packed:
             mode_indices[mode] = [(lo - start, hi - start) for lo, hi in bounds]
             if rope is not None:
                 rope[mode] = self.rope[mode][start:end]
-            if static_hidden is not None and mode in self.static_hidden:
-                static_hidden[mode] = self.static_hidden[mode][start:end]
+            if static is not None and mode in self.static.hidden:
+                static.hidden[mode] = self.static.hidden[mode][start:end]
+                static.modulation[mode] = tuple(
+                    value[start:end] for value in self.static.modulation[mode]
+                )
         timesteps_ref = (
             None if self.timesteps_ref is None else self.timesteps_ref[first:stop]
         )
-        return Packed(
-            data, ids, timesteps, mode_indices, timesteps_ref, rope, static_hidden
-        )
+        return Packed(data, ids, timesteps, mode_indices, timesteps_ref, rope, static)
 
 
 def pack(
@@ -797,8 +808,10 @@ class Flux3ImageDiT(Flux3Transformer):
         def mod_key(mode: str) -> str:
             return TEXT_STREAM if mode == TEXT else mode
 
-        vec = {mode: self._token_vector(timesteps[mode]) for mode in modes}
-        self._add_reference_time(packed, modes, vec)
+        cached = {} if packed.static is None else packed.static.hidden
+        active = tuple(mode for mode in modes if mode not in cached)
+        vec = {mode: self._token_vector(timesteps[mode]) for mode in active}
+        self._add_reference_time(packed, active, vec)
 
         def broadcast_modulation(values, mode):
             length = data[mode].shape[0]
@@ -813,21 +826,23 @@ class Flux3ImageDiT(Flux3Transformer):
             mode: broadcast_modulation(
                 self.early_stream_modulations[mod_key(mode)](vec[mode]), mode
             )
-            for mode in modes
+            for mode in active
         }
         single = {
             mode: broadcast_modulation(
                 self.single_stream_modulations[mod_key(mode)](vec[mode]), mode
             )
-            for mode in modes
+            for mode in active
         }
+        if packed.static is not None:
+            single.update(packed.static.modulation)
         x = {
             mode: (
                 self.txt_in(data[mode].to(self.dtype))
                 if mode == TEXT
                 else self.emb_in[mode](data[mode].to(self.dtype))
             )
-            for mode in modes
+            for mode in active
         }
         rope = {
             mode: (
@@ -853,9 +868,14 @@ class Flux3ImageDiT(Flux3Transformer):
 
     def _packed_blocks(self, packed, content, x, rope, early, single, layout):
         """All samples in one varlen sequence per block (no sequence parallel)."""
-        cached = packed.static_hidden if packed.static_hidden is not None else {}
+        cached = packed.static.hidden if packed.static is not None else {}
         x.update(cached)
-        mode_rope = {mode: _with_positions(rows) for mode, rows in rope.items()}
+        if packed.static is not None and packed.static.rope:
+            mode_rope = packed.static.rope
+        else:
+            mode_rope = {mode: _with_positions(rows) for mode, rows in rope.items()}
+            if packed.static is not None:
+                packed.static.rope = mode_rope
         for depth in range(self.depth):
             for mode in content:
                 if mode in cached:
@@ -873,12 +893,20 @@ class Flux3ImageDiT(Flux3Transformer):
                     early[TEXT],
                     seq_lens=_seq_lens(packed.mode_indices[TEXT]),
                 )
-        if packed.static_hidden is not None:
-            packed.static_hidden.update(
+        if packed.static is not None:
+            packed.static.hidden.update(
                 (mode, x[mode]) for mode in (TEXT, "image_cond") if mode in x
             )
+            packed.static.modulation.update(
+                (mode, single[mode]) for mode in packed.static.hidden
+            )
         hidden = layout.pack(x)
-        joint_rope = _with_positions(layout.pack(rope))
+        if packed.static is not None and packed.static.joint_rope is not None:
+            joint_rope = packed.static.joint_rope
+        else:
+            joint_rope = _with_positions(layout.pack(rope))
+            if packed.static is not None:
+                packed.static.joint_rope = joint_rope
         joint_mods = tuple(
             layout.pack({mode: single[mode][index] for mode in single})
             for index in range(3)

@@ -16,7 +16,9 @@ from sglang.kernels.spec import (
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
     ("cache_locs", "assign_extend_cache_locs_func"),
+    ("cache_locs", "assign_extend_cache_locs_uniform_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
+    ("cache_locs", "generate_draft_decode_window_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
