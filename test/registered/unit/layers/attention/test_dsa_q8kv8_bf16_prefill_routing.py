@@ -195,11 +195,16 @@ def test_kpool_tail_guard_admits_q8_for_prefill_only():
     indices = torch.full((2, 2051), -1, dtype=torch.int32)
     mixin = DeepseekSparseAttnBackendKPoolMixin
     assert (
-        mixin._resolve_kpool_tail_backend(backend, indices, "flashmla_sparse_q8")
+        mixin._resolve_kpool_tail_backend(
+            backend, indices, "flashmla_sparse_q8", "prefill"
+        )
         == "flashmla_sparse_q8"
     )
     assert (
-        mixin._resolve_kpool_tail_backend(backend, indices, "flashmla_sparse") == "fa3"
+        mixin._resolve_kpool_tail_backend(
+            backend, indices, "flashmla_sparse", "prefill"
+        )
+        == "fa3"
     )
     mixin._check_kpool_tail_backend(backend, indices, "flashmla_sparse_q8", "prefill")
     with pytest.raises(NotImplementedError):

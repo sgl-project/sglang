@@ -583,6 +583,63 @@ def _check_dsa_backend_constraints(
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
 
+def _check_dsa_kpool_backend_support(
+    hf_config: Any,
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    device_sm_major: int,
+) -> None:
+    """Reject DSA backends that cannot serve an index_kpool > 1 model.
+
+    Without this check the server loads the weights and then fails in CUDA
+    graph capture with NotImplementedError from _check_kpool_tail_backend.
+    """
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+    from sglang.srt.layers.attention.dsa.kpool_backend import (
+        kpool_tail_backends,
+        resolve_kpool_tail_backend,
+        supported_kpool_tail_backends,
+    )
+
+    index_kpool = get_dsa_index_kpool(hf_config)
+    if index_kpool <= 1:
+        return
+    supported = {}
+    unsupported = []
+    bf16_kv = kv_cache_dtype == "bfloat16"
+    for phase, backend in (("prefill", prefill_backend), ("decode", decode_backend)):
+        backends = kpool_tail_backends(phase, bf16_kv=bf16_kv)
+        supported[phase] = ", ".join(
+            supported_kpool_tail_backends(
+                phase, bf16_kv=bf16_kv, device_sm_major=device_sm_major
+            )
+        )
+        if (
+            backend
+            and resolve_kpool_tail_backend(
+                backend,
+                device_sm_major,
+                phase=phase,
+                bf16_kv=bf16_kv,
+            )
+            not in backends
+        ):
+            unsupported.append(f"{phase}={backend}")
+    if not unsupported:
+        return
+    raise ValueError(
+        f"{hf_config.architectures[0]} sets index_kpool={index_kpool}, and the "
+        f"{', '.join(unsupported)} DSA backend does not support index_kpool > 1 "
+        f"(kv_cache_dtype={kv_cache_dtype}, prefill={prefill_backend}, "
+        f"decode={decode_backend}). "
+        f"Supported prefill backends: {supported['prefill']}. "
+        f"Supported decode backends: {supported['decode']}. "
+        "Choose a backend supported by the selected KV dtype and GPU."
+    )
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
@@ -734,6 +791,10 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
+    if not get_platform().is_hip:
+        _check_dsa_kpool_backend_support(
+            hf_config, kv_cache_dtype, prefill, decode, device_sm_major=major
+        )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
