@@ -806,10 +806,11 @@ class Qwen3ForCausalLM(nn.Module):
 
 
 class PPLXQwen3Model(Qwen3ForCausalLM):
-    """perplexity-ai/pplx-embed-v1 -- Qwen3 with bidirectional attention for embedding."""
+    """perplexity-ai/pplx-embed-v1: Qwen3 with bidirectional attention and mean pooling."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
         for layer in self.model.layers:
             if isinstance(layer, Qwen3DecoderLayer):
                 layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
