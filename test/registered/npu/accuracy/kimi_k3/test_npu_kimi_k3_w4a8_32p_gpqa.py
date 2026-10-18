@@ -64,7 +64,10 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    "--attn-dp-size",
+    # Deprecated spelling, still auto-converted to --attn-dp-size on main;
+    # required by the older sglang build in the nightly image.
+    "--enable-dp-attention",
+    "--dp-size",
     4,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
