@@ -8,7 +8,7 @@ import requests
 import torch
 
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_sm100_supported, kill_process_tree
 from sglang.srt.weight_cache.protocol import get_ready_path, get_socket_path
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -28,9 +28,10 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # the TP=1 smoke class is always-on (base-b / 1-gpu-small) so the daemon->client
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
-# visible (i.e. on the 1-gpu runner).
-register_cuda_ci(est_time=390, stage="extra-a", runner_config="2-gpu-large")
-register_cuda_ci(est_time=71, stage="base-b", runner_config="1-gpu-small")
+# visible (i.e. on the 1-gpu runner). Each class also has a vmm_fd variant, which
+# brings up one more fixture.
+register_cuda_ci(est_time=780, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=142, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).
@@ -45,10 +46,44 @@ PROMPTS = [
     "The future of AI is",
 ]
 
+# --weight-cache-transport vmm_fd, for the daemons and the servers of the vmm_fd
+# variants at the end of this file.
+VMM_FD_ARGS = ["--weight-cache-transport", "vmm_fd"]
+
+# Greedy completions of PROMPTS from every fixture that came up in this process,
+# keyed by its configuration. A vmm_fd variant compares its outputs with those
+# of the torch_ipc fixture of the same configuration.
+_GREEDY_OUTPUTS = {}
+
 
 def _gpu_uuids(tp_size: int) -> list:
     # Single-node, default base_gpu_id/gpu_id_step: rank i runs on physical GPU i.
     return [current_platform.get_device_uuid(i) for i in range(tp_size)]
+
+
+def _config_key(model, tp_size, daemon_args, server_args) -> tuple:
+    return (model, tp_size, tuple(daemon_args), tuple(server_args))
+
+
+def _greedy_completions(base_url: str, model: str) -> list:
+    texts = []
+    for prompt in PROMPTS:
+        resp = requests.post(
+            f"{base_url}/v1/completions",
+            json={"model": model, "prompt": prompt, "max_tokens": 32, "temperature": 0},
+        )
+        resp.raise_for_status()
+        texts.append(resp.json()["choices"][0]["text"])
+    return texts
+
+
+def _read_logs(paths) -> str:
+    logs = ""
+    for path in paths:
+        if os.path.exists(path):
+            with open(path, errors="replace") as f:
+                logs += f.read()
+    return logs
 
 
 @unittest.skipIf(
@@ -61,12 +96,13 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
     model_override = None
     daemon_args = []
     server_args = []
+    tp_size = 2
+    log_files = (STDOUT_FILENAME, STDERR_FILENAME)
 
     @classmethod
     def setUpClass(cls):
         cls.model = cls.model_override or DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.tp_size = 2
         cls.gpu_uuids = _gpu_uuids(cls.tp_size)
 
         # Clean up stale ready/socket files from previous runs
@@ -125,6 +161,10 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
+        cls.greedy_outputs = _greedy_completions(cls.base_url, cls.model)
+        _GREEDY_OUTPUTS[
+            _config_key(cls.model, cls.tp_size, cls.daemon_args, cls.server_args)
+        ] = cls.greedy_outputs
 
     @classmethod
     def tearDownClass(cls):
@@ -222,11 +262,15 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
     the 2-GPU runner.
     """
 
+    daemon_args = []
+    server_args = []
+    tp_size = 1
+    log_files = (SMOKE_STDOUT_FILENAME, SMOKE_STDERR_FILENAME)
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.tp_size = 1
         cls.gpu_uuids = _gpu_uuids(cls.tp_size)
 
         # Clean up stale ready/socket files from previous runs.
@@ -246,6 +290,7 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 cls.model,
                 "--tp-size",
                 str(cls.tp_size),
+                *cls.daemon_args,
             ]
         )
 
@@ -280,9 +325,14 @@ class TestWeightCacheDaemonTP1Smoke(CustomTestCase):
                 str(cls.tp_size),
                 "--weight-cache-mode",
                 "client",
+                *cls.server_args,
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
+        cls.greedy_outputs = _greedy_completions(cls.base_url, cls.model)
+        _GREEDY_OUTPUTS[
+            _config_key(cls.model, cls.tp_size, cls.daemon_args, cls.server_args)
+        ] = cls.greedy_outputs
 
     @classmethod
     def tearDownClass(cls):
@@ -401,6 +451,114 @@ class TestWeightCacheDaemonQwen3MoeAttnCP(TestWeightCacheDaemonTP2):
         "42",
     ]
     server_args = daemon_args[:]
+
+
+def _moe_runner_args() -> list:
+    """On SM100, SGLang picks the flashinfer_trtllm MoE runner for BF16 Qwen3-MoE.
+    Its weight post-processing reshapes the expert weights, which an engine that
+    loads them over IPC (meta-initialized, no post-processing) cannot reproduce,
+    with torch_ipc and vmm_fd alike. There, the MoE vmm_fd variants pin the
+    triton runner on the daemons and the servers of both transports, so they
+    compare the transports only."""
+    return ["--moe-runner-backend", "triton"] if is_sm100_supported() else []
+
+
+class _VmmFdVariant:
+    """The parent fixture with ``--weight-cache-transport vmm_fd`` on the daemon
+    and the server.
+
+    The greedy outputs must equal those of the torch_ipc fixture with the same
+    configuration. When that fixture has not come up in this process (the
+    parent class did not run first, or ``extra_args()`` adds arguments), it is
+    launched here first to record them. The last test kills the daemon: the
+    engine's own vmm_fd mappings keep its weights valid, so it keeps serving the
+    same outputs.
+    """
+
+    @classmethod
+    def extra_args(cls) -> list:
+        """Arguments added to the daemon and the server of both transports."""
+        return []
+
+    @classmethod
+    def setUpClass(cls):
+        model = getattr(cls, "model_override", None) or DEFAULT_MODEL
+        daemon_args = [*cls.daemon_args, *cls.extra_args()]
+        server_args = [*cls.server_args, *cls.extra_args()]
+        key = _config_key(model, cls.tp_size, daemon_args, server_args)
+        if key not in _GREEDY_OUTPUTS:
+            cls.daemon_args, cls.server_args = daemon_args, server_args
+            super().setUpClass()
+            super().tearDownClass()
+        cls.reference_outputs = _GREEDY_OUTPUTS[key]
+        cls.daemon_args = daemon_args + VMM_FD_ARGS
+        cls.server_args = server_args + VMM_FD_ARGS
+        super().setUpClass()
+
+    def test_loaded_via_vmm_fd(self):
+        logs = _read_logs(self.log_files)
+        self.assertEqual(
+            logs.count("vmm_fd: mapped"),
+            self.tp_size,
+            "Expected every engine rank to map its daemon's vmm_fd allocations.",
+        )
+
+    def test_matches_torch_ipc(self):
+        self.assertEqual(self.greedy_outputs, self.reference_outputs)
+
+    def test_serves_after_daemon_exit(self):
+        # Runs after the other tests of the class (tests run in name order).
+        kill_process_tree(self.daemon_process.pid)
+        deadline = time.time() + 60
+        logs = ""
+        while time.time() < deadline:
+            logs = _read_logs(self.log_files)
+            if logs.count("serving continues") >= self.tp_size:
+                break
+            time.sleep(1)
+        self.assertEqual(
+            logs.count("serving continues"),
+            self.tp_size,
+            "Expected every engine rank to log that it keeps serving after the "
+            "daemon exited.",
+        )
+        self.assertEqual(
+            _greedy_completions(self.base_url, self.model), self.greedy_outputs
+        )
+
+
+class TestWeightCacheDaemonTP1SmokeVmmFd(_VmmFdVariant, TestWeightCacheDaemonTP1Smoke):
+    """TP=1 smoke over the vmm_fd transport."""
+
+
+class TestWeightCacheDaemonTP2VmmFd(_VmmFdVariant, TestWeightCacheDaemonTP2):
+    """TP=2 over the vmm_fd transport."""
+
+
+class TestWeightCacheDaemonQwen3MoeDPVmmFd(
+    _VmmFdVariant, TestWeightCacheDaemonQwen3MoeDP
+):
+    """Static attention DP over the vmm_fd transport."""
+
+
+class TestWeightCacheDaemonQwen3MoeEPVmmFd(
+    _VmmFdVariant, TestWeightCacheDaemonQwen3MoeEP
+):
+    """Qwen3 MoE expert parallelism + EPLB over the vmm_fd transport."""
+
+    @classmethod
+    def extra_args(cls) -> list:
+        return _moe_runner_args()
+
+
+class TestWeightCacheDaemonQwen3MoeAttnCPVmmFd(
+    _VmmFdVariant, TestWeightCacheDaemonQwen3MoeAttnCP
+):
+    """Qwen3 MoE attention CP over the vmm_fd transport."""
+
+    @classmethod
+    def extra_args(cls) -> list:
+        return _moe_runner_args()
 
 
 if __name__ == "__main__":
