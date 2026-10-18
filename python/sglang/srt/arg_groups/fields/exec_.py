@@ -1,11 +1,4 @@
-"""Config fields of the ``exec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``exec`` bag, which is what ``get_exec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``exec`` namespace."""
 
 from __future__ import annotations
 
@@ -35,6 +28,7 @@ from sglang.srt.arg_groups.choices import (
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    parse_cuda_graph_backend_arg,
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.utils.common import human_readable_int
@@ -49,12 +43,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -74,6 +70,44 @@ class ExecFeatures(msgspec.Struct):
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
+    ] = False
+    enable_watermark: A[
+        bool,
+        "Enable Aaronson-Gumbel text watermarking.",
+    ] = False
+    watermark_config: A[
+        Optional[str],
+        "Watermark settings as a JSON file path or an inline JSON object with "
+        "optional key, key_b, context_window, mixing_probability, max_probability, "
+        "default_enabled, and enforce_all fields.",
+    ] = None
+    watermark_key: A[
+        Optional[str],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_key_b: A[
+        Optional[str],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_window: A[
+        int,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 4
+    watermark_mixing_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 0.5
+    watermark_max_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 1.0
+    watermark_default_enabled: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = False
+    watermark_enforce_all: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
     enable_return_hidden_states: A[
         bool,
@@ -99,12 +133,20 @@ class ExecFeatures(msgspec.Struct):
     enable_encoder_swa_bounded_replay: A[
         bool,
         "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
-        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
-        bool,
-        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
+            "for supported configurations. Not numerically equivalent to full "
+            "prefill; requests for prompt logprobs compute every prompt row. Use "
+            "--no-enable-decoder-swa-bounded-replay to retain full prefill, e.g. "
+            "for RL rollouts whose logprobs must match the trainer.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -149,6 +191,10 @@ class ExecKernel(msgspec.Struct):
     enable_lean_attention: A[
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+    ] = None
+    monokernel_backend: A[
+        Optional[str],
+        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],
@@ -224,11 +270,13 @@ class ExecKernel(msgspec.Struct):
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",
+                "triton_sparse_mla",
                 "fa3",
                 "tilelang",
                 "triton",
                 "aiter",
                 "trtllm",
+                "intel_xpu",
             ],
             resolvable=True,
         ),
@@ -244,6 +292,16 @@ class ExecKernel(msgspec.Struct):
             choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
         ),
     ] = "auto"
+    dsa_triton_union: A[
+        int,
+        Arg(
+            help="Union group size for --dsa-prefill-backend triton_sparse_mla: "
+            "0 disables, 2 or 4 make G adjacent query tokens share one gathered "
+            "index set (mathematically exact; an ownership mask restores each "
+            "token's own softmax support).",
+            choices=[0, 2, 4],
+        ),
+    ] = 0
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -259,6 +317,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "intel_xpu",
             ],
             resolvable=True,
         ),
@@ -267,12 +326,15 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla'. 'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
+            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
-            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
-            "choice is shared by prefill and decode.",
-            choices=["auto", "flashmla", "trtllm"],
+            "through the flashinfer trtllm-gen sparse MLA kernel. "
+            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103) runs the fused "
+            "Q-RoPE + sparse attention + inverse-RoPE + MXFP8 FlashMLA kernel. "
+            "The backend choice is shared by prefill and decode.",
+            choices=["auto", "flashmla", "flashmla_mega", "trtllm"],
             resolvable=True,
         ),
     ] = "auto"
@@ -300,8 +362,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
-                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "Skipped ops use FlashInfer's heuristic fallback."
             ),
             nargs="+",
         ),
@@ -333,6 +394,19 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dsa_fused_indexer: A[
+        Optional[bool],
+        Arg(
+            help="Use the four-kernel fused DSA indexer decode path in place of "
+            "the 12-launch aiter/torch chain. By default this is enabled "
+            "wherever it is supported -- gfx950 (MI355X) with aiter preshuffle "
+            "and an fp8 e4m3fn index cache -- and the runtime declines with a "
+            "logged reason wherever any of that is missing. Pass "
+            "--no-enable-dsa-fused-indexer to force the standard path.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
 
 
 class ExecMamba(msgspec.Struct):
@@ -486,22 +560,24 @@ class ExecGraph(msgspec.Struct):
     cuda_graph_config: A[
         Optional[CudaGraphConfig],
         Arg(
-            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}\'. Allowed backends per phase: full, breakable, tc_piecewise, disabled (full is decode-only). JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
+            help='Per-phase CUDA graph settings as JSON, e.g. \'{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"breakable"}}\'. Allowed backends per phase: full, breakable, disabled. JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags.',
             type_parser=parse_cuda_graph_config_arg,
         ),
     ] = None
     cuda_graph_backend_decode: A[
-        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
+        Optional[Literal["full", "breakable", "disabled"]],
         Arg(
             help="Backend for the decode phase. Folds into cuda_graph_config[decode].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_backend_prefill: A[
-        Optional[Literal["full", "breakable", "tc_piecewise", "disabled"]],
+        Optional[Literal["full", "breakable", "disabled"]],
         Arg(
             help="Backend for the prefill phase. Folds into cuda_graph_config[prefill].backend.",
             choices=Backend.ALL,
+            type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
     cuda_graph_max_bs_decode: A[
@@ -536,10 +612,6 @@ class ExecGraph(msgspec.Struct):
             type_parser=human_readable_int,
             aliases=["--context-bucket"],
         ),
-    ] = None
-    cuda_graph_tc_compiler: A[
-        Optional[Literal["eager", "inductor"]],
-        "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
     ] = None
     disable_prefill_cuda_graph: A[
         bool,
@@ -613,7 +685,7 @@ class ExecComm(msgspec.Struct):
     ] = False
     enable_mscclpp: A[
         bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
     ] = False
     enable_torch_symm_mem: A[
         bool,
@@ -627,6 +699,19 @@ class ExecComm(msgspec.Struct):
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
     ] = False
+    boundary_reduction: A[
+        Literal["auto", "ar", "rs", "rsv", "rs+rsv"],
+        Arg(
+            help="Select FFN boundary reduction: ar uses all-reduce then token "
+            "redistribution; rs and rsv permit fixed-size and variable-size "
+            "reduce-scatter respectively; rs+rsv permits both (RSv first). "
+            "Unsupported paths fall back to ar. The option applies to the FFN "
+            "stages of decoders built with stage boundaries, where auto resolves "
+            "the model default; other models ignore it. Required attention and "
+            "MoE collectives and all-reduce fusion are unaffected.",
+            resolvable=True,
+        ),
+    ] = "auto"
     enable_quant_communications: A[
         Optional[bool],
         "Enable INT8 quantization of TP communications (limited support).",
@@ -637,17 +722,21 @@ class ExecComm(msgspec.Struct):
         "Enforce disable FlashInfer allreduce fusion.",
     ] = False
     flashinfer_allreduce_fusion_backend: A[
-        Optional[Literal["auto", "trtllm", "mnnvl"]],
+        Optional[Literal["auto", "trtllm", "mnnvl", "cutedsl"]],
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
-                "Defaults to auto. "
+                "When unspecified, supported MiMo configurations use cutedsl; "
+                "other supported models use auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
                 "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
+                "'cutedsl': Blackwell-only bf16 MNNVL CuTe DSL backend; also "
+                "fuses the MoE finalize and the shared-expert add into the "
+                "collective when the MoE runner can defer them. "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
             resolvable=True,

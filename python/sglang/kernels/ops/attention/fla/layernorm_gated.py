@@ -8,7 +8,6 @@
 
 from contextlib import nullcontext
 from functools import lru_cache
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +30,6 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
@@ -100,6 +98,9 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    Q=None,
+    S=None,
+    QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -194,8 +195,15 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
-    # Write output
-    tl.store(Y_base, y, mask=mask)
+    if QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
+        y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
+        tl.store(S + tl.program_id(0), y_s)
+    else:
+        # Write output
+        tl.store(Y_base, y, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -234,6 +242,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_heads: int = 0,
 ):
     M, N = x.shape
     if group_size is None:
@@ -275,6 +284,20 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    quant = {}
+    # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+    if quant_heads:
+        assert ngroups == 1 and M % quant_heads == 0
+        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+        rows_per_block = quant_heads
+        q = torch.empty(
+            (M // quant_heads, quant_heads * N),
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+        quant = {"Q": q, "S": s, "QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -320,75 +343,13 @@ def _layer_norm_fwd(
             num_warps=num_warps,
             ACTIVATION=activation,
             **pdl_kwargs,
+            **quant,
         )
-    return out, mean, rstd
+    return ((q, s) if quant_heads else out), mean, rstd
 
 
 if _is_npu:
-    from sgl_kernel_npu.fla.layernorm_gated import (
-        layer_norm_fwd_npu as _layer_norm_fwd_npu_raw,
-    )
-
-    @register_custom_op(out_shape="x", mutates_args=["out"])
-    def _layer_norm_fwd_custom(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        eps: float,
-        z: Optional[torch.Tensor],
-        out: Optional[torch.Tensor],
-        group_size: Optional[int],
-        norm_before_gate: bool,
-        is_rms_norm: bool,
-        activation: Optional[str],
-    ) -> torch.Tensor:
-        _out, _mean, _rstd = _layer_norm_fwd_npu_raw(
-            x=x,
-            weight=weight,
-            bias=bias,
-            eps=eps,
-            z=z,
-            out=out,
-            group_size=group_size,
-            norm_before_gate=norm_before_gate,
-            is_rms_norm=is_rms_norm,
-            activation=activation,
-        )
-        return _out
-
-    def _layer_norm_fwd(
-        x,
-        weight,
-        bias,
-        eps,
-        z=None,
-        out=None,
-        group_size=None,
-        norm_before_gate=True,
-        is_rms_norm=False,
-        activation=None,
-    ):
-        if group_size is None:
-            group_size = x.shape[-1]
-        if out is not None:
-            assert out.shape == x.shape
-        else:
-            out = torch.empty_like(x)
-        y = _layer_norm_fwd_custom(
-            x=x,
-            weight=weight,
-            bias=bias,
-            eps=eps,
-            z=z,
-            out=out,
-            group_size=group_size,
-            norm_before_gate=norm_before_gate,
-            is_rms_norm=is_rms_norm,
-            activation=activation,
-        )
-        # mean/rstd are unused by all callers on the NPU path (rms_norm_gated
-        # discards them); return None to keep the (y, mean, rstd) unpack contract.
-        return y, None, None
+    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
 
 
 def rms_norm_gated(

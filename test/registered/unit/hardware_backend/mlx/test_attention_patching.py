@@ -1237,7 +1237,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             multimodal_inputs=None,
             session=None,
             return_routed_experts=False,
-            mamba_lazy_is_insert=True,
+            mamba_lazy_checkpoint=True,
             time_stats=SimpleNamespace(
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
@@ -1253,7 +1253,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
 
-        def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
+        def fake_release_kv_cache(release_req, tree_cache, checkpoint=False):
             events.append(("release", release_req.rid))
             self.assertIs(tree_cache, processor.tree_cache)
 
