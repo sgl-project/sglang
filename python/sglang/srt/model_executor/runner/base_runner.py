@@ -48,7 +48,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.cp_extend import (
     cp_extend_forward,
     runner_owns_cp_boundary,
 )
