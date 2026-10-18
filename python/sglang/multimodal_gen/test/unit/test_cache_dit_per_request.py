@@ -216,7 +216,9 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         finally:
             release_comfyui_session(f"{family}:2")
         self.assertEqual(self.cfg_modes, [False, True])
-        self.assertEqual(self.cfg_overrides, [None, True])
+        # a no-CFG run must say so, or cache-dit falls back to its registered
+        # default (separate CFG for Wan, QwenImage, ...)
+        self.assertEqual(self.cfg_overrides, [False, True])
 
     def test_cfg_change_remounts_and_parallel_cfg_has_one_branch_per_rank(self):
         self.stage._maybe_enable_cache_dit(8, _batch(enable_cache_dit=True))

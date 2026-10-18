@@ -1235,9 +1235,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 tp_group=tp_group,
                 has_separate_cfg=has_separate_cfg,
                 # Registered adapters ignore has_separate_cfg and assume a diffusers
-                # pipeline that batches CFG; ComfyUI sends one request per branch.
+                # pipeline that batches CFG; ComfyUI sends one request per branch,
+                # so pass the run's own value (False too, or cfg=1 runs alternate).
                 separate_cfg_override=(
-                    True if comfyui_run is not None and comfyui_run[2] else None
+                    bool(comfyui_run[2]) if comfyui_run is not None else None
                 ),
                 joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )

@@ -313,7 +313,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
         enable = self._cache_dit_enabled_for(packed)
         if enable is not None:
             kwargs["enable_cache_dit"] = enable
-        if enable:
+        # None leaves the switch to the server; the worker ignores params when off
+        if enable is not False:
             params = {
                 **(self.cache_dit_params or {}),
                 **(packed.cache_options.get("cache_dit_params") or {}),

@@ -34,6 +34,11 @@ def build_cache_options(
     )
 
     params = resolve_cache_dit_request_overrides(cache_dit_params)
+    # cache-dit asserts Fn >= 1 only once sampling has started
+    for knobs in (params, params.get("secondary") or {}):
+        fn = knobs.get("Fn_compute_blocks")
+        if fn is not None and fn < 1:
+            raise ValueError(f"Fn_compute_blocks must be >= 1, got {fn}")
     if enable_cache_dit is False:
         params = {}
     return {"enable_cache_dit": enable_cache_dit, "cache_dit_params": params or None}

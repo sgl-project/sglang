@@ -465,6 +465,15 @@ def test_cache_options_reject_bad_requests() -> None:
         build_cache_options(True, {"not_a_knob": 1})
 
 
+def test_cache_options_reject_zero_fn_compute_blocks() -> None:
+    # cache-dit would only assert Fn >= 1 mid-sampling
+    with pytest.raises(ValueError, match="Fn_compute_blocks must be >= 1"):
+        build_cache_options(None, {"Fn_compute_blocks": 0})
+    with pytest.raises(ValueError, match="Fn_compute_blocks must be >= 1"):
+        build_cache_options(True, {"secondary": {"Fn_compute_blocks": 0}})
+    assert build_cache_options(True, {"Fn_compute_blocks": 1})["cache_dit_params"]
+
+
 def test_cache_options_off_drops_tuned_knobs() -> None:
     """Switching a tuned node to off must not raise; default keeps the knobs."""
     knobs = {"max_warmup_steps": 2}
@@ -524,6 +533,13 @@ def test_per_run_cache_dit_overrides_loader_flag(cls) -> None:
     params = {"max_warmup_steps": 3}
     kwargs = _h3_kwargs(loader_on, build_cache_options(True, params))
     assert kwargs["cache_dit_params"] == params
+    # left to the server default, the node's knobs still go along
+    kwargs = _h3_kwargs(_bare_executor(cls), build_cache_options(None, params))
+    assert "enable_cache_dit" not in kwargs
+    assert kwargs["cache_dit_params"] == params
+    assert "cache_dit_params" not in _h3_kwargs(
+        loader_on, {"enable_cache_dit": False, "cache_dit_params": params}
+    )
 
 
 def test_cache_options_not_sent_in_h3_worker_transformer_options() -> None:
