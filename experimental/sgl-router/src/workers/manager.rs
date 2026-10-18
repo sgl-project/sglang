@@ -34,8 +34,9 @@ const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
 /// The router serves a single configured model; apply its circuit-breaker
-/// config when this worker advertises that model id. Falls back to `None`
-/// (a breaker that never opens) otherwise.
+/// config when this worker advertises that model id, and the default config
+/// otherwise. Under `--disable-circuit-breaker` there is none, so the worker's
+/// breaker never opens.
 fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
     let model = &cfg.model;
     let cbc = model.circuit_breaker.as_ref()?;
@@ -45,7 +46,7 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
             cool_down: Duration::from_secs(cbc.cool_down_secs),
         });
     }
-    None
+    Some(CircuitBreakerConfig::default())
 }
 
 /// Whether `worker_url` is one the router will dial in cleartext.
@@ -680,6 +681,22 @@ mod tests {
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cb_config_for_spec_is_none_only_when_disabled() {
+        let mut cfg = cfg_with_model_cb("m", 5, 60);
+        let spec = WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("other".into())],
+            ..Default::default()
+        };
+        let cb = cb_config_for_spec(&spec, &cfg).expect("default breaker for another model");
+        assert_eq!(cb.threshold.get(), 3);
+        cfg.model.circuit_breaker = None;
+        assert!(cb_config_for_spec(&spec, &cfg).is_none());
     }
 
     #[test]

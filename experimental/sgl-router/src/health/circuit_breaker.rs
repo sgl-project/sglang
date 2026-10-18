@@ -77,7 +77,7 @@ impl CircuitBreaker {
         }
     }
 
-    /// The breaker of a worker registered without `--cb-threshold`.
+    /// The breaker of every worker under `--disable-circuit-breaker`.
     pub fn disabled() -> Self {
         Self {
             enabled: false,

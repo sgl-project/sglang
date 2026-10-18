@@ -320,13 +320,14 @@ connections leave the pool after 3 s, under SGLang's default 5 s keep-alive.
 
 ### Circuit breaker
 
-`--cb-threshold N` enables a per-worker circuit breaker: after N consecutive
-failures the worker is taken out of routing until a request already sent to it
-succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a probe request
-does. Without `--cb-threshold` no breaker opens. Under `--worker-urls` nothing
-else takes a dead worker out of routing, since there is no active health check,
-so with retries off (the default) every request routed to it fails; a static
-fleet should set `--cb-threshold 3` or `--retry-max-attempts 3`.
+Each worker has a circuit breaker: after `--cb-threshold` (default 3)
+consecutive failures the worker is taken out of routing until a request already
+sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
+probe request does. Under `--worker-urls` it is the only thing that takes a
+dead or hung worker out of routing, since there is no active health check.
+`--disable-circuit-breaker` turns it off, for example when one worker serves a
+role and an open breaker would reject all of that role's requests; a worker
+that stops answering then keeps its share of traffic.
 
 ### Engines with `--api-key`
 
@@ -701,8 +702,7 @@ EndpointSlice to `ready=false`, which is a `Removed` → `Added` cycle and so a
 fresh reading; under `--worker-urls` the fan-out happens once at startup and
 nothing re-registers. So a worker registered over h2c that later stops serving
 it (a proxy interposed on its port, say) is not detected until it
-is re-registered; with `--cb-threshold`, its circuit breaker will open in
-the meantime.
+is re-registered; its circuit breaker will open in the meantime.
 
 ## Native gRPC
 

@@ -265,7 +265,7 @@ impl Worker {
 
     /// Construct a worker with an explicit circuit-breaker configuration and
     /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`,
-    /// as without `--cb-threshold`, for a breaker that never opens.
+    /// as under `--disable-circuit-breaker`, for a breaker that never opens.
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
