@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.model_runner_components import moe_ep_setup
 from sglang.srt.models import deepseek_v2 as deepseek_v2_module
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -194,10 +194,12 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         correction_bias=True,
         deepseek_v4=False,
         hash_layer=False,
+        fused_shared=0,
+        ep_size=1,
     ):
         config = SimpleNamespace(
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
-            n_shared_experts=None,
+            n_shared_experts=fused_shared or None,
             n_routed_experts=16,
             num_experts_per_tok=2,
             hidden_act="silu",
@@ -226,13 +228,15 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             patch.object(
                 module,
                 "get_parallel",
-                return_value=SimpleNamespace(tp_size=1, moe_ep_size=1),
+                return_value=SimpleNamespace(tp_size=1, moe_ep_size=ep_size),
             ),
             patch.object(module, "get_exec", return_value=exec_config),
             patch.object(topk_module, "get_exec", return_value=exec_config),
             patch.object(hash_topk_module, "get_exec", return_value=exec_config),
             patch.object(
-                module, "is_shared_experts_fusion_disabled", return_value=True
+                module,
+                "is_shared_experts_fusion_disabled",
+                return_value=not fused_shared,
             ),
             patch.object(module, "MoEGate", return_value=gate),
             patch.object(
@@ -271,6 +275,145 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                     folded_in_topk=folded_in_topk, use_aiter=use_aiter, **route
                 )
                 self.assertEqual(moe.routed_scaling_factor_fused_in_topk, expected)
+
+    def test_dynamic_bias_preserves_the_final_routed_scale(self):
+        """Per-token bias must preserve the final scale of the static AITER route."""
+        hidden = torch.ones(2, 4)
+        logits = torch.zeros(2, 16)
+        rsf = self.ROUTED_SCALING_FACTOR
+
+        def aiter_route(
+            logits, bias, weights, ids, groups, selected, renormalize, scale
+        ):
+            weights.fill_((1.0 / weights.shape[1] if renormalize else 0.5) * scale)
+            ids.copy_(torch.arange(ids.shape[1]).expand_as(ids))
+
+        with (
+            get_context().override_server_args(),
+            patch.object(topk_module, "_use_aiter", True),
+            patch.object(topk_module, "_is_cuda", False),
+            patch.object(topk_module, "_is_hip", False),
+            patch.object(
+                topk_module, "biased_grouped_topk", topk_module.biased_grouped_topk_gpu
+            ),
+            patch.object(
+                topk_module, "aiter_biased_grouped_topk", aiter_route, create=True
+            ),
+        ):
+            for renormalize in (False, True):
+                config = TopKConfig(
+                    top_k=4,
+                    use_grouped_topk=True,
+                    num_expert_group=4,
+                    topk_group=2,
+                    renormalize=renormalize,
+                    correction_bias=torch.zeros(16),
+                    routed_scaling_factor=rsf,
+                    scoring_func="sigmoid",
+                    allow_routed_experts_capture=False,
+                )
+                for dynamic in (False, True):
+                    with self.subTest(renormalize=renormalize, dynamic=dynamic):
+                        output = topk_module.select_experts(
+                            hidden,
+                            logits,
+                            config,
+                            dynamic_expert_bias=torch.zeros_like(logits)
+                            if dynamic
+                            else None,
+                        )
+                        routed = output.topk_weights.sum(dim=-1, keepdim=True)
+                        final = deepseek_v2_module._scale_routed_and_add_shared(
+                            routed,
+                            None,
+                            routed_scaling_factor=rsf,
+                            fused_in_topk=topk_module.is_routed_scaling_factor_fused_in_topk(
+                                config
+                            ),
+                        )
+                        expected = torch.full_like(
+                            final, rsf if renormalize else 2.0 * rsf
+                        )
+                        torch.testing.assert_close(final, expected)
+
+    def test_per_token_bias_keeps_the_shared_coefficient_independent(self):
+        """Dynamic routing must not scale shared output by the selected-score sum."""
+        logits = torch.zeros(2, 16)
+        rsf = self.ROUTED_SCALING_FACTOR
+        for renormalize in (False, True):
+            for folded in (False, True):
+                with self.subTest(renormalize=renormalize, folded=folded):
+                    weights, _ = topk_module.biased_grouped_topk_impl(
+                        logits,
+                        logits,
+                        torch.zeros_like(logits),
+                        topk=5,
+                        renormalize=renormalize,
+                        num_expert_group=4,
+                        topk_group=2,
+                        num_fused_shared_experts=1,
+                        routed_scaling_factor=rsf,
+                        apply_routed_scaling_factor_on_output=folded,
+                    )
+                    shared = weights[:, -1] * (1.0 if folded else rsf)
+                    torch.testing.assert_close(shared, torch.ones_like(shared))
+
+    def test_unbiased_aiter_global_shared_output_is_scaled_once(self):
+        """Restoring the routed scale must retain one shared contribution, including EP."""
+        from sglang.kernels.ops.moe import fused_moe_triton_kernels
+
+        def append(ids, weights, count, scale, base, **kwargs):
+            return (
+                torch.cat((ids, ids.new_full((ids.shape[0], count), base)), dim=-1),
+                torch.cat(
+                    (weights, weights.new_full((weights.shape[0], count), scale)),
+                    dim=-1,
+                ),
+            )
+
+        with (
+            get_context().override_server_args(),
+            patch.object(topk_module, "_use_aiter", True),
+            patch.object(topk_module, "_is_cuda", False),
+            patch.object(topk_module, "_is_hip", False),
+            patch.object(topk_module, "grouped_topk", topk_module.grouped_topk_gpu),
+            patch.object(
+                fused_moe_triton_kernels, "fused_append_shared_experts", append
+            ),
+        ):
+            for ep_size in (1, 4):
+                with self.subTest(ep_size=ep_size):
+                    moe = self._build_deepseek_moe(
+                        folded_in_topk=False,
+                        use_aiter=True,
+                        correction_bias=False,
+                        fused_shared=1,
+                        ep_size=ep_size,
+                    )
+                    moe.topk.topk_config.allow_routed_experts_capture = False
+                    output = topk_module.select_experts(
+                        torch.ones(1, 8),
+                        torch.zeros(1, 16),
+                        moe.topk.topk_config,
+                    )
+                    # Orthogonal expert outputs expose routed and shared coefficients.
+                    combined = torch.stack(
+                        (
+                            output.topk_weights[:, :-1].sum(dim=-1),
+                            output.topk_weights[:, -1],
+                        ),
+                        dim=-1,
+                    )
+                    final = deepseek_v2_module._scale_routed_and_add_shared(
+                        combined,
+                        None,
+                        routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+                        fused_in_topk=moe.routed_scaling_factor_fused_in_topk,
+                    )
+                    torch.testing.assert_close(
+                        final,
+                        torch.tensor([[self.ROUTED_SCALING_FACTOR, 1.0 / ep_size]]),
+                    )
 
     def _run_post_process_standard_path(self, *, scaling_factor):
         topk_ids = torch.tensor([[5, 40, 100, 256]], dtype=torch.int32)

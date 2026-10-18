@@ -122,6 +122,7 @@ from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     TopK,
     TopKOutputFormat,
+    fused_shared_expert_weight,
     is_routed_scaling_factor_fused_in_topk,
 )
 from sglang.srt.layers.moe.utils import (
@@ -824,6 +825,25 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor_fused_in_topk = (
                 is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
             )
+            if (
+                _use_aiter
+                and self.num_fused_shared_experts > 0
+                and not _uses_per_rank_shared_slots
+                and not self.routed_scaling_factor_fused_in_topk
+            ):
+                # The global AITER append also needs to compensate for this
+                # model's post-MoE multiply, in addition to EP replication.
+                self.topk.topk_config.fused_shared_experts_scaling_factor = (
+                    fused_shared_expert_weight(
+                        routed_scaling_factor=self.routed_scaling_factor,
+                        fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+                    )
+                    * (
+                        fused_shared_experts_scaling_factor
+                        if fused_shared_experts_scaling_factor is not None
+                        else 1.0
+                    )
+                )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False

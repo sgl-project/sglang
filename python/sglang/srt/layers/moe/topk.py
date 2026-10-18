@@ -1655,10 +1655,6 @@ def biased_grouped_topk_impl(
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
@@ -1670,8 +1666,14 @@ def biased_grouped_topk_impl(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
+
+    if num_fused_shared_experts:
+        topk_weights[:, -1] = fused_shared_expert_weight(
+            routed_scaling_factor=routed_scaling_factor,
+            fused_in_topk=bool(apply_routed_scaling_factor_on_output),
+        )
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -2660,7 +2662,10 @@ def select_experts(
             topk_group=topk_group or 1,
             num_fused_shared_experts=num_fused_shared_experts,
             routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            # Per-token bias bypasses AITER but must retain its folding policy.
+            apply_routed_scaling_factor_on_output=is_routed_scaling_factor_fused_in_topk(
+                topk_config
+            ),
         )
     elif use_grouped_topk:
         assert topk_group is not None

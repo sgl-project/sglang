@@ -17,7 +17,6 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
 )
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
-    _use_aiter,
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -178,53 +177,50 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                 self.assertLess(max(routed_set), ep_size * num_local_experts)
 
     def test_equivalence_with_eager_append_then_remap(self):
-        """Fused kernel == append shared experts + per-rank shared-slot remap.
-
-        The eager remap overwrites the shared weight: 1.0 on the aiter/HIP path
-        (routed_scaling_factor is pre-folded into the routed topk weights), else
-        1/routed_scaling_factor. The fused kernel is invoked with that same value
-        so the two paths stay bit-identical (ids match regardless of scaling).
-        """
+        """Fused and eager append agree for folding and nonfolding routes."""
         rsf = 2.5
-        scale_factor = 1.0 if _use_aiter else 1.0 / rsf
-        for m, k, npr, ep_size, ep_rank, s in self.CASES:
-            with self.subTest(m=m, k=k, npr=npr, ep_rank=ep_rank, s=s):
-                shared_id_base, num_local_routed = self._shared_id_base(
-                    npr, ep_size, ep_rank, s
-                )
-                topk_ids, topk_weights = self._make_inputs(m, k, npr)
+        for folded, scale_factor in ((False, 1.0 / rsf), (True, 1.0)):
+            for m, k, npr, ep_size, ep_rank, s in self.CASES:
+                with self.subTest(m=m, k=k, npr=npr, ep_rank=ep_rank, s=s):
+                    shared_id_base, num_local_routed = self._shared_id_base(
+                        npr, ep_size, ep_rank, s
+                    )
+                    topk_ids, topk_weights = self._make_inputs(m, k, npr)
 
-                fused_ids, fused_w = fused_append_remap_shared_experts_deepep(
-                    topk_ids.clone(),
-                    topk_weights.clone(),
-                    s,
-                    scale_factor,
-                    shared_id_base,
-                    num_local_routed,
-                )
-
-                with get_parallel().override(moe_ep_size=ep_size, moe_ep_rank=ep_rank):
-                    eager_ids, eager_w = fused_append_shared_experts(
+                    fused_ids, fused_w = fused_append_remap_shared_experts_deepep(
                         topk_ids.clone(),
                         topk_weights.clone(),
                         s,
                         scale_factor,
-                        npr,  # shared-expert base id (overwritten by the remap)
-                    )
-                    eager_ids, eager_w = remap_topk_for_per_rank_shared_slots(
-                        eager_ids,
-                        eager_w,
-                        s,
-                        npr,
-                        TopKConfig(
-                            top_k=k,
-                            num_fused_shared_experts=s,
-                            routed_scaling_factor=rsf,
-                        ),
+                        shared_id_base,
+                        num_local_routed,
                     )
 
-                self.assertTrue(torch.equal(fused_ids, eager_ids))
-                self.assertTrue(torch.allclose(fused_w, eager_w))
+                    with get_parallel().override(
+                        moe_ep_size=ep_size, moe_ep_rank=ep_rank
+                    ):
+                        eager_ids, eager_w = fused_append_shared_experts(
+                            topk_ids.clone(),
+                            topk_weights.clone(),
+                            s,
+                            scale_factor,
+                            npr,  # shared-expert base id (overwritten by the remap)
+                        )
+                        eager_ids, eager_w = remap_topk_for_per_rank_shared_slots(
+                            eager_ids,
+                            eager_w,
+                            s,
+                            npr,
+                            TopKConfig(
+                                top_k=k,
+                                num_fused_shared_experts=s,
+                                routed_scaling_factor=rsf,
+                                apply_routed_scaling_factor_on_output=folded,
+                            ),
+                        )
+
+                    self.assertTrue(torch.equal(fused_ids, eager_ids))
+                    self.assertTrue(torch.allclose(fused_w, eager_w))
 
     def test_shared_weight_is_one_on_aiter_path(self):
         """On the aiter path the always-on shared expert must contribute 1.0x."""
