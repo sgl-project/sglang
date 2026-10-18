@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import abc
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -23,7 +25,7 @@ class BaseSWAKVPool(KVCache):
     swa_req_ring_size: Optional[int] = None
     # Set when the target keeps SWA KV in per-request window rows (DeepSeek-V4.1
     # encoder replay) instead of a paged pool; there is no full -> swa mapping.
-    request_window: Optional["RequestWindow"] = None
+    request_window: Optional[RequestWindow] = None
     # Independent draft SWA buffers can consume full-token IDs directly instead
     # of the target SWA allocator's physical IDs. HiCache must preserve that
     # index ownership even though both buffers implement sliding attention.
