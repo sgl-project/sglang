@@ -445,6 +445,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             params=SimpleNamespace(mtp_draft_device_pools=draft_pools),
             components={ComponentType.FULL},
         )
+        with self.assertRaisesRegex(ValueError, "draft KV"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(
+                    mtp_draft_device_pools=(), sidecar_draft_device_pools=(object(),)
+                ),
+                components={ComponentType.FULL},
+            )
 
         self.assertEqual(group.num_layers, 2)
         self.assertTrue(group.rank_replicated)
@@ -472,8 +481,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
-    def test_linker_requires_packed_draft(self):
-        """Do not accept draft state that the linker would omit from storage."""
+    def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -510,25 +518,18 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     ),
                 ),
             ):
-                if linker_enabled and not nextn_layers:
-                    with self.assertRaisesRegex(
-                        NotImplementedError, "only supports packed"
-                    ):
-                        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-                    self.assertEqual(target.mtp_draft_device_pools, ())
-                else:
-                    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-                    self.assertEqual(
-                        plan.mode,
-                        spec.HiCacheDraftMode.PACKED
-                        if nextn_layers
-                        else spec.HiCacheDraftMode.SIDECAR,
-                    )
-                    self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
-                    self.assertEqual(
-                        target.mtp_draft_device_pools,
-                        plan.device_pools if nextn_layers else (),
-                    )
+                plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+                self.assertEqual(
+                    plan.mode,
+                    spec.HiCacheDraftMode.PACKED
+                    if nextn_layers
+                    else spec.HiCacheDraftMode.SIDECAR,
+                )
+                self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
+                self.assertEqual(
+                    target.mtp_draft_device_pools,
+                    plan.device_pools if nextn_layers else (),
+                )
 
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
@@ -549,8 +550,14 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             temporal=torch.zeros((2, 4, 3), dtype=torch.uint8),
             conv=[torch.zeros((2, 4, 2), dtype=torch.uint8)],
         )
+        draft = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft.page_size, draft.layer_num = 2, 1
+        draft.k_scale_buffer = draft.native_k_scale_buffer = None
+        draft.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
+        draft.v_buffer = [torch.zeros((8, 3), dtype=torch.uint8)]
         params = SimpleNamespace(
             mtp_draft_device_pools=(),
+            sidecar_draft_device_pools=(draft,),
             req_to_token_pool=SimpleNamespace(
                 mamba_pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
                 mamba_map={0: 0, 2: 1},
@@ -588,6 +595,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(mamba.layer_mapping, {0: 0, 2: 1})
         self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
+        self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
+        self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
 
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve(dcp_size=2)

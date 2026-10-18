@@ -400,6 +400,12 @@ def build_kv_cache(
         swa_gates_prefix_match=swa_gates_prefix_match,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
+        sidecar_draft_device_pools=(
+            hicache_draft_plan.device_pools
+            if hicache_draft_plan is not None
+            and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
+            else ()
+        ),
     )
 
     tree_context = TreeCacheBuildContext(

@@ -444,7 +444,11 @@ def _build_dsa_device_pool_group(
 
 
 def _mha_device_pool_entry(
-    name: PoolName, pool: Any, layer_mapping: dict[int, int], page_size: int
+    name: PoolName,
+    pool: Any,
+    layer_mapping: dict[int, int],
+    page_size: int,
+    indices_from_pool: PoolName | None = None,
 ) -> DevicePoolEntry:
     # TODO(alphabetc1): support mxfp8.
     if pool.k_scale_buffer is not None or pool.native_k_scale_buffer is not None:
@@ -454,7 +458,7 @@ def _mha_device_pool_entry(
     num_layers = len(pool.k_buffer)
     return DevicePoolEntry(
         name=name,
-        indices_from_pool=name,
+        indices_from_pool=indices_from_pool or name,
         device_pool=pool,
         components=[[*pool.k_buffer, *pool.v_buffer]],
         layer_mapping={
@@ -543,7 +547,7 @@ def _build_mamba_device_pool_group(
         MLATokenToKVPool,
     )
 
-    # TODO(alphabetc1): support other full-attention pools, DCP and draft KV.
+    # TODO(alphabetc1): support other full-attention pools, DCP and packed draft KV.
     full_kv_pool = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
@@ -553,7 +557,7 @@ def _build_mamba_device_pool_group(
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
-            "plain MLA pool, without DCP or speculative draft KV."
+            "plain MLA pool, without DCP or packed draft KV."
         )
 
     entries = [
@@ -570,6 +574,20 @@ def _build_mamba_device_pool_group(
         ),
         _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
     ]
+    for draft_pool in params.sidecar_draft_device_pools:
+        if draft_pool.page_size != page_size:
+            raise ValueError("Draft KV page size must match the tree page size.")
+        # Draft layer i rides transfer layer i; the draft reads it only after
+        # the batch's loads finish.
+        entries.append(
+            _mha_device_pool_entry(
+                PoolName.DRAFT,
+                draft_pool,
+                {layer: layer for layer in range(draft_pool.layer_num)},
+                page_size,
+                indices_from_pool=PoolName.KV,
+            )
+        )
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
     return DevicePoolGroup(entries, num_layers + 1, page_size)
@@ -587,8 +605,15 @@ def resolve_hybrid_device_pool_group(
         _select_strategy,
     )
 
-    return _select_strategy(kvcache, components).build_direct_linker_pool_group(
+    group = _select_strategy(kvcache, components).build_direct_linker_pool_group(
         kvcache=kvcache,
         params=params,
         page_size=page_size,
     )
+    if getattr(params, "sidecar_draft_device_pools", ()) and (
+        PoolName.DRAFT not in group.entry_map
+    ):
+        raise ValueError(
+            "The direct external linker does not support this model's draft KV."
+        )
+    return group
