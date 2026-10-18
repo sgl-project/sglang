@@ -758,8 +758,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if value is not None and value != "none":
             logger.warning(
                 "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
-                "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
-                "integer budget in [1, 100] via chat_template_kwargs are accepted).",
+                "default %r (minimal/low/medium/high/xhigh/max, a float in [0, 0.99], "
+                "or an integer budget in [1, 100] via chat_template_kwargs are "
+                "accepted).",
                 value,
                 self._dsv41_default_reasoning_effort,
             )

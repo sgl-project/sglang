@@ -2993,6 +2993,49 @@ class ServingChatTestCase(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             OpenAIServingChat(tm, TemplateManager())
 
+    def test_dsv41_openai_effort_levels_map_to_budgets(self):
+        # "minimal" and "medium" are OpenAI levels the V4.1 encoder does not
+        # name; they map to budgets instead of falling back to the default.
+        from sglang.srt.entrypoints.openai import chat_encoding
+
+        expected = {
+            "minimal": 50,
+            "low": "low",
+            "medium": 62,
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+        for effort, parsed in expected.items():
+            with self.subTest(effort=effort):
+                self.assertEqual(
+                    chat_encoding.parse_dsv41_reasoning_effort(effort), parsed
+                )
+        self.assertIsNone(chat_encoding.parse_dsv41_reasoning_effort("none"))
+        for effort, budget in (("minimal", 50), ("medium", 62)):
+            with self.subTest(env_effort=effort):
+                self.assertEqual(
+                    chat_encoding.default_dsv41_reasoning_effort_from_env(effort),
+                    budget,
+                )
+
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "dsv41"
+        for effort, budget in (("minimal", 50), ("medium", 62)):
+            with self.subTest(request_effort=effort):
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort=effort,
+                )
+                with patch("sglang.srt.entrypoints.openai.serving_chat.logger") as log:
+                    self.chat._process_messages(request, is_multimodal=False)
+                log.warning.assert_not_called()
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertIn(f"Reasoning Effort: {budget} ", prompt)
+                self.assertTrue(prompt.endswith("<｜Assistant｜><think>"))
+
     def test_dsv41_rejects_image_placeholder_in_text(self):
         from sglang.srt.entrypoints.openai import encoding_dsv41
 

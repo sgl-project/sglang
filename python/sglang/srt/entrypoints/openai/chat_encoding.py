@@ -154,11 +154,19 @@ def resolve_chat_encoding_spec(
     return None
 
 
+# OpenAI reasoning_effort levels the V4.1 encoder has no name for, as budgets
+# on its 1-100 scale, where it names low=50, high=75 and max=100. "minimal"
+# is the lowest named budget, as Harmony maps minimal to low; "medium" is the
+# midpoint of low and high, rounded down.
+_DSV41_OPENAI_EFFORT_BUDGETS = {"minimal": 50, "medium": 62}
+
+
 def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
     """Map an API ``reasoning_effort`` onto what the V4.1 encoder accepts.
 
-    An int budget only reaches here through ``chat_template_kwargs``; None
-    means unsupported, and the caller applies its default.
+    An int input only arrives through ``chat_template_kwargs``; "minimal" and
+    "medium" are returned as int budgets. None means unsupported, and the
+    caller applies its default.
     """
     if isinstance(value, bool):
         return None
@@ -168,6 +176,8 @@ def parse_dsv41_reasoning_effort(value: Any) -> Union[str, int, None]:
         return max(1, round(value * 100)) if 0.0 <= value <= 0.99 else None
     if value in encoding_dsv41.REASONING_EFFORT_MAPPINGS:
         return value
+    if value in _DSV41_OPENAI_EFFORT_BUDGETS:
+        return _DSV41_OPENAI_EFFORT_BUDGETS[value]
     return None
 
 
@@ -199,7 +209,8 @@ def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, in
     if effort is None:
         raise ValueError(
             f"Invalid SGLANG_DSV41_REASONING_EFFORT={raw!r}; expected one of "
-            f"{list(encoding_dsv41.REASONING_EFFORT_MAPPINGS)} or an integer in [1, 100]"
+            f"{[*encoding_dsv41.REASONING_EFFORT_MAPPINGS, *_DSV41_OPENAI_EFFORT_BUDGETS]} "
+            "or an integer in [1, 100]"
         )
     return effort
 
