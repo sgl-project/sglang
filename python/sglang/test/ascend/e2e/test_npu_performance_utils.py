@@ -1288,6 +1288,8 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    # Metrics dict of the latest benchmark run, exposed for cross-case comparison.
+    last_metrics = None
 
     dp = None
     generation_kwargs = None
@@ -1393,6 +1395,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             else:
                 bench_env = None
             metrics = run_bench_serving(**bench_params, env=bench_env)
+            self.last_metrics = metrics
             assert_metrics(self, metrics)
 
 

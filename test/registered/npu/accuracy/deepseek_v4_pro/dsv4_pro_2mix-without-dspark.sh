@@ -162,7 +162,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
   --dp 16 \
   --enable-dp-attention \
   --enable-dp-lm-head \
-  --disable-radix-cache
+  --disable-radix-cache \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path ${MODEL_PATH} \
   --speculative-draft-model-quantization modelslim \
