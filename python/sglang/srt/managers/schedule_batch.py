@@ -18,6 +18,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_pinned_cpu,
     is_hip,
     is_pin_memory_available,
+    is_xpu,
 )
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -169,6 +170,7 @@ _MM_WIDE_PAD_MASK = (1 << 62) - 1
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -1957,7 +1959,7 @@ class Req(ReqDllmMixin):
                         finished_len = self._locate_str_stop_finished_len(
                             new_accepted_len, stop_regex=stop_regex_str
                         )
-                    elif new_accepted_len > 1:
+                    elif _is_xpu and new_accepted_len > 1:
                         # An end-anchored pattern can match after a token
                         # accepted mid-step but not after the last one.
                         finished_len = self._locate_str_stop_finished_len(
