@@ -281,13 +281,29 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 ),
             ),
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            # ROCm replays hits in a forward of their own, outside the graph.
+            (
+                "the prefill CUDA graph on ROCm",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and get_platform().is_hip,
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
+            # ROCm replays hits in a forward of their own, which only the hitting
+            # attention-DP ranks would enter; CUDA folds them into the extend.
+            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
-            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            # Decode receives the last SWA window from prefill and never replays.
+            ("PD decode", cfg.disaggregation_mode == "decode"),
+            # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
+            (
+                "PD prefill on ROCm",
+                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
+            ),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),
             ("radix sessions", cfg.enable_session_radix_cache),
@@ -411,6 +427,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         (get_platform().is_cuda or get_platform().is_hip)
         and cfg.disaggregation_mode == "null"
         and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
+        # Returning every hidden state runs every prompt row: nothing to trim.
+        and not cfg.enable_return_hidden_states
         and not any(enabled for _, enabled in incompatible)
     )
     declare_resolution(
