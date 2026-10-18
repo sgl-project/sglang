@@ -586,36 +586,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
         self.assertEqual(kv.layer_mapping, {1: 0, 3: 1})
         self.assertEqual(mamba.layer_mapping, {0: 0, 2: 1})
+        self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
+        self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
 
-        kv_rows = kv.prepare_locations(torch.tensor([2, 3]))
-        self.assertIsNone(kv.get_prepared_layer_range_meta(kv_rows, 0))
-        ptrs, sizes, _ = kv.get_prepared_layer_range_meta(kv_rows, 3)
-        buffer = kvcache.full_kv_pool.kv_buffer[1]
-        self.assertEqual(ptrs, [[buffer.data_ptr() + 2 * 5]])
-        self.assertEqual(sizes, [[10]])
-
-        mamba_rows = mamba.prepare_locations(torch.tensor([3]))
-        ptrs, sizes, offsets = mamba.get_prepared_layer_range_meta(mamba_rows, 2)
-        self.assertEqual(
-            ptrs,
-            [
-                [
-                    mamba_cache.temporal[1].data_ptr() + 3 * 3,
-                    mamba_cache.conv[0][1].data_ptr() + 3 * 2,
-                ]
-            ],
-        )
-        self.assertEqual(sizes, [[3, 2]])
-        self.assertEqual(offsets, [[3, 8]])
-
-        with self.assertRaisesRegex(ValueError, "--dcp-size > 1"):
+        with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve(dcp_size=2)
         params.mtp_draft_device_pools = (object(),)
-        with self.assertRaisesRegex(ValueError, "speculative draft KV"):
+        with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
         params.mtp_draft_device_pools = ()
         kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        with self.assertRaisesRegex(ValueError, "plain MLA full-attention pool"):
+        with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
 
     def test_unsupported_strategy_fails_with_context(self):

@@ -1,7 +1,6 @@
-"""Mooncake direct linker on Kimi Linear (MLA + KDA, the Kimi-K3 layout): a host hit must
-decode bit-for-bit like a device hit at the same prefix."""
+"""Mooncake direct linker on Kimi Linear (MLA + KDA, as Kimi-K3): a host hit decodes
+bit-for-bit like a device hit."""
 
-import os
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -24,14 +23,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
 
-_MODEL_PATH = os.environ.get(
-    "KIMI_LINEAR_TEST_MODEL_PATH", "yujiepan/kimi-linear-tiny-random"
-)
+_MODEL_PATH = "yujiepan/kimi-linear-tiny-random"
 
 PAGE_SIZE = 64
 TRACK_INTERVAL = 128
-# A checkpoint boundary; each request ends inside the next page, so neither its
-# prefill-end checkpoint nor its decode reaches past it and both hits stop here.
+# A checkpoint boundary; requests end inside the next page so both hits stop here.
 PREFIX_LEN = 1024
 
 
@@ -80,7 +76,6 @@ class TestKimiLinearUnifiedCacheLinker(CustomTestCase):
         )
 
     def test_host_hit_matches_device_hit(self):
-        # The populate prompt ends at the boundary, so no extend token has a tree copy.
         prompts = [list(ids[: PREFIX_LEN + 1]) for ids in self.input_ids]
         for ids in prompts:
             _generate(self.base_url, [ids], 1)
@@ -91,15 +86,13 @@ class TestKimiLinearUnifiedCacheLinker(CustomTestCase):
             )
         ]
 
-        def run_all():
-            return [
-                _generate(self.base_url, [ids], 32, return_logprob=True)[0]
-                for ids in requests
-            ]
-
-        device_results = run_all()
+        run = lambda: [
+            _generate(self.base_url, [ids], 32, return_logprob=True)[0]
+            for ids in requests
+        ]
+        device_results = run()
         _flush_cache(self.base_url)
-        host_results = run_all()
+        host_results = run()
 
         for device, host in zip(device_results, host_results):
             for result, host_tokens in ((device, 0), (host, PREFIX_LEN)):

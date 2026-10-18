@@ -543,27 +543,17 @@ def _build_mamba_device_pool_group(
         MLATokenToKVPool,
     )
 
-    # TODO(alphabetc1): support MHA, DSA, QSA and FP4 full-attention pools.
+    # TODO(alphabetc1): support other full-attention pools, DCP and draft KV.
     full_kv_pool = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
         or type(full_kv_pool) is not MLATokenToKVPool
+        or get_parallel().attn_dcp_size > 1
+        or params.mtp_draft_device_pools
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
-            f"plain MLA full-attention pool, got {type(kvcache).__name__} over "
-            f"{type(full_kv_pool).__name__}."
-        )
-    # TODO(alphabetc1): support DCP-sharded MLA KV and packed draft KV.
-    if get_parallel().attn_dcp_size > 1:
-        raise ValueError(
-            "The direct external linker does not support --dcp-size > 1 on "
-            "FULL + MAMBA models yet."
-        )
-    if params.mtp_draft_device_pools:
-        raise ValueError(
-            "The direct external linker does not support speculative draft KV "
-            "on FULL + MAMBA models yet."
+            "plain MLA pool, without DCP or speculative draft KV."
         )
 
     entries = [
@@ -581,7 +571,7 @@ def _build_mamba_device_pool_group(
         _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
-    # The MLA KV is TP-replicated but the Mamba state is TP-sharded.
+    # Not rank_replicated: the Mamba state is TP-sharded.
     return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
