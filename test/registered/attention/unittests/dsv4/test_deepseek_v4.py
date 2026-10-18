@@ -1021,5 +1021,33 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         self.assertEqual(out.tolist(), [0, 0])
 
 
+class TestDSV4PrefillGraphSharedCandidateTable(CustomTestCase):
+    """Every prefill graph bucket reads a layer's candidate table at one address."""
+
+    def test_buckets_captured_largest_first_share_one_buffer(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+
+        def table(rows):
+            return (
+                torch.arange(rows * 4, dtype=torch.int32).view(rows, 4),
+                torch.ones(rows, dtype=torch.int64),
+            )
+
+        large = backend._shared_candidate_table(20, table(16))
+        small = backend._shared_candidate_table(20, table(8))
+        other_layer = backend._shared_candidate_table(21, table(8))
+        for big, little in zip(large, small):
+            self.assertEqual(big.data_ptr(), little.data_ptr())
+        self.assertNotEqual(other_layer[0].data_ptr(), small[0].data_ptr())
+        self.assertTrue(torch.equal(small[0], table(8)[0]))
+
+    def test_a_larger_bucket_gets_a_new_buffer(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        small = backend._shared_candidate_table(20, (torch.zeros(8, 4),))
+        large = backend._shared_candidate_table(20, (torch.zeros(16, 4),))
+        self.assertNotEqual(small[0].data_ptr(), large[0].data_ptr())
+        self.assertEqual(large[0].shape, (16, 4))
+
+
 if __name__ == "__main__":
     unittest.main()
