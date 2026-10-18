@@ -481,11 +481,12 @@ class OpenAIServingChat(OpenAIServingBase):
             self._tokenizer_auto_adds_specials = True
 
         # Fixed system prompt (feature-gated by --system-prompt). When set, the
-        # fixed (padded) system message is injected into chat as the first
-        # message and its tokens / cached prefix are reused (see SystemPrefix).
-        # `self._system_prefix` owns the injected content + token prefix and the
-        # radix/mamba boundary; it is None when the feature is disabled so the
-        # default path stays byte-identical.
+        # fixed system message is injected into chat as the first message and
+        # its tokens / cached prefix are reused (see SystemPrefix). The shared
+        # prefix is truncated down to a mamba chunk boundary, so the injected
+        # text is the ORIGINAL prompt and the full token stream stays
+        # byte-identical. `self._system_prefix` is None when the feature is
+        # disabled so the default path stays byte-identical too.
         system_text = resolve_system_prompt(self.tokenizer_manager.server_args)
         self._system_prefix = None
         if system_text is not None:
@@ -2086,8 +2087,9 @@ class OpenAIServingChat(OpenAIServingBase):
             messages.insert(0, self._system_prefix.inject_message())
             _injected_system = True
         # Radix KV / mamba truncation boundary, valid only when we actually
-        # inject the fixed (padded) system prefix as the first message and the
-        # standard chat-template pipeline renders it (not a custom encoder).
+        # inject the fixed system prefix as the first message and the standard
+        # chat-template pipeline renders it (not a custom encoder). The boundary
+        # is chunk-aligned by construction (truncate-down in SystemPrefix).
         # Works for both text-only and multimodal requests (the injected system
         # block is pure text and sits before any media).
         _system_boundary = (

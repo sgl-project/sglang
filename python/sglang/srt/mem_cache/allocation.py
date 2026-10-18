@@ -287,6 +287,20 @@ def ensure_mamba_capacity(
         tree_cache.evict_for_alloc(
             EvictParams(num_tokens=0, mamba_num=needed - available)
         )
+    if allocator.schedulable_available_size() < needed:
+        # Still short after eviction (e.g. a cold burst on a fresh tree with
+        # nothing to evict). Log with context so the subsequent fail-loud
+        # allocation failure is diagnosable; the PrefillAdder mamba budget
+        # should normally prevent ever reaching this point.
+        logger.error(
+            "alloc_req_slots: mamba pool short even after eviction: "
+            "need %d slots for %d reqs, %d free. With --system-prompt this "
+            "means the steady-state pool plan met a cold burst; the "
+            "admission budget should throttle it — if it didn't, please report.",
+            needed,
+            len(reqs),
+            allocator.schedulable_available_size(),
+        )
     return allocator.schedulable_available_size() >= needed
 
 

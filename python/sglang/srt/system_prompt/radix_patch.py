@@ -73,17 +73,23 @@ def is_system_prefix_warm(
 def seed_mamba_boundary(boundary_len: Optional[int], chunk: int) -> Optional[int]:
     """Return the boundary aligned for mamba tracking, or None to keep default.
 
-    ``boundary_len`` is the fixed system-prefix length in tokens (already padded
-    on the tokenizer side). We return it unchanged if it is a positive multiple
-    of ``chunk``; anything else returns None so the runtime keeps its default
-    (no system-prompt limiting).
+    ``boundary_len`` is the fixed system-prefix length in tokens (already
+    truncated down to a chunk multiple by ``SystemPrefix._truncate_boundary``),
+    so the misaligned branch below is a last line of defense that should be
+    unreachable. We return the length unchanged if it is a positive multiple of
+    ``chunk``; anything else returns None so the runtime keeps its default (no
+    system-prompt mamba limiting) — but loudly, because a misaligned boundary
+    still flows into the other layers (KV cap, donate cap, pool ratio), which
+    is exactly the half-enabled state the startup probe exists to prevent.
     """
     if boundary_len is None or boundary_len <= 0 or chunk <= 0:
         return None
     if boundary_len % chunk != 0:
-        logger.warning(
-            "SystemPrompt boundary %d is not aligned to mamba chunk %d; "
-            "skipping mamba limiting",
+        logger.error(
+            "SystemPrompt boundary %d is not aligned to mamba chunk %d — "
+            "UNREACHABLE if SystemPrefix truncation is in place. Skipping "
+            "mamba limiting for this request; other system-prompt layers "
+            "stay active, please report this state.",
             boundary_len,
             chunk,
         )

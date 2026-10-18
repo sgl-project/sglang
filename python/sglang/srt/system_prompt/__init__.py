@@ -1,5 +1,6 @@
 from sglang.srt.system_prompt.system_prompt import (
-    aligned_prefix_len,
+    aligned_prefix_len_down,
+    probe_system_prefix_or_disable,
     resolve_system_prompt,
 )
 from sglang.srt.system_prompt.token_seam import SystemPrefix
@@ -12,7 +13,8 @@ from sglang.srt.system_prompt.radix_patch import (
 
 __all__ = [
     "resolve_system_prompt",
-    "aligned_prefix_len",
+    "aligned_prefix_len_down",
+    "probe_system_prefix_or_disable",
     "SystemPrefix",
     "seed_mamba_boundary",
     "reseed_mamba_boundary_after_match",

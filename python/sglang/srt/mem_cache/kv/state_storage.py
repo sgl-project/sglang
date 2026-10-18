@@ -174,9 +174,19 @@ class StateStorage:
                         )
                     elif not self.alloc_ping_pong_buffer(table, req):
                         self._give_back(given_state, given_tracking)
+                        # Admission (PrefillAdder slot budget + alloc_req_slots)
+                        # should throttle before this point; reaching it means
+                        # the budget under-counted actual allocation. Report
+                        # with context so the crash log shows what to tune.
                         raise StateSlotsExhausted(
-                            "Not enough space for mamba ping pong idx, "
-                            "try to increase --mamba-full-memory-ratio."
+                            f"Not enough space for mamba ping pong idx: need "
+                            f"{table.mamba_initial_tracking_slots} slot(s) for "
+                            f"req={req.rid} but the mamba allocator has "
+                            f"{self.slots.schedulable_available_size()} free. "
+                            "This means admission over-committed the mamba "
+                            "pool — with --system-prompt check the startup "
+                            "probe log line; otherwise try to increase "
+                            "--mamba-full-memory-ratio."
                         )
                     given_tracking.append(req)
                 mamba_ping_pong_track_buffers.append(
