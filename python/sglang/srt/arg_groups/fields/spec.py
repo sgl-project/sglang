@@ -228,7 +228,7 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_skip_dp_mlp_sync: A[
         bool,
-        "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
+        "Deprecated; drop this flag. It no longer applies with attention DP outside PD disaggregation, where it is rejected at startup, and has no effect in any other configuration.",
     ] = False
     enable_multi_layer_eagle: A[
         bool,

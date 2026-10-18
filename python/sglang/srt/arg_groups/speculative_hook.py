@@ -260,10 +260,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             raise ValueError(
-                "--speculative-skip-dp-mlp-sync with attention DP lets one DP rank "
-                "prefill while another decodes, and the decoding rank then runs "
-                "the prefill path; set SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1 "
-                "to mix them."
+                "--speculative-skip-dp-mlp-sync no longer applies with attention DP "
+                "outside PD disaggregation: it lets one DP rank prefill while another "
+                "decodes, and the decoding rank then crashes in the prefill path. "
+                "Drop the flag; SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1 skips "
+                "the same sync safely."
             )
 
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
