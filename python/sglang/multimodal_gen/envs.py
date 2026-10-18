@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
+    SGLANG_USE_ROCM_AITER_TGEMM: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -262,6 +263,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional override to force a specific attention backend (e.g. "aiter")
     "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+    ),
+    # Cosmos3 Multiview-AV attention backend for masked exports: "auto" (default;
+    # FA4 block-sparse on Hopper and Blackwell, FlexAttention Triton elsewhere), "triton" or
+    # "fa4". An explicit pipeline-config multiview_attention_backend wins over it.
+    # Both kernels compute the same attention.
+    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+    ),
+    # Debug: under Ulysses, recompute each layer's attention on the gathered
+    # full sequence and log the difference to the sharded result (exactness
+    # check of the collectives; slow, first denoising step only).
+    "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK"
+    ),
+    "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
+        "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
     ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
@@ -536,6 +553,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_ROCM_VAE_CONV2D": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D"),
     # ROCm: use BF16 compute for the Conv2D replacement (implies CONV2D=true)
     "SGLANG_USE_ROCM_VAE_CONV2D_BF16": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D_BF16"),
+    # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
+    # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
+    "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

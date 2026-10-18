@@ -52,6 +52,8 @@ export const config = {
   // AgentX 1P1D recipe: InferenceX PR #3664, commit df5e433239d7.
   // The strategy presets use c16 / c48 / c256. Pro uses its MTP head;
   // Pro Official is the InferenceX checkpoint. Acceptance simulation is omitted.
+  // Pro Official kernel/routing updates follow the optimized AgentX recipe;
+  // see section 3.7 for the c1 / c512 overrides.
   overlayDims: [
     { id: "pdMode", title: "PD role", default: "prefill",
       showWhen: (s) => s.hw === "mi355x" && s.quant === "fp4"
@@ -73,13 +75,15 @@ export const config = {
     const tp = dp || !prefill ? 8 : 4;
     const image = "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001";
     const router = [
+      ...(official && dp ? ["env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests"] : []),
       "python3 -m sglang_router.launch_router",
       "  --pd-disaggregation",
       "  --prefill http://<prefill-host>:30000",
       "  --decode http://<decode-host>:30100",
       "  --host 0.0.0.0 --port 8000",
       "  --policy consistent_hashing --dp-aware",
-      "  --decode-policy round_robin",
+      `  --decode-policy ${official && dp ? "power_of_two" : "round_robin"}`,
+      ...(official && dp ? ["  --worker-startup-check-interval 1"] : []),
       "  --cache-threshold 0.3",
       "  --balance-abs-threshold 2 --balance-rel-threshold 1.1",
       "  --disable-circuit-breaker --health-failure-threshold 100",
@@ -111,8 +115,12 @@ export const config = {
       // SGE follows NIC capabilities; MORI already selects 2 on AMD AINIC.
       `GPU_MAX_HW_QUEUES=${dp ? 5 : 2}`,
       ...(prefill ? ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock"] : []),
+      // Both PD peers must use the same KV layout. TP prefill and all
+      // decode points use mxscale; MegaMoE prefill keeps its existing GEMMs.
+      ...(official || dp ? ["SGLANG_DSV4_UNIFIED_KV_FP8=1"] : []),
+      ...(official && (!dp || !prefill) ? ["SGLANG_DSV4_DENSE_MXSCALE=1"] : []),
+      ...(official && !prefill ? [`MORI_MAX_DISPATCH_TOKENS_DECODE=${64 * (gamma + 1)}`] : []),
       ...(dp ? [
-        "SGLANG_DSV4_UNIFIED_KV_FP8=1",
         // Shared-expert/gatherv default off; reduce-scatter defaults on in ROCm.
         ...(prefill ? ["SGLANG_DP_USE_REDUCE_SCATTER=0"] : [
           "SGLANG_SHARED_EXPERT_TP1=1",
@@ -679,6 +687,7 @@ sgl-eval run mmmu_pro \\
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
             "--load-balance-method round_robin",
@@ -697,6 +706,8 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["low-latency"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1",
+                "MORI_MAX_DISPATCH_TOKENS_DECODE=448"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -716,6 +727,7 @@ sgl-eval run mmmu_pro \\
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["balanced"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1"],
           stripFlags: ["--prefill-decode-interval"],
           flags: [
             "--tp 4",
@@ -734,6 +746,8 @@ sgl-eval run mmmu_pro \\
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["balanced"] },
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1",
+                "MORI_MAX_DISPATCH_TOKENS_DECODE=256"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -835,7 +849,8 @@ sgl-eval run mmmu_pro \\
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           // Same value as prefill — the handshake compares KV layouts.
-          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1"],
+          env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1", "SGLANG_DSV4_DENSE_MXSCALE=1",
+                "MORI_MAX_DISPATCH_TOKENS_DECODE=256"],
           stripFlags: ["--prefill-decode-interval", "--chunked-prefill-size"],
           flags: [
             "--load-balance-method round_robin",
@@ -876,9 +891,9 @@ sgl-eval run mmmu_pro \\
       // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
       // than the default round-robin: consistent_hashing keeps a conversation on
       // the prefill worker that already holds its prefix (decode holds no
-      // reusable prefix, so it stays round-robin), and the tight balance
-      // thresholds stop that affinity from starving the peer at the small
-      // running-request ceiling the roles above use. Health checking stays
+      // reusable prefix, so Pro Official DP uses power-of-two; other presets
+      // keep round-robin). The tight balance thresholds stop that affinity
+      // from starving the peer at the small running-request ceiling above. Health checking stays
       // enabled here (unlike the default's 999999s interval) because a long
       // agentic run should notice a wedged worker, but it is slack enough that
       // a multi-minute prefill is not mistaken for a failure.
@@ -896,13 +911,14 @@ sgl-eval run mmmu_pro \\
         { when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           command:
-`python3 -m sglang_router.launch_router \\
+`env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
   --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
   --decode http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy consistent_hashing --dp-aware \\
-  --decode-policy round_robin \\
+  --decode-policy power_of_two \\
+  --worker-startup-check-interval 1 \\
   --cache-threshold 0.3 \\
   --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
   --disable-circuit-breaker --health-failure-threshold 100 \\

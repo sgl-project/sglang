@@ -1,7 +1,12 @@
 import argparse
 
 from sglang.cli.main import COOKBOOK_EPILOG
-from sglang.cli.utils import get_is_diffusion_model, get_model_path
+from sglang.cli.utils import (
+    get_is_diffusion_model,
+    get_model_path,
+    get_pipeline_class_name,
+    is_registered_native_pipeline,
+)
 
 
 def generate(args, extra_argv):
@@ -21,7 +26,13 @@ def generate(args, extra_argv):
         return
 
     model_path = get_model_path(extra_argv)
-    is_diffusion_model = get_is_diffusion_model(model_path)
+    # An explicit --pipeline-class-name naming a registered native diffusion
+    # pipeline (e.g. FLUX.3's Flux3ImagePipeline) is treated as a diffusion signal even
+    # when model_path itself is not auto-detectable (bare .safetensors, no
+    # model_index.json). All downstream resolution already keys off this flag.
+    is_diffusion_model = get_is_diffusion_model(
+        model_path
+    ) or is_registered_native_pipeline(get_pipeline_class_name(extra_argv))
     if is_diffusion_model:
         from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
             add_multimodal_gen_generate_args,
