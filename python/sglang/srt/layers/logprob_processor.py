@@ -5,7 +5,7 @@ import dataclasses
 import logging
 from contextlib import nullcontext
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -75,6 +75,37 @@ class LogprobResult:
             )
 
 
+@dataclasses.dataclass(frozen=True)
+class DistributedLogprobContext:
+    """TP-sharded input-logprob callbacks and contiguous vocab ownership."""
+
+    tp_group: Any
+    vocab_start_index: int
+    vocab_end_index: int
+    vocab_size: int
+    get_local_logits_fn: Callable
+    gather_sampled_logits_fn: Callable
+    # Exact projection width, including local padding. Borrowing falls back
+    # unless both this and tp_size are provided by the LM-head owner.
+    local_vocab_size: Optional[int] = None
+    tp_size: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _TokenIdsChunkEntry:
+    token_ids: Optional[List[int]]
+    num_rows: int
+    continue_previous: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _TokenIdsChunkPlan:
+    row_indices: torch.Tensor
+    token_ids: torch.Tensor
+    entries: List[_TokenIdsChunkEntry]
+    next_split_pruned_len: int
+
+
 def compute_row_log_normalizer(
     logits: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -93,6 +124,480 @@ def compute_row_log_normalizer(
     row_log_sum = torch.logsumexp(x - row_max[:, None], dim=-1)
     row_log_sum = torch.where(row_max.isinf(), 0.0, row_log_sum)
     return row_max, row_log_sum
+
+
+def compute_distributed_row_log_normalizer(
+    local_logits: torch.Tensor,
+    valid_vocab_size: int,
+    tp_group: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute a global row normalizer without gathering vocab logits.
+
+    ``local_logits`` follows rank-local contiguous vocab order. Columns after
+    ``valid_vocab_size`` are padding and do not participate. The exchanged
+    tensors are one fp32 max and one fp32 exponential sum per row.
+    """
+    if not 0 <= valid_vocab_size <= local_logits.shape[1]:
+        raise ValueError(
+            f"valid_vocab_size={valid_vocab_size} is incompatible with "
+            f"local logits width {local_logits.shape[1]}"
+        )
+
+    if valid_vocab_size == 0:
+        local_max = torch.full(
+            (local_logits.shape[0],),
+            float("-inf"),
+            dtype=torch.float32,
+            device=local_logits.device,
+        )
+        local_log_sum = torch.zeros_like(local_max)
+    else:
+        valid_logits = local_logits[:, :valid_vocab_size]
+        local_max, local_log_sum = compute_row_log_normalizer(valid_logits)
+
+    global_max = local_max.clone()
+    torch.distributed.all_reduce(
+        global_max,
+        op=torch.distributed.ReduceOp.MAX,
+        group=tp_group.device_group,
+    )
+
+    if valid_vocab_size == 0:
+        local_exp_sum = torch.zeros_like(global_max)
+    else:
+        local_exp_sum = torch.exp((local_max - global_max) + local_log_sum)
+    global_exp_sum = tp_group.all_reduce(local_exp_sum)
+    return global_max, torch.log(global_exp_sum)
+
+
+def get_distributed_token_scores(
+    local_logits: torch.Tensor,
+    row_indices: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: Any,
+) -> torch.Tensor:
+    """Look up raw token scores from contiguous TP vocab shards.
+
+    Exactly one rank contributes each requested token score; all other ranks
+    contribute zero. A SUM reduction therefore returns the selected score on
+    every rank while exchanging only one fp32 value per request.
+    """
+    if row_indices.ndim != 1 or token_ids.ndim != 1:
+        raise ValueError("row_indices and token_ids must be one-dimensional")
+    if row_indices.shape != token_ids.shape:
+        raise ValueError("row_indices and token_ids must have the same shape")
+    if row_indices.numel() == 0:
+        return local_logits.new_empty(0, dtype=torch.float32)
+
+    owned = (token_ids >= vocab_start_index) & (token_ids < vocab_end_index)
+    local_width = local_logits.shape[1]
+    if local_width == 0:
+        local_scores = local_logits.new_zeros(token_ids.shape, dtype=torch.float32)
+    else:
+        local_indices = (token_ids - vocab_start_index).clamp(
+            min=0, max=local_width - 1
+        )
+        selected = local_logits[row_indices, local_indices].float()
+        local_scores = torch.where(owned, selected, torch.zeros_like(selected))
+    return tp_group.all_reduce(local_scores)
+
+
+def get_distributed_input_state(
+    local_logits: torch.Tensor,
+    row_indices: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    vocab_size: int,
+    max_k: int,
+    tp_group: Any,
+    normalize: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exchange row statistics, selected scores and Top-N in one AllGather.
+
+    The packed wire tensor is FP32. Token IDs are therefore packed only while
+    the vocabulary fits exactly in FP32 integer precision. Local row reduction
+    keeps its existing implementation; bounded CUDA Top-N uses tiled selection
+    with a Torch fallback. With normalize=True, selected scores and Top-N values
+    are returned as logprobs; row statistics remain available in either mode.
+    """
+    if row_indices.ndim != 1 or token_ids.ndim != 1:
+        raise ValueError("row_indices and token_ids must be one-dimensional")
+    if row_indices.shape != token_ids.shape:
+        raise ValueError("row_indices and token_ids must have the same shape")
+    if not 0 <= max_k <= vocab_size:
+        raise ValueError(f"max_k={max_k} is incompatible with vocab_size={vocab_size}")
+    if vocab_size > 2**24:
+        raise ValueError("compact exchange requires vocab_size <= 2**24")
+
+    rows = local_logits.shape[0]
+    valid_vocab_size = vocab_end_index - vocab_start_index
+    if not 0 <= valid_vocab_size <= local_logits.shape[1]:
+        raise ValueError(
+            f"valid_vocab_size={valid_vocab_size} is incompatible with "
+            f"local logits width {local_logits.shape[1]}"
+        )
+
+    use_fused_pack = (
+        local_logits.is_cuda
+        and torch.version.hip is None
+        and rows > 0
+        and max_k > 0
+        # The packing kernel uses int32 flattened wire offsets.
+        and 2 * rows + token_ids.numel() + 2 * rows * max_k <= 2**31 - 1
+    )
+    local_values = (
+        None
+        if use_fused_pack
+        else torch.full(
+            (rows, max_k),
+            float("-inf"),
+            dtype=torch.float32,
+            device=local_logits.device,
+        )
+    )
+    local_indices = (
+        None
+        if use_fused_pack
+        else torch.full(
+            (rows, max_k),
+            vocab_size,
+            dtype=torch.float32,
+            device=local_logits.device,
+        )
+    )
+    top_values = top_indices = None
+    if valid_vocab_size:
+        valid_logits = local_logits[:, :valid_vocab_size]
+        local_k = min(max_k, valid_vocab_size)
+        fused_local = False
+        if local_logits.is_cuda and torch.version.hip is None and local_k:
+            from sglang.srt.layers.local_logprob_topk import (
+                can_use_local_topk,
+                local_logsumexp_topk,
+            )
+
+            if can_use_local_topk(valid_logits, local_k):
+                local_max, local_log_sum, top_values, top_indices = (
+                    local_logsumexp_topk(valid_logits, local_k)
+                )
+                fused_local = True
+        if not fused_local:
+            local_max, local_log_sum = compute_row_log_normalizer(valid_logits)
+            if local_k:
+                top_values, top_indices = valid_logits.topk(local_k, dim=-1)
+        if local_k:
+            if not use_fused_pack:
+                local_values[:, :local_k] = top_values.float()
+                local_indices[:, :local_k] = (top_indices + vocab_start_index).float()
+    else:
+        local_max = torch.full(
+            (rows,),
+            float("-inf"),
+            dtype=torch.float32,
+            device=local_logits.device,
+        )
+        local_log_sum = torch.zeros_like(local_max)
+
+    if use_fused_pack:
+        from sglang.srt.layers.compact_logprob_merge import pack_compact_input_state
+
+        packed = pack_compact_input_state(
+            local_logits,
+            local_max,
+            local_log_sum,
+            top_values,
+            top_indices,
+            row_indices,
+            token_ids,
+            vocab_start_index,
+            vocab_end_index,
+            vocab_size,
+            max_k,
+        )
+    else:
+        owned = (token_ids >= vocab_start_index) & (token_ids < vocab_end_index)
+        local_width = local_logits.shape[1]
+        if local_width:
+            local_offsets = (token_ids - vocab_start_index).clamp(
+                min=0, max=local_width - 1
+            )
+            selected = local_logits[row_indices, local_offsets].float()
+            local_scores = torch.where(owned, selected, torch.zeros_like(selected))
+        else:
+            local_scores = torch.zeros_like(token_ids, dtype=torch.float32)
+
+        packed = torch.cat(
+            (
+                local_max,
+                local_log_sum,
+                local_scores,
+                local_values.flatten(),
+                local_indices.flatten(),
+            )
+        )
+    gathered = tp_group.all_gather(packed, dim=0).reshape(-1, packed.numel())
+
+    if (
+        local_logits.is_cuda
+        and torch.version.hip is None
+        and rows > 0
+        and max_k > 0
+        and gathered.shape[0] <= 32
+        and gathered.shape[0] * max_k <= 1024
+        and gathered.is_contiguous()
+        and gathered.numel() <= 2**31 - 1
+    ):
+        from sglang.srt.layers.compact_logprob_merge import merge_compact_input_state
+
+        return merge_compact_input_state(
+            gathered,
+            rows,
+            token_ids.numel(),
+            max_k,
+            lookup_rows=row_indices if normalize else None,
+        )
+
+    maxima = gathered[:, :rows]
+    local_log_sums = gathered[:, rows : 2 * rows]
+    global_max = maxima.amax(dim=0)
+    global_log_sum = (
+        torch.exp(maxima - global_max[None, :] + local_log_sums).sum(dim=0).log()
+    )
+
+    score_end = 2 * rows + token_ids.numel()
+    global_scores = gathered[:, 2 * rows : score_end].sum(dim=0)
+    if max_k:
+        width = rows * max_k
+        candidates = gathered[:, score_end : score_end + width].reshape(-1, rows, max_k)
+        candidate_ids = gathered[:, score_end + width :].reshape(-1, rows, max_k).long()
+        candidates = candidates.permute(1, 0, 2).reshape(rows, -1)
+        candidate_ids = candidate_ids.permute(1, 0, 2).reshape(rows, -1)
+
+        # Establish lowest-ID tie order among exchanged candidates before the
+        # stable score sort. The padding sentinel loses even genuine -inf ties.
+        id_order = candidate_ids.argsort(dim=-1, stable=True)
+        candidates = candidates.gather(1, id_order)
+        candidate_ids = candidate_ids.gather(1, id_order)
+        score_order = candidates.argsort(dim=-1, descending=True, stable=True)[
+            :, :max_k
+        ]
+        values = candidates.gather(1, score_order)
+        indices = candidate_ids.gather(1, score_order)
+    else:
+        values = local_values
+        indices = local_indices.long()
+
+    if normalize:
+        global_scores = (global_scores - global_max[row_indices]) - global_log_sum[
+            row_indices
+        ]
+        values = (values - global_max[:, None]) - global_log_sum[:, None]
+    return global_max, global_log_sum, global_scores, values, indices
+
+
+def get_distributed_topk(
+    local_logits: torch.Tensor,
+    valid_vocab_size: int,
+    max_k: int,
+    vocab_start_index: int,
+    vocab_size: int,
+    tp_group: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return global top-k raw logits from contiguous TP vocab shards.
+
+    Each rank first selects at most ``max_k`` of its *valid* local columns.
+    Values and absolute token ids are then all-gathered and reduced locally.
+    This exchanges ``O(rows * tp_size * max_k)`` candidates instead of a
+    full-vocabulary tensor.  Padding columns are represented by ``-inf`` and
+    an out-of-vocabulary sentinel, so they cannot win the final top-k.
+
+    Ties retain the backend's ``torch.topk`` behavior.  In particular, equal
+    logits that straddle shards are valid top-k members but their relative
+    order is not promised to match a monolithic full-vocab ``topk``.
+    """
+    if max_k < 0:
+        raise ValueError(f"max_k must be non-negative, got {max_k}")
+    if max_k > vocab_size:
+        raise ValueError(f"max_k={max_k} exceeds global vocabulary size {vocab_size}")
+    if not 0 <= valid_vocab_size <= local_logits.shape[1]:
+        raise ValueError(
+            f"valid_vocab_size={valid_vocab_size} is incompatible with "
+            f"local logits width {local_logits.shape[1]}"
+        )
+
+    rows = local_logits.shape[0]
+    if max_k == 0:
+        return (
+            local_logits.new_empty((rows, 0), dtype=torch.float32),
+            torch.empty((rows, 0), dtype=torch.long, device=local_logits.device),
+        )
+
+    local_values = torch.full(
+        (rows, max_k),
+        float("-inf"),
+        dtype=torch.float32,
+        device=local_logits.device,
+    )
+    local_indices = torch.full(
+        (rows, max_k),
+        vocab_size,
+        dtype=torch.long,
+        device=local_logits.device,
+    )
+    local_k = min(max_k, valid_vocab_size)
+    if local_k:
+        values, indices = local_logits[:, :valid_vocab_size].topk(local_k, dim=-1)
+        local_values[:, :local_k] = values.float()
+        local_indices[:, :local_k] = indices + vocab_start_index
+
+    candidate_values = tp_group.all_gather(local_values, dim=1)
+    candidate_indices = tp_group.all_gather(local_indices, dim=1)
+    values, candidate_positions = candidate_values.topk(max_k, dim=-1)
+    indices = candidate_indices.gather(1, candidate_positions)
+    return values, indices
+
+
+def append_distributed_topk_chunk(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    top_k_nums: List[int],
+    pruned_lens: List[int],
+    top_logprobs_val: List,
+    top_logprobs_idx: List,
+    split_pruned_len: int,
+    copy_to_pinned_cpu: bool = False,
+) -> int:
+    """Restore prompt top-k responses from row-major distributed results."""
+    if copy_to_pinned_cpu:
+        values = async_d2h(values)
+        indices = async_d2h(indices)
+
+    pt = 0
+    next_split_pruned_len = 0
+    for n, (k, original_pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
+        current_split = split_pruned_len if n == 0 else 0
+        pruned_len = original_pruned_len - current_split
+        if pruned_len <= 0:
+            top_logprobs_val.append([])
+            top_logprobs_idx.append([])
+            continue
+
+        available_rows = min(pruned_len, max(values.shape[0] - pt, 0))
+        if copy_to_pinned_cpu:
+            # Preserve one span per sequence. finalize_input_logprobs waits for
+            # the shared copy event, then converts each span to response rows.
+            val = [values[pt : pt + available_rows, :k]] if available_rows else []
+            idx = [indices[pt : pt + available_rows, :k]] if available_rows else []
+        else:
+            val = values[pt : pt + available_rows, :k].tolist()
+            idx = indices[pt : pt + available_rows, :k].tolist()
+        if current_split:
+            top_logprobs_val[-1].extend(val)
+            top_logprobs_idx[-1].extend(idx)
+        else:
+            top_logprobs_val.append(val)
+            top_logprobs_idx.append(idx)
+        if available_rows < pruned_len:
+            next_split_pruned_len = current_split + available_rows
+        pt += pruned_len
+    return next_split_pruned_len
+
+
+def _build_token_ids_chunk_plan(
+    token_ids_logprobs: List[Optional[List[int]]],
+    pruned_lens: List[int],
+    split_pruned_len: int,
+    num_rows: int,
+    device: torch.device,
+) -> _TokenIdsChunkPlan:
+    """Flatten ragged explicit-token probes into one collective request."""
+    request_rows: List[int] = []
+    request_token_ids: List[int] = []
+    entries: List[_TokenIdsChunkEntry] = []
+    pt = 0
+    next_split_pruned_len = 0
+
+    for n, (token_ids, original_pruned_len) in enumerate(
+        zip(token_ids_logprobs, pruned_lens)
+    ):
+        current_split = split_pruned_len if n == 0 else 0
+        pruned_len = original_pruned_len - current_split
+        continue_previous = current_split > 0
+
+        if pruned_len <= 0:
+            entries.append(_TokenIdsChunkEntry(token_ids, 0, False))
+            continue
+
+        available_rows = min(pruned_len, max(num_rows - pt, 0))
+        if available_rows < pruned_len:
+            next_split_pruned_len = current_split + available_rows
+
+        if token_ids:
+            for row in range(pt, pt + available_rows):
+                request_rows.extend([row] * len(token_ids))
+                request_token_ids.extend(token_ids)
+
+        entries.append(
+            _TokenIdsChunkEntry(token_ids, available_rows, continue_previous)
+        )
+        pt += pruned_len
+
+    return _TokenIdsChunkPlan(
+        row_indices=torch.tensor(request_rows, dtype=torch.long, device=device),
+        token_ids=torch.tensor(request_token_ids, dtype=torch.long, device=device),
+        entries=entries,
+        next_split_pruned_len=next_split_pruned_len,
+    )
+
+
+def _append_token_ids_chunk_from_flat_scores(
+    plan: _TokenIdsChunkPlan,
+    flat_scores: torch.Tensor,
+    token_ids_logprobs_val: List,
+    token_ids_logprobs_idx: List,
+    copy_to_pinned_cpu: bool = False,
+) -> None:
+    """Restore the existing per-sequence/per-row response shape."""
+    if copy_to_pinned_cpu:
+        flat_scores = async_d2h(flat_scores)
+
+    score_pt = 0
+    for entry in plan.entries:
+        token_ids = entry.token_ids
+        width = len(token_ids) if token_ids else 0
+        count = entry.num_rows * width
+        if token_ids is None:
+            val, idx = [], []
+        elif width:
+            values = flat_scores[score_pt : score_pt + count].reshape(
+                entry.num_rows, width
+            )
+            if copy_to_pinned_cpu:
+                val = [values] if entry.num_rows else []
+            else:
+                val = values.tolist()
+            idx = [token_ids for _ in range(entry.num_rows)]
+        else:
+            # [] requests a zero-width result for every prompt row; None is
+            # the opt-out sentinel and returns no rows at all.
+            if copy_to_pinned_cpu and entry.num_rows:
+                val = [flat_scores[score_pt:score_pt].reshape(entry.num_rows, 0)]
+            else:
+                val = [[] for _ in range(entry.num_rows)]
+            idx = [[] for _ in range(entry.num_rows)]
+        score_pt += count
+
+        if entry.continue_previous:
+            token_ids_logprobs_val[-1].extend(val)
+            token_ids_logprobs_idx[-1].extend(idx)
+        else:
+            token_ids_logprobs_val.append(val)
+            token_ids_logprobs_idx.append(idx)
+
+    assert score_pt == flat_scores.numel()
 
 
 def get_top_logprobs_raw(
@@ -500,6 +1005,9 @@ class InputLogprobProcessor:
             envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
             and not _deterministic_inference_enabled()
         )
+        self.enable_distributed_input_logprobs = (
+            envs.SGLANG_ENABLE_DISTRIBUTED_INPUT_LOGPROBS.get()
+        )
 
     def forward(
         self,
@@ -511,6 +1019,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
+        distributed_context: Optional[DistributedLogprobContext] = None,
     ) -> Tuple[LogprobResult, torch.Tensor]:
         # Non-chunked = one chunk covering every row. DP-attention must stay
         # single-chunk: the collective schedule cannot depend on per-rank rows.
@@ -523,12 +1032,32 @@ class InputLogprobProcessor:
         else:
             chunk_size = self.logprobs_chunk_size
 
+        use_distributed_logprobs = (
+            distributed_context is not None and self.enable_fast_input_logprobs
+        )
+        stage_distributed_outputs = (
+            use_distributed_logprobs
+            and pruned_states.is_cuda
+            and is_pin_memory_available(pruned_states.device)
+            and (
+                logits_metadata.extend_return_top_logprob
+                or logits_metadata.extend_token_ids_logprob
+            )
+        )
         borrow_logprob_memory = False
         if pruned_states.is_cuda:
-            borrow_logprob_memory = self._can_borrow_logprob_memory(
-                chunk_size=chunk_size,
-                borrow_logits=not skip_chunking_for_dp_attn,
-            )
+            if use_distributed_logprobs:
+                borrow_logprob_memory = self._can_borrow_distributed_logprob_memory(
+                    chunk_size=chunk_size,
+                    context=distributed_context,
+                    logits_metadata=logits_metadata,
+                    device=pruned_states.device,
+                )
+            else:
+                borrow_logprob_memory = self._can_borrow_logprob_memory(
+                    chunk_size=chunk_size,
+                    borrow_logits=not skip_chunking_for_dp_attn,
+                )
 
         return self._forward_by_chunk(
             pruned_states,
@@ -539,6 +1068,8 @@ class InputLogprobProcessor:
             get_logits_fn,
             logits_metadata,
             chunk_size,
+            distributed_context=distributed_context,
+            stage_distributed_outputs=stage_distributed_outputs,
             borrow_logprob_memory=borrow_logprob_memory,
             borrow_logits_memory=(
                 borrow_logprob_memory and not skip_chunking_for_dp_attn
@@ -549,6 +1080,7 @@ class InputLogprobProcessor:
         self,
         chunk_size: int,
         borrow_logits: bool,
+        bytes_per_row: Optional[int] = None,
     ) -> bool:
         """Borrow only when the planned chunk fits on every TP rank.
 
@@ -558,19 +1090,24 @@ class InputLogprobProcessor:
         """
         # A TP gather can hold the local projection, gathered tensor, and its
         # contiguous reshape together. Scoring alone needs at most two matrices.
-        matrices_per_chunk = (
-            3 if borrow_logits else (1 if self.enable_fast_input_logprobs else 2)
-        )
-        bytes_per_row = matrices_per_chunk * self.vocab_size * 4
-
-        # NCCL's symmetric allocator owns its collective buffers, so they
-        # cannot be counted as borrowed storage.
-        free_run = (
-            0
-            if borrow_logits and is_symmetric_memory_enabled()
-            else graph_pool_borrow_largest_run()
-        )
-        fit_rows = max(0, free_run - _GRAPH_POOL_BORROW_SLACK_BYTES) // bytes_per_row
+        if bytes_per_row is None:
+            matrices_per_chunk = (
+                3 if borrow_logits else (1 if self.enable_fast_input_logprobs else 2)
+            )
+            bytes_per_row = matrices_per_chunk * self.vocab_size * 4
+        if bytes_per_row <= 0:
+            fit_rows = 0
+        else:
+            # NCCL's symmetric allocator owns its collective buffers, so they
+            # cannot be counted as borrowed storage.
+            free_run = (
+                0
+                if borrow_logits and is_symmetric_memory_enabled()
+                else graph_pool_borrow_largest_run()
+            )
+            fit_rows = (
+                max(0, free_run - _GRAPH_POOL_BORROW_SLACK_BYTES) // bytes_per_row
+            )
         if self.chunking_group is not None:
             capacity = torch.tensor(fit_rows, dtype=torch.int64, device="cpu")
             torch.distributed.all_reduce(
@@ -583,6 +1120,112 @@ class InputLogprobProcessor:
         # hold the whole chunk; do not change LoRA or logprob chunk boundaries.
         return fit_rows >= chunk_size
 
+    def _can_borrow_distributed_logprob_memory(
+        self,
+        chunk_size: int,
+        context: DistributedLogprobContext,
+        logits_metadata: LogitsMetadata,
+        device: torch.device,
+    ) -> bool:
+        """Make one uniform distributed borrow decision when the feature is on.
+
+        The environment flag is process-uniform, so the disabled fast path can
+        skip host collectives entirely. Once enabled, every TP rank contributes
+        capacity: incomplete local metadata or unavailable pinned storage is a
+        zero contribution rather than a rank-local early return.
+        """
+        if not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get():
+            return False
+
+        bytes_per_row = self._distributed_borrow_bytes_per_row(context, logits_metadata)
+        if bytes_per_row is None or not is_pin_memory_available(device):
+            bytes_per_row = 0
+        # Borrowed outputs must leave the pool before replay. Target scores use
+        # pinned storage and Top-N/probes use staged spans. Symmetric NCCL memory
+        # owns another allocator, so _can_borrow contributes zero when active.
+        return self._can_borrow_logprob_memory(
+            chunk_size=chunk_size,
+            borrow_logits=True,
+            bytes_per_row=bytes_per_row,
+        )
+
+    @staticmethod
+    def _distributed_borrow_bytes_per_row(
+        context: DistributedLogprobContext,
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[int]:
+        """Conservative graph-pool budget for one distributed chunk row.
+
+        Two full local matrices cover the projection and indexed logprob copy
+        at FP32 width (also covering BF16-to-FP32 softcap overlap). The compact
+        allowance deliberately overcounts simultaneously-live lookup-plan,
+        ownership, score, normalization, local Top-N, TP-gathered candidate,
+        final-selection and staged-source tensors. Large arbitrary probe/Top-N
+        requests therefore consume capacity or safely fall back to the heap.
+        """
+        local_width = context.local_vocab_size
+        tp_size = context.tp_size
+        if (
+            not isinstance(local_width, int)
+            or local_width <= 0
+            or not isinstance(tp_size, int)
+            or tp_size <= 0
+            or getattr(context.tp_group, "world_size", None) != tp_size
+        ):
+            return None
+        valid_width = context.vocab_end_index - context.vocab_start_index
+        if local_width < valid_width:
+            return None
+
+        if logits_metadata.extend_return_top_logprob:
+            top_k_nums = logits_metadata.top_logprobs_nums
+            if (
+                not isinstance(top_k_nums, (list, tuple))
+                or not top_k_nums
+                or any(not isinstance(k, int) for k in top_k_nums)
+            ):
+                return None
+            max_k = max(top_k_nums)
+            if max_k < 0 or max_k > context.vocab_size:
+                return None
+        else:
+            max_k = 0
+
+        max_probe_width = 0
+        if logits_metadata.extend_token_ids_logprob:
+            token_ids_logprobs = logits_metadata.token_ids_logprobs
+            if not isinstance(token_ids_logprobs, (list, tuple)) or any(
+                token_ids is not None and not isinstance(token_ids, (list, tuple))
+                for token_ids in token_ids_logprobs
+            ):
+                return None
+            max_probe_width = max(
+                (len(token_ids) for token_ids in token_ids_logprobs if token_ids),
+                default=0,
+            )
+
+        full_matrix_bytes = 2 * local_width * 4
+        compact_exchange = (
+            logits_metadata.extend_return_top_logprob and context.vocab_size <= 2**24
+        )
+        if compact_exchange:
+            # The packed exchange retains local plan tensors together with the
+            # packed and raw/contiguous TP-gathered score copies during merge.
+            lookup_bytes = (160 + 16 * tp_size) * (1 + max_probe_width)
+            # FP32-packed values/IDs, gathered candidates, FP32->int64 IDs,
+            # stable sort orders/gathers, normalized results and staged sources.
+            topk_bytes = (160 + 64 * tp_size) * max_k
+            # Gathered local max/log-sum pairs, shifted mass and merge temps.
+            row_scalar_bytes = 96 + 32 * tp_size
+        else:
+            # Existing reduction path: flattened plan and concatenated row/token
+            # IDs, ownership mask, offsets, scores and pointwise temporaries.
+            lookup_bytes = 128 * (1 + max_probe_width)
+            # Separate local and TP-gathered Top-N values/IDs plus selection temps.
+            topk_bytes = (96 + 32 * tp_size) * max_k
+            row_scalar_bytes = 64
+        return full_matrix_bytes + lookup_bytes + topk_bytes + row_scalar_bytes
+
     def _forward_by_chunk(
         self,
         pruned_states: torch.Tensor,
@@ -593,6 +1236,8 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
+        distributed_context: Optional[DistributedLogprobContext] = None,
+        stage_distributed_outputs: bool = False,
         borrow_logprob_memory: bool = False,
         borrow_logits_memory: bool = False,
     ) -> Tuple[LogprobResult, torch.Tensor]:
@@ -630,6 +1275,10 @@ class InputLogprobProcessor:
 
             fused_kernel, fused_max_k = row_logsumexp_topk, FUSED_TOPK_MAX_K
 
+        use_distributed_logprobs = (
+            distributed_context is not None and self.enable_fast_input_logprobs
+        )
+
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
@@ -643,7 +1292,21 @@ class InputLogprobProcessor:
             # The sorted host indices avoid per-chunk device synchronization.
             lp_lo = bisect.bisect_left(input_logprob_indices_cpu, start_idx)
             lp_hi = bisect.bisect_left(input_logprob_indices_cpu, end_idx)
-            chunk_indices = input_logprob_indices[lp_lo:lp_hi] - start_idx
+            # Distributed consumers only read logits. When every row is selected
+            # in order, retain this chunk's owned projection instead of copying
+            # its whole matrix with advanced indexing. Exact list equality also
+            # rejects duplicate or missing row IDs, not just matching endpoints.
+            whole_distributed_chunk = (
+                use_distributed_logprobs
+                and lp_hi - lp_lo == end_idx - start_idx
+                and input_logprob_indices_cpu[lp_lo:lp_hi]
+                == list(range(start_idx, end_idx))
+            )
+            chunk_indices = (
+                None
+                if whole_distributed_chunk
+                else input_logprob_indices[lp_lo:lp_hi] - start_idx
+            )
 
             # Get the logits for this chunk. Each chunk must own its output:
             # writing through the shared graph logits buffer would alias
@@ -654,19 +1317,31 @@ class InputLogprobProcessor:
                 if borrow_logits_memory
                 else nullcontext()
             ):
-                chunk_logits = get_logits_fn(
-                    chunk_states,
-                    lm_head,
-                    logits_metadata,
-                    use_logits_buffer=num_chunks == 1,
-                )
+                if use_distributed_logprobs:
+                    chunk_logits = distributed_context.get_local_logits_fn(
+                        chunk_states, lm_head, logits_metadata
+                    )
+                else:
+                    chunk_logits = get_logits_fn(
+                        chunk_states,
+                        lm_head,
+                        logits_metadata,
+                        use_logits_buffer=num_chunks == 1,
+                    )
 
             # These outputs must survive graph replay. Allocate them outside
             # borrowing, then consume and release chunk_logits in the next scope.
             if i == 0:
+                sampled_vocab_size = (
+                    distributed_context.vocab_size
+                    if use_distributed_logprobs
+                    else chunk_logits.shape[1]
+                )
                 sampled_logits = torch.empty(
-                    (sample_indices.shape[0], chunk_logits.shape[1]),
-                    dtype=chunk_logits.dtype,
+                    (sample_indices.shape[0], sampled_vocab_size),
+                    dtype=torch.float32
+                    if use_distributed_logprobs
+                    else chunk_logits.dtype,
                     device=chunk_logits.device,
                 )
                 if borrow_logprob_memory:
@@ -685,9 +1360,14 @@ class InputLogprobProcessor:
             s_lo = bisect.bisect_left(sample_indices_cpu, start_idx)
             s_hi = bisect.bisect_left(sample_indices_cpu, end_idx)
             if s_hi > s_lo:
-                sampled_logits[s_lo:s_hi] = chunk_logits[
+                chunk_sampled_logits = chunk_logits[
                     sample_indices[s_lo:s_hi] - start_idx
                 ]
+                if use_distributed_logprobs:
+                    chunk_sampled_logits = distributed_context.gather_sampled_logits_fn(
+                        chunk_sampled_logits
+                    )
+                sampled_logits[s_lo:s_hi] = chunk_sampled_logits
 
             borrow_scope = (
                 borrow_graph_pool(user="input logprob processing")
@@ -695,7 +1375,11 @@ class InputLogprobProcessor:
                 else nullcontext()
             )
             with borrow_scope:
-                chunk_logprobs = chunk_logits[chunk_indices]
+                chunk_logprobs = (
+                    chunk_logits
+                    if whole_distributed_chunk
+                    else chunk_logits[chunk_indices]
+                )
                 del chunk_logits
 
                 # End at the last row inside the chunk; token_to_seq_idx[end_idx]
@@ -703,6 +1387,182 @@ class InputLogprobProcessor:
                 chunk_slice = slice(
                     token_to_seq_idx[start_idx], token_to_seq_idx[end_idx - 1] + 1
                 )
+
+                if use_distributed_logprobs:
+                    valid_vocab_size = (
+                        distributed_context.vocab_end_index
+                        - distributed_context.vocab_start_index
+                    )
+                    if chunk_logprobs.shape[0] > 0:
+                        target_token_ids = (
+                            logits_metadata.extend_input_logprob_token_ids_gpu[
+                                lp_lo:lp_hi
+                            ]
+                        ).long()
+                        target_rows = torch.arange(
+                            chunk_logprobs.shape[0],
+                            device=chunk_logprobs.device,
+                            dtype=torch.long,
+                        )
+
+                        explicit_plan = None
+                        lookup_rows = target_rows
+                        lookup_token_ids = target_token_ids
+                        if logits_metadata.extend_token_ids_logprob:
+                            explicit_plan = _build_token_ids_chunk_plan(
+                                logits_metadata.token_ids_logprobs[chunk_slice],
+                                logits_metadata.extend_logprob_pruned_lens_cpu[
+                                    chunk_slice
+                                ],
+                                split_len_token_ids,
+                                chunk_logprobs.shape[0],
+                                chunk_logprobs.device,
+                            )
+                            lookup_rows = torch.cat(
+                                (lookup_rows, explicit_plan.row_indices)
+                            )
+                            lookup_token_ids = torch.cat(
+                                (lookup_token_ids, explicit_plan.token_ids)
+                            )
+
+                        compact_exchange = (
+                            logits_metadata.extend_return_top_logprob
+                            and distributed_context.vocab_size <= 2**24
+                        )
+                        if compact_exchange:
+                            max_k = max(logits_metadata.top_logprobs_nums[chunk_slice])
+                            (
+                                row_max,
+                                row_log_sum,
+                                selected_scores,
+                                top_values,
+                                top_indices,
+                            ) = get_distributed_input_state(
+                                chunk_logprobs,
+                                lookup_rows,
+                                lookup_token_ids,
+                                distributed_context.vocab_start_index,
+                                distributed_context.vocab_end_index,
+                                distributed_context.vocab_size,
+                                max_k,
+                                distributed_context.tp_group,
+                                normalize=True,
+                            )
+                        else:
+                            row_max, row_log_sum = (
+                                compute_distributed_row_log_normalizer(
+                                    chunk_logprobs,
+                                    valid_vocab_size,
+                                    distributed_context.tp_group,
+                                )
+                            )
+                            selected_scores = get_distributed_token_scores(
+                                chunk_logprobs,
+                                lookup_rows,
+                                lookup_token_ids,
+                                distributed_context.vocab_start_index,
+                                distributed_context.vocab_end_index,
+                                distributed_context.tp_group,
+                            )
+                        # Compact exchange already normalized scores in its merge.
+                        normalized_scores = (
+                            selected_scores
+                            if compact_exchange
+                            else (selected_scores - row_max[lookup_rows])
+                            - row_log_sum[lookup_rows]
+                        )
+                        num_targets = target_rows.numel()
+                        if borrow_logprob_memory:
+                            token_logprobs[lp_lo:lp_hi].copy_(
+                                normalized_scores[:num_targets], non_blocking=True
+                            )
+                        else:
+                            token_logprobs.append(normalized_scores[:num_targets])
+
+                        if logits_metadata.extend_return_top_logprob:
+                            top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                            if not compact_exchange:
+                                top_values, top_indices = get_distributed_topk(
+                                    chunk_logprobs,
+                                    valid_vocab_size,
+                                    max(top_k_nums),
+                                    distributed_context.vocab_start_index,
+                                    distributed_context.vocab_size,
+                                    distributed_context.tp_group,
+                                )
+                            if not compact_exchange:
+                                top_values = (
+                                    top_values - row_max[:, None]
+                                ) - row_log_sum[:, None]
+                            split_len_topk = append_distributed_topk_chunk(
+                                top_values,
+                                top_indices,
+                                top_k_nums,
+                                logits_metadata.extend_logprob_pruned_lens_cpu[
+                                    chunk_slice
+                                ],
+                                top_logprobs_val,
+                                top_logprobs_idx,
+                                split_len_topk,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
+                            )
+
+                        if explicit_plan is not None:
+                            _append_token_ids_chunk_from_flat_scores(
+                                explicit_plan,
+                                normalized_scores[num_targets:],
+                                token_ids_logprobs_val,
+                                token_ids_logprobs_idx,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
+                            )
+                            split_len_token_ids = explicit_plan.next_split_pruned_len
+                    else:
+                        if not borrow_logprob_memory:
+                            token_logprobs.append(
+                                chunk_logprobs.new_empty(0, dtype=torch.float32)
+                            )
+                        if logits_metadata.extend_return_top_logprob:
+                            top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
+                            empty_values = chunk_logprobs.new_empty(
+                                (0, max(top_k_nums)), dtype=torch.float32
+                            )
+                            empty_indices = torch.empty(
+                                (0, max(top_k_nums)),
+                                dtype=torch.long,
+                                device=chunk_logprobs.device,
+                            )
+                            split_len_topk = append_distributed_topk_chunk(
+                                empty_values,
+                                empty_indices,
+                                top_k_nums,
+                                logits_metadata.extend_logprob_pruned_lens_cpu[
+                                    chunk_slice
+                                ],
+                                top_logprobs_val,
+                                top_logprobs_idx,
+                                split_len_topk,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
+                            )
+                        if logits_metadata.extend_token_ids_logprob:
+                            explicit_plan = _build_token_ids_chunk_plan(
+                                logits_metadata.token_ids_logprobs[chunk_slice],
+                                logits_metadata.extend_logprob_pruned_lens_cpu[
+                                    chunk_slice
+                                ],
+                                split_len_token_ids,
+                                0,
+                                chunk_logprobs.device,
+                            )
+                            _append_token_ids_chunk_from_flat_scores(
+                                explicit_plan,
+                                chunk_logprobs.new_empty(0, dtype=torch.float32),
+                                token_ids_logprobs_val,
+                                token_ids_logprobs_idx,
+                                copy_to_pinned_cpu=stage_distributed_outputs,
+                            )
+                            split_len_token_ids = explicit_plan.next_split_pruned_len
+                    del chunk_logprobs
+                    continue
 
                 chunk_precomputed_topk = None
                 if self.enable_fast_input_logprobs:
@@ -797,11 +1657,12 @@ class InputLogprobProcessor:
             lm_head.reset_lm_head_pass()
 
         input_copy_done = None
-        if borrow_logprob_memory:
-            # The copies and the next replay share the forward stream.
+        if borrow_logprob_memory or stage_distributed_outputs:
+            # The output copies and their source tensors share the forward
+            # stream. Consumers wait once before expanding the staged spans.
             input_copy_done = torch.cuda.Event()
             input_copy_done.record(torch.cuda.current_stream(pruned_states.device))
-        else:
+        if not borrow_logprob_memory:
             # Concatenate the results
             token_logprobs = torch.cat(token_logprobs, dim=0)
 
