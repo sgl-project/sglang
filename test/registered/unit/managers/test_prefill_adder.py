@@ -374,6 +374,43 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(req.extend_len, expected)
 
+    def test_encoder_replay_rows_share_the_chunk(self):
+        # A hit's replay rows run in the same step as its extend, so both must
+        # fit the chunk: the MegaMoE token cap is sized from it.
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        for prefix_len, rem_chunk, extend_len in (
+            (0, 1024, 1024),
+            (64, 1024, 960),
+            (4096, 1024, 896),
+            (4096, 128, None),
+        ):
+            with self.subTest(prefix_len=prefix_len, rem_chunk=rem_chunk):
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=64,
+                    rem_chunk_tokens=rem_chunk,
+                )
+                req = self.create_shared_req(f"hit-{prefix_len}-{rem_chunk}")
+                req.prefix_len = prefix_len
+                req.full_untruncated_fill_ids = list(range(prefix_len + 4096))
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                if extend_len is None:
+                    self.assertEqual(result, AddReqResult.OTHER)
+                    self.assertEqual(adder.can_run_list, [])
+                    continue
+                self.assertEqual(req.extend_len, extend_len)
+                self.assertEqual(adder.log_replay_tokens, min(prefix_len, 128))
+                self.assertEqual(adder.rem_chunk_tokens, 0)
+
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
         first, second = (

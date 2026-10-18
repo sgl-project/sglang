@@ -28,11 +28,17 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def replay_len(prefix_len: int) -> int:
+    """Cached tokens replayed in front of a hit's extend: the last SWA window.
+    The prefill budget, the MLP-sync row count and the fold all read this."""
+    return min(prefix_len, 128)
+
+
 def folded_replay_rows(batch) -> int:
     if not batch.forward_mode.is_extend_without_speculative():
         return 0
     return sum(
-        min(end, 128)
+        replay_len(end)
         for reset, end in zip(batch.encoder_swa_reset, batch.prefix_lens)
         if reset
     )
@@ -114,7 +120,7 @@ def _reset_windows_and_collect_hits(*, batch, window):
             raise ValueError(
                 "encoder SWA replay requires an even cached-prefix boundary"
             )
-        rows.append((i, max(0, end - 128), end))
+        rows.append((i, end - replay_len(end), end))
     return rows
 
 
