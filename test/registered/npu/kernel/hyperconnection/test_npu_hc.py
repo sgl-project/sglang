@@ -57,6 +57,7 @@ def test_model_public_routing(monkeypatch, rows):
     assert not hasattr(module.hc_norm, "_npu_hc_norm")
     mixed, residuals = module.mix(x)
     out = module.combine(mixed, residuals)
+    assert len(residuals) == 3 and residuals[2] is None
     assert residuals[0] is x
     assert mixed.shape == (rows, 2560) and out.shape == x.shape
     assert calls == ([] if rows == 0 else ["grouped_norm", "mix", "combine"])
@@ -98,11 +99,11 @@ def test_model_inputs_rejected_not_fallback(monkeypatch, bad):
 def test_unsupported_configuration_rejected(monkeypatch, per_branch):
     module = make_module(monkeypatch, model=False, per_branch=per_branch)
     x = torch.randn(4, 512, device="npu", dtype=torch.bfloat16)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"Expected x\[R,10240\], weight\[10240\]"):
         module.mix(x)
     block = torch.zeros(4, 128, device="npu", dtype=torch.bfloat16)
-    with pytest.raises(ValueError):
-        module.combine(block, (x, x))
+    with pytest.raises(ValueError, match="Current model requires HC=4 and H=2560"):
+        module.combine(block, (x, x, None))
 
 
 @torch.no_grad()

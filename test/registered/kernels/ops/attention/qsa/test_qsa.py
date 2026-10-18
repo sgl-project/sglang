@@ -2112,6 +2112,9 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
 @pytest.mark.parametrize("bs", [1, 3, 128])
 @pytest.mark.parametrize("padding", [0, 1])
 def test_qsa_draft_metadata_multi_step_graph(bs, padding):
+    if qsa_backend_module._is_npu or not torch.cuda.is_available():
+        pytest.skip("CUDA-only graph metadata kernel")
+
     from types import SimpleNamespace
 
     from sglang.srt.layers.attention.qsa.graph_metadata import (

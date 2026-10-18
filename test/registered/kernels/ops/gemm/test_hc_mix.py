@@ -166,6 +166,9 @@ def test_npu_grouped_norm_matches_reference(monkeypatch, ple_norm):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 4, 7, _FUSED_MIX_MAX_ROWS])
+@pytest.mark.skipif(
+    hyperconnection._is_npu or not torch.cuda.is_available(), reason="CUDA is required"
+)
 def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     x, w_down, w_up = _make_inputs(num_tokens, dtype)
     assert fused_hc_mix_supported(x, w_down, w_up)
@@ -174,6 +177,9 @@ def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     torch.testing.assert_close(out.to(torch.float64), ref, **_TOLERANCES[dtype])
 
 
+@pytest.mark.skipif(
+    hyperconnection._is_npu or not torch.cuda.is_available(), reason="CUDA is required"
+)
 def test_fused_hc_mix_no_less_accurate_than_eager():
     """The fused kernel (fp32 accumulation throughout) must not be farther
     from the fp64 reference than the eager bf16 chain it replaces."""
@@ -188,6 +194,9 @@ def test_fused_hc_mix_no_less_accurate_than_eager():
     assert fused_err <= eager_err * 1.5 + 1e-6
 
 
+@pytest.mark.skipif(
+    hyperconnection._is_npu or not torch.cuda.is_available(), reason="CUDA is required"
+)
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
