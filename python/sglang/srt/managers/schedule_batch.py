@@ -260,9 +260,15 @@ def split_cached_prefix_by_tier(
     return device, host, storage
 
 
-def _compute_pad_value(hash: int) -> int:
-    """Compute pad value from hash."""
-    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
+def _compute_pad_values(identity: bytes) -> Tuple[int, ...]:
+    """derive shared wide sentinels from an item hash or full identity digest"""
+    digest = hashlib.sha256(_MM_WIDE_PAD_TAG + identity).digest()
+    # prefix matching can stop after one sentinel, so each must retain wide bits
+    return tuple(
+        MM_PAD_SHIFT_VALUE
+        + (int.from_bytes(digest[i : i + 8], byteorder="big") & _MM_WIDE_PAD_MASK)
+        for i in range(0, _MM_IDENTITY_BYTES, 8)
+    )
 
 
 class BaseFinishReason:
@@ -396,9 +402,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         default_factory=dict
     )
 
-    # Full SHA-256 identity and the wide sentinels derived from it. Only
-    # processors that call ``set_identity`` populate them; everything else
-    # keeps the scalar ``pad_value`` contract.
+    # optional full identity; otherwise sentinels derive from the 64-bit item hash
+    # pad_value remains the first sentinel for scalar-padding consumers
     identity: Optional[bytes] = None
     pad_values: Optional[Tuple[int, ...]] = None
 
@@ -431,8 +436,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     def set_hash(self, hash_value: int) -> None:
         self.hash = hash_value
         self.identity = None
-        self.pad_values = None
-        self.pad_value = _compute_pad_value(hash_value)
+        self.pad_values = _compute_pad_values(self.hash.to_bytes(8, byteorder="big"))
+        self.pad_value = self.pad_values[0]
 
     def set_identity(self, identity: bytes) -> None:
         """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
@@ -445,17 +450,9 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 f"multimodal identity must be {_MM_IDENTITY_BYTES} bytes, "
                 f"got {len(identity)}"
             )
-        sentinel_digest = hashlib.sha256(_MM_WIDE_PAD_TAG + identity).digest()
         self.identity = bytes(identity)
         self.hash = int.from_bytes(identity[:8], byteorder="big", signed=False)
-        self.pad_values = tuple(
-            MM_PAD_SHIFT_VALUE
-            + (
-                int.from_bytes(sentinel_digest[i : i + 8], byteorder="big")
-                & _MM_WIDE_PAD_MASK
-            )
-            for i in range(0, _MM_IDENTITY_BYTES, 8)
-        )
+        self.pad_values = _compute_pad_values(self.identity)
         self.pad_value = self.pad_values[0]
 
     def padding_values(self) -> Tuple[int, ...]:
@@ -478,12 +475,13 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
         from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        self.hash = resolve_multimodal_item_hash(
-            existing_hash=self.hash,
-            feature=self.feature,
-            precomputed_embeddings=self.precomputed_embeddings,
+        self.set_hash(
+            resolve_multimodal_item_hash(
+                existing_hash=self.hash,
+                feature=self.feature,
+                precomputed_embeddings=self.precomputed_embeddings,
+            )
         )
-        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality

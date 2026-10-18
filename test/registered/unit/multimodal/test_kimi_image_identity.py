@@ -205,16 +205,19 @@ class TestKimiImageIdentity(CustomTestCase):
             self.assertGreaterEqual(value, MM_PAD_SHIFT_VALUE)
             self.assertLess(value, 2**63)
 
-    def test_distinct_images_cannot_share_pad_value(self):
+    def test_known_legacy_collision_is_separated(self):
         legacy = []
+        generic = []
         for value in _LEGACY_COLLIDING_FEATURES:
             item = MultimodalDataItem(
                 modality=Modality.IMAGE,
                 feature=torch.tensor([value], dtype=torch.int64),
             )
             item.set_pad_value()
-            legacy.append(item.pad_value)
+            legacy.append(MM_PAD_SHIFT_VALUE + item.hash % (1 << 30))
+            generic.append(item.pad_value)
         self.assertEqual(legacy[0], legacy[1])
+        self.assertNotEqual(generic[0], generic[1])
 
         items = [
             _image_item(
@@ -248,8 +251,10 @@ class TestKimiImageIdentity(CustomTestCase):
         item.set_identity(kimi_image_identity("sha256:" + "ab" * 32, [1, 4, 4]))
         item.set_hash(7)
         self.assertIsNone(item.identity)
-        self.assertIsNone(item.pad_values)
-        self.assertEqual(item.padding_values(), (item.pad_value,))
+        expected = MultimodalDataItem(modality=Modality.IMAGE, hash=7)
+        expected.set_pad_value()
+        self.assertEqual(item.padding_values(), expected.padding_values())
+        self.assertEqual(len(item.padding_values()), 4)
 
     def test_rejects_short_identity(self):
         with self.assertRaises(ValueError):

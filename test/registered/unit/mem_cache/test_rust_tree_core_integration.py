@@ -24,7 +24,13 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.mm_utils import pad_mm_tokens
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+)
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -158,6 +164,39 @@ def test_match_on_the_empty_tree_returns_no_indices():
     core = _tree_core()
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.device_prefix_len == 0
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("image_len", [1, 2, 3, 8])
+@pytest.mark.parametrize("prefix_len", [0, 13, 14, 15, 16])
+def test_multimodal_hash_collision_does_not_reuse_image_kv(
+    backend, page_size, image_len, prefix_len
+):
+    core = _tree_core(backend=backend, page_size=page_size)
+    # identical low 30 bits used to alias every image token
+    keys = []
+    for item_hash in (7, 7 + (1 << 30)):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=item_hash,
+            offsets=[(prefix_len, prefix_len + image_len - 1)],
+        )
+        item.set_pad_value()
+        tokens = array("q", [1] * prefix_len + [9] * image_len + [2] * 32)
+        keys.append(
+            list(
+                pad_mm_tokens(tokens, MultimodalInputs(mm_items=[item], im_token_id=9))
+            )
+        )
+    cached_len = len(keys[0]) // page_size * page_size
+    _insert(core, keys[0], list(range(cached_len)))
+
+    same = core.match_prefix(MatchPrefixParams(key=_key(keys[0])))
+    assert same.device_indices.tolist() == list(range(cached_len))
+    different = core.match_prefix(MatchPrefixParams(key=_key(keys[1])))
+    text_hit_len = prefix_len // page_size * page_size
+    assert different.device_indices.tolist() == list(range(text_hit_len))
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
