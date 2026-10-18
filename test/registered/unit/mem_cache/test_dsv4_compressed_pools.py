@@ -26,6 +26,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _num_dsv4_physical_kv_pages,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -391,7 +396,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
 
 
 class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
-    RING = 128 + 6  # sliding window + the largest draft token count
+    RING = 256  # sliding window + the largest draft token count, in whole pages
 
     def setUp(self):
         super().setUp()
@@ -440,6 +445,40 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         self.assertFalse(draft.needs_paged_swa_allocator)
         self.assertEqual(draft.swa_req_ring_size, self.RING)
         self.assertGreaterEqual(draft.swa_kv_pool.size, 3 * self.RING)
+
+    def test_pd_swa_state_pairs_with_a_paged_decode(self):
+        target = self.make_pool(draft=False)
+        draft = self.make_pool(draft=True)
+        self.assertEqual(target.request_window.capacity, draft.swa_req_ring_size)
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=False
+        )
+        override.install()
+        try:
+            decode_target = self.make_pool(draft=False)
+            decode_draft = self.make_pool(draft=True)
+        finally:
+            override.restore()
+        for prefill, decode in ((target, decode_target), (draft, decode_draft)):
+            self.assertEqual(
+                prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
+            )
+
+    def test_pd_window_pages_carry_the_last_window(self):
+        window = self.make_pool(draft=False).request_window
+        page, slot, sliding = window.page_size, 2, 128
+        for seq_len in (300, 1000, 1030):
+            with self.subTest(seq_len=seq_len):
+                # A row holds the newest committed position with its residue.
+                held = torch.full((window.rows + page,), -1)
+                newest = torch.arange(seq_len - window.capacity, seq_len)
+                held[window.row_loc(slot, newest)] = newest
+                start = (seq_len - sliding) // page * page
+                pages = torch.from_numpy(window.page_indices(slot, start, seq_len))
+                # Decode lays the received pages out by position from start.
+                received = held.view(-1, page)[pages.long()].flatten()
+                last = torch.arange(seq_len - sliding, seq_len)
+                self.assertEqual(received[last - start].tolist(), last.tolist())
 
     def _block_inputs(self, prefix_lens, slots, block_size=5):
         seq_lens_casual = build_block_seq_lens_causal(
@@ -544,8 +583,8 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
-        pool = DeepSeekV4TokenToKVPool(
+    def _make_pool(self):
+        return DeepSeekV4TokenToKVPool(
             max_num_reqs=2,
             num_req_slots=3,
             swa_size=0,
@@ -567,6 +606,25 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
             compression_ratios=[0, 0, 0],
             full_size=2048,
         )
+
+    def test_workspace_covers_the_largest_prefill_graph_bucket(self):
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.BREAKABLE, bs=[64, 1024])
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        history = (3 + 1) * 128  # (num_req_slots + 1) * sliding_window
+        workspace = self._make_pool().request_window.workspace
+        self.assertGreaterEqual(workspace.size, history + 1024)
+
+    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
+        pool = self._make_pool()
         self.assertIsNotNone(pool.request_window)
         self.assertFalse(pool.needs_paged_swa_allocator)
         self.assertIsNone(pool.full_to_swa_index_mapping)
