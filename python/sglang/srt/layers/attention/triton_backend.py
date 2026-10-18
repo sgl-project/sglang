@@ -2344,8 +2344,8 @@ class TritonAttnBackend(AttentionBackend):
             assert kv_indices is not None, (
                 f"layer {layer.layer_id} is a sliding-window layer but this "
                 "forward built no window_kv_indices; a multi-step draft gets the "
-                "per-step window rail only on a sliding-window KV pool with a "
-                "window (TritonMultiStepDraftBackend.window_rail)."
+                "per-step window rail whenever its model has a window "
+                "(TritonMultiStepDraftBackend.window_rail)."
             )
         else:
             kv_indptr = self.forward_metadata.kv_indptr
@@ -2538,9 +2538,7 @@ class TritonMultiStepDraftBackend:
         # own: the draft's chain is not part of the committed prefix yet.
         self.sliding_window_size = model_runner.sliding_window_size
         self.window_rail = (
-            isinstance(self.token_to_kv_pool, SWAKVPool)
-            and self.sliding_window_size is not None
-            and self.sliding_window_size > 0
+            self.sliding_window_size is not None and self.sliding_window_size > 0
         )
         self.window_kv_indptr = (
             torch.zeros(
@@ -2655,9 +2653,8 @@ class TritonMultiStepDraftBackend:
     ) -> None:
         """Emit every step's window-clipped read ids into the per-step rows
         of ``window_kv_indices_buffer`` and their indptr into
-        ``self.window_kv_indptr``, from the iteration's sliding-window read
-        source: swa-side ids on a unified pool, req_to_token ids through the
-        pool's full-to-swa mapping otherwise."""
+        ``self.window_kv_indptr``. The reader selects FULL or SWA storage;
+        the layer's window determines which positions to gather."""
         num_seqs = forward_batch.batch_size
         width = bs * self.sliding_window_size
         assert window_kv_indices_buffer.shape[1] >= width, (
@@ -2668,7 +2665,7 @@ class TritonMultiStepDraftBackend:
             forward_batch.kv_loc_plan,
             req_pool_indices=forward_batch.req_pool_indices,
             bs=num_seqs,
-            kind=IdSpaceKind.SLIDING_WINDOW,
+            kind=self.kv_index_translator.window_kv_kind,
         )
         generate_draft_decode_window_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
@@ -2691,7 +2688,10 @@ class TritonMultiStepDraftBackend:
             v2p=src.v2p,
             TRANSLATE=src.v2p is not None,
         )
-        if not src.is_translated:
+        if (
+            not src.is_translated
+            and self.kv_index_translator.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
+        ):
             # Static pool: the legacy full->swa translate, as
             # update_sliding_window_buffer applies it to the target's window.
             for i in range(self.speculative_num_steps):
@@ -2873,12 +2873,7 @@ def update_sliding_window_buffer(
         indptr=window_kv_indptr,
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        kind=(
-            IdSpaceKind.SLIDING_WINDOW
-            if translator.reads_are_translated
-            and isinstance(token_to_kv_pool, BaseSWAKVPool)
-            else IdSpaceKind.FULL
-        ),
+        kind=translator.window_kv_kind,
         token_mapping=token_mapping,
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
