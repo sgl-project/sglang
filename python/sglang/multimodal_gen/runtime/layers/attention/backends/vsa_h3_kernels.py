@@ -12,6 +12,12 @@ The attention kernel consumes an explicit per-query-block index list
 chunks and 3D video tiles whose dimensions do not divide the tile shape - mask
 their pad columns exactly.
 
+Two kernels implement the same attention with different load paths: a TMA
+tensor-descriptor kernel for Hopper and newer, and a raw-pointer kernel for
+sm80, where Triton does not lower descriptor loads to TMA. Both compute
+identical results; ``vsa_h3_block_sparse_attn_forward`` picks between them
+from the device compute capability.
+
 ``vsa_h3_pack_tiles`` gathers packed ``[T, H, D]`` rows into the head-major
 padded tile layout the attention kernel reads and pools each tile in the same
 pass; ``vsa_h3_untile`` scatters the attention output back to packed rows and
@@ -27,8 +33,6 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from sglang.kernels.ops.diffusion import vsa_block_sparse_sm100
-
 # BLOCK_M / BLOCK_N are structural, not tunable: the kernel indexes the top-k
 # list per BLOCK_M q-tile and addresses keys as kv_idx * BLOCK_N, so both must
 # match the granularity q2k_index and variable_block_sizes were built at.
@@ -36,9 +40,23 @@ VSA_H3_KERNEL_BLOCK = 64
 
 # Pinned instead of autotuned: on B300 num_warps=4 wins at every sequence
 # length and num_stages=5 is within 0.5% of the best (7 spills); FastVideo
-# reports the same optimum for Blackwell.
+# reports the same optimum for Blackwell. The raw-pointer path used on sm80
+# measures best at num_stages=2 on the production DiT shape (H=56, D=128,
+# S=37760, keep=66); its loads are not TMA-prefetched, so the deeper pipeline
+# the descriptor path relies on does not help there.
 _ATTN_NUM_WARPS = 4
 _ATTN_NUM_STAGES = 5
+_ATTN_NUM_STAGES_PTR = 2
+
+
+def _use_pointer_loads(capability: tuple[int, int]) -> bool:
+    """Whether to use the raw-pointer kernel for the given compute capability.
+
+    ``TensorDescriptor`` loads are lowered to TMA only on Hopper and newer. On
+    sm80 Triton degrades them to synchronous tile loads without ``cp.async``
+    prefetch, so the pointer kernel is used there instead.
+    """
+    return capability[0] < 9
 
 
 @triton.jit
@@ -101,6 +119,95 @@ def _attn_fwd_sparse(
     )
 
 
+@triton.jit
+def _attn_fwd_sparse_ptr(
+    Q,
+    K,
+    V,
+    O,
+    sm_scale,
+    q2k_index,
+    q2k_num,
+    max_kv_blks,
+    variable_block_sizes,
+    H,
+    N_CTX_Q,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Same block-sparse attention as ``_attn_fwd_sparse``, loading Q/K/V/O
+    through raw pointers instead of TMA tensor descriptors.
+
+    On sm80 Triton does not lower ``TensorDescriptor`` loads to TMA; they become
+    synchronous tile loads with no ``cp.async`` prefetch, so each K/V tile load
+    exposes its full latency. Raw pointer loads let the pipeliner issue
+    ``cp.async`` for K/V on Ampere. The arithmetic is the same as the descriptor
+    kernel, so the output is bit-identical (verified against the Hopper path and
+    torch SDPA).
+    """
+    q_blk = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    q_tiles = N_CTX_Q // BLOCK_M
+    meta_base = off_hz * q_tiles + q_blk
+
+    kv_blocks = tl.load(q2k_num + meta_base)
+    kv_ptr = q2k_index + meta_base.to(tl.int64) * max_kv_blks
+
+    # Contiguous [B, H, S, D]: fold (b, h) into a single base offset.
+    bh = off_hz.to(tl.int64)
+    sd = N_CTX_Q * HEAD_DIM
+    q_base = Q + bh * sd
+    k_base = K + bh * sd
+    v_base = V + bh * sd
+    o_base = O + bh * sd
+
+    offs_m = q_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(q_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + offs_d[None, :])
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    qk_scale = sm_scale * 1.44269504  # 1/ln2
+
+    for i in range(0, kv_blocks):
+        kv_idx = tl.load(kv_ptr + i).to(tl.int64)
+        block_size = tl.load(variable_block_sizes + kv_idx)
+        kv_row = kv_idx * BLOCK_N
+        k = tl.load(
+            k_base
+            + (kv_row + offs_n)[:, None].to(tl.int64) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        qk = tl.dot(q, tl.trans(k))
+        mask = offs_n[None, :] < block_size
+        qk = tl.where(mask, qk, -float("inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+
+        v = tl.load(
+            v_base
+            + (kv_row + offs_n)[:, None].to(tl.int64) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        acc = tl.dot(p.to(tl.bfloat16), v, acc)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    tl.store(
+        o_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + offs_d[None, :],
+        acc.to(O.dtype.element_ty),
+    )
+
+
 def vsa_h3_block_sparse_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -127,9 +234,15 @@ def vsa_h3_block_sparse_attn_forward(
             "variable_block_sizes must have one entry per 64-token key block: "
             f"{variable_block_sizes.numel()} vs {seq_kv // VSA_H3_KERNEL_BLOCK}"
         )
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("q/k/v must be contiguous [B, H, S_pad, D]")
     if out is None:
         out = torch.empty_like(q)
     if use_sm100_kernel:
+        # Imported lazily: the sm100 tcgen05 kernel is an optional fast path, and
+        # the Triton kernel below must stay usable on stacks that do not ship it.
+        from sglang.kernels.ops.diffusion import vsa_block_sparse_sm100
+
         vsa_block_sparse_sm100(
             q,
             k,
@@ -141,20 +254,42 @@ def vsa_h3_block_sparse_attn_forward(
             1.0 / math.sqrt(head_dim),
         )
         return out
+    grid = (seq_q // VSA_H3_KERNEL_BLOCK, batch * heads, 1)
+    max_kv_blks = q2k_index.shape[-1]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    if _use_pointer_loads(torch.cuda.get_device_capability()):
+        _attn_fwd_sparse_ptr[grid](
+            q,
+            k,
+            v,
+            out,
+            sm_scale,
+            q2k_index,
+            q2k_num,
+            max_kv_blks,
+            variable_block_sizes,
+            heads,
+            seq_q,
+            HEAD_DIM=head_dim,
+            BLOCK_M=VSA_H3_KERNEL_BLOCK,
+            BLOCK_N=VSA_H3_KERNEL_BLOCK,
+            num_warps=_ATTN_NUM_WARPS,
+            num_stages=_ATTN_NUM_STAGES_PTR,
+        )
+        return out
     block = [1, 1, VSA_H3_KERNEL_BLOCK, head_dim]
     desc_q, desc_k, desc_v, desc_o = (
         TensorDescriptor.from_tensor(t, block_shape=block) for t in (q, k, v, out)
     )
-    grid = (seq_q // VSA_H3_KERNEL_BLOCK, batch * heads, 1)
     _attn_fwd_sparse[grid](
         desc_q,
         desc_k,
         desc_v,
         desc_o,
-        1.0 / math.sqrt(head_dim),
+        sm_scale,
         q2k_index,
         q2k_num,
-        q2k_index.shape[-1],
+        max_kv_blks,
         variable_block_sizes,
         heads,
         seq_q,

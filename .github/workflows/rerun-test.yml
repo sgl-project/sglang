@@ -183,6 +183,7 @@ jobs:
         env:
           TEST_COMMAND: ${{ matrix.test_command }}
           REQUESTED_TEST_COMMAND: ${{ inputs.test_command }}
+          HF_MUSE_SPARK_TOKEN: ${{ inputs.runs_on == '8-gpu-b300' && inputs.pr_head_sha == '' && contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_12_b300_pd.py') && secrets.HF_MUSE_SPARK_TOKEN || '' }}
           SGLANG_PRECISION_HF_TOKEN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
           if [[ "${{ inputs.refresh_precision_baseline }}" == "true" ]]; then

@@ -563,6 +563,15 @@ class LoRAPipeline(ComposedPipelineBase):
                 converted_count_critic,
             )
 
+        # The wrappers replaced quantized linears; FP8 fused fast paths decided
+        # against the raw modules are stale and would read quant attributes
+        # (input_scale/quant_method) off the wrappers. Let each DiT recheck.
+        for module_name in ("transformer", "transformer_2"):
+            module = self.modules.get(module_name)
+            revalidate = getattr(module, "revalidate_fp8_fast_paths", None)
+            if callable(revalidate):
+                revalidate()
+
     def _normalize_lora_params(
         self,
         lora_nickname: str | list[str],
@@ -1317,19 +1326,18 @@ class LoRAPipeline(ComposedPipelineBase):
                 merge_weights=False,
             )
             self.auto_merge_rounding_loss[key] = merge_rounding_loss(lora_layers)
+            loss = self.auto_merge_rounding_loss[key]
+            if rank == 0 and loss is not None and loss > AUTO_MERGE_MAX_ROUNDING_LOSS:
+                logger.info(
+                    "LoRA %s stays unmerged on %s: merging it into the base weights "
+                    "would round away %.0f%% of its update. Pass "
+                    "--lora-merge-mode merge to merge anyway.",
+                    ",".join(str(p) for p in paths),
+                    module_name,
+                    100 * loss,
+                )
         loss = self.auto_merge_rounding_loss[key]
-        if loss is None or loss <= AUTO_MERGE_MAX_ROUNDING_LOSS:
-            return False
-        if rank == 0:
-            logger.info(
-                "LoRA %s stays unmerged on %s: merging it into the base weights "
-                "would round away %.0f%% of its update. Pass "
-                "--lora-merge-mode merge to merge anyway.",
-                ",".join(str(p) for p in paths),
-                module_name,
-                100 * loss,
-            )
-        return True
+        return loss is not None and loss > AUTO_MERGE_MAX_ROUNDING_LOSS
 
     def _merge_via_cache(self, name, layer, merge_cache) -> None:
         """Merge one layer through the cache instead of in place.
