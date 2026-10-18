@@ -5122,7 +5122,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
             None,
         )
-        if layer is None:
+        # a weight-update model replica (miles p2p) loads into meta params, where no kernel can run
+        if layer is None or layer.hc_attn_fn.device.type == "meta":
             return
 
         from sglang.kernels.ops.layernorm.mhc import mhc_post, prewarm_mhc_pre
