@@ -101,6 +101,12 @@ class CpuDeviceMixin(DeviceMixin):
         # symmetry with CudaDeviceMixin's torch.cuda.synchronize().
         torch.cpu.synchronize()
 
+    def current_device(self) -> str:
+        return torch.cpu.current_device()
+
+    def current_stream(self, device=None) -> torch.cpu.Stream:
+        return torch.cpu.current_stream(device)
+
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         vm = psutil.virtual_memory()
         return (vm.available, vm.total)

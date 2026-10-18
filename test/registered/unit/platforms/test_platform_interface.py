@@ -19,8 +19,10 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
+from sglang.srt.platforms.hpu import HpuSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
@@ -145,6 +147,42 @@ class TestDeviceMixin(CustomTestCase):
         module.current_stream.assert_called_with(3)
         module.synchronize.assert_called_once_with()
         module.set_device.assert_called_once_with("custom:1")
+
+    def test_mps_stream_state_does_not_use_torch_mps(self):
+        platform = MpsSRTPlatform()
+        self.assertEqual(platform.current_device(), 0)
+        with patch.object(torch.accelerator, "current_stream") as current_stream:
+            self.assertIs(platform.current_stream(), current_stream.return_value)
+        current_stream.assert_called_once_with(None)
+
+    @patch("sglang.srt.platforms.musa.torch")
+    def test_musa_device_state_uses_torch_musa_not_the_cuda_shim(self, mock_torch):
+        platform = MusaSRTPlatform()
+        device = platform.get_device(1)
+        platform.set_device(device)
+        platform.current_device()
+        platform.current_stream()
+        platform.synchronize()
+        platform.empty_cache()
+        mock_torch.device.assert_called_once_with("musa", 1)
+        musa = mock_torch.musa
+        musa.set_device.assert_called_once_with(device)
+        musa.current_device.assert_called_once_with()
+        musa.current_stream.assert_called_once_with(None)
+        musa.synchronize.assert_called_once_with()
+        musa.empty_cache.assert_called_once_with()
+        self.assertEqual(mock_torch.cuda.mock_calls, [])
+
+    def test_hpu_device_state_uses_torch_hpu(self):
+        platform = HpuSRTPlatform()
+        hpu = MagicMock()
+        with patch.object(torch, "hpu", hpu, create=True):
+            platform.set_device(platform.get_device(2))
+            platform.current_stream()
+            platform.synchronize()
+        hpu.set_device.assert_called_once_with(torch.device("hpu", 2))
+        hpu.current_stream.assert_called_once_with(None)
+        hpu.synchronize.assert_called_once_with()
 
     def test_get_device_default_builds_a_torch_device(self):
         mixin = _make_device_mixin(PlatformEnum.CPU, "cpu", "cpu")
@@ -825,6 +863,31 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_load.return_value = {}
         self.assertIsInstance(_resolve_platform(), MpsSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_hpu_available", return_value=True)
+    @patch("sglang.srt.platforms._is_musa_available", return_value=False)
+    @patch("sglang.srt.platforms._is_xpu_available", return_value=False)
+    @patch("sglang.srt.platforms._is_rocm_available", return_value=False)
+    @patch("sglang.srt.platforms._is_npu_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cuda_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_activates_hpu_fallback(
+        self,
+        mock_envs,
+        _mock_is_cpu,
+        _mock_is_cuda,
+        _mock_is_npu,
+        _mock_is_rocm,
+        _mock_is_xpu,
+        _mock_is_musa,
+        _mock_is_hpu,
+        mock_load,
+    ):
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_load.return_value = {}
+        self.assertIsInstance(_resolve_platform(), HpuSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.torch")

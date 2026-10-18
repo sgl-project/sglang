@@ -81,8 +81,12 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
   └─ SGLANG_PLATFORM unset (auto-discover, activate all):
       ├─ 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
       ├─ 0 activated + CUDA available          → fallback CudaSRTPlatform
+      ├─ 0 activated + NPU available           → fallback NPUSRTPlatform
       ├─ 0 activated + ROCm available          → fallback RocmSRTPlatform
       ├─ 0 activated + XPU available           → fallback XpuSRTPlatform
+      ├─ 0 activated + MUSA available          → fallback MusaSRTPlatform
+      ├─ 0 activated + HPU available           → fallback HpuSRTPlatform
+      ├─ 0 activated + MPS available           → fallback MpsSRTPlatform
       ├─ 0 activated + none of the above       → fallback base SRTPlatform
       ├─ 1 activated → use it
       └─ N activated → RuntimeError (must set SGLANG_PLATFORM)

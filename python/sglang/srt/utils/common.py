@@ -637,22 +637,9 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
-    # Resolve from the platform checks: torch.get_device_module() with no
-    # argument initializes the CUDA runtime, which poisons fork() startup.
-    if is_cuda() or is_hip():
-        return torch.cuda
-    if is_npu():
-        return torch.npu
-    if is_xpu():
-        return torch.xpu
-    if is_musa():
-        return torch.musa
-    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
-    # even with no usable device; require an available accelerator instead.
-    accelerator = torch.accelerator.current_accelerator(check_available=True)
-    if accelerator is None:
-        return torch.cpu
-    return torch.get_device_module(accelerator)
+    # Named lookup: torch.get_device_module() with no argument initializes the
+    # CUDA runtime, which poisons fork() startup.
+    return torch.get_device_module(current_platform.device_type)
 
 
 def create_device_stream(device):

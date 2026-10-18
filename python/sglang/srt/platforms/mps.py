@@ -75,6 +75,12 @@ class MpsDeviceMixin(DeviceMixin):
         if callable(synchronize):
             synchronize()
 
+    def current_device(self) -> int:
+        return 0
+
+    def current_stream(self, device=None) -> torch.Stream:
+        return torch.accelerator.current_stream(device)
+
 
 class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
     """Built-in SRT platform for Apple Silicon MPS."""

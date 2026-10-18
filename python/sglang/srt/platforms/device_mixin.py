@@ -53,6 +53,7 @@ class PlatformEnum(enum.Enum):
     NPU = enum.auto()
     TPU = enum.auto()
     MPS = enum.auto()
+    HPU = enum.auto()
     OOT = enum.auto()  # Out-of-tree (external plugin)
     UNSPECIFIED = enum.auto()
 
