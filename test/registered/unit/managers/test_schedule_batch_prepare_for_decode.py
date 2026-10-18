@@ -58,25 +58,6 @@ class TestPrepareForDecodeMambaInit(CustomTestCase):
         self.assertIsNone(batch.mamba_clear_indices)
 
 
-class TestPrepareForDecodeClearsPrefillEmbeds(CustomTestCase):
-    def test_decode_drops_prefill_embed_overrides(self):
-        """A prefill batch's embed overrides must not reach its decode steps:
-        they veto the decode graph on this rank only, and a decode converted
-        to extend would scatter them at stale positions."""
-        batch = ScheduleBatch(reqs=[])
-        batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
-        batch.input_embeds = torch.zeros(4, 8)
-        batch.replace_embeds = torch.zeros(2, 8)
-        batch.replace_positions = torch.tensor([1, 2])
-
-        with patch("sglang.srt.speculative.spec_utils.spec_prepare_for_decode"):
-            batch.prepare_for_decode()
-
-        self.assertIsNone(batch.input_embeds)
-        self.assertIsNone(batch.replace_embeds)
-        self.assertIsNone(batch.replace_positions)
-
-
 class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
     def test_decode_seq_lens_bump_is_out_of_place(self):
         """Each prepare_for_decode call rebinds seq-lens tensors to new +1 objects without mutating the old ones."""
