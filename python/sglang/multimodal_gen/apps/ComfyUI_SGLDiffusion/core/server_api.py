@@ -4,6 +4,7 @@ Provides a low-level interface for interacting with SGLang Diffusion HTTP server
 """
 
 import contextlib
+import json
 import os
 import time
 from typing import Any, Callable, Dict, Optional
@@ -330,8 +331,12 @@ class SGLDiffusionServerAPI:
 
         try:
             if uploads:
+                # JSON, not repr: the server json-decodes form values, so a
+                # nested dict or False must not arrive as Python's repr
                 data = {
-                    key: (value if isinstance(value, (str, bytes)) else str(value))
+                    key: (
+                        value if isinstance(value, (str, bytes)) else json.dumps(value)
+                    )
                     for key, value in {**fields, **string_fields}.items()
                 }
                 with contextlib.ExitStack() as stack:

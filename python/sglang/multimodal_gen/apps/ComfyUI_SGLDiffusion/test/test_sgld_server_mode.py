@@ -398,6 +398,24 @@ def test_generate_video_uploads_local_source_video_as_video_reference():
     assert "input_reference" not in seen["data"]
 
 
+def test_generate_video_multipart_fields_are_json_encoded():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    with tempfile.TemporaryDirectory() as tmp:
+        image = os.path.join(tmp, "ref.png")
+        with open(image, "wb") as fh:
+            fh.write(b"fake-png")
+        seen = _capture_video_request(
+            client,
+            input_reference=image,
+            extra_fields={"target": {"type": "image"}, "flag": False},
+        )
+
+    # the server json-decodes form values, so Python repr would break them
+    assert seen["data"]["target"] == '{"type": "image"}'
+    assert seen["data"]["flag"] == "false"
+    assert seen["data"]["prompt"] == "a cat"
+
+
 def test_generate_video_sends_remote_source_video_as_video_path():
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
     for source in ("https://example.com/clip.mp4", "/srv/sglang/inputs/clip.mp4"):
@@ -513,6 +531,15 @@ def test_h3_allows_local_video_reference_against_local_server():
         "/data/clip.mp4", "reference_video", "http://127.0.0.1:3000/v1"
     )
     assert uri == "file:///data/clip.mp4"
+
+
+def test_h3_passes_file_uri_through_for_any_server():
+    # a file:// URI names a path on the server, so it is never rewritten
+    for base_url in ("http://127.0.0.1:3000/v1", "http://remote-host.example:3000/v1"):
+        uri = NODES.SGLDiffusionGenerateH3._remote_material_uri(
+            "file:///srv/clip.mp4", "reference_video", base_url
+        )
+        assert uri == "file:///srv/clip.mp4"
 
 
 # --- server-mode video jobs: no progress bar, Cancel was ignored ------------

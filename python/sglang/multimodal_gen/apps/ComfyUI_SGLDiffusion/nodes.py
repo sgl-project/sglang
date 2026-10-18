@@ -732,7 +732,8 @@ class SGLDiffusionGenerateH3:
         Raise clearly instead of building a `file://` URI that will
         silently fail against any server that isn't local.
         """
-        if value.startswith(("http://", "https://")):
+        # file:// already names a server-side path
+        if value.startswith(("http://", "https://", "file://")):
             return value
         if cls._is_local_server(base_url):
             return f"file://{os.path.abspath(value)}"
