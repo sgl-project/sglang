@@ -181,7 +181,9 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         rsf = 2.5
         for folded, scale_factor in ((False, 1.0 / rsf), (True, 1.0)):
             for m, k, npr, ep_size, ep_rank, s in self.CASES:
-                with self.subTest(m=m, k=k, npr=npr, ep_rank=ep_rank, s=s):
+                with self.subTest(
+                    m=m, k=k, npr=npr, ep_rank=ep_rank, s=s, folded=folded
+                ):
                     shared_id_base, num_local_routed = self._shared_id_base(
                         npr, ep_size, ep_rank, s
                     )

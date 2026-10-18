@@ -249,7 +249,7 @@ if _is_musa:
 
 @dataclass
 class TopKConfig:
-    top_k: int
+    top_k: int  # Ordinary output width: routed experts plus shared TopK slots.
     use_grouped_topk: bool = False
     topk_group: Optional[int] = None
     num_expert_group: Optional[int] = None
@@ -260,6 +260,8 @@ class TopKConfig:
     torch_native: bool = False
     routed_scaling_factor: Optional[float] = None
     apply_routed_scaling_factor_on_output: bool = False
+    # Absolute appended weight for global AITER slots; a multiplier on the
+    # router's shared weights on the other standard path.
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
@@ -585,9 +587,9 @@ class TopK(BaseFusedOp):
       per-layer EPLB state are keyed by it.
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
-    --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
-      topk weight (models pass 1/ep_size under standard EP, where the per-rank shared-expert
-      outputs are all-reduced).
+    --fused_shared_experts_scaling_factor: absolute appended weight on the global AITER
+      path; otherwise multiplies the router's existing shared weight under standard EP.
+      Models include 1/ep_size when the per-rank shared-expert outputs are all-reduced.
     """
 
     def __init__(
