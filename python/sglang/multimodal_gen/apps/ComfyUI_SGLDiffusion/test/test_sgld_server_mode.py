@@ -436,6 +436,64 @@ def test_generate_video_downloads_result_when_server_path_is_not_local():
         assert os.path.dirname(result["file_path"]) == out_dir
 
 
+class _HTTPErrorResponse(_Response):
+    def raise_for_status(self):
+        raise SERVER_API.requests.exceptions.HTTPError(
+            f"{self.status_code} Client Error", response=self
+        )
+
+
+def _completed_video_client(job, max_polls=3):
+    """Client whose job is already completed; /content answers 400, as the
+    server does for a job uploaded to cloud storage. Polling past
+    `max_polls` fails the test instead of looping until max_wait_time."""
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    calls = {"status": 0, "content": 0}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/content"):
+            calls["content"] += 1
+            return _HTTPErrorResponse({"detail": "use the cloud URL"}, 400)
+        calls["status"] += 1
+        assert calls["status"] <= max_polls, "kept polling a completed job"
+        return _Response(job)
+
+    def fake_post(url, **kwargs):
+        return _Response({"id": "job-1"})
+
+    patches = (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(SERVER_API.requests, "post", fake_post),
+        mock.patch.object(SERVER_API.time, "sleep"),
+    )
+    return client, calls, patches
+
+
+def test_generate_video_returns_cloud_url_without_downloading_content():
+    url = "https://bucket.example/job-1.mp4"
+    client, calls, patches = _completed_video_client(
+        {"id": "job-1", "status": "completed", "url": url, "file_path": None}
+    )
+    with tempfile.TemporaryDirectory() as out_dir:
+        with patches[0], patches[1], patches[2]:
+            result = client.generate_video(prompt="a cat", output_path=out_dir)
+    # resolve_video_path fetches the url, as on main.
+    assert result["url"] == url
+    assert result["file_path"] is None
+    assert calls["content"] == 0
+
+
+def test_generate_video_fails_fast_when_result_download_fails():
+    client, calls, patches = _completed_video_client(
+        {"id": "job-1", "status": "completed", "file_path": "/srv/out/job-1.mp4"}
+    )
+    with tempfile.TemporaryDirectory() as out_dir:
+        with patches[0], patches[1], patches[2]:
+            with pytest.raises(RuntimeError, match="400"):
+                client.generate_video(prompt="a cat", output_path=out_dir)
+    assert calls == {"status": 1, "content": 1}
+
+
 def test_h3_image_conditions_use_data_uri_not_local_file_path():
     node = NODES.SGLDiffusionGenerateH3()
     image = torch.zeros(1, 8, 8, 3)

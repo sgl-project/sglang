@@ -387,9 +387,9 @@ class SGLDiffusionServerAPI:
                         progress_callback(int(status["progress"]))
 
                     if status.get("status") == "completed":
-                        return self._localize_video_result(
-                            status, video_id, output_path
-                        )
+                        # Localize outside this try, so a failed download
+                        # fails fast instead of being retried as a poll error.
+                        break
                     elif status.get("status") == "failed":
                         error = status.get("error", {})
                         error_msg = (
@@ -419,10 +419,11 @@ class SGLDiffusionServerAPI:
                     if check_interrupt:
                         check_interrupt()
                     time.sleep(1)
-
-            raise TimeoutError(
-                f"Video generation timed out after {max_wait_time} seconds"
-            )
+            else:
+                raise TimeoutError(
+                    f"Video generation timed out after {max_wait_time} seconds"
+                )
+            return self._localize_video_result(status, video_id, output_path)
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
@@ -434,10 +435,14 @@ class SGLDiffusionServerAPI:
         The server's own ``file_path`` is only readable when the server runs
         on this machine. When it isn't (no such local file), download the
         result through ``GET /videos/{id}/content`` instead of trusting a
-        path that belongs to a different filesystem.
+        path that belongs to a different filesystem. A job uploaded to cloud
+        storage has no file_path and a ``url`` instead; ``/content`` refuses
+        those, so it is returned as is and the node fetches the url.
         """
         file_path = status.get("file_path")
         if file_path and os.path.exists(file_path):
+            return status
+        if not file_path and status.get("url"):
             return status
         target_dir = output_path or os.getcwd()
         os.makedirs(target_dir, exist_ok=True)
