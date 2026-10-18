@@ -18,18 +18,12 @@ register_npu_ci(
 )
 
 # Common environment variables shared by prefill/decode nodes, ported from
-# 2p.sh and d.sh.
+# A3-pro-pd-pcp-cpp-L2cache.sh.
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "TRANSFORMERS_VERBOSITY": "error",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "MF_HYBM_USE_VMM_SEGMENT": "1",
     "STREAMS_PER_DEVICE": "32",
-    "DEEPEP_HCCL_BUFFSIZE": "1536",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_CONNECT_TIMEOUT": "300",
-    "HCCL_EXEC_TIMEOUT": "68",
-    "ACL_DEVICE_SYNC_TIMEOUT": "60",
-    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
+    "SGLANG_SET_CPU_AFFINITY": "1",
     # skip gpu branch
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "FORCE_DRAFT_MODEL_NON_QUANT": "1",
@@ -42,104 +36,55 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     "SGLANG_OPT_FP8_WO_A_GEMM": "False",
     # deepep
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
-    # dspark
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
-    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
-    "SGLANG_DSPARK_QUANT_AUDIT": "1",
-    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    # multi-node
+    "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
-    "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+    # dspark
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
+    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
+    # PD-sep: required when prefill enables CP but decode does not
+    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
 }
 
-# Prefill node environment variables, ported from 2p.sh.
+# Prefill node environment variables, ported from A3-pro-pd-pcp-cpp-L2cache.sh.
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ENVS = {
     **DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS,
-    # cp
-    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
-    # memory fabric for PD KV transfer
-    "ASCEND_MF_STORE_URL": "tcp://127.0.0.1:24667",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
 }
 
-# Decode node environment variables, ported from d.sh.
+# Decode node environment variables, ported from A3-pro-pd-pcp-cpp-L2cache.sh.
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS,
-    "HCCL_BUFFSIZE": "512",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
-    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
-    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "1600",
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
 
-# Prefill node (2 nodes x 16 NPUs, TP16 DP8 PP2 + CP interleave) launch
-# arguments, ported from 2p.sh.
+# Prefill node (2 nodes x 16 NPUs, TP16 PP2 DP8 + CP interleave) launch
+# arguments, ported from A3-pro-pd-pcp-cpp-L2cache.sh.
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
-    "--disaggregation-mode",
-    "prefill",
-    "--disaggregation-transfer-backend",
-    "ascend",
-    "--tp-size",
-    16,
     "--nnodes",
     2,
+    "--tp-size",
+    16,
     "--pp-size",
     2,
     "--dp-size",
     8,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
-    "--trust-remote-code",
-    "--attention-backend",
-    "ascend",
-    "--device",
-    "npu",
-    "--watchdog-timeout",
-    9000,
-    "--max-running-requests",
-    32,
-    "--mem-fraction-static",
-    0.83,
-    "--quantization",
-    "modelslim",
-    "--max-prefill-tokens",
-    9000,
-    "--chunked-prefill-size",
-    8192,
-    "--kv-cache-dtype",
-    "auto",
-    "--moe-dense-tp-size",
-    1,
-    "--cuda-graph-bs-decode",
-    1,
-    2,
-    "--moe-a2a-backend",
-    "deepep",
-    "--deepep-mode",
-    "auto",
-    "--enable-prefill-cp",
-    "--cp-strategy",
-    "interleave",
-    "--disable-radix-cache",
-]
-
-# Decode node (2 nodes x 16 NPUs, TP32 DP16) launch arguments, ported from
-# d.sh.
-DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
+    # sh passes round_robin first and total_tokens later; the last one wins.
+    "--load-balance-method",
+    "total_tokens",
     "--disaggregation-mode",
-    "decode",
+    "prefill",
     "--disaggregation-transfer-backend",
     "ascend",
-    "--tp-size",
-    32,
-    "--nnodes",
-    2,
-    "--dp-size",
-    16,
-    "--enable-dp-attention",
-    "--enable-dp-lm-head",
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
@@ -150,25 +95,72 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     "--max-running-requests",
     64,
     "--mem-fraction-static",
-    0.83,
+    0.82,
     "--quantization",
     "modelslim",
     "--max-prefill-tokens",
-    9000,
+    70000,
     "--chunked-prefill-size",
-    8192,
-    "--kv-cache-dtype",
-    "auto",
-    "--moe-dense-tp-size",
-    1,
-    "--cuda-graph-bs-decode",
-    1,
-    2,
+    65536,
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
     "auto",
-    "--disable-radix-cache",
+    "--disable-cuda-graph",
+    "--enable-prefill-cp",
+    "--cp-strategy",
+    "interleave",
+    "--enable-metrics",
+    "--enable-cache-report",
+    "--enable-hierarchical-cache",
+    "--hicache-io-backend",
+    "kernel_ascend",
+    "--hicache-ratio",
+    1.5,
+    "--hicache-write-policy",
+    "write_through",
+    "--max-total-tokens",
+    140000,
+]
+
+# Decode node (2 nodes x 16 NPUs, TP32 DP4) launch arguments, ported from
+# A3-pro-pd-pcp-cpp-L2cache.sh.
+DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
+    "--nnodes",
+    2,
+    "--tp-size",
+    32,
+    "--dp-size",
+    4,
+    "--enable-dp-attention",
+    "--enable-dp-lm-head",
+    "--load-balance-method",
+    "round_robin",
+    "--disaggregation-mode",
+    "decode",
+    "--disaggregation-transfer-backend",
+    "ascend",
+    "--trust-remote-code",
+    "--attention-backend",
+    "ascend",
+    "--device",
+    "npu",
+    "--watchdog-timeout",
+    9000,
+    "--max-running-requests",
+    8,
+    "--mem-fraction-static",
+    0.78,
+    "--quantization",
+    "modelslim",
+    "--moe-a2a-backend",
+    "deepep",
+    "--deepep-mode",
+    "auto",
+    "--cuda-graph-bs-decode",
+    1,
+    2,
+    8,
     # DSPARK speculative decoding with the bundled draft weights.
     "--speculative-algorithm",
     "DSPARK",
@@ -180,8 +172,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     "ascend",
     "--speculative-num-draft-tokens",
     6,
-    "--speculative-dspark-block-size",
-    5,
+    "--enable-metrics",
 ]
 
 # Model config for DSV4-Pro W4A8 2P+2D PD-Sep deployment.
@@ -210,18 +201,14 @@ DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH = {
 class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(
     TestNpuAccuracyMultiNodePdSepTestCaseBase
 ):
-    """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 PD-Sep GPQA High mode.
-
-    Requirement: DSV4_Pro_Radix_Cache_0 (step 2, 1P1D PD separation with
-    radix cache enabled).
-    """
+    """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 32p 1P1D GPQA"""
 
     model_config = DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG
-    # TODO: calibrate the baseline on the first successful run.
+    # (reference: Pro W4A8 GPQA Diamond baseline is 0.85).
     accuracy = 0.85
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 64
+    eval_batch_size = 128
 
     def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
@@ -230,35 +217,24 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(
 class TestNPUDeepSeekV4ProW4A8PDSEPIn128kOut1kPrefix90(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
-    """Test NPU perf for DeepSeek-V4-Pro W4A8 PD-Sep 2P+2D in128k prefix90.
+    """Test NPU performance for DeepSeek-V4-Pro W4A8 32p 1P1D in128k out1k 90PrefixCache."""
 
-    Requirement: DSV4_Pro_Radix_Cache_0 (step 4, PD separation 128k input
-    with 90% radix-cache hit rate). The shared-prefix dataset makes 90% of
-    each input length a repeated prefix, so radix cache hits should reduce
-    TTFT noticeably compared with the random-input test above.
-    """
-
-    model_config = DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    model_config = DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
-    repeat_rate = 0.9
+    max_concurrency = 32
+    num_prompts = 32
     input_len = 131072
     output_len = 1024
-    num_prompts = 32
-    max_concurrency = 32
     random_range_ratio = 1
-    warmup_requests = 0
-    request_rate = float("inf")
     seed = 1
-    temperature = 0.6
-    top_p = 0.95
-    # TODO: calibrate tpot / output_token_throughput / ttft baselines on the
-    # first successful run, then set them here to enable regression assertions.
+    repeat_rate = 0.9
+    request_rate = float("inf")
+    warmup_requests = 16
     pop_sglang_is_in_ci_for_gsp = True
 
     def test_npu_deepseek_v4_pro_w4a8_pd_sep_in128k_out1k_prefix90(self):
-        """Run NPU perf test for DSV4-Pro W4A8 PD-Sep in128k prefix90."""
+        """Run NPU performance test for DeepSeek-V4-Pro W4A8 32p 1P1D in128k out1k 90PrefixCache."""
         self.run_throughput()
 
 

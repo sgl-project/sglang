@@ -222,7 +222,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH = {
 class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     TestNpuAccuracyMultiNodePdSepTestCaseBase
 ):
-    """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D DSPARK GPQA."""
+    """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
@@ -236,13 +236,12 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
         self.run_accuracy()
 
 class TestNPUDeepSeekV4Flash0731W8A81P1D16PIn128kOut1k90PrefixCache(TestNpuPerfMultiNodePdSepTestCaseBase):
-    """Test NPU performance for Qwen3.6-27B-w8a8 2p in128k out1k 50ms"""
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 16p 1P1D in128k out1k 90PrefixCache."""
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 20
-    num_prompts = 20
+    max_concurrency = 32
+    num_prompts = 32
     input_len = 131072
     output_len = 1024
     random_range_ratio = 1
@@ -253,8 +252,8 @@ class TestNPUDeepSeekV4Flash0731W8A81P1D16PIn128kOut1k90PrefixCache(TestNpuPerfM
     pop_sglang_is_in_ci_for_gsp = True
 
 
-    def test_npu_qwen3_6_27b_2p_in128k_out1k_50ms(self):
-        """Run NPU performance test for Qwen3.6-27B-w8a8 in128k out1k 50ms"""
+    def test_npu_qwen3_6_27b_2p_in128k_out1k(self):
+        """Run NPU performance test for DeepSeek-V4-Flash W8A8 16p 1P1D in128k out1k 90PrefixCache."""
         self.run_throughput()
 
 
