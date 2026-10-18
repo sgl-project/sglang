@@ -76,7 +76,7 @@ pub async fn prefetch_all(
         .collect::<Result<Vec<_>, String>>()?;
     let fetches = plans
         .into_iter()
-        .map(|sources| fetch_ordered(sources, MAX_REQUEST_BYTES));
+        .map(|sources| fetch_ordered(sources, MAX_REQUEST_BYTES, &PERMITS));
     let fetched = futures::future::try_join_all(fetches).await?;
     for (req, bytes) in requests.iter_mut().zip(fetched) {
         if !bytes.is_empty() {
@@ -91,17 +91,24 @@ pub async fn prefetch_all(
 /// per-source cap, matching Python's URL-only security limit. Overflow rejects
 /// before or during I/O and `try_join_all` drops the rest, so queued sources
 /// never start.
-async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Bytes>, String> {
+async fn fetch_ordered(
+    sources: Vec<String>,
+    total_bytes: u64,
+    permits: &'static Semaphore,
+) -> Result<Vec<Bytes>, String> {
     let budget = Arc::new(ByteBudget::new(total_bytes));
     futures::future::try_join_all(sources.into_iter().map(|src| {
         let budget = Arc::clone(&budget);
         async move {
-            let _permit = PERMITS.acquire().await.expect("semaphore never closed");
+            let permit = permits.acquire().await.expect("semaphore never closed");
             // Blocking I/O: parks a lazily-spawned blocking-pool thread, never
             // an API worker. Those threads are pinned round-robin over the api
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
             tokio::task::spawn_blocking(move || {
+                // A cancelled waiter cannot stop blocking I/O. Keep its slot
+                // occupied until the fetch itself returns or unwinds.
+                let _permit = permit;
                 if src.starts_with('/') || src.starts_with("file://") {
                     fetch_local_file_budgeted(&src, &budget)
                 } else {
@@ -275,7 +282,7 @@ mod tests {
             format!("http://{addr}/b.png"),
         ];
         // Room for one body, not both.
-        let err = fetch_ordered(sources, 6144).await.err().unwrap();
+        let err = fetch_ordered(sources, 6144, &PERMITS).await.err().unwrap();
         assert!(err.contains("request media byte budget"), "{err}");
     }
 
@@ -287,7 +294,9 @@ mod tests {
             format!("http://{addr}/a.png"),
             format!("http://{addr}/b.png"),
         ];
-        let fetched = fetch_ordered(sources, MAX_REQUEST_BYTES).await.unwrap();
+        let fetched = fetch_ordered(sources, MAX_REQUEST_BYTES, &PERMITS)
+            .await
+            .unwrap();
         assert_eq!(fetched.iter().map(|b| b.len()).sum::<usize>(), 8192);
     }
 
@@ -304,10 +313,122 @@ mod tests {
         std::fs::write(&second, b"second").unwrap();
 
         let sources = vec![first.display().to_string(), second.display().to_string()];
-        let fetched = fetch_ordered(sources.clone(), 11).await.unwrap();
-        let error = fetch_ordered(sources, 10).await.err().unwrap();
+        let fetched = fetch_ordered(sources.clone(), 11, &PERMITS).await.unwrap();
+        let error = fetch_ordered(sources, 10, &PERMITS).await.err().unwrap();
         std::fs::remove_dir_all(base).ok();
         assert_eq!(fetched.len(), 2);
         assert!(error.contains("request media byte budget"), "{error}");
+    }
+
+    struct GatedFetch {
+        url: String,
+        started: tokio::sync::oneshot::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    fn gated_fetch(status: u16) -> GatedFetch {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            started_tx.send(()).unwrap();
+            // Bound cleanup if the assertion path fails; the test never sleeps
+            // to infer whether a download has started or finished.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let _ = write!(
+                reader.into_inner(),
+                "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\n\r\nok"
+            );
+        });
+        GatedFetch {
+            url: format!("http://{address}/image"),
+            started,
+            release,
+            server,
+        }
+    }
+
+    async fn check_cancelled_fetch_permit(permits: &'static Semaphore, reject_sibling: bool) {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let slow = gated_fetch(200);
+        let rejected = reject_sibling.then(|| gated_fetch(503));
+        let mut sources = vec![slow.url];
+        if let Some(rejected) = &rejected {
+            sources.push(rejected.url.clone());
+        }
+        let fetch = tokio::spawn(fetch_ordered(sources, MAX_REQUEST_BYTES, permits));
+        timeout(Duration::from_secs(2), slow.started)
+            .await
+            .expect("slow download did not start")
+            .unwrap();
+
+        if let Some(rejected) = rejected {
+            timeout(Duration::from_secs(2), rejected.started)
+                .await
+                .expect("failing download did not start")
+                .unwrap();
+            rejected.release.send(()).unwrap();
+            let error = timeout(Duration::from_secs(2), fetch)
+                .await
+                .expect("failed batch did not return")
+                .unwrap()
+                .unwrap_err();
+            assert!(error.contains("503"), "{error}");
+            rejected.server.join().unwrap();
+        } else {
+            fetch.abort();
+            assert!(fetch.await.unwrap_err().is_cancelled());
+        }
+
+        let available_while_downloading = permits.available_permits();
+        // The cancelled download occupies one slot, leaving the second usable
+        // by a live request before the slow server has sent any response.
+        let live_address = serve(vec![b"live".to_vec()]);
+        let live = timeout(
+            Duration::from_secs(2),
+            fetch_ordered(
+                vec![format!("http://{live_address}/live")],
+                MAX_REQUEST_BYTES,
+                permits,
+            ),
+        )
+        .await
+        .expect("live request could not use the remaining fetch slot")
+        .unwrap();
+        assert_eq!(live[0].as_ref(), b"live");
+        slow.release.send(()).unwrap();
+        let _all_permits = timeout(Duration::from_secs(2), permits.acquire_many(2))
+            .await
+            .expect("finished download did not release its permit")
+            .unwrap();
+        slow.server.join().unwrap();
+        assert_eq!(
+            available_while_downloading, 1,
+            "cancelled caller released the permit before blocking I/O finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_prefetch_keeps_ongoing_download_permit() {
+        static TEST_PERMITS: Semaphore = Semaphore::const_new(2);
+        check_cancelled_fetch_permit(&TEST_PERMITS, false).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_keeps_ongoing_download_permit() {
+        static TEST_PERMITS: Semaphore = Semaphore::const_new(2);
+        check_cancelled_fetch_permit(&TEST_PERMITS, true).await;
     }
 }
