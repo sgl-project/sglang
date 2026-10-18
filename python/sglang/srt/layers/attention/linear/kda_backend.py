@@ -941,7 +941,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
-        # The packed kernel assumes one token per request.
+        # Packed T=1 implements lower_bound when the kernel opts in.
+        # Kimi-K3 always sets lower_bound; Triton sets the safe-gate flag.
         if self.kernel_dispatcher.supports_packed_decode and (
             getattr(layer, "lower_bound", None) is None
             or self.kernel_dispatcher.supports_packed_decode_safe_gate

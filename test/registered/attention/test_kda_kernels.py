@@ -710,6 +710,138 @@ class TestKDAPackedDecode(unittest.TestCase):
             rtol=1e-2,
         )
 
+    def test_graph_replay_bf16_safe_gate_with_pad(self):
+        """Graph replay of packed decode with bf16 SSM, lower_bound, and pads."""
+        device = get_device()
+        B, H, HV, K, V = 8, 12, 12, 128, 128
+        lower_bound = -5.0
+        pool_size = B + 4
+        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
+            B, H, HV, K, V, pool_size, torch.bfloat16, device
+        )
+        cache_indices = cache_indices.clone()
+        cache_indices[4:] = -1
+
+        s_eager = ssm_states.clone()
+        o_eager = self._run_packed(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            s_eager,
+            cache_indices,
+            HV,
+            K,
+            V,
+            lower_bound=lower_bound,
+        )
+
+        s_graph = ssm_states.clone()
+        out = mixed_qkv.new_empty(B, 1, HV, V)
+        # Warmup outside the graph, then capture + replay on a restored pool.
+        fused_recurrent_kda_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=K**-0.5,
+            initial_state=s_graph,
+            out=out,
+            ssm_state_indices=cache_indices,
+            use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
+        )
+        s_graph.copy_(ssm_states)
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(graph):
+                fused_recurrent_kda_packed_decode(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=K**-0.5,
+                    initial_state=s_graph,
+                    out=out,
+                    ssm_state_indices=cache_indices,
+                    use_qk_l2norm_in_kernel=True,
+                    lower_bound=lower_bound,
+                )
+        torch.cuda.current_stream().wait_stream(stream)
+        s_graph.copy_(ssm_states)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            out.transpose(0, 1).float(), o_eager.float(), atol=0, rtol=0
+        )
+        torch.testing.assert_close(s_graph.float(), s_eager.float(), atol=0, rtol=0)
+        torch.testing.assert_close(
+            out[4:].float(),
+            torch.zeros_like(out[4:]).float(),
+            atol=0,
+            rtol=0,
+        )
+
+
+@unittest.skipIf(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    "Test requires CUDA or XPU",
+)
+class TestKDAFusedSigmoidVarlenPadding(CustomTestCase):
+    """Varlen fused_sigmoid must write zeros for T=0 graph-padded rows."""
+
+    def test_t0_padded_rows_write_zeros(self):
+        device = get_device()
+        H = HV = 12
+        K = V = 128
+        B = 4
+        valid = 2
+        q = torch.randn(1, B, H, K, device=device, dtype=torch.bfloat16)
+        k = torch.randn(1, B, H, K, device=device, dtype=torch.bfloat16)
+        v = torch.randn(1, B, HV, V, device=device, dtype=torch.bfloat16)
+        a = torch.randn(1, B, HV * K, device=device, dtype=torch.bfloat16)
+        b = torch.randn(1, B, HV, device=device, dtype=torch.bfloat16)
+        A_log = torch.randn(1, 1, HV, 1, device=device, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV * K, device=device, dtype=torch.float32) * 0.1
+        state = torch.randn(B + 2, HV, V, K, device=device, dtype=torch.bfloat16) * 0.05
+        idx = torch.arange(B, device=device, dtype=torch.int32)
+        idx[valid:] = -1
+        # Graph padding: valid rows T=1, padded rows T=0.
+        cu = torch.tensor([0, 1, 2, 2, 2], device=device, dtype=torch.int32)
+        out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=idx,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu,
+            is_kda=True,
+            lower_bound=-5.0,
+        )
+        self.assertFalse(torch.isnan(out).any())
+        token_out = out[0] if out.ndim == 4 and out.shape[0] == 1 else out
+        self.assertTrue(torch.any(token_out[0] != 0))
+        torch.testing.assert_close(
+            token_out[valid:].float(),
+            torch.zeros_like(token_out[valid:]).float(),
+            atol=0,
+            rtol=0,
+        )
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAVerifyDecodeParity(CustomTestCase):

@@ -255,6 +255,23 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    # T=0 is graph padding. o is new_empty, so write zeros.
+    # Pad rows share one bos, so also zero this program's own row.
+    if T <= 0:
+        tl.store(
+            p_o,
+            tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty),
+            mask=mask_v,
+        )
+        if i_n < all and i_n > bos:
+            p_row = o + ((i_k * all + i_n) * HV + i_hv) * V + o_v
+            tl.store(
+                p_row,
+                tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty),
+                mask=mask_v,
+            )
+        return
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
         # Slot stride comes from the caller (h0_source.stride(0)): the state pool
