@@ -5,6 +5,8 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -197,6 +199,36 @@ class TestSRTPlatform(CustomTestCase):
                 return True
 
         self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
+    def test_in_tree_graph_factories(self):
+        stubs = {
+            "sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner": "NPUGraphRunner",
+            "sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner": "XPUGraphRunner",
+            "sglang.srt.model_executor.cpu_graph_runner": "CPUGraphRunner",
+            "sglang.srt.compilation.npu_piecewise_backend": "NPUPiecewiseBackend",
+            "sglang.srt.compilation.xpu_piecewise_backend": "XPUPiecewiseBackend",
+        }
+        modules, classes = {}, {}
+        for module_name, cls_name in stubs.items():
+            classes[cls_name] = type(cls_name, (), {})
+            modules[module_name] = types.ModuleType(module_name)
+            setattr(modules[module_name], cls_name, classes[cls_name])
+
+        cases = [
+            (SRTPlatform, None, None),
+            (CudaSRTPlatform, None, None),
+            (RocmSRTPlatform, None, None),
+            (MpsSRTPlatform, None, None),
+            (NPUSRTPlatform, classes["NPUGraphRunner"], classes["NPUPiecewiseBackend"]),
+            (XpuSRTPlatform, classes["XPUGraphRunner"], classes["XPUPiecewiseBackend"]),
+            (CpuSRTPlatform, classes["CPUGraphRunner"], None),
+        ]
+        with patch.dict(sys.modules, modules):
+            for platform_cls, graph_runner_cls, piecewise_cls in cases:
+                with self.subTest(platform=platform_cls.__name__):
+                    platform = platform_cls()
+                    self.assertIs(platform.get_graph_runner_cls(), graph_runner_cls)
+                    self.assertIs(platform.get_piecewise_backend_cls(), piecewise_cls)
 
 
 class TestCudaDeviceMixin(CustomTestCase):

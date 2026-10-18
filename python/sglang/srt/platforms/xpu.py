@@ -99,3 +99,15 @@ class XpuSRTPlatform(XpuDeviceMixin, SRTPlatform):
         graph_capture=True,
         piecewise_graph=True,
     )
+
+    def get_graph_runner_cls(self) -> type:
+        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import (
+            XPUGraphRunner,
+        )
+
+        return XPUGraphRunner
+
+    def get_piecewise_backend_cls(self) -> type:
+        from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
+
+        return XPUPiecewiseBackend

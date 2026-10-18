@@ -17,9 +17,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
-from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -725,15 +722,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
             hook="get_graph_runner_cls()",
             subsystem="CUDA graph runner",
         )
-        graph_runners = defaultdict(
-            model_runner._decode_cuda_graph_runner_cls,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-                "xpu": XPUGraphRunner,
-            },
-        )
-        GraphRunnerCls = graph_runners[model_runner.device]
+        GraphRunnerCls = model_runner._decode_cuda_graph_runner_cls()
     runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

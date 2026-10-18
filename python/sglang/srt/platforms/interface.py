@@ -109,11 +109,8 @@ class SRTPlatform(DeviceMixin):
         raise NotImplementedError
 
     def get_graph_runner_cls(self) -> Optional[type]:
-        """Return the graph runner class, or None for the in-tree default.
-
-        ``None`` means "no platform opinion": the caller falls back to the
-        in-tree device-keyed selection.
-        """
+        """Return the decode graph runner class, or None for the model
+        runner's own decode CUDA-graph runner."""
         return None
 
     def get_full_graph_backend_cls(self) -> type[Any]:
@@ -173,7 +170,7 @@ class SRTPlatform(DeviceMixin):
 
     def get_piecewise_backend_cls(self) -> Optional[type]:
         """Return the piecewise compilation backend class, or None for the
-        in-tree device-keyed default."""
+        CUDA piecewise backend."""
         return None
 
     def get_speculative_cache_locs_fn(

@@ -21,13 +21,10 @@ from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
-from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import require_out_of_tree_impl
-from sglang.srt.utils.common import is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +57,7 @@ def make_backend(
             hook="get_piecewise_backend_cls()",
             subsystem="piecewise compilation backend",
         )
-        if is_xpu():
-            backend_cls = XPUPiecewiseBackend
-        elif is_npu():
-            backend_cls = NPUPiecewiseBackend
-        else:
-            backend_cls = CUDAPiecewiseBackend
+        backend_cls = CUDAPiecewiseBackend
     return backend_cls(
         graph,
         compile_config,
