@@ -220,11 +220,16 @@ class ForwardMetadata:
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
     prefill_seqlen_k: Optional[torch.Tensor] = None
+    # Updated once per batch; graph replay uses stable preallocated storage.
+    verify_seqlen_k: Optional[torch.Tensor] = None
     # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
     # once per batch by AiterAttnBackend._asm_context_prefill_indices.
     asm_ctx_ready: bool = False
     asm_ctx_tok_idx: Optional[torch.Tensor] = None
     asm_ctx_cu_k: Optional[torch.Tensor] = None
+    # Retain the updater's token-level view when kv_indices becomes a page table.
+    # This aliases existing storage for the #39901 per-batch gather cache.
+    kv_token_indices: Optional[torch.Tensor] = None
     # (page_indptr, page_ids, last_page_len); None means use the token-level table
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
     prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
@@ -1240,19 +1245,24 @@ class AiterAttnBackend(AttentionBackend):
         dim to the next power of two and reads the same paged KV the decode path
         reads, so one kernel serves prefill and decode."""
         bs = forward_batch.batch_size
-        max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
-        page_table, swa_page_table = self._build_extend_unified_page_table(
-            bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
-        )
-
-        # Build cu_seqlens_q from this batch's extend lengths. The standard
-        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
-        # ForwardMetadata), so relying on it corrupts multi-sequence batches
-        # (only bs=1 happens to work).
-        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
-        cu_seqlens_q[1:] = torch.cumsum(
-            forward_batch.extend_seq_lens.to(torch.int32), dim=0
-        )
+        fm = self.forward_metadata
+        reuse_metadata = os.environ.get("MUSE_REUSE_EXTEND_METADATA", "0") == "1"
+        if reuse_metadata and self.page_size > 1:
+            # init_forward_metadata already built both page tables. The prefill
+            # updater also computed these query boundaries before any layer ran.
+            page_table = fm.kv_indices
+            swa_page_table = fm.swa_page_table
+            cu_seqlens_q = fm.qo_indptr
+            assert page_table.ndim == 2 and cu_seqlens_q is not None
+        else:
+            max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+            page_table, swa_page_table = self._build_extend_unified_page_table(
+                bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+            )
+            cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
+            cu_seqlens_q[1:] = torch.cumsum(
+                forward_batch.extend_seq_lens.to(torch.int32), dim=0
+            )
 
         # unified_attention uses (left, right) window = (window-1, 0), NOT the
         # CK convention (window, -1). Match the decode path (`de_window`).
@@ -1365,6 +1375,9 @@ class AiterAttnBackend(AttentionBackend):
         if fm.asm_ctx_ready:
             return fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k
         fm.asm_ctx_ready = True
+        kv_indices = (
+            fm.kv_token_indices if fm.kv_token_indices is not None else fm.kv_indices
+        )
         total_k = 0
         if (
             forward_batch.spec_info is None
@@ -1372,15 +1385,15 @@ class AiterAttnBackend(AttentionBackend):
             and forward_batch.seq_lens_cpu is not None
         ):
             total_k = int(forward_batch.seq_lens_cpu[:bs].sum())
-        if 0 < total_k <= fm.kv_indices.numel():
-            tok_idx = fm.kv_indices[:total_k]
+        if 0 < total_k <= kv_indices.numel():
+            tok_idx = kv_indices[:total_k]
             cu_k = fm.kv_indptr[: bs + 1]
             if cu_k.dtype != torch.int32:
                 cu_k = cu_k.to(torch.int32)
             if _GFX_ASM_CTX_GATHER_CHECK:
                 ref = _asm_context_prefill_gather_indices(
                     fm.kv_indptr[: bs + 1],
-                    fm.kv_indices,
+                    kv_indices,
                     forward_batch.seq_lens[:bs],
                     num_kv_slots,
                     forward_batch.forward_mode,
@@ -1400,7 +1413,7 @@ class AiterAttnBackend(AttentionBackend):
         else:
             gathered = _asm_context_prefill_gather_indices(
                 fm.kv_indptr[: bs + 1],
-                fm.kv_indices,
+                kv_indices,
                 forward_batch.seq_lens[:bs],
                 num_kv_slots,
                 forward_batch.forward_mode,
@@ -2499,6 +2512,11 @@ class AiterAttnBackend(AttentionBackend):
                         max_extend_len=max_q_len,
                         swa_page_table=swa_page_table,
                         swa_out_cache_loc=swa_out_cache_loc,
+                        verify_seqlen_k=(
+                            forward_batch.seq_lens[:bs] + draft_num
+                            if os.environ.get("MUSE_REUSE_VERIFY_LENGTHS", "0") == "1"
+                            else None
+                        ),
                     )
                 else:
                     qo_indptr = torch.arange(
@@ -2649,7 +2667,11 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     kv_indices,
-                    None,
+                    (
+                        self.qo_indptr[: bs + 1]
+                        if os.environ.get("MUSE_REUSE_EXTEND_METADATA", "0") == "1"
+                        else None
+                    ),
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
@@ -2661,6 +2683,11 @@ class AiterAttnBackend(AttentionBackend):
                         else None
                     ),
                     paged_kv_view=paged_kv_view,
+                    kv_token_indices=(
+                        self.indices_updater_prefill.kv_indices
+                        if os.environ.get("MUSE_REUSE_EXTEND_METADATA", "0") == "1"
+                        else None
+                    ),
                 )
 
     def _plan_dcp_decode_metadata(
@@ -2812,6 +2839,9 @@ class AiterAttnBackend(AttentionBackend):
                     (max_bs + 1,), dtype=torch.int32, device=self.device
                 )
 
+        self.cuda_graph_verify_seqlen_k = torch.empty(
+            max_bs, dtype=torch.int64, device=self.device
+        )
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
@@ -3359,6 +3389,14 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     )
 
+                    # This buffer is refilled by replay preparation, never
+                    # replaced. Every layer in the captured graph reads it.
+                    verify_seqlen_k = None
+                    if os.environ.get("MUSE_REUSE_VERIFY_LENGTHS", "0") == "1":
+                        verify_seqlen_k = self.cuda_graph_verify_seqlen_k[:bs]
+                        torch.add(
+                            seq_lens[:bs], verify_tokens_per_req, out=verify_seqlen_k
+                        )
                     max_kv_len_unified = max_num_blocks_per_seq * self.page_size
                     self.forward_metadata = ForwardMetadata(
                         None,
@@ -3369,6 +3407,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_kv_len_unified,
                         max_extend_len=_max_q_len,
                         swa_page_table=_swa_page_table,
+                        verify_seqlen_k=verify_seqlen_k,
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
@@ -4202,6 +4241,11 @@ class AiterAttnBackend(AttentionBackend):
                         if self.forward_metadata.swa_page_table is not None:
                             page_table = self.forward_metadata.swa_page_table
 
+                    seqused_k = self.forward_metadata.verify_seqlen_k
+                    if seqused_k is None:
+                        seqused_k = (
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        )
                     q_unified = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     k_unified = k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
@@ -4251,9 +4295,7 @@ class AiterAttnBackend(AttentionBackend):
                             v=v_unified,
                             out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                             cu_seqlens_q=self.forward_metadata.qo_indptr,
-                            seqused_k=(
-                                forward_batch.seq_lens + self.forward_metadata.max_q_len
-                            ),
+                            seqused_k=seqused_k,
                             max_seqlen_q=self.forward_metadata.max_q_len,
                             max_seqlen_k=max_kv_len,
                             softmax_scale=layer.scaling,
@@ -4273,18 +4315,16 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
-                    # The seq_lens + draft_num add has to run INSIDE the graph
-                    # region; a host-side pre-add would allocate a new tensor
-                    # each replay and break the captured pointer.
+                    # Reused lengths live in a stable graph buffer, refreshed
+                    # in replay preparation. Without reuse, compute them in
+                    # the captured graph as before.
                     unified_attention(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=seqused_k,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
