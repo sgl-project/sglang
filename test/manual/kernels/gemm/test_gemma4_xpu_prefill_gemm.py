@@ -107,6 +107,7 @@ class TestGemma4PrefillGemm(CustomTestCase):
                         mlp._xpu_gate_up_gelu_table, owner._xpu_gate_up_lut_owner
                     )
                 for mlp in (wide, narrow):
+                    torch._dynamo.reset()
                     graphs = []
 
                     def backend(graph, _):
@@ -114,6 +115,13 @@ class TestGemma4PrefillGemm(CustomTestCase):
                         return graph.forward
 
                     compiled = torch.compile(mlp, backend=backend, fullgraph=True)
+                    for rows in mlp._xpu_prefill_gate_up_rows:
+                        short = torch.full(
+                            (rows, 1536), 1 / 32, device="xpu", dtype=torch.bfloat16
+                        )
+                        torch.testing.assert_close(
+                            compiled(short), reference(mlp, short), atol=0, rtol=0
+                        )
                     original_weight = mlp.gate_up_proj.weight.detach().clone()
                     for offset, scale in ((32, 1), (1, 0.5), (0, -1)):
                         x = torch.full(
@@ -175,12 +183,14 @@ class TestGemma4PrefillGemm(CustomTestCase):
                         )
 
                     mlp._xpu_prefill_gate_up_lut = forbidden
+                    # Unadmitted rows retain the original parent MLP path.
                     mlp._xpu_gelu_mul_lut = forbidden
-                    # M128 remains the ordinary parent model route.
-                    small = x[:128].contiguous()
-                    torch.testing.assert_close(
-                        mlp(small), Gemma3MLP.forward(mlp, small), atol=0, rtol=0
-                    )
+                    for rows in (1, 26, 61, 128, 512):
+                        small = x[:rows].contiguous()
+                        torch.testing.assert_close(
+                            mlp(small), Gemma3MLP.forward(mlp, small), atol=0, rtol=0
+                        )
+                    mlp._xpu_gelu_mul_lut = forbidden
                     for method in ("forward_xpu", "_forward_impl"):
                         original = getattr(mlp.act_fn, method)
                         calls = []
@@ -230,7 +240,7 @@ class TestGemma4PrefillGemm(CustomTestCase):
                 self.assertTrue(
                     hasattr(torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20")
                 )
-                for mode in ("missing", "false", "wide_only"):
+                for mode in ("missing", "false", "wide_only", "legacy_4096"):
                     with self.subTest(mode=mode):
                         for intermediate in (6144, 12288):
                             original = getattr(sgl_kernel, _QUERY)
@@ -238,7 +248,9 @@ class TestGemma4PrefillGemm(CustomTestCase):
 
                             def unsupported(*shape):
                                 calls.append(shape)
-                                return mode == "wide_only" and shape[1] == 24576
+                                return (mode == "wide_only" and shape[1] == 24576) or (
+                                    mode == "legacy_4096" and shape[0] == 4096
+                                )
 
                             try:
                                 if mode == "missing":
@@ -248,7 +260,7 @@ class TestGemma4PrefillGemm(CustomTestCase):
                                 mlp = make_mlp(intermediate)
                             finally:
                                 setattr(sgl_kernel, _QUERY, original)
-                            native_expected = (
+                            native_expected = mode == "legacy_4096" or (
                                 mode == "wide_only" and intermediate == 12288
                             )
                             self.assertEqual(
@@ -257,8 +269,22 @@ class TestGemma4PrefillGemm(CustomTestCase):
                             )
                             if mode != "missing":
                                 self.assertEqual(
-                                    calls, [(4096, 2 * intermediate, 1536)]
+                                    calls,
+                                    [
+                                        (rows, 2 * intermediate, 1536)
+                                        for rows in (256, 1024, 2048, 4095, 4096)
+                                    ],
                                 )
+                            self.assertEqual(
+                                mlp._xpu_prefill_gate_up_rows,
+                                (4096,)
+                                if mode == "legacy_4096"
+                                else (
+                                    (256, 1024, 2048, 4095, 4096)
+                                    if native_expected
+                                    else ()
+                                ),
+                            )
                             owner = make_owner(mlp)
                             self.assertIs(
                                 mlp._xpu_gate_up_gelu_table,
