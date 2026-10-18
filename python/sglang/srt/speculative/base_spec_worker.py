@@ -53,6 +53,27 @@ def _can_pack_hicache_mtp(
     return is_nextn_mtp or is_dspark_dsv4
 
 
+def _hicache_mtp_kv_rows_match(target_pool, draft_pools) -> bool:
+    from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+        is_mla_pool,
+        packed_kv_rows_match,
+    )
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    def unwrap(pool):
+        return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+
+    target_pool = unwrap(target_pool)
+    draft_pools = tuple(map(unwrap, draft_pools))
+    if not is_mla_pool(target_pool):
+        return True
+    # A separate draft KV dtype changes the MLA row the packed host pool
+    # shares with the target, even for the model's own MTP layer.
+    return all(map(is_mla_pool, draft_pools)) and packed_kv_rows_match(
+        kv_pool=target_pool, drafts=draft_pools, use_mla=True
+    )
+
+
 class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
@@ -274,7 +295,6 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
-            target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = getattr(
                 target_model_runner.req_to_token_pool, "mamba_pool", None
             )
@@ -284,22 +304,42 @@ class BaseSpecWorker(ABC):
             )
             # Shared state is already backed up with the target. Separate
             # draft state follows the target's Mamba slot indices.
-            if any(
+            separate_draft_state = any(
                 pool is not None and pool is not target_mamba_pool
                 for pool in draft_mamba_pools
-            ):
-                assert target_mamba_pool is not None, (
-                    "Packed draft state requires target Mamba slot indices"
-                )
-                assert all(
-                    pool is not None and pool is not target_mamba_pool
-                    for pool in draft_mamba_pools
-                ), "Packed MTP requires separate state for every draft layer"
-                target_model_runner.mtp_draft_mamba_pools = draft_mamba_pools
-            return HiCacheDraftPlan(
-                mode=HiCacheDraftMode.PACKED,
-                device_pools=draft_pools,
             )
+            if _hicache_mtp_kv_rows_match(
+                target_model_runner.token_to_kv_pool, draft_pools
+            ):
+                target_model_runner.mtp_draft_device_pools = draft_pools
+                if separate_draft_state:
+                    assert target_mamba_pool is not None, (
+                        "Packed draft state requires target Mamba slot indices"
+                    )
+                    assert all(
+                        pool is not None and pool is not target_mamba_pool
+                        for pool in draft_mamba_pools
+                    ), "Packed MTP requires separate state for every draft layer"
+                    target_model_runner.mtp_draft_mamba_pools = draft_mamba_pools
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.PACKED,
+                    device_pools=draft_pools,
+                )
+            if separate_draft_state:
+                # Only packed MTP backs up separate draft recurrent state.
+                raise NotImplementedError(
+                    "HiCache with separate MTP draft recurrent state requires the "
+                    "draft KV rows to match the target's (same kv_cache_dim and "
+                    "store dtype)."
+                )
+            if len(draft_pools) > 1:
+                # The sidecar keeps only the first runner, so later MTP depths
+                # would silently lose their host copies.
+                raise NotImplementedError(
+                    "HiCache with multiple MTP draft runners requires the draft "
+                    "KV rows to match the target's (same kv_cache_dim and "
+                    "store dtype). The separate draft sidecar supports one runner."
+                )
 
         if get_memory().enable_unified_cache_external_linker:
             raise NotImplementedError(
