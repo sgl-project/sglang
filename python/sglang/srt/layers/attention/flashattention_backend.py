@@ -93,6 +93,8 @@ class FlashAttentionMetadata:
     # CUDA graph (built once per forward, reused across layers). See forward_extend.
     fa_skip_cu_seqlens_q: torch.Tensor = None
     fa_skip_max_seqlen_q: int = None
+    # Packed absolute image ranges for Gemma4 prefill; None for text/decode.
+    image_token_ranges: torch.Tensor = None
     # Window size (typically used by Gemma)
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
@@ -1387,6 +1389,41 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
+    def get_fused_kv_write_buffers(self, layer, forward_batch):
+        if (
+            self.kv_cache_dtype != torch.bfloat16
+            or self.use_mla
+            or layer.is_cross_attention
+            or self.kv_index_translator.is_translating
+            or self._kv_shard_pool is not None
+            or self.fa_skip_kv_cache
+            or layer.tp_k_head_num != layer.tp_v_head_num
+            or is_cp_active(forward_batch)
+            or forward_batch.dcp_kv_mask is not None
+        ):
+            return None
+        write_loc = KVWriteLoc.for_layer(
+            forward_batch,
+            layer,
+            swa_loc=self.forward_metadata.swa_out_cache_loc,
+        )
+        locations = (
+            write_loc.swa_loc
+            if self.use_sliding_window_kv_pool and layer.sliding_window_size >= 0
+            else write_loc.loc
+        )
+        if locations is None:
+            return None
+        buffers = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        shapes = (
+            (layer.tp_k_head_num, layer.head_dim),
+            (layer.tp_v_head_num, layer.v_head_dim),
+        )
+        for buffer, shape in zip(buffers, shapes):
+            if buffer.shape[1:] != shape or buffer.stride()[-2:] != (shape[-1], 1):
+                return None
+        return (*buffers, locations)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1513,6 +1550,33 @@ class FlashAttentionBackend(AttentionBackend):
         if score_mod is not None:
             kwargs["score_mod"] = score_mod
             kwargs["aux_tensors"] = aux_tensors
+        if metadata.image_token_ranges is not None:
+            if (
+                self.fa_impl_ver != 4
+                or cp_active
+                or use_local_attn
+                or use_cascade_attn
+                or self.use_mla
+                or self.fa_skip_kv_cache
+                or metadata.swa_spec_metadata is not None
+                or metadata is self.full_cg_prefill_metadata
+                or score_mod is not None
+            ):
+                raise NotImplementedError(
+                    "FA4 image masks require standard paged MHA prefill without "
+                    "context parallelism, full prefill graphs, speculative metadata, "
+                    "or score modifiers."
+                )
+            from sglang.kernels.ops.attention.flash_attention_v4 import (
+                make_image_mask_mod,
+            )
+
+            kwargs["mask_mod"] = make_image_mask_mod(window_size[0])
+            kwargs["aux_tensors"] = [metadata.image_token_ranges, metadata.cu_seqlens_q]
+            # The callback permits future keys within an image. Built-in
+            # causal/window pruning would discard those keys before the mask.
+            causal = False
+            window_size = (-1, -1)
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
