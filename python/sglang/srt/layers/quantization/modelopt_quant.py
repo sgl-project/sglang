@@ -26,6 +26,8 @@ from sglang.srt.layers.moe.utils import (
     get_flashinfer_a2a_dispatch_type,
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -1592,6 +1594,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         kv_cache_quant_algo = None
         group_size = None
         exclude_modules = []
+        # Checkpoint metadata lives beside quant_algo: the outer mapping for the
+        # flat format, the inner "quantization" block for the nested format.
+        metadata = config
 
         # Try flat format first (config.json quantization_config - preferred format)
         quant_method = config.get("quant_algo")
@@ -1639,6 +1644,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
                 quant_config = cls.get_from_keys(config, ["quantization"])
+                metadata = quant_config
                 quant_method = quant_config["quant_algo"]
                 kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
                 if not kv_cache_quant_algo:
@@ -1680,14 +1686,25 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             use_per_token_activation=(False if quant_method == "W4A16_NVFP4" else None),
         )
         quant_config.is_w4a16 = quant_method == "W4A16_NVFP4"
-        if "use_per_token_activation" in config:
+        if "use_per_token_activation" in metadata:
             if not is_checkpoint_nvfp4_serialized or quant_config.is_w4a16:
                 raise ValueError(
                     "Per-token activation metadata requires serialized W4A4 NVFP4"
                 )
-            quant_config.use_per_token_activation = config["use_per_token_activation"]
+            quant_config.use_per_token_activation = metadata["use_per_token_activation"]
+            # The MoE hook only sees the environment switch, so metadata that
+            # turns per-token scaling on must repeat the DeepEP check here.
+            if (
+                quant_config.use_per_token_activation
+                and get_moe_runner_backend().is_flashinfer_cutedsl()
+                and get_moe_a2a_backend().is_deepep()
+            ):
+                raise ValueError(
+                    "flashinfer_cutedsl per-token NVFP4 activation requires "
+                    "moe_a2a_backend='none' or 'flashinfer'."
+                )
         # Legacy ModelOpt exports bundle an unquantized MTP layer with the target.
-        quant_config.quantized_mtp = config.get("quantized_mtp", False)
+        quant_config.quantized_mtp = metadata.get("quantized_mtp", False)
         if quant_config.quantized_mtp and not is_checkpoint_nvfp4_serialized:
             raise ValueError("quantized_mtp requires serialized NVFP4 weights")
         return quant_config
