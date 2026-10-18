@@ -397,6 +397,7 @@ class GpuDeltaSchedulerControl:
                         "target_version": request.target_version,
                         "plan_digest": request.plan_digest,
                         "participants": request.participants,
+                        "validate_payload_hash": request.validate_payload_hash,
                     }
                 )
             elif isinstance(request, delta_io.GetGpuDeltaStatusReqInput):

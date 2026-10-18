@@ -130,14 +130,19 @@ def applied(session, backend, req=None):
 def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     session, backend = make_session()
     req = request([session.identity])
-    preparing = session.prepare(req)
+    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=False))
+    control.session = session
+    accepted = control.handle(
+        delta_io.PrepareGpuDeltaReqInput(**req, validate_payload_hash=False)
+    )
+    assert accepted.success
+    preparing = accepted.participant
+    assert session._session.request["validate_payload_hash"] is False
     assert preparing["state"] == "PREPARING"
     assert backend.started.wait(2)
     status = session.status()
     assert status["state"] == "PREPARING"
     assert backend.payload.applications == 0
-    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=False))
-    control.session = session
     matched = control.handle(
         delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1")
     )

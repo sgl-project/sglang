@@ -136,6 +136,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 session_id=f"update-{version}",
                 base_version=version - 1,
                 target_version=version,
+                validate_payload_hash=True,
                 participants=[
                     {"engine_id": engine, "rank": 0},
                     {"engine_id": engine, "rank": 1},

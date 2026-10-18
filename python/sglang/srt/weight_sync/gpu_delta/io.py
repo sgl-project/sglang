@@ -27,6 +27,7 @@ class PrepareGpuDeltaReqInput(BaseReq, kw_only=True):
     target_version: int
     plan_digest: str
     participants: List[Dict[str, Any]]
+    validate_payload_hash: bool = True
 
 
 class UpdateWeightsFromGpuDeltaReqInput(PrepareGpuDeltaReqInput, kw_only=True):

@@ -405,16 +405,13 @@ def _map_files(directory, encoded, definitions):
 class HostArena:
     """Persistent rank-owned DE storage with an engine-host encoded cache.
 
-    The original engine cohort shares encoded files under one hash policy. Successful
-    all-rank apply/resume permits the next publication to overwrite that cache;
-    aborted/failed preparation never grants release.
+    The original engine cohort shares encoded files under each publication's hash
+    policy. Successful all-rank apply/resume permits the next publication to
+    overwrite that cache; aborted/failed preparation never grants release.
     """
 
     def __init__(self, engine_id, device):
         self.engine_id, self.device = engine_id, device
-        self.skip_payload_hash = (
-            os.environ.get("GPU_DELTA_SKIP_PAYLOAD_HASH", "0") == "1"
-        )
         self.allocation = self.mapping = self.tensor = None
         self.capacity = None
         self.directory = None
@@ -469,6 +466,7 @@ class HostArena:
     ):
         """Admit READY encoded bytes; returned file views own their mmap lease."""
         started = time.perf_counter()
+        skip_payload_hash = not metadata["validate_payload_hash"]
         publication = Path(manifest_path).resolve(strict=True)
         namespace = {
             "stream_id": metadata["stream_id"],
@@ -486,10 +484,10 @@ class HostArena:
             name, size = record["name"], record["nbytes"]
             if size < 0:
                 raise ValueError("negative delta payload size")
-            if record["sha256"] is None and not self.skip_payload_hash:
+            if record["sha256"] is None and not skip_payload_hash:
                 raise ValueError(
-                    "payload checksum omitted; set GPU_DELTA_SKIP_PAYLOAD_HASH=1 "
-                    "on both sender and receiver"
+                    "payload checksum omitted; request validate_payload_hash=False "
+                    "to accept an unchecked publication"
                 )
             definitions[name] = {"nbytes": size, "sha256": record["sha256"]}
         expected = {
@@ -500,7 +498,7 @@ class HostArena:
             "base_version": metadata["base_version"],
             "target_version": metadata["target_version"],
             "files": definitions,
-            "skip_payload_hash": self.skip_payload_hash,
+            "skip_payload_hash": skip_payload_hash,
         }
         token = hashlib.sha256(
             json.dumps(expected, sort_keys=True).encode()
@@ -538,12 +536,6 @@ class HostArena:
             )
             if previous and previous["namespace"] != namespace:
                 raise ValueError("encoded cache namespace differs")
-            if (
-                previous
-                and previous["publication"]["skip_payload_hash"]
-                != self.skip_payload_hash
-            ):
-                raise ValueError("encoded cache payload hash policy differs")
             if previous and previous["publication"] == expected:
                 if state != {
                     "token": token,
@@ -598,9 +590,9 @@ class HostArena:
                     definitions,
                     pool,
                     metrics,
-                    self.skip_payload_hash,
+                    skip_payload_hash,
                 )
-                if not self.skip_payload_hash:
+                if not skip_payload_hash:
                     metrics["host_encoded_cache_hash_bytes"] = encoded_size
                     metrics["host_encoded_cache_hash_files"] = len(definitions)
                 index["build_s"] = time.perf_counter() - build_started
@@ -623,7 +615,7 @@ class HostArena:
             host_encoded_cache_capacity_bytes=index["encoded"]["capacity"],
             host_encoded_cache_capacity_generation=index["encoded"]["generation"],
             host_encoded_cache_build_s=index["build_s"],
-            host_encoded_cache_skip_payload_hash=int(self.skip_payload_hash),
+            host_encoded_cache_skip_payload_hash=int(skip_payload_hash),
         )
         timings.update(metrics)
         return index, files

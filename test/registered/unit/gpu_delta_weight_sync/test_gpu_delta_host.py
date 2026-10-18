@@ -160,12 +160,13 @@ class FakeHostAllocation:
         self.view.release()
 
 
-def metadata(version=1, engine="a"):
+def metadata(version=1, engine="a", validate_payload_hash=True):
     return dict(
         stream_id="stream",
         session_id=f"session-{version}",
         base_version=version - 1,
         target_version=version,
+        validate_payload_hash=validate_payload_hash,
         participants=[
             {"engine_id": engine, "rank": 0},
             {"engine_id": engine, "rank": 1},
@@ -211,7 +212,6 @@ class TestHostSnapshot(unittest.TestCase):
         self.cache = self.root / "cache"
         self.cache.mkdir()
         for replacement in (
-            patch.dict(os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": "0"}),
             patch.object(host, "_cache_base", return_value=self.cache),
             patch.object(host, "_CAPACITY_ALIGNMENT", 1024),
             patch.object(host, "HostAllocation", FakeHostAllocation),
@@ -320,35 +320,51 @@ class TestHostSnapshot(unittest.TestCase):
         follower.close()
         snapshot.close()
 
-    def test_payload_hash_policy_is_cached_and_shared_cache_requires_agreement(self):
+    def test_payload_hash_policy_follows_publication_and_requires_peer_agreement(self):
         path, digest, manifest, expected = fixture(self.root)
         strict = self.arena("strict")
-        with patch.dict(os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": "1"}):
-            unchecked, follower = self.arena(), self.arena()
-            unchecked_strict_peer = self.arena("strict")
-        strict_peer = self.arena()
-        strict_snapshot = prepare_snapshot(
-            strict,
-            path,
-            digest,
-            manifest,
-            local_entries(manifest, expected),
-            self.pool,
-            {},
-            metadata(engine="strict"),
-        )
-        with self.assertRaisesRegex(ValueError, "payload hash policy differs"):
-            prepare_snapshot(
-                unchecked_strict_peer,
-                path,
-                digest,
-                manifest,
-                local_entries(manifest, expected),
-                self.pool,
-                {},
-                metadata(engine="strict"),
+        peer = self.arena("strict")
+        for version, validate in enumerate((True, False, True), 1):
+            metrics = {}
+            # A legacy inherited environment cannot override the request policy.
+            with patch.dict(
+                os.environ, {"GPU_DELTA_SKIP_PAYLOAD_HASH": str(int(validate))}
+            ):
+                snapshot = prepare_snapshot(
+                    strict,
+                    path,
+                    digest,
+                    manifest,
+                    local_entries(manifest, expected),
+                    self.pool,
+                    metrics,
+                    metadata(version, "strict", validate),
+                )
+            self.assertEqual(metrics["host_encoded_cache_created"], 1)
+            self.assertEqual(
+                metrics["host_encoded_cache_skip_payload_hash"], int(not validate)
             )
-        strict_snapshot.close()
+            self.assertEqual(
+                metrics["host_encoded_cache_hash_files"], 2 if validate else 0
+            )
+            self.assertEqual(
+                {name: bytes(snapshot.get(name)) for name in expected}, expected
+            )
+            with self.assertRaisesRegex(
+                ValueError, "requires prior engine APPLIED release"
+            ):
+                prepare_snapshot(
+                    peer,
+                    path,
+                    digest,
+                    manifest,
+                    local_entries(manifest, expected),
+                    self.pool,
+                    {},
+                    metadata(version, "strict", not validate),
+                )
+            snapshot.mark_reusable()
+            snapshot.close()
 
         # The manifest itself still has an exact digest; only payload SHA is skipped.
         manifest["payload_checksum_format"] = "none"
@@ -356,7 +372,7 @@ class TestHostSnapshot(unittest.TestCase):
             record["sha256"] = None
         path.write_text(json.dumps(manifest))
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        for arena, created in ((unchecked, 1), (follower, 0)):
+        for arena, created in ((self.arena(), 1), (self.arena(), 0)):
             metrics = {}
             snapshot = prepare_snapshot(
                 arena,
@@ -366,12 +382,11 @@ class TestHostSnapshot(unittest.TestCase):
                 local_entries(manifest, expected),
                 self.pool,
                 metrics,
-                metadata(),
+                metadata(validate_payload_hash=False),
             )
             self.assertEqual(
                 {name: bytes(snapshot.get(name)) for name in expected}, expected
             )
-            self.assertTrue(arena.skip_payload_hash)
             self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 1)
             self.assertEqual(metrics["host_encoded_cache_created"], created)
             for field in ("hash_files", "hash_bytes", "sha256_worker_sum_s"):
@@ -379,7 +394,7 @@ class TestHostSnapshot(unittest.TestCase):
             snapshot.close()
         with self.assertRaisesRegex(ValueError, "payload checksum omitted"):
             prepare_snapshot(
-                strict_peer,
+                self.arena(),
                 path,
                 digest,
                 manifest,

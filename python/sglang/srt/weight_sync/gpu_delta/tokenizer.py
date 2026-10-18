@@ -123,6 +123,7 @@ class GpuDeltaTokenizerControl:
             target_version=obj.target_version,
             plan_digest=obj.plan_digest,
             participants=obj.participants,
+            validate_payload_hash=obj.validate_payload_hash,
         )
         # Preparation can fail safely while the engine still serves base weights.
         # After apply dispatch, neither cancellation nor failure may replay XOR

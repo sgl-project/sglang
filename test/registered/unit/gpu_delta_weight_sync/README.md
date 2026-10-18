@@ -78,7 +78,8 @@ endpoints are an internal interface to Miles:
 
 The update request carries the negotiated participants, caller-generated session
 ID and publication descriptor: manifest path/SHA256, stream, base/target versions
-and plan digest. Rolling updates and HF-base recovery use the same request shape;
+and plan digest, plus `validate_payload_hash=true` by default. Rolling updates and
+HF-base recovery use the same request shape;
 the tokenizer does not reread the manifest or repeat admission. Each engine's
 tokenizer owns the following internal phases:
 
@@ -210,8 +211,8 @@ identity cannot detect unrelated same-buffer writes by another updater.
 ## Configuration and observations
 
 Feature environment variables are development controls, not a stable public API.
-Keep them fixed for the stream's lifetime. Batch size, worker count and hash policy
-are captured when the backend is created; sorting is captured by each decoder.
+Keep them fixed for the stream's lifetime. Batch size and worker count are
+captured when the backend is created; sorting is captured by each decoder.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -219,7 +220,6 @@ are captured when the backend is created; sorting is captured by each decoder.
 | `GPU_DELTA_CPU_WORKERS` | `32` | Reusable workers per rank, allowed range 1–32 |
 | `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS` | `0` | `0`/`1`, native sorting on the paused DE call |
 | `GPU_DELTA_HOST_CACHE_DIR` | `/dev/shm/sglang-gpu-delta-<uid>` | Private user-owned tmpfs visible to the engine's host-local cohort |
-| `GPU_DELTA_SKIP_PAYLOAD_HASH` | `0` | `1` skips payload SHA256; manifest authentication and size/path/native checks remain |
 | `SGLANG_ENABLE_NVTX_OPERATIONS` | `0` | Standard SGLang detailed operation annotations, including GPU delta |
 
 There is no decode-depth or legacy timing/NVTX knob. Wrapped workers have independent
@@ -227,11 +227,16 @@ Zstd contexts and at most four tasks per worker. Two EP4 engines can use eight p
 of 32 workers. Engine IDs and `host_cache_id`, not hostname alone, define cache
 sharing. Independent engines share no cache locks or release lifecycle.
 
-Set the same payload hash policy in the Miles/Ray environment. A receiver requiring
-hashes rejects a publication with `payload_checksum_format="none"`; a skipping
-receiver may accept hashed publications. Skipping trusts contents without payload
-SHA authentication. Exact file extent/identity, path containment, Zstd output
-length and native decode checks still apply.
+Payload verification is selected per update by `validate_payload_hash=True` on
+`update_weights_from_gpu_delta`. Miles passes its configured policy explicitly;
+SGLang does not read a hash-policy environment variable. Every rank sharing a
+publication must agree. After successful all-rank apply/resume releases the cache,
+the next publication may choose another policy; unchecked bytes cannot satisfy a
+checked publication. A receiver requiring hashes rejects
+`payload_checksum_format="none"`; a skipping receiver may accept hashed
+publications. Skipping trusts contents without payload SHA authentication.
+Manifest SHA, exact file extent/identity, path containment, Zstd output length and
+native decode checks still apply.
 
 CPU timings, bytes and counters remain available for W&B independently of NVTX.
 The paused APPLIED acknowledgement retains identity, publication provenance, state,

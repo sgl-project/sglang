@@ -87,6 +87,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "flush_cache": False,
                 "abort_all_requests": True,
                 "weight_version": "actor-42",
+                "validate_payload_hash": False,
             },
         ),
         ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
@@ -116,6 +117,10 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         received = msgpack_decode(msgpack_encode(calls[-1]))
         assert type(received) is request_type
         assert received == calls[-1]
+        if request_type is UpdateWeightsFromGpuDeltaReqInput:
+            assert received.validate_payload_hash is payload.get(
+                "validate_payload_hash", True
+            )
     response = GpuDeltaReqOutput(
         success=True, message="", participant=receipts[0], rid="control-reply"
     )
@@ -216,6 +221,7 @@ def test_update_waits_for_every_rank_before_apply_and_resume(
         )
         prepare = await sent.get()
         assert type(prepare) is io.PrepareGpuDeltaReqInput
+        assert prepare.validate_payload_hash is True
         assert not facade.manager.is_pause
         reply(facade, prepare, "PREPARED")
         await asyncio.sleep(0)
@@ -273,6 +279,7 @@ def test_update_preserves_receipts_options_and_failure_boundaries(
     pause_at,
 ):
     # The same negotiated input contract supports fresh-base and rolling updates.
+    publication["validate_payload_hash"] = False
     if release_state:
         publication["base_version"] = 0
     now = [0.0]
