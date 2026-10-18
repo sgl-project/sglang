@@ -12,7 +12,8 @@ use sgl_router::policies_reorg::admission::{
     AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
 };
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::state::kv_events::CacheNamespace;
+use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
 #[derive(Debug)]
 struct TestPolicy {
@@ -103,7 +104,10 @@ fn registry() -> Arc<WorkerRegistry> {
         ("p", Stage::Prefill, "pd"),
         ("d", Stage::Decode, "pd"),
     ] {
-        workers.add(spec(id, mode, model)).unwrap();
+        let cb = Some(Default::default());
+        workers
+            .add_with_cb(spec(id, mode, model), cb, WireProtocol::default())
+            .unwrap();
     }
     let unhealthy = workers.get(&WorkerId("unhealthy".into())).unwrap();
     for _ in 0..3 {
@@ -114,6 +118,7 @@ fn registry() -> Arc<WorkerRegistry> {
 
 fn group(members: &[&str], policy: Arc<dyn Policy>) -> EngineGroup {
     EngineGroup {
+        worker_services: None,
         worker_ids: Some(members.iter().map(|id| WorkerId((*id).into())).collect()),
         policy,
     }
@@ -259,16 +264,72 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         prefix: None,
         model: &model,
         input_tokens: 10,
+        total_input_tokens: 10,
         expected_peak_tokens: Some(20),
         token_ids: None,
+        cache_namespace: CacheNamespace::NONE,
         session_key: None,
         routing_key: None,
+        excluded: &[],
     };
     let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "p2");
     assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
     assert_eq!(*prefill_policy.calls.lock().unwrap(), ["shared"]);
     assert_eq!(*decode_policy.calls.lock().unwrap(), ["shared"]);
+}
+
+#[tokio::test]
+async fn excluded_engines_are_never_offered() {
+    let workers = registry();
+    workers.add(spec("d2", Stage::Decode, "pd")).unwrap();
+    let ids =
+        |ids: &[&str]| -> Vec<WorkerId> { ids.iter().map(|id| WorkerId((*id).into())).collect() };
+    let policy = || -> Arc<dyn Policy> { Arc::new(TestPolicy::default()) };
+    let request = |model, excluded| BucketRequest {
+        prefix: None,
+        model,
+        input_tokens: 10,
+        total_input_tokens: 10,
+        expected_peak_tokens: None,
+        token_ids: None,
+        cache_namespace: CacheNamespace::NONE,
+        session_key: None,
+        routing_key: None,
+        excluded,
+    };
+
+    let model = ModelId("m".into());
+    let plain = Bucket::new("plain", BucketGroups::Plain(group(&["a", "b"], policy())));
+    let excluded = ids(&["a"]);
+    let picks = plain
+        .pick_engines(&workers, &request(&model, &excluded))
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "b");
+    let excluded = ids(&["a", "b"]);
+    assert!(matches!(
+        plain
+            .pick_engines(&workers, &request(&model, &excluded))
+            .await,
+        Err((Stage::Plain, PickError::NoCandidates))
+    ));
+
+    let model = ModelId("pd".into());
+    let pd = Bucket::new(
+        "pd",
+        BucketGroups::Pd {
+            prefill: group(&["p"], policy()),
+            decode: group(&["d", "d2"], policy()),
+        },
+    );
+    let excluded = ids(&["d"]);
+    let picks = pd
+        .pick_engines(&workers, &request(&model, &excluded))
+        .await
+        .unwrap();
+    assert_eq!(picks.prefill.engine.id.0, "p");
+    assert_eq!(picks.decode.unwrap().engine.id.0, "d2");
 }
 
 #[tokio::test]
@@ -427,10 +488,13 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         prefix: None,
         model: &model,
         input_tokens: 2,
+        total_input_tokens: 2,
         expected_peak_tokens: Some(12),
         token_ids: Some(&[7, 9]),
+        cache_namespace: CacheNamespace::NONE,
         session_key: Some("session"),
         routing_key: Some("routing"),
+        excluded: &[],
     };
     let picks = bucket.pick_engines(&workers, &request).await.unwrap();
     assert_eq!(picks.prefill.engine.id.0, "b");
@@ -439,14 +503,14 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
 }
 
 #[tokio::test]
-async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fallback() {
+async fn power_of_two_samples_only_admitted_engines() {
     use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
     use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 
     #[derive(Debug)]
     struct Check {
         calls: Mutex<Vec<WorkerId>>,
-        reject: bool,
+        reject: Vec<WorkerId>,
         invalid: bool,
     }
 
@@ -455,7 +519,7 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
             self.calls.lock().unwrap().push(engine.id.clone());
             if self.invalid {
                 Err(PickError::InvalidSignal("admission input".into()))
-            } else if self.reject {
+            } else if self.reject.contains(&engine.id) {
                 Ok(Decision::Reject("full".into()))
             } else {
                 Ok(Decision::Allow)
@@ -465,36 +529,59 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
 
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
-    let engine = Arc::new(Worker::new(spec("a", Stage::Plain, "m")));
-    let other = Arc::new(Worker::new(spec("b", Stage::Plain, "m")));
-    let _busy = other.load_guard();
-    for engines in [vec![engine.clone()], vec![other.clone(), engine.clone()]] {
-        for (reject, invalid) in [(false, false), (true, false), (false, true)] {
-            let check = Arc::new(Check {
-                calls: Mutex::new(Vec::new()),
-                reject,
-                invalid,
-            });
-            let mut policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
-            policy.admission = check.clone();
-            assert!(matches!(
-                policy.pick(&[], &request).await,
-                Err(PickError::NoCandidates)
-            ));
-            assert!(check.calls.lock().unwrap().is_empty());
-            let result = policy.pick(&engines, &request).await;
-            if invalid {
-                assert!(matches!(result, Err(PickError::InvalidSignal(_))));
-            } else if reject {
-                assert!(matches!(result, Err(PickError::AdmissionRejected(reason))
-                if reason.engine == engine.id && reason.reason == "full"));
-            } else {
-                assert!(Arc::ptr_eq(&result.unwrap().engine, &engine));
-            }
-            assert_eq!(
-                check.calls.lock().unwrap().as_slice(),
-                std::slice::from_ref(&engine.id)
-            );
-        }
-    }
+    let idle = Arc::new(Worker::new(spec("a", Stage::Plain, "m")));
+    let busy = Arc::new(Worker::new(spec("b", Stage::Plain, "m")));
+    let _busy = busy.load_guard();
+    let engines = [busy.clone(), idle.clone()];
+    let policy = |check: &Arc<Check>| {
+        let mut policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
+        policy.admission = check.clone();
+        policy
+    };
+    let check = |reject: &[&Arc<Worker>], invalid| {
+        Arc::new(Check {
+            calls: Mutex::new(Vec::new()),
+            reject: reject.iter().map(|e| e.id.clone()).collect(),
+            invalid,
+        })
+    };
+    let all_ids = [busy.id.clone(), idle.id.clone()];
+
+    // No candidates: nothing to check.
+    let none = check(&[], false);
+    assert!(matches!(
+        policy(&none).pick(&[], &request).await,
+        Err(PickError::NoCandidates)
+    ));
+    assert!(none.calls.lock().unwrap().is_empty());
+
+    // Every candidate is checked before sampling; with all admitted the less
+    // loaded one wins.
+    let open = check(&[], false);
+    let pick = policy(&open).pick(&engines, &request).await.unwrap();
+    assert!(Arc::ptr_eq(&pick.engine, &idle));
+    assert_eq!(open.calls.lock().unwrap().as_slice(), all_ids.as_slice());
+
+    // A rejected engine is skipped even when it is the less loaded one.
+    let idle_full = check(&[&idle], false);
+    let pick = policy(&idle_full).pick(&engines, &request).await.unwrap();
+    assert!(Arc::ptr_eq(&pick.engine, &busy));
+
+    // The pick fails only when no engine is admitted, naming every rejection.
+    let all_full = check(&[&busy, &idle], false);
+    let result = policy(&all_full).pick(&engines, &request).await;
+    assert!(
+        matches!(&result, Err(PickError::NoAdmissibleEngine(rejections))
+        if rejections.iter().map(|r| &r.engine).eq(all_ids.iter())
+            && rejections.iter().all(|r| r.reason == "full"))
+    );
+
+    // An invalid admission signal stops the pick at the first engine.
+    let invalid = check(&[], true);
+    let result = policy(&invalid).pick(&engines, &request).await;
+    assert!(matches!(result, Err(PickError::InvalidSignal(_))));
+    assert_eq!(
+        invalid.calls.lock().unwrap().as_slice(),
+        std::slice::from_ref(&busy.id)
+    );
 }

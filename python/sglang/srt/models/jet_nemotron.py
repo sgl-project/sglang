@@ -461,6 +461,12 @@ class JetNemotronDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    @staticmethod
+    def stage_facts(config: JetNemotronConfig, layer_id: int):
+        """None: the layer adds its own residual, so it declares no stages.
+        The model's shared declaration function (see make_layers)."""
+        return ()
+
     def forward(
         self,
         positions: torch.Tensor,
