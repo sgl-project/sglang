@@ -47,7 +47,6 @@ from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -163,22 +162,8 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"Invalid quantization method: {quantization}. "
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
-    from sglang.srt.utils import is_cpu
-
-    if is_cpu() and cpu_has_amx_support():
-        if quantization not in CPU_QUANTIZATION_METHODS:
-            raise ValueError(
-                f"Invalid quantization method on CPU: {quantization}. "
-                f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
-            )
-        else:
-            return CPU_QUANTIZATION_METHODS[quantization]
-
-    if current_platform.is_out_of_tree():
-        config = current_platform.get_quantization_config(quantization)
-
-        # If the platform has a quantization config, use it else use the default
-        if config is not None:
-            return config
+    config = current_platform.get_quantization_config(quantization)
+    if config is not None:
+        return config
 
     return QUANTIZATION_METHODS[quantization]
