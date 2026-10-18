@@ -989,6 +989,19 @@ def late_layer_whole_extend(
     )
 
 
+def late_layer_num_tokens(forward_batch: ForwardBatch, *, dspark: bool) -> int:
+    """Rows a rank runs from late_layer_start on: an extend's tail rows, as
+    late_layer_tail_layout picks them, and every row otherwise."""
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return forward_batch.input_ids.shape[0]
+    whole_extend = late_layer_whole_extend(forward_batch, dspark=dspark)
+    return sum(
+        late_layer_tail_lens(
+            forward_batch.extend_seq_lens_cpu, SWA_WINDOW, whole_extend
+        )
+    )
+
+
 def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
     if t.shape[0] == num_rows:
@@ -1639,6 +1652,13 @@ class DeepseekV4AttnBackend(
             ):
                 return False
         return True
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay:
+            return None
+        return late_layer_num_tokens(
+            forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+        )
 
     def vote_prefill_cuda_graph(self, batch: ScheduleBatch) -> bool:
         """`can_run_prefill_cuda_graph`'s late-layer tail check judged from the
