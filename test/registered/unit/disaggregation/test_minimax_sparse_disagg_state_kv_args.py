@@ -53,14 +53,19 @@ def _make_kv_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
 
 
 class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
-    def test_setup_state_kv_args_single_minimax_component(self):
+    def test_setup_state_kv_args_minimax_components(self):
         pool = _make_k_only_pool()
         kv_args = KVArgs()
         setup_state_kv_args(kv_args, pool)
-        self.assertEqual(kv_args.state_types, [StateType.MINIMAX_INDEX_K])
-        self.assertEqual(len(kv_args.state_data_ptrs), 1)
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV],
+        )
+        self.assertEqual(len(kv_args.state_data_ptrs), 2)
         self.assertEqual(len(kv_args.state_data_ptrs[0]), pool.index_k_pool.layer_num)
         self.assertEqual(len(kv_args.state_item_lens[0]), pool.index_k_pool.layer_num)
+        self.assertEqual(len(kv_args.state_data_ptrs[1]), 6)
+        self.assertEqual(len(kv_args.state_item_lens[1]), 6)
 
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()

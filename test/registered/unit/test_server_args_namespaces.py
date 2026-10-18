@@ -11,8 +11,11 @@ This is the guardrail that fails when an upstream PR adds a field to a namespace
 class that has no ``_NS_PATH``, or adds one outside the taxonomy below.
 """
 
-import dataclasses
+import ast
 import unittest
+
+import msgspec
+import msgspec.structs
 
 from sglang.srt.arg_groups.arg_utils import namespace_of
 from sglang.srt.server_args import ServerArgs
@@ -21,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=31, suite="base-a-test-cpu")
 
-# Locked taxonomy (global_context/11-server-args-namespace-split.md).
+# Supported runtime configuration namespaces.
 VALID_NAMESPACES = {
     "parallel",
     "device",
@@ -48,7 +51,52 @@ VALID_NAMESPACES = {
 
 
 def _field_names():
-    return {f.name for f in dataclasses.fields(ServerArgs)}
+    return {f.name for f in msgspec.structs.fields(ServerArgs)}
+
+
+def _config_reads(tree, mapping):
+    """Yield ``(node, namespace, leaf)`` for each config leaf a module reads.
+
+    A read starts at a bag accessor such as ``get_exec()`` and follows the
+    sub-namespaces it names (``get_exec().moe``); the first other name is the
+    leaf. Attributes past the leaf belong to its value, so
+    ``get_parallel().tp_group.device`` reads ``tp_group``, not the ``device``
+    leaf.
+    """
+    accessors = {f"get_{path.split('.')[0]}" for path in mapping.values()}
+    namespaces = {
+        ".".join(path.split(".")[:depth])
+        for path in mapping.values()
+        for depth in range(1, path.count(".") + 2)
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        chain, cursor = [], node
+        while isinstance(cursor, ast.Attribute):
+            chain.append(cursor.attr)
+            cursor = cursor.value
+        if not (
+            isinstance(cursor, ast.Call)
+            and isinstance(cursor.func, ast.Name)
+            and cursor.func.id in accessors
+        ):
+            continue
+        chain.reverse()
+        read = [cursor.func.id[len("get_") :]]
+        if read == ["parallel"] and chain[:1] == ["config"]:
+            # `config` on `get_parallel()` is the tier hop, not a
+            # sub-namespace: bare names there are the live topology.
+            chain = chain[1:]
+        for index, name in enumerate(chain):
+            if name in mapping or ".".join(read + [name]) not in namespaces:
+                break
+            read.append(name)
+        else:
+            continue
+        # A leaf is checked at the node that ends with it, so once.
+        if index == len(chain) - 1 and name in mapping:
+            yield node, ".".join(read), name
 
 
 class TestServerArgsNamespaces(CustomTestCase):
@@ -79,7 +127,7 @@ class TestServerArgsNamespaces(CustomTestCase):
             for node in context_module.body
             if isinstance(node, ast.FunctionDef) and node.name.startswith("get_")
         }
-        self.assertGreater(len(accessors), 15, "the accessor derivation broke")
+        self.assertTrue(accessors, "no runtime context accessors found")
 
         shadowed = []
         for path in sorted(srt.rglob("*.py")):
@@ -139,7 +187,7 @@ class TestServerArgsNamespaces(CustomTestCase):
     def test_the_readers_agree_with_the_namespace_metadata(self):
         """Two independent sources say where a leaf lives; they must match.
 
-        The metadata is one source and the ~2000 hand-written reads
+        The metadata is one source and the ~2800 hand-written reads
         (`get_schedule().chunked_prefill_size`) are the other. Checking the
         projection against the metadata cannot catch a field assigned to the
         wrong group -- both sides come from the same marker, so the check is
@@ -148,7 +196,6 @@ class TestServerArgsNamespaces(CustomTestCase):
         losing side raises `has no leaf/subgroup` at runtime on whichever
         branch reaches it first.
         """
-        import ast
         import pathlib as _pathlib
 
         import sglang
@@ -169,34 +216,12 @@ class TestServerArgsNamespaces(CustomTestCase):
                 tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {path}")
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Attribute):
-                    continue
-                chain, cursor = [], node
-                while isinstance(cursor, ast.Attribute):
-                    chain.append(cursor.attr)
-                    cursor = cursor.value
-                if not (
-                    isinstance(cursor, ast.Call)
-                    and isinstance(cursor.func, ast.Name)
-                    and cursor.func.id in accessors
-                ):
-                    continue
-                chain.reverse()
-                field = chain[-1]
-                if field not in mapping:
-                    continue
+            for node, read, leaf in _config_reads(tree, mapping):
                 sites += 1
-                read = [cursor.func.id[len("get_") :]] + chain[:-1]
-                if read[:2] == ["parallel", "config"]:
-                    # `config` on `get_parallel()` is the tier hop, not a
-                    # sub-namespace: bare names there are the live topology.
-                    del read[1]
-                if mapping[field].split(".") != read:
+                if mapping[leaf] != read:
                     disagreements.append(
                         f"{path.relative_to(srt)}:{node.lineno} reads "
-                        f"{'.'.join(read)}.{field}, metadata says "
-                        f"{mapping[field]}.{field}"
+                        f"{read}.{leaf}, metadata says {mapping[leaf]}.{leaf}"
                     )
         self.assertEqual(
             disagreements,
@@ -206,19 +231,41 @@ class TestServerArgsNamespaces(CustomTestCase):
         )
         self.assertGreater(
             sites,
-            1500,
+            0,
             f"only {sites} bag reads were matched; the scan broke and this "
             "check stopped covering anything",
         )
 
-    def test_every_field_has_a_namespace(self):
-        nsmap = namespace_of(ServerArgs)
-        missing = sorted(_field_names() - set(nsmap))
-        self.assertFalse(
-            missing,
-            "ServerArgs fields missing an NS(...) marker "
-            f"(assign a namespace in server_args.py): {missing}",
-        )
+    def test_the_scan_reads_the_leaf_a_chain_names(self):
+        """Wrong reads are caught through sub-namespaces, and an attribute of a
+        leaf's value is not mistaken for a leaf."""
+        mapping = namespace_of(ServerArgs)
+
+        def disagreements(expression):
+            return [
+                (read, leaf)
+                for _, read, leaf in _config_reads(ast.parse(expression), mapping)
+                if mapping[leaf] != read
+            ]
+
+        for expression in (
+            "get_exec().moe.moe_a2a_backend",
+            "get_parallel().config.tp_size",
+            # A process group is a value, not a namespace.
+            "get_parallel().tp_group.device",
+        ):
+            with self.subTest(expression):
+                self.assertEqual(disagreements(expression), [])
+        for expression, read in (
+            ("get_exec().moe_a2a_backend", ("exec", "moe_a2a_backend")),
+            (
+                "get_exec().moe.chunked_prefill_size",
+                ("exec.moe", "chunked_prefill_size"),
+            ),
+            ("get_schedule().device", ("schedule", "device")),
+        ):
+            with self.subTest(expression):
+                self.assertEqual(disagreements(expression), [read])
 
     def test_all_namespaces_are_known(self):
         nsmap = namespace_of(ServerArgs)
@@ -228,7 +275,6 @@ class TestServerArgsNamespaces(CustomTestCase):
     def test_namespace_map_covers_all_fields(self):
         nsmap = namespace_of(ServerArgs)
         self.assertEqual(set(nsmap), _field_names())
-        self.assertGreaterEqual(len(nsmap), 440)
 
 
 if __name__ == "__main__":

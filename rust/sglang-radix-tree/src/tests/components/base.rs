@@ -70,7 +70,7 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         &self,
         tree_core: &mut UnifiedTreeCore<Vec<i64>>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     ) {
         unimplemented!()
@@ -89,14 +89,17 @@ fn insert_overlap_default_consumes_nothing() {
         /* total_prefix_len = */ 0,
         Tensor::from_slice(&[0i64, 1, 2]),
         &InsertParams {
+            rotation_base: None,
             key: &vec![0, 1, 2],
             namespace: Default::default(),
             value: Tensor::from_slice(&[0i64, 1, 2]),
             mamba_value: None,
             prev_prefix_len: 0,
             swa_evicted_seqlen: 0,
-            chunked: false,
+            swa_branching_seqlen: None,
+            inserted_len: 0,
             priority: 0,
+            session_id: None,
             track_adopted_ranges: false,
         },
         &mut InsertResult::default(),
@@ -119,6 +122,8 @@ fn finalize_match_result_default_returns_result_unchanged() {
     let out = DefaultComponentForTest.finalize_match_result_in_tree_core(
         &tc,
         result,
+        tc.arena.root(),
+        tc.arena.root(),
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),

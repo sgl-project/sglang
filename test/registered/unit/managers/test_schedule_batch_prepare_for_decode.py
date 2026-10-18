@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -37,6 +37,25 @@ def _make_decode_batch():
     batch.seq_lens_cpu = torch.tensor([3, 5], dtype=torch.int64)
     batch.orig_seq_lens = torch.tensor([3, 5], dtype=torch.int32)
     return batch
+
+
+class TestPrepareForDecodeMambaInit(CustomTestCase):
+    def test_spec_decode_drops_extend_mamba_init_metadata(self):
+        batch = ScheduleBatch(reqs=[])
+        batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        batch.mamba_cow_src_indices = torch.tensor([1])
+        batch.mamba_cow_dst_indices = torch.tensor([2])
+        batch.mamba_clear_indices = torch.tensor([3])
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.spec_prepare_for_decode"
+        ) as prepare:
+            batch.prepare_for_decode()
+
+        prepare.assert_called_once_with(batch)
+        self.assertIsNone(batch.mamba_cow_src_indices)
+        self.assertIsNone(batch.mamba_cow_dst_indices)
+        self.assertIsNone(batch.mamba_clear_indices)
 
 
 class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):

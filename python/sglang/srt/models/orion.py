@@ -15,7 +15,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -34,7 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
@@ -223,7 +222,7 @@ class OrionModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -232,13 +231,11 @@ class OrionModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: OrionDecoderLayer(
                 config, layer_id=idx, quant_config=quant_config, prefix=prefix
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 
@@ -285,7 +282,7 @@ class OrionForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.model = OrionModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
