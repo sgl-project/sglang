@@ -17,6 +17,7 @@ MEGAKERNEL_API_VERSION = 1
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
+FLAG = "--enable-nvidia-megakernel"
 
 
 class Feature(enum.Enum):
