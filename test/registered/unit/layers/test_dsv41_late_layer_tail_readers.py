@@ -16,6 +16,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+    _SparsePrefillTable,
+)
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
@@ -269,6 +272,81 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             ):
                 counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
             self.assertEqual(counts, [SWA_WINDOW, 0])
+
+
+def _flat_indexer_break(*, inside_tail, real, x_rows):
+    """Runs the candidate source's prefill-graph break; returns the request rows
+    and positions it scored and the rows it handed to the consumers."""
+    seen = {}
+    tail = SimpleNamespace(
+        scatter_indices=torch.zeros(1),
+        # Full-extend positions of the tail rows (two requests of 8 and 12).
+        token_indices=torch.tensor([6, 7, 17, 18, 19, 0, 0, 0]),
+    )
+    tail_meta = SimpleNamespace(
+        late_layer_tail=tail,
+        low_ratio_req_indices=torch.tensor([3, 3, 5, 5, 5, 5, 5, 5]),
+    )
+    full_meta = SimpleNamespace(
+        late_layer_tail=None,
+        low_ratio_req_indices=torch.tensor([3] * 8 + [5] * 12 + [5] * 4),
+    )
+
+    def make_inputs(layer, x, q_lora, req, pos, forward_batch, rows_per_request):
+        seen.update(req=req.tolist(), pos=pos.tolist(), scored=x.shape[0])
+
+    def tail_rows(self, rows):
+        seen["rows"] = rows.tolist()
+        return SimpleNamespace(blocks=0, schedule=0, phys_blocks=0, valid_lens=0)
+
+    backend = SimpleNamespace(
+        forward_metadata=tail_meta if inside_tail else full_meta,
+        tail_forward_metadata=tail_meta,
+        _make_low_ratio_prefill_indexer_inputs=make_inputs,
+        _prefill_graph_low_ratio_index_captured=lambda: False,
+        prefill_candidates=SimpleNamespace(
+            publish_prefill=lambda inputs: object.__new__(_SparsePrefillTable)
+        ),
+    )
+    with patch.object(_SparsePrefillTable, "tail_rows", tail_rows):
+        DeepseekV4AttnBackend._prefill_graph_flat_indexer_break(
+            backend,
+            SimpleNamespace(
+                layer_id=20, indexer=SimpleNamespace(is_candidate_source=True)
+            ),
+            torch.zeros(x_rows, 4),
+            torch.zeros(x_rows, 4),
+            torch.arange(100, 100 + x_rows),
+            SimpleNamespace(
+                global_num_token_non_padded_cpu=real,
+                forward_mode=ForwardMode.EXTEND,
+                req_pool_indices=torch.tensor([3, 5]),
+                extend_seq_lens=torch.tensor([8, 12]),
+                positions=torch.arange(x_rows),
+            ),
+        )
+    return seen
+
+
+class TestPrefillGraphCandidateSourceRows(CustomTestCase):
+    """The candidate source's eager break in the prefill graph scores the rows of
+    the metadata in use, and hands the consumers rows of the table it built."""
+
+    def test_source_inside_the_tail_scores_the_tail_rows(self):
+        # The source is the tail's first layer: x holds the 8-row tail block,
+        # 5 of them live; the extend's lens and positions are not the tail's.
+        seen = _flat_indexer_break(inside_tail=True, real=5, x_rows=8)
+        self.assertEqual(seen["req"], [3, 3, 5, 5, 5])
+        self.assertEqual(seen["pos"], [100, 101, 102, 103, 104])
+        self.assertEqual(seen["scored"], 5)
+        self.assertEqual(seen["rows"], [0, 1, 2, 3, 4, 4, 4, 4])
+
+    def test_source_before_the_tail_hands_over_the_tail_rows(self):
+        # The source ran over the whole extend; the consumers run on the tail.
+        seen = _flat_indexer_break(inside_tail=False, real=20, x_rows=24)
+        self.assertEqual(seen["req"], [3] * 8 + [5] * 12)
+        self.assertEqual(seen["scored"], 20)
+        self.assertEqual(seen["rows"], [6, 7, 17, 18, 19, 0, 0, 0])
 
 
 if __name__ == "__main__":
