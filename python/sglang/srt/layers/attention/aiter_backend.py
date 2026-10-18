@@ -60,6 +60,7 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
+    from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,
@@ -4276,7 +4277,31 @@ class AiterAttnBackend(AttentionBackend):
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
                     # each replay and break the captured pointer.
-                    unified_attention(
+                    verify_attention = unified_attention
+                    if (
+                        window_size == (2046, 0)
+                        and self.forward_metadata.max_q_len == 8
+                        and self.page_size == 16
+                        and layer.qk_head_dim == layer.v_head_dim == 64
+                        and layer.tp_q_head_num == 16
+                        and layer.tp_k_head_num == layer.tp_v_head_num == 2
+                        and 0 < forward_batch.seq_lens.numel() <= 8
+                        and q_unified.shape[0] == forward_batch.seq_lens.numel() * 8
+                        and q_unified.dtype == torch.bfloat16
+                        and k_unified.dtype == v_unified.dtype == torch.float8_e4m3fn
+                        and layer.logit_cap == 0
+                        and sinks is None
+                        and is_gfx95_supported()
+                        and torch.cuda.get_device_properties(
+                            q_unified.device
+                        ).gcnArchName.split(":")[0]
+                        == "gfx950"
+                    ):
+                        # This small verify grid benefits from 16 parallel KV
+                        # segments. Keep dispatch and kernels in SGLang; AITER's
+                        # unified_attention remains the general path.
+                        verify_attention = swa_verify_splitkv
+                    verify_attention(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
