@@ -22,7 +22,8 @@ LAUNCH_TIMEOUT = 3600
 
 
 class DSV41FlashLinkerKLMixin(UnifiedRadixTreeTestMixin):
-    """Every KL case must restore at least one page through the Mooncake direct linker."""
+    """The small device pool evicts every turn, so each KL case must restore
+    at least one page through the Mooncake direct linker."""
 
     extra_args = []
     page_size = 256
@@ -60,10 +61,12 @@ class DSV41FlashLinkerKLMixin(UnifiedRadixTreeTestMixin):
                 "4096",
                 "--mem-fraction-static",
                 "0.8",
+                "--max-total-tokens",
+                "8192",
                 "--max-running-requests",
-                "4",
+                "1",
                 "--cuda-graph-max-bs-decode",
-                "4",
+                "1",
                 "--enable-cache-report",
                 "--enable-unified-cache-external-linker",
                 "--hicache-storage-backend-extra-config",
