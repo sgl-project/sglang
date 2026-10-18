@@ -53,6 +53,8 @@ http-body = "1"
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "catch-panic"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
+# Named directly for `Error::is_incomplete_message`, which reqwest does not expose.
+hyper = "1"
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
 # Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
 sglang-api-types = { path = "../../rust/sglang-api-types" }

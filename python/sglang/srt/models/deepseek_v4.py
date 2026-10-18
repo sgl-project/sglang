@@ -3652,16 +3652,38 @@ class DeepseekV4Model(nn.Module):
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
-        # Decoder SWA bounded replay: layers past the last kv_source layer run over
-        # each request's last SWA_WINDOW extend tokens only.
+        # Decoder SWA bounded replay: layers from late_layer_start on run over each
+        # request's last SWA_WINDOW extend tokens only.
         self.late_layer_start: Optional[int] = None
+        # The tail starts at the last kv_source layer, whose compressed KV is first
+        # written for every row (DeepseekV4AttnBackend.write_tail_source_kv).
+        self.tail_writes_source_kv = False
         if get_exec().features.enable_decoder_swa_bounded_replay:
             assert config.kv_source_layer_ids, (
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
-            self.late_layer_start = max(config.kv_source_layer_ids) + 1
+            last_source = max(config.kv_source_layer_ids)
+            # ROCm starts the tail after the source layer: the gfx950 fused boundary
+            # runs a whole layer in one call, and the ROCm backend carries the source
+            # layer's top-k and candidates into the tail itself.
+            self.tail_writes_source_kv = not _is_hip
+            self.late_layer_start = (
+                last_source if self.tail_writes_source_kv else last_source + 1
+            )
+            if self.tail_writes_source_kv:
+                assert self.layers[last_source].engram is None, (
+                    "the last kv_source layer must not carry an Engram"
+                )
+                # The tail layers read the top-k and candidates the source layer
+                # publishes inside the tail; no earlier layer carries them over.
+                assert (
+                    last_source in config.index_source_layer_ids
+                    and config.candidate_source_layer_id in (-1, last_source)
+                ), (
+                    "the last kv_source layer must also be the index and candidate source"
+                )
             late_ratios = set(
-                config.compress_ratios[self.late_layer_start : config.num_hidden_layers]
+                config.compress_ratios[last_source + 1 : config.num_hidden_layers]
             )
             assert late_ratios <= {
                 0,
@@ -3719,7 +3741,7 @@ class DeepseekV4Model(nn.Module):
     def _check_late_layer_tail_readers(
         self, forward_batch: ForwardBatch, tail: LateLayerTail
     ) -> None:
-        # Rows outside the tail are never computed past the last kv_source layer;
+        # Rows outside the tail are never computed from late_layer_start on;
         # late_layer_whole_extend gives the requests that read them a whole tail.
         extend_lens = forward_batch.extend_seq_lens_cpu
         if (
@@ -3840,6 +3862,14 @@ class DeepseekV4Model(nn.Module):
                         hidden_states, forward_batch, next=next_boundary
                     )
             if tail is not None and i == self.late_layer_start:
+                if self.tail_writes_source_kv:
+                    source = self.layers[i]
+                    attn_backend.write_tail_source_kv(
+                        layer=source.self_attn,
+                        x=mhc.combine(source.attn_hc, state),
+                        positions=positions,
+                        forward_batch=forward_batch,
+                    )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
