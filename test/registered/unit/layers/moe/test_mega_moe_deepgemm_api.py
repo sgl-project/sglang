@@ -17,9 +17,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
-from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.layers.moe.topk import TopK, TopKConfig
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -256,11 +257,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ),
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),
-            patch.object(
-                mega_moe.ExpertLocationDispatchInfo,
-                "init_new",
-                return_value=object(),
-            ),
             get_parallel().override(
                 moe_ep_group=SimpleNamespace(device_group=object())
             ),
@@ -355,6 +351,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         expert boundary exposes accidentally routing image rows as text, and
         padded rows must contribute nothing.
         """
+        config = get_context().override_server_args(
+            model_path="dummy",
+            enable_waterfill=False,
+            ep_dispatch_algorithm=None,
+            enable_eplb=False,
+        )
+        config.install()
+        self.addCleanup(config.restore)
         for fused_shared in (0, 1):
             for scale_in_topk in (False, True):
                 with self.subTest(
@@ -382,12 +386,17 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
                     with (
                         get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
-                        get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
-                        patch.object(
-                            mega_moe.ExpertLocationDispatchInfo,
-                            "init_new",
-                            return_value=None,
+                        get_parallel().override(
+                            tp_size=2,
+                            tp_rank=1,
+                            attn_tp_size=2,
+                            attn_tp_rank=1,
+                            moe_ep_size=2,
+                            moe_ep_rank=1,
+                            moe_tp_size=1,
+                            moe_tp_rank=0,
                         ),
+                        forward_context(ForwardContext(None), forward_batch=batch),
                         patch.object(mega_moe, "run_mega_routed_experts", run_experts),
                         # The fused padded-row fill requires Triton/GPU.
                         patch(

@@ -8,6 +8,7 @@ collectives and graph replay are out of scope.
 
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -60,11 +61,6 @@ def runtime(monkeypatch):
     monkeypatch.setattr(mega, "get_dp_global_num_tokens", lambda: state.global_tokens)
     monkeypatch.setattr(mega, "_ensure_mori_shmem", lambda: None)
     monkeypatch.setattr(mega, "_ep_rank_world", lambda: (state.rank, 8))
-    monkeypatch.setattr(
-        mega,
-        "ExpertLocationDispatchInfo",
-        SimpleNamespace(init_new=lambda layer_id: None),
-    )
     utils = ModuleType("sglang.srt.models.deepseek_common.utils")
     utils._use_aiter = True
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
@@ -99,6 +95,13 @@ def runtime(monkeypatch):
         state.extend = extend
         state.capture = capture
         state.global_tokens = global_tokens
+        topk = Mock(
+            return_value=SimpleNamespace(
+                topk_ids=torch.zeros(local_rows, TOPK, dtype=torch.int64),
+                topk_weights=torch.ones(local_rows, TOPK),
+            )
+        )
+        topk.routing_inputs.return_value = (None, None)
         moe = SimpleNamespace(
             config=SimpleNamespace(
                 hidden_size=HIDDEN,
@@ -109,10 +112,7 @@ def runtime(monkeypatch):
             num_fused_shared_experts=0,
             experts=state.layer if layer is None else layer,
             gate=lambda h, forward_batch=None: torch.zeros(h.shape[0], EXPERTS),
-            topk=lambda h, logits, **kwargs: SimpleNamespace(
-                topk_ids=torch.zeros(h.shape[0], TOPK, dtype=torch.int64),
-                topk_weights=torch.ones(h.shape[0], TOPK),
-            ),
+            topk=topk,
             is_hash=False,
             layer_id=0,
             routed_scaling_factor=1.0,
