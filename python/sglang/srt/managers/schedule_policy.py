@@ -867,16 +867,11 @@ class PrefillAdder:
         """Charge one admitted request against the prefill budgets.
 
         The compute budgets (`rem_chunk_tokens`, `rem_input_tokens`,
-        `rem_dllm_tokens`) count the rows the step runs for the request:
-        - its extend, billed `compute_charge` tokens. It defaults to the ceiled
-          count, so only the exact-chunk-fill path parts from upstream
-          behaviour. Both compute budgets have to take it: they are usually
-          configured to the same value, so leaving either one ceiled makes it
-          hit zero first and stop admission with the rounding slack unspent.
-        - `replay_len` cached tokens that encoder SWA replay recomputes in
-          front of the extend.
-        The KV budgets are always billed the page-ceiled extend: replay rows
-        are cached prefix tokens and take no new KV slots.
+        `rem_dllm_tokens`) take the rows the step runs: `compute_charge` for the
+        extend, plus `replay_len` cached tokens that encoder replay recomputes.
+        The KV budgets take only the page-ceiled extend, which is also the
+        default `compute_charge`. Exact-chunk-fill bills the raw length to every
+        compute budget alike, so none runs out first with rounding slack unspent.
         """
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         raw_extend_input_len = extend_input_len
@@ -918,7 +913,6 @@ class PrefillAdder:
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
     def _replay_len(self, req: Req, prefix_len: int) -> int:
-        """Cached tokens encoder replay recomputes in front of this request's extend."""
         if get_exec().features.enable_encoder_swa_bounded_replay and (
             req.kv.req_pool_idx is None or req.is_retracted
         ):
@@ -1554,8 +1548,7 @@ class PrefillAdder:
         replay_len = self._replay_len(req, prefix_len)
         chunk_limit = self.rem_chunk_tokens
         if chunk_limit is not None and replay_len:
-            # The step runs the replay rows too, so the extend gets what is
-            # left of the chunk.
+            # The replay rows share the chunk with the extend.
             chunk_limit -= replay_len
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
