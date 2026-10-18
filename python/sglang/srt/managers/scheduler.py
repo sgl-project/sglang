@@ -4648,6 +4648,12 @@ class Scheduler(
                 running_batch.batch_is_full = True
                 break
 
+            # Sample BEFORE init_next_round_input: the match-time mamba COW
+            # below sets req.kv.mamba_pool_idx, and the slot budget keys on
+            # this pre-match sample (`fresh_cow`) — budgeting on the
+            # post-match pool_idx would zero the charge for every queued
+            # request and the COW would drain the hard free list unbudgeted.
+            mamba_fresh_cow = req.kv.mamba_pool_idx is None
             req.init_next_round_input(self.tree_cache)
             if (
                 self.uocr_doc_hooks is not None
@@ -4671,6 +4677,7 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+                mamba_fresh_cow=mamba_fresh_cow,
             )
 
             if self.enable_lora:

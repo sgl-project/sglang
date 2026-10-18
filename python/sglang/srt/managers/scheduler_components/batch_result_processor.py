@@ -1662,6 +1662,19 @@ class SchedulerBatchResultProcessor:
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
+        # Fixed-system-prompt warm sentinel: the buffer is torch.zeros over
+        # the RESERVED slot 0 (see HybridReqToTokenPool.alloc) — never a real
+        # allocation, and real allocations start at slot 1 so "both slots are
+        # 0" uniquely identifies it. The boundary bookkeeping below must not
+        # touch it: the lazy branch would free slot 0 into the allocator
+        # (poisoning the reserved slot and leaking the slot that later gets
+        # allocated onto it), and the non-lazy swap would rotate the dummy
+        # index. Warm requests don't track at all — the prefill/decode masks
+        # already skip them.
+        buf = req.kv.mamba_ping_pong_track_buffer
+        if buf[0].item() == 0 and buf[1].item() == 0:
+            return
+
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)

@@ -504,10 +504,10 @@ class TestStaticMambaSlotBudget(CustomTestCase):
             ),
         )
 
-    def _budget(self, adder, req):
+    def _budget(self, adder, req, fresh_cow=False):
         from sglang.srt.managers.schedule_policy import PrefillAdder
 
-        return PrefillAdder._mamba_slot_budget_for_req(adder, req)
+        return PrefillAdder._mamba_slot_budget_for_req(adder, req, fresh_cow=fresh_cow)
 
     def test_cold_charged_full_factor(self):
         # Warm-up burst: no boundary coverage -> 3 slots (running+ping-pong).
@@ -542,6 +542,23 @@ class TestStaticMambaSlotBudget(CustomTestCase):
         # re-allocate, so admission must not charge again.
         adder = self._adder(static=True)
         self.assertEqual(self._budget(adder, self._req(64, 0, None, has_pool_idx=True)), 0)
+
+    def test_fresh_cow_charged_despite_pool_idx_set(self):
+        # Bug regression (match-COW crash): the scheduler samples fresh_cow
+        # BEFORE init_next_round_input; the match COW then sets mamba_pool_idx.
+        # Budgeting on the post-match pool_idx zeroed the charge for every
+        # queued request — the COW drained the hard free list unbudgeted and
+        # died on free=0. With fresh_cow=True the charge must apply even
+        # though pool_idx is already set (both warm=1 and cold=factor).
+        adder = self._adder(static=True)
+        # warm (boundary covered, no branching) with pool_idx set by the COW
+        self.assertEqual(
+            self._budget(adder, self._req(64, 64, None, has_pool_idx=True), fresh_cow=True), 1
+        )
+        # cold (branching) with pool_idx set by the COW
+        self.assertEqual(
+            self._budget(adder, self._req(64, 100, 64, has_pool_idx=True), fresh_cow=True), 3
+        )
 
     def test_feature_off_charges_cold_factor(self):
         # Without --system-prompt every request is "cold" in slot terms (full

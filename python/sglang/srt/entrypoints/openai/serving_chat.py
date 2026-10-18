@@ -2276,6 +2276,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 and not extra_template_kwargs
                 and len(openai_compatible_messages) > 1
                 and openai_compatible_messages[0].get("role") == "system"
+                # Only split when the leading system block IS the fixed prompt
+                # (injected by us, or a client system with identical content —
+                # then the cached prefix is token-identical either way). A
+                # client-supplied DIFFERENT system must fall through to the
+                # full render below, or its instructions would be silently
+                # replaced by the fixed prompt's tokens.
+                and openai_compatible_messages[0].get("content")
+                == self._system_prefix.system_text
             ):
                 split_ids = self._system_prefix.split_request(
                     openai_compatible_messages, encode_kwargs

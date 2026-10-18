@@ -3060,7 +3060,14 @@ class KVCacheConfigurator:
             # for the boundary state + evict headroom. No-op at ratio > 1
             # (already over-reserved) and for the disable_radix_cache ratio-1
             # path (no shared boundary state).
-            if ratio == 1 and self.server_args.system_prompt:
+            if (
+                ratio == 1
+                and self.server_args.system_prompt
+                # The disable_radix_cache ratio-1 path has no shared boundary
+                # state, no warm sentinel and no COW headroom — subtracting
+                # here would silently shrink an exactly-sized pool by 2.
+                and not get_memory().disable_radix_cache
+            ):
                 mamba_cap = max(1, mamba_cap - 2)
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
