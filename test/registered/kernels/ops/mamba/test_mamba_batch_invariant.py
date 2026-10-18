@@ -7,6 +7,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
+from sglang.kernels.ops.mamba.triton_ops.ssd_chunk_state import chunk_state_varlen
+from sglang.kernels.ops.mamba.triton_ops.ssd_combined import (
+    _mamba_chunk_scan_combined_fwd,
+)
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -147,6 +151,80 @@ def test_batch_invariant_optional_arguments(
     )
     torch.testing.assert_close(untracked[0], actual[0], atol=0, rtol=0)
     torch.testing.assert_close(untracked[1], actual[1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("length", [1, 63, 64, 65, 129, 257, 769, 1025])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_initial", [False, True])
+def test_batch_invariant_final_scan_state(length, dtype, state_dtype, with_initial):
+    """Even a partial last chunk must return the scan's own checkpoint."""
+    torch.manual_seed(43413)
+    heads, width, state_size = 4, 32, 16
+    x, dt, B, C, _ = _sequence(
+        length, heads=heads, width=width, state_size=state_size, dtype=dtype
+    )
+    cu = torch.tensor([0, length], device="cuda", dtype=torch.int32)
+    initial = (
+        torch.randn(1, heads, width, state_size, device="cuda", dtype=state_dtype)
+        if with_initial
+        else None
+    )
+    indices = offsets = None
+    if with_initial:
+        indices, offsets = Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+            cu, 64, length
+        )
+    result = _mamba_chunk_scan_combined_fwd(
+        x,
+        dt,
+        -torch.exp(torch.rand(heads, device="cuda")),
+        B,
+        C,
+        64,
+        initial_states=initial,
+        seq_idx=torch.zeros(1, length, device="cuda", dtype=torch.int32),
+        chunk_indices=indices,
+        chunk_offsets=offsets,
+        cu_seqlens=cu,
+        state_dtype=state_dtype,
+        out=torch.empty_like(x),
+        use_scan_boundary_states=True,
+    )
+    final_state, varlen_state = result[4:6]
+    torch.testing.assert_close(
+        varlen_state, final_state.to(state_dtype), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize("width,state_size", [(5, 19), (80, 128)])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+def test_batch_invariant_boundary_state_copies(width, state_size, state_dtype, strided):
+    """Copy aligned and final states without assuming contiguous input states."""
+    torch.manual_seed(43413)
+    heads, length, chunk_size = 3, 129, 64
+    storage_width = state_size * 2 if strided else state_size
+    chunks = torch.randn(
+        3, heads, width, storage_width, device="cuda", dtype=state_dtype
+    )
+    final = torch.randn(1, heads, width, storage_width, device="cuda")
+    if strided:
+        chunks = chunks[..., ::2]
+        final = final[..., ::2]
+    states = chunk_state_varlen(
+        torch.zeros(length, 1, state_size, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(length, heads, width, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(heads, 3, chunk_size, device="cuda"),
+        torch.zeros(heads, 3, chunk_size, device="cuda"),
+        torch.tensor([0, 64, 99, 128, 129], device="cuda", dtype=torch.int32),
+        chunks,
+        final_states=final,
+    )
+    torch.testing.assert_close(states[0], chunks[1], atol=0, rtol=0)
+    torch.testing.assert_close(states[1], torch.zeros_like(states[1]), atol=0, rtol=0)
+    torch.testing.assert_close(states[2], chunks[2], atol=0, rtol=0)
+    torch.testing.assert_close(states[3], final[0].to(state_dtype), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

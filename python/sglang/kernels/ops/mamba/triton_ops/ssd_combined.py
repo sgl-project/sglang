@@ -75,7 +75,6 @@ def _mamba_chunk_scan_combined_fwd(
     out=None,
     track_seq_idx=None,
     track_end_locs=None,
-    varlen_end_locs=None,
     use_scan_boundary_states=False,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
@@ -200,7 +199,11 @@ def _mamba_chunk_scan_combined_fwd(
         assert batch == 1, (
             "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
         )
-        if varlen_end_locs is None:
+        if use_scan_boundary_states and cu_seqlens.numel() == 2:
+            # The only request ends at the scan's final state. Avoid launching
+            # a reduction that has no partial-chunk queries to evaluate.
+            varlen_states = final_states.to(dtype=states.dtype, copy=True)
+        else:
             varlen_states = chunk_state_varlen(
                 B.squeeze(0),
                 x.squeeze(0),
@@ -211,21 +214,6 @@ def _mamba_chunk_scan_combined_fwd(
                 initial_states=initial_states,
                 final_states=final_states if use_scan_boundary_states else None,
             )
-        else:
-            # Aligned packing may add inert tokens after each real sequence.
-            # Capture states at the real ends rather than after the padding.
-            varlen_states = _track_states_at(
-                B,
-                x,
-                dt,
-                dA_cumsum,
-                states,
-                cu_seqlens,
-                initial_states,
-                torch.arange(len(cu_seqlens) - 1, device=x.device),
-                varlen_end_locs,
-                final_states=final_states if use_scan_boundary_states else None,
-            ).squeeze(0)
         track_states = None
         if (
             track_seq_idx is not None
@@ -464,11 +452,6 @@ def _mamba_chunk_scan_combined_batch_invariant(
         torch.tensor(padded_lengths, device=x.device, dtype=torch.int32),
         output_size=padded_total,
     ).unsqueeze(0)
-    padded_end_locs = torch.tensor(
-        [start + length for start, length in zip(padded_boundaries, lengths)],
-        device=x.device,
-        dtype=cu_seqlens.dtype,
-    )
     if initial_states is not None:
         num_chunks = triton.cdiv(padded_total, chunk_size)
         padded_chunk_indices = torch.arange(
@@ -512,7 +495,8 @@ def _mamba_chunk_scan_combined_batch_invariant(
         state_dtype=state_dtype,
         track_seq_idx=track_seq_idx,
         track_end_locs=padded_track_end_locs,
-        varlen_end_locs=padded_end_locs,
+        # Padding has zero effective dt, so the scan boundary is also the real
+        # sequence's final state. Use it instead of recomputing a partial chunk.
         use_scan_boundary_states=True,
     )
 
