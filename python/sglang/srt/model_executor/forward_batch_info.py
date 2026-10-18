@@ -750,8 +750,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
     # under MAX_LEN, padded to the max. None when the raw list already is.
     global_num_tokens_padded_cpu: Optional[List[int]] = None
-    # Each DP rank's rows from a late-layer row switch on; None when no rank
-    # switches rows this step.
+    # Each DP rank's rows from a late-layer row switch on; None on steps that skip
+    # the exchange.
     global_late_layer_num_tokens_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
