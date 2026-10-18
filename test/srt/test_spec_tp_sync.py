@@ -1,4 +1,5 @@
 """Tests for SpecTpSync.available_memory_gb group semantics (#39886)."""
+
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,7 +26,9 @@ def test_foreign_multi_rank_group_reduces():
 
 def test_constructor_multi_rank_group_reduces_by_default():
     # Multi-rank constructor group: sites default to all -> reduced.
-    sync = SpecTpSync(SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object()))
+    sync = SpecTpSync(
+        SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object())
+    )
     assert _mem_call(sync, sync._tp_group) is True
 
 
@@ -33,7 +36,9 @@ def test_site_gate_still_applies_on_constructor_group():
     # Same-group call with every site disabled stays rank-local.
     os.environ["SGLANG_SPEC_TP_SYNC"] = "-all"
     try:
-        sync = SpecTpSync(SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object()))
+        sync = SpecTpSync(
+            SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object())
+        )
         assert _mem_call(sync, sync._tp_group) is False
     finally:
         del os.environ["SGLANG_SPEC_TP_SYNC"]
