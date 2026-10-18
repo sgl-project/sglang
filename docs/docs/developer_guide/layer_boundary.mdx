@@ -308,7 +308,7 @@ Paths in this table are relative to `python/sglang/srt/layers/layer_boundary/`.
 | `contracts.py` | Resolved input/output contracts, edge declarations, batch variants, and bound step records |
 | `layout.py` | Token axes, layouts, named sum groups, and topology/batch facts |
 | `construction.py` | Build a `StagePlan` and select its batch variant |
-| `boundary.py` | Select and bind producer/consumer boundary operations from contracts; for CP, `_cp_moves` pairs gather, return-to-local-rows, and eligible reduce-scatter operations using the same token mapping |
+| `boundary.py` | Select and bind producer/consumer boundary operations from contracts; for prefill CP, one `CpMoves` (`contracts.py`) pairs the FFN-input gather, the take-back of a complete output, and, where there is one, the reduce-scatter that completes a sum |
 | `prepare.py` | Execute completion, update, read, and input movement in the selected order |
 | `ops.py` | Collective and token-row movement primitives |
 | `stage.py` | Model-facing `StageBoundary` methods |

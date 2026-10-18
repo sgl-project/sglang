@@ -136,8 +136,8 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# Largest batch the FlashInfer all-reduce fusion runs on; it also sizes the
-# fusion workspace pre-allocated before graph capture.
+# Largest batch the non-CuTe-DSL FlashInfer all-reduce fusion runs on;
+# it also sizes that fusion's workspace, pre-allocated before graph capture.
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 

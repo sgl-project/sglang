@@ -716,9 +716,10 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
 
 def should_use_dp_reduce_scatterv():
     """
-    Use reduce_scatterv when a stage boundary returns an FFN output over
-    attention DP (DP attention with EP), replacing the default all-reduce +
-    dp_scatter path. Only that post-expert return changes; dispatch is unchanged.
+    Whether the parallel configuration allows reduce_scatterv for returning an
+    FFN output over attention DP (DP attention with EP), replacing the default
+    all-reduce + dp_scatter path; a stage boundary also needs boundary_reduction
+    rsv or rs+rsv. Only that post-expert return changes; dispatch is unchanged.
 
     The reduce_scatterv group is the global TP group, while its variable split
     sizes are one entry per attention-DP rank. Therefore this optimization is

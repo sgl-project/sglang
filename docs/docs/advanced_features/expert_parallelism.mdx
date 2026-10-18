@@ -155,7 +155,7 @@ SGLang's EP framework provides modular abstractions for easy integration of cust
 The framework centers on `FusedMoE` as the unified entry point for a single, extensible structure. Key components include:
 - **Dispatcher**: Manages dispatch/combine for backends like DeepEP (implements `BaseDispatcher` subclasses).
 - **MoeRunner**: Orchestrates grouped-GEMM execution via `MoeRunnerCore` implementations (e.g., `TritonRunnerCore`).
-- **FusedOpPool** and **PermuteMethodPool**: Auto-register fused functions per all-to-all and runner backend pair (`register_fused_func`) and layout conversions (`register_pre_permute` and `register_post_permute`). `MoeRunner.run` calls the fused function when one is registered for the layer's pair and LoRA is disabled; otherwise it runs pre-permute, the runner core, and post-permute.
+- **FusedOpPool** and **PermuteMethodPool**: Auto-register fused functions per all-to-all and runner backend pair (`register_fused_func`) and layout conversions (`register_pre_permute` and `register_post_permute`). `MoeRunner.run` calls the fused function when one is registered for the layer's pair and LoRA is disabled; otherwise it runs pre-permute, the runner core, and post-permute, or hands the dispatch output to a `DispatchMoeRunnerCore`.
 - **TopK Router**: Backend-agnostic expert selection.
 
 This design supports multiple backends via `--moe-a2a-backend` and `--moe-runner-backend`, with quantization integrated through a standardized `apply()` method. The computation flow ensures modularity:
@@ -205,7 +205,7 @@ To add a new backend:
    - **Fused Mode** (static, torch.compile-compatible): Use `register_fused_func` for end-to-end operations.
    - **Permute Mode** (dynamic): Register `register_pre_permute` and `register_post_permute` for flexible layouts.
 
-   When both are registered for a backend pair, the fused function takes precedence; the permute path still serves LoRA, which skips fused functions.
+   When both are registered for a backend pair, the fused function takes precedence; the non-fused path still serves LoRA, which skips fused functions.
 
 See the [MoE Refactor Implementation PR](https://github.com/sgl-project/sglang/pull/9269) for full changes, including type hints and config expansions.
 
