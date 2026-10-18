@@ -127,6 +127,44 @@ _mock_device = patch(
 _mock_device.start()
 
 
+class TestServerArgsPositionalOrder(CustomTestCase):
+    def test_new_parallel_flag_preserves_existing_positional_slots(self):
+        """New options must not reinterpret existing positional constructor calls."""
+        defaults = ServerArgs(model_path="dummy")
+        # Preserve the 537-input signature, including fields added after the split.
+        positional = [
+            getattr(defaults, field.name)
+            for field in msgspec.structs.fields(ServerArgs)[:537]
+        ]
+        positional[95] = True
+        positional[96] = True
+        positional[97] = "cpu"
+        positional[536] = 123.0
+
+        args = ServerArgs(*positional)
+
+        self.assertTrue(args.disable_attn_tp_gather)
+        self.assertTrue(args.enable_p2p_check)
+        self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.grpc_response_timeout_secs, 123.0)
+        self.assertFalse(args.enable_megamoe_for_layernorm_sp)
+
+    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                keyword_args = ServerArgs(
+                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
+                )
+                argv = ["--model-path", "dummy"]
+                if enabled:
+                    argv.append("--enable-megamoe-for-layernorm-sp")
+                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
+                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
+                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
+
+
 class TestPrepareServerArgs(CustomTestCase):
     def test_optimistic_prefill_allows_l2_write_through_only(self):
         for policy, expected in (
