@@ -3788,6 +3788,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_worker_count = physical_ep_size_to_dp_size(
             msg.effective_ep_size, self.attn_replica_size
         )
+        if not msg.graph_ready:
+            # Expanded eager serving is not completion of graph preparation.
+            self.elastic_pending_ep_size = msg.effective_ep_size
+            self.elastic_scale_phase = "graph_warming"
+            self.update_control_communicator_fan_out(self.elastic_worker_count)
+            return
         if self.elastic_pending_stages:
             # Intermediate stage: widen the fan-out to the landed cohort but leave
             # pending_ep_size and the shrink gate untouched -- the op is unfinished.

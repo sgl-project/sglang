@@ -597,7 +597,12 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
-        if self.model_runner._elastic_cuda_graph_enabled():
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        if self.model_runner._elastic_cuda_graph_enabled() and (
+            self.model_runner.live_scale is None
+            or ElasticEPStateManager.get_pending_ep_size() is None
+        ):
             self.model_runner.maybe_join_ep_ranks()
 
     def forward_batch_generation(

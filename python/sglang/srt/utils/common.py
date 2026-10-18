@@ -4153,6 +4153,14 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
 
     # elastic-EP scale-up widens num_dp_ranks on the published config
     if get_parallel().attn_dp_enabled:
+        if (
+            get_parallel().num_dp_ranks == 1
+            and get_exec().moe.is_ep_scale_joiner
+            and get_exec().moe.elastic_ep_backend is not None
+        ):
+            # Live singleton joiners allocate local graph buffers before
+            # admission publishes the expanded logical DP size.
+            return False
         assert get_parallel().num_dp_ranks > 1, (
             "attention DP needs more than one DP rank"
         )

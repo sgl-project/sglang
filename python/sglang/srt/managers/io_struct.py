@@ -2316,6 +2316,7 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     slot_count: int = 0
     direction: str = "grow"  # "grow" adds DPC routing slots; "shrink" removes them.
     error: Optional[str] = None
+    graph_ready: bool = True
 
 
 class ElasticDrainClearReq(BaseReq, kw_only=True):

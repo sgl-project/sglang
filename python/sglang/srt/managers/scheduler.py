@@ -719,6 +719,8 @@ class Scheduler(
 
         self.init_rank_consensus_checker()
 
+        if self.tp_worker.model_runner.live_scale is not None:
+            self.tp_worker.model_runner.live_scale.finish_joiner()
         self.is_initializing = False
         self.init_startup_timing_summary()
 
@@ -1994,6 +1996,12 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
+
+            # Capture only after all batch outputs, including sampling/logprobs,
+            # have been consumed. DP idle ranks also reach this control boundary.
+            if self.tp_worker.model_runner.live_scale is not None:
+                self.tp_worker.model_runner.live_scale.tick()
+                self._maybe_report_active_ranks()
 
             # Update last_batch
             self.last_batch = batch

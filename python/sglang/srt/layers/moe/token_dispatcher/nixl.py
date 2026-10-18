@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from enum import Enum, auto
@@ -15,6 +16,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     nixl_wired_barrier_via_store,
     read_heartbeats,
 )
+from sglang.srt.elastic_ep.live_scale import live_scale_mode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -112,6 +114,8 @@ class NixlEPBuffer:
                 last_fault_poll=0.0,
                 heartbeats={},
                 held_marks=set(),
+                initializer=None,
+                staged_ep_size=None,
             )
             buffers["nixl_ep_state"] = state
         return state
@@ -299,6 +303,13 @@ class NixlEPBuffer:
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
         """Schedule connections for newly admitted ranks."""
         state = cls._state()
+        if state.staged_ep_size is not None and to_ep_size > from_ep_size:
+            if state.staged_ep_size != to_ep_size:
+                raise RuntimeError("NIXL cohort was not prepared before activation")
+            for rank in range(to_ep_size):
+                state.buffer.update_mask_buffer(rank, False)
+            state.connected_ep_size = to_ep_size
+            state.staged_ep_size = None
         state.scale_to = to_ep_size
         # Under graph reuse the width stays at capacity; see _mask_unwired.
         if not state.reuse_graphs:
@@ -360,6 +371,33 @@ class NixlEPBuffer:
                 "dispatch will wait on them",
                 unmasked,
             )
+
+    @classmethod
+    def initialize_for_live_prepare(cls):
+        Buffer, _ = _load_nixl_ep()
+        if "activate" not in inspect.signature(Buffer.connect_ranks).parameters:
+            raise RuntimeError("Live scale requires NIXL connect_ranks(activate=False)")
+        state = cls._state()
+        if state.initializer is None:
+            raise RuntimeError("Live scale requires a NIXL dispatcher")
+        state.initializer()
+
+    @classmethod
+    def start_live_prepare(cls, preparation, device):
+        state = cls._state()
+        state.buffer.set_tcp_store_group(preparation.store)
+        first = 0 if preparation.rank >= preparation.old_size else preparation.old_size
+        ranks = list(range(first, preparation.target_size))
+
+        def connect():
+            torch.cuda.set_device(device)
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                state.buffer.connect_ranks(ranks, activate=False)
+            stream.synchronize()
+            state.staged_ep_size = preparation.target_size
+
+        preparation.start(connect)
 
     @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
@@ -471,6 +509,10 @@ class NixlEPBuffer:
         )
         initial_ep_size = offset + world_size
         scale_to = max(initial_ep_size, state.scale_to or 0)
+        if live_scale_mode() and get_exec().moe.is_ep_scale_joiner:
+            state.connected_ep_size = 0
+            state.dispatch_ep_size = scale_to
+            return state.buffer
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
         state.connected_ep_size = scale_to
         state.scale_to = scale_to
@@ -756,6 +798,10 @@ class NixlEPDispatcher(BaseDispatcher):
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
+            if live_scale_mode():
+                state = NixlEPBuffer._state()
+                if state.initializer is None:
+                    state.initializer = self._low_latency_dispatcher._get_buffer
         if self.deepep_mode.enable_normal():
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
 

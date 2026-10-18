@@ -236,6 +236,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         record_nolora_graph: bool = False,
+        defer_capture: bool = False,
     ):
         super().__init__(model_runner)
         self.record_nolora_graph = record_nolora_graph
@@ -511,6 +512,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.backend = resolve_decode_backend(self)
 
         # --- capture --------------------------------------------------
+        if defer_capture:
+            return
         try:
             with model_capture_mode():
                 self.capture()
@@ -1120,6 +1123,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
         return forward_batch, attn_backend, pp_proxy_tensors
+
+    def capture_step(self, size: int) -> None:
+        """Record one shape with all capture contexts closed before returning.
+
+        The coordinator keeps this runner unpublished until every shape exists.
+        capture() resets shared index inputs on *each* entry, preserving the
+        mid-serving KV safety reset of ordinary elastic recapture.
+        """
+        if size not in self.capture_bs:
+            raise ValueError(f"Unknown capture shape {size}")
+        sizes = self.capture_bs
+        try:
+            self.capture_bs = [size]
+            with model_capture_mode():
+                self.capture()
+        finally:
+            self.capture_bs = sizes
 
     def capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
