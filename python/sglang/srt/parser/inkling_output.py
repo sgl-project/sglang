@@ -43,11 +43,7 @@ class InklingOutputDelta(msgspec.Struct, frozen=True):
 
 
 class InklingOutputParser:
-    """Incremental TMLv0 parse of one choice's sampled token IDs.
-
-    Parsing runs on token IDs through ``tml_renderers.v0.Parser``, so a control
-    token is recognized only by ID: model text that spells a marker stays text.
-    """
+    """Control tokens are identified by ID; ordinary tokens spelling a marker remain text."""
 
     def __init__(
         self,
@@ -186,8 +182,7 @@ class InklingOutputParser:
             if token_id != self._end_message_id:
                 self._parse(self._end_message_id, delta)
         elif self._at_message_boundary and not is_special:
-            # Constrained decoding (e.g. response_format) samples a bare payload
-            # where a message header belongs; parse it as model text.
+            # Headerless fallback output is model text; synthesize its missing opener.
             for opener_id in self._text_opener_ids:
                 self._parse(opener_id, delta)
             self._in_unframed_text = True

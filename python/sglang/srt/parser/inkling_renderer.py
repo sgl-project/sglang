@@ -52,12 +52,8 @@ def render_inkling_messages(
     tools: Sequence[Mapping[str, Any]] | None = None,
     reasoning_effort: float | None = None,
 ) -> list[int]:
-    """Render chat messages to Inkling input_ids via ``tml_renderers.v0``.
-
-    Emits ONE ``IMAGE_TOKEN_ID`` / ``AUDIO_TOKEN_ID`` per media part; the MM
-    processor expands them later. No assistant turn opener is appended: Inkling
-    samples its own ``<|message_model|>`` header.
-    """
+    """Media parts emit one placeholder each for later MM expansion.
+    Inkling samples its own assistant header."""
     tml = load_tml_renderers()
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     oss_messages, media_kinds = _to_oss_messages(messages, media_marker)
@@ -80,9 +76,7 @@ def render_inkling_messages(
 
 
 def render_inkling_assistant_prefix(prefix: str) -> list[int]:
-    """Open (unterminated) model text block that the model continues; TMLv0
-    itself has no prefill, so this is an sglang ``continue_final_message``
-    extension."""
+    """TMLv0 has no prefill; continuation opens a model text block without a terminator."""
     tokenizer = load_tml_renderers().tokenizer
     return [
         tokenizer.encode_special(_special_name(MESSAGE_MODEL)),

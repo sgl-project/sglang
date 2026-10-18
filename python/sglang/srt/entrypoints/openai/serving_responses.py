@@ -1073,7 +1073,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if content:
             output_text = ResponseOutputText(
                 text=content,
-                annotations=[],  # TODO
+                annotations=[],
                 type="output_text",
                 # logprobs cover all generated tokens, not just the stripped content.
                 logprobs=output_logprobs,
@@ -1175,7 +1175,6 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _parse_required_tool_json(
         self, content: str, custom_names: set[str]
     ) -> tuple[str, list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]]]:
-        """Parse required/named tool output constrained to the generic JSON array."""
         tool_call_items = []
         try:
             tool_call_data = orjson.loads(content)

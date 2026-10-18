@@ -483,7 +483,6 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _build_spec_adapter(self) -> Optional[spec_adapters.SpecAdapter]:
-        """None keeps ``chat_encoding_spec`` on the branches in ``_encode_messages``."""
         return spec_adapters.build_spec_adapter(
             self.chat_encoding_spec,
             spec_adapters.SpecAdapterContext(

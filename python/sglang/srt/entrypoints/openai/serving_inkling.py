@@ -34,10 +34,6 @@ if TYPE_CHECKING:
 
 
 class InklingSpecAdapter:
-    """Renders Inkling prompts and, when an Inkling parser is configured,
-    parses output from token IDs (the ``SpecAdapter`` and ``SpecOutputAdapter``
-    protocols in ``spec_adapters``)."""
-
     collects_openai_media = True
 
     def __init__(
@@ -48,9 +44,8 @@ class InklingSpecAdapter:
         tool_call_parser: str | None,
         chat_hooks: ChatOutputHooks,
     ):
-        # Resolve the env-configured Inkling effort default once: the env var is
-        # frozen for the server's lifetime, and a misconfigured value should
-        # fail at boot, not 400 every request.
+        # Validate the frozen effort default at startup,
+        # so configuration errors fail before requests.
         self._default_reasoning_effort = get_default_reasoning_effort()
         load_tml_renderers()
         if tokenizer is not None:
@@ -246,9 +241,6 @@ class InklingSpecAdapter:
 
 
 class InklingResponsesStream:
-    """One streamed response's parse, shaped like the text parsers' output:
-    each engine chunk yields (reasoning, text, tool calls)."""
-
     def __init__(self, *, separate_reasoning: bool, parse_tool_calls: bool):
         self._parser = InklingOutputParser(
             separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
@@ -330,12 +322,7 @@ def _pop_assistant_prefix(
     messages: list[dict[str, Any]],
     request: ChatCompletionRequest,
 ) -> str | None:
-    """Extract the trailing assistant text for ``continue_final_message``.
-
-    Only a plain-string assistant message with no tool calls and no
-    reasoning content can be continued; anything else renders as a closed
-    historical turn. Mutates ``messages`` in place (callers pass a copy).
-    """
+    """Pops only a continuable text turn; callers pass a message-list copy."""
     if not request.continue_final_message or not messages:
         return None
     if not _is_continuable_message(messages[-1]):
@@ -355,7 +342,6 @@ def _is_continuable_message(message: dict[str, Any]) -> bool:
 def parse_reasoning_effort(
     value: str | float | None,
 ) -> float | None:
-    """Convert an OpenAI-style reasoning_effort to an Inkling float."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -386,7 +372,6 @@ def parse_reasoning_effort(
 
 
 def get_default_reasoning_effort() -> float:
-    """Read the default Inkling reasoning effort from the environment."""
     from sglang.srt.environ import envs
 
     val = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT.get()

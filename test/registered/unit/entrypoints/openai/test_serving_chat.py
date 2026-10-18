@@ -5573,8 +5573,7 @@ class InklingTokenOutputTest(CustomTestCase):
         self.assertEqual(has_tool_calls, {0: True})
 
     def test_matched_stop_is_trimmed_from_visible_text(self):
-        """Bug regression: output ids include the matched stop, which only the
-        detokenized text had trimmed; the token-ID parse returned it verbatim."""
+        """Matched stops are trimmed from sampled IDs, including matches inside a token."""
         encode = self.tokenizer.encode_ordinary
         special = self.tokenizer.encode_special
         text_block = [special("message_model"), special("content_text")]
@@ -5645,9 +5644,8 @@ class InklingTokenOutputTest(CustomTestCase):
                     self.assertEqual(result, expected)
 
     def test_stop_string_is_cut_where_the_sampler_matched(self):
-        """Bug regression: the stop string was searched in the merged content,
-        where two text blocks can spell it although framing separated them in
-        the sampled stream; the answer was truncated at that false match."""
+        """Trimming follows sampled framing;
+        concatenated message text can contain a false earlier match."""
         encode = self.tokenizer.encode_ordinary
         special = self.tokenizer.encode_special
         first_block = [
@@ -5682,9 +5680,8 @@ class InklingTokenOutputTest(CustomTestCase):
                     self.assertEqual(result, expected)
 
     def test_overlapping_stop_is_cut_at_its_earliest_start(self):
-        """Bug regression: the backward search stopped at the first suffix
-        holding any match, so a stop that began in the previous token and
-        overlapped a later match in the final token was cut too late."""
+        """The suffix window must retain the earliest overlapping stop,
+        including one starting in the previous token."""
         header = [
             self.tokenizer.encode_special("message_model"),
             self.tokenizer.encode_special("content_text"),
@@ -5710,8 +5707,7 @@ class InklingTokenOutputTest(CustomTestCase):
                         self.assertEqual(result, expected)
 
     def test_special_stop_inside_open_text_block_is_not_visible(self):
-        """Bug regression: inside an open text block TML renders a special token
-        as text, so a custom special stop id leaked unless trimmed by id."""
+        """Special stops inside an open text block stay invisible unless no_stop_trim keeps them."""
         encode = self.tokenizer.encode_ordinary
         stop_id = self.tokenizer.encode_special("content_thinking")
         text_block = [
@@ -5748,8 +5744,8 @@ class InklingTokenOutputTest(CustomTestCase):
                         self.assertEqual(result, expected)
 
     def test_unframed_prefix_keeps_the_following_marker_kind(self):
-        """Bug regression: stray text before a header-less thinking or tool-call
-        marker erased the marker, so reasoning became content and the call text."""
+        """A stray ordinary prefix must not erase the following thinking
+        or tool-call discriminator."""
         encode = self.tokenizer.encode_ordinary
         special = self.tokenizer.encode_special
         eos = special("content_model_end_sampling")
@@ -5790,9 +5786,8 @@ class InklingTokenOutputTest(CustomTestCase):
         )
 
     def test_constrained_output_without_header_is_content(self):
-        """Bug regression: response_format grammars sample bare JSON where a
-        message header belongs (after the reasoning terminator, or from the
-        first token), and the parser dropped that unframed text."""
+        """Headerless fallback payloads remain content,
+        whether they start the response or follow thinking."""
         encode = self.tokenizer.encode_ordinary
         special = self.tokenizer.encode_special
         payload = '{"marker": "<|end_message|>", "ok": true}'
@@ -5803,8 +5798,8 @@ class InklingTokenOutputTest(CustomTestCase):
             special("end_message"),
         ]
         eos = special("content_model_end_sampling")
-        # Grammars can sample a content-kind token inside the payload; the EOS
-        # then lands in a reopened text block and must still not render.
+        # Recovery can reopen text after a content-kind token;
+        # a terminal EOS must still stay invisible.
         with_kind_token = [
             *encode('{"a": "'),
             special("content_text"),
@@ -5826,8 +5821,8 @@ class InklingTokenOutputTest(CustomTestCase):
                     self.assertEqual(result, expected)
 
     def test_constrained_continuation_stays_in_the_open_text_block(self):
-        """Bug regression: a constrained continue_final_message request had to open
-        a new message header inside the prompt's text block, which leaked as text."""
+        """The rendered continuation must select an open-answer grammar
+        and parse its sampled suffix without leaking a header."""
         from types import SimpleNamespace
 
         from xgrammar import TokenizerInfo, VocabType

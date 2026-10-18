@@ -1,15 +1,5 @@
-"""Serving adapters for chat encoding specs that own prompt rendering.
-
-``build_spec_adapter`` returns None for a spec with no registered adapter; that
-spec keeps its existing rendering branches in ``serving_chat``. Concrete
-adapters are imported lazily, so selecting another spec never loads them.
-
-The output protocols re-derive encode-time state (such as a prompt ending inside
-an open text block) from the request. A spec whose output parsing depends on a
-decision the encoder made, such as whether the prompt opened a thinking block,
-should return it from encoding as an ``EncodedPrompt`` (prompt ids plus that
-state) and take it in the output methods, rather than deciding twice.
-"""
+"""Unregistered specs retain the existing serving branches;
+concrete adapters load only when selected."""
 
 from __future__ import annotations
 
@@ -37,8 +27,6 @@ class ResponsesOutputStream(Protocol):
 
 
 class SpecOutputAdapter(Protocol):
-    """Parses sampled token IDs into API output, replacing the text parsers."""
-
     def parse_chat_response(
         self,
         *,
@@ -95,9 +83,6 @@ class SpecAdapter(Protocol):
 
 
 class SpecAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
-    """Everything a builder may read; a new builder input is a field here, so the
-    builder signature and the one construction site in serving_chat stay stable."""
-
     tokenizer: Any
     reasoning_parser: Optional[str]
     tool_call_parser: Optional[str]

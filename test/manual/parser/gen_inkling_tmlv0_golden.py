@@ -3,11 +3,7 @@
 Run after bumping the tml-renderers pin:
     python test/manual/parser/gen_inkling_tmlv0_golden.py
 
-Each prompt case stores the request sglang receives (``messages``/``tools``) and
-the ``input_ids`` the library renders for the equivalent reference conversation.
-The only sglang-owned conventions applied here are the ones the fixture's
-``source`` names: tool_declare after the leading system messages, and one -101
-placeholder per image span.
+The fixture's source field records the explicit adaptation conventions.
 """
 
 import copy

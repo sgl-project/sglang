@@ -29,9 +29,8 @@ _GOLDEN = json.loads(
 
 class TestInklingRenderer(unittest.TestCase):
     def test_prompts_match_tmlv0_reference(self):
-        """Golden input_ids were produced by tml-renderers itself (see the
-        fixture's ``source``); sglang's message adaptation must not change a
-        single token."""
+        """Reference-generated prompt IDs pin the bridge conventions
+        recorded in the fixture's source."""
         for case in _GOLDEN["prompts"]:
             with self.subTest(case=case["name"]):
                 actual = render_inkling_messages(
@@ -57,9 +56,8 @@ class TestInklingRenderer(unittest.TestCase):
             )
 
     def test_audio_part_keeps_mm_processor_framing(self):
-        """The MM processor expands one AUDIO_TOKEN_ID inside
-        <|content_audio_input|> ... <|audio_end|>; tml-renderers cannot render
-        audio without DMel-encoding the bytes, so this framing is sglang's."""
+        """The MM processor expands one AUDIO_TOKEN_ID inside the audio input envelope;
+        tml-renderers cannot render audio without DMel bytes, so this envelope is sglang's."""
         actual = render_inkling_messages(
             [
                 {
@@ -85,9 +83,8 @@ class TestInklingRenderer(unittest.TestCase):
         )
 
     def test_audio_outside_user_messages_is_rejected(self):
-        """tml-renderers renders AudioPointer only as user input audio; a tool
-        or assistant audio part must fail instead of rendering a framing the
-        model never saw."""
+        """tml-renderers supports audio only as user input; tool or assistant audio
+        must fail rather than render a framing the model never saw."""
         audio = {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}
         for message in (
             {"role": "tool", "tool_call_id": "c", "name": "rec", "content": [audio]},
@@ -147,8 +144,8 @@ def _stream(token_ids: list[int], **kwargs):
 
 class TestInklingOutputParser(unittest.TestCase):
     def test_outputs_match_tmlv0_reference(self):
-        """Expected reasoning/content/tool_calls come from tml-renderers'
-        own parser; one-shot and per-token parsing must both reproduce them."""
+        """The fixture uses reference-parser messages and sampled-JSON arguments;
+        batch and per-token parsing must match it."""
         for case in _GOLDEN["outputs"]:
             for mode, parse in (
                 ("batch", _batch),
@@ -175,9 +172,8 @@ class TestInklingOutputParser(unittest.TestCase):
                     )
 
     def test_unparseable_call_becomes_payload_text(self):
-        """A call payload the reference parser rejects (NaN, missing args) must
-        not surface as a tool call, and the header tool name must not leak
-        into content; parsing resumes at the next message."""
+        """A call payload the reference parser rejects (NaN, missing args) is not a tool call
+        and does not leak its header name; parsing resumes at the next message."""
         for payload in ('{"name":"f","args":{"a":NaN}}', '{"name":"f"}'):
             output_ids = _ids(
                 "<|message_model|>",
