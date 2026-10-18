@@ -41,6 +41,7 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
     )
     model_runner = MagicMock(is_draft_worker=False)
     model_runner.attn_tp_sequence_sharded.return_value = False
+    model_runner.attn_backend.late_layer_num_tokens.return_value = None
     no_prefill_graph = SimpleNamespace(
         graph=SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[]))
