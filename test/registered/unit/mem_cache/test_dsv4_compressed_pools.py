@@ -464,21 +464,19 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
                 prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
             )
 
-    def test_pd_draft_mark_pairs_as_request_row_state(self):
-        # A replay prefill's draft ring and a paged draft on either PD role send
-        # the mark as one request-row item per slot; a server without PD and
-        # without a ring keeps none.
+    def test_dspark_draft_keeps_the_mark_for_either_storage(self):
+        # Ring or paged, a DSpark draft sends one request-row item, so the PD
+        # roles' state pairs; another algorithm's draft and the target keep none.
         item = torch.zeros(1, dtype=torch.int64).nbytes
-        for encoder_replay, mode, expected in (
-            (True, "prefill", [item]),
-            (False, "prefill", [item]),
-            (False, "decode", [item]),
-            (False, "null", []),
+        for algorithm, encoder_replay, expected in (
+            ("DSPARK", True, [item]),
+            ("DSPARK", False, [item]),
+            ("EAGLE", False, []),
         ):
-            with self.subTest(encoder_replay=encoder_replay, mode=mode):
+            with self.subTest(algorithm=algorithm, encoder_replay=encoder_replay):
                 override = get_context().override_server_args(
+                    speculative_algorithm=algorithm,
                     enable_encoder_swa_bounded_replay=encoder_replay,
-                    disaggregation_mode=mode,
                 )
                 override.install()
                 try:
@@ -486,8 +484,8 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
                     draft = self.make_pool(draft=True)
                 finally:
                     override.restore()
-                self.assertEqual(draft.get_request_row_buf_infos()[2], expected)
-                self.assertEqual(target.get_request_row_buf_infos(), ([], [], []))
+                self.assertEqual(draft.get_swa_valid_from_buf_infos()[2], expected)
+                self.assertEqual(target.get_swa_valid_from_buf_infos(), ([], [], []))
 
     def test_pd_window_pages_carry_the_last_window(self):
         window = self.make_pool(draft=False).request_window

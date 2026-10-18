@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_disagg, get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
@@ -121,6 +121,16 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     `c_plan.cuh`, where the bound is derived."""
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
+
+
+def is_dspark_spec() -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algorithm = get_spec().speculative_algorithm
+    return (
+        spec_algorithm is not None
+        and SpeculativeAlgorithm.from_string(spec_algorithm).is_dspark()
+    )
 
 
 def uses_draft_swa_ring() -> bool:
@@ -1176,9 +1186,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = get_draft_swa_ring_size(
                 self.sliding_window, online_mtp_max_draft_tokens or 0, swa_page_size
             )
-            self.swa_valid_from = torch.zeros(
-                self.num_req_slots, dtype=torch.int64, device=device
-            )
             self.swa_kv_pool = self._make_kv_pool(
                 size=self.num_req_slots * self.swa_req_ring_size,
                 page_size=swa_kv_page_size,
@@ -1240,16 +1247,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             is_draft_worker
             and not _is_hip
             and self.swa_kv_pool is not None
-            and self.swa_valid_from is None
-            and get_disagg().disaggregation_mode != "null"
+            and is_dspark_spec()
         ):
-            # A prefill whose draft keeps a ring sends window rows below the
-            # cached prefix that it never wrote for this request. Both PD roles
-            # keep the mark so their request-row state pairs; a paged prefill's
-            # stays 0.
-            self.swa_valid_from = torch.zeros(
-                self.num_req_slots, dtype=torch.int64, device=device
-            )
+            # Kept for the ring and for paged SWA alike, so both PD roles
+            # register it; it stays 0 unless the ring restarts or PD writes it.
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.swa_valid_from = torch.zeros(
+                    self.num_req_slots, dtype=torch.int64, device=device
+                )
 
         if self.request_window is not None:
             swa_storage = "request_window"
@@ -1316,8 +1325,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         request's: the slot's previous owner wrote them, or no one did."""
         self.swa_valid_from[slots] = valid_from
 
-    def get_request_row_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """Request-row state for PD: one item per req slot, sent slot to slot."""
+    def get_swa_valid_from_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """The draft SWA valid-from, which PD sends as request-row state."""
         if self.swa_valid_from is None:
             return [], [], []
         mark = self.swa_valid_from

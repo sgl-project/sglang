@@ -1781,7 +1781,7 @@ def setup_state_kv_args(
                 draft_item_lens,
             )
         row_ptrs, row_lens, row_item_lens = (
-            draft_token_to_kv_pool.get_request_row_buf_infos()
+            draft_token_to_kv_pool.get_swa_valid_from_buf_infos()
         )
         if row_ptrs:
             append_state_component(
