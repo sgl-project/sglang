@@ -4526,6 +4526,72 @@ class Scheduler(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
 
+    # Module-level throttle timestamp for the periodic mamba slot audit (kept
+    # out of __init__ on purpose): one [MambaAudit] line per 30s per scheduler.
+    _mamba_audit_last_ts: float = 0.0
+
+    def _maybe_audit_mamba_slots(self, adder, running_batch) -> None:
+        """Periodic slot-accounting snapshot for the fixed-system-prompt mamba
+        debugging ([MambaAudit] lines, 30s throttle).
+
+        Reconciles the PHYSICAL pool state (free / allocated / lifetime
+        alloc-free counters / group-degraded count) against the LOGICAL holders
+        (running + admitted + chunked requests, evictable tree nodes). A
+        monotonic growth of `allocated - holders - evictable` means slots are
+        leaking; a `free` far below `rem` at the moment of a match-COW failure
+        pinpoints which consumer drained the hard list between the budget
+        snapshot and the allocation.
+        """
+        allocator = self.token_to_kv_pool_allocator.mamba_allocator
+        if allocator is None:
+            return
+        import time as _time
+
+        now = _time.monotonic()
+        if now - self._mamba_audit_last_ts < 30.0:
+            return
+        self._mamba_audit_last_ts = now
+
+        stats = allocator.debug_stats()
+        running_hold = sum(
+            1 for r in running_batch.reqs if r.kv.mamba_pool_idx is not None
+        )
+        can_run_hold = sum(
+            1 for r in adder.can_run_list if r.kv.mamba_pool_idx is not None
+        )
+        chunked_hold = (
+            1
+            if self.chunked_req is not None
+            and self.chunked_req.kv.mamba_pool_idx is not None
+            else 0
+        )
+        evictable = self.tree_cache.mamba_evictable_size()
+        # Remaining slot budget: the static pool's adder-level count; the
+        # shared pool budgets slots through the memory budget instead.
+        rem_mamba_slots = adder.rem_mamba_slots
+        logger.info(
+            "[MambaAudit] size=%d free=%d allocated=%d | hold: running=%d "
+            "can_run=%d chunked=%d evictable=%d | unaccounted=%d | queue=%d "
+            "rem=%d | lifetime alloc=%d free=%d group_degraded=%d",
+            stats["size"],
+            stats["free"],
+            stats["size"] - stats["free"],
+            running_hold,
+            can_run_hold,
+            chunked_hold,
+            evictable,
+            (stats["size"] - stats["free"])
+            - running_hold
+            - can_run_hold
+            - chunked_hold
+            - evictable,
+            len(self.waiting_queue),
+            rem_mamba_slots if rem_mamba_slots is not None else -1,
+            stats["alloc_total"],
+            stats["free_total"],
+            stats["group_degraded"],
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4688,6 +4754,7 @@ class Scheduler(
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
+            self._maybe_audit_mamba_slots(adder, running_batch)
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # A parked chunk found no budget in this pass: admit no one ahead of it,
@@ -4786,6 +4853,17 @@ class Scheduler(
                 adder.rem_mamba_slots is not None
                 and adder.rem_mamba_slots < adder._mamba_match_headroom()
             ):
+                if mamba_allocator is not None:
+                    logger.info(
+                        "[MambaAudit] match pre-check stopped pulling: "
+                        "rem=%d headroom=%d free=%d queue=%d can_run=%d running=%d",
+                        adder.rem_mamba_slots,
+                        adder._mamba_match_headroom(),
+                        mamba_allocator.schedulable_available_size(),
+                        len(self.waiting_queue),
+                        len(adder.can_run_list),
+                        len(running_batch.reqs),
+                    )
                 running_batch.batch_is_full = True
                 break
 
