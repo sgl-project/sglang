@@ -1119,9 +1119,8 @@ class DSV4Metadata:
                 self.c2_indexer_metadata, src=static_metadata.c2_indexer_metadata
             )
         else:
-            # Two-level candidates: the flat sources score as eager breaks on the
-            # live objects (any context width) and the captured consumers read
-            # the candidate window through the bridge tensors only.
+            # Two-level candidates: only the eager flat-indexer breaks read these, so
+            # they take the live objects; captured consumers read the bridge tensors.
             self.c1_indexer_metadata = static_metadata.c1_indexer_metadata
             self.c2_indexer_metadata = static_metadata.c2_indexer_metadata
         maybe_copy_inplace(
@@ -1686,8 +1685,6 @@ class DeepseekV4AttnBackend(
             int(seq_lens_cpu.max().item()) > max_seq_len
             and not self._prefill_graph_context_unbounded()
         ):
-            # The flat index layers score eagerly and the consumers score a fixed
-            # candidate window, so the captured width no longer bounds the context.
             return False
         if self.enable_decoder_swa_bounded_replay:
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -1866,12 +1863,12 @@ class DeepseekV4AttnBackend(
             else None
         )
 
+        # When any context replays, the tail's page tables span the live context,
+        # like the full rows' in _build_forward_metadata.
         max_seq_len = int(seq_lens_cpu.max().item())
         if max_seq_len_override is not None and not (
             for_prefill_graph and self._prefill_graph_context_unbounded()
         ):
-            # When any context replays, the tail's page tables span the live
-            # context like the full rows' (_build_forward_metadata).
             max_seq_len = max_seq_len_override
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
@@ -2904,16 +2901,11 @@ class DeepseekV4AttnBackend(
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 actual_max_seq_len = int(seq_lens_cpu.max().item())
                 if use_prefill_cuda_graph and self._prefill_graph_context_unbounded():
-                    # Nothing captured is sized by the context: the page
-                    # tables are per-replay objects and the flat index
-                    # scoring runs as an eager break, so they span the live
-                    # context rather than the captured width.
+                    # Nothing captured is sized by the context: the page tables are
+                    # per-replay objects, so they span the live context.
                     max_seq_len = actual_max_seq_len
                 elif actual_max_seq_len > max_seq_len:
                     if self._prefill_graph_context_unbounded():
-                        # Nothing captured is sized by the context: the page
-                        # tables are per-replay objects and the flat index
-                        # scoring runs as an eager break.
                         max_seq_len = actual_max_seq_len
                     else:
                         raise ValueError(
@@ -3746,19 +3738,14 @@ class DeepseekV4AttnBackend(
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        # Inside the candidate window every block is a candidate, so the full
-        # top-k is the whole selection. Past it the graph runs the two levels
-        # itself: the source publishes a static block table from its flat
-        # scores and the consumers score only those blocks (the decode graph's
-        # candidate variant, captured for prefill).
+        # Two-level consumers take the two-level path at every width: inside the
+        # candidate window the published table is the identity, so it equals the
+        # plain top-k, and past it the flat path would be wrong. The candidate
+        # source publishes the table from an eager break (forward_low_ratio_sources).
         if (
             indexer.uses_candidates
             and not self._prefill_graph_low_ratio_index_captured()
         ):
-            # Always the two-level path: inside the candidate window the published
-            # table is the identity, so this equals the plain top-k; past it the
-            # flat path would be wrong. The candidate source runs as an eager
-            # break (see forward_low_ratio_sources).
             self.prefill_candidates.consume_prefill_captured(
                 inputs, self.forward_metadata.candidate_metadata
             )
@@ -3853,9 +3840,7 @@ class DeepseekV4AttnBackend(
 
     def _prefill_graph_low_ratio_index_captured(self) -> bool:
         """Whether a prefill graph replay reads the ratio-1/2 indexer metadata by
-        address: without two-level candidates the full-top-k fallback is captured
-        with its lengths and page tables (see forward_low_ratio_sources), so the
-        replay has to refresh them in place."""
+        address: true without two-level candidates, whose full top-k is captured."""
         return not isinstance(self.prefill_candidates, SparseTableBackend)
 
     @property
@@ -3888,14 +3873,11 @@ class DeepseekV4AttnBackend(
         if real is None:
             real = x.shape[0]
         if real == 0:
-            # An idle DP-attention rank replays on fabricated rows: one dummy
-            # request over the padded token count (ForwardBatch's idle
-            # materialization), scored like the captured indexer scored it.
-            # Nothing reads the result.
+            # An idle DP-attention rank replays on one fabricated request of the
+            # padded token count (ForwardBatch idle materialization); nothing reads it.
             real = forward_batch.extend_num_tokens
-        # Rows of the metadata in use: the late-layer tail's when the candidate
-        # source is the tail's first layer (decoder SWA bounded replay), whose
-        # rows are not the leading rows of the extend.
+        # The metadata in use holds the rows x has: the late-layer tail's when the
+        # source is the tail's first layer, which are not the extend's leading rows.
         req = self.forward_metadata.low_ratio_req_indices[:real]
         inputs = self._make_low_ratio_prefill_indexer_inputs(
             layer,

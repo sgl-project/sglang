@@ -95,8 +95,8 @@ class _SparsePrefillTable(_SparseTable):
     def tail_rows(
         self, rows: torch.Tensor, rows_per_request: Optional[List[int]] = None
     ) -> _SparsePrefillTable:
-        """The table of ``rows`` (a gather, graph-safe for a persistent index
-        buffer): the prefill graph's late-layer tail block."""
+        """The table restricted to ``rows``: a gather, graph-safe for a persistent
+        index buffer."""
         compress_lens = self.compress_lens[rows].contiguous()
         _, valid_lens = candidate_row_lens(compress_lens, self.blocks.shape[1])
         return _build_prefill_table(

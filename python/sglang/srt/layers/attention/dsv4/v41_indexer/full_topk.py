@@ -178,10 +178,9 @@ class FullTopKIndexer:
         width = metadata.max_compressed_seq_len
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
-        # The paged metadata dispatches to the v1 kernel here (top-k v2 is off
-        # for the low-ratio prefill metadata), which takes k from the output
-        # width it is handed and caps it; wider outputs keep the torch top-k,
-        # which selects min(k, width) columns as before.
+        # With top-k v2 off (the low-ratio prefill metadata), the metadata path runs
+        # the v1 kernel, which takes k from the output width and caps it at
+        # TOPK_V1_MAX_K; wider outputs use the torch top-k over min(k, width) columns.
         out_width = inputs.out_page_indices.shape[1]
         torch_topk = not metadata.use_topk_v2 and out_width > TOPK_V1_MAX_K
         topk = min(out_width, width)
