@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -156,6 +157,8 @@ def build_kv_host_pool(
         kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
     )
     kwargs = {}
+    if not use_mla and get_memory().hicache_mem_layout == "page_unified":
+        kwargs["head_group_num"] = resolve_head_group_num(kv_pool.head_num)
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if mtp_draft_device_pools:
