@@ -3201,9 +3201,13 @@ class SchedulerDisaggregationDecodeMixin:
         if computer is None:
             return
 
+        kv_manager = self.disagg_decode_prealloc_queue.kv_manager
         verified: List[int] = []
         for i, req in enumerate(batch.reqs):
             if is_health_check_req(req):
+                verified.append(i)
+                continue
+            if not kv_manager.should_verify_kv_checksum(_bootstrap_addr(req)):
                 verified.append(i)
                 continue
             expected = req.expected_kv_checksum
