@@ -89,7 +89,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -223,6 +223,19 @@ def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
         # Without a bias, ReplicatedLinear.forward is a bare quant_method.apply.
         and projection.bias is None
         and isinstance(projection.quant_method, UnquantizedLinearMethod)
+    )
+
+
+def _publishes_weight_storage() -> bool:
+    # Transfer-engine seeds and ModelExpress instances publish parameter
+    # addresses for remote readers right after weight loading.
+    model_config = get_model()
+    return (
+        model_config.remote_instance_weight_loader_start_seed_via_transfer_engine
+        or (
+            model_config.load_format == "remote_instance"
+            and model_config.remote_instance_weight_loader_backend == "modelexpress"
+        )
     )
 
 
@@ -968,6 +981,11 @@ class NemotronHForCausalLM(nn.Module):
         super().__init__()
         lora_config = None
         self._use_nvfp4_phase_layout = envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get()
+        if self._use_nvfp4_phase_layout and _publishes_weight_storage():
+            raise ValueError(
+                "NVFP4 phase layout rewrites FC2 weight storage in place; "
+                "it cannot be combined with remote-instance weight publication"
+            )
         self.config = config
         self.quant_config = quant_config
         self.model = self._init_model(
