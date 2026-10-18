@@ -13,6 +13,7 @@ import torch
 _SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -44,6 +45,105 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MOE_SORTING_DISPATCH_POLICY = envs.SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY.get()
+
+
+@functools.lru_cache(maxsize=1)
+def install_moe_sorting_handoff() -> None:
+    """Let aiter's fused_moe take a sort staged in moe_sort_handoff.
+
+    aiter has no argument for precomputed routes, so its module-level
+    moe_sorting (looked up by name inside fused_moe) is wrapped once."""
+    import aiter.fused_moe as aiter_fused_moe
+
+    from sglang.srt.layers.moe import moe_sort_handoff
+
+    orig = aiter_fused_moe.moe_sorting
+
+    @functools.wraps(orig)
+    def moe_sorting(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size=aiter_fused_moe.BLOCK_SIZE_M,
+        expert_mask=None,
+        num_local_tokens=None,
+        dispatch_policy=0,
+        return_local_topk_ids=False,
+        accumulate=True,
+        flat=False,
+        output_aux=False,
+        output=None,
+    ):
+        if (
+            moe_sort_handoff.sort_staged()
+            and expert_mask is None
+            and num_local_tokens is None
+            and not return_local_topk_ids
+            and accumulate
+            and not flat
+            and not output_aux
+        ):
+            staged = moe_sort_handoff.take(topk_ids, block_size, output, moebuf_dtype)
+            if staged is not None:
+                return staged
+        return orig(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            dispatch_policy,
+            return_local_topk_ids,
+            accumulate,
+            flat,
+            output_aux,
+            output,
+        )
+
+    aiter_fused_moe.moe_sorting = moe_sorting
+
+    orig_quant = aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort
+
+    @functools.wraps(orig_quant)
+    def fused_dynamic_mxfp8_quant_moe_sort(
+        input,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        topk,
+        block_size,
+        num_rows=None,
+        group_size=32,
+        sorted_weights=None,
+        num_experts_upper_bound=None,
+    ):
+        if moe_sort_handoff.active() and num_rows is None and group_size == 32:
+            staged = moe_sort_handoff.take_quant(
+                input, sorted_ids, num_valid_ids, token_num
+            )
+            if staged is not None:
+                return staged
+        return orig_quant(
+            input,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+            topk,
+            block_size,
+            num_rows=num_rows,
+            group_size=group_size,
+            sorted_weights=sorted_weights,
+            num_experts_upper_bound=num_experts_upper_bound,
+        )
+
+    aiter_fused_moe.fused_dynamic_mxfp8_quant_moe_sort = (
+        fused_dynamic_mxfp8_quant_moe_sort
+    )
 
 
 class AiterQuantType(str, Enum):
@@ -352,6 +452,13 @@ def pre_permute_standard_to_aiter(
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        # A caller-published destination (e.g. K3's joint all-reduce buffer)
+        # saves the copy out of fused_moe's own output.
+        output=(
+            zero_copy_context.get_moe_output(hidden_states)
+            if is_gfx95_supported()
+            else None
+        ),
     )
 
 
