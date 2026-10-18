@@ -11,15 +11,15 @@ use std::num::NonZeroU32;
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::is_selector_empty;
 use crate::config::{
-    default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
-    default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
-    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
-    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
-    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
-    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    default_cb_cool_down, default_cb_threshold, default_host, default_port,
+    default_proxy_request_timeout_secs, default_shutdown_drain_secs,
+    default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
+    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
+    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -297,14 +297,18 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub prefix_cache_min_share: Option<f32>,
 
-    /// Consecutive upstream failures before opening the breaker. Must be positive; enables the breaker.
-    #[arg(long)]
-    pub cb_threshold: Option<NonZeroU32>,
+    /// Consecutive upstream failures before a worker's circuit breaker opens; must be positive.
+    #[arg(long, default_value_t = default_cb_threshold())]
+    pub cb_threshold: NonZeroU32,
 
-    /// Circuit-breaker cool-down in seconds. Only meaningful with
-    /// `--cb-threshold`; defaults to 30 when the breaker is enabled.
-    #[arg(long)]
-    pub cb_cool_down_secs: Option<u64>,
+    /// Seconds an open circuit breaker waits before letting a probe request through.
+    #[arg(long, default_value_t = default_cb_cool_down())]
+    pub cb_cool_down_secs: u64,
+
+    /// Turn off the per-worker circuit breaker. Under `--worker-urls` nothing else takes
+    /// a dead or hung worker out of routing.
+    #[arg(long, conflicts_with_all = ["cb_threshold", "cb_cool_down_secs"])]
+    pub disable_circuit_breaker: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -541,7 +545,7 @@ impl Cli {
             Some(path) => (Some(load_bucket_config(path)?), None),
             None => (None, None),
         };
-        let circuit_breaker = self.routing.build_circuit_breaker()?;
+        let circuit_breaker = self.routing.build_circuit_breaker();
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
         let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
         let kv_bootstrap_seed_required = self.cache.kv_bootstrap_seed_required;
@@ -737,18 +741,11 @@ impl DiscoveryArgs {
 }
 
 impl RoutingArgs {
-    fn build_circuit_breaker(&self) -> Result<Option<CircuitBreakerConfig>> {
-        ensure!(
-            self.cb_cool_down_secs.is_none() || self.cb_threshold.is_some(),
-            "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
-                 enabled by --cb-threshold)"
-        );
-        let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
-            threshold,
-            cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
-        });
-
-        Ok(circuit_breaker)
+    fn build_circuit_breaker(&self) -> Option<CircuitBreakerConfig> {
+        (!self.disable_circuit_breaker).then_some(CircuitBreakerConfig {
+            threshold: self.cb_threshold,
+            cool_down_secs: self.cb_cool_down_secs,
+        })
     }
 
     fn build_fused(&self) -> Result<Option<Vec<FusedTerm>>> {
@@ -2085,7 +2082,15 @@ mod tests {
     }
 
     #[test]
-    fn cb_threshold_enables_circuit_breaker_with_default_cool_down() {
+    fn circuit_breaker_is_on_by_default() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        let cb = c.model.circuit_breaker.expect("cb enabled");
+        assert_eq!(cb.threshold.get(), 3);
+        assert_eq!(cb.cool_down_secs, 30);
+    }
+
+    #[test]
+    fn cb_threshold_keeps_default_cool_down() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
@@ -2103,30 +2108,40 @@ mod tests {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--cb-threshold",
-            "3",
             "--cb-cool-down-secs",
             "10",
         ]))
         .unwrap();
         let cb = c.model.circuit_breaker.expect("cb enabled");
+        assert_eq!(cb.threshold.get(), 3);
         assert_eq!(cb.cool_down_secs, 10);
     }
 
     #[test]
-    fn rejects_cb_cool_down_without_threshold() {
-        let err = into_config_owned(with_model(&[
+    fn disable_circuit_breaker_turns_it_off() {
+        let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--cb-cool-down-secs",
-            "10",
+            "--disable-circuit-breaker",
         ]))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("--cb-cool-down-secs requires --cb-threshold"),
-            "got: {err}"
-        );
+        .unwrap();
+        assert!(c.model.circuit_breaker.is_none());
+    }
+
+    #[test]
+    fn disable_circuit_breaker_rejects_breaker_settings() {
+        for flag in ["--cb-threshold", "--cb-cool-down-secs"] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--disable-circuit-breaker",
+                flag,
+                "5",
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cannot be used with"), "{flag}: {err}");
+        }
     }
 
     #[test]
