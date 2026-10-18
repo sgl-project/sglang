@@ -14,12 +14,11 @@ name: PR Test Extra
 # `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
 
 on:
+  # No `labeled` trigger: a label event would join the concurrency group and
+  # cancel the run in progress. Adding `run-ci-extra` after a push takes a
+  # rerun (/tag-and-rerun-ci extra, or a manual rerun), which the live label
+  # gate in pr-gate.yml then passes.
   pull_request:
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push — otherwise GHA leaves the stale
-    # skipped run in place and there's no way to enable extra without
-    # another push. See check-changes.if below for the matching guard.
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -50,13 +49,14 @@ on:
         type: boolean
         default: false
       skip_pr_test_health_check:
-        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
+        description: "Skip PR test health check fail-fast (e.g. for release branch cuts)"
         required: false
         type: boolean
         default: false
 
 concurrency:
-  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
+  # Keys on the PR number: two forks can share a head_ref and would cancel each other.
+  group: pr-test-extra-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -83,16 +83,7 @@ jobs:
   # passes. The previous workflow-level `if` checked the frozen event
   # payload, which never updates on rerun and made the slash-add-label flow
   # impossible to recover.
-  #
-  # We only keep one filter here: for `labeled` events, only proceed if the
-  # just-added label is one of the gating labels. This prevents every
-  # unrelated label addition from dispatching a full CI run.
   check-changes:
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}

@@ -4,11 +4,9 @@ The detailed-annotation aggregates are folded into SGLang's existing per-forward
 span (see ``sglang.srt.utils.profile_utils.build_step_span_name``): the
 per-phase ``sq``/``sqsq``/``sqsk``/``sk`` terms (with the context/generation split
 for MIXED) are appended and are self-contained, so ``sq`` is emitted even where it
-duplicates the base label's ``bs``/``toks``. This also covers the
-``detailed_annotations`` plumbing on ``ProfileReq``.
+duplicates the base label's ``bs``/``toks``.
 """
 
-import json
 import unittest
 from types import SimpleNamespace
 
@@ -17,7 +15,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import ProfileReq
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
@@ -198,6 +195,36 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=None)
         self.assertEqual(self._name(fb), "step[DECODE bs=2]")
 
+    def test_forward_id_disambiguates_identical_shapes_and_preserves_model(self):
+        # Consecutive forwards can have identical shapes and prefix sums. The
+        # recorder's runner-local ID binds them without matching by shape/order.
+        fb = _fb(
+            ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            seq_lens_cpu=[10, 20],
+            num_tokens_per_req=3,
+        )
+        for is_draft, stage in [(False, "VERIFY"), (True, "DRAFT")]:
+            for forward_id in (41, 42):
+                self.assertEqual(
+                    build_step_span_name(
+                        fb,
+                        detailed_annotations=True,
+                        is_draft_worker=is_draft,
+                        forward_id=forward_id,
+                    ),
+                    f"step[{stage} bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30 forward_id={forward_id}]",
+                )
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=False, forward_id=42),
+            "step[VERIFY bs=2]",
+        )
+        fb.seq_lens_cpu = None
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=True, forward_id=42),
+            "step[VERIFY bs=2 forward_id=42]",
+        )
+
 
 class TestStepSpanGating(CustomTestCase):
     def test_disabled_flag_emits_base_label(self):
@@ -215,18 +242,6 @@ class TestStepSpanGating(CustomTestCase):
             extend_prefix_lens_cpu=[0],
         )
         self.assertEqual(build_step_span_name(fb), "step[EXTEND bs=1 toks=4]")
-
-
-class TestDetailedAnnotationPlumbing(CustomTestCase):
-    def test_default_is_false(self):
-        self.assertFalse(ProfileReq().detailed_annotations)
-
-    def test_json_round_trip(self):
-        req = ProfileReq(output_dir="/tmp/x", detailed_annotations=True)
-        payload = {"detailed_annotations": req.detailed_annotations}
-        parsed = json.loads(json.dumps(payload))
-        self.assertTrue(parsed["detailed_annotations"])
-        self.assertTrue(ProfileReq(**parsed).detailed_annotations)
 
 
 class TestDetailedAnnotationsToggle(CustomTestCase):

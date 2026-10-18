@@ -24,8 +24,10 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -72,7 +74,7 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -118,10 +120,18 @@ class GenerationBatchResult:
     # until the accepted path comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
 
+    # The plan the forward wrote its KV through, when the caller asked for it
+    # (`return_kv_loc_plan`): a speculative worker's own writes into the same
+    # slots take their ids from it.
+    kv_loc_plan: Optional[KVLocPlan] = None
+
     # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
+    prepared_draft_extend_inputs: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -304,8 +314,18 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
             if sampling_mask_output is None
             else sampling_mask_output.selected_logprobs
         ),
+        "sampling_mask_support_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.support_logprobs
+        ),
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
+        ),
+        "sampling_mask_num_accept_tokens": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.num_accept_tokens
         ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
@@ -325,7 +345,9 @@ def get_logprob_from_pp_outputs(
             token_ids=next_pp_outputs["sampling_mask_token_ids"],
             lengths=next_pp_outputs["sampling_mask_lengths"],
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+            support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
+            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large
@@ -369,7 +391,7 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")

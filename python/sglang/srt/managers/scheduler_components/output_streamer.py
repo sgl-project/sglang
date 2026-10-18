@@ -19,7 +19,6 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -33,6 +32,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
@@ -53,7 +53,6 @@ class SchedulerOutputStreamer:
 
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
-    ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -80,6 +79,8 @@ class SchedulerOutputStreamer:
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
                 storage_backend_type = type(storage_backend).__name__
+        elif self.server_args.enable_lmcache:
+            storage_backend_type = "LMCache"
         return storage_backend_type
 
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
@@ -172,6 +173,9 @@ class SchedulerOutputStreamer:
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            is_request_level_customized_info_key=(
+                self.is_request_level_customized_info_key
+            ),
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
         )
@@ -228,6 +232,10 @@ class SchedulerOutputStreamer:
     def should_build_additional_customized_info(self) -> bool:
         """Return whether this invocation needs subclass-provided output fields."""
         return True
+
+    def is_request_level_customized_info_key(self, key: str) -> bool:
+        """Whether a customized-info value is emitted once rather than token-sliced."""
+        return False
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
@@ -322,6 +330,7 @@ class _GenerationStreamAccumulator:
     default_stream_interval: int
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    is_request_level_customized_info_key: Callable[[str], bool]
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
@@ -376,8 +385,7 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
-    output_token_sampling_mask: Optional[list] = None
-    output_token_sampling_logprobs: Optional[list] = None
+    output_token_sampling_mask: Optional[list[Optional[SamplingMaskChunk]]] = None
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
@@ -409,7 +417,6 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_idx = []
         if self.return_sampling_mask:
             self.output_token_sampling_mask = []
-            self.output_token_sampling_logprobs = []
 
     def _beam_admits(self, *, req: Req) -> bool:
         # Only the leader is ever streamed, and only at group finish.
@@ -430,11 +437,16 @@ class _GenerationStreamAccumulator:
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
 
-                # origin stream_interval logic
+                # Send every step at the default interval of 1. Otherwise send
+                # the first token at once, then whenever at least
+                # stream_interval tokens are unsent: a step can append several
+                # tokens (speculative decoding, dLLM), so it can pass a multiple
+                # of the interval without landing on it.
+                num_unsent = len(req.output_ids) - req.send_token_offset
                 should_output = (
-                    len(req.output_ids) % stream_interval == 1
-                    if stream_interval > 1
-                    else len(req.output_ids) % stream_interval == 0
+                    stream_interval == 1
+                    or num_unsent >= stream_interval
+                    or (req.send_token_offset == 0 and num_unsent > 0)
                 )
 
                 if should_output:
@@ -460,6 +472,8 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.cached_tokens.append(req.cached_tokens)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -486,13 +500,11 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
                 else len(output_ids_)
             )
-            self.cached_tokens.append(req.cached_tokens)
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
@@ -501,14 +513,7 @@ class _GenerationStreamAccumulator:
         # already computed these and transferred them via the metadata buffer
         # (req.mm_*), so prefer the pre-stored values; otherwise compute them
         # from the request's multimodal items.
-        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
-            image_t = req.mm_image_tokens
-            audio_t = req.mm_audio_tokens
-            video_t = req.mm_video_tokens
-        elif req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
-        else:
-            image_t = audio_t = video_t = 0
+        image_t, audio_t, video_t = req.get_mm_token_counts()
         self.image_tokens.append(image_t)
         self.audio_tokens.append(audio_t)
         self.video_tokens.append(video_t)
@@ -626,22 +631,9 @@ class _GenerationStreamAccumulator:
 
         if self.return_sampling_mask:
             if req.return_sampling_mask:
-                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
-                sampling_mask_end = len(req.output_token_sampling_mask)
-                self.output_token_sampling_mask.append(
-                    req.output_token_sampling_mask[
-                        send_output_sampling_mask_offset:sampling_mask_end
-                    ]
-                )
-                self.output_token_sampling_logprobs.append(
-                    req.output_token_sampling_logprobs[
-                        send_output_sampling_mask_offset:sampling_mask_end
-                    ]
-                )
-                req.send_output_sampling_mask_offset = sampling_mask_end
+                self.output_token_sampling_mask.append(req.sampling_mask_rows.take())
             else:
-                self.output_token_sampling_mask.append([])
-                self.output_token_sampling_logprobs.append([])
+                self.output_token_sampling_mask.append(None)
 
         if self.return_hidden_states:
             if req.return_hidden_states:
@@ -672,20 +664,33 @@ class _GenerationStreamAccumulator:
         current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
             for key, req_values in req.customized_info.items():
+                is_request_level = self.is_request_level_customized_info_key(key)
+                if is_request_level:
+                    if req.stream:
+                        if send_token_offset != 0:
+                            continue
+                    elif not req.finished():
+                        continue
                 if key not in self.customized_info:
                     self.customized_info[key] = [
-                        [None] * len(prev_output_ids)
+                        [] if is_request_level else [None] * len(prev_output_ids)
                         for prev_output_ids in self.output_ids[:-1]
                     ]
-                self.customized_info[key].append(
-                    [None] * current_output_len
-                    if req_values is None
-                    else req_values[send_token_offset : len(output_ids_)]
-                )
+                if req_values is None:
+                    values = [] if is_request_level else [None] * current_output_len
+                elif is_request_level:
+                    values = req_values
+                else:
+                    values = req_values[send_token_offset : len(output_ids_)]
+                self.customized_info[key].append(values)
 
-        for per_request_values in self.customized_info.values():
+        for key, per_request_values in self.customized_info.items():
             if len(per_request_values) < len(self.output_ids):
-                per_request_values.append([None] * current_output_len)
+                per_request_values.append(
+                    []
+                    if self.is_request_level_customized_info_key(key)
+                    else [None] * current_output_len
+                )
 
     def to_payload(
         self, *, dp_rank: int, is_idle_batch: bool
@@ -750,7 +755,6 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
             output_token_sampling_mask=self.output_token_sampling_mask,
-            output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,

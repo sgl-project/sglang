@@ -1,7 +1,4 @@
-"""Config-time override declarations for gigachat35.
-
-Architectures: GigaChat35ForCausalLM, GigaChat35ForCausalLMNextN.
-"""
+"""Config-time override declarations for gigachat35."""
 
 import logging
 from typing import Any, Dict

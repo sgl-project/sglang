@@ -26,34 +26,16 @@ First, launch the SGLang environment using the provided container image:
   <Tab title="Ascend A3 Series">
 
 ```shell Command
-export IMAGE=quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+# TODO: CANN 9.1.0 has no stable image yet, so this temporarily uses the
+# daily build tag. Once the stable image is published, switch back to the
+# stable release tag.
+export IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
     --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
-    --device=/dev/davinci_manager \
-    --device=/dev/hisi_hdc \
-    --volume /usr/local/sbin:/usr/local/sbin \
-    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-    --volume /etc/ascend_install.info:/etc/ascend_install.info \
-    --volume /var/queue_schedule:/var/queue_schedule \
-    --volume ~/.cache/:/root/.cache/ \
-    --entrypoint=bash \
-    $IMAGE
-```
-
-  </Tab>
-  <Tab title="Ascend A2 Series">
-
-```shell Command
-export IMAGE=quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-
-docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
-    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
-    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
     --device=/dev/davinci_manager \
     --device=/dev/hisi_hdc \
     --volume /usr/local/sbin:/usr/local/sbin \
@@ -105,40 +87,25 @@ For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/h
 
 #### Execute Accuracy Evaluation
 
-EvalScope connects to the SGLang server via OpenAI-compatible API. The following example uses the GSM8K dataset:
+Use sgl-eval for GSM8K and MMLU. It owns the datasets, chat prompts and graders. EvalScope remains available for the other benchmarks below:
 
 ```shell Command
-evalscope eval \
+pip install sgl-eval
+sgl-eval run gsm8k \
  --model /home/weights/Qwen2.5-7B-Instruct \
- --api-url http://localhost:30000/v1 \
- --api-key EMPTY \
- --eval-type openai_api \
- --datasets gsm8k \
- --limit 10
+ --base-url http://localhost:30000/v1 \
+ --num-examples 10 --max-tokens 2048
 ```
 
-Upon completion, results similar to the following will be displayed:
-
-```text
-+---------------------+-----------+----------+----------+-------+---------+---------+
-| Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
-+=====================+===========+==========+==========+=======+=========+=========+
-| Qwen2.5-7B-Instruct | gsm8k     | mean_acc | main     |     5 |     1.0 | default |
-+---------------------+-----------+----------+----------+-------+---------+---------+
-```
-
-> **Note**: Output format may vary slightly across different EvalScope versions. The above example is from EvalScope 1.6.x. Ensure the `--model` parameter matches the model name returned by the SGLang server's `/v1/models` endpoint. When starting the server with an HF path (e.g., `Qwen/Qwen2.5-7B-Instruct`), use that path directly. For local paths, pass the full path or the model name returned by `/v1/models`.
+The run directory contains `metrics.json` and per-example predictions. Use the model name reported by `/v1/models`.
 
 #### Common Datasets for Online Evaluation
 
 ```shell Command
 # MMLU
-evalscope eval \
+sgl-eval run mmlu \
  --model /home/weights/Qwen2.5-7B-Instruct \
- --api-url http://localhost:30000/v1 \
- --api-key EMPTY \
- --eval-type openai_api \
- --datasets mmlu
+ --base-url http://localhost:30000/v1 --max-tokens 2048
 
 # CEval (Chinese evaluation)
 evalscope eval \
@@ -214,8 +181,8 @@ For more details, refer to the [EvalScope documentation](https://evalscope.readt
 
 ### SGLang Server Startup Failure
 
-1. Verify device mapping: A2 Series uses `davinci[0-7]`, A3 Series uses `davinci[0-15]`
-2. Confirm image tag matches device type: A2 Series uses `...-910b`, A3 Series uses `...-a3`
+1. Verify device mapping: A3 Series uses `davinci[0-15]`
+2. Confirm image tag matches device type: A3 Series uses `...-a3`
 3. Check NPU status with `npu-smi info`
 4. First run requires model download; set `HF_ENDPOINT=https://hf-mirror.com` if network access is restricted
 
@@ -241,7 +208,7 @@ When using EvalScope commands without specifying a dataset or model path, it wil
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/adapters.py", line 676, in send
     raise SSLError(e, request=request)
-requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
+requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/ceval (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
 [ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
 **Temporary workaround (test only):**
