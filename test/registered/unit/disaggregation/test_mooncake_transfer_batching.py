@@ -138,6 +138,104 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         )
 
 
+class TestMooncakeDescriptorData(CustomTestCase):
+    def test_fragmented_transfers_preserve_bytes_and_unselected_pages(self):
+        """Combining ranges must respect both page orders, layouts and strides."""
+        for mla in (False, True):
+            for high_addresses, use_device_indices in (
+                (False, False),
+                (False, True),
+                (True, False),
+                (True, True),
+            ):
+                for limit, custom in ((0, False), (3, False), (0, True)):
+                    with self.subTest(
+                        mla=mla,
+                        high=high_addresses,
+                        limit=limit,
+                        custom=custom,
+                        device_indices=use_device_indices,
+                    ):
+                        entries = 3 if mla else 6
+                        src_pages = np.array(
+                            [5, 6, 20, 10, 11, 12, 31, 32], dtype=np.int32
+                        )
+                        dst_pages = np.array(
+                            [1, 2, 9, 10, 11, 12, 18, 19], dtype=np.int32
+                        )
+                        strides = [8 * (i + 1) for i in range(entries)]
+                        sources = [
+                            np.arange(64 * stride, dtype=np.uint8).reshape(64, stride)
+                            for stride in strides
+                        ]
+                        destinations = [np.full_like(src, 173) for src in sources]
+                        expected = [dst.copy() for dst in destinations]
+                        offset = 1 << 63 if high_addresses else 0
+                        src_ptrs = [src.ctypes.data + offset for src in sources]
+                        dst_ptrs = [dst.ctypes.data + offset for dst in destinations]
+                        device_ptrs = (
+                            set(dst_ptrs[::2]) if use_device_indices else set()
+                        )
+                        for i in range(entries):
+                            pages = (
+                                dst_pages + 24
+                                if dst_ptrs[i] in device_ptrs
+                                else dst_pages
+                            )
+                            expected[i][pages] = sources[i][src_pages]
+
+                        def copy_bytes(session, src_addrs, dst_addrs, lengths):
+                            for src, dst, length in zip(
+                                src_addrs, dst_addrs, lengths, strict=True
+                            ):
+                                # Validate synthetic high-bit pointers before mapping them
+                                # back to actual CPU buffers for the byte-level check.
+                                self.assertTrue(
+                                    any(
+                                        p <= src and src + length <= p + s.nbytes
+                                        for p, s in zip(src_ptrs, sources)
+                                    )
+                                )
+                                self.assertTrue(
+                                    any(
+                                        p <= dst and dst + length <= p + d.nbytes
+                                        for p, d in zip(dst_ptrs, destinations)
+                                    )
+                                )
+                                ctypes.memmove(dst - offset, src - offset, length)
+                            return 0
+
+                        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                        manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
+                        manager.kv_args = SimpleNamespace(
+                            prefill_start_layer=0, num_draft_entries=0
+                        )
+                        manager.pp_size = 1
+                        manager.is_mla_backend = mla
+                        manager.is_hybrid_mla_backend = False
+                        manager.enable_custom_mem_pool = custom
+                        manager.custom_mem_pool_type = "NVLINK" if custom else None
+                        manager.enable_deferred_decode_kv_release = True
+                        manager.max_transfer_batch_indices = limit
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=4
+                        ) as executor:
+                            ret = manager._send_kvcache_generic(
+                                "cpu",
+                                src_ptrs,
+                                dst_ptrs,
+                                strides,
+                                src_pages,
+                                dst_pages,
+                                executor,
+                                dst_device_data_indices=dst_pages + 24,
+                                dst_device_data_ptrs=device_ptrs,
+                            )
+                        self.assertEqual(ret, 0)
+                        for actual, wanted in zip(destinations, expected):
+                            np.testing.assert_array_equal(actual, wanted)
+
+
 class TestMiniMaxStateTransfer(CustomTestCase):
     def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
         """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""

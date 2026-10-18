@@ -135,6 +135,35 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def get_contiguous_transfer_ranges(
+    src_indices: npt.NDArray, dst_indices: npt.NDArray
+) -> Tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], npt.NDArray[np.uint64]]:
+    """Return paired start indices and lengths without materializing each run.
+
+    A run ends when either index array stops being contiguous. Keeping only its
+    starts and length avoids splitting arrays and boxing every page in Python.
+    """
+    if src_indices.size == 0 or dst_indices.size == 0:
+        empty = np.empty(0, dtype=np.uint64)
+        return empty, empty, empty
+    if src_indices.size != dst_indices.size:
+        raise ValueError(
+            "get_contiguous_transfer_ranges requires equal-length src/dst index arrays, "
+            f"got {src_indices.size} and {dst_indices.size}"
+        )
+
+    breaks = (
+        np.flatnonzero((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1)) + 1
+    )
+    starts = np.concatenate(([0], breaks))
+    lengths = np.diff(np.concatenate((starts, [src_indices.size])))
+    return (
+        src_indices[starts].astype(np.uint64),
+        dst_indices[starts].astype(np.uint64),
+        lengths.astype(np.uint64),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     target_src_token_indices: npt.NDArray[np.int64]

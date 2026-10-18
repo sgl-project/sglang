@@ -76,6 +76,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TransferDataMock(Mock):
+    """Record descriptor values independently of their row/column storage."""
+
+    def __call__(self, session, blocks):
+        return super().__call__(session, list(blocks))
+
+
 class TestMixedSWAKVBlockScales(CustomTestCase):
     def test_swa_block_scales_follow_each_subpools_dtype(self):
         from sglang.srt.mem_cache.memory_pool import (
@@ -220,7 +227,7 @@ class TestDisaggregationWire(unittest.TestCase):
                             manager.request_status.pop(42)
 
                     manager._send_multipart_locked = Mock(side_effect=send_status)
-                    manager._transfer_data = Mock(
+                    manager._transfer_data = TransferDataMock(
                         side_effect=lambda session, blocks: (
                             -1
                             if session == "decode:42" and outcome == "transport_failure"
@@ -437,7 +444,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.enable_custom_mem_pool = False
         manager.max_transfer_batch_indices = 0
         manager.state_strides_validated = {"decode"}
-        manager._transfer_data = Mock(return_value=0)
+        manager._transfer_data = TransferDataMock(return_value=0)
         manager._state_stride_mismatch = Mock(
             side_effect=AssertionError("must not re-check a validated session")
         )
@@ -497,7 +504,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.transfer_infos = {42: {"decode:42": req}}
         manager.decode_kv_args_table = {}
         manager._send_multipart_locked = Mock()
-        manager._transfer_data = Mock(return_value=0)
+        manager._transfer_data = TransferDataMock(return_value=0)
         queue = FastQueue()
         queue.put(
             TransferKVChunk(
@@ -560,7 +567,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.state_strides_validated = set()
                 manager.enable_custom_mem_pool = False
                 manager.max_transfer_batch_indices = 0
-                manager._transfer_data = Mock(return_value=0)
+                manager._transfer_data = TransferDataMock(return_value=0)
                 src_ptrs = [0x1000 * (i + 1) for i in range(len(src_lens))]
                 dst_ptrs = [0x1000 * (i + 9) for i in range(len(dst_lens))]
                 manager._send_kvcache_generic(
@@ -1048,7 +1055,7 @@ class TestQwen4StateWire(unittest.TestCase):
                     manager.state_strides_validated = set()
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
-                    manager._transfer_data = Mock(return_value=0)
+                    manager._transfer_data = TransferDataMock(return_value=0)
 
                     ret = manager._send_kvcache_generic(
                         "decode",
@@ -1579,7 +1586,7 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
                 manager.enable_custom_mem_pool = False
                 manager.max_transfer_batch_indices = 0
                 manager.pp_size = pp_size
-                manager._transfer_data = Mock(return_value=0)
+                manager._transfer_data = TransferDataMock(return_value=0)
                 dst_ptrs = (
                     [10000, 20000, 50000]
                     if pp_size == 1
@@ -1703,7 +1710,7 @@ class TestMooncakePPStaging(unittest.TestCase):
             kv_head_num=4,
             kv_layer_ids=[7, 7],
         )
-        manager._transfer_data = Mock(return_value=0)
+        manager._transfer_data = TransferDataMock(return_value=0)
         staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
 
         ret = manager.send_kvcache_staged(

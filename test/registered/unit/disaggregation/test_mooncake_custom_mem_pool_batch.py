@@ -41,6 +41,7 @@ class TestMooncakeCustomMemPoolBatch(CustomTestCase):
         executor.submit.assert_not_called()
         manager._transfer_data.assert_called_once()
         session_id, blocks = manager._transfer_data.call_args.args
+        blocks = list(blocks)
         self.assertEqual(session_id, "session")
         self.assertEqual(len(blocks), layer_count * 2)
         self.assertEqual(

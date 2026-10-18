@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
+    get_contiguous_transfer_ranges,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -85,6 +86,26 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+
+@dataclasses.dataclass
+class _TransferBatch:
+    """Keep descriptor columns in the format consumed by the transfer engine."""
+
+    src_addrs: List[int] = dataclasses.field(default_factory=list)
+    dst_addrs: List[int] = dataclasses.field(default_factory=list)
+    lengths: List[int] = dataclasses.field(default_factory=list)
+
+    def __len__(self):
+        return len(self.src_addrs)
+
+    def __iter__(self):
+        return zip(self.src_addrs, self.dst_addrs, self.lengths)
+
+    def extend(self, other: _TransferBatch):
+        self.src_addrs.extend(other.src_addrs)
+        self.dst_addrs.extend(other.dst_addrs)
+        self.lengths.extend(other.lengths)
 
 
 # decode
@@ -793,6 +814,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if not transfer_blocks:
             return 0
 
+        if isinstance(transfer_blocks, _TransferBatch):
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id,
+                transfer_blocks.src_addrs,
+                transfer_blocks.dst_addrs,
+                transfer_blocks.lengths,
+            )
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
         return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
@@ -1003,15 +1031,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-        device_prefill_kv_blocks = device_dst_kv_blocks = None
+        ranges = get_contiguous_transfer_ranges(prefill_data_indices, dst_data_indices)
+        device_ranges = None
         if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
-                )
+            device_ranges = get_contiguous_transfer_ranges(
+                prefill_data_indices, dst_device_data_indices
             )
 
         layers_params = None
@@ -1129,37 +1153,75 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         assert layers_params is not None
 
         def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
+            src_ptr: int, dst_ptr: int, item_len: int, ranges, device_ranges
+        ) -> _TransferBatch:
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
-                assert (
-                    device_prefill_kv_blocks is not None
-                    and device_dst_kv_blocks is not None
-                )
-                src_blocks, dst_blocks = (
-                    device_prefill_kv_blocks,
-                    device_dst_kv_blocks,
-                )
+                assert device_ranges is not None
+                src_starts, dst_starts, lengths = device_ranges
             else:
-                src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
-            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+                src_starts, dst_starts, lengths = ranges
+            if lengths.size == 0:
+                return _TransferBatch()
+            if lengths.size == 1:
+                # The common contiguous case does not need vector arithmetic.
+                return _TransferBatch(
+                    [src_ptr + int(src_starts[0]) * item_len],
+                    [dst_ptr + int(dst_starts[0]) * item_len],
+                    [int(lengths[0]) * item_len],
+                )
+            # Unsigned arithmetic preserves addresses with bit 63 set.
+            stride = np.uint64(item_len)
+            return _TransferBatch(
+                (np.uint64(src_ptr) + src_starts * stride).tolist(),
+                (np.uint64(dst_ptr) + dst_starts * stride).tolist(),
+                (lengths * stride).tolist(),
+            )
 
-        # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+            transfer_blocks = set_transfer_blocks(
+                src_ptr, dst_ptr, item_len, ranges, device_ranges
+            )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
+        def process_layers(
+            layers_params: List[Tuple[int, int, int]], ranges, device_ranges
+        ) -> int:
+            if not dst_device_data_ptrs:
+                src_starts, dst_starts, lengths = ranges
+                if not layers_params or lengths.size == 0:
+                    return 0
+                if lengths.size == 1:
+                    src_start, dst_start, count = (
+                        int(src_starts[0]),
+                        int(dst_starts[0]),
+                        int(lengths[0]),
+                    )
+                    transfer_blocks = _TransferBatch(
+                        [ptr + src_start * size for ptr, _, size in layers_params],
+                        [ptr + dst_start * size for _, ptr, size in layers_params],
+                        [count * size for _, _, size in layers_params],
+                    )
+                else:
+                    # Broadcast across layers as well as runs. Per-layer NumPy
+                    # dispatch costs more than the address math for short plans.
+                    src_ptrs, dst_ptrs, sizes = np.asarray(
+                        layers_params, dtype=np.uint64
+                    ).T
+                    sizes = sizes[:, None]
+                    transfer_blocks = _TransferBatch(
+                        (src_ptrs[:, None] + src_starts * sizes).ravel().tolist(),
+                        (dst_ptrs[:, None] + dst_starts * sizes).ravel().tolist(),
+                        (lengths * sizes).ravel().tolist(),
+                    )
+                return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+            transfer_blocks = _TransferBatch()
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+                transfer_blocks.extend(
+                    set_transfer_blocks(
+                        src_ptr, dst_ptr, item_len, ranges, device_ranges
+                    )
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if (
@@ -1182,57 +1244,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # users explicitly opt in to bounded index batches.
             max_batch_indices = self.max_transfer_batch_indices
             if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
-                return process_layers(layers_params)
-
-            def process_index_batch(
-                prefill_blocks,
-                dst_blocks,
-                device_prefill_blocks=None,
-                device_dst_blocks=None,
-            ) -> int:
-                transfer_blocks = []
-                for src_ptr, dst_ptr, item_len in layers_params:
-                    if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
-                        assert (
-                            device_prefill_blocks is not None
-                            and device_dst_blocks is not None
-                        )
-                        src_blocks, target_blocks = (
-                            device_prefill_blocks,
-                            device_dst_blocks,
-                        )
-                    else:
-                        src_blocks, target_blocks = prefill_blocks, dst_blocks
-                    for prefill_index, decode_index in zip(src_blocks, target_blocks):
-                        src_addr = src_ptr + int(prefill_index[0]) * item_len
-                        dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                        length = item_len * len(prefill_index)
-                        transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
+                return process_layers(layers_params, ranges, device_ranges)
 
             for start in range(
                 0,
                 prefill_data_indices.size,
                 max_batch_indices,
             ):
-                batch_prefill_blocks, batch_dst_blocks = group_concurrent_contiguous(
+                batch_ranges = get_contiguous_transfer_ranges(
                     prefill_data_indices[start : start + max_batch_indices],
                     dst_data_indices[start : start + max_batch_indices],
                 )
-                batch_device_prefill_blocks = batch_device_dst_blocks = None
+                batch_device_ranges = None
                 if dst_device_data_indices is not None:
-                    batch_device_prefill_blocks, batch_device_dst_blocks = (
-                        group_concurrent_contiguous(
-                            prefill_data_indices[start : start + max_batch_indices],
-                            dst_device_data_indices[start : start + max_batch_indices],
-                        )
+                    batch_device_ranges = get_contiguous_transfer_ranges(
+                        prefill_data_indices[start : start + max_batch_indices],
+                        dst_device_data_indices[start : start + max_batch_indices],
                     )
-                ret = process_index_batch(
-                    batch_prefill_blocks,
-                    batch_dst_blocks,
-                    batch_device_prefill_blocks,
-                    batch_device_dst_blocks,
-                )
+                ret = process_layers(layers_params, batch_ranges, batch_device_ranges)
                 if ret != 0:
                     return ret
             return 0
