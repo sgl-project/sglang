@@ -275,7 +275,9 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
-def _flat_indexer_break(*, inside_tail, real, x_rows, with_tail=True):
+def _flat_indexer_break(
+    *, inside_tail, real, x_rows, with_tail=True, extend_num_tokens=20
+):
     """Runs the candidate source's prefill-graph break; returns the request rows
     and positions it scored and the rows it handed to the consumers."""
     seen = {}
@@ -323,6 +325,7 @@ def _flat_indexer_break(*, inside_tail, real, x_rows, with_tail=True):
                 forward_mode=ForwardMode.EXTEND,
                 req_pool_indices=torch.tensor([3, 5]),
                 extend_seq_lens=torch.tensor([8, 12]),
+                extend_num_tokens=extend_num_tokens,
                 positions=torch.arange(x_rows),
             ),
         )
@@ -350,11 +353,14 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
         self.assertEqual(seen["rows"], [6, 7, 17, 18, 19, 0, 0, 0])
 
     def test_idle_dp_rank_scores_its_fabricated_rows(self):
-        # An idle DP-attention rank replays on one dummy request over the bucket.
-        seen = _flat_indexer_break(inside_tail=False, real=0, x_rows=8, with_tail=False)
-        self.assertEqual(seen["scored"], 8)
-        self.assertEqual(seen["req"], [3] * 8)
-        self.assertEqual(seen["rows"], list(range(8)))
+        # An idle DP-attention rank replays on one dummy request of the padded
+        # token count (6 here), inside an 8-row bucket.
+        seen = _flat_indexer_break(
+            inside_tail=False, real=0, x_rows=8, with_tail=False, extend_num_tokens=6
+        )
+        self.assertEqual(seen["scored"], 6)
+        self.assertEqual(seen["req"], [3] * 6)
+        self.assertEqual(seen["rows"], [0, 1, 2, 3, 4, 5, 5, 5])
 
 
 class _MetadataBuilt(Exception):

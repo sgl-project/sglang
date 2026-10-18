@@ -3889,9 +3889,10 @@ class DeepseekV4AttnBackend(
             real = x.shape[0]
         if real == 0:
             # An idle DP-attention rank replays on fabricated rows: one dummy
-            # request over the whole bucket, scored like main's captured indexer
-            # scored it. Nothing reads the result.
-            real = x.shape[0]
+            # request over the padded token count (ForwardBatch's idle
+            # materialization), scored like the captured indexer scored it.
+            # Nothing reads the result.
+            real = forward_batch.extend_num_tokens
         # Rows of the metadata in use: the late-layer tail's when the candidate
         # source is the tail's first layer (decoder SWA bounded replay), whose
         # rows are not the leading rows of the extend.
