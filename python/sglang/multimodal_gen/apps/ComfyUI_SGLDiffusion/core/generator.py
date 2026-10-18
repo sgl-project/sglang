@@ -291,7 +291,9 @@ def _loader_settings(*, args, sgld_options: dict, int8_kernel: str, model_type) 
     if sgld_options.get("attention_backend_config"):
         settings["attention_backend_config"] = sgld_options["attention_backend_config"]
     settings["quantization"] = args.quantization or "none"
-    if args.quantization == "convrot_int8":
+    # A pre-quantized H3 file reports quantization=none, but an explicit
+    # ConvRot backend still affects the worker through its environment.
+    if int8_kernel != "auto":
         settings["int8_gemm"] = INT8_GEMM_DISPLAY.get(int8_kernel, int8_kernel)
     if args.enable_torch_compile:
         settings["execution_mode"] = "torch_compile"

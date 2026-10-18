@@ -364,6 +364,12 @@ def test_status_text_defaults_hide_fields_that_do_not_apply() -> None:
     assert "peak allocated 3000 MiB, peak reserved 4000 MiB" in text
 
 
+def test_status_text_reports_backend_for_prequantized_h3() -> None:
+    text = _status_runtime(int8_gemm="comfy_kitchen").status_text()
+    assert "quantization=none" in text
+    assert "int8_gemm=comfy_kitchen" in text
+
+
 def test_status_text_before_first_call_and_without_worker() -> None:
     runtime = _status_runtime()
     runtime.executor.last_metrics = None
