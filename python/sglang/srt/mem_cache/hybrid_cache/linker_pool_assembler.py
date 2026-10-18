@@ -361,19 +361,25 @@ def _build_deepseek_v4_device_pool_group(
             )
     for name, pool, buffers, layer_mapping in rope_entries:
         add(name, PoolName.KV, pool, buffers, layer_mapping)
-    for name, pool in (
-        (PoolName.DEEPSEEK_V4_C4_STATE, kvcache.compress_state_pools),
-        (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, kvcache.indexer_compress_state_pools),
+    for name in (
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
     ):
         state = infos.get(name)
-        if state is not None:
-            add(
-                name,
-                state.indices_from_pool,
-                pool,
-                [info.pages for info in state.buffer_info.states],
-                _dsv4_transfer_layer_mapping(state.layer_ids, kvcache.start_layer),
-            )
+        if state is None:
+            continue
+        pool = (
+            kvcache.compress_state_pools
+            if name == PoolName.DEEPSEEK_V4_C4_STATE
+            else kvcache.indexer_compress_state_pools
+        )
+        add(
+            name,
+            state.indices_from_pool,
+            pool,
+            [info.pages for info in state.buffer_info.states],
+            _dsv4_transfer_layer_mapping(state.layer_ids, kvcache.start_layer),
+        )
     return DevicePoolGroup(
         entries,
         len(kvcache.stage_layer_ids),
