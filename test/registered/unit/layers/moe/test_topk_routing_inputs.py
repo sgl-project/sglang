@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat, fused_topk_torch_native
-from sglang.srt.layers.moe.utils import draft_model_build_scope
+from sglang.srt.layers.moe.utils import draft_model_build_scope, initialize_moe_config
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -81,6 +81,7 @@ class TestTopKRoutingInputs(CustomTestCase):
         )
         config.install()
         self.addCleanup(config.restore)
+        initialize_moe_config()
         topology = get_parallel().override(
             attn_dp_size=1, attn_cp_size=1, attn_tp_size=1, attn_tp_rank=0
         )
@@ -249,12 +250,12 @@ class TestTopKRoutingInputs(CustomTestCase):
         batch = _batch(0)
         batch.input_ids = None
         batch.spec_info = EagleDraftInput(num_tokens_per_req=2)
-        with get_parallel().override(moe_ep_size=4):
+        with get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4):
             batch._init_num_token_non_padded(device="cpu", is_draft_worker=True)
         self.assertEqual(batch.global_num_token_non_padded_cpu, 8)
         self.assertEqual(int(batch.global_num_token_non_padded), 8)
         batch.forward_mode = ForwardMode.IDLE
-        with get_parallel().override(moe_ep_size=4):
+        with get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4):
             batch._init_num_token_non_padded(device="cpu", is_draft_worker=True)
         self.assertEqual(int(batch.global_num_token_non_padded), 0)
 
