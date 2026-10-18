@@ -54,6 +54,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
         DispatchOutput,
         StandardDispatchOutput,
     )
@@ -1334,10 +1336,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DispatchOutputChecker,
+            StandardCombineInput,
+        )
 
         moe_runner_config = self.moe_runner_config
         assert moe_runner_config.activation in [
@@ -1345,6 +1347,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             "gelu",
             "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            return self._forward_xpu_deepep_normal(layer, dispatch_output)
+        if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            return self._forward_xpu_deepep_ll(layer, dispatch_output)
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         backend = self.runner.runner_backend
         if not get_moe_runner_backend().is_triton():
@@ -1380,6 +1390,115 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
+
+    def _forward_xpu_deepep_normal(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ) -> CombineInput:
+        # deep_ep_xpu normal dispatch: token-major [T_recv, H] with local expert
+        # ids (-1 = routed to an expert on another rank). Combine sums the
+        # per-rank partial outputs unweighted, so weights are applied here.
+        from sgl_kernel import fused_experts
+
+        from sglang.srt.layers.moe.token_dispatcher import DeepEPNormalCombineInput
+
+        moe_runner_config = self.moe_runner_config
+        x = dispatch_output.hidden_states
+        topk_ids = dispatch_output.topk_ids
+        topk_weights = dispatch_output.topk_weights
+        assert dispatch_output.hidden_states_scale is None, (
+            "deep_ep_xpu path expects bf16 dispatch; "
+            "use --deepep-dispatcher-output-dtype bf16"
+        )
+
+        if x.shape[0] == 0:
+            output = x.new_empty((0, layer.w2_weight.shape[1]))
+        else:
+            # A remote slot keeps its row's expert id at weight 0: fused_experts
+            # miscomputes the whole row if any id in it is negative. Sorting the
+            # local slots forward and trimming is slower here, because a
+            # dispatched row usually has a local expert in most of its slots.
+            remote = topk_ids < 0
+            topk_ids = topk_ids.clamp(min=0).to(torch.int32)
+            topk_weights = topk_weights.masked_fill(remote, 0.0).to(torch.float32)
+            if moe_runner_config.apply_router_weight_on_input:
+                assert topk_ids.shape[1] == 1
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = (~remote).to(torch.float32)
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                activation=moe_runner_config.activation,
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
+            )
+        return DeepEPNormalCombineInput(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
+    def _forward_xpu_deepep_ll(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ) -> CombineInput:
+        # deep_ep_xpu low-latency dispatch: expert-major [E_local, T_max, H] where
+        # only the first masked_m[e] rows of expert e are valid. sgl-kernel-xpu has
+        # no masked grouped GEMM, so gather the valid rows and run them
+        # token-major. Combine applies the routing weights. The gather costs one
+        # host sync per layer; a static bound would instead run the whole padded
+        # layout, which at decode sizes is orders of magnitude more rows.
+        from sgl_kernel import fused_experts
+
+        from sglang.srt.layers.moe.token_dispatcher import DeepEPLLCombineInput
+
+        moe_runner_config = self.moe_runner_config
+        x = dispatch_output.hidden_states
+        assert dispatch_output.hidden_states_scale is None, (
+            "deep_ep_xpu path expects bf16 dispatch; "
+            "use --deepep-dispatcher-output-dtype bf16"
+        )
+        assert not moe_runner_config.apply_router_weight_on_input, (
+            "deep_ep_xpu low-latency mode does not support "
+            "apply_router_weight_on_input; use --deepep-mode normal"
+        )
+
+        num_local_experts, num_slots, hidden = x.shape
+        valid = (
+            torch.arange(num_slots, device=x.device)[None, :]
+            < dispatch_output.masked_m[:, None]
+        )
+        rows = valid.view(-1).nonzero().squeeze(1)
+        # Combine only reads the valid rows of each expert, so the rest stay unset.
+        output = x.new_empty((num_local_experts, num_slots, layer.w2_weight.shape[1]))
+        if rows.numel() > 0:
+            row_output = fused_experts(
+                x.view(-1, hidden).index_select(0, rows),
+                layer.w13_weight,
+                layer.w2_weight,
+                torch.ones((rows.numel(), 1), dtype=torch.float32, device=x.device),
+                (rows // num_slots).to(torch.int32).unsqueeze(1),
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                activation=moe_runner_config.activation,
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
+            )
+            output.view(-1, output.shape[-1]).index_copy_(0, rows, row_output)
+        return DeepEPLLCombineInput(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
 
     def forward_npu(
         self,

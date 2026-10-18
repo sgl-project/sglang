@@ -306,6 +306,56 @@ Unsupported features are refused at startup. If startup fails with
 With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
 kernel runs only on CUDA, so KV is transferred per token instead.
 
+## DeepEP MoE All-to-All on Intel XPU [Experimental]
+
+`--moe-a2a-backend deepep` on XPU uses `deep_ep_xpu`, the DeepEP port shipped by
+`applications.ai.gpu.deepsymm` (DeepSymm, distribution `deep-symm`). SGLang runs it
+intranode: all EP ranks on one node, exchanging buffers over PCIe P2P. Neither iSHMEM
+nor an RDMA NIC is needed. Both dispatch paths are supported:
+
+| `--deepep-mode` | Prefill | Decode | Ranks |
+|---|---|---|---|
+| `normal` | normal | normal | up to 8 |
+| `low_latency` | low-latency | low-latency | 1, 2, 4 or 8 |
+| `auto` (recommended) | normal | low-latency | 1, 2, 4 or 8 |
+
+**Install DeepSymm.** It is built from source against your local oneAPI and
+`torch+xpu`, and must be installed in the same environment as SGLang:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+export XPU_AOT_TARGETS=bmg TORCH_XPU_ARCH_LIST=bmg
+cd <deepsymm checkout>
+pip install --no-build-isolation --no-deps -e .
+```
+
+SGLang checks at startup that `applications.ai.gpu.deepsymm` (distribution `deep-symm`) is installed, that `deep_ep_xpu` loads,
+and that its `deep_ep_cpp` extension is DeepSymm's and not one from another DeepEP
+build. If any check fails, the server exits with the reason.
+
+```bash
+# Keep the 4 ranks on one CPU socket, e.g. GPUs 0-3.
+ZE_AFFINITY_MASK=0,1,2,3 python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-30B-A3B --device xpu --attention-backend intel_xpu \
+    --tp 4 --ep-size 4 --moe-a2a-backend deepep --deepep-mode auto
+```
+
+Low-latency dispatch handles at most `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`
+tokens per rank per step (default 128). In `low_latency` mode prefill goes through it
+too. An all-to-all MoE layer sees the batch scattered over the ranks, so a step sends
+about `--chunked-prefill-size` divided by `--tp-size` tokens per rank: keep that below
+the cap, with headroom, or raise the variable. SGLang refuses such a launch at startup
+and such a step at runtime.
+
+Limitations:
+
+- Intranode only (`--nnodes 1`).
+- Only BF16 dispatch (`--deepep-dispatcher-output-dtype auto` or `bf16`).
+- Only unquantized MoE weights.
+- No two-batch or single-batch overlap.
+- XPU graph is disabled for decode in every mode. The low-latency expert step gathers
+  its valid rows with a host sync.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights

@@ -36,34 +36,50 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_xpu,
     load_json_config,
 )
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 _deepep_import_error: Optional[BaseException] = None
-try:
-    if _use_zbal:
-        from zbal.zbal.deepep_adaptor import Config
-        from zbal.zbal_buffer import Buffer
-    else:
-        from deep_ep import Buffer, Config
+if _is_xpu:
+    from sglang.srt.hardware_backend.xpu.deepsymm import import_deep_ep_xpu
 
-    if not _is_npu:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
+    try:
+        deep_ep_xpu = import_deep_ep_xpu()
+        Buffer, Config = deep_ep_xpu.Buffer, deep_ep_xpu.Config
 
-    use_deepep = True
-except Exception as exc:
-    # deep_ep's import-time host checks raise more than ImportError; defer any
-    # failure to the first DeepEP use so other models still start.
-    use_deepep = False
-    _deepep_import_error = exc
+        use_deepep = True
+    except Exception as exc:
+        # deep_ep_xpu's import-time host checks raise more than ImportError; defer
+        # any failure to the first DeepEP use so other models still start.
+        use_deepep = False
+        _deepep_import_error = exc
+else:
+    try:
+        if _use_zbal:
+            from zbal.zbal.deepep_adaptor import Config
+            from zbal.zbal_buffer import Buffer
+        else:
+            from deep_ep import Buffer, Config
+
+        if not _is_npu:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+        use_deepep = True
+    except Exception as exc:
+        # deep_ep's import-time host checks raise more than ImportError; defer any
+        # failure to the first DeepEP use so other models still start.
+        use_deepep = False
+        _deepep_import_error = exc
 
 from enum import Enum, IntEnum, auto
 
@@ -218,8 +234,13 @@ class DeepEPBuffer:
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
 
-        num_nvl_bytes, num_rdma_bytes = 0, 0
+        num_intranode_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
+            if _is_xpu and group.size() > 8:
+                raise NotImplementedError(
+                    "deep_ep_xpu normal mode is intranode only (<= 8 ranks); "
+                    f"got {group.size()}."
+                )
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
@@ -227,15 +248,41 @@ class DeepEPBuffer:
                 DeepEPConfig.get_instance().normal_combine_config
                 or Buffer.get_combine_config(group.size()),
             ):
-                num_nvl_bytes = max(
-                    config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                    num_nvl_bytes,
+                get_intranode_hint = (
+                    config.get_pcie_buffer_size_hint
+                    if _is_xpu
+                    else config.get_nvl_buffer_size_hint
                 )
-                num_rdma_bytes = max(
-                    config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
-                    num_rdma_bytes,
+                num_intranode_bytes = max(
+                    get_intranode_hint(hidden_bytes, group.size()),
+                    num_intranode_bytes,
                 )
-        if deepep_mode.enable_low_latency():
+                # deep_ep_xpu normal mode is intranode-only and rejects an RDMA size query.
+                if not _is_xpu:
+                    num_rdma_bytes = max(
+                        config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
+                        num_rdma_bytes,
+                    )
+        if deepep_mode.enable_low_latency() and _is_xpu:
+            assert num_max_dispatch_tokens_per_rank != -1
+            assert num_experts != -1 and num_experts % group.size() == 0
+            if group.size() not in (1, 2, 4, 8):
+                raise NotImplementedError(
+                    "deep_ep_xpu intranode low-latency mode needs 1, 2, 4 or 8 "
+                    f"ranks; got {group.size()}."
+                )
+            # Intranode low-latency lives in the same PCIe P2P buffer as normal
+            # mode (num_rdma_bytes == 0 selects it, so no iSHMEM); size it for both.
+            num_intranode_bytes = max(
+                Buffer.get_low_latency_pcie_size_hint(
+                    num_max_dispatch_tokens_per_rank,
+                    hidden_size,
+                    group.size(),
+                    num_experts,
+                ),
+                num_intranode_bytes,
+            )
+        elif deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             if not _is_npu:
@@ -265,6 +312,17 @@ class DeepEPBuffer:
             )
         else:
             raise NotImplementedError
+
+        if _is_xpu:
+            # deep_ep_xpu: no MNNVL / fabric; buffers are exchanged over PCIe P2P.
+            state.buffer = Buffer(
+                group,
+                num_pcie_bytes=num_intranode_bytes,
+                num_rdma_bytes=num_rdma_bytes,
+                low_latency_mode=deepep_mode.enable_low_latency(),
+                num_qps_per_rank=num_qps_per_rank,
+            )
+            return state.buffer
 
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
@@ -301,7 +359,9 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
-        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        state.buffer = Buffer(
+            group, num_intranode_bytes, num_rdma_bytes, **buffer_kwargs
+        )
         return state.buffer
 
     @classmethod
@@ -336,6 +396,17 @@ class DeepEPBuffer:
             raise Exception("unsupported mode")
 
 
+_XPU_CONFIG_KEY_MAP = {
+    "num_sms": "num_eus",
+    "num_max_nvl_chunked_send_tokens": "num_max_pcie_chunked_send_tokens",
+    "num_max_nvl_chunked_recv_tokens": "num_max_pcie_chunked_recv_tokens",
+}
+
+
+def _to_xpu_config_keys(config: dict[str, int]) -> dict[str, int]:
+    return {_XPU_CONFIG_KEY_MAP.get(k, k): v for k, v in config.items()}
+
+
 class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
@@ -347,16 +418,21 @@ class DeepEPConfig(BaseDispatcherConfig):
                 logger.info(f"Use DeepEP Config: {config_parsed}")
             config_dispatch = config_parsed["normal_dispatch"]
             config_combine = config_parsed["normal_combine"]
+            if _is_xpu:
+                # deep_ep_xpu.Config uses EU / PCIe names; accept CUDA-style keys too.
+                config_dispatch = _to_xpu_config_keys(config_dispatch)
+                config_combine = _to_xpu_config_keys(config_combine)
 
             self.normal_dispatch_config = Config(**config_dispatch)
             self.normal_combine_config = Config(**config_combine)
 
-            assert config_dispatch["num_sms"] == config_combine["num_sms"]
-            self.num_sms = config_dispatch["num_sms"]
+            sms_key = "num_eus" if _is_xpu else "num_sms"
+            assert config_dispatch[sms_key] == config_combine[sms_key]
+            self.num_sms = config_dispatch[sms_key]
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
-            self.num_sms = Buffer.num_sms
+            self.num_sms = Buffer.num_eus if _is_xpu else Buffer.num_sms
 
     @classmethod
     def get_instance(cls):
@@ -379,14 +455,14 @@ class _DeepEPDispatcherImplBase:
         runner_backend=None,
     ):
         if not use_deepep:
+            package_hint = (
+                "applications.ai.gpu.deepsymm (deep_ep_xpu)"
+                if _is_xpu
+                else "DeepEP from https://github.com/deepseek-ai/deepep"
+            )
             raise ImportError(
-                "DeepEP is not available. Please install DeepEP package from "
-                "https://github.com/deepseek-ai/deepep."
-                + (
-                    f" Original import error: {_deepep_import_error}"
-                    if _deepep_import_error is not None
-                    else ""
-                )
+                f"DeepEP failed to import; please install {package_hint}. "
+                f"Original error: {_deepep_import_error!r}"
             ) from _deepep_import_error
 
         self.runner_backend = runner_backend
@@ -702,7 +778,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu or _is_xpu:
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
@@ -837,6 +913,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
+        if _is_xpu and hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
+            # deep_ep_xpu does not bound-check this; overflowing corrupts its buffer.
+            raise ValueError(
+                f"DeepEP low-latency dispatch got {hidden_states.shape[0]} tokens on "
+                f"this rank, above SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+                f"{self.num_max_dispatch_tokens_per_rank}. Raise it, or lower "
+                "--chunked-prefill-size / --max-running-requests."
+            )
         _deepep_precompile_tp_barrier()
         npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
