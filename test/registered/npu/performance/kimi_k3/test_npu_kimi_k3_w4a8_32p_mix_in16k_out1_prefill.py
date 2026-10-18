@@ -75,15 +75,20 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
     "--mem-fraction-static",
-    0.72,
+    0.75,
+    # TTFT lever for a 16k cold prefill: 32768/4DP = 8192 tokens per chunk
+    # iteration, so one request is served in 2 iterations instead of 8 with
+    # the previous 8192. The accuracy case used 8192 to interleave prefill
+    # with long decodes, which is irrelevant for a 1-request / 1-token run.
     "--chunked-prefill-size",
-    8192,
+    32768,
     "--cuda-graph-bs-decode",
     1,
     4,
     16,
+    # Single-request scenario: a small running slot list is sufficient.
     "--max-running-requests",
-    64,
+    8,
     "--reasoning-parser",
     "kimi_k3",
     "--moe-a2a-backend",
@@ -119,21 +124,24 @@ KIMI_K3_W4A8_32P_MODEL_CONFIG = {
 class TestNPUKimiK3W4A832PMixIn16kOut1Prefill(TestNpuPerfMultiNodePdMixTestCaseBase):
     """Test NPU cold prefill TTFT for Kimi-K3-w4a8 32p four nodes, 16k in / 1 out.
 
-    Pipeline-validation gate: 6000 ms. The historical single-request 16k TTFT
-    on this deployment is ~5 s (dev measurement, 2026-10); the acceptance SLO
-    of 4.0 s is tracked separately and not asserted here.
+    Acceptance SLO: mean TTFT <= 4.0 s (historical single-request 16k TTFT on
+    this deployment was ~5 s with the accuracy launch config; the prefill
+    chunk size is raised to 32768 here to get under the SLO).
     """
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
     dataset_type = AISBENCHMARK_DATASET_GSM8K
+    # Must be None so run_aisbench() generates the exact-length GSM8K dataset;
+    # the base-class default would silently fall back to the raw ShareGPT file.
+    dataset_path = None
     input_len = 16384
     output_len = 1
     num_prompts = 1
     max_concurrency = 1
     random_range_ratio = 1
     request_rate = 0
-    ttft = 6000.0
+    ttft = 4000.0
 
     def test_npu_kimi_k3_w4a8_32p_mix_in16k_out1_prefill(self):
         """Run NPU cold prefill TTFT test for Kimi-K3-w4a8 32p 16k in / 1 out."""

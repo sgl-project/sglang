@@ -145,17 +145,23 @@ jobs:
     needs: [set-image-config]
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # Two independent 4-node perf jobs run in parallel on purpose.
+      max-parallel: 2
       matrix:
         test_config:
-          # kimi_k3 aisbench cold-prefill perf trial (16k in / 1 out, C1).
+          # kimi_k3 aisbench cold-prefill perf (16k in / 1 out, C1, TTFT 4s SLO).
           # cann9.1.0-a3-B103 image: the main-cann9.1.0-a3 image fails to compile
           # the kda_target_verify triton kernel (UB overflow) at graph capture.
-          # The L2 HiCache accuracy case stays scoped to PR #44398 and is not
-          # re-run here to keep the 4-node pool load minimal.
           - name: kimi_k3_w4a8_32p_mix_in16k_out1_prefill_aisbench
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in16k_out1_prefill.py
+            test_type: 'perf'
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
+          # kimi_k3 aisbench pure-decode throughput (16k shared prefix in /
+          # 1024 out; C72 asserted at TPOT<=50ms, C80 exploratory).
+          - name: kimi_k3_w4a8_32p_mix_in16k_out1k_prefix_aisbench
+            node_size: 4
+            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in16k_out1k_prefix_tpot50.py
             test_type: 'perf'
             image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
