@@ -60,6 +60,79 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
 
+class IndexKeyFormat(Enum):
+    # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
+    DSA_FP8 = "dsa_fp8"
+
+    def page_bytes(self, key_count: int) -> int:
+        # Each physical format owns its sizing, including scales and padding.
+        if self is IndexKeyFormat.DSA_FP8:
+            key_data_bytes = key_count * 128
+            scale_bytes = key_count * 4
+            return key_data_bytes + scale_bytes
+        raise ValueError(f"unsupported index key format {self}")
+
+
+class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    page_size: int
+    buffers: tuple[torch.Tensor, ...]
+    compress_ratio: int
+    key_format: IndexKeyFormat
+    # Replicated DCP stores multiple kernel pages in each allocation row.
+    kernel_page_size: int | None = None
+
+    @property
+    def page_bytes(self) -> int:
+        return self.key_format.page_bytes(self.page_size // self.compress_ratio)
+
+    @property
+    def kernel_page_bytes(self) -> int:
+        return self.key_format.page_bytes(
+            self.page_size // self.compress_ratio
+            if self.kernel_page_size is None
+            else self.kernel_page_size
+        )
+
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        buffers = self.buffers
+        if layer_ids is not None and len(layer_ids) != len(buffers):
+            raise ValueError(
+                f"{len(layer_ids)} model layers must match {len(buffers)} buffers"
+            )
+        if (
+            self.page_size <= 0
+            or self.compress_ratio <= 0
+            or self.page_size % self.compress_ratio
+        ):
+            raise ValueError(
+                f"page coverage {self.page_size} must be divisible by "
+                f"compression ratio {self.compress_ratio}"
+            )
+        if not isinstance(self.key_format, IndexKeyFormat):
+            raise ValueError(f"unsupported index key format {self.key_format}")
+        if not buffers:
+            raise ValueError("index key input must contain at least one buffer")
+        page_bytes = self.page_bytes
+        if self.kernel_page_bytes <= 0 or page_bytes % self.kernel_page_bytes:
+            raise ValueError(
+                f"index row bytes {page_bytes} must contain whole kernel pages of {self.kernel_page_bytes} bytes"
+            )
+        for layer, buffer in enumerate(buffers):
+            if (
+                buffer.dtype != torch.uint8
+                or buffer.ndim != 2
+                or buffer.shape[0] == 0
+                or buffer.shape[1] != page_bytes
+                or not buffer.is_contiguous()
+                or buffer.device != buffers[0].device
+            ):
+                raise ValueError(
+                    f"index buffer[{layer}]: expected contiguous uint8 index pages of {page_bytes} bytes "
+                    f"on {buffers[0].device}, got {tuple(buffer.shape)} "
+                    f"{buffer.dtype} on {buffer.device}, stride={buffer.stride()}"
+                )
+
+
 class KVBufferLayout(Enum):
     NHD = "nhd"
     PAGED_NHD = "paged_nhd"
@@ -219,7 +292,9 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     indices_from_pool: PoolName
     # Model layer IDs, including the PP stage offset, in buffer-axis order.
     layer_ids: tuple[int, ...]
-    buffer_info: MambaStateBufferInfo | MHABufferInfo | MLABufferInfo
+    buffer_info: (
+        MambaStateBufferInfo | MHABufferInfo | MLABufferInfo | IndexKeyBufferInfo
+    )
 
     def __post_init__(self) -> None:
         # A PP stage may own no checkpoint layers. Buffer validation decides
