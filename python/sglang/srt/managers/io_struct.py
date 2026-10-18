@@ -315,8 +315,9 @@ class GenerateReqInput:
     background: bool = False
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
-    # Per-request thinking budget. Requires strict thinking so the runtime can
-    # enforce the limit rather than silently treating it as metadata.
+    # Per-request thinking budget. Requires --reasoning-parser and a grammar
+    # backend with token filtering so the runtime can enforce the limit rather
+    # than silently treating it as metadata.
     max_thinking_tokens: Optional[int] = None
 
     # Priority for the request

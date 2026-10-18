@@ -12,6 +12,7 @@ Usage:
 """
 
 import json
+import os
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -212,6 +213,13 @@ class TestCreateGrammarBackend(unittest.TestCase):
         args = self._make_server_args("none", enable_strict_thinking=True)
         with self.assertRaisesRegex(ValueError, "enable-strict-thinking"):
             create_grammar_backend(args, None, 32000)
+
+    def test_none_backend_with_env_thinking_budget_raises(self):
+        """A server-wide budget is a hard requirement, strict flag or not."""
+        with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "128"}):
+            args = self._make_server_args("none")
+            with self.assertRaisesRegex(ValueError, "SGLANG_MAX_THINK_TOKENS"):
+                create_grammar_backend(args, None, 32000)
 
     def test_invalid_backend_raises(self):
         args = self._make_server_args("nonexistent_backend")

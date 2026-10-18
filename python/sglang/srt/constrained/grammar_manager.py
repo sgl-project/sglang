@@ -43,12 +43,6 @@ class GrammarManager:
         else:
             self.grammar_backend = None
 
-        self._enable_strict_thinking = (
-            self.grammar_backend.enable_strict_thinking
-            if self.grammar_backend is not None
-            else False
-        )
-
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
@@ -187,13 +181,25 @@ class GrammarManager:
                         req.set_finish_with_abort(error_msg)
                     else:
                         self._apply_request_reasoning_config(req)
-        elif self._enable_strict_thinking:
-            grammar_obj = self.grammar_backend.init_strict_reasoning_grammar(
-                req.require_reasoning
+        else:
+            thinking_budget = self._get_request_thinking_budget(req)
+            grammar_obj = (
+                self.grammar_backend.init_strict_reasoning_grammar(
+                    req.require_reasoning,
+                    request_thinking_budget=thinking_budget,
+                )
+                if self.grammar_backend is not None
+                else None
             )
             if grammar_obj is not None:
                 req.grammar = grammar_obj
                 self._apply_request_reasoning_config(req)
+            elif thinking_budget is not None:
+                req.set_finish_with_abort(
+                    "thinking_budget requires the server to be launched with "
+                    "--reasoning-parser and a grammar backend that supports "
+                    "token filtering (e.g., xgrammar)"
+                )
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)

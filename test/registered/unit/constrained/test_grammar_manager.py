@@ -359,7 +359,6 @@ class TestProcessReqWithGrammar(unittest.TestCase):
 
     def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
         mgr = self._make_mgr()
-        mgr._enable_strict_thinking = True
         grammar_obj = ReasonerGrammarObject(
             grammar=None, think_end_ids=[0], max_think_tokens=99
         )
@@ -369,8 +368,39 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         req.require_reasoning = True
         mgr.process_req_with_grammar(req)
 
+        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+            True, request_thinking_budget=3
+        )
         self.assertIs(req.grammar, grammar_obj)
         self.assertEqual(req.grammar.max_think_tokens, 3)
+
+    def test_request_budget_aborts_when_backend_offers_no_filter_grammar(self):
+        """A budget the backend cannot enforce must abort, not be silently ignored."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend.init_strict_reasoning_grammar.return_value = None
+
+        req = _make_req(custom_params={"thinking_budget": 3})
+        req.require_reasoning = True
+        result = mgr.process_req_with_grammar(req)
+
+        self.assertFalse(result)
+        self.assertIsNone(req.grammar)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn("thinking_budget", req.set_finish_with_abort.call_args[0][0])
+
+    def test_request_budget_aborts_without_grammar_backend(self):
+        scheduler = _make_scheduler()
+        enter_override(
+            self, get_context().override_server_args(skip_tokenizer_init=True)
+        )
+        mgr = GrammarManager(scheduler)
+        mgr.grammar_backend = None
+
+        req = _make_req(custom_params={"thinking_budget": 3})
+        result = mgr.process_req_with_grammar(req)
+
+        self.assertFalse(result)
+        req.set_finish_with_abort.assert_called_once()
 
 
 class TestAbortRequests(unittest.TestCase):
@@ -806,12 +836,12 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         self.assertTrue(work.waited)
 
 
-class TestStrictReasoningPaths(unittest.TestCase):
+class TestUnconstrainedThinkingFilterPaths(unittest.TestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
 
-    """Test _enable_strict_thinking code paths in GrammarManager."""
+    """Unconstrained requests: the backend decides whether a thinking filter applies."""
 
     def _make_mgr(self):
         scheduler = _make_scheduler()
@@ -820,7 +850,6 @@ class TestStrictReasoningPaths(unittest.TestCase):
         )
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
-        mgr._enable_strict_thinking = True
         return mgr
 
     def test_strict_unconstrained_request_gets_strict_grammar(self):
@@ -835,7 +864,9 @@ class TestStrictReasoningPaths(unittest.TestCase):
 
         self.assertFalse(result)  # Not added to grammar queue
         self.assertIs(req.grammar, grammar_obj)
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(True)
+        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+            True, request_thinking_budget=None
+        )
 
     def test_strict_unconstrained_no_reasoning_flag(self):
         """Unconstrained request with require_reasoning=False still gets strict grammar."""
@@ -848,7 +879,9 @@ class TestStrictReasoningPaths(unittest.TestCase):
         mgr.process_req_with_grammar(req)
 
         self.assertIs(req.grammar, grammar_obj)
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(False)
+        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+            False, request_thinking_budget=None
+        )
 
     def test_strict_unconstrained_none_grammar_is_fine(self):
         """If init_strict_reasoning_grammar returns None, req.grammar stays None."""
@@ -872,18 +905,6 @@ class TestStrictReasoningPaths(unittest.TestCase):
         result = mgr.process_req_with_grammar(req)
 
         self.assertTrue(result)  # Added to grammar queue
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_not_called()
-
-    def test_strict_not_set_skips_strict_path(self):
-        """When _enable_strict_thinking=False, unconstrained requests get no grammar."""
-        mgr = self._make_mgr()
-        mgr._enable_strict_thinking = False
-
-        req = _make_req()
-        req.require_reasoning = True
-        mgr.process_req_with_grammar(req)
-
-        self.assertIsNone(req.grammar)
         mgr.grammar_backend.init_strict_reasoning_grammar.assert_not_called()
 
     def test_future_exception_creates_invalid_grammar(self):

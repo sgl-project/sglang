@@ -22,6 +22,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -233,8 +234,10 @@ class BaseGrammarBackend:
         """Set or clear specific tokens in the vocab mask. No-op by default."""
         pass
 
-    def init_strict_reasoning_grammar(self, reasoning: bool):
-        """Create a grammar object for strict token filtering only. Returns None by default."""
+    def init_strict_reasoning_grammar(
+        self, reasoning: bool, request_thinking_budget: Optional[int] = None
+    ):
+        """Create a grammar object for thinking-phase token filtering only. Returns None by default."""
         return None
 
     def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
@@ -347,6 +350,19 @@ def register_grammar_backend(name, init_func):
     GRAMMAR_BACKEND_REGISTRY[name] = init_func
 
 
+def grammar_backend_supports_token_filter(name: str) -> bool:
+    # Custom backends are checked against the live instance instead of the name.
+    if name in GRAMMAR_BACKEND_REGISTRY:
+        return True
+    return name == "xgrammar"
+
+
+def _thinking_token_filter_requested() -> bool:
+    return (
+        get_serving().enable_strict_thinking or envs.SGLANG_MAX_THINK_TOKENS.get() >= 0
+    )
+
+
 def create_grammar_backend(
     server_args: ServerArgs,
     tokenizer,
@@ -388,12 +404,12 @@ def create_grammar_backend(
                 max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
             )
         except TokenizerNotSupportedError as e:
-            if get_serving().enable_strict_thinking:
+            if _thinking_token_filter_requested():
                 raise ValueError(
-                    f"--enable-strict-thinking requires a grammar backend with "
-                    f"token filtering support, but XGrammar failed to initialize: "
-                    f"{e}. Cannot fall back to grammar_backend='none' with strict "
-                    f"thinking enabled."
+                    f"--enable-strict-thinking and SGLANG_MAX_THINK_TOKENS require "
+                    f"a grammar backend with token filtering support, but XGrammar "
+                    f"failed to initialize: {e}. Cannot fall back to "
+                    f"grammar_backend='none'."
                 ) from e
             logger.warning(
                 f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
@@ -413,12 +429,12 @@ def create_grammar_backend(
             eos_token_ids=eos_token_ids,
         )
     elif name == "none":
-        if get_serving().enable_strict_thinking:
+        if _thinking_token_filter_requested():
             raise ValueError(
-                "--enable-strict-thinking requires a grammar backend that supports "
-                "token filtering, but grammar_backend='none' was specified. Use "
-                "--grammar-backend xgrammar or another backend that supports token "
-                "filtering."
+                "--enable-strict-thinking and SGLANG_MAX_THINK_TOKENS require a "
+                "grammar backend that supports token filtering, but "
+                "grammar_backend='none' was specified. Use --grammar-backend "
+                "xgrammar or another backend that supports token filtering."
             )
         return None
     else:
