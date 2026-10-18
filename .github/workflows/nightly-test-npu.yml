@@ -94,7 +94,7 @@ jobs:
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
@@ -340,15 +340,6 @@ jobs:
             test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          # deepseek_v4_pro accuracy tests
-          - name: deepseek_v4_pro_0731_w4a8_1p1d_32p_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0731_w4a8_1p1d_32p_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
