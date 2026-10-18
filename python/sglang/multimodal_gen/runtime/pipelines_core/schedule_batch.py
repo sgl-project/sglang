@@ -135,6 +135,7 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    source_latents: list[torch.Tensor] | None = None
     y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
@@ -468,6 +469,13 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
+        # Add model-specific fields if present
+        bot_task = getattr(self, "bot_task", None)
+        system_prompt = getattr(self, "system_prompt", None)
+        if bot_task is not None:
+            debug_str += f"            bot_task: {bot_task}\n"
+        if system_prompt is not None:
+            debug_str += f"               system_prompt: {system_prompt}\n"
         logger.info(debug_str)
 
 
@@ -500,6 +508,9 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
+    # plus range_m/intensity/validity arrays when the client asked for frames.
+    lidar: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -518,5 +529,6 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None

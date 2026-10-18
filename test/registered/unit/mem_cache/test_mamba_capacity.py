@@ -252,7 +252,7 @@ class TestMambaCapacity(unittest.TestCase):
         with patch(
             "sglang.srt.disaggregation.decode.get_disagg",
             return_value=SimpleNamespace(
-                disaggregation_decode_host_receive_threshold=0
+                disaggregation_decode_host_receive_threshold=1
             ),
         ):
             self.assertEqual(queue.pop_preallocated(), ([], []))

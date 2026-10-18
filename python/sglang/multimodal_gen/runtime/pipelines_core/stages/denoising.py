@@ -173,6 +173,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
+    apply_inductor_config,
     resolve_torch_compile_kwargs,
 )
 
@@ -564,6 +565,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     moved.append(module)
         return moved
 
+    def _explicit_dit_layerwise_offload(self) -> bool:
+        """True when the user asked for layerwise DiT residency, not a compile-only window."""
+        args = self.server_args
+        if args.dit_layerwise_offload:
+            return True
+        return bool(getattr(args, "is_dit_layerwise_offload_selected", False))
+
     def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -584,6 +592,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return
 
         dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+        if not current_platform.is_npu():
+            apply_inductor_config(
+                getattr(dit_config, "torch_compile_inductor_config", {})
+            )
         compile_kwargs, mode = resolve_torch_compile_kwargs(
             "SGLANG_TORCH_COMPILE_MODE",
             config=dit_config,
@@ -840,6 +852,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
 
+    def _cache_dit_has_separate_cfg(self, batch: Req) -> bool:
+        """Whether CFG runs as separate cond/uncond transformer calls per step."""
+        return (
+            batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
+
+    def _cache_dit_joint_cfg_decision(self) -> bool:
+        """Whether one forward carries the whole CFG pair (see
+        ``enable_cache_on_transformer``)."""
+        return False
+
     def _cache_dit_requested(self) -> bool:
         """Request-independent server default (init-time decisions only)."""
         return envs.SGLANG_CACHE_DIT_ENABLED
@@ -1071,11 +1095,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
-        has_separate_cfg = (
-            requested
-            and batch.do_classifier_free_guidance
-            and not self.server_args.enable_cfg_parallel
-        )
+        has_separate_cfg = requested and self._cache_dit_has_separate_cfg(batch)
         desired_key = (
             (
                 cache_dit_overrides_key(self._cache_dit_request_overrides),
@@ -1186,6 +1206,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
@@ -1201,6 +1222,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 sp_group=sp_group,
                 tp_group=tp_group,
                 has_separate_cfg=has_separate_cfg,
+                joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -2058,11 +2080,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 for module in moved:
                     module.to(device)
             return
-        # prepare for first real request: restore the user-configured residency
-        for module in self._offloaded_dit_modules_for_compile:
-            module.disable_offload()
+        # Compile-only offload is undone so the real request is GPU-resident.
+        # An explicit layerwise request must stay enabled: disable_offload()
+        # clears manager.enabled, and the next use-site then raises
+        # ComponentResidencyError (Wan transformer_2).
+        if not self._explicit_dit_layerwise_offload():
+            for module in self._offloaded_dit_modules_for_compile:
+                module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
+        # The warmup traced the offload hooks, whose graph breaks inside the
+        # block loop make Dynamo skip the DiT frame for good. Forget it, so
+        # this request compiles whole graphs from the cached autotune results.
+        torch._dynamo.reset()
         yield
 
     def forward(

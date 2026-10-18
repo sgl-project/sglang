@@ -430,7 +430,7 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     verified = sig in _FLUX2_SWIGLU_SIGS
     can_fuse = (
         not _FLUX2_SWIGLU.disabled
-        and x.is_cuda
+        and (x.is_cuda or x.is_xpu)
         and x.dtype is torch.bfloat16
         and x.dim() == 3
         and x.stride(-1) == 1
@@ -441,7 +441,11 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     )
     # Per-signature verification may compare tensors and synchronize.  Never
     # verify a new layout while a CUDA graph is being captured.
-    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+    if (
+        can_fuse
+        and not verified
+        and torch.get_device_module(x.device).is_current_stream_capturing()
+    ):
         return F.silu(x[..., :half]) * x[..., half:]
     if can_fuse:
         try:
@@ -956,6 +960,28 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+        )
+
+    def revalidate_fp8_fast_paths(self) -> None:
+        """Recompute fused FP8/NVFP4 fast-path eligibility after submodule changes.
+
+        LoRA wrapping replaces quantized linears with wrappers that do not
+        expose ``quant_method``/``input_scale``; flags decided at ``__init__``
+        against the raw modules then go stale and ``forward`` would read those
+        attributes off the wrapper and crash. Read them defensively here so a
+        recheck after wrapping disables the fusion instead.
+        """
+        self._enable_fp8_token_cat = self.tp_size == 1 and isinstance(
+            getattr(self.to_out, "quant_method", None), ModelOptFp8LinearMethod
+        )
+        capability = current_platform.get_device_capability()
+        self._enable_nvfp4_token_cat = (
+            self.tp_size == 1
+            and capability is not None
+            and (capability.major, capability.minor) == (10, 3)
+            and isinstance(
+                getattr(self.to_out, "quant_method", None), ModelOptFp4LinearMethod
+            )
         )
 
     def _patch_to_out_weight_loader(self) -> None:
@@ -1548,6 +1574,18 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 enabled,
                 total,
             )
+
+    def revalidate_fp8_fast_paths(self) -> None:
+        """Recheck FP8 fast paths after LoRA (or other) submodule replacement.
+
+        ``configure_fp8_norm_quant`` is getattr-safe, so a wrapper that hides
+        the quant attributes simply turns each flag off.
+        """
+        for block in self.transformer_blocks:
+            block.configure_fp8_norm_quant()
+        for block in self.single_transformer_blocks:
+            block.configure_fp8_norm_quant()
+            block.attn.revalidate_fp8_fast_paths()
 
     def __init__(
         self,

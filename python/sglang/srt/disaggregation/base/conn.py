@@ -61,6 +61,9 @@ class KVArgs:
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None
+    host_state_data_ptrs: Optional[List[List[int]]] = None
+    host_state_data_lens: Optional[List[List[int]]] = None
+    host_state_item_lens: Optional[List[List[int]]] = None
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -78,6 +81,9 @@ class KVArgs:
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
+    # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
+    # None when the SWA state is not held in an MHA sub-pool.
+    swa_kv_cache_layout: Optional[str]
     ib_device: str
     gpu_id: int
     kv_head_num: int
@@ -122,6 +128,13 @@ class BaseKVManager(ABC):
 
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
+
+    def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
+        """Whether the checksum sent by the prefill at bootstrap_addr is comparable
+        with one over this rank's local KV. A backend returns False for a peer
+        whose digest covers a different byte range, e.g. a TP width mismatch where
+        each decode rank receives only a slice of what the sender digested."""
+        return True
 
     @abstractmethod
     def __init__(
@@ -231,6 +244,14 @@ class BaseKVReceiver(ABC):
     def supports_host_destination(self) -> bool:
         """Whether this receiver's peer and layout support host KV destinations."""
         return False
+
+    def is_abort_release_safe(self) -> bool:
+        """Whether all writes to an aborted host destination have drained.
+
+        Host-capable backends must retain this state until ``clear()``. A failed
+        poll or elapsed timeout alone does not prove the buffers can be reused.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def __init__(
