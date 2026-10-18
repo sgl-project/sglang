@@ -567,6 +567,7 @@ FROM framework AS framework_final
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
 ARG CUDA_VERSION
+ARG TARGETARCH
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
@@ -587,7 +588,9 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Editable install (fast - dependencies already installed via constraints)
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/var/cache/sglang-hf,id=sglang-hf-kernels-${TARGETARCH}-${CUDA_VERSION},sharing=locked \
     cd /sgl-workspace/sglang \
+    && export HF_HOME=/var/cache/sglang-hf \
     && uv pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
@@ -613,6 +616,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
          fi; \
          [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
+    # BuildKit cache mounts are not exported in image layers. Preserve the
+    # downloaded kernels for the runtime stage before leaving this RUN.
+    && cp -a /var/cache/sglang-hf/. /root/.cache/huggingface/ \
     && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
