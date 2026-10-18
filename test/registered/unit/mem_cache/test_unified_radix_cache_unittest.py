@@ -125,8 +125,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 # A dedicated test entry point overrides this without changing the process-wide
 # production backend selection. Direct Python-core tests in this module remain
@@ -154,6 +154,7 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    draft_swa_window: int = 0
     decoder_swa_bounded_replay: bool = False
 
     # Mamba
@@ -742,6 +743,7 @@ def build_fixture(
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
@@ -11423,6 +11425,105 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         child = self._attach_host_child(cache, parent_id, start_token=1000)
         self.assertIsNotNone(child)
         cache.sanity_check()
+
+
+class TestSWADraftHistory(CustomTestCase):
+    """A widened draft needs SWA history before the target window. A running
+    checkpoint must lock that history, and an incomplete cached window must
+    not be reused even when the target alone could read it. The shared suite
+    runs these contracts against both Python and Rust TreeCore.
+    """
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        sliding_window_size=511,
+        draft_swa_window=516,
+        is_eagle=True,
+        kv_size=2048,
+        max_context_len=2048,
+        num_layers=2,
+        full_attention_layer_ids=(0,),
+        head_num=1,
+        head_dim=8,
+        enable_mamba_extra_buffer=True,
+    )
+
+    def _request(self, pool):
+        tokens = array("q", range(1, 1025))
+        req = Req(
+            rid="widened-draft",
+            origin_input_text="",
+            origin_input_ids=tokens,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
+        )
+        pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = tokens
+        req.extend_end = len(tokens)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(0)
+        req.lock = None
+        req.extra_key = None
+        return req
+
+    def test_checkpoint_protects_widened_draft_history_under_eviction(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        req = self._request(pool)
+        req.last_node = cache.root_node_handle()
+        kv = allocator.alloc(1024)
+        pool.write((req.kv.req_pool_idx, slice(0, 1024)), kv)
+        cache.checkpoint(req, up_to=1024)
+        self.addCleanup(lambda: cache.unlock(req.lock))
+
+        # Mamba disables bigram keys: this checkpoint is exactly at 1024.
+        self.assertEqual(req.kv.cache_protected_len, 1024)
+        # A three-depth draft with five front rows and three warmup rows has
+        # its first real query at 1022. Its window needs key 511, which lies
+        # before the target-only lock [513, 1024).
+        needed = kv[1024 - self.cfg.draft_swa_window : 1024]
+        mapping = allocator.full_to_swa_index_mapping
+        before = mapping[needed].clone()
+        self.assertTrue(bool((before > 0).all()))
+        cache.evict(EvictParams(swa_num_tokens=1))
+        torch.testing.assert_close(mapping[needed], before)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+        )
+        self.assertEqual(match.device_prefix_len, 1024)
+
+        # Decode advances past the last recurrent checkpoint. Its complete
+        # draft history must remain until a newer checkpoint replaces it.
+        cache.evict_sliding_windows(req, 1040)
+        torch.testing.assert_close(mapping[needed], before)
+        cache.sanity_check()
+
+    def test_prefix_match_rejects_target_only_swa_history(self):
+        for retained, expected_match in ((511, 0), (516, 1024)):
+            with self.subTest(retained=retained):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=64
+                )
+                req = self._request(pool)
+                kv = allocator.alloc(1024)
+                cutoff = 1024 - retained
+                allocator.free_swa_segment(kv[:cutoff], start_pos=0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(req.origin_input_ids),
+                        value=kv,
+                        mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
+                        component_evicted_seqlens={ComponentType.SWA: cutoff},
+                    )
+                )
+                result = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+                )
+                self.assertEqual(result.device_prefix_len, expected_match)
+                cache.sanity_check()
 
 
 class TestSWAWindowUnderBigramKey(CustomTestCase):

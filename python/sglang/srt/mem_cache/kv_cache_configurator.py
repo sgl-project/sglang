@@ -638,12 +638,8 @@ class KVCacheConfigurator:
                 alloc = token_to_kv_pool_allocator
                 placement = self._fused_draft_from_target_buffer(alloc)
                 if placement is not None:
-                    from sglang.srt.mem_cache.layout.fused_draft import (
-                        draft_swa_layer_ids,
-                    )
                     from sglang.srt.mem_cache.unified_draft_pool import (
                         bind_fused_draft,
-                        draft_kv_layer_ids,
                         draft_state_layer_classes,
                     )
 
@@ -651,27 +647,29 @@ class KVCacheConfigurator:
                         req_to_token_pool = self._build_req_to_token_pool(
                             max_num_reqs=sizes.max_running_requests
                         )
+                    runner = self.draft_model_idx or 0
                     # The target placed this draft from its config; the built
                     # model is the ground truth for whether it carries state.
                     state_layers = draft_state_layer_classes(self.model)
-                    if state_layers:
+                    if state_layers and not placement.lanes_for(runner, "mamba"):
                         raise ValueError(
                             "Fused draft KV: the draft model has recurrent / "
                             f"linear-attention layers ({', '.join(state_layers)}) "
-                            "that the fused region gives no state pool."
+                            "that the fused placement gives no state lanes."
                         )
-                    draft_pool = bind_fused_draft(
+                    binding = bind_fused_draft(
+                        placement=placement,
+                        runner=runner,
                         unified_buffer=alloc.unified_buffer,
                         host_allocator=alloc,
-                        placement=placement,
-                        runner=self.draft_model_idx or 0,
-                        kv_layer_ids=draft_kv_layer_ids(self.model),
-                        swa_layer_ids=draft_swa_layer_ids(self.model_config),
+                        model=self.model,
+                        model_config=self.model_config,
+                        req_to_token_pool=req_to_token_pool,
                         page_size=self.page_size,
                     )
                     return _InitializedPools(
-                        req_to_token_pool=req_to_token_pool,
-                        token_to_kv_pool=draft_pool,
+                        req_to_token_pool=binding.req_to_token_pool,
+                        token_to_kv_pool=binding.token_to_kv_pool,
                         token_to_kv_pool_allocator=alloc,
                         unified_memory_pool=None,
                     )
@@ -823,14 +821,20 @@ class KVCacheConfigurator:
         # The region holds rows in the target's KV dtype; a draft that resolved
         # its own would read and write them as something else. Compare the KV
         # dtypes, not their storage: every fp8 flavor is stored as uint8.
-        region_kv_dtype = placement.region.resolved_kv_dtype()
-        if self.kv_cache_dtype != region_kv_dtype:
-            raise ValueError(
-                f"Fused draft KV: the draft resolved its KV cache dtype to "
-                f"{self.kv_cache_dtype}, but its region inside the target's pages "
-                f"holds {region_kv_dtype}. Set "
-                "--speculative-draft-kv-cache-dtype to the target's KV cache dtype."
-            )
+        from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
+
+        for host in placement.hosts():
+            if HOST_KINDS[host].family != "dense":
+                continue
+            region_kv_dtype = placement.region(host).resolved_kv_dtype()
+            if self.kv_cache_dtype != region_kv_dtype:
+                raise ValueError(
+                    f"Fused draft KV: the draft resolved its KV cache dtype to "
+                    f"{self.kv_cache_dtype}, but its region inside the target's "
+                    f"pages holds {region_kv_dtype}. Set "
+                    "--speculative-draft-kv-cache-dtype to the target's KV cache "
+                    "dtype."
+                )
         return placement
 
     def _init_unified_mamba_pools(
@@ -1038,6 +1042,15 @@ class KVCacheConfigurator:
             swa_v_head_dim=mc.swa_v_head_dim,
         )
 
+    def _unified_host_names(self) -> tuple:
+        """The sub-pools the unified factory for this model builds, by name."""
+        names = ["full"]
+        if self.is_hybrid_swa:
+            names.append("swa")
+        if self.mambaish_config is not None:
+            names.append("mamba")
+        return tuple(names)
+
     def _fused_draft_decision(self):
         """Whether, and where, the draft's layers fuse into the target's
         sub-pools. An empty decision means fusion does not apply (unified
@@ -1048,6 +1061,7 @@ class KVCacheConfigurator:
         to the kernel."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
+            PlacementContext,
             draft_kv_profile,
             place_fused_draft,
         )
@@ -1166,10 +1180,23 @@ class KVCacheConfigurator:
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
-            asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
+            ctx=PlacementContext(
+                host_names=self._unified_host_names(),
+                target_window=self.model_config.sliding_window_size,
+                asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
+                draft_backends=self._draft_attention_backends(),
+            ),
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
             kv_dtype=self.kv_cache_dtype,
         )
+
+    def _draft_attention_backends(self) -> tuple:
+        """The backends the draft worker may run on: its explicit one, else
+        the target's, which it inherits."""
+        explicit = get_spec().speculative_draft_attention_backend
+        if explicit is not None:
+            return (explicit,)
+        return tuple(sorted(b for b in attention_backends() if b is not None))
 
     def _draft_backends_carry_v_head_dim(self) -> bool:
         """Whether every resolved attention backend, the draft's included,
@@ -1187,10 +1214,69 @@ class KVCacheConfigurator:
         pad), built from the same spec as the pool factory's so the priced and
         allocated entries agree; None when the draft does not fuse into that
         sub-pool."""
+        from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
+
         placement = self._fused_draft_decision().placement
-        if placement is None or sub_pool_name != "full":
+        if placement is None:
             return None
-        return self._full_host_spec(placement.region).entry_bytes()
+        region = placement.region(sub_pool_name)
+        if region is None:
+            return None
+        builders = {
+            "full": self._full_host_spec,
+            "swa": self._swa_host_spec,
+            "mamba": self._mamba_host_spec,
+        }
+        assert sub_pool_name in HOST_KINDS, (
+            f"sub-pool {sub_pool_name!r} is not a registered host kind"
+        )
+        assert sub_pool_name in builders, (
+            f"no fused host spec builder for sub-pool {sub_pool_name!r}"
+        )
+        return builders[sub_pool_name](region).entry_bytes()
+
+    def _mamba_host_spec(self, region):
+        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+
+        assert self.mambaish_config is not None, (
+            "only a mamba-ish host builds a mamba sub-pool"
+        )
+        cp = self.mambaish_config.mamba2_cache_params
+        # This runner's OWN state layers, as the mamba factory slices them.
+        layer_ids = [
+            i
+            for i in cp.layers
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        return MambaSubPoolSpec(
+            name="mamba",
+            layer_num=len(layer_ids),
+            conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
+            conv_dtype=cp.dtype.conv,
+            temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+            temporal_dtype=cp.dtype.temporal,
+            grow_direction="up",
+            draft_region=region,
+        )
+
+    def _swa_host_spec(self, region):
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        assert self.is_hybrid_swa, "only a hybrid-SWA host builds an swa sub-pool"
+        geometry = self._unified_swa_head_geometry()
+        return MHASubPoolSpec(
+            name="swa",
+            layer_num=len(self.layer_info.swa_attention_layer_ids),
+            head_num=geometry.swa_head_num,
+            head_dim=geometry.swa_head_dim,
+            v_head_dim=geometry.swa_v_head_dim,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            grow_direction="up",
+            draft_region=region,
+        )
 
     def _full_host_spec(self, region):
         from sglang.srt.mem_cache.unified_memory_pool import (
@@ -1292,31 +1378,28 @@ class KVCacheConfigurator:
     def _fused_draft_for_pool_factory(self, decision):
         """The placement a pool factory is handed. It logs the decision it
         returns, so the boot log shows whether fusion engaged or why not."""
+        from sglang.srt.mem_cache.layout.fused_draft import HOST_KINDS
+
         if decision.placement is None:
             if decision.declined is not None:
                 logger.warning("fused draft KV disabled: %s", decision.declined)
             return None
         placement = decision.placement
-        region = placement.region
-        kv_dtype = region.resolved_kv_dtype()
-        logger.info(
-            "[unified-memory-pool] fused draft region in 'full': %d lane(s) x %d "
-            "kv head(s) x %d/%d k/v head_dim @ %s = %d B/token; runner lanes %s",
-            region.lane_num,
-            region.head_num,
-            region.head_dim,
-            region.resolved_v_head_dim(),
-            (
-                kv_dtype
-                if kv_dtype == region.store_dtype
-                else f"{kv_dtype} (stored as {region.store_dtype})"
-            ),
-            region.entry_bytes(),
-            [
-                tuple(placement.lanes_for(r))
-                for r in range(len(placement.runner_lane_counts))
-            ],
-        )
+        if decision.note is not None:
+            logger.info(
+                "[unified-memory-pool] fused draft placement: %s", decision.note
+            )
+        for host in placement.hosts():
+            logger.info(
+                "[unified-memory-pool] %s",
+                HOST_KINDS[host].describe(
+                    region=placement.region(host),
+                    lanes=[
+                        tuple(placement.lanes_for(r, host))
+                        for r in range(len(placement.runners))
+                    ],
+                ),
+            )
         return placement
 
     def _init_unified_swa_pools(
@@ -2956,9 +3039,15 @@ class KVCacheConfigurator:
         else:
             max_stage_mamba_layers = len(all_mamba_layers)
         pp_layer_scale = max_stage_mamba_layers / max(len(all_mamba_layers), 1)
-        stage_per_req = int(
-            config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
+        # A fused draft state block widens every state slot: price the entry
+        # the unified factory carves out (host + draft + pad), not the host's.
+        fused_state_entry = self.fused_entry_bytes("mamba")
+        per_req = (
+            config.mamba2_cache_params.mamba_cache_per_req
+            if fused_state_entry is None
+            else fused_state_entry
         )
+        stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
