@@ -7,6 +7,7 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len_from_batch
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -67,14 +68,15 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
         fb.num_token_non_padded,
     )
     fb.global_num_tokens_cpu = counts
-    # Device ops only: this runs inside prefill graph capture, where a host copy
-    # would be recorded against pageable memory.
     gpu = fb.global_num_tokens_gpu
-    fb.global_num_tokens_gpu = (
-        torch.full_like(gpu, counts[0])
-        if len(set(counts)) == 1
-        else gpu.new_tensor(counts)
-    )
+    if len(set(counts)) == 1:
+        # Device ops only: this runs inside prefill graph capture, where a host
+        # copy would be recorded against pageable memory.
+        fb.global_num_tokens_gpu = torch.full_like(gpu, counts[0])
+    else:
+        # Captures bake rank-uniform counts, so this host copy never runs in one.
+        # A pageable copy would stall the host until the early layers finish.
+        fb.global_num_tokens_gpu = async_h2d(counts, dtype=gpu.dtype, device=gpu.device)
     fb.global_num_tokens_padded_cpu = counts
     # The MoE gatherv reads its sizes from the logprob counts when present.
     fb.global_num_tokens_for_logprob_cpu = counts
