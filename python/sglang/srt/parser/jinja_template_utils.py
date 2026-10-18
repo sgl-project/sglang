@@ -277,6 +277,15 @@ def process_content_for_template_format(
                 elif chunk_type == "tool_reference":
                     # Preserve this extension because GLM templates resolve referenced tool schemas by function name.
                     processed_content_parts.append(chunk)
+                elif chunk_type in ("thinking", "reasoning"):
+                    thinking_val = chunk.get("thinking")
+                    if thinking_val is None:
+                        thinking_val = chunk.get("text")
+                    if (
+                        isinstance(thinking_val, str)
+                        and msg_dict.get("reasoning_content") is None
+                    ):
+                        msg_dict["reasoning_content"] = thinking_val
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
@@ -290,14 +299,24 @@ def process_content_for_template_format(
     elif content_format == "string":
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
+        thinking_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
-                text_parts.append(chunk["text"])
+            if isinstance(chunk, dict):
+                if chunk.get("type") in ("text", "input_text"):
+                    text_parts.append(chunk["text"])
+                elif chunk.get("type") in ("thinking", "reasoning"):
+                    thinking_val = chunk.get("thinking")
+                    if thinking_val is None:
+                        thinking_val = chunk.get("text")
+                    if isinstance(thinking_val, str):
+                        thinking_parts.append(thinking_val)
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
             # need to be inserted differently
 
         new_msg = msg_dict.copy()
+        if thinking_parts and new_msg.get("reasoning_content") is None:
+            new_msg["reasoning_content"] = "\n".join(thinking_parts)
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
         return new_msg

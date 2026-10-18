@@ -1685,6 +1685,15 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
+            tokenizer_chat_template = (
+                self.tokenizer_manager.tokenizer.chat_template
+                if self.tokenizer_manager.tokenizer is not None
+                else None
+            )
+            populates_thinking_field = (
+                chat_encoding.template_reads_thinking(tokenizer_chat_template)
+                and not chat_encoding.template_reads_reasoning(tokenizer_chat_template)
+            )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
@@ -1702,6 +1711,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 processed_msg["content"] = normalize_tool_content(
                     processed_msg["role"], processed_msg.get("content")
                 )
+                if (
+                    populates_thinking_field
+                    and processed_msg.get("role") == "assistant"
+                    and processed_msg.get("reasoning_content") is not None
+                    and "thinking" not in processed_msg
+                ):
+                    processed_msg["thinking"] = processed_msg["reasoning_content"]
+                    if processed_msg.get("tool_calls") and processed_msg.get("content"):
+                        processed_msg["thinking"] = (
+                            f"{processed_msg['thinking']}\n{processed_msg['content']}"
+                        )
+                        processed_msg["content"] = ""
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -2850,11 +2871,19 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def supports_native_reasoning_history(self) -> bool:
-        """Whether the chat encoder takes history as ``reasoning_content`` rather
-        than via :meth:`wrap_reasoning_history`; see
-        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+        """Whether the chat encoder or Jinja template takes history as
+        ``reasoning_content`` rather than via :meth:`wrap_reasoning_history`.
         """
-        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
+        if chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec):
+            return True
+        chat_template = (
+            self.tokenizer_manager.tokenizer.chat_template
+            if self.tokenizer_manager.tokenizer is not None
+            else None
+        )
+        return chat_encoding.template_reads_reasoning(
+            chat_template
+        ) or chat_encoding.template_reads_thinking(chat_template)
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.
