@@ -1,0 +1,1128 @@
+# SPDX-License-Identifier: MIT
+"""Muse grouped GEMM with BF16 or packed MXFP4 weights.
+
+The prepared FP4 loader consumes the lossless MFMA-oriented weight layout.
+Gate/up and down retain the existing BF16 matrix arithmetic.
+"""
+
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
+from flydsl.expr import arith, range_constexpr
+from flydsl.expr.typing import T
+
+
+def _row_swap(op_name, lhs, rhs):
+    """gfx950 ``v_permlane{16,32}_swap_b32``: exchange lane rows between two VGPRs.
+
+    ``permlane16_swap`` trades the odd 16-lane rows of ``lhs`` for the even rows
+    of ``rhs``; ``permlane32_swap`` trades the upper half of ``lhs`` for the
+    lower half of ``rhs``. Both are plain VALU ops, so unlike ``ds_bpermute``
+    they neither occupy the LDS pipe nor add an ``lgkmcnt`` wait.
+    """
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm, rocdl
+
+    i32 = ir.IntegerType.get_signless(32)
+    pair = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    swapped = getattr(rocdl, op_name)(pair, _to_raw(lhs), _to_raw(rhs), False, True)
+    return (
+        fx.Int32(llvm.extractvalue(i32, swapped, [0])),
+        fx.Int32(llvm.extractvalue(i32, swapped, [1])),
+    )
+
+
+@functools.lru_cache(maxsize=128)
+def _launcher(
+    N,
+    K,
+    topk,
+    block_m,
+    block_n,
+    num_warps,
+    waves_per_eu,
+    mxfp4,
+    fuse_silu,
+    row_div,
+    unroll=2,
+    lds_stages=2,
+    prefetch=True,
+    exact_scale_edge=False,
+    split_k=1,
+    prepared=False,
+    persistent_grid=0,
+    adaptive_n=False,
+):
+    if block_m % 16 or block_n % 16 or K % (32 * unroll):
+        raise ValueError("MFMA requires M/N tiles divisible by 16 and aligned K")
+    waves = min(num_warps, block_n // 16)
+    m_waves = 2 if waves >= 8 and block_m >= 32 else 1
+    n_waves = waves // m_waves
+    n_repeat = block_n // (n_waves * 16)
+    m_repeat = block_m // (m_waves * 16)
+    w_rows = N * (2 if fuse_silu else 1)
+    w_bytes = 1 if mxfp4 else 2
+    w_k = K // 2 if mxfp4 else K
+    halves = 2 if fuse_silu else 1
+    lds_k = 32 * unroll
+    use_bf16_lds = not mxfp4 and unroll == 1 and waves in (4, 8)
+    use_mxfp4_lds = mxfp4 and unroll in (2, 4) and waves in (4, 8)
+    use_bf16_reg_transpose = not mxfp4 and unroll in (2, 4) and waves == 4
+    use_lds = use_bf16_lds or use_mxfp4_lds
+    # Register-resident MXFP4: 128-bit packed loads, a lane-row transpose into
+    # MFMA layout, and one E8M0 dword per column per K tile.
+    mxfp4_reg = mxfp4 and unroll % 4 == 0 and not use_mxfp4_lds
+    # Register-resident BF16 needs neither transpose nor unpack: eight BF16 along
+    # K is already the MFMA fragment, so a load lands operand-ready. That left it
+    # with nothing to overlap HBM latency against, which is what the K-tile
+    # pipeline below fixes.
+    bf16_reg = not mxfp4 and not use_bf16_lds and not use_bf16_reg_transpose
+    # E8M0 exponents are addressed as dwords, which needs four per column.
+    if mxfp4_reg and K % 128:
+        raise ValueError("MXFP4 register path needs K divisible by 128")
+    a_load_vec = 8
+
+    @fx.struct
+    class SharedTiles:
+        a: fx.Array[fx.BFloat16, lds_stages * block_m * lds_k, 16]
+        b: fx.Array[fx.BFloat16, lds_stages * halves * block_n * lds_k, 16]
+
+    @fx.struct
+    class MXSharedTiles:
+        a: fx.Array[fx.BFloat16, lds_stages * block_m * lds_k, 16]
+        # One int32 contains the eight FP4 values consumed by one MFMA lane.
+        b: fx.Array[fx.Int32, lds_stages * halves * block_n * (lds_k // 8), 16]
+        scale: fx.Array[fx.Int8, lds_stages * halves * block_n * (lds_k // 32), 16]
+
+    def e8m0_to_f32(exponent):
+        """E8M0 biased exponent (in the low byte of an i32) -> f32 multiplier.
+
+        The common range folds into a single shift, which the backend fuses
+        with the byte extract into one SDWA op. ``exact_scale_edge`` adds the
+        two OCP corner cases back at four extra VALU ops per MFMA fragment:
+        exponent 0 denotes 2**-127 rather than zero, and 255 denotes NaN.
+        Quark exports clamp the exponent to [1, 254] for any block whose
+        absolute maximum is finite and non-zero, so both are unreachable in
+        practice and the corner-case values are below BF16 denormal range.
+        """
+        scale_bits = _to_raw(exponent << 23)
+        if fx.const_expr(exact_scale_edge):
+            scale_bits = _to_raw(
+                (exponent == 0).select(fx.Int32(0x00400000), fx.Int32(scale_bits))
+            )
+            scale_bits = _to_raw(
+                (exponent == 255).select(fx.Int32(0x7FC00000), fx.Int32(scale_bits))
+            )
+        return arith.bitcast(T.f32, scale_bits)
+
+    def decode_packed(packed, scale_f32):
+        pairs = []
+        for sel in range_constexpr(4):
+            pair = fx.rocdl.cvt_scalef32_pk_bf16_fp4(
+                T.vec(2, T.bf16), packed, scale_f32, sel
+            )
+            pairs.append(fx.Vector(pair).bitcast(fx.Int32)[0])
+        return _to_raw(fx.Vector.from_elements(pairs, fx.Int32).bitcast(fx.BFloat16))
+
+    def decode_weight(packed, scale):
+        exponent = fx.Int32(arith.extui(T.i32, _to_raw(scale)))
+        return decode_packed(packed, e8m0_to_f32(exponent))
+
+    def transpose_packed(words):
+        """Transpose the 4x4 (lane row, register) tile of one 128-bit B load.
+
+        A lane loads 32 packed FP4 values for its own column, so register
+        ``w`` holds K group ``lane_row`` of MFMA step ``w``; the MFMA wants
+        register ``ku`` to hold K group ``lane_row`` of step ``ku``. Two
+        ``permlane32`` swaps exchange the 2x2 quadrants and two ``permlane16``
+        swaps transpose inside them, replacing eight ``ds_bpermute`` plus eight
+        compare/select pairs with four VALU ops.
+        """
+        w0, w1, w2, w3 = words
+        w0, w2 = _row_swap("permlane32_swap", w0, w2)
+        w1, w3 = _row_swap("permlane32_swap", w1, w3)
+        w0, w1 = _row_swap("permlane16_swap", w0, w1)
+        w2, w3 = _row_swap("permlane16_swap", w2, w3)
+        return [w0, w1, w2, w3]
+
+    def load_weight(resource, scales, col, k_base):
+        if fx.const_expr(mxfp4):
+            if fx.const_expr(prepared):
+                offset = (
+                    ((col // 16 * (K // 128) + k_base // 128) * 4 + k_base // 8 % 4)
+                    * 16
+                    + col % 16
+                ) * 4 + k_base // 32 % 4
+            else:
+                offset = (col * w_k + k_base // 2) // 4
+            packed = buffer_ops.buffer_load(resource, offset, vec_width=1, dtype=T.i32)
+            scale = buffer_ops.buffer_load(
+                scales, col * (K // 32) + k_base // 32, vec_width=1, dtype=T.i8
+            )
+            return decode_weight(packed, scale)
+        else:
+            return buffer_ops.buffer_load(
+                resource, col * K + k_base, vec_width=8, dtype=T.bf16
+            )
+
+    def transpose_bf16_fragment(loaded, lane, row_lane):
+        words = fx.Vector(loaded, shape=8, dtype=fx.BFloat16).bitcast(fx.Int32)
+        source_lane = row_lane * 4 + lane // 16
+        gathered = []
+        for word in range_constexpr(4):
+            gathered.append(
+                fx.Int32(
+                    fx.rocdl.ds_bpermute(
+                        T.i32,
+                        _to_raw(source_lane * 4),
+                        _to_raw(words[word]),
+                    )
+                )
+            )
+        return _to_raw(fx.Vector.from_elements(gathered, fx.Int32).bitcast(fx.BFloat16))
+
+    def schedule_bf16_lds_loop():
+        # Keep the next tile's VMEM/DS writes in flight while the current tile
+        # feeds MFMA. These markers are consumed by the ROCm scheduler and do
+        # not add instructions to the final kernel.
+        dsrd = m_repeat + n_repeat * halves
+        mfma = m_repeat * n_repeat * halves
+        a_vmem = (block_m * lds_k + waves * 64 * a_load_vec - 1) // (
+            waves * 64 * a_load_vec
+        )
+        vmem = a_vmem + (halves * block_n * lds_k) // (waves * 64 * 8)
+        preload = min(2, dsrd)
+        if fx.const_expr(preload):
+            fx.rocdl.sched_dsrd(preload)
+        ds_left = dsrd - preload
+        for si in range_constexpr(mfma):
+            fx.rocdl.sched_mfma(1)
+            if fx.const_expr(si < ds_left):
+                fx.rocdl.sched_dsrd(1)
+            if fx.const_expr(si < vmem):
+                fx.rocdl.sched_vmem(1)
+        if fx.const_expr(vmem > mfma):
+            fx.rocdl.sched_vmem(vmem - mfma)
+        if fx.const_expr(a_vmem):
+            fx.rocdl.sched_dswr(a_vmem)
+        fx.rocdl.sched_barrier(0)
+
+    kernel_name = (
+        "muse_moe_gate_up_mfma_flydsl" if fuse_silu else "muse_moe_down_mfma_flydsl"
+    )
+    if prepared:
+        kernel_name += "_prepared"
+    if adaptive_n:
+        kernel_name += "_adaptive"
+        if not (
+            prepared
+            and mxfp4_reg
+            and block_m == 16
+            and block_n == 64
+            and waves == 2
+            and split_k == 1
+            and persistent_grid >= 512
+        ):
+            raise ValueError(
+                "adaptive N requires prepared FP4, BM16, BN64, two waves, and grid >=512"
+            )
+
+    @flyc.kernel(name=kernel_name)
+    def kernel(
+        a: fx.Tensor,
+        b: fx.Tensor,
+        scale: fx.Tensor,
+        c: fx.Tensor,
+        sorted_ids: fx.Tensor,
+        expert_ids: fx.Tensor,
+        num_post: fx.Tensor,
+        num_valid: fx.Int32,
+    ):
+        def emit_job(pid, job_bn, job_n_waves, job_n_repeat):
+            split_id = pid % split_k
+            gemm_pid = pid // split_k
+            wave = fx.thread_idx.x // 64
+            wave_m = wave // job_n_waves
+            wave_n = wave % job_n_waves
+            lane = fx.thread_idx.x % 64
+            n_block = gemm_pid % (N // job_bn)
+            m_block = gemm_pid // (N // job_bn)
+            post_r = buffer_ops.create_buffer_resource(num_post, max_size=True)
+            e_r = buffer_ops.create_buffer_resource(expert_ids, max_size=True)
+            # Most of the grid is padding: alignment rounds every expert up to
+            # BLOCK_M and gathers the non-local routes into their own -1 blocks, so
+            # at decode sizes the majority of workgroups only exist to exit. Both
+            # guards are wave-uniform, so they go through the scalar cache and are
+            # issued together instead of costing two dependent round trips.
+            post = fx.Int32(
+                buffer_ops.buffer_load(
+                    post_r, fx.Int32(0), vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            expert = fx.Int32(
+                buffer_ops.buffer_load(
+                    e_r, m_block, vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            if m_block * block_m < post:
+                if expert >= 0:
+                    # Expert base is 64-bit, so a multi-GB expert stack never wraps
+                    # the hardware's 32-bit buffer offset.
+                    b_r = buffer_ops.create_buffer_resource(
+                        b,
+                        max_size=True,
+                        base_byte_offset=_to_raw(
+                            fx.Int64(expert) * (w_rows * w_k * w_bytes)
+                        ),
+                    )
+                    if fx.const_expr(mxfp4):
+                        s_r = buffer_ops.create_buffer_resource(
+                            scale,
+                            max_size=True,
+                            base_byte_offset=_to_raw(
+                                fx.Int64(expert) * (w_rows * (K // 32))
+                            ),
+                        )
+                    else:
+                        s_r = b_r
+                    a_r = buffer_ops.create_buffer_resource(
+                        a,
+                        num_records_bytes=_to_raw(
+                            (num_valid // topk if row_div else num_valid) * K * 2
+                        ),
+                    )
+                    c_cols = N * (2 if fuse_silu and split_k > 1 else 1)
+                    c_r = buffer_ops.create_buffer_resource(
+                        c,
+                        num_records_bytes=_to_raw(
+                            split_k * num_valid * c_cols * (4 if split_k > 1 else 2)
+                        ),
+                    )
+                    id_r = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
+                    row_lane = lane % 16
+                    k_lane = lane // 16 * 8
+                    cols = [
+                        n_block * job_bn
+                        + wave_n * (job_n_repeat * 16)
+                        + nr * 16
+                        + row_lane
+                        for nr in range(job_n_repeat)
+                    ]
+                    a_rows = []
+                    masks = []
+                    for mr in range_constexpr(m_repeat):
+                        slot = fx.Int32(
+                            buffer_ops.buffer_load(
+                                id_r,
+                                m_block * block_m
+                                + wave_m * (m_repeat * 16)
+                                + mr * 16
+                                + row_lane,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        masks.append(slot < num_valid)
+                        safe = (slot < num_valid).select(slot, 0)
+                        a_rows.append(safe // topk if row_div else safe)
+                    if fx.const_expr(use_bf16_reg_transpose):
+                        source_a_rows = []
+                        source_masks = []
+                        for mr in range_constexpr(m_repeat):
+                            source_local_row = (
+                                wave_m * (m_repeat * 16) + mr * 16 + lane // 4
+                            )
+                            source_slot = fx.Int32(
+                                buffer_ops.buffer_load(
+                                    id_r,
+                                    m_block * block_m + source_local_row,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            source_masks.append(source_slot < num_valid)
+                            source_safe = (source_slot < num_valid).select(
+                                source_slot, 0
+                            )
+                            source_a_rows.append(
+                                source_safe // topk if row_div else source_safe
+                            )
+                    acc_count = m_repeat * job_n_repeat * (2 if fuse_silu else 1)
+                    initial = [
+                        _to_raw(fx.full(4, 0.0, fx.Float32)) for _ in range(acc_count)
+                    ]
+
+                    def load_b_words(tile_i):
+                        """One K tile of packed FP4 weights, still in load layout.
+
+                        A lane reads 32 packed values of its own column, so each
+                        request covers 64 contiguous bytes per column and the two
+                        unroll groups together retire a full 128-byte line.
+                        """
+                        words = []
+                        for group in range_constexpr(unroll // 4):
+                            load_k = (
+                                tile_i * (32 * unroll) + lane // 16 * 32 + group * 128
+                            )
+                            for nr in range_constexpr(job_n_repeat):
+                                for half in range_constexpr(halves):
+                                    col = cols[nr] + half * N
+                                    if fx.const_expr(prepared):
+                                        # [N/16, K/128, lane_row=4, N16, word=4].
+                                        # Each lane loads four MFMA-ready FP4 words.
+                                        packed_k_tile = tile_i * (unroll // 4) + group
+                                        offset = (
+                                            (col // 16 * (K // 128) + packed_k_tile)
+                                            * 64
+                                            + lane // 16 * 16
+                                            + col % 16
+                                        ) * 4
+                                    else:
+                                        offset = (col * w_k + load_k // 2) // 4
+                                    words.append(
+                                        buffer_ops.buffer_load(
+                                            b_r,
+                                            offset,
+                                            vec_width=4,
+                                            dtype=T.i32,
+                                        )
+                                    )
+                        return words
+
+                    def load_b_scales(tile_i):
+                        """E8M0 exponents for one K tile, one dword group per column.
+
+                        The K tile spans ``unroll`` scale bytes, so every lane can
+                        read the exponents of its own column directly. That drops
+                        the per-fragment ``ds_bpermute`` broadcast the byte-wide
+                        loads used to need.
+                        """
+                        scales = []
+                        for nr in range_constexpr(job_n_repeat):
+                            for half in range_constexpr(halves):
+                                col = cols[nr] + half * N
+                                scales.append(
+                                    buffer_ops.buffer_load(
+                                        s_r,
+                                        col * (K // 128) + tile_i * (unroll // 4),
+                                        vec_width=unroll // 4,
+                                        dtype=T.i32,
+                                    )
+                                )
+                        return scales
+
+                    def scale_dwords(loaded):
+                        if fx.const_expr(unroll // 4 == 1):
+                            return [fx.Int32(loaded)]
+                        return list(
+                            fx.Vector(loaded, shape=unroll // 4, dtype=fx.Int32)
+                        )
+
+                    def load_a_frags(tile_i):
+                        """Activation fragments for one K tile, in MFMA layout."""
+                        frags = []
+                        for ku in range_constexpr(unroll):
+                            for mr in range_constexpr(m_repeat):
+                                frags.append(
+                                    buffer_ops.buffer_load(
+                                        a_r,
+                                        a_rows[mr] * K
+                                        + tile_i * (32 * unroll)
+                                        + k_lane
+                                        + ku * 32,
+                                        vec_width=8,
+                                        dtype=T.bf16,
+                                        mask=_to_raw(masks[mr]),
+                                    )
+                                )
+                        return frags
+
+                    def load_b_frags(tile_i):
+                        """BF16 weight fragments for one K tile, already MFMA-shaped."""
+                        frags = []
+                        for ku in range_constexpr(unroll):
+                            for nr in range_constexpr(job_n_repeat):
+                                for half in range_constexpr(halves):
+                                    frags.append(
+                                        load_weight(
+                                            b_r,
+                                            s_r,
+                                            cols[nr] + half * N,
+                                            tile_i * (32 * unroll) + k_lane + ku * 32,
+                                        )
+                                    )
+                        return frags
+
+                    ntiles = K // (32 * unroll)
+                    split_tiles = ntiles // split_k
+                    split_tile_base = split_id * split_tiles
+                    pipelined = (mxfp4_reg or bf16_reg) and prefetch and split_tiles > 1
+                    if fx.const_expr(pipelined and mxfp4_reg):
+                        initial = (
+                            initial
+                            + load_b_words(split_tile_base)
+                            + load_b_scales(split_tile_base)
+                        )
+                        initial = initial + load_a_frags(split_tile_base)
+                    elif fx.const_expr(pipelined):
+                        initial = (
+                            initial
+                            + load_b_frags(split_tile_base)
+                            + load_a_frags(split_tile_base)
+                        )
+                    if fx.const_expr(use_lds):
+                        if fx.const_expr(use_mxfp4_lds):
+                            lds = fx.SharedAllocator().allocate(MXSharedTiles).peek()
+                            a_lds_ptr = lds.a.ptr
+                            b_lds_ptr = lds.b.ptr
+                            s_lds_ptr = lds.scale.ptr
+                        else:
+                            lds = fx.SharedAllocator().allocate(SharedTiles).peek()
+                            a_lds_ptr = lds.a.ptr
+                            b_lds_ptr = lds.b.ptr
+                            b_base_addr = fx.Int64(
+                                fx.ptrtoint(fx.get_iter(b))
+                            ) + fx.Int64(expert) * fx.Int64(w_rows * K * 2)
+                            b_i32_ptr = fx.inttoptr(
+                                fx.PointerType.get(
+                                    T.i32,
+                                    address_space=fx.AddressSpace.Global,
+                                    alignment=4,
+                                ),
+                                b_base_addr,
+                            )
+                            b_dma_view = fx.Tensor(
+                                fx.make_view(
+                                    b_i32_ptr,
+                                    fx.make_layout(fx.Int64(w_rows * K // 2), 1),
+                                )
+                            )
+                            b_dma_buffer = fx.rocdl.make_buffer_tensor(
+                                b_dma_view,
+                                max_size=False,
+                                num_records_bytes=fx.Int64(w_rows * K * 2),
+                            )
+                            b_dma_tiles = fx.logical_divide(
+                                b_dma_buffer, fx.make_layout(4, 1)
+                            )
+                            b_dma_atom = fx.make_copy_atom(
+                                fx.rocdl.BufferCopyLDS128b(), fx.Int32
+                            )
+                            b_lds_i32 = fx.make_view(
+                                fx.recast_iter(fx.Int32, b_lds_ptr),
+                                fx.make_layout(
+                                    lds_stages * halves * job_bn * lds_k // 2, 1
+                                ),
+                            )
+                            b_lds_tiles = fx.logical_divide(
+                                b_lds_i32, fx.make_layout(4, 1)
+                            )
+
+                        def fill_lds(tile_k, stage):
+                            tid = fx.thread_idx.x
+                            a_stage_base = fx.Int64(stage) * (block_m * lds_k)
+                            b_stage_base = fx.Int64(stage) * (halves * job_bn * lds_k)
+                            for load_i in range_constexpr(
+                                (block_m * lds_k + waves * 64 * a_load_vec - 1)
+                                // (waves * 64 * a_load_vec)
+                            ):
+                                linear = (
+                                    tid * a_load_vec + load_i * waves * 64 * a_load_vec
+                                )
+                                if linear < block_m * lds_k:
+                                    local_row = linear // lds_k
+                                    local_k = linear % lds_k
+                                    slot = fx.Int32(
+                                        buffer_ops.buffer_load(
+                                            id_r,
+                                            m_block * block_m + local_row,
+                                            vec_width=1,
+                                            dtype=T.i32,
+                                        )
+                                    )
+                                    valid = slot < num_valid
+                                    safe = valid.select(slot, 0)
+                                    a_row = safe // topk if row_div else safe
+                                    loaded = buffer_ops.buffer_load(
+                                        a_r,
+                                        a_row * K + tile_k + local_k,
+                                        vec_width=a_load_vec,
+                                        dtype=T.bf16,
+                                        mask=_to_raw(valid),
+                                    )
+                                    fx.ptr_store(
+                                        loaded,
+                                        a_lds_ptr + a_stage_base + fx.Int64(linear),
+                                    )
+                            if fx.const_expr(use_mxfp4_lds):
+                                # One thread owns a complete K=32 packed row. Global
+                                # accesses remain contiguous within each 16-byte row;
+                                # LDS then supplies the MFMA lane-specific word.
+                                col_count = halves * job_bn
+                                packed_words = lds_k // 8
+                                scale_count = lds_k // 32
+                                for load_i in range_constexpr(
+                                    (col_count + waves * 64 - 1) // (waves * 64)
+                                ):
+                                    local = tid + load_i * waves * 64
+                                    if local < col_count:
+                                        half = local // job_bn
+                                        local_col = local % job_bn
+                                        col = half * N + n_block * job_bn + local_col
+                                        for q in range_constexpr(scale_count):
+                                            if fx.const_expr(prepared):
+                                                fragments = []
+                                                for lr in range_constexpr(4):
+                                                    k_elem = tile_k + q * 32 + lr * 8
+                                                    word_offset = (
+                                                        (
+                                                            (
+                                                                col // 16 * (K // 128)
+                                                                + k_elem // 128
+                                                            )
+                                                            * 4
+                                                            + lr
+                                                        )
+                                                        * 16
+                                                        + col % 16
+                                                    ) * 4 + k_elem // 32 % 4
+                                                    fragments.append(
+                                                        fx.Int32(
+                                                            buffer_ops.buffer_load(
+                                                                b_r,
+                                                                word_offset,
+                                                                vec_width=1,
+                                                                dtype=T.i32,
+                                                            )
+                                                        )
+                                                    )
+                                                packed = _to_raw(
+                                                    fx.Vector.from_elements(
+                                                        fragments, fx.Int32
+                                                    )
+                                                )
+                                            else:
+                                                packed = buffer_ops.buffer_load(
+                                                    b_r,
+                                                    (col * w_k + tile_k // 2 + q * 16)
+                                                    // 4,
+                                                    vec_width=4,
+                                                    dtype=T.i32,
+                                                )
+                                            fx.ptr_store(
+                                                packed,
+                                                b_lds_ptr
+                                                + fx.Int64(stage)
+                                                * (col_count * packed_words)
+                                                + fx.Int64(
+                                                    local * packed_words + q * 4
+                                                ),
+                                            )
+                                            exponent = buffer_ops.buffer_load(
+                                                s_r,
+                                                col * (K // 32) + tile_k // 32 + q,
+                                                vec_width=1,
+                                                dtype=T.i8,
+                                            )
+                                            fx.ptr_store(
+                                                exponent,
+                                                s_lds_ptr
+                                                + fx.Int64(stage)
+                                                * (col_count * scale_count)
+                                                + fx.Int64(local * scale_count + q),
+                                            )
+                            else:
+                                for load_i in range_constexpr(
+                                    (halves * job_bn * lds_k) // (waves * 64 * 8)
+                                ):
+                                    linear = tid * 8 + load_i * waves * 64 * 8
+                                    half = linear // (job_bn * lds_k)
+                                    within_half = linear % (job_bn * lds_k)
+                                    local_col = within_half // lds_k
+                                    local_k = within_half % lds_k
+                                    col = half * N + n_block * job_bn + local_col
+                                    src_byte = (col * K + tile_k + local_k) * 2
+                                    dst_byte = (b_stage_base + fx.Int64(linear)) * 2
+                                    fx.copy(
+                                        b_dma_atom,
+                                        fx.slice(
+                                            b_dma_tiles,
+                                            (None, src_byte // 16),
+                                        ),
+                                        fx.slice(
+                                            b_lds_tiles,
+                                            (None, dst_byte // 16),
+                                        ),
+                                    )
+
+                        fill_lds(split_tile_base * lds_k, fx.Int32(0))
+                        if fx.const_expr(use_bf16_lds):
+                            fx.rocdl.s_waitcnt(0)
+                        fx.gpu.barrier()
+                    # Only this small inner micro-tile is expanded. K stays a loop.
+                    for tile, state in range(0, split_tiles, 1, init=initial):
+                        local_tile_i = fx.Int32(arith.index_cast(T.i32, _to_raw(tile)))
+                        tile_i = local_tile_i + split_tile_base
+                        k0 = tile_i * (32 * unroll) + k_lane
+                        stage = tile_i % lds_stages
+                        a_frag = []
+                        b_frag = []
+                        packed_tiles = []
+                        scale_tiles = []
+                        ahead = []
+                        if fx.const_expr(use_lds and lds_stages == 2):
+                            next_tile = tile_i + 1
+                            if local_tile_i + 1 < split_tiles:
+                                next_stage = (stage == 0).select(
+                                    fx.Int32(1), fx.Int32(0)
+                                )
+                                fill_lds(next_tile * lds_k, next_stage)
+                        if fx.const_expr(mxfp4_reg):
+                            n_words = (unroll // 4) * job_n_repeat * halves
+                            if fx.const_expr(pipelined):
+                                # Issue the next tile's weight loads before touching
+                                # this tile's registers, so HBM latency overlaps the
+                                # unpack instead of stalling in front of it. The
+                                # final iteration re-reads its own tile, which is
+                                # still resident, rather than running off the end.
+                                n_scales = job_n_repeat * halves
+                                raw_words = list(state[acc_count : acc_count + n_words])
+                                raw_scales = list(
+                                    state[
+                                        acc_count + n_words : acc_count
+                                        + n_words
+                                        + n_scales
+                                    ]
+                                )
+                                step = local_tile_i + 1
+                                next_tile = (step < split_tiles).select(
+                                    tile_i + 1,
+                                    split_tile_base + fx.Int32(split_tiles - 1),
+                                )
+                                ahead = load_b_words(next_tile) + load_b_scales(
+                                    next_tile
+                                )
+                                a_frag = list(state[acc_count + n_words + n_scales :])
+                                ahead = ahead + load_a_frags(next_tile)
+                            else:
+                                raw_words = load_b_words(tile_i)
+                                raw_scales = load_b_scales(tile_i)
+                        elif fx.const_expr(pipelined):
+                            # BF16: the carried values are the fragments themselves,
+                            # so the tile is consumed straight out of loop state.
+                            n_frags = unroll * job_n_repeat * halves
+                            b_frag = list(state[acc_count : acc_count + n_frags])
+                            a_frag = list(state[acc_count + n_frags :])
+                            step = local_tile_i + 1
+                            next_tile = (step < split_tiles).select(
+                                tile_i + 1,
+                                split_tile_base + fx.Int32(split_tiles - 1),
+                            )
+                            ahead = load_b_frags(next_tile) + load_a_frags(next_tile)
+                        if fx.const_expr(mxfp4_reg):
+                            for loaded in raw_words:
+                                words = list(fx.Vector(loaded, shape=4, dtype=fx.Int32))
+                                packed_tiles.append(
+                                    words if prepared else transpose_packed(words)
+                                )
+                            for loaded in raw_scales:
+                                scale_tiles.append(scale_dwords(loaded))
+                        # Unpack every MFMA step before issuing any MFMA. The
+                        # accumulator chain serialises the MFMAs, so the unpack
+                        # work has to be independent of it to fill the gaps;
+                        # interleaving unpack with MFMA measured 15-20% slower.
+                        for ku in range_constexpr(unroll):
+                            for mr in range_constexpr(m_repeat):
+                                if fx.const_expr(use_lds):
+                                    local_row = (
+                                        wave_m * (m_repeat * 16) + mr * 16 + row_lane
+                                    )
+                                    a_frag.append(
+                                        fx.ptr_load(
+                                            a_lds_ptr
+                                            + fx.Int64(stage) * (block_m * lds_k)
+                                            + fx.Int64(
+                                                local_row * lds_k + ku * 32 + k_lane
+                                            ),
+                                            result_type=fx.Vector.make_type(
+                                                8, fx.BFloat16
+                                            ),
+                                        )
+                                    )
+                                elif fx.const_expr(use_bf16_reg_transpose):
+                                    loaded_a = buffer_ops.buffer_load(
+                                        a_r,
+                                        source_a_rows[mr] * K
+                                        + k0
+                                        - k_lane
+                                        + ku * 32
+                                        + (lane % 4) * 8,
+                                        vec_width=8,
+                                        dtype=T.bf16,
+                                        mask=_to_raw(source_masks[mr]),
+                                    )
+                                    a_frag.append(
+                                        transpose_bf16_fragment(
+                                            loaded_a, lane, row_lane
+                                        )
+                                    )
+                                elif fx.const_expr(not pipelined):
+                                    a_frag.append(
+                                        buffer_ops.buffer_load(
+                                            a_r,
+                                            a_rows[mr] * K + k0 + ku * 32,
+                                            vec_width=8,
+                                            dtype=T.bf16,
+                                            mask=_to_raw(masks[mr]),
+                                        )
+                                    )
+                            for nr in range_constexpr(job_n_repeat):
+                                for half in range_constexpr(halves):
+                                    if fx.const_expr(use_bf16_lds):
+                                        local_col = (
+                                            wave_n * (job_n_repeat * 16)
+                                            + nr * 16
+                                            + row_lane
+                                        )
+                                        b_frag.append(
+                                            fx.ptr_load(
+                                                b_lds_ptr
+                                                + fx.Int64(stage)
+                                                * (halves * job_bn * lds_k)
+                                                + fx.Int64(
+                                                    (half * job_bn + local_col) * lds_k
+                                                    + ku * 32
+                                                    + k_lane
+                                                ),
+                                                result_type=fx.Vector.make_type(
+                                                    8, fx.BFloat16
+                                                ),
+                                            )
+                                        )
+                                    elif fx.const_expr(use_mxfp4_lds):
+                                        local_col = (
+                                            wave_n * (job_n_repeat * 16)
+                                            + nr * 16
+                                            + row_lane
+                                        )
+                                        local = half * job_bn + local_col
+                                        packed = fx.ptr_load(
+                                            b_lds_ptr
+                                            + fx.Int64(stage)
+                                            * (halves * job_bn * (lds_k // 8))
+                                            + fx.Int64(
+                                                local * (lds_k // 8)
+                                                + ku * 4
+                                                + lane // 16
+                                            ),
+                                            result_type=fx.Int32,
+                                        )
+                                        exponent = fx.ptr_load(
+                                            s_lds_ptr
+                                            + fx.Int64(stage)
+                                            * (halves * job_bn * (lds_k // 32))
+                                            + fx.Int64(local * (lds_k // 32) + ku),
+                                            result_type=fx.Int8,
+                                        )
+                                        b_frag.append(decode_weight(packed, exponent))
+                                    elif fx.const_expr(mxfp4_reg):
+                                        pi = (
+                                            (ku // 4) * job_n_repeat + nr
+                                        ) * halves + half
+                                        dword = scale_tiles[nr * halves + half][ku // 4]
+                                        if fx.const_expr(ku % 4):
+                                            dword = dword >> (8 * (ku % 4))
+                                        b_frag.append(
+                                            decode_weight(
+                                                _to_raw(packed_tiles[pi][ku % 4]),
+                                                arith.trunci(T.i8, _to_raw(dword)),
+                                            )
+                                        )
+                                    elif fx.const_expr(use_bf16_reg_transpose):
+                                        local_col = (
+                                            wave_n * (job_n_repeat * 16)
+                                            + nr * 16
+                                            + lane // 4
+                                        )
+                                        col = half * N + n_block * job_bn + local_col
+                                        loaded_b = buffer_ops.buffer_load(
+                                            b_r,
+                                            col * K
+                                            + k0
+                                            - k_lane
+                                            + ku * 32
+                                            + (lane % 4) * 8,
+                                            vec_width=8,
+                                            dtype=T.bf16,
+                                        )
+                                        b_frag.append(
+                                            transpose_bf16_fragment(
+                                                loaded_b, lane, row_lane
+                                            )
+                                        )
+                                    elif fx.const_expr(not pipelined):
+                                        b_frag.append(
+                                            load_weight(
+                                                b_r,
+                                                s_r,
+                                                cols[nr] + half * N,
+                                                k0 + ku * 32,
+                                            )
+                                        )
+                        updated = list(state)[:acc_count]
+                        for ku in range_constexpr(unroll):
+                            for mr in range_constexpr(m_repeat):
+                                for nr in range_constexpr(job_n_repeat):
+                                    for half in range_constexpr(halves):
+                                        idx = (mr * job_n_repeat + nr) * halves + half
+                                        bi = (ku * job_n_repeat + nr) * halves + half
+                                        updated[idx] = fx.rocdl.mfma_f32_16x16x32_bf16(
+                                            T.f32x4,
+                                            [
+                                                a_frag[ku * m_repeat + mr],
+                                                b_frag[bi],
+                                                updated[idx],
+                                                0,
+                                                0,
+                                                0,
+                                            ],
+                                        )
+                        if fx.const_expr(use_lds and lds_stages == 1):
+                            # Single buffering trades overlap for half the LDS and
+                            # therefore higher workgroup residency.
+                            fx.gpu.barrier()
+                            next_tile = tile_i + 1
+                            if local_tile_i + 1 < split_tiles:
+                                fill_lds(next_tile * lds_k, fx.Int32(0))
+                                if fx.const_expr(use_bf16_lds):
+                                    fx.rocdl.s_waitcnt(0)
+                            fx.gpu.barrier()
+                        elif fx.const_expr(use_lds):
+                            if fx.const_expr(use_bf16_lds):
+                                schedule_bf16_lds_loop()
+                                fx.rocdl.s_waitcnt(0)
+                            fx.gpu.barrier()
+                        final = yield updated + ahead
+                    if fx.const_expr(acc_count == 1 and not pipelined):
+                        final_acc = [final]
+                    else:
+                        final_acc = list(final)[:acc_count]
+                    for mr in range_constexpr(m_repeat):
+                        for j in range_constexpr(4):
+                            row = (
+                                wave_m * (m_repeat * 16)
+                                + mr * 16
+                                + (lane // 16) * 4
+                                + j
+                            )
+                            slot = fx.Int32(
+                                buffer_ops.buffer_load(
+                                    id_r,
+                                    m_block * block_m + row,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                            )
+                            for nr in range_constexpr(job_n_repeat):
+                                idx = (mr * job_n_repeat + nr) * (2 if fuse_silu else 1)
+                                value = _to_raw(
+                                    fx.Vector(
+                                        final_acc[idx], shape=4, dtype=fx.Float32
+                                    )[j]
+                                )
+                                if fx.const_expr(fuse_silu and split_k == 1):
+                                    up = _to_raw(
+                                        fx.Vector(
+                                            final_acc[idx + 1],
+                                            shape=4,
+                                            dtype=fx.Float32,
+                                        )[j]
+                                    )
+                                    exp = fx.rocdl.exp2(
+                                        T.f32,
+                                        arith.mulf(
+                                            value,
+                                            arith.constant(
+                                                -1.4426950408889634, type=T.f32
+                                            ),
+                                        ),
+                                    )
+                                    sigmoid = arith.divf(
+                                        arith.constant(1.0, type=T.f32),
+                                        arith.addf(
+                                            arith.constant(1.0, type=T.f32), exp
+                                        ),
+                                    )
+                                    value = arith.mulf(arith.mulf(value, sigmoid), up)
+                                if fx.const_expr(split_k > 1):
+                                    for half in range_constexpr(halves):
+                                        raw_idx = idx + half
+                                        raw_value = _to_raw(
+                                            fx.Vector(
+                                                final_acc[raw_idx],
+                                                shape=4,
+                                                dtype=fx.Float32,
+                                            )[j]
+                                        )
+                                        buffer_ops.buffer_store(
+                                            raw_value,
+                                            c_r,
+                                            split_id * (num_valid * c_cols)
+                                            + slot * c_cols
+                                            + half * N
+                                            + cols[nr],
+                                            mask=_to_raw(slot < num_valid),
+                                        )
+                                else:
+                                    buffer_ops.buffer_store(
+                                        arith.truncf(T.bf16, value),
+                                        c_r,
+                                        slot * N + cols[nr],
+                                        mask=_to_raw(slot < num_valid),
+                                    )
+
+        if fx.const_expr(adaptive_n):
+            task_post_r = buffer_ops.create_buffer_resource(num_post, max_size=True)
+            task_post = fx.Int32(
+                buffer_ops.buffer_load(
+                    task_post_r, fx.Int32(0), vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            active = task_post // block_m
+            if active <= 1:
+                if fx.thread_idx.x < 64:
+                    if fx.block_idx.x < active * (N // 16):
+                        emit_job(fx.block_idx.x, 16, 1, 1)
+            elif active <= 4:
+                if fx.block_idx.x < active * (N // 32):
+                    emit_job(fx.block_idx.x, 32, 2, 1)
+            else:
+                for task_index in range(
+                    fx.block_idx.x, active * (N // 64), persistent_grid
+                ):
+                    task = fx.Int32(arith.index_cast(T.i32, _to_raw(task_index)))
+                    emit_job(task, 64, 2, 2)
+        elif fx.const_expr(persistent_grid > 0):
+            task_post_r = buffer_ops.create_buffer_resource(num_post, max_size=True)
+            task_post = fx.Int32(
+                buffer_ops.buffer_load(
+                    task_post_r, fx.Int32(0), vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            task_limit = (task_post // block_m) * (N // block_n) * split_k
+            for task_index in range(fx.block_idx.x, task_limit, persistent_grid):
+                task = fx.Int32(arith.index_cast(T.i32, _to_raw(task_index)))
+                emit_job(task, block_n, n_waves, n_repeat)
+        else:
+            emit_job(fx.block_idx.x, block_n, n_waves, n_repeat)
+
+    @flyc.jit
+    def launch(
+        a: fx.Tensor,
+        b: fx.Tensor,
+        scale: fx.Tensor,
+        c: fx.Tensor,
+        sorted_ids: fx.Tensor,
+        expert_ids: fx.Tensor,
+        num_post: fx.Tensor,
+        num_valid: fx.Int32,
+        grid: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            a,
+            b,
+            scale,
+            c,
+            sorted_ids,
+            expert_ids,
+            num_post,
+            num_valid,
+            value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
+        ).launch(grid=(fx.Int64(grid), 1, 1), block=(waves * 64, 1, 1), stream=stream)
+
+    return launch
+
+
+def launch_muse_moe_gemm(
+    a,
+    b,
+    b_scale,
+    c,
+    sorted_ids,
+    expert_ids,
+    num_post_padded,
+    N,
+    K,
+    num_valid,
+    topk,
+    a_row_div_topk,
+    fuse_silu,
+    mxfp4,
+    cfg,
+    split_k=1,
+):
+    import torch
+
+    if a.dtype != torch.bfloat16 or c.dtype != (
+        torch.float32 if split_k > 1 else torch.bfloat16
+    ):
+        raise ValueError("Muse FlyDSL GEMM requires BF16 input and BF16/FP32 output")
+    if not all(t.is_contiguous() for t in (a, b, c)):
+        raise ValueError("Muse FlyDSL GEMM requires contiguous native weight layouts")
+    if mxfp4 and not b_scale.is_contiguous():
+        raise ValueError("MXFP4 scales must be contiguous")
+    bm, bn = cfg["BLOCK_M"], cfg["BLOCK_N"]
+    # BLOCK_N and FLYDSL_K_UNROLL are requests, not requirements: the selector
+    # does not see the shapes, and the two stages differ in both N (I for
+    # gate/up, H for down) and K. Halve each until it divides its own stage.
+    while bn > 16 and N % bn:
+        bn //= 2
+    unroll = cfg.get("FLYDSL_K_UNROLL", 8)
+    while unroll > 1 and K % (32 * unroll):
+        unroll //= 2
+    if K % (split_k * 32 * unroll):
+        raise ValueError("split-K requires an equal number of MFMA tiles per split")
+    grid = ((sorted_ids.numel() + bm - 1) // bm) * (N // bn) * split_k
+    persistent_grid = int(cfg.get("PERSISTENT_CTA", 0))
+    if persistent_grid:
+        grid = min(grid, persistent_grid)
+        persistent_grid = grid
+    num_warps = cfg.get("num_warps", 4)
+    waves_per_eu = cfg.get("FLYDSL_WAVES_PER_EU", cfg.get("waves_per_eu", 0))
+    lds_stages = cfg.get("FLYDSL_LDS_STAGES", 2)
+    _run_compiled(
+        _launcher(
+            N,
+            K,
+            topk,
+            bm,
+            bn,
+            num_warps,
+            waves_per_eu,
+            mxfp4,
+            fuse_silu,
+            a_row_div_topk,
+            unroll,
+            lds_stages,
+            bool(cfg.get("FLYDSL_PREFETCH", True)),
+            bool(cfg.get("FLYDSL_EXACT_SCALE_EDGE", False)),
+            split_k,
+            bool(cfg.get("PREPARED_FP4", False)),
+            persistent_grid,
+            bool(cfg.get("ADAPTIVE_N", False)),
+        ),
+        a,
+        b,
+        b_scale if mxfp4 else c,
+        c,
+        sorted_ids,
+        expert_ids,
+        num_post_padded,
+        int(num_valid),
+        int(grid),
+        fx.Stream(torch.cuda.current_stream(a.device).cuda_stream),
+    )
