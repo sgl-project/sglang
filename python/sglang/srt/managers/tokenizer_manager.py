@@ -1914,10 +1914,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
-        if finish_reason.get("type") != "abort" or status_code not in (
-            HTTPStatus.BAD_REQUEST,
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
+        if (
+            finish_reason.get("type") != "abort"
+            or status_code is None
+            or not HTTPStatus.BAD_REQUEST <= status_code < 600
         ):
             return None
 
@@ -2434,8 +2434,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self._dispatch_to_scheduler(FreezeGCReq())
-        freeze_gc("Tokenizer Manager")
+        gc_threshold = get_device().gc_threshold
+        self._dispatch_to_scheduler(FreezeGCReq(gc_threshold=gc_threshold))
+        freeze_gc("Tokenizer Manager", gc_threshold)
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):

@@ -107,14 +107,14 @@ impl DetokenizerBackend {
     /// Decode one complete sequence without creating request-scoped streaming
     /// state. This runs on a pinned detokenizer worker, never on an API runtime
     /// thread.
-    fn decode_once(&self, token_ids: &[u32]) -> Result<String, Error> {
+    fn decode_once(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String, Error> {
         match self {
             DetokenizerBackend::Dynamo(tokenizer) => tokenizer
-                .decode(token_ids, true)
+                .decode(token_ids, skip_special_tokens)
                 .map(String::from)
                 .map_err(|error| Error::Detokenize(error.to_string())),
             DetokenizerBackend::Skip => Err(Error::Validation(
-                "echo for token-ID prompts is unavailable when skip_tokenizer_init=True".into(),
+                "detokenization is unavailable when skip_tokenizer_init=True".into(),
             )),
         }
     }
@@ -220,9 +220,17 @@ impl Runnable for DetokenizerWorker {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
-                DetokMsg::Decode { rid, token_ids } => {
-                    handle_decode(&mut table, &rid, &token_ids, &self.backend)
-                }
+                DetokMsg::Decode {
+                    rid,
+                    token_ids,
+                    skip_special_tokens,
+                } => handle_decode(
+                    &mut table,
+                    &rid,
+                    &token_ids,
+                    skip_special_tokens,
+                    &self.backend,
+                ),
                 DetokMsg::Result { rid, payload } => handle_result(&mut table, &rid, payload),
                 DetokMsg::Fail { rid, message } => {
                     handle_fail(&mut table, &rid, message, &self.abort)
@@ -244,10 +252,11 @@ fn handle_decode(
     table: &mut HashMap<Rid, DetokState>,
     rid: &Rid,
     token_ids: &[u32],
+    skip_special_tokens: bool,
     backend: &DetokenizerBackend,
 ) {
     if let Some(mut st) = table.remove(rid) {
-        let item = match backend.decode_once(token_ids) {
+        let item = match backend.decode_once(token_ids, skip_special_tokens) {
             Ok(text) => ResponseItem::Data(text.into()),
             Err(e) => ResponseItem::Error(e),
         };
@@ -515,7 +524,9 @@ mod tests {
 
     #[test]
     fn decode_once_rejects_skip_mode() {
-        let error = DetokenizerBackend::Skip.decode_once(&[1]).unwrap_err();
+        let error = DetokenizerBackend::Skip
+            .decode_once(&[1], true /* skip_special_tokens */)
+            .unwrap_err();
         assert!(matches!(error, Error::Validation(_)));
         assert!(error.to_string().contains("skip_tokenizer_init=True"));
     }
@@ -541,6 +552,7 @@ mod tests {
             &mut table,
             &Rid::from("d1"),
             &[1],
+            true, /* skip_special_tokens */
             &DetokenizerBackend::Skip,
         );
 
@@ -556,6 +568,7 @@ mod tests {
             &mut table,
             &Rid::from("d2"),
             &[1],
+            true, /* skip_special_tokens */
             &DetokenizerBackend::Skip,
         );
         assert!(rx.try_recv().is_err());
