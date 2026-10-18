@@ -923,7 +923,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
     def _swa_match_len(self, cache, tokens) -> int:
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-        return len(match.device_indices)
+        return match.device_prefix_len
 
     @requires_swa_only
     def test_swa_evict_reclaims_branch_tails_last(self):
