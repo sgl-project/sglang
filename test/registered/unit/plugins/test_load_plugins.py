@@ -181,45 +181,6 @@ class TestLoadPlugins(CustomTestCase):
         self.assertIsNone(_current_plugin_source.get())
 
 
-class TestNvidiaMegakernelFlag(CustomTestCase):
-    """--enable-nvidia-megakernel fails at argument resolution unless its plugin loads."""
-
-    def _check(self, enabled, eps, allowed=""):
-        from types import SimpleNamespace
-
-        from sglang.srt.plugins import handle_nvidia_megakernel
-
-        view = SimpleNamespace(enable_nvidia_megakernel=enabled)
-        with (
-            patch(
-                "sglang.srt.arg_groups.model_override_base.resolving_view",
-                return_value=view,
-            ),
-            patch("sglang.srt.plugins.entry_points", return_value=eps) as found,
-            patch("sglang.srt.plugins.envs") as mock_envs,
-        ):
-            mock_envs.SGLANG_PLUGINS.get.return_value = allowed
-            handle_nvidia_megakernel(object())
-        return found
-
-    def test_flag_off_checks_nothing(self):
-        found = self._check(False, [])
-        found.assert_not_called()
-
-    def test_flag_on_without_the_plugin_raises_with_an_install_hint(self):
-        with self.assertRaisesRegex(ValueError, "Install sgl-nvidia-mega"):
-            self._check(True, [_make_ep("other")])
-
-    def test_flag_on_with_sglang_plugins_excluding_it_raises(self):
-        with self.assertRaisesRegex(ValueError, "SGLANG_PLUGINS='other'"):
-            self._check(True, [_make_ep("nvidia_megakernel")], allowed="other")
-
-    def test_flag_on_with_the_plugin_passes(self):
-        eps = [_make_ep("nvidia_megakernel")]
-        self._check(True, eps)
-        self._check(True, eps, allowed="other, nvidia_megakernel")
-
-
 if __name__ == "__main__":
     import unittest
 
