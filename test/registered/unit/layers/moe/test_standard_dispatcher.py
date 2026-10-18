@@ -1,9 +1,9 @@
 import sys
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -48,6 +48,12 @@ def test_dispatch_preserves_negative_routing_sentinel():
 class TestLayerRunnerDispatch(CustomTestCase):
     def setUp(self):
         self.enterContext(
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.standard.get_device",
+                return_value="cpu",
+            )
+        )
+        self.enterContext(
             get_context().override_server_args(model_path="dummy", device="cpu")
         )
         self.enterContext(
@@ -79,6 +85,17 @@ class TestLayerRunnerDispatch(CustomTestCase):
             intermediate_size_per_partition=96,
             top_k=2,
         )
+
+    def _build_layer(self, method):
+        with patch.object(method, "create_weights"):
+            return FusedMoE(
+                num_experts=4,
+                top_k=2,
+                hidden_size=4,
+                intermediate_size=96,
+                layer_id=0,
+                quant_method=method,
+            )
 
     def _assert_local_routes(self, config):
         dispatcher = StandardDispatcher(config)
@@ -114,11 +131,11 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 self.subTest(requested=requested),
                 get_flags().moe.override(runner_backend=requested),
             ):
-                config = self._config()
                 method = object.__new__(Fp8MoEMethod)
                 method.is_fp4_expert = False
-                method.create_moe_runner(SimpleNamespace(), config)
-                self._assert_local_routes(config)
+                method.use_mxfp8 = False
+                layer = self._build_layer(method)
+                self._assert_local_routes(layer.moe_runner_config)
 
     def test_unquantized_fallback_is_independent_of_requested_runner(self):
         """A draft BF16 layer may fall back while its target keeps global IDs."""
@@ -130,10 +147,8 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 self.subTest(requested=requested),
                 get_flags().moe.override(runner_backend=requested),
             ):
-                config = self._config()
-                method = UnquantizedFusedMoEMethod()
-                method.create_moe_runner(SimpleNamespace(), config)
-                self._assert_local_routes(config)
+                layer = self._build_layer(UnquantizedFusedMoEMethod())
+                self._assert_local_routes(layer.moe_runner_config)
 
     def test_unsupported_aiter_shape_keeps_triton_local_ids(self):
         """Enabling AITER must not suppress local remapping after a shape fallback."""
@@ -141,12 +156,8 @@ class TestLayerRunnerDispatch(CustomTestCase):
             get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
             patch("sglang.srt.layers.quantization.unquant._use_aiter", True),
         ):
-            config = self._config()
-            method = UnquantizedFusedMoEMethod()
-            method.create_moe_runner(
-                SimpleNamespace(intermediate_size_per_partition=96), config
-            )
-            self._assert_local_routes(config)
+            layer = self._build_layer(UnquantizedFusedMoEMethod())
+            self._assert_local_routes(layer.moe_runner_config)
 
     def test_fp8_fallback_keeps_dp_allgather_in_bf16(self):
         """FP8 fallback experts still gather DP-local rows without FP4 quantization."""
@@ -195,6 +206,69 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 torch.tensor([[-1, 1], [0, -1]], dtype=torch.int32),
             )
         )
+
+    def test_direct_kernels_declare_their_execution_contract(self):
+        """A missing or dormant runner must not change a direct kernel's ID ABI."""
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxint4_moe import (
+            CompressedTensorsMxInt4MoE,
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8MoEMethod
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            Mxfp4FlashinferTrtllmMoEMethod,
+        )
+
+        cases = [
+            (CompressedTensorsMxInt4MoE, MoeRunnerBackend.FLASHINFER_TRTLLM, False),
+            (Mxfp4FlashinferTrtllmMoEMethod, MoeRunnerBackend.FLASHINFER_MXFP4, True),
+            (ModelOptFp8MoEMethod, MoeRunnerBackend.FLASHINFER_TRTLLM, False),
+        ]
+        for method_type, backend, fp4 in cases:
+            with (
+                self.subTest(method=method_type.__name__),
+                get_flags().moe.override(runner_backend=backend),
+            ):
+                method = object.__new__(method_type)
+                layer = self._build_layer(method)
+                self.assertEqual(layer.runner_backend, backend)
+                self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
+                topk = TopK(top_k=2, layer_id=0, is_fp4_experts=fp4)
+                topk.bind_runner_backend(layer.runner_backend)
+                self.assertEqual(
+                    topk.topk_config.output_format,
+                    TopKOutputFormat.STANDARD if fp4 else TopKOutputFormat.BYPASSED,
+                )
+                if method_type is ModelOptFp8MoEMethod:
+                    self.assertTrue(method.runner.runner_backend.is_triton())
+                    self.assertTrue(layer.use_flashinfer_trtllm_moe)
+                    self.assertFalse(layer.moe_runner_config.inplace)
+
+    def test_compressed_wrapper_propagates_the_inner_direct_contract(self):
+        """Wrapper methods expose their scheme's format and global-ID contract."""
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxint4_moe import (
+            CompressedTensorsMxInt4MoE,
+        )
+
+        scheme = object.__new__(CompressedTensorsMxInt4MoE)
+        method = object.__new__(CompressedTensorsFusedMoEMethod)
+
+        def create_weights(*, layer, **kwargs):
+            layer.scheme = scheme
+
+        with patch.object(method, "create_weights", side_effect=create_weights):
+            layer = FusedMoE(
+                num_experts=4,
+                top_k=2,
+                hidden_size=4,
+                intermediate_size=96,
+                layer_id=0,
+                quant_method=method,
+            )
+        self.assertEqual(layer.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM)
+        self.assertTrue(layer.use_flashinfer_trtllm_moe)
+        self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
 
     def test_topk_does_not_re_read_the_target_backend(self):
         """A constructed router keeps its layer's format across draft scopes."""

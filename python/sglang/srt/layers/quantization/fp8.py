@@ -2914,7 +2914,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._owns_moe_runner = True
         else:
             # Direct kernels still declare the layout they consume.
-            moe_runner_config.runner_backend = moe_runner_backend
+            self._moe_runner_backend = moe_runner_backend
+
+    def get_moe_runner_backend(self, layer):
+        if self.runner is not None:
+            return self.runner.runner_backend
+        return self._moe_runner_backend
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported

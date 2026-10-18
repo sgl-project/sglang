@@ -749,6 +749,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
+        self._aiter_runner: Optional[MoeRunner] = None
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
         self.w13_swiglu_interleaved = False
@@ -1138,6 +1139,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     f"aiter CK fused-MoE does not support this layer: {reason}; "
                     "using triton MoE runner."
                 )
+
+    def get_moe_runner_backend(self, layer):
+        runner = self._aiter_runner if self._aiter_runner is not None else self.runner
+        return runner.runner_backend if runner is not None else None
 
     @property
     def load_up_proj_weight_first(self) -> bool:

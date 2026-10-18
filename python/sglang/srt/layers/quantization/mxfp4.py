@@ -1475,7 +1475,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 f"Mxfp4MoEMethod has no MoeRunner for backend={moe_runner_backend} "
                 f"/ _fi_kernel={self._fi_kernel}."
             )
-        moe_runner_config.runner_backend = self.runner.runner_backend
 
     def _apply_sm90_cutlass(self, layer, dispatch_output):
         """SM90 MXFP4 x BF16/FP8 MoE via FlashInfer's mixed-input kernels.

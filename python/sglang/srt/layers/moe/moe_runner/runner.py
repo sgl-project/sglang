@@ -192,8 +192,6 @@ class MoeRunner:
             )
             self.fused_func = None
 
-        config.runner_backend = runner_backend
-
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:

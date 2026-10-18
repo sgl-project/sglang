@@ -562,7 +562,8 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.runner_backend = self.moe_runner_config.runner_backend
+        self.runner_backend = self.quant_method.get_moe_runner_backend(self)
+        self.moe_runner_config.runner_backend = self.runner_backend
         self._set_runner_flags()
         self.supports_deferred_finalize = (
             self.runner_backend is not None
