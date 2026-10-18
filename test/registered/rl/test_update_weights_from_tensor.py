@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import (
 
 register_cuda_ci(est_time=174, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="extra-a-test-1-gpu-small-amd")
-register_xpu_ci(est_time=190, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=190, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 
 import gc
 import json
@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     get_device_module,
     kill_process_tree,
 )
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -205,6 +206,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        monkey_patch_torch_reductions()
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(

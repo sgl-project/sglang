@@ -40,7 +40,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-large")
-register_xpu_ci(est_time=60, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=60, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's

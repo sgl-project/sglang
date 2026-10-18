@@ -6,7 +6,6 @@ from typing import List
 import torch
 import torch.multiprocessing as mp
 
-from sglang.srt.utils import get_device, get_device_count
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -18,19 +17,15 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
         mp.set_start_method("spawn", force=True)
 
-        device = get_device()
-        if device not in ("cuda", "xpu") or get_device_count() < 2:
-            self.skipTest("At least two CUDA or XPU devices are required")
-        visibility_variable = (
-            "ZE_AFFINITY_MASK" if device == "xpu" else "CUDA_VISIBLE_DEVICES"
-        )
-        visible_devices_list: List[int] = [
+        cuda_visible_devices_list: List[int] = [
             int(x)
-            for x in os.environ.get(visibility_variable, "0,1,2,3,4,5,6,7").split(",")
+            for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(
+                ","
+            )
         ]
 
-        # Sender's device 1 and receiver's device 0 map to the same physical device.
-        # With the patch, the IPC tensor must land on receiver's device 0.
+        # Sender's cuda:1 and receiver's cuda:0 map to the same physical device.
+        # With the patch, the IPC tensor must land on receiver's cuda:0.
         sender_info = dict(visible_devices=[0, 1], tensor_device=1)
         receiver_info = dict(visible_devices=[1, 0], tensor_device=0)
 
@@ -44,8 +39,9 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             ("sender", sender_info),
             ("receiver", receiver_info),
         ]:
-            os.environ[visibility_variable] = ",".join(
-                str(visible_devices_list[device]) for device in info["visible_devices"]
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(cuda_visible_devices_list[device])
+                for device in info["visible_devices"]
             )
             p = mp.Process(
                 target=_run_subprocess,
@@ -55,7 +51,6 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
                     ack_queue=ack_queue,
                     output_writer=output_writer,
                     tensor_device=info["tensor_device"],
-                    visibility_variable=visibility_variable,
                 ),
             )
             p.start()
@@ -76,10 +71,9 @@ def _run_subprocess(
     ack_queue: mp.Queue,
     output_writer,
     tensor_device: int,
-    visibility_variable: str,
 ):
     print(
-        f"subprocess[{role}] start {visibility_variable}={os.environ.get(visibility_variable)}",
+        f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}',
         flush=True,
     )
 
@@ -87,14 +81,14 @@ def _run_subprocess(
 
     try:
         if role == "sender":
-            tensor = torch.tensor([1.0, 2.0], device=get_device(tensor_device))
+            tensor = torch.tensor([1.0, 2.0], device=f"cuda:{tensor_device}")
             print(f"sender tensor_queue.put {tensor=} {tensor.device=}")
             tensor_queue.put(tensor)
             assert ack_queue.get() == "done"
         elif role == "receiver":
             tensor = tensor_queue.get()
             print(f"receiver tensor_queue.get {tensor=} {tensor.device=}")
-            assert str(tensor.device) == get_device(tensor_device)
+            assert str(tensor.device) == f"cuda:{tensor_device}"
             ack_queue.put("done")
         else:
             raise NotImplementedError
