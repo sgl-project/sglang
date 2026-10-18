@@ -405,6 +405,11 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         if _use_gfx1250_w4a8:
+            if layer.moe_ep_size != 1:
+                raise ValueError(
+                    "gfx1250 W4A8 MXFP4 MoE does not support expert parallelism; "
+                    "its internal router requires the full expert weights."
+                )
             # gfx1250 bypasses the MoeRunner and calls aiter's triton
             # moe_gemm_a8w4 directly in ``apply_weights``.
             return
