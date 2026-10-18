@@ -266,6 +266,124 @@ def generate_draft_decode_kv_indices(
 
 
 @triton.jit
+def generate_draft_decode_window_kv_indices(
+    req_pool_indices,
+    req_to_token,
+    paged_kernel_lens,
+    window_kv_indices,
+    window_kv_indptr,
+    positions,
+    # Runtime, as in generate_draft_decode_kv_indices.
+    row_stride,
+    kv_indices_stride: tl.constexpr,
+    kv_indptr_stride: tl.constexpr,
+    bs_upper: tl.constexpr,
+    iter_upper: tl.constexpr,
+    num_tokens_upper: tl.constexpr,
+    page_size: tl.constexpr,
+    window: tl.constexpr,
+    ENTRY_PAGE_SIZE: tl.constexpr = 1,
+    # The source's sliding-window page table (`KVIndexTable.v2p`).
+    v2p=None,
+    TRANSLATE: tl.constexpr = False,
+):
+    """Per-step sliding-window read rail of the multi-step draft.
+
+    Step ``iters`` of branch ``(bid, topk_id)`` attends ``seq_len + iters``
+    tokens: the committed prefix plus the draft's own chain in the slots
+    `generate_draft_decode_kv_indices` emits. A window layer reads the last
+    ``min(seq_len + iters, window)`` of them, so this emits that tail only,
+    prefix ids first and chain ids after, from the sliding-window read source.
+    """
+    BLOCK_SIZE: tl.constexpr = 128
+    iters = tl.program_id(axis=0)
+    bid = tl.program_id(axis=1)
+    topk_id = tl.program_id(axis=2)
+
+    num_steps = tl.num_programs(axis=0)
+    num_seqs = tl.num_programs(axis=1)
+    topk = tl.num_programs(axis=2)
+
+    window_kv_indices += kv_indices_stride * iters
+    window_kv_indptr += kv_indptr_stride * iters
+    iters += 1
+
+    seq_len = tl.load(paged_kernel_lens + bid)
+    total = seq_len + iters
+    window_len = tl.minimum(total, window)
+    # Chain position of the first token in the window; the prefix part covers
+    # [start, seq_len), the chain part [max(start - seq_len, 0), iters).
+    start = total - window_len
+
+    # This branch's output offset: the window lengths of the branches before
+    # it, each clipped like this one.
+    zid = bid * topk + topk_id
+    bs_offset = tl.arange(0, num_tokens_upper)
+    in_front = bs_offset < zid
+    prev_lens = tl.load(positions + bs_offset, mask=in_front, other=0)
+    prev_window = tl.where(in_front, tl.minimum(prev_lens + iters, window), 0)
+    base = tl.sum(prev_window)
+    out_ptr = window_kv_indices + base
+    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * row_stride
+
+    prefix_start = tl.minimum(start, seq_len)
+    prefix_len = seq_len - prefix_start
+    kv_offset = tl.arange(0, BLOCK_SIZE)
+    num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = kv_offset < prefix_len
+        data = _load_token_ids(
+            token_pool_ptr,
+            prefix_start + kv_offset,
+            mask,
+            v2p,
+            page_size,
+            ENTRY_PAGE_SIZE,
+            TRANSLATE,
+        )
+        tl.store(out_ptr + kv_offset, data, mask=mask)
+        kv_offset += BLOCK_SIZE
+
+    chain_start = tl.maximum(start - seq_len, 0)
+    extend_offset = tl.arange(0, iter_upper)
+    chain_step = chain_start + extend_offset
+    chain_mask = chain_step < iters
+    # The same chain slots `generate_draft_decode_kv_indices` emits.
+    if page_size == 1 or topk == 1:
+        chain_pos = seq_len + topk_id * num_steps + chain_step
+    else:
+        last_page_len = seq_len % page_size
+        num_new_pages_per_topk = (
+            last_page_len + num_steps + page_size - 1
+        ) // page_size
+        prefix_base = seq_len // page_size * page_size
+        chain_base = (
+            prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
+        )
+        chain_pos = chain_base + chain_step
+    extend_data = _load_token_ids(
+        token_pool_ptr,
+        chain_pos,
+        chain_mask,
+        v2p,
+        page_size,
+        ENTRY_PAGE_SIZE,
+        TRANSLATE,
+    )
+    tl.store(out_ptr + prefix_len + extend_offset, extend_data, mask=chain_mask)
+
+    # Update window_kv_indptr: program 0 writes the total at [num_seqs * topk],
+    # every other program its own start; [0] stays the buffer's zero.
+    if zid == 0:
+        zid = num_seqs * topk
+        in_front = bs_offset < zid
+        prev_lens = tl.load(positions + bs_offset, mask=in_front, other=0)
+        prev_window = tl.where(in_front, tl.minimum(prev_lens + iters, window), 0)
+        base = tl.sum(prev_window)
+    tl.store(window_kv_indptr + zid, base)
+
+
+@triton.jit
 def align_evict_mask_to_page_size(
     seq_lens,
     evict_mask,
