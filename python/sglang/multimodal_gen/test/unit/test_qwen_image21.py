@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Attention,
     build_layout,
+    can_pack_convrot_int8_projection,
+    consecutive_slices_view,
+    share_slices,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -850,3 +853,89 @@ def test_packed_qkv_projection_is_skipped_under_compile():
     # plain projections instead of breaking in every attention.
     with patch.object(torch.compiler, "is_compiling", return_value=True):
         assert QwenImage21Attention._project_qkv_packed(object(), None, [], []) is None
+
+
+def test_share_slices_keeps_values_and_shares_one_storage():
+    layers = [
+        SimpleNamespace(weight=torch.arange(12.0).reshape(4, 3)) for _ in range(3)
+    ]
+    originals = [layer.weight.clone() for layer in layers]
+    share_slices(layers, ("weight",), 4)
+    base = layers[0].weight.untyped_storage().data_ptr()
+    assert all(layer.weight.untyped_storage().data_ptr() == base for layer in layers)
+    assert all(
+        layer.weight.storage_offset() == i * 12 for i, layer in enumerate(layers)
+    )
+    assert all(
+        torch.equal(layer.weight, original)
+        for layer, original in zip(layers, originals)
+    )
+
+
+def test_can_pack_convrot_int8_projection_requires_the_convrot_int8_method():
+    # Anything that is not a convrot_int8 ColumnParallelLinear stays unpacked.
+    assert (
+        can_pack_convrot_int8_projection(SimpleNamespace(weight=torch.empty(2, 2)))
+        is False
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_consecutive_slices_view_requires_shared_consecutive_storage():
+    base = torch.arange(18.0, device="cuda").reshape(6, 3)
+    slices = [base[2 * i : 2 * i + 2] for i in range(3)]
+    assert torch.equal(consecutive_slices_view(slices), base)
+    # Gaps in the storage and separate storages must not be read as packed.
+    assert consecutive_slices_view([base[:2], base[4:6]]) is None
+    assert consecutive_slices_view([base[:2], base[2:4].clone()]) is None
+
+
+def test_packed_qkv_projection_convrot_int8_is_skipped_under_compile():
+    # Its storage-identity checks cannot be traced; compiled graphs keep the
+    # plain projections instead of breaking in every attention.
+    method = QwenImage21Attention._project_qkv_packed_convrot_int8
+    with patch.object(torch.compiler, "is_compiling", return_value=True):
+        assert method(object(), None, [], []) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_int8_linear_packed_weight_is_bit_exact_against_separate_calls():
+    pytest.importorskip("comfy_kitchen")
+    from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
+
+    from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
+        int8_linear,
+    )
+
+    def quantize(w):
+        qdata, params = TensorWiseINT8Layout.quantize(
+            w,
+            is_weight=True,
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=256,
+            stochastic_rounding=0,
+        )
+        return qdata.contiguous(), params.scale.to(torch.float32).contiguous()
+
+    # Production shapes (C=4096, M=4096): at these the packed [3C, C] call and
+    # the separate [C, C] calls share one CUTLASS tile schedule, so the call is
+    # bit-exact (mirrors the 20261013-1610 bench and the e2e md5 check).
+    torch.manual_seed(0)
+    c = 4096
+    m = 4096
+    weights = torch.randn(3 * c, c, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(m, c, dtype=torch.bfloat16, device="cuda")
+    q_full, scale_full = quantize(weights)
+    packed = int8_linear(x, q_full, scale_full, 256, split_out_features=c)
+    for i in range(3):
+        q_i, scale_i = quantize(weights[i * c : (i + 1) * c])
+        # Quantising the packed weight equals quantising each block, so the
+        # packed storage is exact.
+        assert torch.equal(q_i, q_full[i * c : (i + 1) * c])
+        assert torch.equal(scale_i, scale_full[i * c : (i + 1) * c])
+        # One packed call is bit-exact against the separate calls.
+        assert torch.equal(
+            packed[:, i * c : (i + 1) * c],
+            int8_linear(x, q_i, scale_i, 256),
+        )
