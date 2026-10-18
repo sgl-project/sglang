@@ -2442,48 +2442,6 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
-class TestSpecSkipDpMlpSyncArgs(CustomTestCase):
-    def _args(self, **overrides):
-        args = ServerArgs(
-            model_path="dummy",
-            device="cuda",
-            speculative_algorithm="EAGLE",
-            speculative_eagle_topk=1,
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-            speculative_skip_dp_mlp_sync=True,
-        )
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
-        )
-        for key, value in overrides.items():
-            setattr(args, key, value)
-        return args
-
-    def test_rejected_with_attention_dp(self):
-        """Skipping the spec pre-sync lets a DP step mix prefill and decode
-        ranks; the decoding rank then crashes in the prefill path."""
-        args = self._args(tp_size=2, attn_dp_size=2)
-        with self.assertRaises(ValueError) as context:
-            handle_speculative_decoding(args)
-        self.assertIn("--speculative-skip-dp-mlp-sync", str(context.exception))
-
-    def test_allowed_where_no_step_mixes(self):
-        """Without attention DP, under PD, or with the coordination that runs
-        mixed steps, the flag stays accepted."""
-        cases = {
-            "no attention dp": self._args(),
-            "pd decode": self._args(
-                tp_size=2, attn_dp_size=2, disaggregation_mode="decode"
-            ),
-        }
-        for name, args in cases.items():
-            with self.subTest(name):
-                handle_speculative_decoding(args)
-        with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True):
-            handle_speculative_decoding(self._args(tp_size=2, attn_dp_size=2))
-
-
 class TestDecoupledSpecArgs(CustomTestCase):
     """Decoupled speculative-decoding CLI flags.
 

@@ -226,10 +226,6 @@ class Spec(msgspec.Struct):
         Optional[bool],
         Arg(no_cli=True),
     ] = None
-    speculative_skip_dp_mlp_sync: A[
-        bool,
-        "Deprecated; drop this flag. It no longer applies with attention DP outside PD disaggregation, where it is rejected at startup, and has no effect in any other configuration.",
-    ] = False
     enable_multi_layer_eagle: A[
         bool,
         Arg(
