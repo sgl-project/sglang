@@ -672,7 +672,12 @@ def handle_deterministic_inference(server_args: Any):
                 run_post_process_pass(server_args, _deterministic_rocm_rccl_check)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
             elif get_platform().is_xpu:
+                # oneCCL's default SYCL allreduce switches kernels with message size,
+                # so a token's reduction order would follow the token count.
                 os.environ["CCL_ALLREDUCE"] = "recursive_doubling"
+                logger.warning(
+                    "CCL_ALLREDUCE is set to 'recursive_doubling' for deterministic inference when TP size > 1. oneCCL then skips its SYCL allreduce kernels and reduces through host memory, so TP all-reduce is several times slower."
+                )
             else:
                 # CUDA: use NCCL tree algorithm
                 os.environ["NCCL_ALGO"] = "allreduce:tree"
