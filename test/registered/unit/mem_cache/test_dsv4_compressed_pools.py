@@ -26,6 +26,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _num_dsv4_physical_kv_pages,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -544,8 +549,8 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
-        pool = DeepSeekV4TokenToKVPool(
+    def _make_pool(self):
+        return DeepSeekV4TokenToKVPool(
             max_num_reqs=2,
             num_req_slots=3,
             swa_size=0,
@@ -567,6 +572,25 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
             compression_ratios=[0, 0, 0],
             full_size=2048,
         )
+
+    def test_workspace_covers_the_largest_prefill_graph_bucket(self):
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.BREAKABLE, bs=[64, 1024])
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        history = (3 + 1) * 128  # (num_req_slots + 1) * sliding_window
+        workspace = self._make_pool().request_window.workspace
+        self.assertGreaterEqual(workspace.size, history + 1024)
+
+    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
+        pool = self._make_pool()
         self.assertIsNotNone(pool.request_window)
         self.assertFalse(pool.needs_paged_swa_allocator)
         self.assertIsNone(pool.full_to_swa_index_mapping)

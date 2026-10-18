@@ -281,8 +281,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 ),
             ),
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            # ROCm replays hits in a forward of their own, outside the graph.
+            (
+                "the prefill CUDA graph on ROCm",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and get_platform().is_hip,
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
             # ROCm replays hits in a forward of their own, which only the hitting
