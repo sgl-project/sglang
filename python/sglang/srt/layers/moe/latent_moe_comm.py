@@ -14,14 +14,11 @@ own reduced rows back up. One attention-TP all-reduce then assembles every
 rank's rows together with the shared expert, which is sharded over attention
 TP. Gathering the slices in TP rank order reproduces the row layout of the
 hidden-width DP gather, so routed-experts capture keeps its indexing.
-
-``latent_moe_forward`` is torch-only; callers inject the model's compute and
-the collectives (``DpAttnLatentMoEComm`` on GPUs).
 """
 
 import functools
 import logging
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Callable, Optional, Sequence
 
 import torch
 
@@ -36,38 +33,14 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_max_padding,
 )
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 logger = logging.getLogger(__name__)
 
 WEIGHTS_DTYPE = torch.float32
 IDS_DTYPE = torch.int32
-
-
-class LatentMoEComm(Protocol):
-    def dispatch(self, payload: torch.Tensor) -> torch.Tensor:
-        """All-gather this rank's ``[C, W]`` rows into ``[G, W]`` across the
-        EP group, in TP rank order."""
-
-    def combine(self, partial: torch.Tensor) -> torch.Tensor:
-        """Sum ``[G, D]`` partial expert outputs over the EP group and return
-        this rank's ``[C, D]`` rows (reduce-scatter)."""
-
-    def attn_tp_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        """Sum over this rank's attention-TP group."""
-
-
-def chunk_bounds(
-    *, num_local_tokens: int, attn_tp_rank: int, attn_tp_size: int
-) -> tuple[int, int]:
-    """This attention-TP rank's contiguous slice of the DP group's tokens."""
-    if num_local_tokens % attn_tp_size != 0:
-        raise ValueError(
-            f"DP-local token count {num_local_tokens} is not a multiple of "
-            f"attn_tp_size {attn_tp_size}"
-        )
-    chunk = num_local_tokens // attn_tp_size
-    return attn_tp_rank * chunk, (attn_tp_rank + 1) * chunk
 
 
 def rank_chunk_sizes(*, dp_num_tokens: Sequence[int], attn_tp_size: int) -> list[int]:
@@ -129,60 +102,92 @@ def unpack_dispatch_payload(
     return latent, topk_weights, topk_ids
 
 
+def _start_shared(shared_experts, hidden_states, alt_stream):
+    """Launch the shared expert's attention-TP partial, on ``alt_stream`` when
+    given so it overlaps the EP collectives, and return a waiter."""
+    if shared_experts is None:
+        return lambda: None
+    if alt_stream is None:
+        output = shared_experts(hidden_states)
+        return lambda: output
+    current_stream = torch.cuda.current_stream()
+    alt_stream.wait_stream(current_stream)
+    with torch.cuda.stream(alt_stream):
+        output = shared_experts(hidden_states)
+
+    def wait() -> torch.Tensor:
+        current_stream.wait_stream(alt_stream)
+        return output
+
+    return wait
+
+
 def latent_moe_forward(
     hidden_states: torch.Tensor,
     *,
-    attn_tp_rank: int,
-    attn_tp_size: int,
-    route: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    layer_id: int,
+    gate: Callable[[torch.Tensor], torch.Tensor],
+    topk: Callable,
     down_proj: Callable[[torch.Tensor], torch.Tensor],
-    experts: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
-    up_proj_accumulate: Callable[[torch.Tensor, torch.Tensor], None],
-    start_shared: Callable[[torch.Tensor], Callable[[], Optional[torch.Tensor]]],
-    comm: LatentMoEComm,
-    on_global_topk_ids: Optional[Callable[[torch.Tensor], None]] = None,
+    experts: Callable,
+    up_proj: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    shared_experts: Optional[Callable[[torch.Tensor], torch.Tensor]],
+    alt_stream: Optional[torch.cuda.Stream],
 ) -> torch.Tensor:
     """Complete MoE output for this DP group's post-norm ``[N, H]`` tokens,
     replicated over the attention-TP group like the input.
 
-    ``route`` returns fp32 top-k weights and int32 ids for its rows;
-    ``down_proj`` maps hidden rows to latent rows; ``experts`` returns this
-    rank's ``[G, D]`` partial sum; ``up_proj_accumulate(latent, out)`` adds
-    the reduced latent rows, projected back to hidden size (after any latent
-    norm), into ``out``; ``start_shared`` launches the shared expert's
-    attention-TP partial and returns a waiter (which may return None);
-    ``on_global_topk_ids`` sees the gathered ``[G, k]`` ids.
+    ``gate`` gives router logits and ``topk`` a standard top-k output for the
+    rows it is given; ``experts(latent, topk_output)`` returns this rank's
+    ``[G, D]`` partial sum; ``up_proj(latent, addend)`` returns ``addend``
+    plus the reduced latent rows projected back to hidden size (after any
+    latent norm), possibly in ``addend`` itself.
     """
-    start, end = chunk_bounds(
-        num_local_tokens=hidden_states.shape[0],
-        attn_tp_rank=attn_tp_rank,
-        attn_tp_size=attn_tp_size,
-    )
+    comm = DpAttnLatentMoEComm(num_local_tokens=hidden_states.shape[0])
+    start = get_parallel().attn_tp_rank * comm.own_rows
+    end = start + comm.own_rows
     own_rows = hidden_states[start:end]
-    wait_shared = start_shared(hidden_states)
+    wait_shared = _start_shared(shared_experts, hidden_states, alt_stream)
 
-    topk_weights, topk_ids = route(own_rows)
+    topk_output = topk(own_rows, gate(own_rows))
+    assert TopKOutputChecker.format_is_standard(topk_output)
     latent = down_proj(own_rows)
-    latent_dim, top_k = latent.shape[1], topk_ids.shape[1]
     payload = comm.dispatch(
         pack_dispatch_payload(
-            latent=latent, topk_weights=topk_weights, topk_ids=topk_ids
+            latent=latent,
+            topk_weights=topk_output.topk_weights,
+            topk_ids=topk_output.topk_ids,
         )
     )
     latent, topk_weights, topk_ids = unpack_dispatch_payload(
-        payload, latent_dim=latent_dim, top_k=top_k
+        payload, latent_dim=latent.shape[1], top_k=topk_output.topk_ids.shape[1]
     )
-    if on_global_topk_ids is not None:
-        on_global_topk_ids(topk_ids)
-    reduced_latent = comm.combine(experts(latent, topk_weights, topk_ids))
+    # The layer's TopK routed only this rank's slice, so its own capture is
+    # off; the gathered ids keep the DP-gathered row layout.
+    if (capturer := get_global_experts_capturer()) is not None:
+        capturer.capture(layer_id=layer_id, topk_indices=topk_ids)
+    partial = experts(
+        latent,
+        StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            # Router logits stay rank-local; the runners this path allows
+            # route from the precomputed top-k instead.
+            router_logits=topk_weights.new_empty((topk_weights.shape[0], 0)),
+        ),
+    )
+    reduced_latent = comm.combine(partial)
 
-    # One attention-TP all-reduce sums the shared expert's partials and
-    # assembles every rank's rows.
     output = wait_shared()
     if output is None:
         output = hidden_states.new_zeros(hidden_states.shape)
-    up_proj_accumulate(reduced_latent, output[start:end])
-    return comm.attn_tp_all_reduce(output)
+    own_output = output[start:end]
+    result = up_proj(reduced_latent, own_output)
+    if result.data_ptr() != own_output.data_ptr():
+        own_output.copy_(result)
+    # One attention-TP all-reduce sums the shared expert's partials and
+    # assembles every rank's rows.
+    return get_parallel().attn_tp_group.all_reduce(output)
 
 
 class DpAttnLatentMoEComm:
@@ -224,9 +229,6 @@ class DpAttnLatentMoEComm:
         else:
             group.reduce_scatterv(partial, output=output, sizes=self.rank_sizes)
         return output
-
-    def attn_tp_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        return get_parallel().attn_tp_group.all_reduce(x)
 
 
 @functools.cache

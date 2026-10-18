@@ -10,6 +10,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe import latent_moe_comm as lmc
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,8 +19,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 DP_SIZE, ATTN_TP_SIZE = 2, 8
 WORLD = DP_SIZE * ATTN_TP_SIZE
 HIDDEN, LATENT, NUM_EXPERTS, TOP_K = 64, 16, 32, 4
-NUM_GROUPS, TOPK_GROUPS = 4, 2
-EXPERT_INTER, SHARED_INTER, ROUTED_SCALING = 24, 48, 2.5
+EXPERT_INTER, SHARED_INTER = 24, 48
 
 
 class _SimGroup:
@@ -81,7 +81,6 @@ def _make_weights(*, dtype, with_shared, seed):
 
     weights = {
         "gate": randn(NUM_EXPERTS, HIDDEN, scale=HIDDEN**-0.5),
-        "bias": torch.rand(NUM_EXPERTS, generator=g, dtype=torch.float64) * 0.1,
         "down": randn(LATENT, HIDDEN, scale=HIDDEN**-0.5),
         "up": randn(HIDDEN, LATENT, scale=LATENT**-0.5),
         "w_up": randn(NUM_EXPERTS, EXPERT_INTER, LATENT, scale=LATENT**-0.5),
@@ -95,18 +94,10 @@ def _make_weights(*, dtype, with_shared, seed):
 
 
 def _route(weights, h):
-    """Sigmoid grouped top-k with correction bias; per-row so batching-invariant."""
+    """Sigmoid top-k, computed per row so it is batching-invariant."""
     scores = (h.double()[:, None, :] * weights["gate"].double()[None]).sum(-1).sigmoid()
-    choice = scores + weights["bias"]
-    group_scores = choice.view(-1, NUM_GROUPS, NUM_EXPERTS // NUM_GROUPS)
-    group_idx = group_scores.topk(2, dim=-1).values.sum(-1).topk(TOPK_GROUPS).indices
-    group_mask = torch.zeros(h.shape[0], NUM_GROUPS, dtype=torch.float64)
-    expert_mask = group_mask.scatter_(1, group_idx, 1.0).repeat_interleave(
-        NUM_EXPERTS // NUM_GROUPS, dim=1
-    )
-    topk_ids = choice.masked_fill(expert_mask == 0, float("-inf")).topk(TOP_K).indices
-    topk_weights = scores.gather(1, topk_ids)
-    topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True) * ROUTED_SCALING
+    topk_weights, topk_ids = scores.topk(TOP_K)
+    topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
     return topk_weights.float(), topk_ids.int()
 
 
@@ -170,33 +161,31 @@ def _hidden_width_rank(rank, tp_group, weights, dp_hidden, record, latent_norm):
     return output[start : start + dp_hidden[rank // ATTN_TP_SIZE].shape[0]]
 
 
-def _latent_rank(rank, comm, weights, dp_hidden, record, latent_norm):
-    attn_tp_rank = rank % ATTN_TP_SIZE
-
-    def up_proj_accumulate(latent, out):
+def _latent_rank(rank, weights, dp_hidden, latent_norm):
+    def up_proj(latent, addend):
         if latent_norm:
             latent = _rms_norm(latent, weights["norm"])
-        out += _linear(latent, weights["up"])
+        return addend + _linear(latent, weights["up"])
 
-    def start_shared(h):
-        if "shared_up" not in weights:
-            return lambda: None
-        partial = _shared_partial(
-            weights, h, shard=attn_tp_rank, num_shards=ATTN_TP_SIZE
+    shared = None
+    if "shared_up" in weights:
+        shard = rank % ATTN_TP_SIZE
+        shared = lambda h: _shared_partial(  # noqa: E731
+            weights, h, shard=shard, num_shards=ATTN_TP_SIZE
         )
-        return lambda: partial
 
     return lmc.latent_moe_forward(
         dp_hidden[rank // ATTN_TP_SIZE],
-        attn_tp_rank=attn_tp_rank,
-        attn_tp_size=ATTN_TP_SIZE,
-        route=lambda h: _route(weights, h),
+        layer_id=0,
+        gate=lambda h: h,
+        topk=lambda h, _: StandardTopKOutput(*_route(weights, h), None),
         down_proj=lambda h: _linear(h, weights["down"]),
-        experts=lambda *args: _local_experts(weights, rank, *args),
-        up_proj_accumulate=up_proj_accumulate,
-        start_shared=start_shared,
-        comm=comm,
-        on_global_topk_ids=lambda ids: record.__setitem__("topk_ids", ids),
+        experts=lambda latent, out: _local_experts(
+            weights, rank, latent, out.topk_weights, out.topk_ids
+        ),
+        up_proj=up_proj,
+        shared_experts=shared,
+        alt_stream=None,
     )
 
 
@@ -233,17 +222,21 @@ def _run_latent(weights, dp_hidden, *, max_len_padding, calls, latent_norm=False
             tp_size=WORLD,
             tp_rank=rank,
             attn_tp_size=ATTN_TP_SIZE,
+            attn_tp_rank=rank % ATTN_TP_SIZE,
             attn_tp_group=_SimNcclGroup(attn_group, rank % ATTN_TP_SIZE, set()),
         )
         state.tp_group = _SimNcclGroup(tp_group, rank, calls)
-        comm = lmc.DpAttnLatentMoEComm(
-            num_local_tokens=dp_hidden[rank // ATTN_TP_SIZE].shape[0]
+        state.capturer = types.SimpleNamespace(
+            capture=lambda layer_id, topk_indices: record.__setitem__(
+                "topk_ids", topk_indices
+            )
         )
-        return _latent_rank(rank, comm, weights, dp_hidden, record, latent_norm)
+        return _latent_rank(rank, weights, dp_hidden, latent_norm)
 
     with (
         patch.object(lmc, "get_parallel", lambda: state.parallel),
         patch.object(lmc, "get_tp_group", lambda: state.tp_group),
+        patch.object(lmc, "get_global_experts_capturer", lambda: state.capturer),
         patch.object(lmc, "is_dp_max_padding", return_value=max_len_padding),
         patch.object(
             lmc,
@@ -259,16 +252,11 @@ def _run_latent(weights, dp_hidden, *, max_len_padding, calls, latent_norm=False
 
 
 def _run_hidden_width(weights, dp_hidden, latent_norm=False):
-    return _run_world(
-        lambda rank, tp_group, _, record: _hidden_width_rank(
-            rank,
-            _SimNcclGroup(tp_group, rank, set()),
-            weights,
-            dp_hidden,
-            record,
-            latent_norm,
-        )
-    )
+    def rank_fn(rank, tp_group, _, record):
+        group = _SimNcclGroup(tp_group, rank, set())
+        return _hidden_width_rank(rank, group, weights, dp_hidden, record, latent_norm)
+
+    return _run_world(rank_fn)
 
 
 def _dp_hidden(dp_num_tokens, *, dtype, seed):

@@ -23,19 +23,14 @@ def is_attn_layer(layer_type: str) -> bool:
     return layer_type in ATTN_LAYERS
 
 
-def latent_moe_comm_layers(config: NemotronHConfig) -> frozenset[int]:
-    """The MoE layers that exchange latent rows across EP instead of
+def uses_latent_moe_comm(config: NemotronHConfig, layer_idx: int) -> bool:
+    """Whether a MoE layer exchanges latent rows across EP instead of
     hidden-width rows (SGLANG_OPT_LATENT_MOE_COMM)."""
-    return frozenset(
-        idx
-        for idx, layer_type in enumerate(config.hybrid_override_pattern)
-        if layer_type == MOE
-        and use_latent_moe_comm(
-            is_latent_moe=getattr(
-                config.get_nemotron_h_config_for_layer(idx), "moe_latent_size", None
-            )
-            is not None
+    return config.hybrid_override_pattern[layer_idx] == MOE and use_latent_moe_comm(
+        is_latent_moe=getattr(
+            config.get_nemotron_h_config_for_layer(layer_idx), "moe_latent_size", None
         )
+        is not None
     )
 
 
@@ -46,20 +41,19 @@ def _declaration(pattern: str, layer_idx: int, latent_moe_comm: bool):
             reduction=ProducerReduction.EXIT_SCOPED,
             gathers_attn_tp_input=False,
         )
+    is_moe = pattern[layer_idx] == MOE
+    # A latent-exchange MoE runs on its DP group's rows like an attention-TP
+    # dense FFN, owns the exchange across DP ranks, and completes its sum.
     if latent_moe_comm:
-        # The MoE runs on its DP group's rows, owns the exchange across DP
-        # ranks, and completes its sum with one attention-TP all-reduce.
-        return declare_ffn(
-            read=NormReadout(reads_before_dp_gather=True),
-            dense_tp_size=get_parallel().attn_tp_size,
-            exit_rows=ExitRows.ATTENTION,
-            output_complete=True,
-        )
+        dense_tp_size = get_parallel().attn_tp_size
+    else:
+        dense_tp_size = None if is_moe else get_parallel().tp_size
     return declare_ffn(
-        sparse=pattern[layer_idx] == MOE,
+        sparse=is_moe and not latent_moe_comm,
         read=NormReadout(reads_before_dp_gather=True),
-        dense_tp_size=get_parallel().tp_size if pattern[layer_idx] != MOE else None,
+        dense_tp_size=dense_tp_size,
         exit_rows=ExitRows.ATTENTION,
+        output_complete=latent_moe_comm,
     )
 
 
@@ -77,14 +71,13 @@ def make_stage_boundary(
     *,
     pattern: str,
     layer_idx: int,
-    latent_moe_layers: frozenset[int] = frozenset(),
+    latent_moe_comm: bool = False,
 ):
     from sglang.srt.layers import layernorm_sp
 
     if get_parallel().attn_cp_size > 1 or layernorm_sp.layernorm_sp_enabled():
         raise NotImplementedError("a Nemotron stage with attention CP or LayerNorm SP")
-    (declaration,) = stage_facts(
-        pattern, layer_idx, latent_moe_layers=latent_moe_layers
+    (boundary,) = append_stages(
+        (_declaration(pattern, layer_idx, latent_moe_comm), layer_norm)
     )
-    (boundary,) = append_stages((declaration, layer_norm))
     return boundary
