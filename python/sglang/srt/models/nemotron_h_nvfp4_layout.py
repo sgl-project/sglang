@@ -25,11 +25,9 @@ class Nvfp4LayoutCycle:
         if len({weight.data_ptr() for weight in weights}) != len(weights):
             raise ValueError("Expert weights in a layout cycle must not alias")
         self.original = tuple(weights)
-        self.workspace_bytes = first.numel()
         self.scratch = None
         self.pair = ()
         self.is_pair = False
-        self.switches = 0
         # Compile before any graph capture can reach the state transition.
         self._forward = _transpose_module(1024, 1344)
         self._inverse = _transpose_module(1344, 1024)
@@ -62,4 +60,3 @@ class Nvfp4LayoutCycle:
             for original, paired in reversed(tuple(zip(self.original, self.pair))):
                 self._inverse.run(paired, original)
         self.is_pair = pair
-        self.switches += 1
