@@ -16,8 +16,9 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional
+from typing import Any, Optional
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
@@ -81,6 +82,15 @@ def get_cw(
         cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
         cw = cache[dtype] = cw.to(dtype)
     return cw
+
+
+def get_fp32_norm_weight(norm: RMSNorm) -> torch.Tensor:
+    """Cached fp32 copy of an output RMSNorm weight, the dtype the fused gfx950
+    collective reads consume."""
+    weight = getattr(norm, "_attn_res_fp32_weight", None)
+    if weight is None:
+        weight = norm._attn_res_fp32_weight = norm.weight.float().contiguous()
+    return weight
 
 
 def _aggregate_fast(
@@ -440,6 +450,16 @@ def _aggregate(
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
 
+class StagedRead(msgspec.Struct, frozen=True):
+    """An attention read computed ahead of its stage (by the kernel that
+    gathered its input), waiting for the read it stands in for."""
+
+    prefix: torch.Tensor
+    score_proj: Any
+    normed: torch.Tensor
+    wrote_bank: bool
+
+
 class AttnResidual:
     """Snapshot bank + aggregation of one K3 attention-residual stream,
     backed by the capability-dispatched kernels above.
@@ -463,6 +483,8 @@ class AttnResidual:
         # Whether a write snapshotted only this rank's slice of the rows, which
         # leaves the bank's other rows stale on this rank.
         self.written_on_slice = False
+        # A read staged by gather_read for the next forward() of its prefix.
+        self.staged: Optional[StagedRead] = None
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -500,6 +522,19 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
+        staged, self.staged = self.staged, None
+        if (
+            staged is not None
+            and prefix_sum is None
+            and rows is None
+            and staged.score_proj is score_proj
+            and staged.wrote_bank == write
+            and staged.prefix.data_ptr() == hidden_states.data_ptr()
+            and staged.prefix.shape == hidden_states.shape
+        ):
+            if write:
+                self._count_write(rows)  # row nvb written in-kernel
+            return staged.normed, hidden_states
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
@@ -549,6 +584,88 @@ class AttnResidual:
         elif write:
             self.write(prefix, rows)
         return normed, prefix
+
+    def gather_covers(self, num_tokens: int, slice_width: int, write: bool) -> bool:
+        """Whether gather_read takes [num_tokens, slice_width] column slices."""
+        from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+
+        return not self.written_on_slice and hip.gather_shape_covered(
+            num_tokens, slice_width, self.block_residual, self.num_valid_blocks, write
+        )
+
+    def gather_tail_read(
+        self,
+        part: torch.Tensor,
+        sq: torch.Tensor,
+        shared: torch.Tensor,
+        prefix: Optional[torch.Tensor],
+        tail_eps: float,
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        write: bool,
+        comm,
+    ) -> torch.Tensor:
+        """Finish this rank's TP8 column slice of the next stream from the
+        column-parallel latent tail's partials, all-gather the stream and
+        stage the attention read of it (the next forward() with these scoring
+        parameters); returns the stream. The caller checked gather_covers()
+        and k3_attn_res_read_hip.tail_covered(); ``comm`` is
+        k3_ll_comm_hip.get_comm()."""
+        from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+
+        normed, stream = hip.gather_tail_attn_res_read(
+            part,
+            sq,
+            shared,
+            prefix,
+            tail_eps,
+            self.block_residual,
+            self.num_valid_blocks,
+            get_cw(score_proj, score_norm),
+            get_fp32_norm_weight(out_norm),
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            comm,
+            write_bank=write,
+        )
+        self.staged = StagedRead(stream, score_proj, normed, write)
+        return stream
+
+    def forward_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        comm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """forward() of hidden_states' TP8 all-reduce with the pending add, the
+        sum and the read in one kernel; None, before anything runs, when the
+        kernel does not take the batch. ``comm`` is k3_ll_comm_hip.get_comm()."""
+        from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+
+        nvb = self.num_valid_blocks
+        if (
+            nvb == 0
+            or self.written_on_slice
+            or not hip.all_reduce_covered(
+                hidden_states, prefix_sum, self.block_residual, nvb
+            )
+        ):
+            return None
+        return hip.all_reduce_attn_res_read(
+            hidden_states,
+            prefix_sum,
+            self.block_residual,
+            nvb,
+            get_cw(score_proj, score_norm),
+            get_fp32_norm_weight(out_norm),
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            comm,
+        )
 
     def forward_sp_all_gather(
         self,

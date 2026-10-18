@@ -15,6 +15,7 @@ from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 from torch import nn
 
@@ -38,7 +39,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import (
+    k3_ar_fusion,
+    k3_ll_comm_hip,
+    k3_sp_collective,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -143,7 +148,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -158,8 +163,16 @@ logger = logging.getLogger(__name__)
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_use_fused_latent_tail = _is_gfx95 and envs.SGLANG_ROCM_K3_FUSED_LATENT_TAIL.get()
+if _use_fused_latent_tail:
+    from sglang.kernels.ops.attention import k3_attn_res_read_hip
+    from sglang.kernels.ops.gemm import kimi_k3_latent_tail_hip
+# The all-gather read's row limit; up to it the column tail's split-K partial GEMM
+# beats the replicated tail on MI350X.
+_COLUMN_TAIL_MAX_TOKENS = 64
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -446,6 +459,18 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+class NextAttnRead(msgspec.Struct, frozen=True):
+    """The next layer's attention read of the stream a latent MoE writes, which
+    the column-parallel tail's all-gather runs ahead (gfx950 TP8)."""
+
+    bank: AttnBank
+    score_proj: nn.Module
+    score_norm: nn.Module
+    norm: nn.Module
+    writes_block: bool
+    comm: object  # k3_ll_comm_hip.get_comm()
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -703,6 +728,15 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+        self._fused_latent_tail_eligible = (
+            _use_fused_latent_tail
+            and self.routed_expert_norm is not None
+            and self.routed_expert_up_proj is not None
+            and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
+        )
+        # Set by the model when the next layer's attention read can ride the
+        # column-parallel tail's all-gather.
+        self.next_attn_read: Optional[NextAttnRead] = None
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1466,6 +1500,28 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if not fused_norm and self.next_attn_read is not None:
+            stream = self._column_tail_and_next_read(latent, shared_output, prefix_sum)
+            if stream is not None:
+                return stream
+        if (
+            not fused_norm
+            and self._fused_latent_tail_eligible
+            and kimi_k3_latent_tail_hip.supports_latent_tail(
+                latent,
+                self.routed_expert_up_proj.weight,  # type: ignore
+                shared_output,
+                prefix_sum,
+            )
+        ):
+            return kimi_k3_latent_tail_hip.k3_latent_tail(
+                latent,
+                self.routed_expert_norm.weight,  # type: ignore
+                self.routed_expert_norm.variance_epsilon,  # type: ignore
+                self.routed_expert_up_proj.weight,  # type: ignore
+                shared_output,
+                prefix_sum,
+            )
         if not fused_norm:
             latent = self._latent_norm(latent)
         out, _ = self.routed_expert_up_proj(latent)
@@ -1473,6 +1529,51 @@ class KimiK3MoE(nn.Module):
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    def _column_tail_and_next_read(
+        self,
+        latent: torch.Tensor,
+        shared_output: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """The latent tail's GEMM on this rank's 1/TP of the up_proj rows (1/TP
+        of the replicated weight), finished by the all-gather of the stream,
+        which also stages the next layer's attention read. None, before
+        anything runs, when the kernels do not take the batch."""
+        read = self.next_attn_read
+        assert read is not None
+        num_tokens = latent.shape[0]
+        slice_width = shared_output.shape[1] // self.tp_size
+        bank = read.bank.require()
+        if not (
+            self._fused_latent_tail_eligible
+            and num_tokens <= _COLUMN_TAIL_MAX_TOKENS
+            and latent.stride(-1) == 1
+            and k3_attn_res_read_hip.tail_covered(shared_output, prefix_sum)
+            and bank.gather_covers(num_tokens, slice_width, read.writes_block)
+        ):
+            return None
+        rank = get_parallel().tp_rank
+        up_weight = self.routed_expert_up_proj.weight[  # type: ignore
+            rank * slice_width : (rank + 1) * slice_width
+        ]
+        part, sq = kimi_k3_latent_tail_hip.k3_latent_tail_partials(
+            latent,
+            self.routed_expert_norm.weight,
+            up_weight,  # type: ignore
+        )
+        return bank.gather_tail_read(
+            part,
+            sq,
+            shared_output,
+            prefix_sum,
+            self.routed_expert_norm.variance_epsilon,  # type: ignore
+            read.score_proj,
+            read.score_norm,
+            read.norm,
+            read.writes_block,
+            read.comm,
+        )
 
     def forward(
         self,
@@ -2618,6 +2719,7 @@ class KimiK3DecoderLayer(nn.Module):
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
                 reads_slices=_carries_bank_slices(config, sp_collective),
+                attn_all_reduce_comm=self._attn_all_reduce_read_comm(),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -2626,6 +2728,15 @@ class KimiK3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
+
+    def _attn_all_reduce_read_comm(self):
+        """gfx950 TP8: the LL communicator of the attention output's all-reduce
+        fused with the FFN-side bank read, or None."""
+        if not (_is_gfx95 and envs.SGLANG_ROCM_K3_FUSED_ATTN_AR_READ.get()):
+            return None
+        if self._sp_moe or self.all_reduce_fusion:
+            return None
+        return k3_ll_comm_hip.get_comm()
 
     def _ffn_input_fusions(self):
         """K3's kernels that complete the attention output's sum with the
@@ -2804,6 +2915,33 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        self._link_column_tails(config)
+
+    def _link_column_tails(self, config: KimiLinearConfig) -> None:
+        """Hand each stream-writing latent MoE the next layer's attention read,
+        which its column-parallel tail's all-gather then runs (gfx950 TP8)."""
+        if self.attn_bank is None or not envs.SGLANG_ROCM_K3_COLUMN_TAIL.get():
+            return
+        comm = k3_ll_comm_hip.get_comm()
+        if comm is None:
+            return
+        for idx in range(self.start_layer, self.end_layer - 1):
+            layer, next_layer = self.layers[idx], self.layers[idx + 1]
+            if not (
+                isinstance(layer.mlp, KimiK3MoE)
+                and layer._ffn_writes_stream
+                and not layer._sp_moe
+                and not next_layer._sp_moe
+            ):
+                continue
+            layer.mlp.next_attn_read = NextAttnRead(
+                bank=self.attn_bank,
+                score_proj=next_layer.self_attention_res_proj,
+                score_norm=next_layer.self_attention_res_norm,
+                norm=next_layer.input_layernorm,
+                writes_block=next_layer.is_block_write_layer,
+                comm=comm,
+            )
 
     def forward(
         self,
