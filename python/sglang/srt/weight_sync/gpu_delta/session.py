@@ -103,22 +103,11 @@ class DeltaSession:
                     "version": self.version,
                     **self._provenance,
                 }
-            request = session.request
             return {
                 "identity": self.identity,
                 "state": session.state,
                 "message": session.message,
-                **{
-                    key: request[key]
-                    for key in (
-                        "session_id",
-                        "manifest_sha256",
-                        "stream_id",
-                        "base_version",
-                        "target_version",
-                        "plan_digest",
-                    )
-                },
+                **self._provenance,
                 "result": session.result,
                 # One original process's clock, never subtract across ranks.
                 # Open/failed pauses have no qualified completed duration.
@@ -145,6 +134,17 @@ class DeltaSession:
                 raise ValueError(
                     "delta base version differs from committed local version"
                 )
+            self._provenance = {
+                key: request[key]
+                for key in (
+                    "session_id",
+                    "manifest_sha256",
+                    "stream_id",
+                    "base_version",
+                    "target_version",
+                    "plan_digest",
+                )
+            }
             session = self._session = _Session(request=request)
             self._executor.submit(self._prepare, session)
             return self.status()
@@ -279,18 +279,6 @@ class DeltaSession:
             self.backend.close()
             self.backend = None
         with self._lock:
-            if self._session is not None:
-                self._provenance = {
-                    key: self._session.request[key]
-                    for key in (
-                        "session_id",
-                        "manifest_sha256",
-                        "stream_id",
-                        "base_version",
-                        "target_version",
-                        "plan_digest",
-                    )
-                }
             self._session = None
             self._release_future = None
             return self.status()
@@ -480,21 +468,16 @@ class GpuDeltaSchedulerControl:
                 receipt = self.session.abort(request.session_id)
             else:
                 raise ValueError("unknown delta operation")
-            receipt["generation_paused"] = self.scheduler._engine_paused
             success = receipt["state"] not in {"FAILED", "POISONED"}
-            return delta_io.GpuDeltaReqOutput(
-                rid=request.rid,
-                success=success,
-                message=receipt.get("message", ""),
-                participant=receipt,
-            )
+            message = receipt.get("message", "")
         except Exception as exc:
             receipt = (
                 self.session.status()
                 if self.session is not None
                 else {"identity": None, "state": "REJECTED"}
             )
-            receipt["generation_paused"] = self.scheduler._engine_paused
-            return delta_io.GpuDeltaReqOutput(
-                rid=request.rid, success=False, message=str(exc), participant=receipt
-            )
+            success, message = False, str(exc)
+        receipt["generation_paused"] = self.scheduler._engine_paused
+        return delta_io.GpuDeltaReqOutput(
+            rid=request.rid, success=success, message=message, participant=receipt
+        )

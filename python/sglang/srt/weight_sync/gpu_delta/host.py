@@ -605,13 +605,8 @@ class HostArena:
             host_rank_capacity_generation=self.capacity["generation"],
             host_rank_cpu_workers=pool.workers,
         )
-        snapshot = HostPreparedSnapshot(
-            self,
-            index
-            | {"tensors": layout, "arena_bytes": size, "rank_arena": self.capacity},
-        )
         timings.update(metrics)
-        return snapshot
+        return HostPreparedSnapshot(self, index, layout)
 
     def close(self):
         self.tensor = self.mapping = None
@@ -624,25 +619,26 @@ class HostArena:
 class HostPreparedSnapshot:
     """One publication's local views, retaining backend-owned DE host storage."""
 
-    def __init__(self, arena, index):
-        self.arena, self.index = arena, index
+    def __init__(self, arena, index, records):
+        self.arena, self.records = arena, records
         self.directory = arena.directory
+        self.ready_state = {
+            "token": index["token"],
+            "state": "READY",
+            "generation": index["encoded"]["generation"],
+        }
 
     def get(self, name):
-        record = self.index["tensors"][name]
+        record = self.records[name]
         return self.arena.tensor[record["offset"] : record["offset"] + record["nbytes"]]
 
     def mark_reusable(self):
-        # Miles sends resume only after every original engine rank applied. A
+        # The tokenizer resumes only after every original engine rank applied. A
         # stale callback cannot release a newer encoded-cache publication.
         with (self.directory / ".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = orjson.loads((self.directory / "state.json").read_bytes())
-            if state == {
-                "token": self.index["token"],
-                "state": "READY",
-                "generation": self.index["encoded"]["generation"],
-            }:
+            if state == self.ready_state:
                 state["state"] = "REUSABLE"
                 _write_record(self.directory, "state", state)
 

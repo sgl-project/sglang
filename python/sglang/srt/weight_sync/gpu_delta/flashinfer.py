@@ -419,10 +419,7 @@ def expert_destinations(
     scale_cols = physical_cols // scale_divisor
     if cols > scale_cols:
         raise ValueError("canonical scales exceed FlashInfer column storage")
-    if layout.backend == "cutedsl":
-        images = _cutedsl_scale_images(layer, stem, local_expert)
-    else:
-        images = [_scale_parameter(layer, stem, layout)[local_expert]]
+    images = [_scale_parameter(layer, stem, layout)[local_expert]]
     if layout.backend == "megamoe" and layout.format == "mxfp4":
         # DeepGEMM packs four UE8M0 bytes per int32 in MN-major storage;
         # MegaMoE then transposes each [4,32] row group for UTCCP.

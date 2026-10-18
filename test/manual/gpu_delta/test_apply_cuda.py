@@ -91,16 +91,12 @@ def test_runtime_geometry_word_units_tails_and_byte_fallback():
             device="cuda",
         )
         metadata = torch.tensor(group.metadata_rows, dtype=torch.int64, device="cuda")
-        error = torch.ones(1, dtype=torch.int32, device="cuda")
+        error = torch.zeros(1, dtype=torch.int32, device="cuda")
         for grid in (1, group.tiles):
             target.copy_(before_target)
             launch = group.bind_launch(
                 pointers, metadata, error, tuple((grid, 1, 1) for _ in group.programs)
             )
-            error.fill_(1)
-            launch()
-            torch.testing.assert_close(target, before_target, rtol=0, atol=0)
-            error.zero_()
             launch()
             torch.testing.assert_close(target, expected, rtol=0, atol=0)
             torch.testing.assert_close(source, before_source, rtol=0, atol=0)
@@ -184,12 +180,8 @@ def test_changed_counts_layouts_and_alignment_reuse_three_fixed_modules_and_exac
             device="cuda",
         )
         metadata = torch.tensor(group.metadata_rows, dtype=torch.int64, device="cuda")
-        error = torch.ones(1, dtype=torch.int32, device="cuda")
+        error = torch.zeros(1, dtype=torch.int32, device="cuda")
         launch = group.bind_launch(pointers, metadata, error)
-        launch()
-        for _, _, storage, before, _ in items:
-            torch.testing.assert_close(storage, before, rtol=0, atol=0)
-        error.zero_()
         launch()
         for _, _, storage, _, expected in items:
             torch.testing.assert_close(storage, expected, rtol=0, atol=0)

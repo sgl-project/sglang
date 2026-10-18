@@ -62,6 +62,12 @@ class TestCanonicalPlanCache(unittest.TestCase):
             range_push=lambda name: events.append(("push", name)),
             range_pop=lambda: events.append(("pop",)),
         )
+
+        def work(fail=False):
+            if fail:
+                raise RuntimeError("worker failure")
+            return 42
+
         for enabled in (False, True):
             with (
                 self.subTest(enabled=enabled),
@@ -72,12 +78,21 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 ),
             ):
                 events.clear()
+                wrapped = layout.profiling.annotate("gpu_delta.worker")(work)
+                if not enabled:
+                    self.assertIs(wrapped, work)
+                self.assertEqual(wrapped(), 42)
+                with self.assertRaisesRegex(RuntimeError, "worker failure"):
+                    wrapped(True)
                 with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
                     with layout.PreparedDelta._phase(SimpleNamespace(), "decode"):
                         raise RuntimeError("enqueue failed")
                 self.assertEqual(
                     events,
-                    [("push", "gpu_delta.pause.decode"), ("pop",)] if enabled else [],
+                    [("push", "gpu_delta.worker"), ("pop",)] * 2
+                    + [("push", "gpu_delta.pause.decode"), ("pop",)]
+                    if enabled
+                    else [],
                 )
 
     def publication(self):

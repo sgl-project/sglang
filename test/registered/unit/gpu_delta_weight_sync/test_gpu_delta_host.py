@@ -194,11 +194,9 @@ def _child(root, path, digest, manifest, names, barrier, output):
                 name: bytes(
                     arena.mapping[row["offset"] : row["offset"] + row["nbytes"]]
                 )
-                for name, row in snapshot.index["tensors"].items()
+                for name, row in snapshot.records.items()
             }
-            output.put(
-                (identity, metrics, values, snapshot.index["rank_arena"]["identity"])
-            )
+            output.put((identity, metrics, values, arena.capacity["identity"]))
             snapshot.close()  # Abort/ordinary close never authorizes overwrite.
     finally:
         arena.close()
@@ -372,7 +370,7 @@ class TestHostSnapshot(unittest.TestCase):
             self.assertEqual(
                 {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
             )
-            self.assertTrue(snapshot.index["publication"]["skip_payload_hash"])
+            self.assertTrue(arena.skip_payload_hash)
             self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 1)
             self.assertEqual(metrics["host_encoded_cache_created"], created)
             for field in ("hash_files", "hash_bytes", "sha256_worker_sum_s"):
@@ -682,12 +680,13 @@ class TestHostSnapshot(unittest.TestCase):
             first_metrics,
             metadata(),
         )
-        original = first.index["rank_arena"]
+        original = arena.capacity.copy()
         self.assertEqual(
-            original["capacity"], (first.index["arena_bytes"] + 1023) // 1024 * 1024
+            original["capacity"],
+            (first_metrics["host_rank_arena_bytes"] + 1023) // 1024 * 1024,
         )
         self.assertEqual(
-            first.index["encoded"]["capacity"],
+            first_metrics["host_encoded_cache_capacity_bytes"],
             (sum(file["nbytes"] for file in manifest["files"]) + 1023) // 1024 * 1024,
         )
         first.mark_reusable()
@@ -703,7 +702,7 @@ class TestHostSnapshot(unittest.TestCase):
             warm,
             metadata(2),
         )
-        self.assertEqual(second.index["rank_arena"], original)
+        self.assertEqual(arena.capacity, original)
         self.assertEqual(warm["host_rank_allocation_calls"], 0)
         self.assertEqual(warm["host_encoded_cache_allocation_calls"], 0)
         self.assertEqual(warm["host_rank_mapping_reused"], 1)
@@ -745,15 +744,15 @@ class TestHostSnapshot(unittest.TestCase):
             growth,
             metadata(3),
         )
-        self.assertNotEqual(third.index["rank_arena"]["identity"], original["identity"])
-        self.assertEqual(third.index["rank_arena"]["generation"], 2)
+        self.assertNotEqual(arena.capacity["identity"], original["identity"])
+        self.assertEqual(arena.capacity["generation"], 2)
         self.assertEqual(growth["host_rank_allocation_calls"], 1)
         self.assertEqual(
-            third.index["rank_arena"]["capacity"],
-            (2 * third.index["arena_bytes"] + 1023) // 1024 * 1024,
+            arena.capacity["capacity"],
+            (2 * growth["host_rank_arena_bytes"] + 1023) // 1024 * 1024,
         )
         self.assertEqual(
-            third.index["encoded"]["capacity"],
+            growth["host_encoded_cache_capacity_bytes"],
             (2 * sum(file["nbytes"] for file in manifest["files"]) + 1023)
             // 1024
             * 1024,

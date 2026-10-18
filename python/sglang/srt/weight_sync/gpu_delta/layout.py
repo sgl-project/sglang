@@ -474,7 +474,7 @@ class PreparedDelta:
             previous_plan is not None and backend.batch_plan is previous_plan
         )
         frame_table, frame_counts, self.gaps = _plan_decode(
-            self.static_plans, entries, self.host_snapshot.index["tensors"]
+            self.static_plans, entries, self.host_snapshot.records
         )
         self.max_decoded = max((plan[1] for plan in self.static_plans), default=0)
         self.matrix_tensor_count = len(compressed)

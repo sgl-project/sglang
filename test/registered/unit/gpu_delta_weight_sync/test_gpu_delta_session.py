@@ -148,7 +148,9 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
         delta_io.GetGpuDeltaStatusReqInput(session_id="another-publication")
     )
     assert not mismatched.success and "different session" in mismatched.message
-    assert mismatched.participant["session_id"] == "publication-1"
+    for receipt in (preparing, status, matched.participant, mismatched.participant):
+        for key in req.keys() - {"manifest_path", "participants"}:
+            assert receipt[key] == req[key]
     assert session.status()["state"] == "PREPARING"
     session.abort("publication-1")
     backend.ready.set()
@@ -181,9 +183,15 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
         assert not other_backend.payload.released.is_set()
         backend.started.clear()
         req = request([session.identity]) | dict(
-            session_id="publication-2", base_version=1, target_version=2
+            session_id="publication-2",
+            manifest_sha256="c" * 64,
+            base_version=1,
+            target_version=2,
         )
-        assert session.prepare(req)["state"] == "PREPARING"
+        receipt = session.prepare(req)
+        assert receipt["state"] == "PREPARING"
+        for key in req.keys() - {"manifest_path", "participants"}:
+            assert receipt[key] == req[key]
         assert not backend.started.is_set()
     finally:
         release.set()
@@ -477,6 +485,9 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
     assert rejected.participant["version"] == 7
     assert rejected.participant["identity"] == session.identity
     assert not rejected.participant["generation_paused"]
+    for receipt in (receipt, session.status(), rejected.participant):
+        for key in req.keys() - {"manifest_path", "participants"}:
+            assert receipt[key] == req[key]
 
 
 @pytest.mark.parametrize(
@@ -754,37 +765,6 @@ def test_describe_binds_published_scheduler_ranks(
         control.session._executor.shutdown(wait=True)
     finally:
         reset_context()
-
-
-def test_nvtx_disabled_identity_and_worker_exception_balance(monkeypatch):
-    profiling = delta_runtime.profiling
-    events = []
-    nvtx = SimpleNamespace(
-        range_push=lambda name: events.append((threading.get_ident(), "push", name)),
-        range_pop=lambda: events.append((threading.get_ident(), "pop")),
-    )
-    monkeypatch.setattr(profiling, "nvtx", nvtx, raising=False)
-
-    def work(fail=False):
-        if fail:
-            raise RuntimeError("worker failure")
-        return threading.get_ident()
-
-    monkeypatch.setattr(profiling, "ENABLED", False)
-    assert profiling.annotate("unused")(work) is work
-    monkeypatch.setattr(profiling, "ENABLED", True)
-    wrapped = profiling.annotate("gpu_delta.worker")(work)
-    with delta_runtime.ThreadPoolExecutor(max_workers=1) as pool:
-        worker_id = pool.submit(wrapped).result()
-        with pytest.raises(RuntimeError, match="worker failure"):
-            pool.submit(wrapped, True).result()
-    assert worker_id != threading.get_ident()
-    assert events == [
-        (worker_id, "push", "gpu_delta.worker"),
-        (worker_id, "pop"),
-        (worker_id, "push", "gpu_delta.worker"),
-        (worker_id, "pop"),
-    ]
 
 
 @pytest.mark.parametrize(

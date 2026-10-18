@@ -170,7 +170,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 offsets[name] = size
                 frames.append(
                     (
-                        snapshot.index["tensors"][name]["offset"],
+                        snapshot.records[name]["offset"],
                         entry["frames"][0]["encoded_bytes"],
                         len(expected[name]),
                         size,
