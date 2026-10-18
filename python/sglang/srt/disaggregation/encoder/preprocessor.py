@@ -268,6 +268,8 @@ class EncoderPreprocessor:
                 return obj.get(attr)
             return getattr(obj, attr, None)
 
+        if self.encoder_media_processor_config.audio_sample_rate is not None:
+            return self.encoder_media_processor_config.audio_sample_rate
         audio_cfg = self.vision_config.get("audio", {})
         sr = audio_cfg.get("audio_sampling_rate")
         if sr:
@@ -698,13 +700,21 @@ class EncoderPreprocessor:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
-            processor_output = invoke_encoder_preprocessor(
+            invoke = functools.partial(
+                invoke_encoder_preprocessor,
                 model_preprocessor,
                 images,
                 Modality.IMAGE,
                 self.vision_config,
                 image_processor=self.image_processor,
                 use_gpu_preprocessing=self.use_image_processor_gpu,
+            )
+            processor_output = (
+                await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor, invoke
+                )
+                if self.encoder_media_processor_config.preprocess_off_event_loop
+                else invoke()
             )
             if (
                 isinstance(processor_output, EncoderPreprocessOutput)
@@ -729,7 +739,21 @@ class EncoderPreprocessor:
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
-            return model_preprocessor(mm_items, Modality.VIDEO, self.vision_config)
+            if not self.encoder_media_processor_config.preprocess_off_event_loop:
+                return model_preprocessor(mm_items, Modality.VIDEO, self.vision_config)
+            videos = await self._flatten_and_load_data_by_modality(
+                mm_items, Modality.VIDEO
+            )
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    model_preprocessor,
+                    videos,
+                    Modality.VIDEO,
+                    self.vision_config,
+                )
+            finally:
+                self._close_video_decoders(videos)
         if not self.video_processor:
             raise ValueError("No video processor available")
 
@@ -793,6 +817,14 @@ class EncoderPreprocessor:
         audios = await self._flatten_and_load_audios(mm_items)
 
         if model_preprocessor:
+            if self.encoder_media_processor_config.preprocess_off_event_loop:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    model_preprocessor,
+                    audios,
+                    Modality.AUDIO,
+                    self.vision_config,
+                )
             return model_preprocessor(audios, Modality.AUDIO, self.vision_config)
 
         if not self.audio_processor:
@@ -900,6 +932,13 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
+        if self.model_type == "muse_spark":
+            # Muse's hook returns output grids, after spatial/temporal merging.
+            return (
+                int(grid)
+                if modality == Modality.AUDIO
+                else int(grid[0] * grid[1] * grid[2])
+            )
         if modality == Modality.AUDIO:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
