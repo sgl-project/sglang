@@ -821,6 +821,21 @@ def _download_overlay_manifest(repo_id: str, filename: str) -> str:
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
+def _cached_single_model_snapshot(repo_id: str) -> str | None:
+    """Cached snapshot of ``repo_id`` if it holds config.json and no model_index.json."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        return None
+    try:
+        local_path = snapshot_download(repo_id=repo_id, local_files_only=True)
+    except Exception:
+        return None
+    if os.path.exists(os.path.join(local_path, "config.json")) and not os.path.exists(
+        os.path.join(local_path, "model_index.json")
+    ):
+        return local_path
+    return None
+
+
 def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     Download and extract just the model_index.json for a Hugging Face model.
@@ -880,15 +895,20 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
         )
         return config
     except EntryNotFoundError as e:
+        local_path = None
         if isinstance(e, LocalEntryNotFoundError):
-            raise ValueError(
-                f"Failed to download or parse model_index.json for {model_name_or_path}: {e}"
-            ) from e
+            # Hub unreachable: only a cached single-model snapshot proves it is one
+            local_path = _cached_single_model_snapshot(model_name_or_path)
+            if local_path is None:
+                raise ValueError(
+                    f"Failed to download or parse model_index.json for {model_name_or_path}: {e}"
+                ) from e
         logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
-        local_path = maybe_download_model(model_name_or_path)
+        if local_path is None:
+            local_path = maybe_download_model(model_name_or_path)
         config_path = os.path.join(local_path, "config.json")
         if not os.path.exists(config_path):
             raise ValueError(

@@ -530,6 +530,34 @@ def test_unreachable_hub_is_not_reported_as_single_model_repo(monkeypatch):
     assert downloads == []
 
 
+def test_unreachable_hub_uses_cached_single_model_snapshot(monkeypatch, tmp_path):
+    """Offline, a fully cached repo with config.json and no model_index.json is
+    still a single model, as it was before the unreachable-Hub check."""
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["M"]}))
+
+    def offline(*args, **kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    def cached_snapshot(repo_id, local_files_only=False, **kwargs):
+        assert local_files_only
+        return str(tmp_path)
+
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda **k: None)
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", cached_snapshot)
+    monkeypatch.setattr(
+        hf_diffusers_utils,
+        "maybe_download_model",
+        lambda *a, **k: pytest.fail("must not hit the Hub"),
+    )
+
+    config = hf_diffusers_utils.maybe_download_model_index("org/model")
+    assert config == {"architectures": ["M"]}
+
+
 def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
     """Only the component's own directory name selects scheduler_config.json; a
     parent such as `scheduler_ablation/` must not redirect every component."""
