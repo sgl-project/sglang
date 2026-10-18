@@ -171,14 +171,17 @@ def _patch_rope_parameters_validation():
     from transformers import PretrainedConfig
 
     # standardize_rope_params accesses self.max_position_embeddings before
-    # __post_init__ sets extra kwargs — skip when the attribute is absent.
+    # __post_init__ sets extra kwargs; preserve default RoPE resolution first.
     if hasattr(PretrainedConfig, "standardize_rope_params"):
         _orig_standardize = PretrainedConfig.standardize_rope_params
 
         def _safe_standardize(self):
-            if not hasattr(self, "max_position_embeddings"):
-                return
-            return _orig_standardize(self)
+            try:
+                return _orig_standardize(self)
+            except AttributeError as error:
+                if "max_position_embeddings" not in str(error):
+                    raise
+                return None
 
         PretrainedConfig.standardize_rope_params = _safe_standardize
 
