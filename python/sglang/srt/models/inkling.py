@@ -4,6 +4,7 @@ import copy
 import logging
 import re
 from array import array
+from contextlib import contextmanager
 from functools import partial
 from typing import Iterable, Optional, Set, Tuple
 
@@ -45,15 +46,14 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -65,8 +65,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.attn import (
@@ -169,6 +170,16 @@ def _is_unsupported_mm_weight_name(name: str) -> bool:
             "image.",
         )
     )
+
+
+@contextmanager
+def force_eager_attention(layer):
+    previous = layer.use_prefill_attention_wrapper
+    layer.use_prefill_attention_wrapper = False
+    try:
+        yield
+    finally:
+        layer.use_prefill_attention_wrapper = previous
 
 
 def _merge_tp1_shared(value):
@@ -495,7 +506,6 @@ class InklingDecoderLayer(nn.Module):
         )
         # The producer convolution uses live metadata in the eager break;
         # its contribution/residual pair keeps the FFN add+norm captured.
-        self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
 
     def _attention_input(
         self, hidden_states, positions, forward_batch, log_scaling_tau, *, eager=False
@@ -505,7 +515,7 @@ class InklingDecoderLayer(nn.Module):
             original = forward_batch.out_cache_loc
             forward_batch.out_cache_loc = original[: hidden_states.shape[0]]
             try:
-                with force_eager_attention():
+                with force_eager_attention(self.attn.attn):
                     hidden_states = self.attn(
                         hidden_states,
                         positions,
@@ -532,7 +542,8 @@ class InklingDecoderLayer(nn.Module):
             )
         return self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-    def _attn_group_impl(
+    @eager_on_graph
+    def _eager_attn_group(
         self,
         hidden_states,
         residual,
@@ -544,7 +555,7 @@ class InklingDecoderLayer(nn.Module):
         written,
     ):
         """BCG eager input preparation uses replay's live batch metadata."""
-        batch = get_tc_piecewise_forward_context().forward_batch
+        batch = get_forward_batch()
         n = batch.global_num_token_non_padded_cpu
         hidden = residual_batch.import_replay_handoff(
             residual_batch.ReplayHandoff(
@@ -574,15 +585,16 @@ class InklingDecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
         if (
-            is_in_breakable_cuda_graph()
-            and get_tc_piecewise_forward_context() is not None
+            is_in_prefill_graph_scope()
+            and is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             value, residual, incoming, written = residual_batch.export_replay_handoff(
                 hidden_states, forward_batch
             )
             shape = (value.shape[0], self.attn_norm.weight.shape[0])
             mlp_input, residual_out = value.new_empty(shape), value.new_empty(shape)
-            self._breakable_attn_group(
+            self._eager_attn_group(
                 value,
                 residual,
                 positions,
@@ -651,7 +663,6 @@ class InklingCausalLLM(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._final_read = _inkling_read()
-        self._breakable_final_read = eager_on_graph(True)(self._final_read_impl)
         self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
@@ -825,8 +836,9 @@ class InklingCausalLLM(nn.Module):
                         value.clone() if residual is None else value + residual
                     )
             if (
-                is_in_breakable_cuda_graph()
-                and get_tc_piecewise_forward_context() is not None
+                is_in_prefill_graph_scope()
+                and is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.layers[-1].mlp_sconv is not None
             ):
                 value, residual, incoming, written = (
@@ -834,7 +846,7 @@ class InklingCausalLLM(nn.Module):
                 )
                 out = value.new_empty((value.shape[0], self.norm.weight.shape[0]))
                 residual_out = torch.empty_like(out)
-                self._breakable_final_read(
+                self._eager_final_read(
                     value, residual, incoming, positions, out, residual_out, written
                 )
                 hidden_states, _ = self._final_read.read_normalization_handoff(
@@ -857,7 +869,8 @@ class InklingCausalLLM(nn.Module):
             if completed and leftover is not None:
                 raise RuntimeError("unconsumed fused-AR shared partials at model exit")
 
-    def _final_read_impl(
+    @eager_on_graph
+    def _eager_final_read(
         self,
         hidden_states,
         residual,
@@ -867,7 +880,7 @@ class InklingCausalLLM(nn.Module):
         residual_out,
         written,
     ):
-        batch = get_tc_piecewise_forward_context().forward_batch
+        batch = get_forward_batch()
         n = batch.global_num_token_non_padded_cpu
         hidden = residual_batch.import_replay_handoff(
             residual_batch.ReplayHandoff(
@@ -998,7 +1011,6 @@ class InklingForConditionalGeneration(nn.Module):
             if build_multimodal and self.config.vision_config.decoder_dmodel is not None
             else None
         )
-        self.mm_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
     def model(self) -> nn.Module:
@@ -1070,7 +1082,7 @@ class InklingForConditionalGeneration(nn.Module):
         # The processor expands one placeholder per media item into a run of the same
         # token id; the scheduler calls this to replace each run with the item's
         # pad_value (radix hash), which _embed_mm then masks on to scatter the embeds.
-        return self.mm_pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.llm.embed_tokens

@@ -1200,7 +1200,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + self.page_size
             )
             draft_ring_size = get_draft_swa_ring_size(
-                self.sliding_window_size, self.online_c128_mtp_max_draft_tokens
+                self.sliding_window_size,
+                self.online_c128_mtp_max_draft_tokens,
+                self.page_size,
             )
             self.request_window_bytes = (
                 (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)

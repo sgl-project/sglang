@@ -67,8 +67,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
     prepare_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -1559,8 +1559,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(

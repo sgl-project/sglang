@@ -170,6 +170,10 @@ pub struct ServerArgs {
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
     pub num_reserved_tokens: u64,
+    /// `/v1/tokenize`'s `max_model_len`: the Python tokenizer's
+    /// `model_max_length` (`-1` when it has none), or the context length when
+    /// that is not a 64-bit integer.
+    pub tokenizer_model_max_length: i64,
     /// Launch-time stamps (not `server_args` fields): sglang package version
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
@@ -224,6 +228,7 @@ impl ServerArgs {
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
+        tokenizer_model_max_length,
         version,
         max_total_num_tokens,
         launch_server_info,
@@ -267,6 +272,7 @@ impl ServerArgs {
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
+        tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
         launch_server_info: LaunchServerInfo,
@@ -308,6 +314,7 @@ impl ServerArgs {
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
+            tokenizer_model_max_length,
             version,
             max_total_num_tokens,
             launch_server_info,
@@ -357,6 +364,7 @@ impl Default for ServerArgs {
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
+            tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
             launch_server_info: LaunchServerInfo::default(),

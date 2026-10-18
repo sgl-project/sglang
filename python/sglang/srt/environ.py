@@ -422,6 +422,9 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
+    # that skips the per-layer load wait reads unloaded layers
+    SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES = EnvInt(0)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
@@ -1385,7 +1388,7 @@ class Envs:
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
-    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
+    # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
@@ -1859,6 +1862,16 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+
+    # ===================================================================
+    # Muse Spark
+    # ===================================================================
+    SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR = EnvBool(True)
+    # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
+    SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
+    )
 
     # ===================================================================
     # MiniMax M3
