@@ -203,10 +203,10 @@ def build_chain(layer, *, fused_mhc_post: bool) -> Optional[LowLatencyChain]:
     ``mlp_reduce_scatter``), so the caller's gate needs only ``defer_all_reduce``.
     """
     from sglang.kernels.ops.communication.all_reduce_fusion import get_registered_comm
-    from sglang.srt.layers.quantization.mxfp8_input import accepts_mxfp8_swizzled_input
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
+    from sglang.srt.layers.quantization.mxfp8_input import accepts_mxfp8_swizzled_input
 
     parallel = get_parallel()
     if not (
