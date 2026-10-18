@@ -1707,10 +1707,19 @@ class AscendAttnBackend(AttentionBackend):
                                 actual_seq_qlen=[q_len],
                                 actual_seq_kvlen=[total_kv_len],
                                 atten_mask=self.fia_mask.unsqueeze(0),
-                                sparse_mode=4,
+                                sparse_mode=4 if layer.sliding_window_size != -1 else 3,
                                 softmax_scale=layer.scaling,
-                                pre_tokens=layer.sliding_window_size,
-                                next_tokens=0,
+                                pre_tokens=(
+                                    layer.sliding_window_size
+                                    if layer.sliding_window_size != -1
+                                    else FULL_ATTENTION_WINDOW
+                                ),
+                                next_tokens=(
+                                    0
+                                    if layer.sliding_window_size != -1
+                                    else FULL_ATTENTION_WINDOW
+                                ),
+                                learnable_sink=sinks,
                             )
                             attn_out[q_len_offset : q_len_offset + q_len] = result[0]
                             q_len_offset += q_len
