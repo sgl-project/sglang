@@ -108,13 +108,19 @@ def _host_pool(layout: str) -> MHATokenToKVPoolHost:
         enable_memory_saver=False,
     )
     return MHATokenToKVPoolHost(
-        device_pool=device_pool,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
         host_to_device_ratio=2.0,
         host_size=0,
         page_size=PAGE_SIZE,
         layout=layout,
         pin_memory=False,
         device="cpu",
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
     )
 
 
