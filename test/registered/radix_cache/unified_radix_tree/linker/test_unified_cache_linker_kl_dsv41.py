@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1-Flash UnifiedRadixCache direct-linker load-back KL tests on GB300."""
+"""DeepSeek-V4.1-Flash UnifiedRadixCache direct-linker load-back KL tests."""
 
 import json
 import unittest
@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="extra-b", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=2400, stage="extra-b", runner_config="8-gpu-h200")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 LAUNCH_TIMEOUT = 3600
@@ -48,9 +48,13 @@ class DSV41FlashLinkerKLMixin(UnifiedRadixTreeTestMixin):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--ep-size",
-                "4",
+                "8",
+                "--attention-backend",
+                "dsv4",
+                "--moe-runner-backend",
+                "flashinfer_mxfp4",
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-dspark-block-size",
