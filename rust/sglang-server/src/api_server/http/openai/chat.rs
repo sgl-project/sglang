@@ -50,10 +50,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(super) struct ChatRequest {
     #[serde(flatten)]
-    request: CreateChatCompletionRequest,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    pub(super) request: CreateChatCompletionRequest,
+    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -484,7 +484,7 @@ pub(super) async fn unary_chat(
             reasoning_parser.as_deref(),
             &reasoning_options,
             &output.text,
-            &output.token_ids,
+            output.stop_trimmed_token_ids(),
         );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
@@ -622,7 +622,7 @@ pub(super) fn chat_event_stream(
             let mut emitted = Vec::with_capacity(2);
             if reasoning_enabled {
                 let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
+                    reasoning_splitters[index].split(&output.text, output.stop_trimmed_token_ids());
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {

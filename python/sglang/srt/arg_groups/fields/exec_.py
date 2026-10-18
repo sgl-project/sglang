@@ -43,12 +43,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -134,9 +136,17 @@ class ExecFeatures(msgspec.Struct):
         "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
-        bool,
-        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
+            "for supported configurations. Not numerically equivalent to full "
+            "prefill; requests for prompt logprobs compute every prompt row. Use "
+            "--no-enable-decoder-swa-bounded-replay to retain full prefill, e.g. "
+            "for RL rollouts whose logprobs must match the trainer.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -181,6 +191,10 @@ class ExecKernel(msgspec.Struct):
     enable_lean_attention: A[
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+    ] = None
+    monokernel_backend: A[
+        Optional[str],
+        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],
@@ -312,12 +326,15 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla'. 'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
+            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
-            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
-            "choice is shared by prefill and decode.",
-            choices=["auto", "flashmla", "trtllm"],
+            "through the flashinfer trtllm-gen sparse MLA kernel. "
+            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103) runs the fused "
+            "Q-RoPE + sparse attention + inverse-RoPE + MXFP8 FlashMLA kernel. "
+            "The backend choice is shared by prefill and decode.",
+            choices=["auto", "flashmla", "flashmla_mega", "trtllm"],
             resolvable=True,
         ),
     ] = "auto"
@@ -345,8 +362,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
-                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "Skipped ops use FlashInfer's heuristic fallback."
             ),
             nargs="+",
         ),

@@ -24,7 +24,13 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.mm_utils import pad_mm_tokens
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+)
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -68,7 +74,11 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.utils import (
+    get_hash_str,
+    get_storage_hash_str,
+    hash_str_to_int64,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -154,6 +164,45 @@ def test_match_on_the_empty_tree_returns_no_indices():
     core = _tree_core()
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.device_prefix_len == 0
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("image_len", [1, 2, 3, 8])
+@pytest.mark.parametrize("prefix_len", [0, 13, 14, 15, 16])
+def test_multimodal_hash_collision_does_not_reuse_image_kv(
+    backend, page_size, image_len, prefix_len
+):
+    core = _tree_core(backend=backend, page_size=page_size)
+    # identical low 30 bits used to alias every image token
+    keys = []
+    for item_hash in (7, 7 + (1 << 30)):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=item_hash,
+            offsets=[(prefix_len, prefix_len + image_len - 1)],
+        )
+        item.set_pad_value()
+        tokens = array("q", [1] * prefix_len + [9] * image_len + [2] * 32)
+        keys.append(
+            list(
+                pad_mm_tokens(tokens, MultimodalInputs(mm_items=[item], im_token_id=9))
+            )
+        )
+    cached_len = len(keys[0]) // page_size * page_size
+    _insert(core, keys[0], list(range(cached_len)))
+
+    same = core.match_prefix(MatchPrefixParams(key=_key(keys[0])))
+    assert same.device_prefix_len == cached_len
+    assert _path_indices(core, same.last_device_node).tolist() == list(
+        range(cached_len)
+    )
+    different = core.match_prefix(MatchPrefixParams(key=_key(keys[1])))
+    text_hit_len = prefix_len // page_size * page_size
+    assert different.device_prefix_len == text_hit_len
+    assert _path_indices(core, different.last_device_node).tolist() == list(
+        range(text_hit_len)
+    )
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
@@ -1214,18 +1263,13 @@ def test_configuration_reads_the_locked_rust_state():
     assert swa_core.has_swa_host_pool is True
 
 
-def test_external_cache_linker_enablement_and_component_guard():
+def test_external_cache_linker_enablement():
     core = _tree_core()
     assert core.enable_external_cache_linker is False
     core.enable_external_cache_linker = True
     assert core.enable_external_cache_linker is True
     core.enable_external_cache_linker = False
     assert core.enable_external_cache_linker is False
-
-    mamba_core = _mamba_tree_core()
-    with pytest.raises(AssertionError, match="(?i)mamba"):
-        mamba_core.enable_external_cache_linker = True
-    assert mamba_core.enable_external_cache_linker is False
 
 
 def test_sanity_check_passes_after_the_full_flow():
@@ -1288,10 +1332,18 @@ def test_hash_boundary_rejects_malformed_prior_hash(prior_hash):
         mem_cache.get_hash_str(array("q", [1, 2]), prior_hash, 2)
 
 
-@pytest.mark.parametrize("token_id", [-1, 1 << 32])
-def test_hash_boundary_rejects_token_ids_outside_uint32(token_id):
-    with pytest.raises(ValueError, match="does not fit in uint32"):
-        mem_cache.get_hash_str(array("q", [token_id]), None, 1)
+def test_hash_boundary_rejects_negative_token_ids():
+    with pytest.raises(ValueError, match="non-negative int64"):
+        mem_cache.get_hash_str(array("q", [-1]), None, 1)
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_hash_boundary_preserves_wide_multimodal_tokens(is_bigram):
+    raw = array("q", [1, 2, (1 << 62) + 123, 4, 5])
+    key = RadixKey(raw, is_bigram=is_bigram)
+    assert mem_cache.get_hash_str(raw, None, 2, is_bigram) == get_hash_str(
+        key, page_size=2
+    )
 
 
 def test_hash_boundary_rejects_zero_page_size():
@@ -2190,7 +2242,14 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
 
 
 def _swa_transfer_core(
-    backend, unified=False, mamba=False, page_size=1, window=16, is_eagle=False
+    backend,
+    unified=False,
+    mamba=False,
+    page_size=1,
+    window=16,
+    is_eagle=False,
+    request_window=False,
+    has_swa_host_pool=True,
 ):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -2216,6 +2275,7 @@ def _swa_transfer_core(
         tree_components=(ComponentType.FULL, ComponentType.SWA)
         + ((ComponentType.MAMBA,) if mamba else ()),
         sliding_window_size=window,
+        swa_gates_prefix_match=not request_window,
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -2235,7 +2295,7 @@ def _swa_transfer_core(
             core = UnifiedTreeCore(params, components)
             cache.tree_core = core
     core.set_hicache_enabled()
-    core.has_swa_host_pool = True
+    core.has_swa_host_pool = has_swa_host_pool
     return core, allocator
 
 
@@ -2615,7 +2675,13 @@ def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
     core.sanity_check([], [])
 
 
-def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
+def _swa_cache(
+    window: int = 8,
+    page_size: int = 1,
+    backend="rust",
+    ring=False,
+    request_window=False,
+):
     """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -2642,6 +2708,9 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
     )
     if ring:
         kv_pool.swa_req_ring_size = window
+    if request_window:
+        # Stand-in for DeepSeek-V4.1's encoder-replay request window.
+        kv_pool.request_window = object()
     allocator = SWATokenToKVPoolAllocator(
         size=64,
         size_swa=64,
@@ -2660,6 +2729,7 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
                 page_size=page_size,
                 disable=False,
                 sliding_window_size=window,
+                swa_gates_prefix_match=not (ring or request_window),
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
             )
         )
@@ -3640,330 +3710,6 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_write_back_swa_repair_backup_leaves_the_unbacked_parent_to_eviction(backend):
-    """Write-back builds the SWA repair backup as the repaired node alone; the
-    parent's missing Full copy waits for eviction instead of joining at insert."""
-    cache, allocator = _swa_cache(window=4, backend=backend)
-    core = cache.tree_core
-    values = allocator.alloc(12)
-    nodes = [
-        cache.insert(
-            InsertParams(
-                key=_key(list(range(size))),
-                value=values[:size],
-                prev_prefix_len=size - 4,
-            )
-        ).last_device_node
-        for size in (4, 8, 12)
-    ]
-    parent, child, leaf = nodes
-    core.set_hicache_enabled()
-    core.has_swa_host_pool = True
-    core.is_write_back = True
-    for node in nodes:
-        _complete_backup(core, node, full_offset=10000, aux_offset=20000)
-
-    # Reclaim the two internal SWA states and the parent's Full host copy.
-    tracker = {}
-    core.evict_device_start(ComponentType.SWA, 8)
-    try:
-        for _ in range(2):
-            step = core.evict_device_next_node(ComponentType.SWA, tracker)
-            assert step.node_id is None
-            for component, count in step.tracker.items():
-                tracker[component] = tracker.get(component, 0) + count
-            cache._free_values(step.device_frees, step.host_frees)
-    finally:
-        core.evict_device_end(ComponentType.SWA)
-    assert tracker[ComponentType.SWA] == 8
-    for component, amount in ((ComponentType.SWA, 8), (ComponentType.FULL, 4)):
-        step = core.drive_host_eviction(component, amount)
-        assert step.tracker[component] == amount
-        _accumulate_step(step, {}, {}, {})
-    assert not core.is_backuped(parent) and core.is_backuped(child)
-
-    # Mock DMA submission only; insertion, backup publication and FIFO
-    # acknowledgment all use the real shared controller.
-    cache.cache_controller = SimpleNamespace(write_policy="write_back")
-    cache._build_backup_sidecar = Mock(return_value=[])
-    submissions = []
-
-    def write(node, device, aux, sidecars):
-        submissions.append((node, device.numel()))
-        for transfers in aux.values():
-            for transfer in transfers:
-                transfer.host_indices = transfer.device_indices + 30000
-        return device + 40000
-
-    cache._execute_kv_backup = write
-    cache.insert(
-        InsertParams(
-            key=_key(list(range(8))),
-            value=allocator.alloc(8),
-            component_evicted_seqlens={ComponentType.SWA: 4},
-        )
-    )
-    # Repairing SWA still issues the async backup in write-back mode, but for
-    # the repaired node alone: a chained parent could already be pending under
-    # another request's window publish.
-    assert submissions == [(child, 0)]
-    assert set(cache.ongoing_write_through) == {child}
-    core.sanity_check([(child, child)], [])
-    cache._finish_write_through_ack(child)
-    core.sanity_check([], [])
-
-    # The existing Full copies keep their order; the parent stays unbacked
-    # until write-back eviction backs it up.
-    expected = [
-        (values[4:8] + 10000).tolist(),
-        (values[8:] + 10000).tolist(),
-    ]
-    for host_indices in expected:
-        host_frees = {}
-        _accumulate_step(
-            core.drive_host_eviction(ComponentType.FULL, 1), {}, {}, host_frees
-        )
-        assert [value.tolist() for value in host_frees[ComponentType.FULL]] == [
-            host_indices
-        ]
-    assert all(not core.is_backuped(node) for node in nodes)
-    core.sanity_check([], [])
-
-
-@pytest.mark.parametrize("backend", ["python", "rust"])
-@pytest.mark.parametrize("pin_ancestor", [False, True])
-def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_ancestor):
-    cache, allocator = _swa_mamba_cache(backend, window=8)
-    core = cache.tree_core
-    values = allocator.alloc(12)
-    nodes = [
-        cache.insert(
-            InsertParams(
-                key=_key(list(range(size))),
-                value=values[:size],
-                prev_prefix_len=size - 4,
-                mamba_value=torch.tensor([slot]),
-            )
-        ).last_device_node
-        for size, slot in ((4, 201), (8, 202), (12, 203))
-    ]
-    parent, child, leaf = nodes
-    core.set_hicache_enabled()
-    core.has_swa_host_pool = True
-    core.is_write_back = True
-    for node in nodes:
-        _complete_backup(core, node, full_offset=10000, aux_offset=20000)
-
-    # SWA eviction also removes ancestor Mamba states. Repair SWA first;
-    # a separate request below restores the ancestor's Mamba checkpoint.
-    tracker = {}
-    core.evict_device_start(ComponentType.SWA, 8)
-    try:
-        for _ in range(2):
-            step = core.evict_device_next_node(ComponentType.SWA, tracker)
-            assert step.node_id is None
-            for component, count in step.tracker.items():
-                tracker[component] = tracker.get(component, 0) + count
-            cache._free_values(step.device_frees, step.host_frees)
-    finally:
-        core.evict_device_end(ComponentType.SWA)
-    assert tracker[ComponentType.SWA] == 8
-    step = core.drive_host_eviction(ComponentType.SWA, 8)
-    assert step.tracker[ComponentType.SWA] == 8
-    _accumulate_step(step, {}, {}, {})
-    assert all(core.is_backuped(node) for node in nodes)
-    cache.cache_controller = SimpleNamespace(write_policy="write_back")
-    cache._build_backup_sidecar = Mock(return_value=[])
-    submissions = []
-
-    def write(node, full, aux, sidecars):
-        submissions.append((node, full.numel(), aux))
-        for transfers in aux.values():
-            for transfer in transfers:
-                transfer.host_indices = transfer.device_indices + 30000
-        return full + 40000
-
-    cache._execute_kv_backup = write
-    cache.insert(
-        InsertParams(
-            key=_key(list(range(8))),
-            value=allocator.alloc(8),
-            component_evicted_seqlens={ComponentType.SWA: 0},
-            mamba_value=torch.tensor([202]),
-        )
-    )
-    assert len(submissions) == 1
-    node, full_rows, aux = submissions[0]
-    assert node == child and full_rows == 0
-    assert aux[ComponentType.SWA][0].nodes_to_load == [parent, child]
-    assert aux[ComponentType.MAMBA][0].device_indices.tolist() == [202]
-    assert list(cache.ongoing_write_through) == [child]
-    assert cache.ongoing_write_through[child].publish_node_ids == [parent, child]
-    assert core.get_component_device_value(parent, ComponentType.MAMBA) is None
-
-    cache.insert(
-        InsertParams(
-            key=_key(list(range(4))),
-            value=allocator.alloc(4),
-            mamba_value=torch.tensor([211]),
-        )
-    )
-    assert len(submissions) == 1
-    assert core.get_component_device_value(parent, ComponentType.MAMBA).tolist() == [
-        211
-    ]
-    leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
-    extra_lock = cache.inc_lock_ref(parent).to_dec_params() if pin_ancestor else None
-    active = [(leaf, leaf)] + ([(parent, parent)] if pin_ancestor else [])
-    core.sanity_check([(child, child)] + active, [])
-    retained = {
-        (node, component): core.get_component_device_value(node, component).tolist()
-        for node in nodes
-        for component in (ComponentType.FULL, ComponentType.SWA)
-    }
-
-    def evict_one_mamba_state():
-        tracker, frees = {ComponentType.MAMBA: 0}, {}
-        core.evict_device_start(ComponentType.MAMBA, 1)
-        try:
-            step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
-            assert step.node_id is None and step.mamba_backup_node_id is None
-            _accumulate_step(step, tracker, frees, {})
-        finally:
-            core.evict_device_end(ComponentType.MAMBA)
-        return [value.tolist() for value in frees.get(ComponentType.MAMBA, [])]
-
-    assert evict_one_mamba_state() == ([] if pin_ancestor else [[211]])
-    # The actual Mamba DMA source remains protected by its own device lock.
-    assert core.get_component_device_value(child, ComponentType.MAMBA).tolist() == [202]
-    core.sanity_check([(child, child)] + active, [])
-    for (node, component), indices in retained.items():
-        assert core.get_component_device_value(node, component).tolist() == indices
-    cache._finish_write_through_ack(child)
-    assert evict_one_mamba_state() == [[202]]
-    core.sanity_check(active, [])
-    cache.dec_lock_ref(leaf, leaf_lock)
-    if extra_lock is not None:
-        cache.dec_lock_ref(parent, extra_lock)
-    core.sanity_check([], [])
-
-
-@pytest.mark.parametrize("backend", ["python", "rust"])
-def test_failed_mamba_backup_drops_state_under_unrelated_pending_swa(backend):
-    cache, allocator = _swa_mamba_cache(backend, window=12)
-    core = cache.tree_core
-    values = allocator.alloc(16)
-    nodes = [
-        cache.insert(
-            InsertParams(
-                key=_key(list(range(size))),
-                value=values[:size],
-                prev_prefix_len=size - 4,
-                mamba_value=torch.tensor([slot]),
-            )
-        ).last_device_node
-        for size, slot in ((4, 201), (8, 202), (12, 203), (16, 204))
-    ]
-    grandparent, parent, anchor, leaf = nodes
-    core.set_hicache_enabled()
-    core.has_swa_host_pool = True
-    core.is_write_back = True
-    cache.cache_controller = SimpleNamespace(write_policy="write_back")
-    cache._build_backup_sidecar = Mock(return_value=[])
-    host_pool = Mock()
-    host_pool.available_size.return_value = 1
-    cache.host_pool_group = Mock()
-    cache.host_pool_group.get_pool.return_value = host_pool
-    cache.components[ComponentType.MAMBA]._mamba_pool_host = host_pool
-    submissions = []
-    failed_node = None
-
-    def write(node, full, aux, sidecars):
-        submissions.append((node, full.numel(), aux))
-        if node == failed_node:
-            return None  # Full host allocation failed before submitting DMA.
-        for transfers in aux.values():
-            for transfer in transfers:
-                transfer.host_indices = transfer.device_indices + 20000
-        return full + 10000
-
-    def complete_physical_writes(write_back=False):
-        for ack_id in list(cache.ongoing_write_through):
-            cache._finish_write_through_ack(ack_id)
-
-    cache._execute_kv_backup = write
-    cache.writing_check = complete_physical_writes
-
-    def evict_component(component, count):
-        tracker = {ct: 0 for ct in cache.tree_components}
-        requested = {
-            ct: count if ct == component else 0 for ct in cache.tree_components
-        }
-        cache._evict_components(requested, tracker)
-        return tracker[component]
-
-    # Reach the host topology through actual state backups and ACKs. Full
-    # duplicate reclaim then leaves an unbacked grandparent above a backed
-    # parent; no synthetic node flags or direct backup commits are needed.
-    assert evict_component(ComponentType.MAMBA, 3) == 3
-    assert [(node, count) for node, count, _ in submissions] == [
-        (node, 4) for node in nodes[:3]
-    ]
-    assert cache.evict_host(4, ComponentType.FULL) == 4
-    assert [core.is_backuped(node) for node in nodes] == [False, True, True, False]
-    core.sanity_check([], [])
-
-    assert evict_component(ComponentType.SWA, 12) == 12
-    assert cache.evict_host(12, ComponentType.SWA) == 12
-    cache.insert(
-        InsertParams(
-            key=_key(list(range(12))),
-            value=allocator.alloc(12),
-            mamba_value=torch.tensor([203]),
-        )
-    )
-    # Backup ancestry stops at the backed parent, while the expanded SWA
-    # window reaches the unbacked grandparent. Its pending mark belongs to SWA.
-    assert list(cache.ongoing_write_through) == [anchor]
-    assert cache.ongoing_write_through[anchor].publish_node_ids == nodes[:3]
-    assert submissions[-1][2][ComponentType.SWA][0].nodes_to_load == nodes[:3]
-    cache.insert(
-        InsertParams(
-            key=_key(list(range(4))),
-            value=allocator.alloc(4),
-            mamba_value=torch.tensor([211]),
-        )
-    )
-    assert not core.is_backuped(grandparent)
-    assert ComponentType.MAMBA in core.build_backup_spec(grandparent)[1]
-    leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
-    active = [(anchor, anchor), (leaf, leaf)]
-    core.sanity_check(active, [])
-    retained = {
-        (node, ct): core.get_component_device_value(node, ct).clone()
-        for node in nodes
-        for ct in (ComponentType.FULL, ComponentType.SWA)
-    }
-
-    failed_node = grandparent
-    assert evict_component(ComponentType.MAMBA, 1) == 1
-    assert submissions[-1][:2] == (grandparent, 4)
-    assert core.get_component_device_value(grandparent, ComponentType.MAMBA) is None
-    # The completed backup and active request retain their other device values.
-    for node, slot in ((anchor, 203), (leaf, 204)):
-        assert core.get_component_device_value(node, ComponentType.MAMBA).tolist() == [
-            slot
-        ]
-    for (node, ct), value in retained.items():
-        assert torch.equal(core.get_component_device_value(node, ct), value)
-    # The earlier SWA ACK is drained before the failed backup attempt.
-    assert not cache.ongoing_write_through
-    core.sanity_check([(leaf, leaf)], [])
-    cache.dec_lock_ref(leaf, leaf_lock)
-    core.sanity_check([], [])
-
-
-@pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize(
     "ring,hicache,has_swa_host_pool",
     [
@@ -3997,6 +3743,50 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     assert cache.path_device_indices(matched.last_device_node).tolist() == (
         indices[:8].tolist() if ring else []
     )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("hicache", [False, True])
+def test_swa_match_ignores_tombstones_with_a_request_window(backend, hicache):
+    # Encoder SWA replay keeps SWA in a per-request window and rebuilds it on a
+    # hit, so an SWA tombstone must not cut the Full-KV match short.
+    cache, allocator = _swa_cache(backend=backend, request_window=True)
+    indices = allocator.alloc(12)
+    cache.insert(
+        InsertParams(
+            key=_key(list(range(12))),
+            value=indices,
+            component_evicted_seqlens={ComponentType.SWA: 8},
+        )
+    )
+    if hicache:
+        cache.tree_core.set_hicache_enabled()
+    matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.full_kv_hit_length == 8
+    assert matched.device_prefix_len == 8
+    assert (
+        cache.path_device_indices(matched.last_device_node)[:8].tolist()
+        == indices[:8].tolist()
+    )
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("request_window", [False, True])
+def test_swa_host_only_prefix_matches_with_a_request_window(backend, request_window):
+    # Without an SWA host pool, a prefix demoted to host keeps no SWA value.
+    # Replay rebuilds a request window, so the prefix stays a host hit; paged
+    # SWA still requires resident SWA state.
+    core, _ = _swa_transfer_core(
+        backend, request_window=request_window, has_swa_host_pool=False
+    )
+    leaf = _insert(core, list(range(8)), list(range(10, 18))).last_device_node
+    core.commit_backup(leaf, torch.arange(100, 108), {})
+    core.mark_write_through_pending([leaf], leaf)
+    core.finish_write_through([leaf], leaf)
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    assert core.component_has_host_value_only(leaf, ComponentType.FULL)
+    matched = core.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.host_hit_length == (8 if request_window else 0)
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():

@@ -56,6 +56,24 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     return skip_ops
 
 
+def _serves_block_fp8_as_mxfp8_on_flashinfer(model_runner: ModelRunner) -> bool:
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    for module in model_runner.model.modules():
+        method = getattr(module, "quant_method", None)
+        if (
+            isinstance(method, Fp8LinearMethod)
+            and method.block_fp8_as_mxfp8
+            and module.block_fp8_mxfp8_ready
+            and (
+                method.mxfp8_dense_backend.is_flashinfer_cutedsl()
+                or method.mxfp8_dense_backend.is_flashinfer_cutlass()
+            )
+        ):
+            return True
+    return False
+
+
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
@@ -124,7 +142,7 @@ def should_run_flashinfer_autotune(
     elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
         fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
     else:
-        fp8_gemm_needs_autotune = False
+        fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False

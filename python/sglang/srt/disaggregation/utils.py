@@ -1749,17 +1749,22 @@ def setup_state_kv_args(
                 raise RuntimeError(
                     "DSV4 target and draft pools must share the SWA index mapping"
                 )
+            # Under encoder replay the target window and the draft ring address SWA
+            # by request slot; equal rows per slot let them share one page list.
+            request_window = token_to_kv_pool.request_window
             target_geometry = (
                 token_to_kv_pool.page_size,
                 token_to_kv_pool.sliding_window,
+                request_window.capacity if request_window is not None else None,
             )
             draft_geometry = (
                 draft_token_to_kv_pool.page_size,
                 draft_token_to_kv_pool.sliding_window,
+                draft_token_to_kv_pool.swa_req_ring_size,
             )
             if target_geometry != draft_geometry:
                 raise RuntimeError(
-                    "DSV4 target and draft pools must share paged SWA geometry: "
+                    "DSV4 target and draft pools must share SWA geometry: "
                     f"target={target_geometry}, draft={draft_geometry}"
                 )
             draft_ptrs, draft_lens, draft_item_lens = (
