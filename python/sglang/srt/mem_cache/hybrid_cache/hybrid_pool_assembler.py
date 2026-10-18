@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     import torch
@@ -134,6 +135,27 @@ def _resolve_deepseek_v4_layer_mappings(
     )
 
 
+def _mha_host_inputs(pool, drafts=()):
+    info = pool.get_device_pool_infos()[0].buffer_info
+    return (
+        get_mha_host_pool_cls(info),
+        info,
+        dict(
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            draft_buffer_infos=tuple(
+                draft.get_device_pool_infos()[0].buffer_info for draft in drafts
+            ),
+            write_back_staging=pool.hicache_write_back_staging,
+        ),
+    )
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -146,21 +168,46 @@ def build_kv_host_pool(
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
-    kv_host_pool_cls = (
-        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
-    )
+    if use_mla:
+        kv_host_pool_cls = MLATokenToKVPoolHost
+        host_input = kv_pool.get_device_pool_infos()[0].buffer_info
+        mha_kwargs = {}
+    else:
+        kv_host_pool_cls, host_input, mha_kwargs = _mha_host_inputs(
+            kv_pool, mtp_draft_device_pools
+        )
     if use_mla and override_kv_cache_dim is None:
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. The
         # device pool already resolved the row width.
         override_kv_cache_dim = kv_pool.kv_cache_dim
-    check_packed_kv_rows(
-        kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
-    )
+    if use_mla or is_npu():
+        check_packed_kv_rows(
+            kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
+        )
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
-    if mtp_draft_device_pools:
-        kwargs["mtp_draft_device_pools"] = mtp_draft_device_pools
+    if use_mla:
+        kwargs.update(
+            device_capacity_tokens=kv_pool.size
+            if kv_pool.host_capacity_tokens is None
+            else kv_pool.host_capacity_tokens,
+            start_layer=kv_pool.start_layer,
+            end_layer=kv_pool.end_layer,
+            draft_buffer_infos=tuple(
+                pool.get_device_pool_infos()[0].buffer_info
+                for pool in mtp_draft_device_pools
+            ),
+            layer_shard_enabled=kv_pool.layer_shard_enabled,
+            target_layer_num=(
+                (kv_pool.layer_num + kv_pool.layer_shard_size - 1)
+                // kv_pool.layer_shard_size
+                if kv_pool.layer_shard_enabled
+                else kv_pool.layer_num
+            ),
+        )
+    else:
+        kwargs.update(mha_kwargs)
     parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
@@ -170,7 +217,7 @@ def build_kv_host_pool(
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
     return kv_host_pool_cls(
-        kv_pool,
+        host_input,
         get_memory().hicache_ratio,
         get_memory().hicache_size if host_size is None else host_size,
         page_size,
@@ -421,14 +468,15 @@ def build_hybrid_swa_group(
         # from full attention. Use a separate host pool with KV indices instead of
         # packing their bytes into either target pool.
         first, *rest = mtp_swa_full_device_pools
-        draft_host_pool = get_mha_host_pool_cls(first)(
-            first,
+        host_cls, host_input, host_kwargs = _mha_host_inputs(first, tuple(rest))
+        draft_host_pool = host_cls(
+            host_input,
             host_to_device_ratio=kv_host_pool.size / first.size,
             host_size=0,
             page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
-            mtp_draft_device_pools=rest,
+            **host_kwargs,
             pool_label="draft_swa",
         )
         group.add_entry(
@@ -1533,9 +1581,16 @@ def _build_mha_mla_host_pool(
         pool_label=pool_label,
     )
     if isinstance(pool, MHATokenToKVPool):
-        return get_mha_host_pool_cls(pool)(pool, **kwargs)
+        host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
+        return host_cls(host_input, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
-        pool,
+        pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=pool.size
+        if pool.host_capacity_tokens is None
+        else pool.host_capacity_tokens,
+        start_layer=pool.start_layer,
+        end_layer=pool.end_layer,
+        target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
         **kwargs,
     )
