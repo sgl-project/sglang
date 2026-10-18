@@ -386,6 +386,9 @@ pub fn text_to_generate(
         require_reasoning,
         max_thinking_tokens,
         kv_hints,
+        image_data: Vec::new(),
+        video_data: Vec::new(),
+        audio_data: Vec::new(),
         return_text: Some(true),
     }
 }
