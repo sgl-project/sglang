@@ -612,6 +612,10 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+                if getattr(cache_controller, "mla_dedup_enabled", False):
+                    cache_controller.set_producer_stream(
+                        self.tp_worker.model_runner.forward_stream
+                    )
                 if self.enable_unified_memory:
                     # Keep device rows stable until host transfers are acknowledged.
                     # Queue reads and relocation both run on the scheduler thread.

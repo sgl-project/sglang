@@ -2178,6 +2178,66 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_mla_host_dedup_is_opt_in(self):
+        self.assertFalse(ServerArgs(model_path="dummy").enable_mla_hicache_host_dedup)
+        self.assertTrue(
+            ServerArgs(
+                model_path="dummy", enable_mla_hicache_host_dedup=True
+            ).enable_mla_hicache_host_dedup
+        )
+
+    def test_mla_host_dedup_rejects_dsa_cache_layer_split(self):
+        args = self._make_args(
+            enable_mla_hicache_host_dedup=True,
+            enable_hierarchical_cache=True,
+            enable_dsa_cache_layer_split=True,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-mla-hicache-host-dedup cannot be used with "
+            "--enable-dsa-cache-layer-split",
+        ):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_rejects_dcp(self):
+        args = self._make_args(
+            enable_mla_hicache_host_dedup=True,
+            enable_hierarchical_cache=True,
+            dcp_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be used with --dcp-size"):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_requires_hierarchical_cache(self):
+        args = self._make_args(enable_mla_hicache_host_dedup=True)
+        with self.assertRaisesRegex(ValueError, "requires --enable-hierarchical-cache"):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_rejects_external_linker(self):
+        args = self._make_args(
+            enable_mla_hicache_host_dedup=True,
+            enable_hierarchical_cache=True,
+            enable_unified_cache_external_linker=True,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "cannot be used with --enable-unified-cache-external-linker"
+        ):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_storage_backend_compatibility(self):
+        for backend in (None, "", "file", "mooncake", "npu_memcache"):
+            with self.subTest(backend=backend):
+                args = self._make_args(
+                    enable_mla_hicache_host_dedup=True,
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend=backend,
+                )
+                if backend in (None, "", "file"):
+                    handle_hicache(args)
+                else:
+                    with self.assertRaisesRegex(ValueError, "only supports"):
+                        handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
