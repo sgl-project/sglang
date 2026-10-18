@@ -743,6 +743,7 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         model_name = storage_model_name(model_name, self.storage_host_pool)
+        storage_dtype = self.storage_host_pool.get_storage_dtype()
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -760,6 +761,11 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
+            kv_cache_dtype=(
+                str(storage_dtype).removeprefix("torch.")
+                if storage_dtype is not None
+                else None
+            ),
         )
 
     def reset(self):

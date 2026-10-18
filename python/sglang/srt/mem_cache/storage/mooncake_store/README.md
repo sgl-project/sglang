@@ -36,7 +36,7 @@ This integration is particularly valuable for production deployments involving l
 **Method 1: with pip**
 
 ```bash
-pip install mooncake-transfer-engine
+pip install 'mooncake-transfer-engine>=0.3.12'
 ```
 
 **Method 2: from source**
@@ -263,6 +263,63 @@ When `tenant_id` is set, SGLang forwards it to `MooncakeDistributedStore.setup(.
 You can configure it through `tenant_id` in `--hicache-storage-backend-extra-config`, `tenant_id` in the JSON config file, or `MOONCAKE_TENANT_ID`.
 
 > **Note:** strict isolation between tenants requires a Mooncake master started with `--enable_multi_tenants=true` and a tenant quota policy that explicitly registers each tenant. When strict multi-tenant mode is disabled, Mooncake ignores request tenant IDs for object placement and all objects use the `default` namespace. Non-default `tenant_id` also requires a Mooncake version that supports the `tenant_id` parameter in `MooncakeDistributedStore.setup()`. In `standalone_storage` mode, start the external `mooncake_client` with the matching `--tenant_id` because that process owns the real Mooncake client.
+
+**KV-cache dtype namespace:**
+
+HiCache appends the host pool's persisted KV value dtype to the tenant:
+
+- Default tenant: `dtype_bfloat16`, `dtype_float8_e4m3fn`, etc.
+- Explicit tenant: `tenant-a_dtype_bfloat16`, etc.
+
+The host pool declares this dtype through `get_storage_dtype()`. Typed host buffers use their own dtype; raw-copy FP8 buffers retain the FP8 value encoding even when their backing tensors use `uint8`. This keeps E4M3 and E5M2 separate without assuming that the device dtype always describes the stored values. Logical anchors without a KV payload declare no value dtype and keep the configured tenant unchanged. Object keys, model prefixes, and `extra_backend_tag` are unchanged. This requires **mooncake-transfer-engine >= 0.3.12** and the multi-tenant configuration described above: register the composed tenant in the master's quota policy, and use the same `--tenant_id` for an external standalone client. Without master-side multi-tenancy, dtype isolation is not enforced.
+
+**Opt-in migration from the pre-dtype tenant:**
+
+Upgrading to dtype tenants makes existing cache objects cold by default. For a
+verified compatible legacy cache, add this object to
+`--hicache-storage-backend-extra-config` (replace the values with the old
+producer's actual format):
+
+```json
+{
+  "legacy_cache_fallback": {
+    "kv_cache_dtype": "bfloat16",
+    "layout": "page_first",
+    "page_size": 16,
+    "verified_compatible": true
+  }
+}
+```
+
+This temporary migration mode reads the configured tenant **before** the dtype
+suffix is appended: `default` for `dtype_bfloat16`, or `tenant-a` for
+`tenant-a_dtype_bfloat16`. Both tenants must be registered on a multi-tenant
+master. The legacy reader uses a separate embedded client with no mounted storage
+segment or SSD offload; it never writes or deletes legacy objects.
+
+The dtype, layout, and page size must exactly match the current host pool.
+`verified_compatible=true` is an operator attestation that **all** legacy objects
+have the same model/checkpoint, representation, quantization scales, page layout,
+head geometry, and TP/PP/CP partitioning as the new instance, and that all legacy
+writers have stopped. These facts cannot be inferred from unversioned bytes.
+Do not enable this option for a namespace that mixed formats. Equal byte lengths
+alone do not establish compatibility (for example, FP16 versus BF16).
+
+New objects take precedence. Existence checks fall back only for missing objects;
+reads confirm a primary miss before fetching legacy bytes. Exact-sized legacy
+values are copied into host buffers and promoted to the new tenant on a
+best-effort basis. Errors and size mismatches remain cache misses; promotion
+failure does not invalidate a successful read. Normal writes target only the new
+tenant. This migration path adds a CPU copy and per-object reads/writes; it is
+intended for temporary warmup, not steady-state throughput.
+
+The initial implementation supports embedded, ordinary MHA/MLA KV pools,
+including multi-buffer MLA objects. Standalone clients, unified page envelopes,
+logical anchors, hybrid/side pools, and group semantics are rejected. Disabling
+the option returns to the ordinary read path. `clear()` disables fallback for
+that backend instance so cleared data cannot be restored from legacy storage;
+remove the option before restarting if the old data must remain invalidated.
+After warmup, remove the option and retire the old tenant separately.
 
 **SSD Offload (`enable_ssd_offload`):**
 

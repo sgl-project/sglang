@@ -69,6 +69,10 @@ class LogicalHostPool:
     stores_page_envelope = False
     storage_format_tag = None
 
+    def get_storage_dtype(self) -> Optional[torch.dtype]:
+        """Logical anchors persist no KV values; side pools own their formats."""
+        return None
+
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
             raise ValueError(

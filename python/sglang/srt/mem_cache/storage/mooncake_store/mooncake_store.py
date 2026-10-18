@@ -24,6 +24,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.mooncake_store.legacy_fallback import (
+    LegacyCacheFallback,
+    validate_legacy_fallback,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -89,6 +93,17 @@ def _normalize_tenant_id(value) -> str:
         return DEFAULT_TENANT_ID
     tenant_id = str(value).strip()
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _tenant_id_with_kv_cache_dtype(
+    tenant_id: str, kv_cache_dtype: Optional[str]
+) -> str:
+    """Put KV-cache dtype in Mooncake's tenant namespace, not object keys."""
+    if not kv_cache_dtype:
+        return tenant_id
+    if tenant_id == DEFAULT_TENANT_ID:
+        return f"dtype_{kv_cache_dtype}"
+    return f"{tenant_id}_dtype_{kv_cache_dtype}"
 
 
 @dataclass
@@ -429,8 +444,33 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.config.global_segment_size // rank_scale_factor
             )
 
-            # Use the backend tag and model name as a prefix to isolate tenants
-            # and models sharing one store.
+            self._legacy_fallback = None
+            legacy_tenant = self.config.tenant_id
+            use_legacy_fallback = validate_legacy_fallback(
+                (extra_config or {}).get("legacy_cache_fallback"),
+                storage_config,
+                mem_pool,
+            )
+            if use_legacy_fallback:
+                from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+                if (
+                    self.config.standalone_storage
+                    or self.enable_group_semantics
+                    or type(mem_pool)
+                    not in (MHATokenToKVPoolHost, MLATokenToKVPoolHost)
+                ):
+                    raise ValueError(
+                        "legacy_cache_fallback supports only embedded MHA/MLA KV pools "
+                        "without group semantics"
+                    )
+
+            self.config.tenant_id = _tenant_id_with_kv_cache_dtype(
+                self.config.tenant_id,
+                getattr(storage_config, "kv_cache_dtype", None),
+            )
+
+            # Backend tags and model names prefix keys; dtype uses the tenant.
             self.config_prefix = None
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
@@ -472,6 +512,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
+                if self.config.tenant_id != DEFAULT_TENANT_ID:
+                    logger.warning(
+                        "Start the standalone mooncake_client with --tenant_id=%s "
+                        "to match the KV-cache dtype namespace.",
+                        self.config.tenant_id,
+                    )
                 ret_code = self.store.setup_dummy(
                     required_bytes,
                     DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
@@ -557,8 +603,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             raise RuntimeError(
                                 "The installed Mooncake version does not support "
                                 "tenant_id in MooncakeDistributedStore.setup(). "
-                                "Please upgrade Mooncake to use non-default "
-                                "Mooncake tenants with SGLang."
+                                "Upgrade with: pip install -U "
+                                "'mooncake-transfer-engine>=0.3.12'."
                             ) from e
                         logger.warning(
                             "The installed Mooncake version does not support the "
@@ -571,6 +617,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
+                )
+            if use_legacy_fallback:
+                legacy_store = MooncakeDistributedStore()
+                # A separate, read-only client: no mounted segment, SSD writes,
+                # shared engine, warmup writes, or inference-buffer registration.
+                ret = legacy_store.setup(
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    0,
+                    DEFAULT_LOCAL_BUFFER_SIZE,
+                    self.config.protocol,
+                    device_name,
+                    self.config.master_server_address,
+                    None,
+                    tenant_id=legacy_tenant,
+                )
+                if ret:
+                    raise RuntimeError(f"Failed to setup legacy Mooncake reader: {ret}")
+                self._legacy_fallback = LegacyCacheFallback(self.store, legacy_store)
+                logger.warning(
+                    "Legacy cache fallback enabled from tenant %s to %s; the operator "
+                    "must verify compatible formats and stop all legacy writers.",
+                    legacy_tenant,
+                    self.config.tenant_id,
                 )
             logger.info("Mooncake store setup successfully.")
 
@@ -726,6 +796,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        if getattr(self, "_legacy_fallback", None) is not None:
+            raise ValueError("legacy_cache_fallback does not support hybrid/side pools")
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
             super().register_buffer(host_pool.kv_buffer)
@@ -1450,9 +1522,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        pass
+        self._legacy_fallback = None
 
     def clear(self) -> None:
+        # Do not resurrect cleared entries from the immutable legacy namespace.
+        self._legacy_fallback = None
         self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
@@ -1488,10 +1562,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        fallback = getattr(self, "_legacy_fallback", None)
+        if fallback is not None:
+            return fallback.read(key_strs, buffer_ptrs, buffer_sizes, list(results))
+        return results
 
     def _batch_exist(
         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1508,7 +1587,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
                 for key in key_strs
             ]
-        return self.store.batch_is_exist(key_strs)
+        results = self.store.batch_is_exist(key_strs)
+        fallback = getattr(self, "_legacy_fallback", None)
+        if fallback is not None:
+            return fallback.exists(key_strs, list(results))
+        return results
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
