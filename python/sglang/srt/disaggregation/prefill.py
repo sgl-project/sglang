@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
+    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -458,6 +459,18 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def can_prefill_before_bootstrap(self, req: Req) -> bool:
+        """Check eligibility; pause and metadata admission stay in the shared queue."""
+        return (
+            req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+            or get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+        ) and not (
+            _uses_write_through_cache(self.scheduler.tree_cache)
+            and req.swa_branching_seqlen is not None
+            and req.swa_branching_seqlen > req.kv.cache_protected_len
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def pop_bootstrapped(self) -> List[Req]:
         """Pop the reqs which have finished bootstrapping."""
@@ -490,20 +503,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
             elif poll == KVPoll.Bootstrapping:
-                if (
-                    (
-                        req.prefill_attempt_count
-                        < get_disagg().optimistic_prefill_attempts
-                        or get_disagg().disaggregation_decode_allocation_policy
-                        == "prefill_complete"
-                    )
-                    and not req.is_retracted  # engine paused
-                    and not (
-                        _uses_write_through_cache(self.scheduler.tree_cache)
-                        and req.swa_branching_seqlen is not None
-                        and req.swa_branching_seqlen > req.kv.cache_protected_len
-                    )
-                ):
+                if not req.is_retracted and self.can_prefill_before_bootstrap(req):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
@@ -931,6 +931,9 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
+                # Its KV never landed: abort instead of sending it to decode.
+                if req.discard_output_reason is not None:
+                    req.to_finish = req.discard_output_reason
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1174,6 +1177,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if req.return_routed_experts:
+                    self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
@@ -1526,9 +1531,21 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                request_window = kvcache.request_window
+                # Under encoder replay the scheduler is not hybrid SWA and keeps no
+                # window size; the pool holds it.
+                window_size = (
+                    self.sliding_window_size
+                    if request_window is None
+                    else kvcache.sliding_window
+                )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
+                if request_window is not None:
+                    return request_window.page_indices(
+                        int(req.kv.req_pool_idx), window_start, seq_len
+                    )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -1544,6 +1561,19 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
+
+            def _dsa_pages_payload():
+                # Decode already holds the indexer rows of the prefix it cached
+                # (decode_prefix_len, page-aligned), and its rows for a prefix
+                # still being restored point at no page yet: send only the
+                # suffix, positionally matching decode's _dsa_pages_payload.
+                return suffix_page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    req.kv.req_pool_idx,
+                    req.disagg_decode_prefix_len,
+                    seq_len,
+                    page_size,
+                )
 
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
@@ -1584,7 +1614,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
