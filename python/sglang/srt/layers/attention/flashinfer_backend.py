@@ -887,7 +887,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if (
             in_capture
-            and envs.SGLANG_FLASHINFER_VERIFY_HOST_PLAN.get()
+            and envs.SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN.get()
             and forward_mode.is_target_verify()
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
@@ -2518,7 +2518,7 @@ class FlashInferMultiStepDraftBackend:
         )
         host_lengths = forward_batch.seq_lens_cpu
         use_host_indptr = (
-            envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.get()
             and self.draft_window_size == 0
             and host_lengths is not None
             and host_lengths.device.type == "cpu"

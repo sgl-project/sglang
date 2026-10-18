@@ -417,7 +417,7 @@ def moe_fused_gate(
     from sglang.srt.environ import envs
 
     if (
-        envs.SGLANG_SM120_MTP_ROUTER_TOP22.get()
+        envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
         and scores.is_cuda
         and torch.cuda.get_device_capability(scores.device) == (12, 0)
         and 2 <= scores.shape[0] <= 16

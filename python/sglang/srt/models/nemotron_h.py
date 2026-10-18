@@ -980,7 +980,7 @@ class NemotronHForCausalLM(nn.Module):
     ):
         super().__init__()
         lora_config = None
-        self._use_nvfp4_phase_layout = envs.SGLANG_SM120_NVFP4_PHASE_LAYOUT.get()
+        self._use_nvfp4_phase_layout = envs.SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT.get()
         if self._use_nvfp4_phase_layout and _publishes_weight_storage():
             raise ValueError(
                 "NVFP4 phase layout rewrites FC2 weight storage in place; "
