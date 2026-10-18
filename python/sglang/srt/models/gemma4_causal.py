@@ -109,6 +109,7 @@ class Gemma4MLP(Gemma3MLP):
         )
         self._xpu_gelu_mul_lut = None
         self._xpu_prefill_gate_up_lut = None
+        self._xpu_prefill_gate_up_rows = ()
         self._xpu_gelu_mul_device = None
         self._xpu_gate_up_activation_dispatch = None
         self._xpu_gate_up_default_activation_forward = None
@@ -155,12 +156,19 @@ class Gemma4MLP(Gemma3MLP):
                         )
                     except ImportError:
                         bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported = None
-                    if (
-                        bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported is not None
-                        and bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(
-                            4096, 2 * intermediate_size, 1536
+                    supported_rows = (
+                        tuple(
+                            rows
+                            for rows in (256, 1024, 2048, 4095, 4096)
+                            if bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(
+                                rows, 2 * intermediate_size, 1536
+                            )
                         )
-                    ):
+                        if bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported
+                        is not None
+                        else ()
+                    )
+                    if supported_rows:
                         from sglang.kernels.ops.gemm import (
                             bf16_dense_gelu_tanh_mul_lut_xe20,
                         )
@@ -174,12 +182,13 @@ class Gemma4MLP(Gemma3MLP):
                         self._xpu_prefill_gate_up_lut = (
                             bf16_dense_gelu_tanh_mul_lut_xe20
                         )
+                        self._xpu_prefill_gate_up_rows = supported_rows
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         projection = self.gate_up_proj
         if (
             x.ndim == 2
-            and x.shape[0] == 4096
+            and (x.shape[0] == 4096 or x.shape[0] in self._xpu_prefill_gate_up_rows)
             and self._xpu_gelu_mul_lut is not None
             and self._xpu_gate_up_gelu_table is not None
             and type(projection) is MergedColumnParallelLinear
@@ -233,12 +242,18 @@ class Gemma4MLP(Gemma3MLP):
                 projection.weight.shape == (24576, 1536)
                 or projection.weight.shape == (12288, 1536)
             )
+            and x.shape[0] * projection.weight.shape[0] <= 2147483647
             and x.is_contiguous()
             and projection.weight.is_contiguous()
             and not x.requires_grad
             and not projection.weight.requires_grad
         ):
-            if self._xpu_prefill_gate_up_lut is not None:
+            # Pointwise lookup and native GEMM have independent shape support.
+            # Older wheels retain their original native-GEMM dispatch set.
+            if (
+                x.shape[0] in self._xpu_prefill_gate_up_rows
+                and self._xpu_prefill_gate_up_lut is not None
+            ):
                 x = self._xpu_prefill_gate_up_lut(
                     x, projection.weight, self._xpu_gate_up_gelu_table
                 )
