@@ -5,9 +5,11 @@
 # forward substitution instead of the BF16 Neumann product (#44758).
 # ruff: noqa  -- vendored kernel library, minimal local deltas
 """
-Akk 64×64 Lower Triangular Block Inversion — Full BF16.
+Akk 64×64 Lower Triangular Block Inversion.
 
-BF16 input, BF16 SMEM (packed bf16x2), BF16 MMA m16n8k16 (FP32 accum), BF16 output.
+BF16 input, BF16 SMEM (packed bf16x2), BF16 output. Diagonal blocks are
+inverted with FP32 arithmetic, off-diagonal blocks with BF16 MMA m16n8k16
+(FP32 accum).
 Numerical precision aligned with Flash Attention / KDA kernels.
 
   Diagonal 16×16 blocks: (I+L)⁻¹ by forward substitution in FP32
@@ -18,7 +20,7 @@ Architecture:
     Total SMEM: 64*36*4 = 9216 bytes (vs 64*72*4 = 18432 in FP32 version)
   - sTemp [16, 24, 2] fp32: inter-warp FP32 accumulator communication
   - cp.async: BF16 global → packed bf16x2 in FP32 SMEM (raw bytes align)
-  - BF16 MMA m16n8k16 with FP32 accumulator for ALL matmuls
+  - BF16 MMA m16n8k16 with FP32 accumulator for the off-diagonal matmuls
   - movmatrix.sync.aligned.m8n8.trans.b16 for A→B layout conversion
   - C→A chain: cvt.rn.bf16x2.f32 to pack FP32 accum → bf16x2 A-operand
 
@@ -230,8 +232,9 @@ def _unpack_bf16x2_hi(packed, *, loc=None, ip=None):
 # The product form (I-L)(I+L²)(I+L⁴)(I+L⁸) is exact in exact arithmetic, but
 # with bf16 MMA operands it loses the cancellation between the large entries of
 # L⁴ and L⁸ when β is close to 1 and the keys are correlated, and the inverse
-# can be off by orders of magnitude. Forward substitution in FP32 does not have
-# this problem, and it is cheap for a 16×16 block.
+# can be off by orders of magnitude. Forward substitution has no such
+# cancellation, and it is cheap for a 16×16 block. L is still read as bf16;
+# only the arithmetic is FP32.
 #
 # Lane j (mod 16) computes column j in registers. sAkk is packed bf16x2:
 # sAkk[row, pair] = {bf16[row, 2*pair], bf16[row, 2*pair+1]}

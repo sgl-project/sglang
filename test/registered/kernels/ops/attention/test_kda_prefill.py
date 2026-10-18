@@ -168,7 +168,8 @@ class TestKdaPrefill(CustomTestCase):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
             self.skipTest("NVIDIA KDA prefill requires datacenter Blackwell")
         generator = torch.Generator(device="cuda").manual_seed(0)
-        batch_size, seq_len, num_heads, head_dim = 1, 256, 2, 128
+        # 250 tokens leaves a partial last chunk.
+        batch_size, seq_len, num_heads, head_dim = 1, 250, 2, 128
         shape = (batch_size, seq_len, num_heads, head_dim)
         base = torch.randn(head_dim, generator=generator, device="cuda")
         k = base + 0.1 * torch.randn(shape, generator=generator, device="cuda")
@@ -186,11 +187,12 @@ class TestKdaPrefill(CustomTestCase):
         ).to(torch.bfloat16)
         a_log = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
         dt_bias = torch.zeros(num_heads * head_dim, device="cuda", dtype=torch.float32)
-        state = torch.zeros(
+        state = 0.1 * torch.randn(
             batch_size,
             num_heads,
             head_dim,
             head_dim,
+            generator=generator,
             device="cuda",
             dtype=torch.float32,
         )
