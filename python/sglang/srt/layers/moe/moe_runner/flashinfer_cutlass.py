@@ -345,13 +345,21 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    # All-gather prefill must use ordinary expert execution and reduce-scatter
+    # combine, without the decode A2A workspace or kernel layout.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
 
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
