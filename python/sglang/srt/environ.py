@@ -354,6 +354,11 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
+    # Request field names whose values are replaced with "<skipped>" in the
+    # request logs at every --log-requests-level (e.g. "ebnf,ebnf_full_assistant").
+    # Unlike the level's skip_names (which drop the field entirely), the field
+    # name is kept so it is still visible that the request carried it.
+    SGLANG_LOG_REQUEST_SKIP_FIELDS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
