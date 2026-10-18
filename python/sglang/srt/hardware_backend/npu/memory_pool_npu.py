@@ -212,7 +212,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             head_dim=self.head_dim,
             v_head_dim=self.v_head_dim,
             dtype=self.store_dtype,
-            device=torch.device(self.device),
+            # self.device is the bare backend name; tensors carry the rank index.
+            device=self._hicache_k_buffer.device,
             transfer_buffers=self.get_hicache_transfer_buffers,
         )
 
@@ -774,7 +775,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             qk_rope_head_dim=self.qk_rope_head_dim,
             kv_cache_dim=self.kv_cache_dim + self.kr_cache_dim,
             dtype=self.store_dtype,
-            device=torch.device(self.device),
+            # self.device is the bare backend name; tensors carry the rank index.
+            device=next(
+                buffer.device
+                for buffer in (self.k_buffer, self.index_k_buffer)
+                if buffer is not None
+            ),
             packed_fp8=self.dsa_kv_cache_store_fp8,
         )
 
