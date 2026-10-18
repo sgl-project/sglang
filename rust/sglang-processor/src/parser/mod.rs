@@ -278,7 +278,9 @@ impl ChatResponseProcessor {
         let parallel_tool_calls = self.parallel_tool_calls;
 
         Box::pin(async_stream::stream! {
-            let mut tool_calls_seen = vec![false; count];
+            // Each choice's first tool call; with `parallel_tool_calls=false` only its
+            // deltas pass, which detectors may split into a name and argument fragments.
+            let mut first_tool_call: Vec<Option<u32>> = vec![None; count];
             futures::pin_mut!(parsed);
             while let Some(mut item) = parsed.next().await {
                 if let Some(response) = item.data.take() {
@@ -293,27 +295,24 @@ impl ChatResponseProcessor {
                     }
                     for choice in response.choices {
                         let index = choice.index as usize;
-                        let had_tool_calls = tool_calls_seen.get(index).copied().unwrap_or(false);
+                        let first = first_tool_call.get(index).copied().flatten();
+                        let had_tool_calls = first.is_some();
                         let mut tool_calls = choice.delta.tool_calls.map(|calls| {
                             calls.into_iter().map(tool_call_delta).collect::<Vec<_>>()
                         });
                         if !parallel_tool_calls
                             && let Some(calls) = tool_calls.as_mut()
                         {
-                            if had_tool_calls {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                            }
+                            let first = first.or(calls.first().map(|call| call.index));
+                            calls.retain(|call| Some(call.index) == first);
                             if calls.is_empty() {
                                 tool_calls = None;
                             }
                         }
-                        let emitted_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
-                        if emitted_tool_calls
-                            && let Some(seen) = tool_calls_seen.get_mut(index)
+                        if let Some(call) = tool_calls.as_ref().and_then(|calls| calls.first())
+                            && let Some(seen) = first_tool_call.get_mut(index)
                         {
-                            *seen = true;
+                            seen.get_or_insert(call.index);
                         }
                         let mut content = match choice.delta.content {
                             Some(ChatCompletionMessageContent::Text(text)) => Some(text),
@@ -576,6 +575,60 @@ mod tests {
             _ => None,
         });
         assert_eq!(roles.collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    /// Without parallel tool calls, the first call keeps every fragment a
+    /// detector streams it in (Qwen3-Coder: the name, then arguments).
+    #[test]
+    fn single_tool_call_keeps_its_argument_fragments() {
+        let tools = vec![ToolDefinition {
+            name: "f".into(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+            })),
+            strict: None,
+        }];
+        let call = |x: u8| {
+            format!(
+                "<tool_call>\n<function=f>\n<parameter=x>\n{x}\n</parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let events = futures::executor::block_on(
+            ChatResponseProcessor::new(
+                Some("qwen3_coder".into()),
+                None,
+                Some(tools),
+                Some(ChatCompletionToolChoiceOption::Auto),
+                false,
+                false,
+                1,
+            )
+            .process_stream(stream::iter(vec![chunk(
+                0,
+                &format!("{}\n{}", call(42), call(7)),
+                true,
+            )]))
+            .collect::<Vec<_>>(),
+        );
+        let calls: Vec<ChatToolCallDelta> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    tool_calls: Some(calls),
+                    ..
+                }) => Some(calls.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(calls.iter().all(|call| call.index == 0), "{calls:?}");
+        assert_eq!(calls[0].name.as_deref(), Some("f"));
+        let arguments: String = calls
+            .iter()
+            .filter_map(|call| call.arguments.as_deref())
+            .collect();
+        assert_eq!(arguments, r#"{"x": 42}"#);
     }
 
     #[test]
