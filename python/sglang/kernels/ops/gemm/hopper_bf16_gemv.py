@@ -86,7 +86,10 @@ def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
 
 
 def hopper_bf16_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """y[1, N] = x[1, K] @ w[N, K]^T, all bf16, fp32 accumulation."""
+    """y[1, N] = x[1, K] @ w[N, K]^T, all bf16, fp32 accumulation.
+
+    x and w must be contiguous with 16-byte-aligned data pointers.
+    """
     out = torch.empty((1, w.shape[0]), dtype=x.dtype, device=x.device)
     module = _jit_hopper_bf16_gemv_module(w.shape[0], w.shape[1])
     module.run(x, w, out)
