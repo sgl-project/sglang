@@ -2944,7 +2944,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    handle_staging_rsp(
+                        waiting_req_bytes,
+                        self.transfer_infos,
+                        self._staging_ctx.prefetch_requested,
+                    )
                     continue
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
