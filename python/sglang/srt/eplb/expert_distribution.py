@@ -50,6 +50,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
@@ -245,7 +246,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def adopt_single_pass_gatherers(self, previous: ExpertDistributionRecorder):
         """Take over ``previous``'s gatherers, which a kept decode graph writes.
-        Shrink only: a grow recaptures and needs gatherers at its own width."""
+
+        Reuse mode allocates at maximum capacity. Collect reads the live width,
+        while graphs keep writing the same storage across growth and shrink.
+        """
         if not isinstance(previous, _ExpertDistributionRecorderReal):
             return
         kept = previous._single_pass_gatherers
@@ -628,7 +632,15 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
             (
                 self._expert_location_metadata.num_layers,
                 (
-                    self._expert_location_metadata.num_physical_experts
+                    (
+                        (
+                            get_parallel().max_ep_size
+                            or self._expert_location_metadata.ep_size
+                        )
+                        * self._expert_location_metadata.num_local_physical_experts
+                        if get_exec().moe.elastic_ep_reuse_cuda_graph
+                        else self._expert_location_metadata.num_physical_experts
+                    )
                     if enable_global_physical_experts
                     else self._expert_location_metadata.num_local_physical_experts
                 ),
@@ -667,9 +679,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
             record_physical_counts(topk_ids, self._data[layer_idx])
             return
         topk_ids = topk_ids.flatten()
-        mask = (topk_ids >= 0) & (
-            topk_ids < self._expert_location_metadata.num_physical_experts
-        )
+        mask = (topk_ids >= 0) & (topk_ids < self._data.shape[1])
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
