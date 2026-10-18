@@ -1,7 +1,7 @@
 <!-- Thank you for your contribution! Please follow these guidelines to enhance your pull request. If anything is unclear, submit your PR and reach out to maintainers for assistance. Join our Slack community at https://slack.sglang.io to discuss further. -->
 
 <!-- PR title: [Type] scope: title, or [Type] [Hardware] scope: title.
-Type: Feat, Fix, Refactor, Perf, Doc, Test, CI, or Chore.
+Type: Feat, Model, Fix, Refactor, Perf, Doc, Test, CI, or Chore.
 Scope: any module or model name (no fixed list or letter-case restriction), e.g. attention, qwen3, or flash-attn.
 Hardware: optional single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend.
 Title: no letter-case restriction.

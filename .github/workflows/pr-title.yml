@@ -26,7 +26,7 @@ jobs:
               ...context.repo,
               pull_number: context.issue.number,
             });
-            const types = ['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore'];
+            const types = ['Feat', 'Model', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore'];
             const pattern = new RegExp(
               String.raw`^\[(${types.join('|')})\] (?:\[([A-Za-z0-9][A-Za-z0-9._+-]*)\] )?` +
               String.raw`[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*: \S(?:[^\r\n]*\S)?$`

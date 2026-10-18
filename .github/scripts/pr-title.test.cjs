@@ -71,9 +71,11 @@ const valid = [
   'Revert "A legacy title without tags or scope"',
   'Revert "Revert "[Fix] attention: Fix output""',
   'Revert "x"',
-  ...['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore']
+  ...['Feat', 'Model', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore']
     .map(type => `[${type}] attention: Update implementation`),
   '[Feat] qwen3: Add model support',
+  '[Model] flux: Add model support',
+  '[Model] [NVIDIA] Qwen3.5: Add model support',
   '[Perf] [AMD] flash-attn: Optimize decode performance',
   '[Fix] [Intel] sgl-kernel: Fix output',
   '[Fix] [NVIDIA] model/qwen3: Fix output',
@@ -107,6 +109,9 @@ const invalid = [
   'Fix KV cache indexing',
   '[Fix] Fix KV cache indexing',
   '[Feature] model: Add support',
+  '[model] flux: Add model support',
+  '[MODEL] flux: Add model support',
+  '[Model] Add model support',
   '[fix] attention: Fix output',
   '[Fix][AMD] attention: Fix output',
   '[Fix] [AMD][NVIDIA] attention: Fix output',
