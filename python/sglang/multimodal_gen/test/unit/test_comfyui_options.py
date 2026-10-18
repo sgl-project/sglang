@@ -81,7 +81,7 @@ _GRAPH = {"execution_mode": "cuda_graph"}
         ("qwen_image", {"attention_backend": "sol_attention"}, False, "does not apply"),
         ("flux", {"quantization": "fp8"}, False, "native model directories"),
         ("lumina2", {"int8_gemm": "comfy_kitchen"}, False, "no effect"),
-        ("qwen_image", {"cache_mode": "cache_dit"}, False, "cache_dit is not"),
+        ("qwen_image", {"cache_mode": "spectrum"}, False, "spectrum is not"),
         ("minimax_h3", {"cache_mode": "teacache"}, False, "teacache is not"),
         ("minimax_h3", {"num_gpus": 2, "cache_mode": "spectrum"}, False, "degree 1"),
     ],
@@ -101,6 +101,7 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ("minimax_h3", {"int8_gemm": "comfy_kitchen", "cache_mode": "spectrum"}, False),
         ("fast_h3", {"attention_backend": "video_sparse_attn_h3"}, True),
         ("vdn_h3", {"quantization": "fp8", "cache_mode": "cache_dit"}, True),
+        ("flux", {"cache_mode": "cache_dit", "cache_dit_tuning": "manual"}, False),
     ],
 )
 def test_preflight_accepts_supported_combinations(
