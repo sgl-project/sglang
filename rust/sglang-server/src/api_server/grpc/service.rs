@@ -179,7 +179,10 @@ impl SglangService for GrpcService {
         }
         let text = tokio::time::timeout(
             self.config.response_timeout,
-            self.core.detokenize(request.into_inner().tokens),
+            self.core.detokenize(
+                request.into_inner().tokens,
+                true, /* skip_special_tokens */
+            ),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("detokenization timed out"))?
@@ -816,7 +819,7 @@ mod tests {
                 };
                 assert!(admission.try_accept());
                 assert!(
-                    matches!(&request.kind, RequestKind::Detokenize { token_ids } if *token_ids == tokens)
+                    matches!(&request.kind, RequestKind::Detokenize { token_ids, skip_special_tokens: true } if *token_ids == tokens)
                 );
                 let reply = if invalid {
                     ResponseItem::Error(crate::utils::error::Error::Validation(
