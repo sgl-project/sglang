@@ -67,6 +67,7 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 class IndexKeyFormat(Enum):
     # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
     DSA_FP8 = "dsa_fp8"
+    DENSE = "dense"
 
     def page_bytes(self, key_count: int) -> int:
         # Each physical format owns its sizing, including scales and padding.
@@ -87,10 +88,14 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def page_bytes(self) -> int:
+        if self.key_format is IndexKeyFormat.DENSE:
+            return self.buffers[0][0].nbytes * (self.page_size // self.compress_ratio)
         return self.key_format.page_bytes(self.page_size // self.compress_ratio)
 
     @property
     def kernel_page_bytes(self) -> int:
+        if self.key_format is IndexKeyFormat.DENSE:
+            return self.page_bytes
         return self.key_format.page_bytes(
             self.page_size // self.compress_ratio
             if self.kernel_page_size is None
@@ -116,6 +121,25 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(f"unsupported index key format {self.key_format}")
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")
+        if self.key_format is IndexKeyFormat.DENSE:
+            if self.kernel_page_size is not None:
+                raise ValueError("dense index keys use full-KV page coverage")
+            key_rows = self.page_size // self.compress_ratio
+            first = buffers[0]
+            for layer, buffer in enumerate(buffers):
+                if (
+                    buffer.ndim != 3
+                    or min(buffer.shape) <= 0
+                    or buffer.shape[0] % key_rows
+                    or buffer[0].nbytes != first[0].nbytes
+                    or buffer.device != first.device
+                    or not buffer.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"dense index buffer[{layer}] requires contiguous complete pages "
+                        f"of {key_rows} rows with matching row bytes and device"
+                    )
+            return
         page_bytes = self.page_bytes
         if self.kernel_page_bytes <= 0 or page_bytes % self.kernel_page_bytes:
             raise ValueError(
@@ -135,6 +159,14 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                     f"on {buffers[0].device}, got {tuple(buffer.shape)} "
                     f"{buffer.dtype} on {buffer.device}, stride={buffer.stride()}"
                 )
+
+    def page_views(self) -> tuple[torch.Tensor, ...]:
+        if self.key_format is IndexKeyFormat.DSA_FP8:
+            return self.buffers
+        return tuple(
+            buffer.view(torch.uint8).reshape(-1, self.page_bytes)
+            for buffer in self.buffers
+        )
 
 
 class KVBufferLayout(Enum):
