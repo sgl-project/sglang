@@ -4773,6 +4773,22 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            # Static-pool mamba COW inside init_next_round_input allocates the
+            # request's running mamba slot BEFORE add_one_req's budget gate
+            # can reject it. With a deep waiting queue the match COWs drain
+            # the hard free list and die on free=0 (observed as "Can not alloc
+            # mamba cache") even though the gate would have throttled one
+            # request later -- so stop pulling new requests from the queue once
+            # the remaining mamba slot budget can't cover a worst-case cold
+            # request. No-op without a static mamba pool (the shared pool
+            # defers its COW slot to admission below).
+            if (
+                adder.rem_mamba_slots is not None
+                and adder.rem_mamba_slots < adder._mamba_match_headroom()
+            ):
+                running_batch.batch_is_full = True
+                break
+
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
             # queued drops the copy its match staged.
