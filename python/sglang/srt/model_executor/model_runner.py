@@ -468,6 +468,7 @@ class ModelRunner:
         self._elastic_pending_graph_recapture = False
         # Set by the scheduler, which owns the retiree's terminal park.
         self.elastic_park_hook: Optional[Callable[[], None]] = None
+        self.live_scale = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         # HiSparse owns target KV only. Draft KV keeps its logical GPU page
@@ -562,9 +563,9 @@ class ModelRunner:
         self.initialize()
         self.check_quantized_moe_compatibility()
 
-        # Before the joiner hook, which fetches weights through the weight updater.
+        # Joiner admission fetches weights through the initialized updater.
         self.init_weight_updater()
-        self._initialize_elastic_ep_joiner()
+        self._initialize_elastic_ep_serving()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -600,6 +601,24 @@ class ModelRunner:
             offset = parallel.ep_join_rank_offset
             register_recover_cohort(offset, offset + parallel.tp_size, parallel.tp_size)
 
+    def _initialize_elastic_ep_serving(self) -> None:
+        """Keep recovery admission synchronous and live control consistent afterwards."""
+        from sglang.srt.elastic_ep.live_scale import (
+            LiveScaleCoordinator,
+            live_scale_mode,
+        )
+
+        if live_scale_mode():
+            if get_exec().moe.ep_join_mode == "recover":
+                # Recovery keeps its ordinary admission/weight/ready protocol.
+                # Install the coordinator afterwards so every serving rank uses
+                # the same DP control metadata and can join later live growth.
+                self._initialize_elastic_ep_joiner()
+            self.live_scale = LiveScaleCoordinator(self)
+            self.live_scale.initialize()
+        else:
+            self._initialize_elastic_ep_joiner()
+
     def _initialize_elastic_ep_joiner(self) -> None:
         # Offset-0 recovery rejoins later; a second rendezvous here goes unanswered.
         if (
@@ -612,10 +631,12 @@ class ModelRunner:
         offset = parallel.ep_join_rank_offset
         width = offset + parallel.tp_size
         # Ahead of the announce below, which is what lets survivors write our inbox.
-        clear_expert_map_inbox(parallel.tp_rank + offset)
+        if self.live_scale is None:
+            clear_expert_map_inbox(parallel.tp_rank + offset)
         # Before the announce, so every epoch minted for this grow sits above our floor;
         # seeding later lets this rank adopt a stale epoch and cross a barrier alone.
-        seed_barrier_epochs()
+        if self.live_scale is None:
+            seed_barrier_epochs()
         if is_scale:
             dist.barrier(group=parallel.tp_group.cpu_group)
             if parallel.tp_rank == 0:
@@ -667,7 +688,10 @@ class ModelRunner:
         return (
             get_exec().moe.is_ep_offset_joiner
             and not self.is_draft_worker
-            and self._elastic_cuda_graph_enabled()
+            and (
+                self._elastic_cuda_graph_enabled()
+                or (get_exec().moe.is_ep_scale_joiner and self.live_scale is not None)
+            )
         )
 
     def _finish_joiner_ready(self, width: int) -> None:
@@ -1341,15 +1365,18 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
-        is_scale_joiner = (
-            get_exec().moe.is_ep_offset_joiner and not self.is_draft_worker
+        is_offset_joiner = get_exec().moe.is_ep_offset_joiner and not self.is_draft_worker
+        live_joiner = (
+            get_exec().moe.is_ep_scale_joiner
+            and not self.is_draft_worker
+            and self.live_scale is not None
         )
-        defer_decode_capture = (
-            is_scale_joiner
+        defer_decode_capture = live_joiner or (
+            is_offset_joiner
             and capture_decode_cuda_graph
             and self._elastic_cuda_graph_enabled()
         )
-        if is_scale_joiner:
+        if is_offset_joiner:
             self._validate_elastic_cuda_graph_recapture()
         capture = capture_cuda_graphs(
             model_runner=self,
@@ -1370,6 +1397,8 @@ class ModelRunner:
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
+        if live_joiner:
+            return
         # Must match the joiner init's predicate exactly: a second post waits forever.
         if self._joiner_ready_is_deferred():
             if defer_decode_capture:
@@ -2096,7 +2125,11 @@ class ModelRunner:
             get_exec().moe.elastic_ep_backend is not None
             and not self._elastic_cuda_graph_enabled()
         ):
-            self.maybe_join_ep_ranks()
+            if (
+                self.live_scale is None
+                or ElasticEPStateManager.get_pending_ep_size() is None
+            ):
+                self.maybe_join_ep_ranks()
             # The scheduler ticks the target runner only; a draft has no is_idle.
             if not self.is_draft_worker:
                 self.maybe_retire_ep_ranks()
@@ -2613,6 +2646,14 @@ class ModelRunner:
             # Single-writer store: rank 0 publishes the seed the joiner waits on.
             sync_random_seed_via_store(is_source=True)
 
+        if (
+            self.live_scale is not None
+            and not is_recover
+            and self.live_scale.mode == "split"
+            and self._elastic_cuda_graph_enabled()
+        ):
+            self.live_scale.activate(target_size, effective_size)
+            return
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:
             self._recapture_elastic_cuda_graphs()
@@ -2621,6 +2662,9 @@ class ModelRunner:
         ElasticEPStateManager.commit_scale()
         self._elastic_scale_ready_barrier(target_size=target_size, log_tag="PRIMARY")
         self._rearm_eplb_after_elastic_scale()
+
+        if self.live_scale is not None:
+            self.live_scale.preparation = None
 
         # A survivor drops the announce, not the joiner: a joiner that dies mid-join
         # would leave the next grow onto these slots planned off a stale width.
@@ -2783,8 +2827,12 @@ class ModelRunner:
         if pending_size < effective_size:
             return
 
+        # Live ranks consume the same deadline vote in the DP metadata gather.
+        # A local recheck here could make one rank abort while its peers enter
+        # the preparation collective in this scheduler turn.
         if (
-            state.pending_since is not None
+            self.live_scale is None
+            and state.pending_since is not None
             and time.monotonic() - state.pending_since
             > self.server_args.elastic_ep_scale_timeout
         ):
@@ -2843,6 +2891,10 @@ class ModelRunner:
         if not ranks_to_join:
             return
 
+        if self.live_scale is not None and not pending_recover:
+            if not self.live_scale.prepare(effective_size, pending_size):
+                return
+            self.live_scale.event("activation_start", target=pending_size)
         current_platform.synchronize()
         ElasticEPStateManager.mark_joining()
         admit = try_recover_ranks if pending_recover else try_admit_scale_ranks

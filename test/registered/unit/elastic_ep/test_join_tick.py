@@ -21,6 +21,7 @@ SCALE_TIMEOUT_S = 1
 def _tick(*, effective, pending, backend="mooncake", active=None, overdue=False):
     """One maybe_join_ep_ranks call; returns (fail_scale mock, recover mock)."""
     runner = ModelRunner.__new__(ModelRunner)
+    runner.live_scale = None
     runner.server_args = SimpleNamespace(elastic_ep_scale_timeout=SCALE_TIMEOUT_S)
     runner._fail_scale = mock.Mock()
     runner._finalize_recovered_ep_ranks = mock.Mock()
