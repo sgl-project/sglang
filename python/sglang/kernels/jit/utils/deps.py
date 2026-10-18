@@ -146,23 +146,52 @@ def get_mathdx_include_paths() -> List[str]:
 
 @register_dependency("cutlass")
 def get_cutlass_include_paths() -> List[str]:
-    include_paths: List[str] = []
+    """CUTLASS headers for JIT compilation.
 
-    flashinfer_root = _find_package_root("flashinfer")
-    if flashinfer_root is not None:
-        candidates = [
-            flashinfer_root / "data" / "cutlass" / "include",
-            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
-        ]
-        for path in candidates:
-            if path.exists():
-                include_paths.append(str(path))
+    A probe only counts when it contains a real CUTLASS tree, verified by
+    sentinel headers. An include dir that merely exists (e.g. deep_gemm's own
+    headers) must not mask a missing tree: nvcc would run with no cutlass -I
+    and die on the first cutlass/util include.
+
+    Probes in priority order:
+      1. ``$CUTLASS_HOME`` — explicit override (mirrors ``MATHDX_HOME``)
+      2. flashinfer's vendored tree (pip wheel; source builds ship none)
+      3. tilelang's vendored tree (``3rdparty/cutlass``)
+      4. deep_gemm's include (only when it really contains ``cutlass/``)
+    """
+
+    def _validated(root: pathlib.Path) -> List[str]:
+        paths: List[str] = []
+        include = root / "include"
+        if (include / "cutlass" / "cutlass.h").is_file():
+            paths.append(str(include))
+        util_include = root / "tools" / "util" / "include"
+        if (util_include / "cutlass" / "util" / "packed_stride.hpp").is_file():
+            paths.append(str(util_include))
+        return paths
+
+    include_paths: List[str] = []
+    probed: List[str] = []
+
+    env_home = os.environ.get("CUTLASS_HOME")
+    if env_home:
+        probed.append(f"CUTLASS_HOME={env_home}")
+        include_paths.extend(_validated(pathlib.Path(env_home).expanduser().resolve()))
+
+    for pkg, subdir in (
+        ("flashinfer", "data/cutlass"),
+        ("tilelang", "3rdparty/cutlass"),
+    ):
+        pkg_root = _find_package_root(pkg)
+        if pkg_root is not None:
+            root = pkg_root / subdir
+            probed.append(str(root))
+            include_paths.extend(_validated(root))
 
     deep_gemm_root = _find_package_root("deep_gemm")
     if deep_gemm_root is not None:
-        candidate = deep_gemm_root / "include"
-        if candidate.exists():
-            include_paths.append(str(candidate))
+        probed.append(str(deep_gemm_root / "include"))
+        include_paths.extend(_validated(deep_gemm_root))
 
     # De-duplicate while preserving order.
     unique_paths = []
@@ -176,6 +205,8 @@ def get_cutlass_include_paths() -> List[str]:
     if not unique_paths:
         raise RuntimeError(
             "Cannot find CUTLASS headers required for JIT compilation. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
+            f"Probed (none contains a cutlass tree): {', '.join(probed) or 'nothing'}. "
+            "Install a package that vendors CUTLASS (the flashinfer pip wheel or "
+            "tilelang), or point CUTLASS_HOME at a CUTLASS source root."
         )
     return unique_paths
