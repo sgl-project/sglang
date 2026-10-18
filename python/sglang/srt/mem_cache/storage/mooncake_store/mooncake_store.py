@@ -91,6 +91,17 @@ def _normalize_tenant_id(value) -> str:
     return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
+def _tenant_id_with_kv_cache_dtype(
+    tenant_id: str, kv_cache_dtype: Optional[str]
+) -> str:
+    """Put KV-cache dtype in Mooncake's tenant namespace, not object keys."""
+    if not kv_cache_dtype:
+        return tenant_id
+    if tenant_id == DEFAULT_TENANT_ID:
+        return f"dtype_{kv_cache_dtype}"
+    return f"{tenant_id}_dtype_{kv_cache_dtype}"
+
+
 @dataclass
 class MooncakeStoreConfig:
     local_hostname: str
@@ -429,8 +440,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.config.global_segment_size // rank_scale_factor
             )
 
-            # Use the backend tag and model name as a prefix to isolate tenants
-            # and models sharing one store.
+            self.config.tenant_id = _tenant_id_with_kv_cache_dtype(
+                self.config.tenant_id,
+                getattr(storage_config, "kv_cache_dtype", None),
+            )
+
+            # Backend tags and model names prefix keys; dtype uses the tenant.
             self.config_prefix = None
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
@@ -472,6 +487,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
+                if self.config.tenant_id != DEFAULT_TENANT_ID:
+                    logger.warning(
+                        "Start the standalone mooncake_client with --tenant_id=%s "
+                        "to match the KV-cache dtype namespace.",
+                        self.config.tenant_id,
+                    )
                 ret_code = self.store.setup_dummy(
                     required_bytes,
                     DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
@@ -557,8 +578,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             raise RuntimeError(
                                 "The installed Mooncake version does not support "
                                 "tenant_id in MooncakeDistributedStore.setup(). "
-                                "Please upgrade Mooncake to use non-default "
-                                "Mooncake tenants with SGLang."
+                                "Upgrade with: pip install -U "
+                                "'mooncake-transfer-engine>=0.3.12'."
                             ) from e
                         logger.warning(
                             "The installed Mooncake version does not support the "

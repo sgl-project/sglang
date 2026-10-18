@@ -30,6 +30,19 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
+def resolve_storage_dtype(
+    buffer_dtype: torch.dtype, value_dtype: torch.dtype
+) -> torch.dtype:
+    """Recover the FP8 value encoding of a raw-copy uint8 buffer."""
+    if buffer_dtype == torch.uint8 and value_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+    ):
+        return value_dtype
+    return buffer_dtype
+
+
 _host_memory_budget: ContextVar[Optional[int]] = ContextVar(
     "hicache_host_memory_budget", default=None
 )
@@ -167,6 +180,14 @@ class HostKVCache(abc.ABC):
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
+
+    def get_storage_dtype(self) -> torch.dtype:
+        """Value dtype persisted by this host pool, not the device compute dtype.
+
+        Raw byte mirrors and codecs override this when their buffer dtype does
+        not identify the stored value encoding. Layout uses storage_format_tag.
+        """
+        return self.dtype
 
     def __init__(
         self,
