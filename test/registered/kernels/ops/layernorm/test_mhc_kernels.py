@@ -209,6 +209,31 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("num_tokens", [1, 5, 20, 80, 256])
+def test_mhc_post_split_hidden_matches_per_token_kernel(
+    monkeypatch, hidden_size, num_tokens
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TileLang mHC kernels")
+
+    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    hc_mult = 4
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
+    residual = torch.randn(
+        num_tokens, hc_mult, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    post = torch.rand(num_tokens, hc_mult, 1, device=device, dtype=torch.float32)
+    comb = torch.rand(num_tokens, hc_mult, hc_mult, device=device, dtype=torch.float32)
+
+    expected = mhc_post(x, residual, post, comb)
+    actual = mhc_post(x, residual, post, comb, split_hidden=True)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def _hopper_mhc_layer(norm, w, scale, base):
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
