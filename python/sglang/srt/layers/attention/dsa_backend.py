@@ -1400,13 +1400,17 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
-        if self.dcp_size > 1:
+        if _is_hip and self.dcp_size > 1:
             forward_batch.attn_dcp_metadata = self._plan_dcp_gathered_prefill(
                 forward_batch, page_table.shape[1]
             )
 
     def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
-        return self.dcp_size > 1 and forward_batch.attn_dcp_metadata is not None
+        return (
+            _is_hip
+            and self.dcp_size > 1
+            and forward_batch.attn_dcp_metadata is not None
+        )
 
     def _plan_dcp_gathered_prefill(
         self, forward_batch: ForwardBatch, page_table_width: int
@@ -2397,7 +2401,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if self.dcp_size > 1 and not dcp_gathered:
+            if _is_hip and self.dcp_size > 1 and not dcp_gathered:
                 assert topk_transform_method == TopkTransformMethod.PAGED
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
@@ -2738,7 +2742,9 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if self.dcp_size > 1:
+            # CUDA keeps upstream's dispatch: #43735 wires DCP to the trtllm
+            # backends, and this localized path has only been run on ROCm.
+            if _is_hip and self.dcp_size > 1:
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
                     q_rope=q_rope,
