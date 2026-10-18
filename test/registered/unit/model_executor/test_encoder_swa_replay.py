@@ -300,6 +300,7 @@ class TestFoldedReplayCompressorWrites(CustomTestCase):
             out_cache_loc=fb.out_cache_loc,
             positions=fx.folded_positions(),
             encoder_swa_compress_rows=fx.folded.keep_rows,
+            swa_recompute=False,
         )
 
     def _expected_out_loc(self, fx):

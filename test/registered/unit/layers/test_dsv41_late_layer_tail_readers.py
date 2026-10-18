@@ -123,6 +123,7 @@ class TestPrefillGraphTailCapacity(CustomTestCase):
         hidden = CaptureHiddenMode.FULL if full else CaptureHiddenMode.NULL
         forward_batch = _batch(extend_lens, starts, capture=hidden)
         forward_batch.seq_lens_cpu = torch.tensor([400] * len(extend_lens))
+        forward_batch.swa_recompute = False
         schedule_batch = SimpleNamespace(
             extend_lens=extend_lens,
             extend_logprob_start_lens=starts,
