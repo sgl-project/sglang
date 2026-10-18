@@ -1,0 +1,223 @@
+---
+title: Stable Diffusion XL
+tag: NEW
+description: "Deploy Stable Diffusion XL base 1.0 with SGLang Diffusion - native 1024px text-to-image UNet with dual CLIP encoders, validated on Intel Arc Pro B60 and NVIDIA A100."
+metatags:
+    description: "Deploy Stable Diffusion XL base 1.0 with SGLang Diffusion - native 1024px text-to-image UNet with dual CLIP encoders, validated on Intel Arc Pro B60 and NVIDIA A100."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/stabilityai/stable-diffusion-xl-base-1.0.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "2.6B UNet", "dual CLIP encoders", "1024x1024"]} />
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform; on Intel GPUs, also follow the [Intel XPU setup](/docs/hardware-platforms/xpu). Then generate the serve command below.
+
+<Deployment config={config} />
+
+## 2. Model capabilities
+
+[Stable Diffusion XL base 1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) is Stability AI's latent-diffusion text-to-image model. A 2.6B-parameter UNet conditions on two text encoders, CLIP ViT-L and OpenCLIP ViT-bigG, and generates 1024x1024 images natively. It also conditions on the original image size and crop coordinates, which SDXL uses to reduce cropping artifacts.
+
+Choose it when you need a widely adopted open-weight image model with a small footprint: the full pipeline fits on one 24GB GPU. It is a classifier-free-guidance model that runs about 30 to 50 denoising steps, so it is slower per image than distilled models such as Z-Image-Turbo. SGLang serves the base model only; the refiner stage is not supported.
+
+## 3. Deployment details
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "40%"}} />
+    <col style={{width: "30%"}} />
+    <col style={{width: "30%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Best fit</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Boundary</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`stabilityai/stable-diffusion-xl-base-1.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Text-to-image at 1024x1024</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Base model only; no refiner, LoRA, or multi-GPU parallelism yet</td>
+    </tr>
+  </tbody>
+</table>
+
+The model is released under the [CreativeML Open RAIL++-M License](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md).
+
+SGLang runs the UNet in bf16, the text encoders in fp16, and the VAE in fp32 by default. The SDXL VAE overflows in fp16, so keep it in fp32. SGLang's automatic memory policy chooses where the smaller components live: on the 24GB Arc Pro B60 it keeps the text encoders in host memory, and on a 40GB A100 it streams the text encoders and VAE layer by layer from pinned host memory. The UNet stays on the GPU in both cases.
+
+You can override component precision at startup with `--dit-precision`, `--text-encoder-precisions`, and `--vae-precision`. The bf16 UNet runs about 10x faster than fp32 on the Arc Pro B60 and about 2.6x faster on the A100 (see [Benchmark](#5-benchmark)).
+
+An empty negative prompt produces zero negative embeddings, matching the Diffusers default for SDXL base (`force_zeros_for_empty_prompt`). Pass a non-empty negative prompt to use text-conditioned negative guidance instead.
+
+## 4. Request examples
+
+For the complete API, see the [OpenAI-compatible API guide](/docs/sglang-diffusion/api/openai_api).
+
+```python Example
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="stabilityai/stable-diffusion-xl-base-1.0",
+    prompt="A beautiful sunset over the ocean, photorealistic",
+    n=1,
+    response_format="b64_json",
+)
+
+with open("output.png", "wb") as f:
+    f.write(base64.b64decode(response.data[0].b64_json))
+```
+
+## 5. Benchmark
+
+Both platforms run the same workload: 1024x1024, 30 steps, guidance scale 7.5, seed 42, and the prompt "a beautiful sunset over the ocean, photorealistic". Each row is one cold `sglang generate` request in a fresh process, not a serving benchmark, so end-to-end time includes one-time startup costs:
+
+```shell Command
+sglang generate --model-path stabilityai/stable-diffusion-xl-base-1.0 \
+    --prompt "a beautiful sunset over the ocean, photorealistic" \
+    --height 1024 --width 1024 --num-inference-steps 30 --guidance-scale 7.5 --seed 42 \
+    --save-output
+```
+
+The accuracy reference is the Diffusers `StableDiffusionXLPipeline` in full fp32 on the same GPU, started from the same initial latents. The VAE runs in fp32 in every configuration.
+
+<Tabs>
+  <Tab title="Intel Arc Pro B60">
+    - Hardware: Intel Arc Pro B60 (1x, 24GB)
+    - Software: PyTorch 2.13 (XPU), Diffusers 0.38.0, SGLang built from source
+
+    <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+      <colgroup>
+        <col style={{width: "22%"}} />
+        <col style={{width: "18%"}} />
+        <col style={{width: "15%"}} />
+        <col style={{width: "15%"}} />
+        <col style={{width: "15%"}} />
+        <col style={{width: "15%"}} />
+      </colgroup>
+      <thead>
+        <tr style={{borderBottom: "2px solid #d55816"}}>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>UNet</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Text encoders</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>PSNR</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>SSIM</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Per step</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>End-to-end</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bf16 (default)</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>fp16 (default)</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>37.92 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9648</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.157 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>14.14 s</td>
+        </tr>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bf16</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>fp32</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>37.53 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9630</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.155 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>14.77 s</td>
+        </tr>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bf16</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bf16</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>36.10 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9528</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.162 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>14.51 s</td>
+        </tr>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>fp32</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>fp32</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>51.14 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9974</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1.623 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>53.15 s</td>
+        </tr>
+      </tbody>
+    </table>
+
+    The fp32 run shows that SGLang reproduces the Diffusers pipeline. In the default configuration, almost all of the remaining difference comes from running the UNet in bf16. The Diffusers fp32 reference took 50.96 s end to end.
+  </Tab>
+  <Tab title="NVIDIA A100">
+    - Hardware: NVIDIA A100-SXM4-40GB (1x)
+    - Software: PyTorch 2.14.1 (CUDA 13.0), Diffusers 0.37.0, SGLang built from source
+
+    <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+      <colgroup>
+        <col style={{width: "22%"}} />
+        <col style={{width: "18%"}} />
+        <col style={{width: "15%"}} />
+        <col style={{width: "15%"}} />
+        <col style={{width: "15%"}} />
+        <col style={{width: "15%"}} />
+      </colgroup>
+      <thead>
+        <tr style={{borderBottom: "2px solid #d55816"}}>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>UNet</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Text encoders</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>PSNR</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>SSIM</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Per step</th>
+          <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>End-to-end</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bf16 (default)</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>fp16 (default)</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>27.02 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.8571</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.145 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>6.41 s</td>
+        </tr>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bf16</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>fp32</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>23.50 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.7842</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.183 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>7.05 s</td>
+        </tr>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bf16</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bf16</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>35.33 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9523</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.141 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>5.98 s</td>
+        </tr>
+        <tr>
+          <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>fp32</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>fp32</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>46.25 dB</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.9928</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.377 s</td>
+          <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>28.93 s</td>
+        </tr>
+      </tbody>
+    </table>
+
+    The fp32 run shows that SGLang reproduces the Diffusers pipeline. The bf16 rows sit lower than on the B60 because small bf16 rounding differences grow over 30 steps into different fine detail; Diffusers' own bf16 UNet with fp32 text encoders scores 23.49 dB and SSIM 0.7843, the same as SGLang's 23.50 dB. Compare bf16 configurations against that Diffusers bf16 run rather than against each other: with one prompt and seed, which configuration lands closest to fp32 varies. The Diffusers fp32 reference took 7.93 s end to end.
+  </Tab>
+</Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="image" />

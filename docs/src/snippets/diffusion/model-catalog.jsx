@@ -99,6 +99,7 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "Stable Diffusion XL",
       modelIds: ["stabilityai/stable-diffusion-xl-base-1.0"],
+      cookbook: "/cookbook/diffusion/StabilityAI/Stable-Diffusion-XL",
     },
     {
       name: "SANA",
