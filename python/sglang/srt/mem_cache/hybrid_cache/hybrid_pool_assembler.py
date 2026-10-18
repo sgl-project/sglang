@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyFormat
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1127,6 +1128,55 @@ def build_mamba_host_pool(
     )
 
 
+def _capture_qsa_index_buffers(
+    pool, drafts=(), *, page_size: int
+) -> IndexKeyBufferInfo:
+    captured = []
+    for item in (pool, *drafts):
+        infos = [
+            info
+            for info in item.get_device_pool_infos()
+            if info.pool_name is PoolName.INDEXER
+        ]
+        if len(infos) != 1:
+            raise ValueError(
+                f"QSA host requires one indexer pool info from {type(item).__name__}, "
+                f"got {len(infos)}"
+            )
+        (info,) = infos
+        buffer_info = info.buffer_info
+        if (
+            not isinstance(buffer_info, IndexKeyBufferInfo)
+            or buffer_info.key_format is not IndexKeyFormat.DENSE
+        ):
+            raise TypeError("QSA host requires dense index key buffers")
+        buffer_info = IndexKeyBufferInfo(
+            page_size=page_size,
+            compress_ratio=buffer_info.compress_ratio,
+            key_format=buffer_info.key_format,
+            buffers=buffer_info.buffers,
+        )
+        buffer_info.validate(layer_ids=info.layer_ids)
+        captured.append(buffer_info)
+    target = captured[0]
+    for draft in captured[1:]:
+        if (
+            draft.page_size != target.page_size
+            or draft.compress_ratio != target.compress_ratio
+        ):
+            raise ValueError(
+                "Packed QSA indexer pools must share page coverage and compress ratio"
+            )
+    packed = IndexKeyBufferInfo(
+        page_size=target.page_size,
+        compress_ratio=target.compress_ratio,
+        key_format=target.key_format,
+        buffers=tuple(buffer for info in captured for buffer in info.buffers),
+    )
+    packed.validate()
+    return packed
+
+
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -1158,6 +1208,13 @@ def build_hybrid_mamba_stack(
     )
     mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     qsa_draft_pools = params.mtp_draft_device_pools if qsa_pool is not None else ()
+    qsa_buffers = (
+        _capture_qsa_index_buffers(
+            qsa_pool, qsa_draft_pools, page_size=params.page_size
+        )
+        if qsa_pool is not None
+        else None
+    )
     config = prepare_host_pool_config(
         root=kv_pool,
         full_layer_mapping=full_layer_mapping,
@@ -1172,11 +1229,7 @@ def build_hybrid_mamba_stack(
         )
     if qsa_pool is not None and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
-        index_bytes = sum(
-            b.nbytes
-            for pool in (qsa_pool, *qsa_draft_pools)
-            for b in pool.qsa_compressed_k_buffer_pool
-        )
+        index_bytes = sum(buffer.nbytes for buffer in qsa_buffers.buffers)
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -1218,10 +1271,12 @@ def build_hybrid_mamba_stack(
             build_pool_entry(
                 name=PoolName.INDEXER,
                 host_pool=QSAIndexerPoolHost(
-                    qsa_pool,
-                    kv_host_pool,
+                    qsa_buffers,
+                    num_host_pages=kv_host_pool.page_num,
+                    layout=kv_host_pool.layout,
+                    device=kv_host_pool.device,
+                    pin_memory=kv_host_pool.pin_memory,
                     allocator_type=_get_allocator_type(),
-                    mtp_draft_device_pools=qsa_draft_pools,
                 ),
                 device_pool=qsa_pool,
                 # The KV config carries the packed draft tail layers.
@@ -1802,8 +1857,13 @@ def build_full_draft_pools(
             build_pool_entry(
                 name=PoolName.DRAFT_INDEXER,
                 host_pool=QSAIndexerPoolHost(
-                    draft_kv_pool,
-                    draft_host_pool,
+                    _capture_qsa_index_buffers(
+                        draft_kv_pool, page_size=draft_host_pool.page_size
+                    ),
+                    num_host_pages=draft_host_pool.page_num,
+                    layout=draft_host_pool.layout,
+                    device=draft_host_pool.device,
+                    pin_memory=draft_host_pool.pin_memory,
                     allocator_type=_get_allocator_type(),
                 ),
                 device_pool=draft_kv_pool,
