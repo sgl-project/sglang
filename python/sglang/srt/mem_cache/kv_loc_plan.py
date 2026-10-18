@@ -293,9 +293,14 @@ class KVLocPlan:
 
     # -- reads -----------------------------------------------------------------
 
-    def has_read_table(self, kind: IdSpaceKind = IdSpaceKind.FULL) -> bool:
+    def has_read_table(
+        self,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
+        *,
+        reader: Optional[KVIndexTranslator] = None,
+    ) -> bool:
         """Whether a reader has had the ``kind`` table built yet."""
-        return self._source.space(kind).key in self._read_tables
+        return self._read_space(kind, reader).key in self._read_tables
 
     def read_table(
         self,
@@ -303,14 +308,17 @@ class KVLocPlan:
         kind: IdSpaceKind = IdSpaceKind.FULL,
         rows: Optional[int] = None,
         into: Optional[torch.Tensor] = None,
+        reader: Optional[KVIndexTranslator] = None,
     ) -> KVIndexTable:
         """The ``kind`` page table over ``[0, seq_lens + read_extent)``, built
         when a table reader first asks (in place in ``into``, that reader's
         capture-stable table, when given) and shared by every later reader.
         ``rows=n`` returns exactly n rows; lanes past the plan's batch read the
         sink, appended by copying, never by translating again. Where reads stay
-        virtual (a static pool, or DCP) it is the `req_to_token` passthrough."""
-        space = self._source.space(kind)
+        virtual (a static pool, or DCP) it is the `req_to_token` passthrough.
+        ``reader`` names the sub-pool, as in `write_ids`; the plan's own
+        runner by default."""
+        space = self._read_space(kind, reader)
         table = self._read_tables.get(space.key)
         if table is None or (
             table.is_translated and rows is not None and table.ids.shape[0] < rows
@@ -328,6 +336,13 @@ class KVLocPlan:
                 table, ids=table.ids[:rows], row_ids=table.row_ids[:rows]
             )
         return table
+
+    def _read_space(
+        self, kind: IdSpaceKind, reader: Optional[KVIndexTranslator]
+    ) -> IdSpace:
+        # A later depth of a multi-layer draft can route window layers that
+        # the depth whose runner built the plan does not.
+        return (self._source if reader is None else reader).space(kind)
 
     def is_read_by(self, reader: KVIndexTranslator) -> bool:
         """Whether `reader` reads this plan's tables: it indexes the plan's

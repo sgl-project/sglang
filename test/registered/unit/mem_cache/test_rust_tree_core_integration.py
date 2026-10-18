@@ -24,7 +24,13 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.mm_utils import pad_mm_tokens
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    Req,
+)
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -68,7 +74,11 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.mem_cache.utils import get_storage_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.utils import (
+    get_hash_str,
+    get_storage_hash_str,
+    hash_str_to_int64,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -154,6 +164,45 @@ def test_match_on_the_empty_tree_returns_no_indices():
     core = _tree_core()
     result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.device_prefix_len == 0
+
+
+@pytest.mark.parametrize("backend", ["rust", "python"])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("image_len", [1, 2, 3, 8])
+@pytest.mark.parametrize("prefix_len", [0, 13, 14, 15, 16])
+def test_multimodal_hash_collision_does_not_reuse_image_kv(
+    backend, page_size, image_len, prefix_len
+):
+    core = _tree_core(backend=backend, page_size=page_size)
+    # identical low 30 bits used to alias every image token
+    keys = []
+    for item_hash in (7, 7 + (1 << 30)):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=item_hash,
+            offsets=[(prefix_len, prefix_len + image_len - 1)],
+        )
+        item.set_pad_value()
+        tokens = array("q", [1] * prefix_len + [9] * image_len + [2] * 32)
+        keys.append(
+            list(
+                pad_mm_tokens(tokens, MultimodalInputs(mm_items=[item], im_token_id=9))
+            )
+        )
+    cached_len = len(keys[0]) // page_size * page_size
+    _insert(core, keys[0], list(range(cached_len)))
+
+    same = core.match_prefix(MatchPrefixParams(key=_key(keys[0])))
+    assert same.device_prefix_len == cached_len
+    assert _path_indices(core, same.last_device_node).tolist() == list(
+        range(cached_len)
+    )
+    different = core.match_prefix(MatchPrefixParams(key=_key(keys[1])))
+    text_hit_len = prefix_len // page_size * page_size
+    assert different.device_prefix_len == text_hit_len
+    assert _path_indices(core, different.last_device_node).tolist() == list(
+        range(text_hit_len)
+    )
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
@@ -1283,10 +1332,18 @@ def test_hash_boundary_rejects_malformed_prior_hash(prior_hash):
         mem_cache.get_hash_str(array("q", [1, 2]), prior_hash, 2)
 
 
-@pytest.mark.parametrize("token_id", [-1, 1 << 32])
-def test_hash_boundary_rejects_token_ids_outside_uint32(token_id):
-    with pytest.raises(ValueError, match="does not fit in uint32"):
-        mem_cache.get_hash_str(array("q", [token_id]), None, 1)
+def test_hash_boundary_rejects_negative_token_ids():
+    with pytest.raises(ValueError, match="non-negative int64"):
+        mem_cache.get_hash_str(array("q", [-1]), None, 1)
+
+
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_hash_boundary_preserves_wide_multimodal_tokens(is_bigram):
+    raw = array("q", [1, 2, (1 << 62) + 123, 4, 5])
+    key = RadixKey(raw, is_bigram=is_bigram)
+    assert mem_cache.get_hash_str(raw, None, 2, is_bigram) == get_hash_str(
+        key, page_size=2
+    )
 
 
 def test_hash_boundary_rejects_zero_page_size():
