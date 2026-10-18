@@ -8,6 +8,7 @@ when you register a parser.
 """
 
 TOOL_CALL_PARSER_NAMES = [
+    "agens",
     "apertus2509",
     "cohere_command4",
     "deepseekv3",

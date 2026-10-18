@@ -515,6 +515,8 @@ _PHASE25_KERNELS = [
     ("mhc_head", "fused_hc_head", "triton"),
     ("hy4_ihc", "fused_hy4_ihc_pre", "triton"),
     ("hy4_ihc", "fused_hy4_ihc_post", "triton"),
+    ("volundr_mhc", "mhc_mix", "triton"),
+    ("volundr_mhc", "mhc_combine", "triton"),
 ]
 for _mod, _fn, _bk in _PHASE25_KERNELS:
     register_kernel(

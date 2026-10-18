@@ -47,6 +47,8 @@ _TRITON_KERNELS = [
     ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
+    ("volundr_bcsa", "bcsa_block_keys_decode"),
+    ("volundr_bcsa", "far_sparse_fused"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

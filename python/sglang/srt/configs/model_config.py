@@ -227,6 +227,11 @@ def is_kimi_k3(config) -> bool:
 
 
 def uses_kda_attention(config) -> bool:
+    registered = get_linear_attn_config(config)
+    if registered is not None and registered[0].backend_class_name.endswith(
+        ".KDAAttnBackend"
+    ):
+        return True
     configs = [config]
     get_text_config = getattr(config, "get_text_config", None)
     if callable(get_text_config):
@@ -604,6 +609,7 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                "VolundrForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -2364,6 +2370,7 @@ multimodal_model_archs = [
     "BailingMMNativeForConditionalGeneration",
     "BailingMM2NativeForConditionalGeneration",
     "BailingMoeV3VLForConditionalGeneration",
+    "VolundrForConditionalGeneration",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [

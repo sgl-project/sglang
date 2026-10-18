@@ -234,6 +234,13 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Grouped value attention (num_v_heads a multiple of num_k_heads): chunk_kda expects
+        # one key head per value head, so broadcast q/k up to the value-head count, as the
+        # decode and verify kernels do in their index arithmetic. No-op when the counts match.
+        group = v.shape[-2] // k.shape[-2]
+        if group > 1:
+            q = q.repeat_interleave(group, dim=-2)
+            k = k.repeat_interleave(group, dim=-2)
         return chunk_kda(
             q=q,
             k=k,
