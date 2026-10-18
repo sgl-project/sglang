@@ -78,6 +78,17 @@ def resolve_decode_backend(
 
         return FullXPUGraphBackend(cuda_graph_runner)
 
+    if model_runner.device == "mlu":
+        if backend_name not in (Backend.FULL, Backend.DISABLED):
+            raise ValueError(
+                f"MLU only supports decode graph backend 'full', got '{backend_name}'"
+            )
+        from sglang.srt.hardware_backend.mlu.graph_runner.mlu_full_graph_backend import (
+            FullMLUGraphBackend,
+        )
+
+        return FullMLUGraphBackend(cuda_graph_runner)
+
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
