@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -275,6 +276,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
         pipeline._cache.components = {}
+        pipeline._swa_component = SimpleNamespace(
+            pool_name=PoolName.SWA,
+            component_type=ComponentType.SWA,
+            full_window_pages=1,
+        )
+        pipeline._auxiliary_swa_component = None
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)
@@ -304,39 +311,33 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         return pipeline
 
     def test_short_staged_swa_tail_keeps_complete_window(self):
-        """FULL-prefix growth trims only FULL; SWA keeps its complete window."""
+        """Logical SWA coverage survives pruning resident rows from H2D."""
         handle = CacheRequestHandle("r", 0)
-        pipeline = self._short_swa_tail_pipeline(swa_page_size=2)
-        pipeline._cache.tree_core.is_eagle = False
-        pipeline._cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
-        pipeline._cache.tree_core.collect_full_device_indices.return_value = _indices(
-            0, 6
-        )
-        req = SimpleNamespace(
-            rid="r",
-            cache_request_handle=handle,
-            prefix_len=0,
-            kv=SimpleNamespace(cache_protected_len=0),
-        )
-        self.assertTrue(pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
-        pipeline.release_staged_hold.assert_not_called()
-
-        pipeline = self._short_swa_tail_pipeline(swa_page_size=4)
-        pipeline._cache.tree_core.is_eagle = False
-        pipeline._cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
-        pipeline._cache.tree_core.collect_full_device_indices.return_value = _indices(
-            0, 6
-        )
-        req = SimpleNamespace(
-            rid="r",
-            cache_request_handle=handle,
-            prefix_len=0,
-            kv=SimpleNamespace(cache_protected_len=0),
-        )
-        self.assertTrue(pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
-        pipeline.release_staged_hold.assert_not_called()
+        for page_size in (2, 4):
+            for resident_prefix in (False, True):
+                with self.subTest(page_size=page_size, resident_prefix=resident_prefix):
+                    pipeline = self._short_swa_tail_pipeline(swa_page_size=page_size)
+                    tree = pipeline._cache.tree_core
+                    tree.is_eagle = False
+                    tree.match_full_device_prefix.return_value = (6, 1, 6)
+                    tree.collect_full_device_indices.return_value = _indices(0, 6)
+                    tree.swa_tombstone_ranges.return_value = (
+                        [] if resident_prefix else [(4, 6)]
+                    )
+                    req = SimpleNamespace(
+                        rid="r",
+                        cache_request_handle=handle,
+                        prefix_len=0,
+                        kv=SimpleNamespace(cache_protected_len=0),
+                    )
+                    self.assertTrue(pipeline.prepare_staged_prefetch(req))
+                    self.assertEqual(req.host_hit_length, 2)
+                    self.assertEqual(
+                        req.swa_host_hit_length, 2 if resident_prefix else 4
+                    )
+                    window = req.staged_prefetch_plan.windows[ComponentType.SWA]
+                    self.assertEqual((window.start, window.end), (4, 8))
+                    pipeline.release_staged_hold.assert_not_called()
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
