@@ -22,7 +22,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -40,6 +40,20 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "XPUAttentionBackend",
     }
 )
+
+
+if is_hip():
+    from sglang.kernels.ops.speculative.verify_sampling import (
+        chain_speculative_sampling_triton,
+    )
+
+    def tree_speculative_sampling_target_only(*, candidates, draft_probs, **kwargs):
+        # DFLASH drafts are greedy, so rejection sampling against one-hot draft
+        # probabilities is target-only verification.
+        draft_probs[:, :-1].scatter_(2, candidates[:, 1:, None], 1.0)
+        chain_speculative_sampling_triton(
+            candidates=candidates, draft_probs=draft_probs, **kwargs
+        )
 
 
 # DFlash does not run sampling verify on NPU, even where the op exists.
