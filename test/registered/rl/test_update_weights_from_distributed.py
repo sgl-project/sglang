@@ -1,4 +1,8 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 """Test distributed weight updates.
 
@@ -29,7 +33,8 @@ import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt.utils import init_custom_process_group
+from sglang.srt.distributed.parallel_state import get_default_distributed_backend
+from sglang.srt.utils import get_device, get_device_module, init_custom_process_group
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     ADMIN_HEADERS_FOR_TEST,
@@ -37,9 +42,9 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     admin_post,
+    find_available_port,
     is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
@@ -48,6 +53,7 @@ from sglang.utils import terminate_process
 
 register_cuda_ci(est_time=110, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=160, suite="extra-a-test-2-gpu-large-amd")
+register_xpu_ci(est_time=200, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 mp.set_start_method("spawn", force=True)
 
@@ -140,8 +146,9 @@ def init_process(
     load_format,
     barrier,
     pause_generation_mode,
+    ports,
 ):
-    torch.cuda.set_device(rank)
+    get_device_module().set_device(rank)
 
     if rank == 0:
         init_process_hf(
@@ -155,6 +162,7 @@ def init_process(
             state_dict_key_to_shape,
             load_format,
             barrier,
+            ports["group"],
         )
     elif rank in [1, 2]:
         init_process_sgl(
@@ -171,6 +179,7 @@ def init_process(
             load_format,
             barrier,
             pause_generation_mode,
+            ports,
         )
 
 
@@ -185,6 +194,7 @@ def init_process_hf(
     state_dict_key_to_shape,
     load_format,
     barrier,
+    group_port,
 ):
     # These two environment variables are very important
     # to avoid unexpected behaviors of CUDA and NCCL.
@@ -196,13 +206,13 @@ def init_process_hf(
         model_name,
         torch_dtype="bfloat16",
         tie_word_embeddings=tie_word_embeddings,
-    ).to("cuda:0")
+    ).to(get_device(0))
     base_model_name = model_name.replace("-Instruct", "")
     hf_base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         torch_dtype="bfloat16",
         tie_word_embeddings=tie_word_embeddings,
-    ).to("cuda:0")
+    ).to(get_device(0))
 
     hf_instruct_params = []
     hf_base_params = []
@@ -230,17 +240,16 @@ def init_process_hf(
     param_queue.put(("hf_base_params", hf_base_params))
 
     # Init weight update group for rank 0 (the training engine in RLHF).
-    port = 60000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
-    init_method = f"tcp://localhost:{port}"
+    init_method = f"tcp://localhost:{group_port}"
     print(f"[hf] {rank=} {world_size=} init custom process group. {init_method=}")
     group = init_custom_process_group(
-        backend="nccl",
+        backend=get_default_distributed_backend(get_device()),
         init_method=init_method,
         world_size=world_size,
         rank=rank,
         group_name="test_parameter_update_group",
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     barrier.wait()
 
     # Warmup: trigger RCCL initialization so it's excluded from timing
@@ -252,7 +261,7 @@ def init_process_hf(
             load_format,
             group,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
     time_begin_broadcast = time.perf_counter()
 
@@ -280,7 +289,7 @@ def init_process_hf(
                 src=0,
                 group=group,
             )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     time_end_broadcast = time.perf_counter()
 
     # Measure the latency of broadcasting/weights update.
@@ -295,7 +304,7 @@ def init_process_hf(
     del hf_instruct_model
     del hf_base_model
     gc.collect()
-    torch.cuda.empty_cache()
+    get_device_module().empty_cache()
 
 
 def init_process_sgl(
@@ -312,9 +321,10 @@ def init_process_sgl(
     load_format,
     barrier,
     pause_generation_mode,
+    ports,
 ):
-    torch.cuda.set_device(rank)
-    torch.cuda.synchronize()
+    get_device_module().set_device(rank)
+    get_device_module().synchronize()
     base_gpu_id = 1 if rank == 1 else 1 + tp_size
     if backend == "Engine":
         print(f"[sgl] rank {rank} init engine")
@@ -325,11 +335,7 @@ def init_process_sgl(
             cuda_graph_max_bs_decode=2,
         )
     else:
-        if rank == 1:
-            url = DEFAULT_URL_FOR_TEST
-        else:
-            host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
-            url = ":".join([host, str(int(port) + 10000)])
+        url = f"http://127.0.0.1:{ports[rank]}"
 
         print(f"[sgl] rank {rank} init server on url: {url}")
         process = popen_launch_server(
@@ -346,7 +352,7 @@ def init_process_sgl(
                 *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     # Get weights of instruct model, i.e. pre-training weights.
     instruct_params = []
@@ -363,28 +369,26 @@ def init_process_sgl(
 
     param_queue.put((f"sgl_dp_{rank}_instruct_params", instruct_params))
 
-    port = 60000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
-
     # Init weight update group with the training engine.
     if backend == "Engine":
         engine.init_weights_update_group(
             master_address="localhost",
-            master_port=str(port),
+            master_port=str(ports["group"]),
             rank_offset=base_gpu_id,
             world_size=world_size,
             group_name="test_parameter_update_group",
-            backend="nccl",
+            backend=get_default_distributed_backend(get_device()),
         )
     else:
         admin_post(
             f"{url}/init_weights_update_group",
             json={
                 "master_address": "localhost",
-                "master_port": str(port),
+                "master_port": str(ports["group"]),
                 "rank_offset": base_gpu_id,
                 "world_size": world_size,
                 "group_name": "test_parameter_update_group",
-                "backend": "nccl",
+                "backend": get_default_distributed_backend(get_device()),
             },
         )
 
@@ -429,7 +433,7 @@ def init_process_sgl(
             url + "/pause_generation",
             json={"mode": pause_generation_mode},
         )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     barrier.wait()
 
     # Warmup: trigger RCCL initialization so it's excluded from timing
@@ -444,7 +448,7 @@ def init_process_sgl(
             load_format,
             pause_generation_mode,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
     time_begin_update = time.perf_counter()
     if backend == "Engine":
@@ -471,7 +475,7 @@ def init_process_sgl(
             },
         )
         admin_post(f"{url}/end_weight_update", json={})
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     time_end_update = time.perf_counter()
     if pause_generation_mode in ["in_place", "retract"]:
         admin_post(
@@ -542,6 +546,15 @@ def assert_tied_weights(params_list, message, should_be_tied):
             assert not np.allclose(params[0], params[-1]), message
 
 
+def _pick_free_ports(count):
+    ports = []
+    while len(ports) < count:
+        port = find_available_port(20000 + 2000 * len(ports))
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
 def test_update_weights_from_distributed(
     tp_size,
     dp_size,
@@ -563,6 +576,8 @@ def test_update_weights_from_distributed(
     param_queue = mp.Queue()
     results = {}
     barrier = mp.Barrier(1 + dp_size)
+    group_port, *server_ports = _pick_free_ports(1 + dp_size)
+    ports = {"group": group_port, **dict(zip((1, 2), server_ports))}
 
     context = mp.spawn(
         init_process,
@@ -579,6 +594,7 @@ def test_update_weights_from_distributed(
             load_format,
             barrier,
             pause_generation_mode,
+            ports,
         ),
         nprocs=1 + dp_size,
         join=False,
@@ -720,13 +736,13 @@ def test_update_weights_from_distributed(
     param_queue.close()
     param_queue.join_thread()
     gc.collect()
-    torch.cuda.empty_cache()
+    get_device_module().empty_cache()
 
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
     def test_update_weights_from_distributed(self):
 
-        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+        assert get_device_module().device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
             mode = random.choice(["Engine", "Server"])
@@ -765,7 +781,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 ),
             ]
 
-            if torch.cuda.device_count() >= 4:
+            if get_device_module().device_count() >= 4:
                 test_suits.extend(
                     [
                         (
@@ -787,7 +803,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                     ]
                 )
 
-            if torch.cuda.device_count() >= 5:
+            if get_device_module().device_count() >= 5:
                 test_suits.extend(
                     [
                         (
@@ -815,7 +831,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
         for model_name in test_models:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
-            ).to("cuda:0")
+            ).to(get_device(0))
             state_dict = model.state_dict()
             state_dict_keys = list(state_dict.keys())
             model_state_dict_shapes[model_name] = {
@@ -823,7 +839,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             }
             del model
             gc.collect()
-            torch.cuda.empty_cache()
+            get_device_module().empty_cache()
 
         truncate_size = 10
         checking_parameters = [
