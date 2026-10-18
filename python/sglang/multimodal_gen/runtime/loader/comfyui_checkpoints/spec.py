@@ -112,8 +112,8 @@ def get_registered_comfyui_pipeline_names() -> list[str]:
 
 
 def is_comfyui_single_file(model_path: str) -> bool:
-    """ComfyUI ships DiTs as one safetensors file with no model_index.json."""
-    return os.path.isfile(model_path) and model_path.endswith(".safetensors")
+    """ComfyUI ships DiTs as one safetensors or GGUF file with no model_index.json."""
+    return os.path.isfile(model_path) and model_path.endswith((".safetensors", ".gguf"))
 
 
 def _load_comfyui_gguf_transformer(
@@ -235,6 +235,9 @@ def load_comfyui_transformer(
     )
 
     gguf_file = resolve_transformer_gguf_to_load(server_args, "transformer")
+    if gguf_file is None and model_path.endswith(".gguf"):
+        # A GGUF unet picked in ComfyUI is the model path itself.
+        gguf_file = model_path
     if gguf_file is not None:
         model = _load_comfyui_gguf_transformer(
             model_cls=model_cls,
