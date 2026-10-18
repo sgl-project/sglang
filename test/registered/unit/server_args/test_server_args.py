@@ -131,15 +131,15 @@ class TestServerArgsPositionalOrder(CustomTestCase):
     def test_new_parallel_flag_preserves_existing_positional_slots(self):
         """New options must not reinterpret existing positional constructor calls."""
         defaults = ServerArgs(model_path="dummy")
-        # Preserve the 537-input signature, including fields added after the split.
+        # Include the 536 legacy inputs, including fields added after the split.
         positional = [
             getattr(defaults, field.name)
-            for field in msgspec.structs.fields(ServerArgs)[:537]
+            for field in msgspec.structs.fields(ServerArgs)[:536]
         ]
         positional[95] = True
         positional[96] = True
         positional[97] = "cpu"
-        positional[536] = 123.0
+        positional[535] = 123.0
 
         args = ServerArgs(*positional)
 
