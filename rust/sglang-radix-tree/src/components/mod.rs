@@ -69,6 +69,11 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// Drop component-owned metadata after the node is removed.
     fn on_node_removed(&self, _node_id: NodeId) {}
 
+    /// Host mamba checkpoints count as a device-prefix match. Default off.
+    fn host_only_checkpoint_counts_as_device(&self) -> bool {
+        false
+    }
+
     /// Return the node's lock-segment UUID, minting and storing one when absent.
     fn get_or_fill_uuid(
         &self,

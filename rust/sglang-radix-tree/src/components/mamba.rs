@@ -110,6 +110,10 @@ impl MambaComponent {
 }
 
 impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
+    fn host_only_checkpoint_counts_as_device(&self) -> bool {
+        self.mamba_host_only_checkpoint
+    }
+
     fn component_type(&self) -> ComponentType {
         MAMBA
     }

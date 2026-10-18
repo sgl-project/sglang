@@ -704,6 +704,54 @@ fn host_only_checkpoint_keeps_the_device_kv_prefix() {
 }
 
 #[test]
+fn host_only_checkpoint_counts_gpu_kv_in_front_and_host_kv_at_the_boundary() {
+    // a is GPU Full with no mamba. b is the host checkpoint: Full was evicted
+    // and backed up, mamba stays on host. The match stands on b, so a is a
+    // device hit and b is a host hit. Nothing past b is included.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            mamba_host_only_checkpoint: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let root = tc.arena.root();
+    let a = tc
+        .arena
+        .alloc_child(root, vec![1, 2, 3], /* priority = */ 0, None)
+        .unwrap();
+    tc.arena
+        .set_device_value(a, FULL, Tensor::from_slice(&[10i64, 11, 12]));
+    let b = tc
+        .arena
+        .alloc_child(a, vec![4, 5], /* priority = */ 0, None)
+        .unwrap();
+    tc.arena
+        .set_host_value(b, FULL, Tensor::from_slice(&[13i64, 14]));
+    set_mamba_host(&mut tc, b, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(b);
+    // Full KV past the checkpoint has no mamba state, so it stays outside the hit.
+    let _c = tc
+        .arena
+        .alloc_child(b, vec![6, 7], /* priority = */ 0, None)
+        .unwrap();
+    tc.arena
+        .set_host_value(_c, FULL, Tensor::from_slice(&[15i64, 16]));
+
+    let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(matched.best_match_node_id, tc.arena.node(b).id);
+    assert_eq!(matched.last_device_node_id, tc.arena.node(a).id);
+    assert_eq!(matched.device_prefix_len, 3);
+    assert_eq!(matched.host_hit_length, 2);
+    assert_eq!(matched.full_kv_hit_length, 7);
+    assert!(tc.arena.node(b).try_device_value(MAMBA).is_none());
+    assert!(tc.arena.node(a).try_device_value(MAMBA).is_none());
+}
+
+#[test]
 fn match_reports_the_chunk_aligned_branching_seqlen() {
     let mut tc = mamba_core_with_chunk(/* page_size = */ 1, /* chunk = */ 3);
     let (a, _b) = two_node_path(&mut tc);
