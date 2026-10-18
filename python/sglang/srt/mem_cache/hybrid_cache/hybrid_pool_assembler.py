@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
@@ -1182,10 +1183,13 @@ def build_deepseek_v4_hicache_stack(
 
 
 def build_mamba_host_pool(
-    mamba_pool, *, host_size: float, layout: str, mtp_draft_device_pools=()
+    mamba_pool,
+    pool_info: DevicePoolInfo,
+    *,
+    host_size: float,
+    layout: str,
+    mtp_draft_device_pools=(),
 ):
-    (pool_info,) = mamba_pool.get_device_pool_infos()
-    pool_info.buffer_info.validate(layer_ids=pool_info.layer_ids)
     draft_buffer_infos = []
     for draft_pool in mtp_draft_device_pools:
         (draft_info,) = draft_pool.get_device_pool_infos()
@@ -1211,7 +1215,7 @@ def build_hybrid_mamba_stack(
     decls: tuple[HostPoolDecl, ...],
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
-    mamba_layer_mapping: dict[int, int],
+    start_layer: int,
     load_cache_event,
     storage_backend: Optional[str],
     use_mla: bool,
@@ -1225,6 +1229,12 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController, HostPoolGroupConfig]:
     """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
     then the Mamba state pool, which keeps its own host path."""
+    (mamba_info,) = mamba_pool.get_device_pool_infos()
+    mamba_info.buffer_info.validate(layer_ids=mamba_info.layer_ids)
+    # Controller IDs are stage-local; Info IDs follow the physical layer axis.
+    mamba_layer_mapping = {
+        layer - start_layer: index for index, layer in enumerate(mamba_info.layer_ids)
+    }
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
@@ -1270,6 +1280,7 @@ def build_hybrid_mamba_stack(
     )
     mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
+        mamba_info,
         host_size=mamba_host_size,
         layout=mamba_layout,
         mtp_draft_device_pools=params.mtp_draft_mamba_pools,
@@ -1277,7 +1288,7 @@ def build_hybrid_mamba_stack(
     mamba_layer_mapping = with_packed_draft_layer_mapping(
         mamba_layer_mapping,
         transfer_layer_start=transfer_layer_id_max,
-        target_device_layer_num=mamba_pool.num_mamba_layers,
+        target_device_layer_num=len(mamba_info.layer_ids),
         draft_layer_num=len(params.mtp_draft_mamba_pools),
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
@@ -1343,7 +1354,7 @@ def build_hybrid_mamba_swa_stack(
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
     swa_layer_mapping: dict[int, int],
-    mamba_layer_mapping: dict[int, int],
+    start_layer: int,
     page_size: int,
     tp_group,
     load_cache_event,
@@ -1360,6 +1371,12 @@ def build_hybrid_mamba_swa_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    (mamba_info,) = mamba_pool.get_device_pool_infos()
+    mamba_info.buffer_info.validate(layer_ids=mamba_info.layer_ids)
+    # Controller IDs are stage-local; Info IDs follow the physical layer axis.
+    mamba_layer_mapping = {
+        layer - start_layer: index for index, layer in enumerate(mamba_info.layer_ids)
+    }
     transfer_layer_id_max = (
         max(
             full_layer_mapping.keys()
@@ -1398,6 +1415,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
+        mamba_info,
         host_size=mamba_host_size,
         layout=get_memory().hicache_mem_layout,
         mtp_draft_device_pools=params.mtp_draft_mamba_pools,
@@ -1405,7 +1423,7 @@ def build_hybrid_mamba_swa_stack(
     mamba_layer_mapping = with_packed_draft_layer_mapping(
         mamba_layer_mapping,
         transfer_layer_start=transfer_layer_id_max,
-        target_device_layer_num=mamba_pool.num_mamba_layers,
+        target_device_layer_num=len(mamba_info.layer_ids),
         draft_layer_num=len(params.mtp_draft_mamba_pools),
     )
     host_pool_group.add_entry(
@@ -1897,15 +1915,12 @@ class _MambaStrategy(StackStrategy):
         full_layer_mapping = _stage_local_layer_mapping(
             kvcache.full_attention_layer_id_mapping, kvcache.start_layer
         )
-        mamba_layer_mapping = _stage_local_layer_mapping(
-            params.req_to_token_pool.mamba_map, kvcache.start_layer
-        )
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
             decls=kvcache.host_pool_decls(),
             mamba_pool=params.req_to_token_pool.mamba_pool,
             full_layer_mapping=full_layer_mapping,
-            mamba_layer_mapping=mamba_layer_mapping,
+            start_layer=kvcache.start_layer,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             use_mla=kvcache.use_mla,
@@ -2047,9 +2062,6 @@ class _MambaSwaStrategy(StackStrategy):
         enable_storage_metrics=False,
     ):
         full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
-        mamba_layer_mapping = _stage_local_layer_mapping(
-            params.req_to_token_pool.mamba_map, kvcache.start_layer
-        )
         host_pool_group, cache_controller = build_hybrid_mamba_swa_stack(
             params=params,
             full_kv_pool=kvcache.full_kv_pool,
@@ -2057,7 +2069,7 @@ class _MambaSwaStrategy(StackStrategy):
             mamba_pool=params.req_to_token_pool.mamba_pool,
             full_layer_mapping=full_layer_mapping,
             swa_layer_mapping=swa_layer_mapping,
-            mamba_layer_mapping=mamba_layer_mapping,
+            start_layer=kvcache.start_layer,
             page_size=cache.page_size,
             tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
