@@ -145,6 +145,9 @@ _NO_WORKER_POOL_ROUTE = {
     "mimo_v2_asr.py",
     "minicpmv4_6.py",
     "moss_vl.py",
+    # Muse's custom media/artifact pipeline offloads preprocessing to io_executor
+    # in _preprocess_media_async and _run_preprocess_and_build_artifact_batch.
+    "muse_spark_omni.py",
     "nano_nemotron_vl.py",
     "voxtral.py",
     "whisper.py",
