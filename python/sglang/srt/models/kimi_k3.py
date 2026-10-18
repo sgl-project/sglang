@@ -100,8 +100,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -438,6 +438,7 @@ def _uses_ep_a2a() -> bool:
     _a2a_backend = get_moe_a2a_backend()
     return (
         _a2a_backend.is_megamoe()
+        or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
@@ -546,6 +547,7 @@ class KimiK3MoE(nn.Module):
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
         )
@@ -3005,6 +3007,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -3613,10 +3617,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 LOCAL_PREPROCESSED_KEY,
             )
 
-            # Match the configured TP consumer count captured when the
-            # tokenizer creates MmItemMemoryPool. A live attention subgroup
-            # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
@@ -3625,9 +3625,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             for image_index in image_indices:
                 item = items[image_index]
                 if device.type == "cuda":
-                    item.reconstruct(
-                        device_index, ipc_consumer_count=ipc_consumer_count
-                    )
+                    item.reconstruct(device_index)
                 selected_items.append(item)
 
             locally_preprocessed = [
@@ -3763,8 +3761,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return self.mm_projector(image_embeds)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @property
     def start_layer(self) -> int:

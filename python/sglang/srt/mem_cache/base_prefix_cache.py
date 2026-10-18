@@ -505,14 +505,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
-        """Evict cache entries to cover allocator shortfalls.
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
+        """Evict for allocation using shortfalls or joint-reclaim quotas.
 
-        The default implementation preserves the component-count semantics of
-        :meth:`evict`. Multi-component caches backed by shared memory can
-        override this entry point to stop once collateral frees make the
-        requested allocation feasible.
+        Without ``allocation_reclaim_satisfied``, callers pass component
+        shortfalls in ``params``. The default implementation forwards these
+        counts to :meth:`evict`; multi-component caches may stop earlier when
+        collateral frees satisfy the requested allocation.
+
+        With ``allocation_reclaim_satisfied``, ``params`` instead contains
+        cumulative reclaim quotas. Supporting caches may stop at the pure
+        predicate before reaching those quotas. The allocator still owns
+        preparation and the actual capacity check after the walk.
         """
+        if allocation_reclaim_satisfied is not None:
+            raise NotImplementedError("This cache does not support joint reclaim")
         return self.evict(params)
 
     @abstractmethod
@@ -595,6 +607,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether the slots loaded by ``init_load_back`` belong to this cache.
+
+        False means they belong to the request, which inserts them like any
+        computed KV once its forward confirms the load.
+        """
+        return True
+
     def finish_storage_prefetch_admission(
         self,
         handle: CacheRequestHandle,
@@ -668,10 +688,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
-    def swa_reprefill_tail_tokens(self) -> int:
-        # Only the unified_kv compress-only HiCache layout needs to hold back a
-        # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
+        # Caches whose matched SWA is not reusable as is override this.
         return 0
 
     def supports_mamba(self) -> bool:
