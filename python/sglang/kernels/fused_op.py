@@ -166,35 +166,11 @@ def _platform() -> PlatformInfo:
 
 @functools.lru_cache(maxsize=1)
 def _platform_key() -> str:
-    """In-tree platform dispatch key, or ``""`` for plain-native platforms.
+    """In-tree platform dispatch key, or ``""`` for plain-native platforms."""
+    from sglang.srt.platforms import current_platform
 
-    Checked in the same order as the former ``MultiPlatformOp``: CPU counts
-    only when AMX is available (otherwise the pure-torch reference is faster
-    than pretending there is an optimized CPU path).
-    """
-    from sglang.srt.utils import (
-        cpu_has_amx_support,
-        is_cpu,
-        is_cuda,
-        is_hip,
-        is_musa,
-        is_npu,
-        is_xpu,
-    )
-
-    if is_cuda():
-        return "cuda"
-    if is_hip():
-        return "hip"
-    if is_cpu() and cpu_has_amx_support():
-        return "cpu"
-    if is_npu():
-        return "npu"
-    if is_xpu():
-        return "xpu"
-    if is_musa():
-        return "musa"
-    return ""
+    key = current_platform.get_dispatch_key_name()
+    return "" if key == "native" else key
 
 
 @functools.lru_cache(maxsize=1)

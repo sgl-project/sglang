@@ -23,3 +23,6 @@ class MusaSRTPlatform(MusaDeviceMixin, SRTPlatform):
     """Default in-tree MUSA SRT platform."""
 
     capabilities = PlatformCapabilities(supports_triton=True, graph_capture=True)
+
+    def get_dispatch_key_name(self) -> str:
+        return "musa"

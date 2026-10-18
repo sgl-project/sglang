@@ -99,3 +99,6 @@ class XpuSRTPlatform(XpuDeviceMixin, SRTPlatform):
         graph_capture=True,
         piecewise_graph=True,
     )
+
+    def get_dispatch_key_name(self) -> str:
+        return "xpu"

@@ -21,6 +21,7 @@ from sglang.srt.platforms.device_mixin import (
 )
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
@@ -197,6 +198,30 @@ class TestSRTPlatform(CustomTestCase):
                 return True
 
         self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
+
+    def test_in_tree_dispatch_keys(self):
+        cases = [
+            (SRTPlatform, "native"),
+            (CudaSRTPlatform, "cuda"),
+            (RocmSRTPlatform, "hip"),
+            (MusaSRTPlatform, "musa"),
+            (NPUSRTPlatform, "npu"),
+            (XpuSRTPlatform, "xpu"),
+            (MpsSRTPlatform, "native"),
+        ]
+        for platform_cls, key in cases:
+            with self.subTest(platform=platform_cls.__name__):
+                self.assertEqual(platform_cls().get_dispatch_key_name(), key)
+
+    def test_cpu_dispatch_key_requires_amx(self):
+        for has_amx, key in [(True, "cpu"), (False, "native")]:
+            with (
+                self.subTest(has_amx=has_amx),
+                patch(
+                    "sglang.srt.utils.common.cpu_has_amx_support", return_value=has_amx
+                ),
+            ):
+                self.assertEqual(CpuSRTPlatform().get_dispatch_key_name(), key)
 
 
 class TestCudaDeviceMixin(CustomTestCase):
@@ -738,6 +763,16 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         """ROCm exposes torch.cuda, but should not use the CUDA platform identity."""
         mock_torch.cuda.is_available.return_value = True
         mock_torch.version.hip = "6.0"
+
+        import sglang.srt.platforms as plat_mod
+
+        self.assertFalse(plat_mod._is_cuda_available())
+
+    @patch("sglang.srt.platforms.torch")
+    def test_is_cuda_available_requires_a_cuda_build(self, mock_torch):
+        mock_torch.cuda.is_available.return_value = True
+        mock_torch.version.hip = None
+        mock_torch.version.cuda = None
 
         import sglang.srt.platforms as plat_mod
 

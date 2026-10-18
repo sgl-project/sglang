@@ -29,3 +29,6 @@ class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
         piecewise_graph=True,
         hicache_device_kernels=True,
     )
+
+    def get_dispatch_key_name(self) -> str:
+        return "hip"

@@ -34,7 +34,11 @@ _current_platform: SRTPlatform | None = None
 
 
 def _is_cuda_available() -> bool:
-    return bool(torch.cuda.is_available() and torch.version.hip is None)
+    return bool(
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.version.cuda is not None
+    )
 
 
 def _is_rocm_available() -> bool:

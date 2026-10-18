@@ -181,6 +181,24 @@ def test_platform_default_chains(monkeypatch, key, expect):
     assert _CudaOnlyPlatformOp()(torch.zeros(1)) == expect
 
 
+@pytest.mark.parametrize(
+    "platform_key, expect", [("cuda", "cuda"), ("npu", "npu"), ("native", "")]
+)
+def test_in_tree_key_comes_from_the_platform(monkeypatch, platform_key, expect):
+    import sglang.srt.platforms as platforms
+
+    class _Platform:
+        def get_dispatch_key_name(self):
+            return platform_key
+
+    monkeypatch.setattr(platforms, "_current_platform", _Platform())
+    fo.clear_platform_caches()
+    try:
+        assert fo._platform_key() == expect
+    finally:
+        fo.clear_platform_caches()
+
+
 def test_native_fallback_without_any_override(monkeypatch):
     _mock_platform(monkeypatch, key="cuda", info=_CUDA)
     assert _NativeOnlyOp()(torch.zeros(1)) == "native"
