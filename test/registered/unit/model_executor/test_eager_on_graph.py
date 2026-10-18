@@ -1,7 +1,10 @@
 """CPU tests of scoped eager replay without requiring CUDA graph capture."""
 
+import gc
 import sys
+import weakref
 from contextlib import contextmanager
+from contextvars import Context
 from types import SimpleNamespace
 
 import pytest
@@ -104,9 +107,6 @@ def test_plain_callable_and_eager_passthrough():
 
 
 def test_replay_does_not_retain_capture_or_serving_batches():
-    import gc
-    import weakref
-
     class Batch:
         scale = 3
 
@@ -162,12 +162,66 @@ def test_batch_scope_restores_outer_batch_after_exception():
 
 
 def test_batch_scope_is_isolated_between_execution_contexts():
-    from contextvars import Context
-
     with set_forward_batch(SimpleNamespace(scale=2)):
         with pytest.raises(RuntimeError, match="No forward batch"):
             Context().run(get_forward_batch)
         assert get_forward_batch().scale == 2
+
+
+def test_run_eager_binds_instance_and_keeps_one_outer_break():
+    calls = []
+
+    class Layer:
+        def __init__(self, scale):
+            self.scale = scale
+
+        def stub(self, x, *, offset=0):
+            raise AssertionError("run_eager must bypass the capture stub")
+
+        @bcg.eager_on_graph(capture_stub=stub)
+        def inner(self, x, *, offset=0):
+            calls.append(self.scale)
+            return x * self.scale + offset
+
+        @bcg.eager_on_graph
+        def outer(self, x):
+            return self.inner.run_eager(x, offset=1)
+
+    first, second = Layer(2), Layer(5)
+    with recording_capture() as (graph, events):
+        output = first.outer(torch.ones(1))
+    assert events == ["end", "begin"]
+    assert len(graph._break_fns) == 1
+    assert output.item() == 3
+    assert second.inner.run_eager(torch.ones(1), offset=1).item() == 6
+    graph._break_fns[0]()
+    assert calls == [2, 5, 2]
+    assert output.item() == 3
+
+
+def test_run_eager_plain_function_does_not_record_a_break():
+    @bcg.eager_on_graph
+    def increment(x):
+        return x + 1
+
+    with recording_capture() as (graph, events):
+        assert increment.run_eager(torch.tensor(2)).item() == 3
+    assert events == [] and graph._break_fns == []
+
+
+def test_run_eager_method_torch_compile():
+    class Layer(torch.nn.Module):
+        @bcg.eager_on_graph
+        def inner(self, x):
+            return x + 1
+
+        def forward(self, x):
+            return self.inner.run_eager(x)
+
+    layer = Layer()
+    x = torch.ones(2)
+    compiled = torch.compile(layer, backend="eager", fullgraph=True)
+    torch.testing.assert_close(compiled(x), layer(x))
 
 
 if __name__ == "__main__":

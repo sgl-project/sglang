@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 import abc
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
 
 
 class BaseSWAKVPool(KVCache):
@@ -18,6 +23,9 @@ class BaseSWAKVPool(KVCache):
     # Set when SWA KV is a per-request ring of this many tokens (addressed by
     # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.
     swa_req_ring_size: Optional[int] = None
+    # Set when the target keeps SWA KV in per-request window rows (DeepSeek-V4.1
+    # encoder replay) instead of a paged pool; there is no full -> swa mapping.
+    request_window: Optional[RequestWindow] = None
     # Independent draft SWA buffers can consume full-token IDs directly instead
     # of the target SWA allocator's physical IDs. HiCache must preserve that
     # index ownership even though both buffers implement sliding attention.

@@ -13,7 +13,7 @@ use sgl_router::policies_reorg::admission::{
 };
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 use sgl_router::state::kv_events::CacheNamespace;
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
 #[derive(Debug)]
 struct TestPolicy {
@@ -104,7 +104,10 @@ fn registry() -> Arc<WorkerRegistry> {
         ("p", Stage::Prefill, "pd"),
         ("d", Stage::Decode, "pd"),
     ] {
-        workers.add(spec(id, mode, model)).unwrap();
+        let cb = Some(Default::default());
+        workers
+            .add_with_cb(spec(id, mode, model), cb, WireProtocol::default())
+            .unwrap();
     }
     let unhealthy = workers.get(&WorkerId("unhealthy".into())).unwrap();
     for _ in 0..3 {
