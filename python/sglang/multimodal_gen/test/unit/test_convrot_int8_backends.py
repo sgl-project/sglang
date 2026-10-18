@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
     ConvRotInt8ComfyKitchenLinearMethod,
+    comfy_kitchen_available,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
     ConvRotInt8JitLinearMethod,
@@ -217,6 +218,57 @@ def test_gelu_input_helper_is_bitwise_eager_gelu_then_layer():
     fused = apply_convrot_int8_gelu_input(layer=down, x=up)
     eager, _ = down(F.gelu(up, approximate="tanh"))
     assert torch.equal(fused, eager)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and comfy_kitchen_available()),
+    reason="needs CUDA and comfy_kitchen",
+)
+def test_qwen_image21_kitchen_mlp_packs_gate_up_and_folds_swiglu(monkeypatch):
+    """On comfy_kitchen the Qwen-Image 2.1 MLP runs ComfyUI's fused form; once
+    the shared gate/up storage is gone it falls back to separate projections."""
+    from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+        QwenImage21FeedForward,
+    )
+
+    _with_tp(monkeypatch, 1)
+    ffn = QwenImage21FeedForward(
+        1024, 3, ConvRotInt8Config(backend="comfy_kitchen"), "blocks.0.img_mlp"
+    ).cuda()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    for layer in (ffn.gate_layer, ffn.proj, ffn.out):
+        with torch.no_grad():
+            layer.weight.copy_(
+                torch.randn(layer.weight.shape, device="cuda", generator=gen) * 0.02
+            )
+        out_weight = layer.weight.detach().float()  # ends as ffn.out's BF16 weight
+        layer.quant_method.process_weights_after_loading(layer)
+    x = torch.randn(1, 2048, 1024, device="cuda", dtype=torch.bfloat16, generator=gen)
+    gate, up = ffn.gate_layer(x)[0], ffn.proj(x)[0]
+    eager = ffn.out(F.silu(gate) * up)[0]
+
+    ffn.pack_gate_up_weights()
+    assert ffn.packed_gate_up() is not None
+    assert ffn.gate_layer.weight.shape == ffn.proj.weight.shape == (3072, 1024)
+    fused = ffn(x)
+    # The fused quantizer keeps silu(gate) * up in FP32 rather than rounding it
+    # to BF16, so it is not bitwise the eager form; it must be no further (1%
+    # slack) from the FP32 down-projection of the same gate and up.
+    reference = (F.silu(gate.float()) * up.float()) @ out_weight.t()
+
+    def rel_l2(out):
+        err = torch.linalg.vector_norm(out.float() - reference)
+        return (err / torch.linalg.vector_norm(reference)).item()
+
+    assert rel_l2(fused) <= 1.01 * rel_l2(eager), (rel_l2(fused), rel_l2(eager))
+
+    # A CPU round trip rebuilds every parameter on its own; .cuda() re-packs.
+    ffn.cpu().cuda()
+    assert torch.equal(ffn(x), fused)
+
+    ffn.proj.weight.data = ffn.proj.weight.data.clone()
+    assert ffn.packed_gate_up() is None
+    assert torch.equal(ffn(x), eager)
 
 
 class _FakeTpGroup:
