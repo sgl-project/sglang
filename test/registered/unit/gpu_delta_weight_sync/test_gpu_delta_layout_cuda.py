@@ -26,7 +26,7 @@ def _apply_prepared_masks(bindings, masks, derived=()):
         plan_apply,
         prepare_status_check,
     )
-    from sglang.srt.weight_sync.gpu_delta.layout import PreparedDelta, _PreparedBatch
+    from sglang.srt.weight_sync.gpu_delta.receiver import PreparedDelta, _PreparedBatch
 
     outputs, size = [], 0
     for binding, mask in zip(bindings, masks):

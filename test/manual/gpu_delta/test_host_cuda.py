@@ -114,7 +114,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     from sglang.srt.weight_sync.gpu_delta import host as host
     from sglang.srt.weight_sync.gpu_delta import memory as memory
     from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
-    from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool
+    from sglang.srt.weight_sync.gpu_delta.host import HostPayloadPool
 
     os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
     # Exercise the exact capacity-growth algorithm with small oracle tensors.
@@ -164,7 +164,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 if name not in names:
                     continue
                 if name == "raw":
-                    assert bytes(snapshot.get(name).numpy()) == expected[name]
+                    assert bytes(snapshot.get(name)) == expected[name]
                     continue
                 size = (size + 15) // 16 * 16
                 offsets[name] = size

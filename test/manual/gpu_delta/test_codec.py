@@ -16,12 +16,12 @@ import torch
 
 from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
-from sglang.srt.weight_sync.gpu_delta.layout import (
+from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation, device_empty
+from sglang.srt.weight_sync.gpu_delta.receiver import (
     PreparedDelta,
     _plan_decode,
     _PreparedBatch,
 )
-from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation, device_empty
 
 
 def _frame_table(batches):

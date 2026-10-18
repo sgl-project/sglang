@@ -13,7 +13,7 @@ import pytest
 import torch
 import zstandard as zstd
 
-from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool, validate_codec
+from sglang.srt.weight_sync.gpu_delta.host import HostPayloadPool, validate_codec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")

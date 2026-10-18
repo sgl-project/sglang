@@ -1,6 +1,5 @@
 """CPU tests for distributed delta transaction failure boundaries."""
 
-import asyncio
 import io
 import sys
 import threading
@@ -17,7 +16,6 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 from sglang.srt.weight_sync.gpu_delta.session import (
     DeltaSession,
-    GpuDeltaCommunicator,
     GpuDeltaSchedulerControl,
 )
 
@@ -408,27 +406,6 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
     assert control.session is None
 
 
-def test_late_reply_after_cancellation_cannot_acknowledge_resume():
-    async def scenario():
-        sent = []
-        comm = GpuDeltaCommunicator(sent.append, 1)
-        old = asyncio.create_task(comm(SimpleNamespace(rid=None)))
-        await asyncio.sleep(0)
-        old_rid = sent[-1].rid
-        old.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await old
-        resume = asyncio.create_task(comm(SimpleNamespace(rid=None)))
-        await asyncio.sleep(0)
-        comm.handle_recv(SimpleNamespace(rid=old_rid, state="APPLIED"))
-        await asyncio.sleep(0)
-        assert not resume.done()
-        comm.handle_recv(SimpleNamespace(rid=sent[-1].rid, state="RESUMED"))
-        assert (await resume)[0].state == "RESUMED"
-
-    asyncio.run(scenario())
-
-
 def test_clear_drains_release_before_private_close_and_shared_unlink(
     make_session, tmp_path
 ):
@@ -709,7 +686,7 @@ def test_describe_binds_published_scheduler_ranks(
 
         monkeypatch.setitem(
             sys.modules,
-            "sglang.srt.weight_sync.gpu_delta.layout",
+            "sglang.srt.weight_sync.gpu_delta.receiver",
             SimpleNamespace(GpuDeltaBackend=make_backend),
         )
         monkeypatch.setattr(

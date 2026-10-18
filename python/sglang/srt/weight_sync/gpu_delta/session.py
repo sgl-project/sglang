@@ -8,7 +8,6 @@ scheduler thread. Failed or ambiguous updates require restart, never XOR retry.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
 import socket
@@ -22,40 +21,6 @@ from typing import Any
 
 from sglang.srt.weight_sync.gpu_delta import io as delta_io
 from sglang.srt.weight_sync.gpu_delta import profiling
-
-
-class GpuDeltaCommunicator:
-    """Serialize delta controls and correlate replies without blocking generation."""
-
-    def __init__(self, send: Callable, fan_out: int):
-        self._send = send
-        self._fan_out = fan_out
-        self._lock = asyncio.Lock()
-        self._rid = self._event = self._results = self._expected = None
-
-    async def __call__(self, request):
-        async with self._lock:
-            request.rid = self._rid = uuid.uuid4().hex
-            self._event = asyncio.Event()
-            self._results = []
-            self._expected = self._fan_out
-            try:
-                self._send(request)
-                await self._event.wait()
-                return self._results
-            finally:
-                self._rid = self._event = self._results = self._expected = None
-
-    def handle_recv(self, reply):
-        # Canceled requests can still reply after the next control was sent.
-        if self._event is None or reply.rid != self._rid:
-            return
-        self._results.append(reply)
-        if len(self._results) == self._expected:
-            self._event.set()
-
-    def set_fan_out(self, fan_out: int):
-        self._fan_out = fan_out
 
 
 @dataclass
@@ -370,7 +335,7 @@ class GpuDeltaSchedulerControl:
             raise ValueError(error)
         if self.session is None:
             from sglang.srt.weight_sync.gpu_delta.host import host_cache_id
-            from sglang.srt.weight_sync.gpu_delta.layout import GpuDeltaBackend
+            from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
 
             # proc stat starttime is the 22nd field; comm may contain spaces.
             with open("/proc/self/stat") as source:
@@ -389,7 +354,7 @@ class GpuDeltaSchedulerControl:
             backend = GpuDeltaBackend(runner, identity)
             self.session = DeltaSession(identity, backend)
         elif self.session.backend is None:
-            from sglang.srt.weight_sync.gpu_delta.layout import GpuDeltaBackend
+            from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
 
             if self.session._closed_cache is not None:
                 raise ValueError("delta cache removal has not completed")

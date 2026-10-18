@@ -17,7 +17,7 @@ import pytest
 import zstandard as zstd
 
 from sglang.srt.weight_sync.gpu_delta import host as host
-from sglang.srt.weight_sync.gpu_delta.payload import HostPayloadPool
+from sglang.srt.weight_sync.gpu_delta.host import HostPayloadPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -299,8 +299,9 @@ class TestHostSnapshot(unittest.TestCase):
             metrics["host_encoded_cache_access_s"], metrics["host_encoded_cache_wait_s"]
         )
         snapshot = snapshots[0]
+        self.assertIs(snapshot.get("dense").obj, arena.mapping.obj)
         self.assertEqual(
-            {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
+            {name: bytes(snapshot.get(name)) for name in expected}, expected
         )
         follower_metrics = {}
         follower = prepare_snapshot(
@@ -313,7 +314,7 @@ class TestHostSnapshot(unittest.TestCase):
             follower_metrics,
             metadata(),
         )
-        self.assertEqual(bytes(follower.get("dense").numpy()), expected["dense"])
+        self.assertEqual(bytes(follower.get("dense")), expected["dense"])
         self.assertEqual(follower_metrics["host_encoded_cache_hash_files"], 0)
         self.assertEqual(follower_metrics["host_rank_outer_zstd_tensors"], 1)
         follower.close()
@@ -368,7 +369,7 @@ class TestHostSnapshot(unittest.TestCase):
                 metadata(),
             )
             self.assertEqual(
-                {name: bytes(snapshot.get(name).numpy()) for name in expected}, expected
+                {name: bytes(snapshot.get(name)) for name in expected}, expected
             )
             self.assertTrue(arena.skip_payload_hash)
             self.assertEqual(metrics["host_encoded_cache_skip_payload_hash"], 1)

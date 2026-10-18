@@ -2,6 +2,8 @@
 
 import asyncio
 import time
+import uuid
+from collections.abc import Callable
 
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.weight_sync.gpu_delta.io import (
@@ -15,7 +17,40 @@ from sglang.srt.weight_sync.gpu_delta.io import (
     ResumeGpuDeltaReqInput,
     UpdateWeightsFromGpuDeltaReqInput,
 )
-from sglang.srt.weight_sync.gpu_delta.session import GpuDeltaCommunicator
+
+
+class GpuDeltaCommunicator:
+    """Serialize delta controls and correlate replies without blocking generation."""
+
+    def __init__(self, send: Callable, fan_out: int):
+        self._send = send
+        self._fan_out = fan_out
+        self._lock = asyncio.Lock()
+        self._rid = self._event = self._results = self._expected = None
+
+    async def __call__(self, request):
+        async with self._lock:
+            request.rid = self._rid = uuid.uuid4().hex
+            self._event = asyncio.Event()
+            self._results = []
+            self._expected = self._fan_out
+            try:
+                self._send(request)
+                await self._event.wait()
+                return self._results
+            finally:
+                self._rid = self._event = self._results = self._expected = None
+
+    def handle_recv(self, reply):
+        # Canceled requests can still reply after the next control was sent.
+        if self._event is None or reply.rid != self._rid:
+            return
+        self._results.append(reply)
+        if len(self._results) == self._expected:
+            self._event.set()
+
+    def set_fan_out(self, fan_out: int):
+        self._fan_out = fan_out
 
 
 class GpuDeltaTokenizerControl:

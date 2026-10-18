@@ -21,7 +21,7 @@ from sglang.srt.weight_sync.gpu_delta.apply import (
     plan_apply,
 )
 from sglang.srt.weight_sync.gpu_delta.bindings import _direct_binding
-from sglang.srt.weight_sync.gpu_delta.layout import PreparedDelta
+from sglang.srt.weight_sync.gpu_delta.receiver import PreparedDelta
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

@@ -1,16 +1,138 @@
-"""Unified updates retain preparation, mutation and resume failure boundaries."""
+"""GPU-delta HTTP contract and tokenizer transaction coordination, without engines."""
 
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 
+from sglang.srt.managers.io_struct import msgpack_decode, msgpack_encode
+from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware
 from sglang.srt.weight_sync.gpu_delta import io as io
 from sglang.srt.weight_sync.gpu_delta import tokenizer as tokenizer
-from sglang.srt.weight_sync.gpu_delta.session import GpuDeltaCommunicator
+from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
+from sglang.srt.weight_sync.gpu_delta.io import (
+    ClearGpuDeltaStateReqInput,
+    GetGpuDeltaInfoReqInput,
+    GetGpuDeltaStatusReqInput,
+    GpuDeltaReqOutput,
+    UpdateWeightsFromGpuDeltaReqInput,
+)
+from sglang.srt.weight_sync.gpu_delta.tokenizer import GpuDeltaCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+@pytest.fixture
+def http_delta():
+    class CustomRoute(APIRoute):
+        pass
+
+    app = FastAPI()
+    app.router.route_class = CustomRoute
+    state = SimpleNamespace(tokenizer_manager=None)
+    register_gpu_delta_routes(app, lambda: state)
+    add_api_key_middleware(app, api_key="ordinary-key", admin_api_key="admin-key")
+    calls = []
+    reply = {"success": True, "message": "", "participants": []}
+
+    async def dispatch(obj):
+        calls.append(obj)
+        return reply
+
+    # Global state is populated at startup, after the routes are registered.
+    state.tokenizer_manager = SimpleNamespace(
+        gpu_delta=SimpleNamespace(request=dispatch)
+    )
+    with TestClient(app, headers={"Authorization": "Bearer admin-key"}) as client:
+        yield client, app, calls, reply, CustomRoute
+
+
+def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delta):
+    client, app, calls, reply, route_class = http_delta
+    session = {"session_id": "publication-1"}
+    receipts = [
+        {
+            "identity": {"engine_id": "e0", "rank_id": "original"},
+            "state": "APPLIED",
+            "session_id": "publication-1",
+            "target_version": 1,
+        }
+    ]
+    publication = session | {
+        "manifest_path": "/immutable/manifest.json",
+        "manifest_sha256": "a" * 64,
+        "stream_id": "run-1",
+        "base_version": 0,
+        "target_version": 1,
+        "plan_digest": "b" * 64,
+        "participants": [],
+    }
+    cases = [
+        (
+            "update_weights_from_gpu_delta",
+            UpdateWeightsFromGpuDeltaReqInput,
+            publication,
+        ),
+        (
+            "update_weights_from_gpu_delta",
+            UpdateWeightsFromGpuDeltaReqInput,
+            publication
+            | {
+                "release_state": True,
+                "flush_cache": False,
+                "abort_all_requests": True,
+                "weight_version": "actor-42",
+            },
+        ),
+        ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
+        ("get_gpu_delta_info", GetGpuDeltaInfoReqInput, {"engine_id": "e0"}),
+        ("get_gpu_delta_status", GetGpuDeltaStatusReqInput, session),
+    ]
+    assert {route.path for route in app.routes if "gpu_delta" in route.path} == {
+        "/update_weights_from_gpu_delta",
+        "/clear_gpu_delta_state",
+        "/get_gpu_delta_info",
+        "/get_gpu_delta_status",
+    }
+    for name, request_type, payload in cases:
+        route = next(route for route in app.routes if route.path == f"/{name}")
+        assert isinstance(route, route_class)
+        assert route.methods == {"POST"}
+        assert route.endpoint._auth_level is AuthLevel.ADMIN_OPTIONAL
+        rejected = client.post(
+            route.path,
+            json=payload,
+            headers={"Authorization": "Bearer ordinary-key"},
+        )
+        assert rejected.status_code == 401
+        result = client.post(route.path, json=payload)
+        assert result.status_code == 200 and result.json() == reply
+        assert isinstance(calls[-1], request_type)
+        received = msgpack_decode(msgpack_encode(calls[-1]))
+        assert type(received) is request_type
+        assert received == calls[-1]
+    response = GpuDeltaReqOutput(
+        success=True, message="", participant=receipts[0], rid="control-reply"
+    )
+    received = msgpack_decode(msgpack_encode(response))
+    assert type(received) is GpuDeltaReqOutput and received == response
+    assert len(calls) == len(cases)
+    assert calls[0].release_state is False
+    rejected = client.post(
+        "/update_weights_from_gpu_delta", json={"manifest_path": "/manifest.json"}
+    )
+    assert rejected.status_code == 422 and len(calls) == len(cases)
+
+    # A real scheduler failure retains the same typed HTTP route and response.
+    reply.update(success=False, message="delta payload checksum failed")
+    result = client.post("/get_gpu_delta_status", json={"session_id": "p"})
+    assert result.status_code == 409 and result.json() == reply
+    assert len(calls) == len(cases) + 1
 
 
 @pytest.fixture
@@ -344,3 +466,28 @@ def test_cancel_only_aborts_before_apply_and_never_reopens_admission(
         assert not any(isinstance(obj, io.ResumeGpuDeltaReqInput) for obj in calls)
 
     asyncio.run(asyncio.wait_for(run(), timeout=2))
+
+
+def test_late_reply_after_cancellation_cannot_acknowledge_resume():
+    async def scenario():
+        sent = []
+        comm = GpuDeltaCommunicator(sent.append, 1)
+        old = asyncio.create_task(comm(SimpleNamespace(rid=None)))
+        await asyncio.sleep(0)
+        old_rid = sent[-1].rid
+        old.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await old
+        resume = asyncio.create_task(comm(SimpleNamespace(rid=None)))
+        await asyncio.sleep(0)
+        comm.handle_recv(SimpleNamespace(rid=old_rid, state="APPLIED"))
+        await asyncio.sleep(0)
+        assert not resume.done()
+        comm.handle_recv(SimpleNamespace(rid=sent[-1].rid, state="RESUMED"))
+        assert (await resume)[0].state == "RESUMED"
+
+    asyncio.run(scenario())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

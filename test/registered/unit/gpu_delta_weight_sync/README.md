@@ -5,6 +5,13 @@ execution-layout buffers. Small complete-value targets use overwrite semantics.
 It does not requantize weights, change checkpoint loading, replace the ordinary
 allocator, or alter the independent disk update API.
 
+Implementation ownership is explicit: `layout.py` admits immutable canonical
+bindings and consumer identities; `receiver.py` prepares publications and runs
+the fixed DE/apply pipeline. `host.py` owns payload workers, the shared encoded
+cache and rank-local arenas. `tokenizer.py` coordinates the public update and
+correlates internal replies; `session.py` owns scheduler integration and each
+rank's state. HTTP routes and IPC schemas stay in `http.py` and `io.py`.
+
 ## Admission and supported layouts
 
 Canonical names, shapes and dtypes come from the immutable local safetensors
@@ -294,10 +301,12 @@ can overlap, and Async enqueue durations can include GPU backpressure.
 ## Validation
 
 The CPU suite is grouped by contract: `bindings` covers canonical slicing and
-FlashInfer byte maps; `layout`, `apply` and `derived` cover planning/caches and
-consumer updates; `codec_admission` covers ABI/frame geometry and outer decoding.
-Checkpoint, host-cache, memory, session/scheduler, tokenizer and HTTP tests retain
-separate fixtures. The independent CPU model mapping exercises extensibility,
+FlashInfer byte maps; `layout` covers model mapping and consumer admission;
+`receiver` covers preparation, plan caches and the decode/apply lifecycle;
+`apply` and `derived` cover execution planning and consumer updates.
+`codec_admission` covers ABI/frame geometry and outer decoding. The API suite
+groups HTTP routing, tokenizer coordination and reply correlation. Checkpoint,
+host-cache, memory and session/scheduler tests retain separate fixtures. The independent CPU model mapping exercises extensibility,
 not a newly qualified serving model. CPU mocks do not prove CUDA/native behavior.
 
 ```bash

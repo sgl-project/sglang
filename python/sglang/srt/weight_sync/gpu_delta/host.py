@@ -24,8 +24,11 @@ import mmap
 import os
 import re
 import stat
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +36,67 @@ import orjson
 
 from sglang.srt.weight_sync.gpu_delta import profiling
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
+
+
+def validate_codec(manifest):
+    """Admit the authenticated publication codec before examining any tensor payload."""
+    if (
+        manifest.get("codec") not in {"snappy-zstd", "lz4-zstd", "lz4"}
+        or type(manifest.get("frame_bytes")) is not int
+        or not 0 < manifest["frame_bytes"] <= 4 << 20
+    ):
+        raise ValueError(
+            "GPU delta requires a snappy-zstd, lz4-zstd or lz4 codec "
+            "and an integer frame size in (0, 4 MiB]"
+        )
+
+
+def configured_cpu_workers():
+    value = int(os.environ.get("GPU_DELTA_CPU_WORKERS", "32"))
+    if not 1 <= value <= 32:
+        raise ValueError("GPU_DELTA_CPU_WORKERS must be between 1 and 32")
+    return value
+
+
+class HostPayloadPool:
+    """Reusable bounded CPU workers; no CUDA work or shared decoder contexts."""
+
+    def __init__(self, workers):
+        self.workers = workers
+        self.executor = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="gpu-delta-payload"
+        )
+        self.local = threading.local()
+
+    def decode_zstd(self, payload, chunks, destination):
+        if not hasattr(self.local, "decoder"):
+            import zstandard as zstd
+
+            self.local.decoder = zstd.ZstdDecompressor()
+        decoder = self.local.decoder
+        started = time.perf_counter()
+        for chunk in chunks:
+            offset, length = chunk["encoded_offset"], chunk["encoded_bytes"]
+            position, stop = (
+                chunk["decoded_offset"],
+                chunk["decoded_offset"] + chunk["decoded_bytes"],
+            )
+            with decoder.stream_reader(
+                payload[offset : offset + length], read_across_frames=False
+            ) as reader:
+                while position < stop:
+                    count = reader.readinto(destination[position:stop])
+                    if not count:
+                        raise ValueError("truncated outer Zstd decode")
+                    position += count
+                if reader.read(1):
+                    raise ValueError(
+                        "outer Zstd output exceeds its declared tensor span"
+                    )
+        return time.perf_counter() - started
+
+    def close(self):
+        self.executor.shutdown(wait=True)
 
 
 def _cache_base():
@@ -356,6 +420,10 @@ class HostArena:
         self.directory = None
         self.tensor_order = None
 
+    @cached_property
+    def root(self):
+        return _cache_root(self.engine_id)
+
     def _reserve_rank_arena(self, size, metrics):
         import torch
 
@@ -401,7 +469,6 @@ class HostArena:
     ):
         """Admit READY encoded bytes; returned file views own their mmap lease."""
         started = time.perf_counter()
-        root = _cache_root(self.engine_id)
         publication = Path(manifest_path).resolve(strict=True)
         namespace = {
             "stream_id": metadata["stream_id"],
@@ -411,7 +478,7 @@ class HostArena:
             ),
         }
         key = hashlib.sha256(json.dumps(namespace, sort_keys=True).encode()).hexdigest()
-        directory = root / key
+        directory = self.root / key
         if self.directory is not None and self.directory != directory:
             raise ValueError("host cache original cohort or stream changed")
         definitions = {}
@@ -630,7 +697,9 @@ class HostPreparedSnapshot:
 
     def get(self, name):
         record = self.records[name]
-        return self.arena.tensor[record["offset"] : record["offset"] + record["nbytes"]]
+        return self.arena.mapping[
+            record["offset"] : record["offset"] + record["nbytes"]
+        ]
 
     def mark_reusable(self):
         # The tokenizer resumes only after every original engine rank applied. A
