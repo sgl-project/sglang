@@ -237,6 +237,217 @@ class TestNixlPreparation(unittest.TestCase):
         self.assertEqual(state.buffer.update_mask_buffer.call_count, 3)
 
 
+class TestJoinerGraphReuse(unittest.TestCase):
+    def test_fresh_joiner_buffer_sets_reuse_capacity_before_local_capture(self):
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                buffer = Mock(group_size=8)
+                buffer_factory = Mock(return_value=buffer)
+                buffer_factory.get_rdma_size_hint.return_value = 128
+                state = SimpleNamespace(buffer=None, scale_to=None, reuse_graphs=False)
+                barrier = Mock()
+                facade = load_class(
+                    SRT / "layers/moe/token_dispatcher/nixl.py",
+                    "NixlEPBuffer",
+                    {
+                        "dist": SimpleNamespace(
+                            get_rank=lambda group: 0, get_world_size=lambda group: 2
+                        ),
+                        "ElasticEPStateManager": SimpleNamespace(
+                            get_ep_join_rank_offset=lambda: 4
+                        ),
+                        "get_parallel": lambda: SimpleNamespace(max_ep_size=8),
+                        "get_exec": lambda: SimpleNamespace(
+                            moe=SimpleNamespace(
+                                elastic_ep_reuse_cuda_graph=reuse,
+                                is_ep_scale_joiner=True,
+                            )
+                        ),
+                        "get_global_tcp_store": lambda: MemoryStore(),
+                        "_load_nixl_ep": lambda: (buffer_factory, None),
+                        "live_scale_mode": lambda: "split",
+                        "nixl_wired_barrier_via_store": barrier,
+                        "torch": SimpleNamespace(
+                            cuda=SimpleNamespace(synchronize=Mock())
+                        ),
+                        "logger": Mock(),
+                    },
+                    methods={"get_nixl_buffer", "prepare_local_capture"},
+                )
+                facade._state = classmethod(lambda cls: state)
+                facade._connect_ranks = Mock()
+                facade._mask_unwired = Mock()
+                result = facade.get_nixl_buffer(
+                    object(),
+                    128,
+                    SimpleNamespace(
+                        enable_normal=lambda: False, enable_low_latency=lambda: True
+                    ),
+                    num_max_dispatch_tokens_per_rank=64,
+                    num_experts=12,
+                    num_local_experts=2,
+                )
+                self.assertIs(result, buffer)
+                self.assertEqual(state.reuse_graphs, reuse)
+                self.assertEqual(state.dispatch_ep_size, 8 if reuse else 6)
+                self.assertEqual(state.connected_ep_size, 0)
+                facade._connect_ranks.assert_not_called()
+                barrier.assert_not_called()
+                if reuse:
+                    facade._mask_unwired.assert_called_once_with(state, [6, 7])
+                    facade._mask_unwired.reset_mock()
+                    state.staged_ep_size = 6
+                    facade.prepare_local_capture(6, 4)
+                    facade._mask_unwired.assert_called_once_with(
+                        state, [0, 1, 2, 3, 5, 6, 7], strict=True
+                    )
+                    self.assertEqual(state.dispatch_ep_size, 8)
+                    self.assertEqual(state.connected_ep_size, 6)
+                else:
+                    facade._mask_unwired.assert_not_called()
+
+    def test_isolated_capture_masks_every_remote_slot_until_commit(self):
+        state = SimpleNamespace(
+            buffer=Mock(group_size=8),
+            reuse_graphs=True,
+            staged_ep_size=6,
+            dispatch_ep_size=8,
+            connected_ep_size=0,
+            scale_to=None,
+        )
+        facade = load_class(
+            SRT / "layers/moe/token_dispatcher/nixl.py",
+            "NixlEPBuffer",
+            {
+                "get_exec": lambda: SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=True)
+                ),
+                "torch": SimpleNamespace(cuda=SimpleNamespace(synchronize=Mock())),
+                "live_scale_mode": lambda: "split",
+                "logger": logging.getLogger(__name__),
+            },
+            methods={"prepare_local_capture", "on_scale"},
+        )
+        facade._state = classmethod(lambda cls: state)
+        facade._mask_unwired = Mock()
+        facade.prepare_local_capture(6, 4)
+        facade._mask_unwired.assert_called_once_with(
+            state, [0, 1, 2, 3, 5, 6, 7], strict=True
+        )
+        state.buffer.update_mask_buffer.assert_called_once_with(4, False)
+        self.assertEqual(state.dispatch_ep_size, 8)
+        self.assertEqual(state.connected_ep_size, 6)
+        state.buffer.update_mask_buffer.reset_mock()
+        facade.on_scale(4, 6)
+        self.assertEqual(state.dispatch_ep_size, 8)
+        self.assertEqual(
+            [c.args for c in state.buffer.update_mask_buffer.call_args_list],
+            [(r, False) for r in range(6)],
+        )
+        state.staged_ep_size = None
+        with self.assertRaisesRegex(RuntimeError, "completed inactive"):
+            facade.prepare_local_capture(6, 4)
+
+    def test_joiner_commit_enters_same_serving_lifecycle_without_http_request(self):
+        import time
+
+        state = SimpleNamespace(
+            pending_ep_size=None,
+            effective_ep_size=8,
+            has_scaled=False,
+            scale_phase="syncing_new_world",
+            reset=Mock(),
+        )
+        manager = load_class(
+            SRT / "elastic_ep/elastic_ep.py",
+            "ElasticEPStateManager",
+            {"time": time, "_WARMUP_SETTLE_TIMEOUT_S": 60},
+            methods={
+                "commit_scale",
+                "is_shrink_pending",
+                "mark_warming_up",
+                "mark_syncing_new_world",
+                "mark_phase",
+            },
+        )
+        manager._instance = state
+        manager.instance = lambda: state
+        cls = load_class(
+            SRT / "elastic_ep/live_scale.py",
+            "LiveScaleCoordinator",
+            {},
+            methods={"finish_reused_graphs"},
+        )
+        coordinator = cls()
+        graph = SimpleNamespace(num_dp_ranks=4)
+        coordinator.runner = SimpleNamespace(
+            decode_cuda_graph_runner=graph,
+            eager_runner=SimpleNamespace(num_dp_ranks=8),
+            _elastic_scale_ready_barrier=Mock(),
+            _rearm_eplb_after_elastic_scale=Mock(),
+        )
+        coordinator.reuse_snapshot = (1, (1, 2), 1, (1, 2))
+        coordinator.graph_storage_snapshot = lambda: coordinator.reuse_snapshot
+        coordinator.event = Mock()
+        coordinator.report = Mock()
+        modules = {
+            "sglang.srt.elastic_ep.elastic_ep": SimpleNamespace(
+                ElasticEPStateManager=manager
+            ),
+            "sglang.srt.model_executor.model_runner_components.cuda_graph_setup": SimpleNamespace(
+                finalize_cuda_graph_capture=Mock()
+            ),
+        }
+        with patch.dict("sys.modules", modules):
+            coordinator.finish_reused_graphs(8, 4, joiner=True)
+        self.assertIs(coordinator.runner.decode_cuda_graph_runner, graph)
+        self.assertEqual(graph.num_dp_ranks, 8)
+        self.assertTrue(state.has_scaled)
+        self.assertEqual(state.scale_phase, "warming_up")
+        self.assertIsNone(state.pending_ep_size)
+        coordinator.report.assert_called_once_with(complete=True)
+
+    def test_joiner_capture_failure_never_publishes_ready_or_enters_world(self):
+        cls = load_class(
+            SRT / "elastic_ep/live_scale.py",
+            "LiveScaleCoordinator",
+            {},
+            methods={"finish_joiner"},
+        )
+        coordinator = cls()
+        coordinator.reuse_graphs = True
+        coordinator.runner = Mock()
+        coordinator.event = Mock()
+        coordinator.start_preparation = Mock()
+        coordinator.preparation = Mock()
+        coordinator.capture_joiner_graphs = Mock(
+            side_effect=RuntimeError("capture failed")
+        )
+        modules = {
+            "sglang.srt.elastic_ep.elastic_ep": SimpleNamespace(
+                ElasticEPStateManager=Mock()
+            ),
+            "sglang.srt.model_executor.model_runner_components.cuda_graph_setup": SimpleNamespace(
+                finalize_cuda_graph_capture=Mock()
+            ),
+            "sglang.srt.platforms": SimpleNamespace(current_platform=Mock()),
+            "sglang.srt.runtime_context": SimpleNamespace(
+                get_exec=lambda: SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=True)
+                ),
+                get_parallel=lambda: SimpleNamespace(ep_join_rank_offset=4, tp_size=4),
+            ),
+        }
+        with patch.dict("sys.modules", modules):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                coordinator.finish_joiner()
+        coordinator.preparation.mark_ready.assert_not_called()
+        coordinator.runner._initialize_elastic_ep_joiner.assert_not_called()
+        self.assertEqual(
+            coordinator.preparation.store.set.call_args.args[1], b"capture failed"
+        )
+
+
 class TestCaptureProgress(unittest.TestCase):
     def test_serving_turns_between_every_capture_and_largest_first(self):
         spec = importlib.util.spec_from_file_location(
@@ -314,6 +525,7 @@ class TestServingReadiness(unittest.TestCase):
             _finish_joiner_ready=Mock(),
         )
         coordinator.mode = "prepare"
+        coordinator.reuse_graphs = False
         coordinator.event = Mock()
         coordinator.start_preparation = Mock()
         coordinator.preparation = Mock()
@@ -493,7 +705,11 @@ class TestServingReadiness(unittest.TestCase):
             and node.name == "require_mlp_tp_gather"
         )
         parallel = SimpleNamespace(attn_dp_enabled=True, num_dp_ranks=1)
-        moe = SimpleNamespace(is_ep_scale_joiner=True, elastic_ep_backend="mooncake")
+        moe = SimpleNamespace(
+            is_ep_scale_joiner=True,
+            elastic_ep_backend="mooncake",
+            elastic_ep_reuse_cuda_graph=False,
+        )
         namespace = {
             "get_parallel": lambda: parallel,
             "get_exec": lambda: SimpleNamespace(moe=moe),
@@ -513,6 +729,9 @@ class TestServingReadiness(unittest.TestCase):
         with patch.dict("sys.modules", modules):
             gather = namespace["require_mlp_tp_gather"]
             self.assertFalse(gather())
+            moe.elastic_ep_reuse_cuda_graph = True
+            self.assertTrue(gather())
+            moe.elastic_ep_reuse_cuda_graph = False
             parallel.num_dp_ranks = 5
             self.assertTrue(gather())
             parallel.num_dp_ranks = 1

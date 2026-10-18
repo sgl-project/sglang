@@ -636,7 +636,10 @@ class ModelRunner:
         # src 0 matches survivors' _lowest_survivor unless rank 0 is itself a retiree.
         self._broadcast_expert_location(src_rank=0)
         self._fetch_joiner_slot_weights(prior_p2l, global_ep_rank)
-        self._reinit_expert_distribution_recorder(global_ep_rank)
+        self._reinit_expert_distribution_recorder(
+            global_ep_rank,
+            keep_gatherers=self.live_scale is not None and self.live_scale.reuse_graphs,
+        )
         self._apply_joiner_ready(join_effective_ep_size, global_ep_rank)
 
     def _fetch_joiner_slot_weights(
@@ -2436,6 +2439,10 @@ class ModelRunner:
         # The scale-failure path reads this: it has to know whether the width it is
         # reconciling to already landed here before it narrows anything itself.
         self._elastic_applied_width = physical_ep_size
+        if self.live_scale is not None and self.live_scale.reuse_graphs:
+            self.eager_runner.num_dp_ranks = get_parallel().num_dp_ranks
+            if self.decode_cuda_graph_runner is not None:
+                self.decode_cuda_graph_runner.num_dp_ranks = get_parallel().num_dp_ranks
         return dp_size
 
     def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
@@ -2498,7 +2505,14 @@ class ModelRunner:
         )
 
         ElasticEPStateManager.on_scale(effective_size, target_size)
-        self._reinit_expert_distribution_recorder(self._elastic_global_rank())
+        reuse_graphs = (
+            self.live_scale is not None
+            and self.live_scale.reuse_graphs
+            and not is_recover
+        )
+        self._reinit_expert_distribution_recorder(
+            self._elastic_global_rank(), keep_gatherers=reuse_graphs
+        )
 
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
@@ -2515,6 +2529,9 @@ class ModelRunner:
             # Single-writer store: rank 0 publishes the seed the joiner waits on.
             sync_random_seed_via_store(is_source=True)
 
+        if reuse_graphs:
+            self.live_scale.finish_reused_graphs(target_size, effective_size)
+            return
         if (
             self.live_scale is not None
             and not is_recover
@@ -2839,6 +2856,16 @@ class ModelRunner:
             logger.exception(
                 "[Elastic EP] rank=%d %s", self._elastic_global_rank(), error
             )
+            if (
+                self.live_scale is not None
+                and self.live_scale.reuse_graphs
+                and not pending_recover
+            ):
+                # Admission may already have changed routing and NIXL masks.
+                # Replaying retained graphs after a partial rollback is unsafe.
+                raise RuntimeError(
+                    "Live graph reuse activation failed; restart required"
+                ) from exc
             self._fail_scale(error, effective_size)
 
     def _maybe_rebalance_after_rank_fault(

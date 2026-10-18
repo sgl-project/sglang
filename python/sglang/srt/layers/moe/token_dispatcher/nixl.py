@@ -322,6 +322,64 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def initialize_for_live_prepare(cls):
+        Buffer, _ = _load_nixl_ep()
+        if "activate" not in inspect.signature(Buffer.connect_ranks).parameters:
+            raise RuntimeError("Live scale requires NIXL connect_ranks(activate=False)")
+        state = cls._state()
+        if state.initializer is None:
+            raise RuntimeError("Live scale requires a NIXL dispatcher")
+        state.initializer()
+
+    @classmethod
+    def live_layout_signature(cls):
+        state = cls._state()
+        return (
+            state.buffer.group_size,
+            state.hidden_size,
+            state.num_local_experts,
+            state.num_max_dispatch_tokens_per_rank,
+        )
+
+    @classmethod
+    def start_live_prepare(cls, preparation, device):
+        state = cls._state()
+        state.buffer.set_tcp_store_group(preparation.store)
+        first = 0 if preparation.rank >= preparation.old_size else preparation.old_size
+        ranks = list(range(first, preparation.target_size))
+
+        def connect():
+            torch.cuda.set_device(device)
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                state.buffer.connect_ranks(ranks, activate=False)
+            stream.synchronize()
+            state.staged_ep_size = preparation.target_size
+
+        preparation.start(connect)
+
+    @classmethod
+    def prepare_local_capture(cls, target: int, local_rank: int) -> None:
+        """Isolate a staged joiner without changing its capacity-wide layout.
+
+        Do not restore these masks on exit: unmasking belongs to on_scale,
+        after every joiner has finished capture and Mooncake admission starts.
+        """
+        state = cls._state()
+        if not get_exec().moe.is_ep_scale_joiner or not state.reuse_graphs:
+            raise RuntimeError("Local capture is only valid for graph-reuse joiners")
+        if state.staged_ep_size != target:
+            raise RuntimeError("Joiner capture requires completed inactive connections")
+        peers = [r for r in range(state.buffer.group_size) if r != local_rank]
+        cls._mask_unwired(state, peers, strict=True)
+        state.buffer.update_mask_buffer(local_rank, False)
+        torch.cuda.synchronize()
+        # Connections physically exist, but only self is active. Avoid the lazy
+        # connection path activating remote ranks during a dummy forward.
+        state.connected_ep_size = target
+        state.scale_to = target
+
+    @classmethod
     def on_retire(cls, retiree_ranks: list) -> None:
         """Survivor NIXL disconnect (drops peer QPs; contiguous tail assumed)."""
         state = cls._state()
@@ -341,7 +399,7 @@ class NixlEPBuffer:
             state.dispatch_ep_size = tail
 
     @classmethod
-    def _mask_unwired(cls, state, ranks: list) -> None:
+    def _mask_unwired(cls, state, ranks: list, *, strict: bool = False) -> None:
         """Have the transport skip slots the capacity-wide dispatch cannot reach.
 
         Under --elastic-ep-reuse-cuda-graph every rank dispatches at the buffer
@@ -366,38 +424,15 @@ class NixlEPBuffer:
         state.buffer.query_mask_buffer(mask)
         unmasked = [r for r in ranks if r < width and not int(mask[r])]
         if unmasked:
+            if strict:
+                raise RuntimeError(
+                    f"Cannot isolate joiner capture; unmasked peers: {unmasked}"
+                )
             logger.warning(
                 "[Elastic EP][nixl] ranks %s are still unmasked; a capacity-wide "
                 "dispatch will wait on them",
                 unmasked,
             )
-
-    @classmethod
-    def initialize_for_live_prepare(cls):
-        Buffer, _ = _load_nixl_ep()
-        if "activate" not in inspect.signature(Buffer.connect_ranks).parameters:
-            raise RuntimeError("Live scale requires NIXL connect_ranks(activate=False)")
-        state = cls._state()
-        if state.initializer is None:
-            raise RuntimeError("Live scale requires a NIXL dispatcher")
-        state.initializer()
-
-    @classmethod
-    def start_live_prepare(cls, preparation, device):
-        state = cls._state()
-        state.buffer.set_tcp_store_group(preparation.store)
-        first = 0 if preparation.rank >= preparation.old_size else preparation.old_size
-        ranks = list(range(first, preparation.target_size))
-
-        def connect():
-            torch.cuda.set_device(device)
-            stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                state.buffer.connect_ranks(ranks, activate=False)
-            stream.synchronize()
-            state.staged_ep_size = preparation.target_size
-
-        preparation.start(connect)
 
     @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
@@ -509,14 +544,16 @@ class NixlEPBuffer:
         )
         initial_ep_size = offset + world_size
         scale_to = max(initial_ep_size, state.scale_to or 0)
+        state.reuse_graphs = get_exec().moe.elastic_ep_reuse_cuda_graph
         if live_scale_mode() and get_exec().moe.is_ep_scale_joiner:
             state.connected_ep_size = 0
-            state.dispatch_ep_size = scale_to
+            state.dispatch_ep_size = nixl_max_ranks if state.reuse_graphs else scale_to
+            if state.reuse_graphs:
+                cls._mask_unwired(state, list(range(scale_to, nixl_max_ranks)))
             return state.buffer
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
         state.connected_ep_size = scale_to
         state.scale_to = scale_to
-        state.reuse_graphs = get_exec().moe.elastic_ep_reuse_cuda_graph
         if state.reuse_graphs:
             state.dispatch_ep_size = nixl_max_ranks
             cls._mask_unwired(state, list(range(scale_to, nixl_max_ranks)))

@@ -1,7 +1,8 @@
 """Live scale coordinator. All WORLD operations run on the scheduler.
 
 SGLANG_ELASTIC_LIVE_SCALE=prepare overlaps inactive NIXL connection only;
-``split`` also yields to eager serving between target CUDA graph captures.
+``split`` reuses graphs with --elastic-ep-reuse-cuda-graph; otherwise it
+yields to eager serving between target CUDA graph captures.
 The first implementation deliberately requires the non-overlap scheduler.
 """
 
@@ -55,6 +56,11 @@ class LiveScaleCoordinator:
 
         self.runner = runner
         self.mode = live_scale_mode()
+        self.reuse_graphs = (
+            self.mode == "split"
+            and get_exec().moe.elastic_ep_reuse_cuda_graph
+            and runner._elastic_cuda_graph_enabled()
+        )
         self.preparation = None
         self.candidate = None
         self.progress = None
@@ -80,6 +86,18 @@ class LiveScaleCoordinator:
             raise ValueError("Live scale requires attention TP=1, CP=1, DCP=1 and PP=1")
         if runner.spec_algorithm.is_speculative():
             raise ValueError("Live scale does not support speculative decoding")
+        if self.reuse_graphs and (
+            get_parallel().moe_dense_tp_size != 1
+            or not get_parallel().enable_dp_lm_head
+        ):
+            raise ValueError(
+                "Live graph reuse requires dense TP=1 and DP LM head; "
+                "joiner capture must not record cross-cohort collectives"
+            )
+        if self.reuse_graphs and get_exec().moe.ep_dispatch_algorithm == "lp":
+            raise ValueError(
+                "Live graph reuse does not yet support LP dispatch solvers"
+            )
         if envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get():
             raise ValueError("Live scale does not support borrowing graph pool storage")
         if get_exec().overlap.enable_two_batch_overlap:
@@ -151,6 +169,8 @@ class LiveScaleCoordinator:
                 old,
                 target,
                 self.service_steps,
+                get_exec().moe.elastic_ep_reuse_cuda_graph,
+                NixlEPBuffer.live_layout_signature(),
                 resolve_elastic_cuda_graph_config(self.runner).signature(),
             )
         )
@@ -163,6 +183,8 @@ class LiveScaleCoordinator:
             operation_id,
             manifest,
         )
+        if self.reuse_graphs and self.runner._elastic_global_rank() < old:
+            self.reuse_snapshot = self.graph_storage_snapshot()
         self.event("prepare_start", old=old, target=target)
         NixlEPBuffer.start_live_prepare(self.preparation, self.runner.gpu_id)
 
@@ -214,11 +236,21 @@ class LiveScaleCoordinator:
         self.event("joiner_local_ready", old=old, target=target)
         self.start_preparation(old, target)
         self.preparation.wait_connected()
+        if self.reuse_graphs:
+            try:
+                self.capture_joiner_graphs(target)
+            except Exception as exc:
+                self.preparation.store.set(
+                    f"error/{self.preparation.rank}", str(exc).encode()
+                )
+                raise
         current_platform.synchronize()
         self.preparation.mark_ready()
         self.runner._initialize_elastic_ep_joiner()
         ElasticEPStateManager.on_scale(old, target)
-        if self.mode == "split" and self.runner._elastic_cuda_graph_enabled():
+        if self.reuse_graphs:
+            self.finish_reused_graphs(target, old, joiner=True)
+        elif self.mode == "split" and self.runner._elastic_cuda_graph_enabled():
             self.activate(target, old)
         else:
             if self.runner._elastic_cuda_graph_enabled():
@@ -226,6 +258,115 @@ class LiveScaleCoordinator:
             finalize_cuda_graph_capture(self.runner)
             self.runner._finish_joiner_ready(target)
             self.preparation = None
+
+    def capture_joiner_graphs(self, target):
+        """Capture on joiner GPUs while the old cohort keeps replaying its graphs.
+
+        The joiner's scheduler has not entered serving yet. Its TP barriers are
+        cohort-local, DP scheduling has not started, and remote NIXL peers stay
+        masked until the whole cohort commits. No expanded WORLD operation is
+        allowed here. The same buffers and graph entries survive admission.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            capture_decode_graph,
+            refresh_deep_gemm_layout_memory_budget,
+        )
+        from sglang.srt.platforms import current_platform
+
+        mr = self.runner
+        self.event("joiner_capture_start", target=target)
+        started = time.monotonic()
+        NixlEPBuffer.prepare_local_capture(target, mr._elastic_global_rank())
+        refresh_deep_gemm_layout_memory_budget(mr)
+        capture = capture_decode_graph(model_runner=mr)
+        if capture.runner is None:
+            raise RuntimeError("Joiner preparation did not produce decode graphs")
+        current_platform.synchronize()
+        mr.decode_cuda_graph_runner = capture.runner
+        mr.graph_memory_usage["decode"] = capture.memory_usage_gb
+        mr.graph_time_usage["decode"] = capture.capture_time
+        self.reuse_snapshot = self.graph_storage_snapshot()
+        self.event(
+            "joiner_capture_end", target=target, duration=time.monotonic() - started
+        )
+
+    def graph_storage_snapshot(self):
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+        runner = self.runner.decode_cuda_graph_runner
+        if runner is None or runner is self.runner.eager_runner:
+            raise RuntimeError("Live graph reuse requires captured decode graphs")
+        metadata = get_global_expert_location_metadata()
+        pointers = tuple(
+            tensor.data_ptr() if tensor is not None else None
+            for tensor in (
+                metadata.logical_to_all_physical_map,
+                metadata.logical_to_all_physical_map_num_valid,
+                metadata.logical_to_rank_dispatch_physical_map,
+            )
+        )
+        return (
+            id(runner),
+            tuple(id(g) for g in runner.backend._graphs.values()),
+            id(NixlEPBuffer._state().buffer),
+            pointers,
+            # Admission may reload relabelled joiner slots. Such reloads must
+            # copy into captured parameter/scale storage, never replace it.
+            tuple(
+                (name, tensor.data_ptr())
+                for name, tensor in (
+                    *self.runner.model.named_parameters(),
+                    *self.runner.model.named_buffers(),
+                )
+            ),
+        )
+
+    def finish_reused_graphs(self, target, old, *, joiner=False):
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            finalize_cuda_graph_capture,
+        )
+
+        mr = self.runner
+        if (
+            mr.decode_cuda_graph_runner is None
+            or mr.decode_cuda_graph_runner is mr.eager_runner
+        ):
+            raise RuntimeError(
+                "Cannot commit graph reuse without prepared decode graphs"
+            )
+        if self.graph_storage_snapshot() != self.reuse_snapshot:
+            raise RuntimeError(
+                "Graph-facing storage changed during live scale preparation"
+            )
+        if joiner:
+            finalize_cuda_graph_capture(mr)
+            self.joiner_finalized = True
+        # All graph-facing storage was updated in place. Only host bookkeeping
+        # follows the new width; there is no eager interval or graph recapture.
+        mr.decode_cuda_graph_runner.num_dp_ranks = mr.eager_runner.num_dp_ranks
+        # Joiners did not receive the HTTP scale request. Give commit_scale the
+        # same pending target so they enter warming_up/serving_expanded too;
+        # otherwise they skip EPLB's WORLD collectives while survivors enter them.
+        if joiner:
+            ElasticEPStateManager.instance().pending_ep_size = target
+        ElasticEPStateManager.mark_syncing_new_world()
+        ElasticEPStateManager.commit_scale()
+        mr._elastic_scale_ready_barrier(target, "LIVE_GRAPH_REUSE")
+        mr._rearm_eplb_after_elastic_scale()
+        self.old, self.target = old, target
+        self.event(
+            "graphs_reused",
+            target=target,
+            joiner=joiner,
+            graph_count=len(self.reuse_snapshot[1]),
+            storage_preserved=True,
+        )
+        self.event("serving_ready", target=target)
+        self.event("graph_ready", target=target)
+        self.report(complete=True)
 
     def activate(self, target, old):
         import torch.distributed as dist
