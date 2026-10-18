@@ -77,8 +77,11 @@ def _reference(full, dispatch_output):
     return _LinearMoE().apply(full, dispatch_output).hidden_states.sum(1)
 
 
-def _step(num_tokens):
+def _step(num_tokens, padded=False):
+    """A random routing step; ``padded`` marks the first token's entries as padding (-1)."""
     ids = torch.stack([torch.randperm(E)[:TOP_K] for _ in range(num_tokens)]).int()
+    if padded:
+        ids[0] = -1
     weights = torch.rand(num_tokens, TOP_K, dtype=torch.float32)
     x = torch.randn(num_tokens, H, dtype=torch.float32)
     return StandardDispatchOutput(
@@ -90,85 +93,70 @@ def _step(num_tokens):
     )
 
 
-def _paged_layer(contract=CONTRACTS[0]):
-    """A paged method over random experts, loaded into a CPU store."""
-    full = {
-        "w13_weight": torch.randn(E, H, H, dtype=torch.float32),
-        "w2_weight": torch.randn(E, H, H, dtype=torch.float32),
-    }
-    layer = SimpleNamespace(
-        **{
-            name: torch.nn.Parameter(torch.empty_like(t[:K]), requires_grad=False)
-            for name, t in full.items()
-        }
-    )
+def _paged_layer(contract=CONTRACTS[0], extra_params=(), load=True):
+    """A paged method over random experts, its layer created through the base method on a CPU
+    store; ``load`` fills the store with the experts and runs the post-load step."""
+    torch.manual_seed(0)
+    full = {name: torch.randn(E, H, H) for name in ("w13_weight", "w2_weight")}
+
+    class _Base(_LinearMoE):
+        def create_weights(self, layer, num_experts, **kwargs):
+            for name in ("w13_weight", "w2_weight", *extra_params):
+                param = torch.nn.Parameter(
+                    torch.zeros(num_experts, H, H), requires_grad=False
+                )
+                param.quant_method = "block"
+                layer.register_parameter(name, param)
+
     expert_format = UnquantizedFormat()
     expert_format.contract = contract
     method = PagedExpertsMoEMethod(
-        base_method=_LinearMoE(),
-        expert_format=expert_format,
-        num_experts=E,
-        num_resident=K,
+        base_method=_Base(), expert_format=expert_format, num_experts=E, num_resident=K
     )
-    method.store = _CpuStore(
-        layer=layer, names=method.format.paged_params, num_experts=E
-    )
-    for name, t in full.items():
-        method.store.host[name].copy_(t)
-    method.process_weights_after_loading(layer)
+    layer = torch.nn.Module()
+    layer.weight_load_method = None
+    with patch("sglang.srt.layers.moe.paged_experts.method.HostExpertStore", _CpuStore):
+        method.create_weights(
+            layer=layer,
+            num_experts=E,
+            hidden_size=H,
+            intermediate_size_per_partition=H,
+            params_dtype=torch.float32,
+        )
+    if load:
+        for name, t in full.items():
+            method.store.host[name].copy_(t)
+        method.process_weights_after_loading(layer)
     return method, layer, SimpleNamespace(**full)
 
 
 class TestPagedForward(CustomTestCase):
     def test_matches_unpaged(self):
+        """Consecutive steps (which reuse and evict residents), in one wave (1, 2 tokens) or
+        several (64 tokens), with and without padded entries: each output equals the unpaged
+        layer, the slots hold the resident experts, and no wave computes the entries of
+        another (without compaction, every wave would compute all of them)."""
         for contract in CONTRACTS:
-            for num_tokens in (1, 2, 64):  # one wave, one wave, several waves
+            for num_tokens, padded in ((1, False), (2, False), (64, False), (3, True)):
                 with self.subTest(
-                    contract=type(contract).__name__, num_tokens=num_tokens
+                    contract=type(contract).__name__,
+                    num_tokens=num_tokens,
+                    padded=padded,
                 ):
-                    torch.manual_seed(0)
                     method, layer, full = _paged_layer(contract)
-                    for _ in range(8):  # consecutive steps reuse and evict residents
-                        d = _step(num_tokens)
+                    for _ in range(8):
+                        d = _step(num_tokens, padded=padded)
+                        method.base_method.rows = 0
                         out = method.apply(layer=layer, dispatch_output=d).hidden_states
                         torch.testing.assert_close(out, _reference(full, d))
-
-    def test_waves_compute_only_their_entries(self):
-        torch.manual_seed(0)
-        method, layer, _ = _paged_layer(CONTRACTS[0])
-        d = _step(64)
-        method.apply(layer=layer, dispatch_output=d)
-        # Each entry once, plus the padding to a bucketed size; without compaction every wave
-        # would compute all of them (here 4 waves).
-        self.assertLess(method.base_method.rows, 2 * d.topk_output.topk_ids.numel())
-
-    def test_padded_ids_are_masked(self):
-        for contract in CONTRACTS:
-            with self.subTest(contract=type(contract).__name__):
-                torch.manual_seed(0)
-                method, layer, full = _paged_layer(contract)
-                d = _step(3)
-                ids = d.topk_output.topk_ids.clone()
-                ids[1] = -1
-                d = d._replace(topk_output=d.topk_output._replace(topk_ids=ids))
-                out = method.apply(layer=layer, dispatch_output=d).hidden_states
-                weights = d.topk_output.topk_weights.clone()
-                weights[1] = 0
-                masked = d._replace(
-                    topk_output=d.topk_output._replace(
-                        topk_ids=ids.clamp(min=0), topk_weights=weights
-                    )
-                )
-                torch.testing.assert_close(out, _reference(full, masked))
-
-    def test_slots_hold_the_resident_experts(self):
-        torch.manual_seed(0)
-        method, layer, _ = _paged_layer()
-        method.apply(layer=layer, dispatch_output=_step(2))
-        for expert, slot in method.policy.resident.items():
-            torch.testing.assert_close(
-                layer.w2_weight[slot], method.store.host["w2_weight"][expert]
-            )
+                        for expert, slot in method.policy.resident.items():
+                            torch.testing.assert_close(
+                                layer.w2_weight[slot],
+                                method.store.host["w2_weight"][expert],
+                            )
+                        self.assertLess(
+                            method.base_method.rows, 2 * d.topk_output.topk_ids.numel()
+                        )
 
 
 class TestLoading(CustomTestCase):
@@ -180,43 +168,11 @@ class TestLoading(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "transforms w2_weight"):
             method.process_weights_after_loading(layer)
 
-    def _created_layer(self, extra_params=()):
-        """A layer whose expert tensors the paged method created through its base method."""
-
-        class _Base:
-            def create_weights(self, layer, num_experts, **kwargs):
-                for name in ("w13_weight", "w2_weight", *extra_params):
-                    param = torch.nn.Parameter(
-                        torch.zeros(num_experts, H, H), requires_grad=False
-                    )
-                    param.quant_method = "block"
-                    layer.register_parameter(name, param)
-
-        method = PagedExpertsMoEMethod(
-            base_method=_Base(),
-            expert_format=UnquantizedFormat(),
-            num_experts=E,
-            num_resident=K,
-        )
-        layer = torch.nn.Module()
-        layer.weight_load_method = None
-        with patch(
-            "sglang.srt.layers.moe.paged_experts.method.HostExpertStore", _CpuStore
-        ):
-            method.create_weights(
-                layer=layer,
-                num_experts=E,
-                hidden_size=H,
-                intermediate_size_per_partition=H,
-                params_dtype=torch.float32,
-            )
-        return method, layer
-
     def test_host_loader_follows_base_method_and_param_tags(self):
         """Host rows are loaded as natively: the layer's loader follows the wrapped method's
         layout, and sees the parameter's tags (a scale's ``quant_method`` decides its
         layout)."""
-        method, layer = self._created_layer()
+        method, layer, _ = _paged_layer(load=False)
         self.assertIs(layer.weight_load_method, method.base_method)
         self.assertEqual(method.store.host["w2_weight"].shape, (E, H, H))
         method.store.host["w2_weight"].zero_()
@@ -242,7 +198,7 @@ class TestLoading(CustomTestCase):
             _unsupported_derived_weight_cache_error,
         )
 
-        _, layer = self._created_layer()
+        _, layer, _ = _paged_layer(load=False)
         model = torch.nn.Sequential(layer)
         self.assertIn(
             "--enable-paged-experts", _unsupported_derived_weight_cache_error(model)
@@ -251,7 +207,7 @@ class TestLoading(CustomTestCase):
     def test_rejects_undeclared_expert_params(self):
         """A per-expert tensor the format does not declare would never reach the slots."""
         with self.assertRaisesRegex(RuntimeError, "w13_weight_scale"):
-            self._created_layer(extra_params=("w13_weight_scale",))
+            _paged_layer(extra_params=("w13_weight_scale",), load=False)
 
     def test_repack_runs_per_chunk_and_keeps_its_output(self):
         """A post-load step that repacks each expert (new shape, new name) is applied to every
