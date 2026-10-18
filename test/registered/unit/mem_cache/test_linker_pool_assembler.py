@@ -530,19 +530,107 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    def test_mla_mamba_maps_kv_pages_and_state_slots(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        kvcache.start_layer = 0
+        kvcache.full_attention_layer_id_mapping = {1: 0, 3: 1}
+        kvcache.full_kv_pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        kvcache.full_kv_pool.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
+        ]
+        mamba_cache = SimpleNamespace(
+            temporal=torch.zeros((2, 4, 3), dtype=torch.uint8),
+            conv=[torch.zeros((2, 4, 2), dtype=torch.uint8)],
+        )
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(),
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
+                mamba_map={0: 0, 2: 1},
+                mamba_ckpt_pool=None,
+                short_conv_pool=SimpleNamespace(enabled=False),
+                ngram_pool=SimpleNamespace(enabled=False),
+            ),
+        )
+
+        def resolve(dcp_size=1):
+            with (
+                patch.object(
+                    linker_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(enable_unified_memory=False),
+                ),
+                patch.object(
+                    linker_pool_assembler,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                ),
+            ):
+                return resolve_hybrid_device_pool_group(
+                    kvcache=kvcache,
+                    page_size=2,
+                    params=params,
+                    components={ComponentType.FULL, ComponentType.MAMBA},
+                )
+
+        group = resolve()
+        self.assertEqual(group.num_layers, 4)
+        self.assertFalse(group.rank_replicated)
+        kv, mamba = group.entry_map[PoolName.KV], group.entry_map[PoolName.MAMBA]
+        self.assertEqual(kv.layer_mapping, {1: 0, 3: 1})
+        self.assertEqual(mamba.layer_mapping, {0: 0, 2: 1})
+
+        kv_rows = kv.prepare_locations(torch.tensor([2, 3]))
+        self.assertIsNone(kv.get_prepared_layer_range_meta(kv_rows, 0))
+        ptrs, sizes, _ = kv.get_prepared_layer_range_meta(kv_rows, 3)
+        buffer = kvcache.full_kv_pool.kv_buffer[1]
+        self.assertEqual(ptrs, [[buffer.data_ptr() + 2 * 5]])
+        self.assertEqual(sizes, [[10]])
+
+        mamba_rows = mamba.prepare_locations(torch.tensor([3]))
+        ptrs, sizes, offsets = mamba.get_prepared_layer_range_meta(mamba_rows, 2)
+        self.assertEqual(
+            ptrs,
+            [
+                [
+                    mamba_cache.temporal[1].data_ptr() + 3 * 3,
+                    mamba_cache.conv[0][1].data_ptr() + 3 * 2,
+                ]
+            ],
+        )
+        self.assertEqual(sizes, [[3, 2]])
+        self.assertEqual(offsets, [[3, 8]])
+
+        with self.assertRaisesRegex(ValueError, "--dcp-size > 1"):
+            resolve(dcp_size=2)
+        params.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "speculative draft KV"):
+            resolve()
+        params.mtp_draft_device_pools = ()
+        kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        with self.assertRaisesRegex(ValueError, "plain MLA full-attention pool"):
+            resolve()
+
+    def test_unsupported_strategy_fails_with_context(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        kvcache = SWAKVPool.__new__(SWAKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "does not support the direct external linker: _SwaStrategy",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
                 params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.MAMBA},
+                components={ComponentType.FULL, ComponentType.SWA},
             )
 
 

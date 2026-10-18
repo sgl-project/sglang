@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_memory, get_parallel
 
 
 class DevicePoolEntry:
@@ -472,6 +472,23 @@ def _mamba_device_pool_entry(
         _stage_local_layer_mapping,
     )
 
+    # TODO(alphabetc1): support unified memory for hybrid Mamba models.
+    if get_memory().enable_unified_memory:
+        raise ValueError(
+            "The direct external linker does not support --enable-unified-memory "
+            "on hybrid Mamba models yet."
+        )
+    # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
+    if (
+        req_to_token_pool.mamba_ckpt_pool is not None
+        or req_to_token_pool.short_conv_pool.enabled
+        or req_to_token_pool.ngram_pool.enabled
+    ):
+        raise ValueError(
+            "The direct external linker does not support int8 Mamba checkpoints "
+            "or Mamba side states yet."
+        )
+
     mamba_pool = req_to_token_pool.mamba_pool
     mamba_cache = mamba_pool.mamba_cache
     layers = range(mamba_pool.num_mamba_layers)
@@ -501,24 +518,6 @@ def _build_mamba_swa_device_pool_group(
         _swa_layer_mappings,
     )
 
-    # TODO(alphabetc1): support unified memory for hybrid Mamba models.
-    if get_memory().enable_unified_memory:
-        raise ValueError(
-            "The direct external linker does not support --enable-unified-memory "
-            "on hybrid Mamba models yet."
-        )
-    # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
-    req_to_token_pool = params.req_to_token_pool
-    if (
-        req_to_token_pool.mamba_ckpt_pool is not None
-        or req_to_token_pool.short_conv_pool.enabled
-        or req_to_token_pool.ngram_pool.enabled
-    ):
-        raise ValueError(
-            "The direct external linker does not support int8 Mamba checkpoints "
-            "or Mamba side states yet."
-        )
-
     full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
     entries = [
         _mha_device_pool_entry(
@@ -530,6 +529,59 @@ def _build_mamba_swa_device_pool_group(
         _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
+
+
+def _build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _stage_local_layer_mapping,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
+
+    # TODO(alphabetc1): support MHA, DSA, QSA and FP4 full-attention pools.
+    full_kv_pool = kvcache.full_kv_pool
+    if (
+        type(kvcache) is not HybridLinearKVPool
+        or type(full_kv_pool) is not MLATokenToKVPool
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + MAMBA models only with a "
+            f"plain MLA full-attention pool, got {type(kvcache).__name__} over "
+            f"{type(full_kv_pool).__name__}."
+        )
+    # TODO(alphabetc1): support DCP-sharded MLA KV and packed draft KV.
+    if get_parallel().attn_dcp_size > 1:
+        raise ValueError(
+            "The direct external linker does not support --dcp-size > 1 on "
+            "FULL + MAMBA models yet."
+        )
+    if params.mtp_draft_device_pools:
+        raise ValueError(
+            "The direct external linker does not support speculative draft KV "
+            "on FULL + MAMBA models yet."
+        )
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_kv_pool,
+            components=[full_kv_pool.kv_buffer],
+            layer_mapping=_stage_local_layer_mapping(
+                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+            ),
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+    ]
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    # The MLA KV is TP-replicated but the Mamba state is TP-sharded.
     return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
