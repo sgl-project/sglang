@@ -98,7 +98,7 @@ impl FinishReason {
     }
 
     /// `Some((status, message))` when this is an abort carrying the scheduler's
-    /// legacy HTTP status — a request failure the frontend boundary converts
+    /// legacy HTTP status — a request failure the core boundary converts
     /// into a semantic error event. A plain abort (no code) reads as `None`.
     pub fn abort_status(&self) -> Option<(u16, &str)> {
         match self {
@@ -128,7 +128,7 @@ mod tests {
         Some((code, message.to_string()))
     }
 
-    /// The classifier the frontend boundary uses: a validation abort yields its
+    /// The classifier the core boundary uses: a validation abort yields its
     /// `(code, message)` so it can become a semantic failure event; anything
     /// else yields `None`.
     #[test]
