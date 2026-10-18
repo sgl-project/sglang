@@ -164,15 +164,27 @@ def _resolve_metadata_page_ids(
     token_ids,
     mask,
     PAGE_SIZE: tl.constexpr,
+    page_mapping,
+    page_mapping_stride,
     token_mapping=None,
     token_mapping_stride=0,
 ):
-    # Static SWA maps token slots. An absent mapping compiles to an identity.
+    # Static SWA maps token slots; unified pools map pages. Callers supply
+    # the appropriate mapping, and absent mappings compile to an identity.
     if token_mapping is not None:
         token_ids = tl.load(
             token_mapping + token_ids * token_mapping_stride, mask=mask, other=0
         )
     page_ids = token_ids // PAGE_SIZE
+    if page_mapping is not None:
+        page_ids = tl.maximum(
+            tl.load(
+                page_mapping + tl.maximum(page_ids, 0) * page_mapping_stride,
+                mask=mask,
+                other=0,
+            ),
+            0,
+        )
     return page_ids
 
 
@@ -197,12 +209,17 @@ def _fused_decode_metadata_kernel(
     swa_page_table_stride_1,
     full_to_swa_index_mapping,
     full_to_swa_mapping_stride_0,
+    full_v2p,
+    full_v2p_stride_0,
+    swa_v2p,
+    swa_v2p_stride_0,
     B,
     max_seq_pages,
     PAGE_SIZE: tl.constexpr,
     SEQ_LEN_DELTA: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
     SKIP_PAGE_TABLE: tl.constexpr,
+    ZERO_TAIL: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -228,7 +245,7 @@ def _fused_decode_metadata_kernel(
         tl.cdiv(seq_len + SEQ_LEN_DELTA, PAGE_SIZE), max_seq_pages
     )
     col_start = pid_c * BLOCK_COLS
-    if col_start >= num_live_pages:
+    if not ZERO_TAIL and col_start >= num_live_pages:
         return
 
     row_idx = tl.load(req_pool_indices + pid_b * req_pool_indices_stride_0)
@@ -242,11 +259,14 @@ def _fused_decode_metadata_kernel(
         other=0,
         cache_modifier=".cg",
     )
-    full_pages = _resolve_metadata_page_ids(token_ids, live_mask, PAGE_SIZE)
+    store_mask = cols < max_seq_pages if ZERO_TAIL else live_mask
+    full_pages = _resolve_metadata_page_ids(
+        token_ids, live_mask, PAGE_SIZE, full_v2p, full_v2p_stride_0
+    )
     tl.store(
         page_table + pid_b * page_table_stride_0 + cols * page_table_stride_1,
         full_pages,
-        mask=live_mask,
+        mask=store_mask,
         cache_modifier=".cg",
     )
     if swa_page_table is not None:
@@ -254,6 +274,8 @@ def _fused_decode_metadata_kernel(
             token_ids,
             live_mask,
             PAGE_SIZE,
+            swa_v2p,
+            swa_v2p_stride_0,
             full_to_swa_index_mapping,
             full_to_swa_mapping_stride_0,
         )
@@ -262,7 +284,7 @@ def _fused_decode_metadata_kernel(
             + pid_b * swa_page_table_stride_0
             + cols * swa_page_table_stride_1,
             swa_pages,
-            mask=live_mask,
+            mask=store_mask,
             cache_modifier=".cg",
         )
 
@@ -490,30 +512,39 @@ def normal_decode_set_metadata(
     swa_page_table: Optional[torch.Tensor] = None,
     full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     skip_page_table: bool = False,
+    full_v2p: Optional[torch.Tensor] = None,
+    swa_v2p: Optional[torch.Tensor] = None,
+    zero_tail: bool = False,
 ):
     """Fill sequence lengths, their prefix sum and page tables in one launch.
 
-    ``req_to_token`` contains token slots. Static SWA uses
-    ``full_to_swa_index_mapping`` to map FULL token slots to SWA token slots.
-    Runtime callers resolve this tensor from their pool before calling.
+    ``req_to_token`` contains token slots. ``full_v2p`` / ``swa_v2p`` map
+    virtual pages to physical pages; an unbound (-1) page maps to the sink.
+    Static SWA instead uses ``full_to_swa_index_mapping`` to map token slots.
+    Supply exactly one SWA mapping when writing ``swa_page_table``. Mappings
+    are read on device on every invocation, including CUDA graph replay.
 
-    Only the live prefix (ceil((seq_len + delta) / page_size)) is rewritten;
-    consumers must bound reads by ``cache_seqlens_int32``. For pretranslated
-    tables, ``skip_page_table=True`` leaves both page tables untouched and
-    computes only lengths and the prefix sum.
+    Only the live prefix (ceil((seq_len + delta) / page_size)) is rewritten
+    by default; consumers must bound reads by ``cache_seqlens_int32``.
+    ``zero_tail=True`` also clears columns up to ``max_seq_pages`` to zero,
+    independently of address translation. ``skip_page_table=True`` leaves
+    both page tables untouched and computes only lengths and the prefix sum.
     """
     assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
         f"page_size must be a power of two, got {page_size}"
     )
     if swa_page_table is not None and not skip_page_table:
-        assert full_to_swa_index_mapping is not None, (
-            "SWA output requires a token-slot mapping"
+        assert (full_to_swa_index_mapping is None) != (swa_v2p is None), (
+            "SWA output requires exactly one token-slot or page mapping"
         )
 
     batch_size = cache_seqlens_int32.shape[0]
-    # Lengths-only/token gathers use 256 columns; page/SWA gathers use 128.
+    # Lengths-only/unmapped token gathers use 256 columns, other gathers 128.
     block_cols = (
-        256 if skip_page_table or (page_size == 1 and swa_page_table is None) else 128
+        256
+        if skip_page_table
+        or (page_size == 1 and swa_page_table is None and full_v2p is None)
+        else 128
     )
     grid = (
         (1, 1)
@@ -542,12 +573,17 @@ def normal_decode_set_metadata(
         full_to_swa_index_mapping.stride(0)
         if full_to_swa_index_mapping is not None
         else 0,
+        full_v2p,
+        full_v2p.stride(0) if full_v2p is not None else 0,
+        swa_v2p,
+        swa_v2p.stride(0) if swa_v2p is not None else 0,
         batch_size,
         max_seq_pages,
         PAGE_SIZE=page_size,
         SEQ_LEN_DELTA=seq_len_delta,
         BLOCK_COLS=block_cols,
         SKIP_PAGE_TABLE=skip_page_table,
+        ZERO_TAIL=zero_tail,
         num_warps=block_cols // 32,
         num_stages=3,
     )

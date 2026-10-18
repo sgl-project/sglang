@@ -744,17 +744,17 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
         """A fused draft reads its rows through the KV-index translator, which
-        only triton, flashinfer, fa3 and trtllm_mha carry on every draft path.
+        triton, flashinfer, fa3, fa4 and trtllm_mha carry on draft paths.
         The draft's backend is the published one, a model hook's declaration
         included; otherwise it is what the draft runner inherits from the
         target."""
-        declined = self._decide(algorithm="DSPARK", draft_backend="fa4")
+        declined = self._decide(algorithm="EAGLE", draft_backend="flashmla")
         self.assertIsNone(declined.placement)
-        self.assertIn("fa4", declined.declined)
+        self.assertIn("flashmla", declined.declined)
         # A DFLASH-family draft runs the target's prefill backend, or the
         # platform default when that is not a draft backend.
         for target_backends, fuses in (
-            (("fa4", "fa4"), False),
+            (("fa4", "fa4"), True),
             (("fa3", "flashmla"), True),
             (("flashmla", "flashmla"), True),
         ):
@@ -762,6 +762,10 @@ class TestFusedDraftDecision(CustomTestCase):
             self.assertEqual(decision.placement is not None, fuses, target_backends)
         # An EAGLE draft with no backend of its own runs the target's pair.
         self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
+
+    def test_a_fa4_dspark_draft_fuses(self):
+        decision = self._decide(algorithm="DSPARK", draft_backend="fa4")
+        self.assertIsNotNone(decision.placement)
 
     def test_a_trtllm_mha_draft_fuses(self):
         """trtllm_mha refills its graph page table to what each replay reads
