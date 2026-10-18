@@ -275,24 +275,15 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
-def _flat_indexer_break(
-    *, inside_tail, real, x_rows, with_tail=True, extend_num_tokens=20
-):
+def _flat_indexer_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
     """Runs the candidate source's prefill-graph break; returns the request rows
     and positions it scored and the rows it handed to the consumers."""
     seen = {}
-    tail = SimpleNamespace(
-        scatter_indices=torch.zeros(1),
-        # Full-extend positions of the tail rows (two requests of 8 and 12).
-        token_indices=torch.tensor([6, 7, 17, 18, 19, 0, 0, 0]),
-    )
     tail_meta = SimpleNamespace(
-        late_layer_tail=tail,
-        low_ratio_req_indices=torch.tensor([3, 3, 5, 5, 5, 5, 5, 5]),
+        low_ratio_req_indices=torch.tensor([3, 3, 5, 5, 5, 5, 5, 5])
     )
     full_meta = SimpleNamespace(
-        late_layer_tail=None,
-        low_ratio_req_indices=torch.tensor([3] * 8 + [5] * 12 + [5] * 4),
+        low_ratio_req_indices=torch.tensor([3] * 8 + [5] * 12 + [5] * 4)
     )
 
     def make_inputs(layer, x, q_lora, req, pos, forward_batch, rows_per_request):
@@ -304,7 +295,6 @@ def _flat_indexer_break(
 
     backend = SimpleNamespace(
         forward_metadata=tail_meta if inside_tail else full_meta,
-        tail_forward_metadata=tail_meta if with_tail else None,
         _make_low_ratio_prefill_indexer_inputs=make_inputs,
         _prefill_graph_low_ratio_index_captured=lambda: False,
         prefill_candidates=SimpleNamespace(
@@ -345,18 +335,11 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
         self.assertEqual(seen["scored"], 5)
         self.assertEqual(seen["rows"], [0, 1, 2, 3, 4, 4, 4, 4])
 
-    def test_source_before_the_tail_hands_over_the_tail_rows(self):
-        # The source ran over the whole extend; the consumers run on the tail.
-        seen = _flat_indexer_break(inside_tail=False, real=20, x_rows=24)
-        self.assertEqual(seen["req"], [3] * 8 + [5] * 12)
-        self.assertEqual(seen["scored"], 20)
-        self.assertEqual(seen["rows"], [6, 7, 17, 18, 19, 0, 0, 0])
-
     def test_idle_dp_rank_scores_its_fabricated_rows(self):
         # An idle DP-attention rank replays on one dummy request of the padded
         # token count (6 here), inside an 8-row bucket.
         seen = _flat_indexer_break(
-            inside_tail=False, real=0, x_rows=8, with_tail=False, extend_num_tokens=6
+            inside_tail=False, real=0, x_rows=8, extend_num_tokens=6
         )
         self.assertEqual(seen["scored"], 6)
         self.assertEqual(seen["req"], [3] * 6)

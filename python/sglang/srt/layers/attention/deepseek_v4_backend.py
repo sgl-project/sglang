@@ -3896,19 +3896,9 @@ class DeepseekV4AttnBackend(
         assert isinstance(published, _SparsePrefillTable), (
             "candidate source published no sparse table"
         )
-        tail_meta = self.tail_forward_metadata
-        tail = tail_meta.late_layer_tail if tail_meta is not None else None
-        if (
-            tail is not None
-            and tail.scatter_indices is not None
-            and self.forward_metadata is not tail_meta
-        ):
-            # The source ran over the whole extend; the consumers run on the tail.
-            rows = tail.token_indices
-        else:
-            # x holds the rows the consumers run on (the whole bucket, or the
-            # tail block): live rows first, padding rows read row 0
-            rows = torch.arange(x.shape[0], device=x.device).clamp_max(real - 1)
+        # x holds the rows the consumers run on (the whole bucket, or the tail
+        # block): live rows first, padding rows read row 0
+        rows = torch.arange(x.shape[0], device=x.device).clamp_max(real - 1)
         table = published.tail_rows(rows)
         out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
         if is_capturing():
