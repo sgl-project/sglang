@@ -377,6 +377,9 @@ def test_off_gpu_worker_reports_zero_and_detach_is_a_noop(monkeypatch):
         worker_token=gen.generator,
     )
     assert patcher.loaded_size() == 0
+    # ComfyUI frees model_size() - loaded_size() on its own GPU before load.
+    assert patcher.model_size() == 0
+    assert patcher.clone().model_size() == 0
     patcher.detach()
     assert sent == []
     assert not gen.worker_asleep

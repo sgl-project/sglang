@@ -81,7 +81,14 @@ class SGLDModelPatcher(ModelPatcher):
         that (e.g. ``clone()``, which does pass `self.size` through, or old
         callers), so every model type gets consistent VRAM accounting
         instead of just the two that happened to have a table entry.
+
+        A worker on another GPU needs no room on ComfyUI's GPU, so report 0
+        (as `loaded_size` does); otherwise ComfyUI evicts its own models.
         """
+        if self.worker is not None and not getattr(
+            self.worker, "shares_comfy_gpu", True
+        ):
+            return 0
         if self.size:
             return self.size
         return self.model_size_dict.get(self.model_type, 0)
