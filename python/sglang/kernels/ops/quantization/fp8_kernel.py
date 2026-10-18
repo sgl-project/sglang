@@ -112,6 +112,27 @@ else:
 fp8_min = -fp8_max
 
 
+def saturate_to_fp8_range(value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Clamp to the representable range of ``dtype``, leaving NaN untouched.
+
+    The two FP8 types disagree on overflow. ``float8_e4m3fn`` saturates to its
+    max finite value, but ``float8_e4m3fnuz`` has no infinity, so its eager cast
+    returns NaN (``0x80``) for every magnitude at or above 256.0. Clamping first
+    gives both types the saturating behaviour, which keeps the fused Triton
+    commit kernel and the eager fallback byte-identical on ROCm and avoids
+    writing NaN into a committed KV slot.
+
+    Note this is the *representable* limit from ``torch.finfo``, not the
+    conservative ``fp8_max`` above: clamping at 224.0 would pull values that
+    eager rounds to 240.0 down a step and lose precision.
+    """
+    limit = torch.finfo(dtype).max
+    # clamp propagates NaN rather than folding it onto a bound: the CUDA/ROCm
+    # kernel returns the input early for NaN, and the CPU one leaves it to
+    # std::min/std::max, which return the NaN operand.
+    return value.clamp(-limit, limit)
+
+
 @triton.jit
 def _per_token_group_quant_8bit(
     # Pointers to inputs and output
@@ -214,6 +235,9 @@ def _per_token_group_quant_8bit_raw(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -251,14 +275,22 @@ def _per_token_group_quant_8bit_raw(
         bit8_max = info.max
         bit8_min = info.min
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=False,
+    x_q = (
+        output_q
+        if output_q is not None
+        else torch.empty_like(x, device=x.device, dtype=dtype)
+    )
+    x_s = (
+        output_s
+        if output_s is not None
+        else create_per_token_group_quant_fp8_output_scale(
+            x_shape=x.shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+        )
     )
 
     M = x.numel() // group_size
@@ -573,6 +605,9 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ):
     assert x.shape[-1] % group_size == 0, (
         "the last dimension of `x` cannot be divisible by `group_size`"
@@ -588,18 +623,34 @@ def sglang_per_token_group_quant_fp8(
         # Whole-row group quant is per-token quant; route to the dedicated
         # kernel (same [T, 1] scale shape) instead of a group kernel that
         # would need arbitrary group sizes.
-        return sglang_per_token_quant_fp8(x)
+        if output_q is not None and output_q.dtype != fp8_dtype:
+            return _per_token_group_quant_8bit_raw(
+                x,
+                group_size,
+                dtype=output_q.dtype,
+                output_q=output_q,
+                output_s=output_s,
+            )
+        return sglang_per_token_quant_fp8(x, output_q=output_q, output_s=output_s)
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=out_shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
+    x_q = (
+        output_q
+        if output_q is not None
+        else torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+    )
+    x_s = (
+        output_s
+        if output_s is not None
+        else create_per_token_group_quant_fp8_output_scale(
+            x_shape=out_shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+        )
     )
 
     if x.shape[0] > 0:
@@ -764,15 +815,26 @@ def sglang_per_token_group_quant_8bit(
 def sglang_per_token_quant_fp8(
     x: torch.Tensor,
     dtype: torch.dtype = fp8_dtype,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ):
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = torch.empty(
-        x.shape[0],
-        1,
-        device=x.device,
-        dtype=torch.float32,
+    x_q = (
+        output_q
+        if output_q is not None
+        else torch.empty_like(x, device=x.device, dtype=dtype)
+    )
+    x_s = (
+        output_s
+        if output_s is not None
+        else torch.empty(
+            x.shape[0],
+            1,
+            device=x.device,
+            dtype=torch.float32,
+        )
     )
 
     sgl_per_token_quant_fp8(x, x_q, x_s)

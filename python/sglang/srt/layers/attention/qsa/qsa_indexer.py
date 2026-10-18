@@ -27,7 +27,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_npu
 
@@ -503,14 +503,18 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
     ) -> torch.Tensor:
+        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
+        # their scores, and never reads past a row's length.
+        use_fast_topk = not _is_npu and q.is_cuda and self.block_topk == 512
         logits = qsa_mqa_decode(
             q,
             compressed_cache,
             compressed_page_table,
             compressed_lengths,
             max_model_len,
+            min_scored_len=self.block_topk if use_fast_topk else 0,
         )
-        if not _is_npu and logits.is_cuda and self.block_topk == 512:
+        if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.attention.fast_topk import fast_topk
