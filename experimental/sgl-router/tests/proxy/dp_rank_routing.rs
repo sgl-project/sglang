@@ -245,6 +245,29 @@ async fn a_request_expiring_before_decode_aborts_its_prefill() {
 }
 
 #[tokio::test]
+async fn a_failed_decode_frees_its_slot() {
+    let prefill = MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let decode =
+        MockWorker::start_returning_error(StatusCode::INTERNAL_SERVER_ERROR, json!({})).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let app = router(one_decode_slot(), &workers, Default::default());
+    let start = Instant::now();
+    for _ in 0..2 {
+        assert_eq!(
+            send_together(&app, 1, false).await,
+            [StatusCode::INTERNAL_SERVER_ERROR]
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a failed decode kept its slot"
+    );
+}
+
+#[tokio::test]
 async fn round_robin_gives_decode_ranks_turns() {
     let (prefill, decode) = (
         MockWorker::start(vec![]).await,

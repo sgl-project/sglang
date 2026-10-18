@@ -259,6 +259,7 @@ async fn dispatch<T: Transport>(
     let stream_abort = CancellationToken::new();
     let decode_slot = (pd.is_some() && ctx.decode_gate.is_enabled() && engine_rid.is_some())
         .then(DecodeSlot::default);
+    let mut unanswered = ReleaseOnDrop(decode_slot.clone());
     let (response_worker, response_leg, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
@@ -273,6 +274,8 @@ async fn dispatch<T: Transport>(
                 stream_abort.clone(),
                 decode_slot.clone(),
             );
+            // Counted from arrival, so decode selection sees requests waiting here.
+            let decode_load = decode.load_guard();
             if let Some(slot) = &decode_slot {
                 let mut abort = ctx.proxy.abort_on_drop(
                     &prefill.url,
@@ -287,6 +290,7 @@ async fn dispatch<T: Transport>(
                     prefill_rank,
                     request_started_at,
                     slot,
+                    &stream_abort,
                 )
                 .await?;
                 abort.disarm();
@@ -295,7 +299,7 @@ async fn dispatch<T: Transport>(
                 .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
                 .flatten();
             let decode_load_guards = (
-                decode.load_guard(),
+                decode_load,
                 ctx.router_inflight_load.register_aged(
                     decode.id.clone(),
                     decode.url.clone(),
@@ -353,6 +357,9 @@ async fn dispatch<T: Transport>(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
+        unanswered.0 = None;
+    }
     // A 2xx stream is already the client's; any other success or client error is final too.
     let retryable = matches!(
         dispatch_outcome::<T>(&result),
@@ -386,19 +393,33 @@ async fn admit_decode(
     rank: Option<u32>,
     request_started_at: Instant,
     slot: &DecodeSlot,
+    prefill_failed: &CancellationToken,
 ) -> Result<(), ApiError> {
     let budget = ctx
         .router_inflight_load
         .stale_request_timeout()
         .saturating_sub(request_started_at.elapsed());
     let admit = ctx.decode_gate.admit(&prefill.id, rank, slot);
-    tokio::time::timeout(budget, admit).await.map_err(|_| {
-        ctx.metrics
-            .record_stale_request(StaleRequestOutcome::Expired);
-        ApiError::StaleRequestExpired {
-            model: request.model.0.clone(),
+    tokio::select! {
+        admitted = tokio::time::timeout(budget, admit) => admitted.map_err(|_| {
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            ApiError::StaleRequestExpired {
+                model: request.model.0.clone(),
+            }
+        }),
+        () = prefill_failed.cancelled() => Ok(()),
+    }
+}
+
+struct ReleaseOnDrop(Option<DecodeSlot>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(slot) = &self.0 {
+            slot.release();
         }
-    })
+    }
 }
 
 fn release_on_first_byte(
