@@ -104,6 +104,7 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ("fast_h3", {"attention_backend": "video_sparse_attn_h3"}, True),
         ("vdn_h3", {"quantization": "fp8", "cache_mode": "cache_dit"}, True),
         ("qwen_image21", {"quantization": "convrot_int8"}, False),
+        ("qwen_image21", {"int8_gemm": "sglang_jit"}, False),
     ],
 )
 def test_preflight_accepts_supported_combinations(
