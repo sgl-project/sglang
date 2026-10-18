@@ -204,6 +204,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     custom_params: Optional[Any] = None
     beam_width: Optional[int] = None
     watermark: Optional[WatermarkRequestConfig] = None
+    ngram_corpus_ids: Optional[StringList] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -903,7 +904,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark", "ngram_corpus_ids",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -964,6 +965,8 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
         elif key == "watermark":
             kw["watermark"] = None if x is None else decode_WatermarkRequestConfig(x)
+        elif key == "ngram_corpus_ids":
+            kw["ngram_corpus_ids"] = None if x is None else decode_StringList(x)
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -1024,6 +1027,8 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["beam_width"] = v.beam_width
     if v.watermark is not None:
         d["watermark"] = encode_WatermarkRequestConfig(v.watermark)
+    if v.ngram_corpus_ids is not None:
+        d["ngram_corpus_ids"] = encode_StringList(v.ngram_corpus_ids)
     return d
 
 
