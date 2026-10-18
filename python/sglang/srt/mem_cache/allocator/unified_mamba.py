@@ -349,6 +349,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
+    def prewarm_compaction(self) -> None:
+        """Prewarm the page-move path of every member that compacts."""
+        for allocator in self._move_gate_targets():
+            allocator.prewarm_compaction()
+
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
 
