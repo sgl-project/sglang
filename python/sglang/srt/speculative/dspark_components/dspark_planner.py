@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import msgspec
 import torch
@@ -22,6 +22,10 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
+from sglang.srt.speculative.acceptance_estimator import (
+    AcceptancePrediction,
+    OnlineAcceptanceEstimator,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -50,6 +54,11 @@ from sglang.srt.utils.invariants import (
     expect,
     resolve_level,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.adaptive_verify_scheduler import (
+        AdaptiveVerifyScheduler,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +98,13 @@ class DSparkVerifyPlanner:
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        self._acceptance_estimator = (
+            OnlineAcceptanceEstimator(num_steps=self.gamma, device=device)
+            if get_spec().speculative_adaptive_verification
+            and get_spec().speculative_adaptive_verification_confidence == "estimator"
+            else None
+        )
+        self._adaptive_scheduler: Optional[AdaptiveVerifyScheduler] = None
 
         sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
@@ -136,15 +152,16 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if self._confidence_head is None and self._acceptance_estimator is None:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
                     f"schedules per-request verify lengths from the draft confidence "
                     f"head, but this DSpark draft checkpoint has no confidence head -- "
                     f"the checkpoint is wrong/incomplete (it ships no "
                     f"enable_confidence_head + trained confidence_head weights). Use a "
-                    f"draft checkpoint that includes the confidence head, or run "
-                    f"SGLANG_RAGGED_VERIFY_MODE=static."
+                    f"draft checkpoint that includes the confidence head, pass "
+                    f"--speculative-adaptive-verification to estimate acceptance "
+                    f"online, or run SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -207,7 +224,45 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return (
+            self._confidence_head is not None or self._acceptance_estimator is not None
+        )
+
+    def predict_confidence(
+        self, *, head_confidence: Optional[torch.Tensor], draft_top_probs
+    ) -> tuple[Optional[torch.Tensor], Optional[AcceptancePrediction]]:
+        if self._acceptance_estimator is None:
+            return head_confidence, None
+        features, predictions = self._acceptance_estimator.predict(draft_top_probs)
+        return predictions, AcceptancePrediction(
+            features=features, predictions=predictions
+        )
+
+    def observe_accept(
+        self,
+        *,
+        prediction: Optional[AcceptancePrediction],
+        num_correct_drafts: torch.Tensor,
+        layout: Optional[RaggedVerifyLayout],
+    ) -> None:
+        if prediction is None:
+            return
+        verify_lens = (
+            torch.full_like(num_correct_drafts, self.verify_num_draft_tokens)
+            if layout is None
+            else layout.verify_lens
+        )
+        self._acceptance_estimator.observe(
+            features=prediction.features,
+            predictions=prediction.predictions,
+            num_correct_drafts=num_correct_drafts,
+            verify_lens=verify_lens,
+        )
+        if (
+            self._adaptive_scheduler is not None
+            and self._adaptive_scheduler.should_log()
+        ):
+            self._adaptive_scheduler.log_state(estimator=self._acceptance_estimator)
 
     @property
     def schedules_verify_budget(self) -> bool:
@@ -241,10 +296,48 @@ class DSparkVerifyPlanner:
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
         )
 
+    def attach_adaptive_scheduler(self, scheduler: AdaptiveVerifyScheduler) -> None:
+        self._adaptive_scheduler = scheduler
+
+    @property
+    def has_adaptive_scheduler(self) -> bool:
+        return self._adaptive_scheduler is not None
+
+    def begin_adaptive_step(self) -> Optional[torch.cuda.Event]:
+        if self._adaptive_scheduler is None:
+            return None
+        return self._adaptive_scheduler.begin_step()
+
+    def end_adaptive_step(
+        self,
+        *,
+        start: Optional[torch.cuda.Event],
+        num_reqs: int,
+        layout: Optional[RaggedVerifyLayout],
+    ) -> None:
+        if self._adaptive_scheduler is not None:
+            self._adaptive_scheduler.end_step(
+                start=start, num_reqs=num_reqs, layout=layout
+            )
+
     def prepare_verify_budget(
         self, batch: ScheduleBatch, future_map: FutureMap
     ) -> None:
         draft_input = batch.spec_info
+        if self._adaptive_scheduler is not None:
+            if (
+                draft_input is None
+                or batch.forward_mode.is_extend()
+                or batch.is_extend_in_batch
+                or batch.batch_size() > self._adaptive_scheduler.max_num_reqs
+            ):
+                self._adaptive_scheduler.note_non_decode_step()
+                return
+            draft_input.verify_token_budget = self._adaptive_scheduler.plan_budget(
+                req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                resolved=future_map.resolve_confidence_cpu(batch, wait=True),
+            )
+            return
         if self._budget_planner is None:
             return
         if draft_input is None:
@@ -331,6 +424,11 @@ class DSparkVerifyPlanner:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
+        if self._adaptive_scheduler is not None:
+            draft_input.verify_token_budget = self._adaptive_scheduler.plan_budget_now(
+                req_pool_indices_cpu=req_pool_indices.cpu(), confidence=confidence
+            )
+            return draft_input.verify_token_budget
 
         # No collective: the budget derives only from the broadcast draft tokens
         # (via confidence), replicated req_generation, and the static sps table.
@@ -380,6 +478,14 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if self._adaptive_scheduler is not None:
+            if confidence is None:
+                return None
+            return self._adaptive_scheduler.schedule_layout(
+                confidence=confidence,
+                verify_token_budget=budget,
+                num_reqs=int(req_pool_indices.shape[0]),
+            )
         if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
@@ -962,6 +1068,7 @@ class HostConfidenceBudgetPlanner:
         generation: torch.Tensor,
         current_generation: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
+        sps_table: Optional[Union[SpsCostTable, SpsAdditiveCostTable]] = None,
     ) -> int:
         lagged_confidence, lagged_generation = self._shift_to_lag(
             confidence=confidence,
@@ -981,7 +1088,7 @@ class HostConfidenceBudgetPlanner:
             return forced_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
-            sps_table=self.sps_table,
+            sps_table=self.sps_table if sps_table is None else sps_table,
             cfg=self.cfg,
         )
         self.last_decision = decision

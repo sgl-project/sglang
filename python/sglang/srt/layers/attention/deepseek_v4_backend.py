@@ -1283,6 +1283,7 @@ class DeepseekV4AttnBackend(
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
+        self._ragged_verify_graphs_per_bs = get_spec().speculative_adaptive_verification
         if self.speculative_num_draft_tokens is not None:
             # Allocated eagerly: a lazy buffer first created inside inference_mode
             # would forbid the in-place updates graph capture performs outside it.
@@ -1346,12 +1347,17 @@ class DeepseekV4AttnBackend(
         self,
         bs: int,
         ragged_layout: Optional[RaggedVerifyLayout],
-    ) -> Tuple[int, int]:
-        return compute_target_verify_graph_key(
+    ) -> Tuple[Union[int, Tuple[int, int]], int]:
+        graph_key, num_tokens = compute_target_verify_graph_key(
             bs=bs,
             num_draft_tokens=self.speculative_num_draft_tokens,
             ragged_layout=ragged_layout,
         )
+        # Adaptive verification captures ragged tiers per padded bs, so a token
+        # count alone collides with a uniform bs or another bs's tier.
+        if ragged_layout is not None and self._ragged_verify_graphs_per_bs:
+            return (bs, graph_key), num_tokens
+        return graph_key, num_tokens
 
     def _make_target_verify_c128_metadata(
         self,
@@ -3271,7 +3277,7 @@ class DeepseekV4AttnBackend(
             and not self.is_dspark_draft
             and layer.compress_ratio in (1, 2)
             and layer.compressor.use_fused_compress
-            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and resolve_ragged_verify_layout(forward_batch) is None
             and self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 1
             and x.shape[0]

@@ -171,6 +171,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"(--speculative-algorithm {cfg.speculative_algorithm})"
         )
 
+    if cfg.speculative_adaptive_verification and cfg.speculative_algorithm not in (
+        "EAGLE",
+        "EAGLE3",
+        "DSPARK",
+    ):
+        raise ValueError(
+            "--speculative-adaptive-verification supports EAGLE / EAGLE3 / NEXTN / "
+            f"DSPARK, got --speculative-algorithm {cfg.speculative_algorithm}."
+        )
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(
@@ -622,6 +632,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         raise ValueError(
             "DSpark speculative decoding only supports CUDA, NPU or XPU device."
         )
+    if cfg.speculative_adaptive_verification:
+        _validate_adaptive_verification(server_args)
 
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
@@ -1205,6 +1217,42 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
+        )
+
+    if cfg.speculative_adaptive_verification:
+        _validate_adaptive_verification(server_args)
+
+
+def _validate_adaptive_verification(server_args: ServerArgs) -> None:
+    from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
+
+    view = resolved_view(server_args)
+    is_dspark = view.speculative_algorithm == "DSPARK"
+    unsupported = {
+        "speculative_algorithm EAGLE/EAGLE3/NEXTN/DSPARK": is_dspark
+        or view.speculative_algorithm in ("EAGLE", "EAGLE3"),
+        "--speculative-eagle-topk 1": is_dspark or view.speculative_eagle_topk == 1,
+        "SGLANG_RAGGED_VERIFY_MODE=compact under DSPARK": not is_dspark
+        or ragged_verify_compact_enabled(),
+        "--speculative-adaptive-verification-confidence estimator unless DSPARK": (
+            is_dspark
+            or view.speculative_adaptive_verification_confidence == "estimator"
+        ),
+        "CUDA": not get_platform().is_hip and view.device == "cuda",
+        "no --speculative-adaptive": not view.speculative_adaptive,
+        "no --enable-multi-layer-eagle": not view.enable_multi_layer_eagle,
+        "no --speculative-use-rejection-sampling": (
+            not view.speculative_use_rejection_sampling
+        ),
+        "pp_size == 1": view.pp_size == 1,
+        "no DP attention": not attn_dp_enabled_of(view),
+        "no --enable-two-batch-overlap": not view.enable_two_batch_overlap,
+        "no SGLANG_SIMULATE_ACC_LEN": float(envs.SGLANG_SIMULATE_ACC_LEN.get()) <= 0,
+    }
+    missing = [name for name, ok in unsupported.items() if not ok]
+    if missing:
+        raise ValueError(
+            "--speculative-adaptive-verification requires " + ", ".join(missing)
         )
 
 
