@@ -4667,6 +4667,124 @@ class ServingChatTestCase(CustomTestCase):
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
         )
 
+    @staticmethod
+    def _partial_stream_result():
+        return {
+            "text": "partial",
+            "meta_info": {
+                "id": "chatcmpl-stream",
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": None,
+                "weight_version": "default",
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+
+    def _stream_that_raises(self, exc):
+        async def _mock_generate():
+            yield self._partial_stream_result()
+            raise exc
+
+        self.tm.generate_request.return_value = _mock_generate()
+        return self._run_chat_stream(Mock(), self.stream_req)
+
+    def test_streaming_unexpected_exception_ends_with_error_frame(self):
+        # Any exception after the stream started ends it with an error frame and
+        # [DONE]; the exception's text is not sent.
+        chunks = self._stream_that_raises(RuntimeError("internal detail"))
+
+        self.assertIn('"content":"partial"', "".join(chunks))
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        error = json.loads(chunks[-2][len("data: ") :])["error"]
+        self.assertEqual(
+            error,
+            {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": None,
+                "code": None,
+            },
+        )
+        self.assertNotIn("internal detail", "".join(chunks))
+
+    def test_streaming_value_error_keeps_its_message(self):
+        chunks = self._stream_that_raises(ValueError("bad request detail"))
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        error = json.loads(chunks[-2][len("data: ") :])["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["message"], "bad request detail")
+
+    def test_streaming_exception_frame_without_envelope(self):
+        # A serving that keeps the flat ErrorResponse gets a 500 frame in that shape.
+        with (
+            patch.object(self.chat, "openai_error_envelope", False),
+            self.assertLogs(level="ERROR"),
+        ):
+            try:
+                raise RuntimeError("detail")
+            except RuntimeError as e:
+                frame = json.loads(self.chat.create_streaming_exception_response(e))
+        self.assertEqual(
+            frame,
+            {
+                "error": {
+                    "object": "error",
+                    "message": "Internal server error",
+                    "type": "InternalServerError",
+                    "param": None,
+                    "code": 500,
+                }
+            },
+        )
+
+    def test_exception_before_first_chunk_is_not_streamed(self):
+        # Before HTTP 200 is sent, errors still take the HTTP error path.
+        def _raising_generate(exc):
+            async def _mock_generate():
+                raise exc
+                yield
+
+            return _mock_generate()
+
+        self.tm.generate_request.return_value = _raising_generate(
+            ValueError("context too long")
+        )
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(Mock(), self.stream_req, Mock())
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"]["message"], "context too long"
+        )
+
+        # Any other exception reaches handle_request's catch-all: a 500.
+        self.tm.generate_request.return_value = _raising_generate(
+            RuntimeError("internal detail")
+        )
+        with patch.object(
+            self.chat,
+            "_convert_to_internal_request",
+            return_value=(Mock(), self.stream_req),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(self.stream_req, Mock())
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": None,
+                "code": None,
+            },
+        )
+
     def test_non_streaming_extension_fields_emit_sglext_without_meta_info(self):
         req = ChatCompletionRequest(
             model="x",

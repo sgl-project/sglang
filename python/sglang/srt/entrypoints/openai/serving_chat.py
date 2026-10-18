@@ -2800,10 +2800,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
-        except ValueError as e:
+        except Exception as e:
             if not stream_started:
                 raise
-            error = self.create_streaming_error_response(str(e))
+            error = self.create_streaming_exception_response(e)
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"

@@ -256,6 +256,20 @@ class OpenAIServingBase(ABC):
         )
         return json.dumps({"error": error.model_dump()})
 
+    def create_streaming_exception_response(self, e: Exception) -> str:
+        """Error frame for an exception raised after a stream has started.
+
+        Classified as handle_request classifies an exception before the stream:
+        a ValueError keeps its message (status 400); any other exception is
+        logged and reported as a generic server error (status 500).
+        """
+        if isinstance(e, ValueError):
+            return self.create_streaming_error_response(str(e))
+        logger.exception(f"Error while streaming a response: {e!r}")
+        return self.create_streaming_error_response(
+            "Internal server error", err_type="InternalServerError", status_code=500
+        )
+
     def extract_custom_labels(self, raw_request):
         if (
             not self.allowed_custom_labels

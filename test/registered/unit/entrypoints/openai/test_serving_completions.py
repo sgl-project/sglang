@@ -415,6 +415,56 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(response.choices[0].logprobs.token_logprobs, [-0.1])
         self.assertEqual(response.choices[0].logprobs.top_logprobs, [])
 
+    def _stream_that_raises(self, exc):
+        async def _mock_generate(*args, **kwargs):
+            yield {
+                "text": "Partial ",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                },
+                "index": 0,
+            }
+            raise exc
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=8, stream=True)
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream())
+        self.assertIn('"text":"Partial "', chunks[0])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        return chunks, json.loads(chunks[-2][len("data: ") :])["error"]
+
+    def test_streaming_unexpected_exception_does_not_leak_its_text(self):
+        chunks, error = self._stream_that_raises(RuntimeError("internal detail"))
+        self.assertEqual(
+            error,
+            {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": None,
+                "code": None,
+            },
+        )
+        self.assertNotIn("internal detail", "".join(chunks))
+
+    def test_streaming_value_error_keeps_its_message(self):
+        _, error = self._stream_that_raises(ValueError("bad request detail"))
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["message"], "bad request detail")
+
     def test_streaming_token_ids_deltas_cover_output_exactly(self):
         req = CompletionRequest(
             model="x",

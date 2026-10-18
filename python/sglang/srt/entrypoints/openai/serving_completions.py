@@ -500,7 +500,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         except Exception as e:
             if not stream_started:
                 raise
-            error = self.create_streaming_error_response(str(e))
+            error = self.create_streaming_exception_response(e)
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
