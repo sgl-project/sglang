@@ -193,10 +193,16 @@ def test_multimodal_hash_collision_does_not_reuse_image_kv(
     _insert(core, keys[0], list(range(cached_len)))
 
     same = core.match_prefix(MatchPrefixParams(key=_key(keys[0])))
-    assert same.device_indices.tolist() == list(range(cached_len))
+    assert same.device_prefix_len == cached_len
+    assert _path_indices(core, same.last_device_node).tolist() == list(
+        range(cached_len)
+    )
     different = core.match_prefix(MatchPrefixParams(key=_key(keys[1])))
     text_hit_len = prefix_len // page_size * page_size
-    assert different.device_indices.tolist() == list(range(text_hit_len))
+    assert different.device_prefix_len == text_hit_len
+    assert _path_indices(core, different.last_device_node).tolist() == list(
+        range(text_hit_len)
+    )
 
 
 @pytest.mark.parametrize("instance_backend", [None, "rust"])
