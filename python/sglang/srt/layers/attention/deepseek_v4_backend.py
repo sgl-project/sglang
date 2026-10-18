@@ -235,13 +235,15 @@ def _maybe_precompute_flashmla_sched_meta(
     if not _fast_flashmla_sched_shape(q):
         return
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        MAX_SMEM_BYTES,
         META_INTS,
         flashmla_sched_meta,
+        sched_meta_smem_bytes,
     )
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
-    if 4 * (5 * b + 1 + num_sm_parts * META_INTS) > 48 * 1024:
+    if sched_meta_smem_bytes(batch_size=b, num_sm_parts=num_sm_parts) > MAX_SMEM_BYTES:
         return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)

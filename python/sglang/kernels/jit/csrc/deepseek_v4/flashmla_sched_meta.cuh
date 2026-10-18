@@ -27,6 +27,9 @@ namespace flashmla {
 // the two per-end split flags, one pad word.
 constexpr int kMetaInts = 8;
 constexpr int kBlockSize = 256;
+// Per-block scalars in the dynamic allocation: warp sums, total blocks, first idle part.
+// Mirrored by sched_meta_smem_bytes in ops/attention/dsv4/flashmla_sched_meta.py.
+constexpr int kScratchInts = kBlockSize / 32 + 2;
 
 struct Params {
   int b;
@@ -54,14 +57,16 @@ __device__ __forceinline__ int ceil_to_i(int a, int b) {
 __global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_constant__ const Params p) {
   extern __shared__ int smem[];
   const int b = p.b;
-  int* num_blocks_shared = smem;                   // [b]
-  int* num_splits_shared = smem + b;               // [b + 1]
-  int* seqlens_k_shared = smem + b * 2 + 1;        // [b]
-  int* first_block_idx_shared = smem + b * 3 + 1;  // [b]
-  int* last_block_idx_shared = smem + b * 4 + 1;   // [b]
-  int* out_shared = smem + b * 5 + 1;              // [num_sm_parts * kMetaInts]
-
-  __shared__ int total_num_blocks_shared;
+  int* num_blocks_shared = smem;                           // [b]
+  int* num_splits_shared = smem + b;                       // [b + 1]
+  int* seqlens_k_shared = smem + b * 2 + 1;                // [b]
+  int* first_block_idx_shared = smem + b * 3 + 1;          // [b]
+  int* last_block_idx_shared = smem + b * 4 + 1;           // [b]
+  int* out_shared = smem + b * 5 + 1;                      // [num_sm_parts * kMetaInts]
+  int* scratch = out_shared + p.num_sm_parts * kMetaInts;  // [kScratchInts]
+  int* warp_sums = scratch;                                // [kBlockSize / 32]
+  int& total_num_blocks_shared = scratch[kBlockSize / 32];
+  int& first_idle_part_shared = scratch[kBlockSize / 32 + 1];
 
   int partial = 0;
   for (int i = threadIdx.x; i < b; i += kBlockSize) {
@@ -91,7 +96,6 @@ __global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_
   for (int offset = 16; offset >= 1; offset /= 2) {
     partial += __shfl_xor_sync(uint32_t(-1), partial, offset);
   }
-  __shared__ int warp_sums[kBlockSize / 32];
   if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = partial;
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -104,7 +108,6 @@ __global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_
   __syncthreads();
 
   const int fixed_overhead_num_blocks = p.fixed_overhead_num_blocks;
-  __shared__ int first_idle_part_shared;
 
   if (threadIdx.x == 0) {
     const int payload = ceil_div_i(total_num_blocks_shared, p.num_sm_parts) + fixed_overhead_num_blocks;
@@ -268,7 +271,7 @@ void flashmla_sched_meta(
       num_sm_parts,
   };
 
-  const std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts);
+  const std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts + kScratchInts);
   RuntimeCheck(smem <= 48 * 1024, "schedule does not fit in shared memory: ", smem, " bytes");
   LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_sched_meta_kernel, p);
 }

@@ -163,6 +163,47 @@ def test_extra_cache_schedule(b: int, topk: int, extra_topk: int):
     assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
 
 
+def _max_batch(num_sm_parts):
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        MAX_SMEM_BYTES,
+        sched_meta_smem_bytes,
+    )
+
+    b = 1
+    while (
+        sched_meta_smem_bytes(batch_size=b + 1, num_sm_parts=num_sm_parts)
+        <= MAX_SMEM_BYTES
+    ):
+        b += 1
+    return b
+
+
+def test_largest_admitted_schedule_launches(monkeypatch):
+    """Every batch the precompute admits must launch: the size check has to
+    count all of the kernel's shared memory, not just the schedule arrays."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as backend
+
+    monkeypatch.setattr(backend, "_fast_flashmla_sched_shape", lambda q: True)
+    monkeypatch.setattr(backend, "_num_sms", lambda _: 148)
+    topk = 128
+    for b in range(2400, 0, -1):
+        meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
+        backend._maybe_precompute_flashmla_sched_meta(
+            meta,
+            q=SimpleNamespace(shape=(b, 1, H_Q, D_QK), device=torch.device("cuda")),
+            indices=SimpleNamespace(shape=(b, 1, topk)),
+            topk_length=torch.full((b,), topk, device="cuda", dtype=torch.int32),
+            extra_indices=None,
+            extra_topk_length=None,
+        )
+        if meta.tile_scheduler_metadata is not None:
+            break
+    torch.cuda.synchronize()
+    assert meta.num_splits[-1].item() >= b
+
+
 def test_precompute_skips_oversized_schedule(monkeypatch):
     from types import SimpleNamespace
 
@@ -170,8 +211,8 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
 
     monkeypatch.setattr(backend, "_fast_flashmla_sched_shape", lambda q: True)
     monkeypatch.setattr(backend, "_num_sms", lambda _: 148)
-    max_batch = (48 * 1024 // 4 - 1 - 148 * 8) // 5
-    for b in (max_batch + 1, 5000, 16384):
+    assert _max_batch(148) == 2218
+    for b in (_max_batch(148) + 1, 5000, 16384):
         meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
         backend._maybe_precompute_flashmla_sched_meta(
             meta,

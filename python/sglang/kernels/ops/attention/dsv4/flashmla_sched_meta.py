@@ -13,6 +13,14 @@ if TYPE_CHECKING:
 
 # sizeof(DecodingSchedMeta) / 4, fixed by FlashMLA's params.h.
 META_INTS = 8
+# kScratchInts in flashmla_sched_meta.cuh.
+_SCRATCH_INTS = 10
+# The kernel launches without opting in to more dynamic shared memory.
+MAX_SMEM_BYTES = 48 * 1024
+
+
+def sched_meta_smem_bytes(*, batch_size: int, num_sm_parts: int) -> int:
+    return 4 * (5 * batch_size + 1 + num_sm_parts * META_INTS + _SCRATCH_INTS)
 
 
 @cache_once
@@ -40,8 +48,8 @@ def flashmla_sched_meta(
 
     Produces the schedule FlashMLA computes for itself when handed no metadata,
     so passing the filled tensors as the cached ``tile_scheduler_metadata`` /
-    ``num_splits`` lets it skip its own kernel. The schedule has to fit in 48 KB
-    of shared memory, ``4 * (5 * batch_size + 1 + 8 * num_sm_parts)`` bytes, so
+    ``num_splits`` lets it skip its own kernel. The schedule has to fit in
+    ``MAX_SMEM_BYTES`` of shared memory, sized by ``sched_meta_smem_bytes``, so
     a few thousand requests at most.
 
     Args:
