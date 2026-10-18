@@ -183,7 +183,9 @@ class TestMultiTokenizerMixin(CustomTestCase):
         threshold = [700, 10, 1000]
         server_args = mock.Mock(gc_threshold=threshold)
         timeline = mock.Mock()
-        execution = mock.Mock(moe=mock.Mock(is_ep_scale_joiner=False))
+        execution = mock.Mock(
+            moe=mock.Mock(is_ep_scale_joiner=False, is_ep_offset_joiner=False)
+        )
         with (
             get_context().override_server_args(
                 checkpoint_engine_wait_weights_before_ready=False,

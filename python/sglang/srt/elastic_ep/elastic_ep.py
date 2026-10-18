@@ -1093,7 +1093,7 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _is_mooncake_pg(pg) -> bool:
+def is_mooncake_pg(pg) -> bool:
     try:
         return torch.distributed.get_backend(pg) in ("mooncake", "mooncake-cpu")
     except Exception:
@@ -1685,7 +1685,7 @@ def _mooncake_membership_targets(global_ranks: List[int]) -> List[tuple]:
     targets = []
     world_backend = torch.distributed.group.WORLD
     world_ranks = parallel_state.get_world_backend_ranks()
-    if world_ranks and _is_mooncake_pg(world_backend):
+    if world_ranks and is_mooncake_pg(world_backend):
         local = _map_global_to_group_local_ranks(world_ranks, global_ranks)
         if local:
             targets.append(("WORLD", world_backend, local))
@@ -1694,7 +1694,7 @@ def _mooncake_membership_targets(global_ranks: List[int]) -> List[tuple]:
         if not local:
             continue
         for pg in (group.device_group, group.cpu_group):
-            if pg is not None and pg is not world_backend and _is_mooncake_pg(pg):
+            if pg is not None and pg is not world_backend and is_mooncake_pg(pg):
                 targets.append((group.unique_name, pg, local))
     return targets
 

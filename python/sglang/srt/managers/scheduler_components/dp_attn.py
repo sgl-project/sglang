@@ -282,13 +282,21 @@ class MLPSyncBatchInfo:
             # Mooncake refuses this while it digests a rank fault, and this gather is
             # the first thing a tick does, so the refusal lands before anything has
             # converged the view. Non-Mooncake backends re-raise unchanged.
-            from sglang.srt.elastic_ep.elastic_ep import mooncake_all_gather_settling
+            # The retry is safe only for one collective. exchange_sync_rows posts a
+            # gather then a broadcast on a CPU group wider than two ranks, and a retry
+            # after the gather completed would repost it against peers already in the
+            # broadcast, so Mooncake keeps the single all-gather.
+            from sglang.srt.elastic_ep.elastic_ep import (
+                is_mooncake_pg,
+                mooncake_all_gather_settling,
+            )
 
+            gather = all_gather_single if is_mooncake_pg(group) else exchange_sync_rows
             mooncake_all_gather_settling(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
-                gather=all_gather_single,
+                gather=gather,
             )
 
         tp_info = global_info_tensor.view(
