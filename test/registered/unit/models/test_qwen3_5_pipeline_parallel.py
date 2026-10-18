@@ -27,6 +27,7 @@ class _RecordingParam(torch.nn.Parameter):
     def weight_loader(self, param, loaded_weight, shard_id=None):
         self.loaded_weights.append((loaded_weight, shard_id))
 
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -178,9 +179,7 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
 
     @staticmethod
     def _make_conditional_generation_stub(quant_config=None, params=None):
-        model = Qwen3_5ForConditionalGeneration.__new__(
-            Qwen3_5ForConditionalGeneration
-        )
+        model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(
             tie_word_embeddings=False,
@@ -315,4 +314,3 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
