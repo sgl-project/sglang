@@ -297,7 +297,7 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_token_num=self.forward_width,
         )
 
-        return ForwardBatch(
+        forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=len(prefix_lens),
             input_ids=input_ids,
@@ -312,6 +312,8 @@ class UnoWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_hidden_states_before_norm=False,
         )
+        self.model_runner.kv_index_translator.bind_own_plan(forward_batch)
+        return forward_batch
 
     def _run_target_block(
         self,

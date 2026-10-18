@@ -357,9 +357,6 @@ class ConvRotInt8Config(QuantizationConfig):
                 len(self.selected_by_backend[COMFY_KITCHEN]),
             )
 
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
     def quantizes_embedding(self, prefix: str) -> bool:
         return self.layer_markers is not None and is_comfy_int8_embedding(
             self.layer_markers.get(prefix)

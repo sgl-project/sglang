@@ -333,6 +333,29 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
 @torch.no_grad()
+def test_cuda_video_condition_key_covers_every_byte():
+    cache = ConditioningCache(256 * 1024 * 1024)
+    vae = VAE().eval()
+    # image followed by zero frames, large enough for the sparse block digest
+    video = torch.zeros(1, 3, 9, 512, 512, device="cuda")
+    video[:, :, 0] = torch.rand(1, 3, 512, 512, device="cuda")
+    negative_zero = video.clone()
+    negative_zero[0, 1, 5, 7, 7] = -0.0
+    last_byte = video.clone()
+    last_byte.view(-1)[-1] = 1
+    shifted = torch.roll(video, shifts=1, dims=2)
+    with cache.scope():
+        expected = vae.encode(video).latent_dist.mean
+        hit = vae.encode(video.clone()).latent_dist.mean
+        for changed in (negative_zero, last_byte, shifted):
+            vae.encode(changed)
+    torch.testing.assert_close(hit, expected, rtol=0, atol=0)
+    assert vae.calls == 4
+    assert cache.hits == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
+@torch.no_grad()
 def test_cuda_cache_hit_does_not_wait_for_unrelated_gpu_work():
     cache = ConditioningCache(4096)
     model = Encoder().eval()
