@@ -1055,6 +1055,10 @@ class ModelConfig:
             "InternS2PreviewForConditionalGeneration",
             "InternS2MobiusForConditionalGeneration",
         ]:
+            # The target shares this config; isolate all draft rewrites,
+            # including the InternS2 expert layout, before modifying it.
+            self.hf_config = copy.deepcopy(self.hf_config)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
             if (
                 self.hf_config.architectures[0]
                 == "InternS2MobiusForConditionalGeneration"
@@ -1070,6 +1074,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
             self.hf_text_config.num_nextn_predict_layers = 1
+            # Layer allocation follows layer_types, so shrink it together with
+            # the depth to give the MTP draft exactly one full-attention layer.
+            self.hf_text_config.num_hidden_layers = 1
+            self.hf_text_config.layer_types = ["full_attention"]
+            self.hf_text_config.full_attention_interval = 1
 
         if is_draft_model and self.hf_config.architectures[0] in (
             "ExaoneMoEForCausalLM",

@@ -312,6 +312,43 @@ def _compile_exclusion_pattern(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern.replace(".", r"\.").replace("*", r".*"))
 
 
+def _visual_layer_prefix_candidates(prefix: str) -> Tuple[str, ...]:
+    """Match both checkpoint and runtime names of Qwen vision linears."""
+    candidates = [prefix]
+    if prefix.startswith("model.visual."):
+        candidates.append(prefix.removeprefix("model."))
+    elif prefix.startswith("visual."):
+        candidates.append("model." + prefix)
+    else:
+        return (prefix,)
+
+    for candidate in tuple(candidates):
+        if candidate.endswith(".attn.qkv_proj"):
+            candidates.append(candidate.removesuffix("_proj"))
+        elif candidate.endswith(".attn.qkv"):
+            candidates.append(candidate + "_proj")
+    return tuple(candidates)
+
+
+def _modelopt_layer_name_mapper(hf_to_sglang_mapper: WeightsMapper) -> WeightsMapper:
+    """Preserve runtime vision QKV names while mapping layer metadata."""
+    substr_mapping = hf_to_sglang_mapper.orig_to_new_substr
+    if (
+        substr_mapping.get("attn.qkv") != "attn.qkv_proj"
+        or "attn.qkv_proj" in substr_mapping
+    ):
+        return hf_to_sglang_mapper
+
+    from sglang.srt.models.utils import WeightsMapper
+
+    # WeightsMapper picks the longest matching substring. Keep the runtime
+    # name from matching the shorter checkpoint alias a second time, without
+    # changing the model's mapper or its prefix/suffix mappings.
+    return hf_to_sglang_mapper | WeightsMapper(
+        orig_to_new_substr={"attn.qkv_proj": "attn.qkv_proj"}
+    )
+
+
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -366,6 +403,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
         # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
         if self.exclude_modules:
+            hf_to_sglang_mapper = _modelopt_layer_name_mapper(hf_to_sglang_mapper)
             mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
             expanded: List[str] = []
             for name in mapped:
@@ -389,7 +427,7 @@ class ModelOptQuantConfig(QuantizationConfig):
             return False
 
         # Build prefix variants: some models wrap layers under "language_model."
-        prefixes_to_check = [prefix]
+        prefixes_to_check = list(_visual_layer_prefix_candidates(prefix))
         if prefix.startswith("language_model."):
             prefixes_to_check.append(prefix.removeprefix("language_model."))
 
@@ -968,6 +1006,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        hf_to_sglang_mapper = _modelopt_layer_name_mapper(hf_to_sglang_mapper)
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_sglang_mapper.apply_dict(
@@ -1008,7 +1047,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> Tuple[str, ...]:
-        candidates = [prefix]
+        candidates = list(_visual_layer_prefix_candidates(prefix))
+
+        if len(candidates) > 1:
+            return tuple(candidates)
 
         if prefix.endswith(".lm_head"):
             candidates.append("lm_head")
@@ -1476,9 +1518,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
         is_awq: bool = False,
+        quantized_layers: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
+        # Optional per-layer metadata lets models distinguish quantized vision
+        # and draft modules from checkpoints that keep those modules in BF16.
+        self.quantized_layers = quantized_layers or {}
         if is_checkpoint_nvfp4_serialized:
             logger.info("Detected nvfp4 checkpoint.")
         self.is_awq = is_awq
@@ -1629,7 +1675,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get("ignore", config.get("exclude_modules", []))
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
@@ -1673,9 +1719,55 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             config.get("packed_modules_mapping"),
             is_awq="AWQ" in quant_method,
             use_per_token_activation=(False if quant_method == "W4A16_NVFP4" else None),
+            quantized_layers=(
+                config.get("quantized_layers")
+                or (config.get("quantization") or {}).get("quantized_layers")
+            ),
         )
         quant_config.is_w4a16 = quant_method == "W4A16_NVFP4"
         return quant_config
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        hf_to_sglang_mapper = _modelopt_layer_name_mapper(hf_to_sglang_mapper)
+        super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        if self.quantized_layers:
+            self.quantized_layers = hf_to_sglang_mapper.apply_dict(
+                self.quantized_layers
+            )
+
+    def _is_auxiliary_layer_quantized(self, prefix: str, *, is_moe: bool) -> bool:
+        candidates = _visual_layer_prefix_candidates(prefix)
+        if any(candidate in self.quantized_layers for candidate in candidates):
+            return True
+
+        proj_name = prefix.rsplit(".", 1)[-1]
+        if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
+            bases = _visual_layer_prefix_candidates(prefix.rsplit(".", 1)[0])
+            shards = self.packed_modules_mapping[proj_name]
+            listed = [
+                any(f"{base}.{shard}" in self.quantized_layers for base in bases)
+                for shard in shards
+            ]
+            if any(listed) and not all(listed):
+                raise ValueError(
+                    f"Partial quantized_layers metadata for fused layer {prefix}. "
+                    "All shards must use the same quantization."
+                )
+            return bool(listed) and all(listed)
+
+        # A single expert projection cannot opt every buffer of a fused MoE
+        # into FP4. Uniform auxiliary MoE requires a whole-module entry.
+        if is_moe and any(
+            key.startswith(candidate + ".")
+            for candidate in candidates
+            for key in self.quantized_layers
+        ):
+            raise ValueError(
+                f"Per-expert quantized_layers metadata is unsupported for uniform "
+                f"FP4 auxiliary MoE {prefix}. Specify the whole fused module "
+                "or use a MIXED_PRECISION checkpoint."
+            )
+        return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.linear import LinearBase
@@ -1691,6 +1783,24 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     return None
                 return ModelOptNvFp4FusedMoEMethod(self)
             return None
+
+        # Uniform FP4 still applies to the text stack. Optional vision/draft
+        # metadata is a whitelist so a partially quantized auxiliary module
+        # allocates BF16 buffers for its unlisted checkpoint weights.
+        if (
+            self.quantized_layers
+            and prefix.startswith(("model.visual.", "visual.", "mtp."))
+            and isinstance(layer, (LinearBase, ParallelLMHead, FusedMoE))
+        ):
+            is_moe = isinstance(layer, FusedMoE)
+            if (
+                self.is_layer_excluded(prefix)
+                or is_layer_skipped(
+                    prefix, self.exclude_modules, self.packed_modules_mapping
+                )
+                or not self._is_auxiliary_layer_quantized(prefix, is_moe=is_moe)
+            ):
+                return None if is_moe else UnquantizedLinearMethod()
 
         return self._get_quant_method(
             layer,
@@ -2068,6 +2178,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             )
 
         if self.quant_mode == "w4a4":
+            output_shape = None
             # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
             # tuple from unrelated code can't silently bypass quantization.
             if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(
@@ -2080,13 +2191,19 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 # NVFP4_AWQ: apply the per-input-channel pre_quant_scale.
                 if self.quant_config.is_awq:
                     x = x * layer.pre_quant_scale
+                # Vision MLPs pass [sequence, batch, hidden] activations while
+                # the GEMM backend consumes a 2-D matrix. Keep the leading
+                # dimensions in the result after quantizing the flattened view.
+                output_shape = (*x.shape[:-1], layer.output_size_per_partition)
+                x = x.reshape(-1, x.shape[-1])
                 x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
                 x_m, _ = x.shape
                 output_dtype = x.dtype
 
             output_size = layer.output_size_per_partition
             w_n, _ = layer.weight.shape
-            output_shape = [x_m, output_size]
+            if output_shape is None:
+                output_shape = (x_m, output_size)
 
             assert x_fp4.dtype == torch.uint8
             assert layer.weight.dtype == torch.uint8
