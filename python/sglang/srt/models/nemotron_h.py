@@ -50,7 +50,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.latent_moe_comm import (
+    DpAttnLatentMoEComm,
+    latent_moe_forward,
+)
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -82,9 +86,14 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
+from sglang.srt.models.nemotron_h_utils import (
+    latent_moe_comm_layers,
+    make_stage_boundary,
+    stage_facts,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -176,11 +185,15 @@ class NemotronHMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_nextn: bool = False,
+        latent_moe_comm: bool = False,
     ) -> None:
         super().__init__()
 
         self.layer_id = layer_idx
         self.is_nextn = is_nextn
+        # Exchange latent rows across EP (SGLANG_OPT_LATENT_MOE_COMM): routing
+        # runs on this rank's slice, so capture uses the gathered ids.
+        self.latent_moe_comm = latent_moe_comm
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -231,7 +244,20 @@ class NemotronHMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            allow_routed_experts_capture=not latent_moe_comm,
         )
+        if latent_moe_comm:
+            # Each attention-TP rank computes its shard for the DP group's
+            # rows; the attention-TP all-reduce completes it.
+            shared_parallel = dict(parallel_group="attn_tp")
+        elif (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_flashinfer_megamoe()
+        ):
+            shared_parallel = dict(parallel_group="replicated")
+        else:
+            shared_parallel = {}
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
                 config,
@@ -239,13 +265,7 @@ class NemotronHMoE(nn.Module):
                 * config.n_shared_experts,
                 quant_config=quant_config,
                 reduce_results=False,
-                **(
-                    dict(parallel_group="replicated")
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_flashinfer()
-                    or get_moe_a2a_backend().is_flashinfer_megamoe()
-                    else {}
-                ),
+                **shared_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
         else:
@@ -389,11 +409,92 @@ class NemotronHMoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _forward_latent_comm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return latent_moe_forward(
+            hidden_states,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            attn_tp_size=get_parallel().attn_tp_size,
+            route=self._route_rows,
+            down_proj=self._apply_fc1_latent_proj,
+            experts=self._run_routed_experts,
+            up_proj_accumulate=self._accumulate_fc2_latent_proj,
+            start_shared=self._start_shared_experts,
+            comm=DpAttnLatentMoEComm(num_local_tokens=hidden_states.shape[0]),
+            on_global_topk_ids=self._capture_routed_experts,
+        )
+
+    def _route_rows(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
+        router_logits = torch.mm(
+            hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+        )
+        # Under DP attention the default path does not mask padded rows
+        # either (moe_num_token_non_padded() is None there).
+        topk_output = self.topk(hidden_states, router_logits)
+        assert TopKOutputChecker.format_is_standard(topk_output)
+        return topk_output.topk_weights, topk_output.topk_ids
+
+    def _run_routed_experts(
+        self,
+        latent: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            # Router logits stay rank-local; the runners this path allows
+            # route from the precomputed top-k instead.
+            router_logits=topk_weights.new_empty((topk_weights.shape[0], 0)),
+        )
+        return self.experts(latent, topk_output)
+
+    def _accumulate_fc2_latent_proj(
+        self, latent: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        projection = self.fc2_latent_proj
+        if _latent_proj_fuses_shared_add(projection):
+            result = projection.quant_method.apply_with_addend(
+                projection, latent, addend=output
+            )
+        else:
+            result = projection(latent)[0].add_(output)
+        if result.data_ptr() != output.data_ptr():
+            output.copy_(result)
+
+    def _start_shared_experts(self, hidden_states: torch.Tensor):
+        if self.shared_experts is None:
+            return lambda: None
+        if not _is_cuda:
+            shared_output = self.shared_experts(hidden_states)
+            return lambda: shared_output
+        # The routed path issues the EP collectives on the current stream;
+        # the shared expert (no collectives) overlaps them on the alt stream.
+        current_stream = get_current_device_stream_fast()
+        alt_stream = _get_or_create_alt_stream(self.device_module)
+        alt_stream.wait_stream(current_stream)
+        with self.device_module.stream(alt_stream):
+            shared_output = self.shared_experts(hidden_states)
+
+        def wait() -> torch.Tensor:
+            current_stream.wait_stream(alt_stream)
+            return shared_output
+
+        return wait
+
+    def _capture_routed_experts(self, topk_ids: torch.Tensor) -> None:
+        if (capturer := get_global_experts_capturer()) is not None:
+            capturer.capture(layer_id=self.layer_id, topk_indices=topk_ids)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        if self.latent_moe_comm:
+            return self._forward_latent_comm(hidden_states)
         num_tokens, hidden_dim = hidden_states.shape
         # routed_scaling_factor is fused into the experts call (applied by the
         # MoE runner / topk), so final_hidden_states is already scaled.
@@ -421,9 +522,17 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
     mixer's attention partial sum, or a value that is complete or carries the
     sum an FFN before it left."""
 
-    def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
+    def _init_stage_boundary(
+        self,
+        config: NemotronHConfig,
+        layer_idx: int,
+        latent_moe_layers: frozenset[int] = frozenset(),
+    ):
         self.boundary = make_stage_boundary(
-            self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
+            self.norm,
+            pattern=config.hybrid_override_pattern,
+            layer_idx=layer_idx,
+            latent_moe_layers=latent_moe_layers,
         )
 
     def forward(
@@ -485,16 +594,18 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.layer_idx = layer_idx
+        latent_moe_layers = frozenset() if is_nextn else latent_moe_comm_layers(config)
         self.mixer = NemotronHMoE(
             layer_config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
             is_nextn=is_nextn,
+            latent_moe_comm=layer_idx in latent_moe_layers,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_stage_boundary(config, layer_idx)
+        self._init_stage_boundary(config, layer_idx, latent_moe_layers)
 
     def forward(
         self,
@@ -752,7 +863,11 @@ class NemotronHModel(nn.Module):
             len(config.hybrid_override_pattern),
             get_layer,
             prefix=f"{prefix}.layers",
-            stage_facts=partial(stage_facts, config.hybrid_override_pattern),
+            stage_facts=partial(
+                stage_facts,
+                config.hybrid_override_pattern,
+                latent_moe_layers=latent_moe_comm_layers(config),
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)

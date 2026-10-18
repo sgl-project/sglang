@@ -78,8 +78,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.latent_moe_comm import (
+    DpAttnLatentMoEComm,
+    latent_moe_forward,
+    use_latent_moe_comm,
+)
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopK,
+    TopKOutputChecker,
     TopKOutputFormat,
     build_precomputed_topk_output,
     precomputed_topk_postprocess_is_noop,
@@ -143,6 +150,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -456,10 +464,14 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        latent_moe_comm: bool = False,
     ):
         super().__init__()
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
+        # Exchange latent rows across EP (SGLANG_OPT_LATENT_MOE_COMM): routing
+        # runs on this rank's slice, so capture uses the gathered ids.
+        self.latent_moe_comm = latent_moe_comm
         moe_renormalize = config.moe_renormalize
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -550,6 +562,7 @@ class KimiK3MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
+            allow_routed_experts_capture=not latent_moe_comm,
         )
 
         # MegaMoE (deep_gemm fused a2a+GEMM over the EP symm buffer) replaces
@@ -598,7 +611,11 @@ class KimiK3MoE(nn.Module):
         )
         self._shared_experts_tp_group = None
         shared_experts_parallel_group = None
-        if self._shared_experts_tp1:
+        if latent_moe_comm:
+            # Each attention-TP rank computes its shard for the DP group's
+            # rows; the attention-TP all-reduce completes it.
+            shared_experts_parallel_group = "attn_tp"
+        elif self._shared_experts_tp1:
             shared_experts_parallel_group = "replicated"
         elif self._shared_experts_tp_comm:
             group = (
@@ -716,7 +733,7 @@ class KimiK3MoE(nn.Module):
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
-        if not self.use_latent_moe:
+        if not self.use_latent_moe or self.latent_moe_comm:
             return
         # These merged layouts feed CUDA and ROCm fused front kernels. Keeping the
         # regular parameters on other devices avoids a large transient copy
@@ -878,6 +895,81 @@ class KimiK3MoE(nn.Module):
         if self.routed_expert_norm is None:
             return latent
         return self.routed_expert_norm(latent)
+
+    def _forward_latent_comm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return latent_moe_forward(
+            hidden_states,
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            attn_tp_size=get_parallel().attn_tp_size,
+            route=self._route_rows,
+            down_proj=self._latent_down_proj,
+            experts=self._run_routed_experts,
+            up_proj_accumulate=self._accumulate_latent_up_proj,
+            start_shared=self._start_shared_experts,
+            comm=DpAttnLatentMoEComm(num_local_tokens=hidden_states.shape[0]),
+            on_global_topk_ids=self._capture_routed_experts,
+        )
+
+    def _route_rows(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        assert TopKOutputChecker.format_is_standard(topk_output)
+        return topk_output.topk_weights, topk_output.topk_ids
+
+    def _latent_down_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states.new_empty((0, self.moe_hidden_size))
+        return self.routed_expert_down_proj(hidden_states)[0]
+
+    def _run_routed_experts(
+        self,
+        latent: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            # Router logits stay rank-local; the runners this path allows
+            # route from the precomputed top-k instead.
+            router_logits=topk_weights.new_empty((topk_weights.shape[0], 0)),
+        )
+        return self.experts(latent, topk_output)
+
+    def _accumulate_latent_up_proj(
+        self, latent: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        # The reduce-scatter leaves complete rows, so the latent norm reads
+        # whole sums as on the default path.
+        if latent.shape[0] == 0:
+            return
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        output.add_(out)
+
+    def _start_shared_experts(self, hidden_states: torch.Tensor):
+        if self.shared_experts is None:
+            return lambda: None
+        if self.alt_stream is None:
+            shared_output = self.shared_experts(hidden_states)
+            return lambda: shared_output
+        # The routed path issues the EP collectives on the current stream;
+        # the shared expert (no collectives) overlaps them on the alt stream.
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self.shared_experts(hidden_states)
+
+        def wait() -> torch.Tensor:
+            current_stream.wait_stream(self.alt_stream)
+            return shared_output
+
+        return wait
+
+    def _capture_routed_experts(self, topk_ids: torch.Tensor) -> None:
+        if (capturer := get_global_experts_capturer()) is not None:
+            capturer.capture(layer_id=self.layer_idx, topk_indices=topk_ids)
 
     @cached_property
     def _routing_contract_ok(self) -> bool:
@@ -1486,6 +1578,13 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self.latent_moe_comm:
+            # Under DP attention without an EP a2a backend the stage boundary
+            # owns the residual add, so no prefix_sum reaches this layer.
+            assert prefix_sum is None
+            return self._forward_latent_comm(hidden_states).view(
+                num_tokens, hidden_size
+            )
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
@@ -2430,6 +2529,14 @@ def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
     )
 
 
+def _uses_latent_moe_comm(config: KimiLinearConfig, layer_idx: int) -> bool:
+    """Whether a MoE layer exchanges latent rows across EP instead of
+    hidden-width rows (SGLANG_OPT_LATENT_MOE_COMM)."""
+    return _is_moe_layer(config, layer_idx) and use_latent_moe_comm(
+        is_latent_moe=_uses_latent_moe(config)
+    )
+
+
 def _stage_facts(
     config: KimiLinearConfig,
     layer_idx: int,
@@ -2474,6 +2581,18 @@ def _stage_facts(
                 REPLACE_AT_EXIT
                 if _latent_moe_writes_stream(config, layer_idx)
                 else bank.ffn_update
+            ),
+        )
+    if _uses_latent_moe_comm(config, layer_idx):
+        # The MoE runs on its DP group's rows, owns the exchange across DP
+        # ranks, and completes its sum with one attention-TP all-reduce.
+        return (
+            declare_attn(**attn_ops),
+            declare_ffn(
+                **ffn_ops,
+                next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
+                dense_tp_size=get_parallel().attn_tp_size,
+                output_complete=True,
             ),
         )
     return (
@@ -2555,6 +2674,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                latent_moe_comm=_uses_latent_moe_comm(config, layer_idx),
             )
         else:
             self.mlp = KimiK3MLP(
