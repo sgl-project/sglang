@@ -1904,6 +1904,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if self.disagg_prefill_bootstrap_queue is not None:
+            self.disagg_prefill_bootstrap_queue.kv_manager.release_host_resources()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()

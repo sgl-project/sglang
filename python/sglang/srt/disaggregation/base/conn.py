@@ -12,6 +12,7 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 
 class StateType(str, enum.Enum):
@@ -61,6 +62,8 @@ class KVArgs:
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None
+    # Decode-owned host KV pool exported for same-node NIXL transfers.
+    local_shm_pool: Optional[MLATokenToKVPoolHost] = None
     host_state_data_ptrs: Optional[List[List[int]]] = None
     host_state_data_lens: Optional[List[List[int]]] = None
     host_state_item_lens: Optional[List[List[int]]] = None
@@ -157,6 +160,9 @@ class BaseKVManager(ABC):
     # Opt-in per backend: set True once the prefill acks a drained abort
     # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.
     supports_deferred_decode_kv_release: bool = False
+
+    def release_host_resources(self) -> None:
+        """Release backend-owned host mappings on graceful shutdown."""
 
     def teardown(self) -> None:
         raise NotImplementedError(

@@ -21,6 +21,53 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiSparseSpecCoordinator(CustomTestCase):
+    def test_wide_workspace_alignment_and_tail_contract(self):
+        for steps in (4, 6, 7, 8):
+            with self.subTest(steps=steps):
+                coordinator = MagicMock(
+                    mem_pool_device=SimpleNamespace(
+                        layer_num=2, kv_buffer=[None, None]
+                    ),
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.empty((2, 16))
+                    ),
+                    device="cpu",
+                    is_dsv4_hisparse=False,
+                    top_k=2051,
+                    page_size=256,
+                    num_tail_slots=3,
+                    device_buffer_size=4096,
+                )
+                spec = HiSparseSpecSwapManager(coordinator, num_draft_tokens=steps)
+                self.assertEqual(spec.miss_plan_capacity, steps * 2051)
+                self.assertEqual(spec.scratch_capacity % 256, 0)
+                self.assertGreaterEqual(spec.scratch_capacity, steps * 2051 - 4096)
+                allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+                allocator.page_size = 256
+                allocator.configure_spec_scratch(
+                    spec.scratch_capacity, device_buffer_size=4352
+                )
+                self.assertEqual(
+                    allocator.request_slot_reserve(has_req_pool_slot=False),
+                    spec.scratch_capacity + 4352,
+                )
+                self.assertGreaterEqual(spec._scratch_state.shape[1], 5 * steps * 2051)
+                self.assertEqual(spec._scratch_state.stride(0) % 2, 0)
+                self.assertEqual(tuple(spec.top_k_device_locs.shape), (2, steps, 2051))
+                with patch(
+                    "sglang.srt.managers.hisparse_coordinator.load_cache_to_device_buffer_spec_mla"
+                ) as kernel:
+                    spec.swap_in(
+                        torch.tensor([0]),
+                        torch.full((steps,), 127),
+                        torch.zeros((1, steps, 2051), dtype=torch.int32),
+                        0,
+                    )
+                self.assertEqual(kernel.call_args.kwargs["num_tail_slots"], 3)
+        coordinator.top_k = 4097
+        with self.assertRaisesRegex(ValueError, "32768 occurrences"):
+            HiSparseSpecSwapManager(coordinator, num_draft_tokens=8)
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
@@ -89,6 +136,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             device="cpu",
             is_dsv4_hisparse=False,
             top_k=1024,
+            page_size=64,
             device_buffer_size=4096,
         )
         spec_swap = HiSparseSpecSwapManager(coordinator, num_draft_tokens=2)
@@ -164,23 +212,29 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         coordinator.spec_swap.reset.assert_called_once_with(0)
 
     def test_accept_commit_keeps_hot_and_newest_device_slots(self):
+        for width in (4, 6, 8):
+            with self.subTest(width=width):
+                self._check_accept_commit(width)
+
+    def _check_accept_commit(self, width):
         coordinator = object.__new__(HiSparseCoordinator)
         coordinator.device_buffer_size = 5
-        coordinator.page_size = 8
+        page_size = 16 if width == 8 else 8
+        coordinator.page_size = page_size
         coordinator.req_to_device_buffer = torch.tensor(
-            [list(range(20, 33))], dtype=torch.int64
+            [list(range(20, 25 + page_size))], dtype=torch.int64
         )
         coordinator.req_device_buffer_tokens = torch.full(
-            (2, 1, 13), -1, dtype=torch.int32
+            (2, 1, 5 + page_size), -1, dtype=torch.int32
         )
         coordinator.req_device_buffer_token_locs = torch.full(
-            (2, 1, 13), -1, dtype=torch.int32
+            (2, 1, 5 + page_size), -1, dtype=torch.int32
         )
         coordinator._skip_first_backup = [False]
 
-        verify_cache_locs = torch.tensor([50, 51, 52, 53], dtype=torch.int64)
+        verify_cache_locs = torch.arange(50, 50 + width, dtype=torch.int64)
         req_to_token = torch.zeros((1, 16), dtype=torch.int64)
-        req_to_token[0, 4:8] = verify_cache_locs
+        req_to_token[0, 4 : 4 + width] = verify_cache_locs
         coordinator.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
 
         full_to_device_mapping = torch.zeros(128, dtype=torch.int64)
@@ -193,9 +247,9 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         )
 
         coordinator.mem_pool_host = HiSparseHostPoolMixin()
-        coordinator.mem_pool_host.page_size = 8
+        coordinator.mem_pool_host.page_size = page_size
         coordinator.mem_pool_host.alloc_page = MagicMock(
-            return_value=torch.arange(1000, 1008)
+            side_effect=lambda pages: torch.arange(1000, 1000 + pages * page_size)
         )
         coordinator.req_to_host_pool = torch.full((1, 16), -1, dtype=torch.int64)
         coordinator.req_to_host_pool_allocated_len = torch.zeros(1, dtype=torch.int64)
@@ -203,12 +257,14 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         spec_swap = object.__new__(HiSparseSpecSwapManager)
         spec_swap._coordinator = coordinator
         spec_swap.enabled = True
-        spec_swap.num_draft_tokens = 4
+        spec_swap.num_draft_tokens = width
         spec_swap._backup_device_locs_to_host = MagicMock()
 
         batch = SimpleNamespace(
             reqs=[
-                SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0, kv_allocated_len=8))
+                SimpleNamespace(
+                    kv=SimpleNamespace(req_pool_idx=0, kv_allocated_len=4 + width)
+                )
             ],
             forward_mode=SimpleNamespace(is_idle=lambda: False),
             req_pool_indices=torch.tensor([0]),
@@ -219,9 +275,16 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         )
         spec_swap.prepare_verify(batch)
         spec_swap.prepare_verify(batch)
-        coordinator.mem_pool_host.alloc_page.assert_called_once_with(1)
-        self.assertEqual(int(coordinator.req_to_host_pool_allocated_len[0]), 8)
-        accept_indices = torch.tensor([[0, 1, 2, -1]], dtype=torch.int32)
+        coordinator.mem_pool_host.alloc_page.assert_called_once_with(
+            (4 + width + page_size - 1) // page_size
+        )
+        self.assertEqual(
+            int(coordinator.req_to_host_pool_allocated_len[0]),
+            (4 + width + page_size - 1) // page_size * page_size,
+        )
+        accept_indices = torch.tensor(
+            [[0, 1, 2] + [-1] * (width - 3)], dtype=torch.int32
+        )
 
         class NoDataDependentOps(TorchDispatchMode):
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
@@ -257,18 +320,23 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
 
         transfer_call = transfer_values.call_args
         torch.testing.assert_close(
-            transfer_call.kwargs["src_indices"], torch.tensor([26, 27, 28, 29])
+            transfer_call.kwargs["src_indices"], torch.arange(26, 26 + width)
         )
         torch.testing.assert_close(
-            transfer_call.kwargs["dst_indices"], torch.tensor([24, 27, 25, 29])
+            transfer_call.kwargs["dst_indices"],
+            torch.tensor([24, 27, 25] + list(range(29, 26 + width))),
         )
         backup_call = spec_swap._backup_device_locs_to_host.call_args
         torch.testing.assert_close(
-            backup_call.args[0], torch.tensor([1004, 1005, 1006, 1007])
+            backup_call.args[0], torch.arange(1004, 1004 + width)
         )
-        torch.testing.assert_close(backup_call.args[1], torch.tensor([24, 27, 25, 29]))
         torch.testing.assert_close(
-            full_to_device_mapping[verify_cache_locs], torch.tensor([24, 0, 25, 0])
+            backup_call.args[1],
+            torch.tensor([24, 27, 25] + list(range(29, 26 + width))),
+        )
+        torch.testing.assert_close(
+            full_to_device_mapping[verify_cache_locs],
+            torch.tensor([24, 0, 25] + [0] * (width - 3)),
         )
         torch.testing.assert_close(
             coordinator.req_device_buffer_tokens[:, 0, 4],
@@ -279,8 +347,8 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             torch.tensor([6, 6], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            coordinator.req_device_buffer_tokens[:, 0, 6:10],
-            torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]], dtype=torch.int32),
+            coordinator.req_device_buffer_tokens[:, 0, 6 : 6 + width],
+            torch.arange(4, 4 + width, dtype=torch.int32).repeat(2, 1),
         )
         self.assertTrue(coordinator._skip_first_backup[0])
 
