@@ -156,7 +156,23 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        needs_dp_allgather = should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_fp4_payload = (
+            self.enable_flashinfer_cutlass_moe
+            and self.quant_config.get("input_global_scale") is not None
+        )
+        if needs_dp_allgather and not use_fp4_payload:
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                topk_output = topk_output.to_standard()
+            topk_weights, topk_ids, hidden_states = get_parallel().tp_group.all_gatherv(
+                [topk_output.topk_weights, topk_output.topk_ids, hidden_states],
+                sizes=get_dp_global_num_tokens(),
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights, topk_ids, topk_output.router_logits
+            )
+            hidden_states_scale = None
+        elif needs_dp_allgather:
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None
