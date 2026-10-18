@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import standard
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -28,23 +28,29 @@ NUM_LOCAL_EXPERTS = 4
 
 @pytest.fixture
 def ep2_rank0(monkeypatch):
-    moe = get_flags().moe
-    saved = (moe.runner_backend, moe.a2a_backend)
-    moe.a2a_backend = MoeA2ABackend.NONE
     monkeypatch.setattr(standard, "get_device", lambda: "cpu")
-    monkeypatch.setattr(
-        standard,
-        "get_parallel",
-        lambda: SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
-    )
     monkeypatch.setattr(
         standard,
         "get_lora",
         lambda: SimpleNamespace(enable_lora=False, lora_paths=None),
-        raising=False,
     )
-    yield moe
-    moe.runner_backend, moe.a2a_backend = saved
+    with (
+        get_context().override_server_args(model_path="dummy", device="cpu"),
+        get_flags().moe.override(
+            a2a_backend=MoeA2ABackend.NONE, runner_backend=MoeRunnerBackend.AUTO
+        ),
+        get_parallel().override(
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=2,
+            attn_tp_rank=0,
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        ),
+    ):
+        yield get_flags().moe
 
 
 @pytest.fixture

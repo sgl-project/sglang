@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from sglang.srt.layers import linear
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.models import kimi_k3
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -32,6 +33,7 @@ def build_mlp(group=None, *, width=16, quant_config=None):
 
 
 class _RoutedExperts(torch.nn.Module):
+    runner_backend = MoeRunnerBackend.TRITON
     should_fuse_routed_scaling_factor_in_topk = False
 
     def __init__(self, **kwargs):
