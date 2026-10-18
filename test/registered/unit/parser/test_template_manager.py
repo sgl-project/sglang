@@ -664,6 +664,27 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "k2_horizon",
         )
 
+    def test_llm_jp_harmony_declaration_wins_over_gpt_oss(self):
+        # LLM-jp-4.1 renders gpt-oss markers too, so the declaration line must
+        # be checked before the <|channel|> rule.
+        template = (
+            "{#- chat_format=llm-jp-harmony-v1 -#}\n"
+            "<|start|>assistant<|channel|>analysis<|message|>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        tokenizer = _DummyTokenizer([])
+
+        self.assertTrue(force)
+        self.assertEqual(config.special_case, "always")
+        self.assertEqual(
+            detect_reasoning_parser(template, tokenizer, config, force),
+            "llm-jp-harmony",
+        )
+        self.assertEqual(
+            detect_tool_call_parser(template, tokenizer, config, force),
+            "llm-jp-harmony",
+        )
+
 
 class TestToolCallParserDetection(unittest.TestCase):
     """Tests for detect_tool_call_parser() using real model tokenizers."""
