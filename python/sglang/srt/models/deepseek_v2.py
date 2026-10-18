@@ -759,11 +759,6 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
         )
-        self.routed_scaling_factor_fused_in_topk = (
-            is_routed_scaling_factor_fused_in_topk(
-                self.experts.should_fuse_routed_scaling_factor_in_topk
-            )
-        )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
@@ -775,6 +770,10 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+            )
+            # Hash routing folds the factor only when its flag asks for it.
+            self.routed_scaling_factor_fused_in_topk = (
+                self.topk.apply_routed_scaling_factor_on_output
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -813,10 +812,18 @@ class DeepseekV2MoE(nn.Module):
                         getattr(config, "model_type", None) == "deepseek_v41"
                     ),
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
-                    # Ungrouped routing never reaches aiter's folding router.
-                    apply_routed_scaling_factor_on_output=self.routed_scaling_factor_fused_in_topk,
+                    # aiter's topk_gating folds the factor regardless; the flag makes
+                    # the other routes (e.g. the vision routing fallback) fold too.
+                    apply_routed_scaling_factor_on_output=(
+                        True
+                        if _use_aiter
+                        else self.experts.should_fuse_routed_scaling_factor_in_topk
+                    ),
                 )
             self.topk = TopK(**topk_kwargs)
+            self.routed_scaling_factor_fused_in_topk = (
+                is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
+            )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -1216,7 +1223,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _is_musa
-            and not _use_aiter
+            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
@@ -1408,10 +1415,9 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not _is_xpu
-            and not _use_aiter
+            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
-            # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
         if (

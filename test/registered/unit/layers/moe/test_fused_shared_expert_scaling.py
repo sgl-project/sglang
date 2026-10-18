@@ -26,10 +26,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap.operations import _StateDict
+from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopK, TopKConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.model_runner_components import moe_ep_setup
+from sglang.srt.models import deepseek_v2 as deepseek_v2_module
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +43,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     EP_SIZE = 8
     EP_RANK = 0
     ROUTED_SCALING_FACTOR = 2.5
+    # DeepSeek-V3-style grouped routing with a correction bias, the route that
+    # aiter folds rsf into whatever the flag says.
+    ROUTING = {"use_grouped_topk": True, "correction_bias": torch.zeros(256)}
+    UNBIASED_ROUTING = {"use_grouped_topk": True, "correction_bias": None}
 
     def _run_remap(self, *, use_aiter, folded_in_topk=False):
         # Layout: [routed, routed, routed, shared]; the trailing column is the
@@ -55,6 +61,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             num_fused_shared_experts=1,
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
             apply_routed_scaling_factor_on_output=folded_in_topk,
+            **self.ROUTING,
         )
 
         with (
@@ -91,13 +98,6 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         shared_weight = self._run_remap(use_aiter=False)
         self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
 
-    def test_factor_folded_in_topk_uses_unit_shared_weight(self):
-        # Regression: a quant method that folds rsf into the top-k weights
-        # (ModelOpt NVFP4, FP8 on CUTLASS) has no post-MoE multiply, so 1/rsf
-        # left the always-on shared expert at 0.4x in every MoE layer.
-        shared_weight = self._run_remap(use_aiter=False, folded_in_topk=True)
-        self.assertAlmostEqual(shared_weight, 1.0)
-
     def _waterfill_shared_weight(self, *, use_aiter, folded_in_topk):
         # Waterfill takes the shared column out of TopK and appends it itself.
         topk = TopK.__new__(TopK)
@@ -109,6 +109,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             top_k=8,
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
             apply_routed_scaling_factor_on_output=folded_in_topk,
+            **self.ROUTING,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(n_routed_experts=self.NUM_PHYSICAL_ROUTED)
@@ -130,16 +131,26 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         return topk.waterfill_balancer.shared_weight
 
     def test_waterfill_shared_weight_matches_the_per_rank_slot(self):
-        # Waterfill and the per-rank slot place the same fused shared expert;
-        # Waterfill used 1/rsf even where rsf was already in the routed weights.
+        # Waterfill and the per-rank slot place the same fused shared expert, and
+        # its weight is 1.0 only where the route really folded rsf: a folding
+        # quant method's flag, or aiter's biased grouped router (not aiter as such).
+        rsf = self.ROUTED_SCALING_FACTOR
         cases = (
-            # (use_aiter, folded_in_topk, shared weight for a net 1.0x)
-            (False, False, 1.0 / self.ROUTED_SCALING_FACTOR),
-            (False, True, 1.0),
-            (True, False, 1.0),
+            # (use_aiter, folded_in_topk, routing, shared weight for a net 1.0x)
+            (False, False, self.ROUTING, 1.0 / rsf),
+            (False, True, self.ROUTING, 1.0),
+            (True, False, self.ROUTING, 1.0),
+            (True, False, self.UNBIASED_ROUTING, 1.0 / rsf),
         )
-        for use_aiter, folded_in_topk, expected in cases:
-            with self.subTest(use_aiter=use_aiter, folded_in_topk=folded_in_topk):
+        for use_aiter, folded_in_topk, routing, expected in cases:
+            with (
+                self.subTest(
+                    use_aiter=use_aiter,
+                    folded_in_topk=folded_in_topk,
+                    bias=routing["correction_bias"] is not None,
+                ),
+                patch.object(self, "ROUTING", routing),
+            ):
                 waterfill = self._waterfill_shared_weight(
                     use_aiter=use_aiter, folded_in_topk=folded_in_topk
                 )
@@ -174,6 +185,92 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                     if has_shared:
                         expected = expected + shared
                     torch.testing.assert_close(state.hidden_states_mlp_output, expected)
+
+    def _build_deepseek_moe(
+        self,
+        *,
+        folded_in_topk,
+        use_aiter,
+        correction_bias=True,
+        deepseek_v4=False,
+        hash_layer=False,
+    ):
+        config = SimpleNamespace(
+            routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+            n_shared_experts=None,
+            n_routed_experts=16,
+            num_experts_per_tok=2,
+            hidden_act="silu",
+            hidden_size=8,
+            moe_intermediate_size=8,
+            norm_topk_prob=True,
+            n_group=4,
+            topk_group=2,
+            scoring_func="sqrtsoftplus" if deepseek_v4 else "sigmoid",
+            num_hash_layers=1 if hash_layer else 0,
+            vocab_size=4,
+        )
+        gate = SimpleNamespace(
+            e_score_correction_bias=torch.zeros(16) if correction_bias else None
+        )
+        experts = SimpleNamespace(
+            should_fuse_routed_scaling_factor_in_topk=folded_in_topk
+        )
+        exec_config = SimpleNamespace(
+            moe=SimpleNamespace(enable_waterfill=False, ep_num_redundant_experts=0)
+        )
+        module = deepseek_v2_module
+        with (
+            patch.object(module, "_use_aiter", use_aiter),
+            patch.object(topk_module, "_use_aiter", use_aiter),
+            patch.object(
+                module,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=1, moe_ep_size=1),
+            ),
+            patch.object(module, "get_exec", return_value=exec_config),
+            patch.object(topk_module, "get_exec", return_value=exec_config),
+            patch.object(hash_topk_module, "get_exec", return_value=exec_config),
+            patch.object(
+                module, "is_shared_experts_fusion_disabled", return_value=True
+            ),
+            patch.object(module, "MoEGate", return_value=gate),
+            patch.object(
+                module, "get_moe_impl_class", return_value=lambda **kwargs: experts
+            ),
+            patch.object(
+                module,
+                "SboFlags",
+                SimpleNamespace(fuse_shared_experts_inside_sbo=lambda: False),
+            ),
+        ):
+            return module.DeepseekV2MoE(
+                config=config, layer_id=0, is_deepseek_v4=deepseek_v4
+            )
+
+    def test_deepseek_moe_takes_the_fold_from_the_router_it_builds(self):
+        """Every step after top-k reads routed_scaling_factor_fused_in_topk, so it
+        must follow the router the block built: the quant method's fold flag, or
+        on aiter a route that folds (biased grouped routing, DeepSeek-V4's
+        sqrtsoftplus gate), never grouped routing without a bias or hash routing."""
+        cases = (
+            # (folded_in_topk, use_aiter, route, routed weights carry rsf)
+            (False, False, {}, False),
+            (True, False, {}, True),
+            (False, True, {}, True),
+            (False, True, {"correction_bias": False}, False),
+            (False, True, {"deepseek_v4": True}, True),
+            (False, True, {"deepseek_v4": True, "hash_layer": True}, False),
+            (True, False, {"deepseek_v4": True, "hash_layer": True}, True),
+        )
+        for folded_in_topk, use_aiter, route, expected in cases:
+            with self.subTest(
+                folded_in_topk=folded_in_topk, use_aiter=use_aiter, **route
+            ):
+                moe = self._build_deepseek_moe(
+                    folded_in_topk=folded_in_topk, use_aiter=use_aiter, **route
+                )
+                self.assertEqual(moe.routed_scaling_factor_fused_in_topk, expected)
 
     def _run_post_process_standard_path(self, *, scaling_factor):
         topk_ids = torch.tensor([[5, 40, 100, 256]], dtype=torch.int32)

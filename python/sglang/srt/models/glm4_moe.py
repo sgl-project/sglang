@@ -667,9 +667,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if enable_npu_dual_stream:
             wait_share_stream()
 
-        fused_in_topk = is_routed_scaling_factor_fused_in_topk(
-            self.experts.should_fuse_routed_scaling_factor_in_topk
-        )
+        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
         if shared_output is not None:
             x = shared_output
             if fused_in_topk:

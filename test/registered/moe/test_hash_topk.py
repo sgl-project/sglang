@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
@@ -23,7 +24,11 @@ def _set_dummy_server_args():
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
-def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
+@pytest.mark.parametrize("use_aiter", [False, True])
+def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch, use_aiter):
+    # Hash routing never folds routed_scaling_factor, on aiter either, so the
+    # shared slot keeps 1/rsf for the multiply after the experts.
+    monkeypatch.setattr(topk_module, "_use_aiter", use_aiter)
     monkeypatch.setattr(hash_topk_module, "_is_xpu", False)
     monkeypatch.setattr(
         hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True

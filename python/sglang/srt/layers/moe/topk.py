@@ -1814,8 +1814,9 @@ def biased_grouped_topk_gpu(
         # The kernel wants the total width; select_experts passes a routed-only
         # topk on the aiter path only (`num_routed_topk if _use_aiter else top_k`).
         #
-        # Fold whenever the steps after top-k assume a fold, which on aiter they
-        # always do, whether or not this call is given the shared slots.
+        # On aiter this route folds whatever the flag says, as
+        # aiter_biased_grouped_topk does and is_routed_scaling_factor_fused_in_topk
+        # assumes, whether or not this call is given the shared slots.
         return jit_grouped_gate(
             gating_output,
             correction_bias.to(dtype=torch.float32),
@@ -1826,8 +1827,8 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0
             ),
-            apply_routed_scaling_factor_on_output=is_routed_scaling_factor_fused_in_topk(
-                apply_routed_scaling_factor_on_output
+            apply_routed_scaling_factor_on_output=(
+                _use_aiter or bool(apply_routed_scaling_factor_on_output)
             ),
             num_expert_group=num_expert_group,
             topk_group=topk_group,
@@ -2205,28 +2206,36 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
-def is_routed_scaling_factor_fused_in_topk(
-    apply_routed_scaling_factor_on_output: bool,
-) -> bool:
-    """Whether the routed top-k weights already carry routed_scaling_factor.
+def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
+    """Whether the routed weights a TopK with this config emits already carry
+    routed_scaling_factor.
 
     When true, no step after top-k may apply the factor again, and a fused
-    shared expert's weight must not compensate for it.
+    shared expert's weight must not compensate for it. HashTopK routing folds
+    the factor only when its own flag asks for it.
     """
-    # aiter_biased_grouped_topk folds the factor whatever the flag says.
-    return bool(apply_routed_scaling_factor_on_output) or _use_aiter
+    if topk_config.apply_routed_scaling_factor_on_output:
+        return True
+    if not _use_aiter:
+        return False
+    # Two aiter routes fold the factor whatever the flag says: grouped routing with
+    # a correction bias (aiter_biased_grouped_topk, or the unified Triton router),
+    # and ungrouped sqrtsoftplus routing (aiter topk_gating, or rocm_router_gate).
+    # Grouped routing without a bias and the other ungrouped routes do not.
+    if topk_config.use_grouped_topk:
+        return topk_config.correction_bias is not None
+    return (
+        topk_config.scoring_func == "sqrtsoftplus"
+        and topk_config.custom_routing_function is None
+    )
 
 
 def fused_shared_expert_weight(
-    *,
-    routed_scaling_factor: Optional[float],
-    apply_routed_scaling_factor_on_output: bool,
+    *, routed_scaling_factor: Optional[float], fused_in_topk: bool
 ) -> float:
-    """Top-k weight that makes a fused shared expert's output count exactly once."""
-    if (
-        is_routed_scaling_factor_fused_in_topk(apply_routed_scaling_factor_on_output)
-        or not routed_scaling_factor
-    ):
+    """Top-k weight that makes a fused shared expert's output count exactly once;
+    fused_in_topk is is_routed_scaling_factor_fused_in_topk's answer."""
+    if fused_in_topk or not routed_scaling_factor:
         return 1.0
     # The routed output, shared column included, is scaled by the factor later.
     return 1.0 / routed_scaling_factor
@@ -2279,7 +2288,7 @@ def remap_topk_for_per_rank_shared_slots(
 
     topk_weights[:, -num_fused_shared_experts:] = fused_shared_expert_weight(
         routed_scaling_factor=topk_config.routed_scaling_factor,
-        apply_routed_scaling_factor_on_output=topk_config.apply_routed_scaling_factor_on_output,
+        fused_in_topk=is_routed_scaling_factor_fused_in_topk(topk_config),
     )
 
     return topk_ids, topk_weights
@@ -2472,7 +2481,7 @@ def _post_process_topk_ids(
             num_fused_shared_experts,
             fused_shared_expert_weight(
                 routed_scaling_factor=topk_config.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=topk_config.apply_routed_scaling_factor_on_output,
+                fused_in_topk=is_routed_scaling_factor_fused_in_topk(topk_config),
             ),
             shared_id_base,
             num_local_routed,
