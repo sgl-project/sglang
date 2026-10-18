@@ -1866,12 +1866,15 @@ class DeepseekV4AttnBackend(
             else None
         )
 
+        max_seq_len = int(seq_lens_cpu.max().item())
+        if max_seq_len_override is not None and not (
+            for_prefill_graph and self._prefill_graph_context_unbounded()
+        ):
+            # When any context replays, the tail's page tables span the live
+            # context like the full rows' (_build_forward_metadata).
+            max_seq_len = max_seq_len_override
         metadata = self.init_forward_metadata_prefill(
-            max_seq_len=(
-                max_seq_len_override
-                if max_seq_len_override is not None
-                else int(seq_lens_cpu.max().item())
-            ),
+            max_seq_len=max_seq_len,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu.tolist(),
