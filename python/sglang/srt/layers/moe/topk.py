@@ -1000,10 +1000,10 @@ class TopK(BaseFusedOp):
     ) -> TopKOutput:
         """Return an empty topk output for a rank with zero tokens this forward.
 
-        When ``layer_id`` is provided and the active dispatch algorithm is LP,
-        also calls ``LPLBSolver.solve(empty)`` so that this rank participates
-        in the EP all-reduce. Without this, an empty rank would skip the
-        collective and deadlock under DP-attention.
+        Target layers call their owning ``LPLBSolver.solve(empty)`` so this
+        rank participates in the EP all-reduce even without tokens. Draft
+        layers skip the target solver. The optional ``layer_id`` is retained
+        for caller compatibility; the router's owning layer determines the solver.
         """
         if not self.is_draft:
             layer_id = self.layer_id
