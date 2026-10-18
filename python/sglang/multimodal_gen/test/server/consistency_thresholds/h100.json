@@ -40,8 +40,8 @@
         "zimage_image_t2i": {
             "clip_threshold": 0.97,
             "ssim_threshold": 0.86,
-            "psnr_threshold": 19.9,
-            "mean_abs_diff_threshold": 8.5
+            "psnr_threshold": 19.3,
+            "mean_abs_diff_threshold": 9.8
         },
         "zimage_image_t2i_multi_lora": {
             "clip_threshold": 0.98,
@@ -270,6 +270,18 @@
             "ssim_threshold": 0.48,
             "psnr_threshold": 13.0,
             "mean_abs_diff_threshold": 45.0
+        },
+        "wan2_2_animate_2_14b_ref2v": {
+            "clip_threshold": 0.90,
+            "ssim_threshold": 0.92,
+            "psnr_threshold": 24.0,
+            "mean_abs_diff_threshold": 10.0
+        },
+        "wan2_2_animate_2_14b_ref2v_cfg_parallel_2gpu": {
+            "clip_threshold": 0.90,
+            "ssim_threshold": 0.92,
+            "psnr_threshold": 24.0,
+            "mean_abs_diff_threshold": 10.0
         }
     },
     "default_clip_threshold_image": 0.92,

@@ -226,6 +226,27 @@ def ep_joiner_of(cfg: Any) -> bool:
     return cfg.ep_join_mode in ("scale", "recover")
 
 
+def context_parallel_attn_dp_size(cfg: Any, layout: str) -> int:
+    """The attention-DP width a DeepSeek context-parallel layout runs.
+
+    These layouts run data-parallel groups as attention DP, so `--dp-size N`
+    alone still means N attention-DP groups there. That reading is deprecated.
+    """
+    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+        "data-parallel replicas combined with attention data parallelism "
+        "are not supported."
+    )
+    if cfg.dp_size > 1:
+        # TODO: reject `--dp-size > 1` here after 2026-12-31.
+        logger.warning(
+            f"--dp-size {cfg.dp_size} under {layout} runs {cfg.dp_size} attention "
+            "data-parallel groups. This is deprecated and will be rejected after "
+            f"2026-12-31; use --attn-dp-size {cfg.dp_size} instead."
+        )
+    return cfg.attn_dp_size * cfg.dp_size
+
+
 def ep_scale_joiner_of(cfg: Any) -> bool:
     """The scale-up arm of :func:`ep_joiner_of`."""
     return cfg.ep_join_mode == "scale"
@@ -242,6 +263,15 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
         "extra_buffer",
         "extra_buffer_lazy",
     )
+
+
+def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    # DFLASH's topk is declared by _handle_dflash, which runs after this default,
+    # so it still reads None here. Matched by name, not from_string, so an
+    # unregistered algorithm keeps failing in validation rather than here.
+    return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
 
 
 def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
@@ -285,6 +315,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             and (
                 cfg.speculative_algorithm is None
                 or cfg.speculative_eagle_topk is not None
+                or _forces_eagle_topk_one(cfg.speculative_algorithm)
             )
         ):
             # trtllm_mha requires equal K/V row widths; fa4 carries

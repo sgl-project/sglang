@@ -29,8 +29,8 @@ from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -134,8 +134,7 @@ class LocateAnythingForConditionalGeneration(nn.Module):
         return self.multi_modal_projector(torch.cat(image_features))
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def forward(
         self,
@@ -200,6 +199,12 @@ class LocateAnythingForConditionalGeneration(nn.Module):
             )
 
             if is_vision_weight:
+                # Map names from wqkv/wo -> attn.qkv_proj/attn.proj
+                # according to wrapped MoonVit's attention (VisionAttention)
+                # in python/sglang/srt/models/kimi_vl.py
+                name = name.replace("wqkv.", "attn.qkv_proj.").replace(
+                    "wo.", "attn.proj."
+                )
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
