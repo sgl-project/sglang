@@ -77,7 +77,9 @@ class DsparkDraftSampler:
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
-            assert not torch.cuda.is_current_stream_capturing()
+            assert not torch.get_device_module(
+                base_logits.device
+            ).is_current_stream_capturing()
             self.step_logits = torch.empty(
                 (self.max_bs, self.gamma, _step_logits_width(self.model)),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
