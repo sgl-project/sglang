@@ -75,6 +75,7 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "total_tokens": prompt + completion,
         "completion_tokens": completion,
         "prompt_tokens_details": cached.map(|n| json!({"cached_tokens": n})),
+        "completion_tokens_details": {"reasoning_tokens": reasoning.min(completion)},
         "reasoning_tokens": reasoning,
     })
 }

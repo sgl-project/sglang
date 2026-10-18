@@ -206,13 +206,30 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """OpenAI ``usage.completion_tokens_details``."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Chat and completions set completion_tokens_details through
+        # UsageProcessor; usage built elsewhere omits the key instead of
+        # emitting null, which OpenAI does not allow.
+        if data.get("completion_tokens_details") is None:
+            data.pop("completion_tokens_details", None)
+        return data
 
 
 class StreamOptions(BaseModel):

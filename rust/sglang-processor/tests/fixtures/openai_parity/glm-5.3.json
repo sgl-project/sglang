@@ -56,6 +56,7 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
+            "completion_tokens_details": {"reasoning_tokens": 2},
             "reasoning_tokens": 2
           },
           "metadata": {"weight_version": "default"}
@@ -119,6 +120,7 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
+            "completion_tokens_details": {"reasoning_tokens": 2},
             "reasoning_tokens": 2
           },
           "metadata": {"weight_version": "default"}
@@ -283,6 +285,7 @@
             "total_tokens": 13,
             "completion_tokens": 1,
             "prompt_tokens_details": null,
+            "completion_tokens_details": {"reasoning_tokens": 1},
             "reasoning_tokens": 2
           },
           "metadata": {"weight_version": "default"}

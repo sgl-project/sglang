@@ -62,6 +62,28 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     }
 }
 
+/// `chunk` with its completion-token delta and the request's running
+/// reasoning-token total.
+pub(super) fn with_tokens(
+    item: ResponseItem,
+    completion_tokens: u64,
+    reasoning_tokens: u64,
+) -> ResponseItem {
+    match item {
+        ResponseItem::Frame(mut output) => {
+            output.completion_tokens = completion_tokens;
+            output.reasoning_tokens = reasoning_tokens;
+            ResponseItem::Frame(output)
+        }
+        ResponseItem::Done(mut output) => {
+            output.completion_tokens = completion_tokens;
+            output.reasoning_tokens = reasoning_tokens;
+            ResponseItem::Done(output)
+        }
+        other => other,
+    }
+}
+
 /// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,
