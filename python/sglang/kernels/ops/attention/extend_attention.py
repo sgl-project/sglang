@@ -17,6 +17,7 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -948,6 +949,32 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+
+    if (
+        os.environ.get("MUSE_DFLASH_SMALL_QUERY_TILE", "0") == "1"
+        and _is_gfx95
+        and Lq == 128
+        and Lk == 128
+        and Lv == 128
+        and head_num == 8
+        and k_extend.shape[1] == 1
+        and max_len_extend == 8
+        and q_extend.shape[0] == batch_size * 8
+        and not is_causal
+        and sliding_window_size == 2048
+        and q_extend.dtype == torch.bfloat16
+        and k_extend.dtype == v_extend.dtype == torch.bfloat16
+        and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+        and custom_mask is None
+        and sinks is None
+        and logit_cap <= 0
+        and xai_temperature_len <= 0
+        and score_mod is None
+        and aux_tensors is None
+    ):
+        # TP8 DFlash has only eight query rows. Preserve the original N tile
+        # and mixed BF16/FP8 arithmetic while avoiding the 64-row query tile.
+        BLOCK_M, BLOCK_N, num_warps = 16, 64, 4
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
