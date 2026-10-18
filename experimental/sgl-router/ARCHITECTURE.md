@@ -118,12 +118,6 @@ Settings fall into these categories:
 | **Admission** | Limits that make an engine reject a request | `--max-*` | `admission` |
 | **Buckets** | Which buckets a request fits and the order they are tried | `--bucket-config` | `max_input_tokens`, `max_context_tokens`, `rank`, ... |
 
-A group's `admission` block takes the flag names with underscores
-(`max_waiting_requests`, `max_pending_prefill_tokens`, `max_running_usage`,
-`max_kv_usage`), except `--max-in-flight`, whose key is `max_inflight_requests`.
-An `affinity` block takes `mode`, `balanced_by`, `load_factor` and `load_gap`;
-the last three require `"mode": "balanced"`.
-
 How policies apply to each group:
 
 - **Plain and prefill groups** use `--policy` (default `power_of_two`).
