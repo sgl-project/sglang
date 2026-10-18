@@ -5,11 +5,12 @@ import torch
 
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
@@ -139,6 +140,130 @@ class TestDraftExtendInGraph(CustomTestCase):
         self._run(translating=True)
         with self.assertRaises(KeyError):
             self._run(translating=False)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA graph replay requires CUDA")
+class TestUnifiedVerifyGraphMetadata(CustomTestCase):
+    def test_replay_uses_live_mapping_and_request_rows(self):
+        """Captured tables must follow compaction, page reuse and shorter rows.
+
+        A raw req_to_token gather silently uses virtual pages; an eager-only
+        builder leaves stale physical pages after replay. Both violate the
+        expected physical addresses checked after each mapping change.
+        """
+        for page_size in (1, 128):
+            for use_swa in (False, True):
+                with self.subTest(page_size=page_size, use_swa=use_swa):
+                    self._check_replay(page_size, use_swa)
+
+    def _check_replay(self, ps, use_swa):
+        device = "cuda"
+        bs, pages, delta = 3, 6, 3
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.fa_impl_ver = 4
+        b.topk = 1
+        b.page_size = ps
+        b.max_num_pages = pages
+        b.speculative_num_draft_tokens = delta
+        b.use_sliding_window_kv_pool = use_swa
+        # Request zero is the padded sink. Live virtual pages differ from
+        # physical pages, including an unbound SWA page (-1).
+        b.req_to_token = torch.zeros((4, pages * ps), dtype=torch.int64, device=device)
+        for row in range(1, 4):
+            b.req_to_token[row] = torch.arange(
+                row * pages * ps, (row + 1) * pages * ps, device=device
+            )
+        full = torch.arange(24, device=device, dtype=torch.int32).flip(0).contiguous()
+        full[0] = 0
+        swa = torch.arange(24, device=device, dtype=torch.int32)
+        swa[7] = -1
+        translator = KVIndexTranslator.__new__(KVIndexTranslator)
+        translator._spaces = {
+            IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
+        }
+        if use_swa:
+            translator._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
+                key="swa", read_v2p=swa
+            )
+        b.kv_index_translator = translator
+        b.target_verify_metadata = {
+            "cache_seqlens": torch.zeros(bs, dtype=torch.int32, device=device),
+            "cu_seqlens_k": torch.zeros(bs + 1, dtype=torch.int32, device=device),
+            "cu_seqlens_q": torch.arange(
+                0, (bs + 1) * delta, delta, dtype=torch.int32, device=device
+            ),
+            "page_table": torch.full(
+                (bs, pages), -99, dtype=torch.int32, device=device
+            ),
+        }
+        if use_swa:
+            b.target_verify_metadata["swa_page_table"] = torch.full(
+                (bs, pages), -99, dtype=torch.int32, device=device
+            )
+            b.cuda_graph_swa_out_cache_loc = torch.zeros(
+                bs * delta, dtype=torch.int64, device=device
+            )
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            req_pool_indices=torch.tensor([2, 1, 0], device=device),
+            seq_lens=torch.tensor([ps + 1, 2 * ps - 1, 1], device=device),
+            encoder_lens=None,
+            spec_info=SimpleNamespace(ragged_verify_layout=None),
+            positions=torch.arange(bs * delta, device=device),
+            out_cache_loc=None,
+        )
+        b.init_forward_metadata_out_graph(fb, in_capture=True)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            b.init_forward_metadata_in_graph(fb)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            b.init_forward_metadata_in_graph(fb)
+        metadata = b.target_verify_metadata[bs]
+        pointer = metadata.page_table.data_ptr()
+        for iteration in range(3):
+            if iteration == 1:
+                # Compaction and request reorder, plus a shorter live prefix.
+                full[6:24] = torch.arange(1, 19, device=device, dtype=torch.int32)
+                swa[7] = 21
+                swa[13] = -1
+                fb.req_pool_indices.copy_(torch.tensor([1, 3, 0], device=device))
+                fb.seq_lens.copy_(torch.tensor([0, 3 * ps, 1], device=device))
+            elif iteration == 2:
+                # Recycle a request row, grow its extent and reuse its pages.
+                b.req_to_token[1].copy_(b.req_to_token[2])
+                full[12:18] = 4
+                fb.seq_lens.copy_(torch.tensor([2 * ps, 0, 1], device=device))
+            b.init_forward_metadata_out_graph(fb)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(metadata.page_table.data_ptr(), pointer)
+            lengths = fb.seq_lens.cpu() + delta
+            torch.testing.assert_close(
+                metadata.cache_seqlens_int32.cpu(), lengths.int()
+            )
+            torch.testing.assert_close(
+                metadata.cu_seqlens_k.cpu(),
+                torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int())),
+            )
+            rows = fb.req_pool_indices.cpu().tolist()
+            for table, mapping in (
+                (metadata.page_table, full),
+                (metadata.swa_page_table, swa),
+            ):
+                if table is None:
+                    continue
+                expected = torch.zeros((bs, pages), dtype=torch.int32)
+                tokens = b.req_to_token.cpu()
+                physical = mapping.cpu()
+                for lane, row in enumerate(rows):
+                    for page in range(min(pages, (int(lengths[lane]) + ps - 1) // ps)):
+                        virtual = int(tokens[row, page * ps]) // ps
+                        expected[lane, page] = max(0, int(physical[virtual]))
+                torch.testing.assert_close(table.cpu(), expected)
 
 
 if __name__ == "__main__":

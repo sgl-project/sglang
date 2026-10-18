@@ -1258,15 +1258,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata-prep hook. The unified memory pool
-                # records ZERO translate nodes here: all its read/write translates
-                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
-                # the captured graph reads already-physical locs. Base no-op for triton.
+                # Backends may gather live pool mappings into their static
+                # metadata here; these nodes run before any model KV reads.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
                 self._record_in_graph_metadata_prep_done()
-
-                # No invalidate_loc_cache() here: the unified pool translates its
-                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
