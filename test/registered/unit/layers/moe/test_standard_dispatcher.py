@@ -303,6 +303,27 @@ class TestLayerRunnerDispatch(CustomTestCase):
             output = topk.forward_cuda(torch.ones((1, 4)), torch.ones((1, 4)))
         self.assertEqual(output.format, TopKOutputFormat.BYPASSED)
 
+    def test_router_rebinding_rejects_conflicting_contract_before_mutation(self):
+        for first, second in (
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, MoeRunnerBackend.TRITON),
+            (MoeRunnerBackend.FLASHINFER_MXFP4, None),
+            (None, MoeRunnerBackend.FLASHINFER_MXFP4),
+        ):
+            with self.subTest(first=first, second=second):
+                topk = TopK(
+                    top_k=2,
+                    layer_id=0,
+                    fused_gate_packed_ids=True,
+                    allow_routed_experts_capture=False,
+                )
+                topk.bind_runner_backend(first)
+                original = vars(topk.topk_config).copy()
+                with self.assertRaisesRegex(RuntimeError, "different MoE runner"):
+                    topk.bind_runner_backend(second)
+                self.assertEqual(vars(topk.topk_config), original)
+                topk.bind_runner_backend(first)
+                self.assertEqual(vars(topk.topk_config), original)
+
     def test_implicit_router_without_a_layer_contract_fails_closed(self):
         """A forgotten model association must fail before invoking a wrong kernel."""
         topk = TopK(top_k=2, layer_id=0)

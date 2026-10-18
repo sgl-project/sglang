@@ -632,6 +632,7 @@ class TopK(BaseFusedOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        self._runner_backend_bound = False
 
         shared_experts = get_model().shared_experts
         self.enable_waterfill = shared_experts.use_waterfill
@@ -666,6 +667,12 @@ class TopK(BaseFusedOp):
     def bind_runner_backend(
         self, runner_backend: Optional[MoeRunnerBackendLike]
     ) -> None:
+        """Associate the owning experts once; repeating the same association is safe."""
+        if self._runner_backend_bound:
+            if runner_backend != self.topk_config.runner_backend:
+                raise RuntimeError("TopK cannot bind a different MoE runner backend.")
+            return
+        self._runner_backend_bound = True
         self.topk_config.runner_backend = runner_backend
         self.topk_config.fused_gate_packed_ids &= (
             runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
