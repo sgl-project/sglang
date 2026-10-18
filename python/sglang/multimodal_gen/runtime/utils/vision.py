@@ -190,7 +190,7 @@ def load_video(
         video = video_path
 
     try:
-        pil_images = _read_video_frames(video)
+        pil_images = _read_video_frames(video, max_frames)
     finally:
         if was_tempfile_created:
             os.remove(video_path)
@@ -201,7 +201,9 @@ def load_video(
     return pil_images
 
 
-def _read_video_frames(video: str) -> list[PIL.Image.Image]:
+def _read_video_frames(
+    video: str, max_frames: int | None = None
+) -> list[PIL.Image.Image]:
     pil_images = []
     if video.endswith(".gif"):
         gif = PIL.Image.open(video)
