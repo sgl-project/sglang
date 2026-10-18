@@ -198,6 +198,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
+                    "enable_decoder_swa_bounded_replay",
                     "dsa_topk_backend",
                     "enable_dsa_fused_indexer",
                     "prefill_attention_backend",
@@ -225,6 +226,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "mm_enable_dp_encoder",
                 }
             ),
         )
@@ -1290,6 +1292,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=model_config,
             ),
             hf_config,
@@ -1358,6 +1363,78 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "attention_backend": "trtllm_mha",
                 },
             )
+
+    def test_nemotron_h_eplb_picks_routed_runner_on_sm100(self):
+        """flashinfer_trtllm cannot take the EPLB remap; with redundant experts it
+        fails its routing shape check at startup."""
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        for quantization in ("modelopt_fp4", "nvfp4_online"):
+            with self.subTest(quantization):
+                server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+                server_args.enable_eplb = True
+                server_args.ep_num_redundant_experts = 32
+                if quantization == "nvfp4_online":
+                    server_args.quantization = quantization
+                    server_args._model_config.quantization = quantization
+
+                with (
+                    override_platform(is_sm100=True),
+                    override_platform(is_blackwell=True),
+                ):
+                    overrides = _nemotron_h_overrides(server_args, hf_config)
+
+                self.assertEqual(
+                    overrides["moe_runner_backend"], "flashinfer_trtllm_routed"
+                )
+
+    def test_nemotron_h_expert_remap_validation(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _validate_expert_remap,
+        )
+
+        def puzzle(*n_routed_experts):
+            return SimpleNamespace(
+                block_configs=[
+                    {"block_type": "moe", "n_routed_experts": n}
+                    for n in n_routed_experts
+                ]
+                + [{"block_type": "mamba"}]
+            )
+
+        def args(moe_runner_backend, moe_a2a_backend="none"):
+            return SimpleNamespace(
+                enable_eplb=True,
+                moe_runner_backend=moe_runner_backend,
+                moe_a2a_backend=moe_a2a_backend,
+            )
+
+        dense = ("NemotronHForCausalLM", SimpleNamespace())
+        rejected = {
+            "flashinfer_trtllm": (args("flashinfer_trtllm"), *dense),
+            "cutedsl_without_a2a": (args("flashinfer_cutedsl"), *dense),
+            "puzzle_mixed_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 128),
+            ),
+        }
+        accepted = {
+            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "puzzle_equal_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 64),
+            ),
+        }
+        for name, (cfg, model_arch, hf_config) in rejected.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                _validate_expert_remap(cfg, hf_config, model_arch)
+        for name, (cfg, model_arch, hf_config) in accepted.items():
+            with self.subTest(name):
+                _validate_expert_remap(cfg, hf_config, model_arch)
 
     def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -1525,6 +1602,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             moe_runner_backend="auto",
             moe_a2a_backend="none",
             attention_backend=None,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
             _model_config=model_config,
         )
 
@@ -2240,6 +2320,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=mc,
             )
             defaults.update(kw)
