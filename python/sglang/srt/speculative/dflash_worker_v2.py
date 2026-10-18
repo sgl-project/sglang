@@ -2599,7 +2599,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=(
-                torch.tensor(bs * block_size, dtype=torch.int32, device=device)
+                torch.full((), bs * block_size, dtype=torch.int32, device=device)
                 if enable_num_token_non_padded()
                 else None
             ),
