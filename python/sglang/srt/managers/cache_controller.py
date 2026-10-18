@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.group import PoolEntry
 
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -530,6 +531,59 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    @staticmethod
+    def _validate_dcp_storage_pools(
+        primary: HostKVCache, entries: Optional[List[PoolEntry]]
+    ):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolFP4
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        message = (
+            "HiCache L3 with DCP requires one materialized MLA host pool "
+            "and at most one materialized Mamba state pool."
+        )
+        if (
+            not isinstance(primary, MLATokenToKVPoolHost)
+            or primary.kv_buffer is None
+            or primary.mtp_draft_device_pools
+        ):
+            raise NotImplementedError(message)
+        if primary.layout not in ("layer_first", "page_first", "page_first_direct"):
+            raise NotImplementedError(
+                "HiCache L3 with DCP requires a generic MLA storage-page layout."
+            )
+        if isinstance(primary.device_pool, MLATokenToKVPoolFP4):
+            raise NotImplementedError(
+                "HiCache L3 with DCP cannot store separate KV scale buffers."
+            )
+        if entries is None:
+            return
+        if len(entries) not in (1, 2):
+            raise NotImplementedError(message)
+        if any(entry.packed_draft_device_pools for entry in entries):
+            raise NotImplementedError(message)
+        seen = set()
+        for entry in entries:
+            name = entry.name
+            if name in seen:
+                raise NotImplementedError(message)
+            seen.add(name)
+            if name == PoolName.KV and entry.host_pool is primary:
+                continue
+            if (
+                name != PoolName.MAMBA
+                or not isinstance(entry.host_pool, MambaPoolHost)
+                or entry.host_pool.layout not in ("page_first", "page_first_direct")
+                or entry.packed_draft_device_pools
+            ):
+                raise NotImplementedError(message)
+            buffers = entry.host_pool.get_hybrid_pool_buffer()
+            if not buffers or any(b is None or b.numel() == 0 for b in buffers):
+                raise NotImplementedError(message)
+        if PoolName.KV not in seen:
+            raise NotImplementedError(message)
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -544,6 +598,23 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if get_parallel().attn_dcp_size > 1:
+            from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
+            from sglang.srt.mem_cache.pool_host.group import HostPoolGroup
+            from sglang.srt.runtime_context import get_server_args
+
+            validate_hicache_dcp_storage(
+                get_server_args(),
+                storage_backend=storage_backend,
+            )
+            self._validate_dcp_storage_pools(
+                self.storage_host_pool,
+                (
+                    self.mem_pool_host.entries
+                    if isinstance(self.mem_pool_host, HostPoolGroup)
+                    else None
+                ),
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -563,12 +634,6 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -587,11 +652,14 @@ class HiCacheController:
                 # to this fraction, and the tree's write flush gate yields
                 # to live fetch demand (the write fraction is a floor).
                 self.prefetch_capacity_limit = int(
-                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
+                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.logical_size
                 )
             else:
                 # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+                # Budgets count logical slots, like prefetch occupancy and the allocator.
+                self.prefetch_capacity_limit = int(
+                    0.5 * self.mem_pool_host.logical_size
+                )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -699,6 +767,10 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
+    @property
+    def backup_skip(self) -> bool:
+        return not self.storage_config.is_storage_writer
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -743,6 +815,7 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         model_name = storage_model_name(model_name, self.storage_host_pool)
+        dcp_size = parallel.attn_dcp_size
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -760,6 +833,14 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
+            dcp_size=dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+            logical_page_size=self.page_size if dcp_size > 1 else None,
+            # FP8 caches use uint8 host buffers; key by the actual KV format.
+            kv_cache_dtype=(
+                self.storage_host_pool.device_pool.dtype if dcp_size > 1 else None
+            ),
+            host_layout=self.storage_host_pool.layout if dcp_size > 1 else None,
         )
 
     def reset(self):
@@ -1223,7 +1304,7 @@ class HiCacheController:
             # state mutates only at scheduler-thread lockstep points, so this
             # stays TP-deterministic. Write staging is the write budget's
             # usage; charging it here would park hits behind its storage drain.
-            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            used = self.mem_pool_host.logical_size - self.mem_pool_host.available_size()
             if self.host_write_staged_tokens_fn is not None:
                 used -= self.host_write_staged_tokens_fn()
             return max(0, used) >= self.prefetch_capacity_limit
@@ -1314,14 +1395,16 @@ class HiCacheController:
             except Empty:
                 continue
 
-    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+    def _sync_prefetch_hit_query(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
         hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce(
             hit_count,
             torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
         )
         return int(hit_count.item())
 
