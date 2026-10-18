@@ -114,7 +114,7 @@ engine's [native gRPC](#native-grpc) API.
 | Model | `--model-id`, `--tokenizer-path`, `--no-tokenizer` |
 | Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) |
 | Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
-| Admission | `--max-in-flight`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
+| Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
 | Reliability | `--retry-max-attempts`, `--request-timeout-secs`, `--stale-request-timeout-secs` |
 | KV signals | `--cache-prefix-provider`, `--kv-indexer-endpoint`, `--kv-peer-selector` |
 
@@ -152,14 +152,14 @@ Admission flags set per-engine caps; an engine at a cap is skipped:
 
 | Flag | Rejects an engine at |
 |---|---|
-| `--max-in-flight N` | `N` requests this router has in flight to it |
+| `--max-inflight-requests N` | `N` requests this router has in flight to it (`--max-in-flight` is an alias) |
 | `--max-waiting-requests N` | `N` engine-reported waiting requests |
 | `--max-pending-prefill-tokens N` | `N` engine-reported waiting uncached tokens |
 | `--max-running-usage F` | share `F` of its reported running-request capacity |
 | `--max-kv-usage F` | share `F` of its reported KV capacity |
 
 Engine-reported caps lag by one load report, so a burst can pass them;
-`--max-in-flight` counts dispatches as they happen.
+`--max-inflight-requests` counts dispatches as they happen.
 
 For the full selection rules see ARCHITECTURE.md:
 [load-aware routing](ARCHITECTURE.md#13-example-load-aware-routing),

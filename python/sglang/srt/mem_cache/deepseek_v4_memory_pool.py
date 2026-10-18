@@ -130,9 +130,12 @@ def uses_draft_swa_ring() -> bool:
     return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
 
 
-def get_draft_swa_ring_size(sliding_window: int, max_draft_tokens: int) -> int:
-    # A draft block and a verify commit write past the committed window.
-    return sliding_window + max_draft_tokens
+def get_draft_swa_ring_size(
+    sliding_window: int, max_draft_tokens: int, page_size: int
+) -> int:
+    # A draft block and a verify commit write past the committed window; whole
+    # pages match the target request window's rows, so PD sends both as one list.
+    return ceil_div(sliding_window + max_draft_tokens, page_size) * page_size
 
 
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
@@ -1169,7 +1172,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # while attending, so it addresses its ring directly with no workspace.
             self.unified_kv_pool = None
             self.swa_req_ring_size = get_draft_swa_ring_size(
-                self.sliding_window, online_mtp_max_draft_tokens or 0
+                self.sliding_window, online_mtp_max_draft_tokens or 0, swa_page_size
             )
             self.swa_req_ring_valid_from = torch.zeros(
                 self.num_req_slots, dtype=torch.int64, device=device
@@ -1451,11 +1454,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self.swa_kv_pool is not None:
-            physical_pages_per_logical_page = (
-                self.swa_page_size // self.swa_kv_pool.page_size
-            )
-            for buf in self.swa_kv_pool.kv_buffer:
+        # Under encoder replay the target's SWA lives in the request window, whose
+        # pages pair with decode's paged SWA pages (RequestWindow.page_indices).
+        swa_pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        if swa_pool is not None:
+            physical_pages_per_logical_page = self.swa_page_size // swa_pool.page_size
+            for buf in swa_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
