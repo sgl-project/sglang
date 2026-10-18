@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.encoder_swa_replay import replay_len
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -787,6 +788,7 @@ class PrefillAdder:
         extend_input_len: int,
         total_tokens: int,
         swa_host_hit_length: int,
+        chunk_limit: Optional[int],
     ) -> tuple[bool, Optional[int]]:
         return self.memory_budget.check_prefill(
             extend_input_len=extend_input_len,
@@ -794,7 +796,7 @@ class PrefillAdder:
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
             swa_host_hit_length=swa_host_hit_length,
-            chunk_limit=self.rem_chunk_tokens,
+            chunk_limit=chunk_limit,
             auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
         )
 
@@ -908,11 +910,16 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
-    def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
+    def _replay_rows(self, req: Req, prefix_len: int) -> int:
+        """Cached rows encoder replay folds in front of this request's extend."""
         if get_exec().features.enable_encoder_swa_bounded_replay and (
             req.kv.req_pool_idx is None or req.is_retracted
         ):
-            replay_tokens = min(prefix_len, 128)
+            return replay_len(prefix_len)
+        return 0
+
+    def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
+        if replay_tokens := self._replay_rows(req, prefix_len):
             self.log_replay_tokens += replay_tokens
             self.rem_input_tokens -= replay_tokens
             if self.rem_chunk_tokens is not None:
@@ -1537,11 +1544,21 @@ class PrefillAdder:
         # exact-chunk-fill, so a request whose ceiled length would spill is
         # not needlessly split into a second chunk.
         chunk_fit_tokens = extend_len if self.exact_chunk_fill else input_tokens
+        chunk_limit = self.rem_chunk_tokens
+        if chunk_limit is not None and (
+            replay_rows := self._replay_rows(req, prefix_len)
+        ):
+            # The step also runs the replay rows, so they share the chunk: an
+            # extend sized to the whole chunk would pass the MegaMoE token cap.
+            chunk_limit -= replay_rows
+            if chunk_limit <= 0:
+                return AddReqResult.OTHER
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
             req,
             extend_input_len=extend_len,
             total_tokens=total_tokens,
             swa_host_hit_length=swa_host_hit_length,
+            chunk_limit=chunk_limit,
         )
         if not can_admit:
             return AddReqResult.NO_TOKEN
