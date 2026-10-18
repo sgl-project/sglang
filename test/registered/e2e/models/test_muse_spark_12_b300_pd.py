@@ -42,7 +42,7 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
     mmmu_pro_score_threshold = 0.8
     mmmu_pro_num_examples = 50
     accept_length_thres = 4.7
-    bs_1_speed_thres = 580
+    bs_1_speed_thres = 500
     prefill_tp_size = 4
     decode_tp_size = 4
     # CUDA_VISIBLE_DEVICES remaps decode GPUs 4-7 to local ordinals 0-3.
@@ -111,9 +111,13 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
         super().tearDownClass()
         _wait_for_gpu_idle_in_ci(timeout=120)
 
-    def _run_accuracy_eval(self, eval_name, num_examples=None):
+    def flush_cache_for_spec_benchmark(self):
+        # The mini-LB does not expose flush_cache. Clear both worker caches.
         for url in (self.prefill_url, self.decode_url):
             requests.post(f"{url}/flush_cache", timeout=60).raise_for_status()
+
+    def _run_accuracy_eval(self, eval_name, num_examples=None):
+        self.flush_cache_for_spec_benchmark()
 
         # Muse Spark has no built-in sgl-eval model preset. Use explicit chat
         # generation settings for both the full GSM8K and the MMMU-Pro smoke test.

@@ -250,9 +250,9 @@ def prepare_megamoe_norm(layer, post_expert_norm) -> None:
 
 
 def _get_ep_group():
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+    from sglang.srt.runtime_context import get_parallel
 
-    return get_moe_ep_group().device_group
+    return get_parallel().moe_ep_group.device_group
 
 
 def _token_capacity():

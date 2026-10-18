@@ -1636,7 +1636,10 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             attn_dp_size=4,
             tp_size=4,
         )
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
+        server_args._model_config = SimpleNamespace(
+            nvfp4_moe_meta=None,
+            hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+        )
         return server_args
 
     def test_auto_resolves_mxfp8_and_normalizes_trtllm(self):
@@ -1665,7 +1668,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="auto")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -1698,7 +1701,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(

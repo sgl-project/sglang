@@ -35,7 +35,6 @@ from sglang.kernels.ops.activation.softcap import (
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
@@ -1020,7 +1019,7 @@ class LogitsProcessor(nn.Module):
         """``argmax`` of the full softcapped logits from a target-verify vocab
         shard, gathering only each rank's row maxima. Ties resolve to the lowest
         vocab index, as ``torch.argmax`` over the gathered row does."""
-        group = get_tp_group()
+        group = get_parallel().tp_group
         num_tokens, shard_width = logits.shape
         col_offset = group.rank_in_group * shard_width
         valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
@@ -1040,7 +1039,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Optional[LogitsMetadata],
         use_buffer: bool,
     ) -> torch.Tensor:
-        group = get_tp_group()
+        group = get_parallel().tp_group
         num_tokens, shard_width = logits.shape
         gathered = torch.empty(
             (group.world_size, num_tokens, shard_width),
