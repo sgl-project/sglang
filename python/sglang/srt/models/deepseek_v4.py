@@ -107,7 +107,12 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    MM_PAD_SHIFT_VALUE,
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -178,6 +183,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
     image_token_types,
     materialize_image_gpu,
+    patchify_image,
 )
 from sglang.srt.runtime_context import (
     get_device,
@@ -4384,6 +4390,27 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+        if getattr(config, "encoder_only", False):
+            # EPD --encoder-only: serve only the ViT/aligner. Building
+            # DeepseekV4Model would allocate every decoder layer's (quantized)
+            # MoE weights on the encoder GPU for layers that never run there —
+            # an instant OOM on a single device.
+            if self.vision is None:
+                raise ValueError(
+                    "--encoder-only requires a DeepSeek-V4.1 vision checkpoint "
+                    "(model_type=deepseek_v41 with vision_n_layers > 0)."
+                )
+            self.model = None
+            self.pp_group = get_parallel().pp_group
+            self.lm_head = None
+            self.logits_processor = None
+            self.capture_aux_hidden_states = False
+            self._routed_experts_weights_of_layer = LazyValue(dict)
+            self.start_layer = 0
+            self.end_layer = 0
+            self.dsa_enable_prefill_cp = False
+            self._mhc_prewarmed_at_load = False
+            return
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -4488,6 +4515,55 @@ class DeepseekV4ForCausalLM(nn.Module):
     def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
 
+    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        """EPD encoder-side hook: CPU image load into ViT patches.
+
+        Runs the same deterministic load as DeepseekV41ImageProcessor (resize
+        plan + patchify); the ViT/aligner then run on the encoder GPU via
+        get_image_feature. V4.1 spans are position-independent (no compress
+        padding), so the P side can splice the returned blocks verbatim.
+        """
+        # Lazy import: encoder-only infrastructure is not needed on the
+        # colocate / prefill / decode servers that also import this model.
+        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
+
+        if modality != Modality.IMAGE:
+            raise ValueError(
+                f"DeepSeek-V4.1 encoder preprocessing supports images only, "
+                f"got {modality}"
+            )
+        if not isinstance(mm_data, (list, tuple)):
+            mm_data = [mm_data]
+
+        mm_items: List[MultimodalDataItem] = []
+        grids: List[List[int]] = []
+        item_sizes: List[int] = []
+        for image in mm_data:
+            patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = patchify_image(
+                image, self.config
+            )
+            # 3-wide grid ([t, h, w]) so the generic encoder/receiver grid
+            # plumbing (get_mm_extra_meta -> img_grid_thw, reshaped to (-1, 3))
+            # carries the LLM token grid to the P side.
+            grids.append([1, n_llm_h, n_llm_w])
+            item_sizes.append(n_vit_h * n_vit_w)
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=patches,
+                    hash=hash_feature(
+                        [patches, torch.tensor([n_vit_h, n_vit_w], dtype=torch.int64)]
+                    ),
+                    model_specific_data={"n_vit_h": n_vit_h, "n_vit_w": n_vit_w},
+                )
+            )
+        return EncoderPreprocessOutput(
+            {"image_grid_thw": torch.tensor(grids, dtype=torch.int64)},
+            mm_items=mm_items,
+            item_sizes=item_sizes,
+        )
+
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
 
@@ -4514,6 +4590,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             span[types == 2] = self.image_newline
             span[types == 3] = self.image_end
             spans.append(span)
+        if getattr(self.config, "encoder_only", False):
+            # The EPD encoder server slices per item by token counts and needs
+            # one flat [sum(span_len), hidden] tensor; colocate consumers
+            # (shared MM cache / chunk scheduler) keep the per-item spans.
+            return torch.cat(spans, dim=0)
         return spans
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
@@ -4743,6 +4824,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
+        if self.model is None:
+            # --encoder-only: no text layers to fix up.
+            return
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
@@ -4933,7 +5017,36 @@ class DeepseekV4ForCausalLM(nn.Module):
             time.perf_counter() - tic - compile_secs,
         )
 
+    def _load_encoder_only_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> None:
+        """--encoder-only: only ViT/aligner params exist; drop text-model tensors.
+
+        Vision names pass through remap_weight_name_to_dpsk_hf_format unchanged
+        apart from the wqkv/wo renames and always load via the generic
+        default-loader path in the full load_weights loop (the ViT uses plain
+        nn.Linear modules), so this mirrors exactly what colocate does for them.
+        """
+        params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+        for name, loaded_weight in weights:
+            if not name.startswith(("vision.", "aligner.", "image_")):
+                continue
+            name = self.remap_weight_name_to_dpsk_hf_format(name)
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            logger.warning(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if self.model is None:
+            self._load_encoder_only_weights(weights)
+            return
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 

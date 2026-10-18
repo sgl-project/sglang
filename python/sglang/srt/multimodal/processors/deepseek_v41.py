@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
+    MM_PAD_SHIFT_VALUE,
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
@@ -16,6 +17,7 @@ from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
     image_token_types,
+    num_image_tokens,
     patchify_image,
     patchify_image_rust,
     prepare_image_gpu,
@@ -76,6 +78,21 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, *args, **kwargs
     ):
+        # EPD/PD decode instances receive the already-expanded input_ids, where
+        # image positions hold MM_PAD_SHIFT_VALUE+hash sentinels that are out of
+        # vocab. The image embeddings were produced during Prefill, so
+        # re-processing here is redundant (and decoding the sentinel ids back to
+        # text would fail). A pad sentinel is the reliable signal that the ids
+        # are already expanded.
+        req_input_ids = getattr(request_obj, "input_ids", None)
+        if req_input_ids is not None and any(
+            int(t) >= MM_PAD_SHIFT_VALUE for t in req_input_ids
+        ):
+            return MultimodalProcessorOutput(
+                input_ids=list(req_input_ids),
+                mm_items=[],
+                im_token_id=self.image_token_id,
+            )
         base = await self.load_mm_data(
             input_text, image_data=image_data, multimodal_tokens=self.mm_tokens
         )
@@ -123,5 +140,73 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
         return MultimodalProcessorOutput(
             input_ids=tokens,
             mm_items=self._prepare_mm_items_for_transport(items),
+            im_token_id=self.image_token_id,
+        )
+
+    def get_mm_data(self, prompt, embeddings, *, img_grid_thw=None, **kwargs):
+        """EPD P-side rebuild: expand each image placeholder into its span.
+
+        The encoder ships one embedding block per image — the complete sentinel
+        span ([START] + rows + [END], ``num_image_tokens(lh, lw)`` rows) built by
+        get_image_feature. V4.1 spans are position-independent, so the blocks
+        are spliced verbatim at the placeholder positions; ``img_grid_thw``
+        carries [t, n_llm_h, n_llm_w] per image (see preprocess_mm_for_encoder).
+        """
+        image_embeddings = (
+            embeddings.get(Modality.IMAGE)
+            if isinstance(embeddings, dict)
+            else embeddings
+        )
+        if image_embeddings is None:
+            raise ValueError(
+                "DeepSeek-V4.1 EPD get_mm_data received no image embeddings"
+            )
+        if img_grid_thw is None:
+            raise ValueError("DeepSeek-V4.1 EPD get_mm_data requires img_grid_thw")
+
+        ids = prompt if isinstance(prompt, list) else self._processor.encode(prompt)
+        grid = torch.as_tensor(img_grid_thw).reshape(-1, 3)
+        num_placeholders = sum(1 for t in ids if t == self.image_token_id)
+        if num_placeholders != grid.shape[0]:
+            raise ValueError(
+                f"Found {num_placeholders} image placeholders but got "
+                f"{grid.shape[0]} image grids"
+            )
+
+        tokens, items = [], []
+        image_index = 0
+        cursor = 0
+        for token in ids:
+            if token != self.image_token_id:
+                tokens.append(token)
+                continue
+            lh, lw = int(grid[image_index][-2]), int(grid[image_index][-1])
+            count = num_image_tokens(lh, lw)
+            block = image_embeddings[cursor : cursor + count]
+            cursor += count
+            if block.shape[0] != count:
+                raise ValueError(
+                    f"DSV4.1 EPD block length mismatch: expected {count} rows "
+                    f"for grid ({lh}, {lw}), got {block.shape[0]}"
+                )
+            start = len(tokens)
+            tokens.extend([self.image_token_id] * count)
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(start, start + count - 1)],
+                    precomputed_embeddings=block,
+                )
+            )
+            image_index += 1
+        if cursor != image_embeddings.shape[0]:
+            raise ValueError(
+                f"DSV4.1 EPD embeddings not fully consumed: used {cursor} of "
+                f"{image_embeddings.shape[0]} rows"
+            )
+
+        return MultimodalProcessorOutput(
+            input_ids=tokens,
+            mm_items=items,
             im_token_id=self.image_token_id,
         )

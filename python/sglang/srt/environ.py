@@ -1952,6 +1952,30 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+    # Force lazy PIL images to decode in the encoder I/O worker instead of
+    # deferring that CPU work to the preprocessing/forward stage.
+    SGLANG_ENCODER_EAGER_IMAGE_DECODE = EnvBool(True)
+
+    # Overlapped image loading: decode each batch's images in a pool of loader
+    # processes off the GPU path so the next batch loads while the current one
+    # encodes. When disabled, IMAGE batches decode inline on the dispatch path.
+    SGLANG_ENCODER_ENABLE_IMAGE_LOADER = EnvBool(True)
+    # Worker processes that load/decode batch images off the GPU path, so the
+    # next batch can be loaded while the current one is encoding on the GPU.
+    SGLANG_ENCODER_IMAGE_LOADER_WORKERS = EnvInt(10)
+
+    # Overlap the CPU preprocessing (resize/normalize/patchify in
+    # process_mm_items) of the next image batch with the GPU ViT forward of the
+    # current batch, as a two-stage pipeline: the encoder (single-rank) dispatch
+    # loop preprocesses batches as they arrive while a dedicated forward thread
+    # runs the GPU encode; a forward starts as soon as its batch is prepped and
+    # is never delayed to wait for future traffic. Because it is the forward that
+    # moves off the event loop, this also overlaps models whose preprocessing is
+    # synchronous. Requires the image loader (it is the pipeline's stage-0 feed).
+    SGLANG_ENCODER_OVERLAP_PREPROCESS = EnvBool(False)
+    # EPD: avoid redundant concat/device-normalization in precomputed embedding
+    # extraction on the prefill side.
+    SGLANG_EPD_PRECOMPUTED_EMBEDDING_FAST_PATH = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

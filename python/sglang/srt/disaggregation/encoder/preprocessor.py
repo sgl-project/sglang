@@ -58,6 +58,83 @@ from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backe
 logger = logging.getLogger(__name__)
 
 
+def load_media_item(
+    data,
+    modality: Modality,
+    *,
+    gpu_image_decode=False,
+    preserve_media_metadata: bool = False,
+    discard_alpha_channel: bool = True,
+    frame_count_limit=None,
+    audio_sr=None,
+):
+    """Load and decode one media reference.
+
+    Module-level, and taking plain config values instead of the preprocessor, so
+    the image-loader worker processes can call the exact same code path as the
+    inline one — a bound method could not be pickled into them.
+    """
+    from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
+
+    media_metadata = {}
+    content_hash = None
+    if isinstance(data, dict):
+        if "url" not in data:
+            return data
+        media_metadata = {key: value for key, value in data.items() if key != "url"}
+        content_hash = parse_content_hash(data.get("content_hash"))
+        data = data["url"]
+    try:
+        if modality == Modality.IMAGE:
+            if content_hash is not None:
+                snapshot = snapshot_media(data)
+                if snapshot.content_digest != content_hash:
+                    raise BadRequestError(
+                        "Encoder media content hash mismatch: "
+                        f"expected {content_hash}, got {snapshot.content_digest}"
+                    )
+                data = snapshot.data
+            img, _ = load_image(data, gpu_image_decode)
+            if (
+                discard_alpha_channel
+                and not isinstance(img, torch.Tensor)
+                and img.mode != "RGB"
+            ):
+                img = img.convert("RGB")
+            elif envs.SGLANG_ENCODER_EAGER_IMAGE_DECODE.get() and not isinstance(
+                img, torch.Tensor
+            ):
+                # PIL decodes lazily; force it in the encoder I/O worker.
+                img.load()
+            if media_metadata and preserve_media_metadata:
+                return {
+                    "type": "image",
+                    "image": img,
+                    **media_metadata,
+                }
+            return img
+        elif modality == Modality.VIDEO:
+            vid = load_video(data, frame_count_limit)
+            if media_metadata and preserve_media_metadata:
+                return {
+                    "type": "video",
+                    "video": vid,
+                    **media_metadata,
+                }
+            return vid
+        elif modality == Modality.AUDIO:
+            return load_audio(data, audio_sr)
+
+    except MMError:
+        raise
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        # Not ValueError: the DP envelope classifies by `.code`, which only
+        # MMError carries.
+        raise BadRequestError(f"Error while loading data {data}: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Error while loading data {data}: {e}")
+
+
 _mm_grid_attrs = {
     # Kimi K2.5/K3 HF processors use grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
     Modality.IMAGE: ("image_grid_thw", "image_grid_hws", "grid_thws"),
@@ -299,6 +376,26 @@ class EncoderPreprocessor:
     # Media I/O
     # ------------------------------------------------------------------
 
+    def load_item_kwargs(
+        self,
+        frame_count_limit=None,
+        discard_alpha_channel=True,
+    ) -> dict:
+        """Picklable load config, shared by the inline path and loader workers."""
+        return {
+            "gpu_image_decode": (
+                self.encoder_media_processor_config.image_decode_mode
+                if self.use_image_processor_gpu
+                else False
+            ),
+            "preserve_media_metadata": (
+                self.encoder_media_processor_config.preserve_media_metadata
+            ),
+            "discard_alpha_channel": discard_alpha_channel,
+            "frame_count_limit": frame_count_limit,
+            "audio_sr": self.model_audio_sr,
+        }
+
     def _load_single_item(
         self,
         data,
@@ -306,71 +403,11 @@ class EncoderPreprocessor:
         frame_count_limit=None,
         discard_alpha_channel=True,
     ):
-        from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
-
-        media_metadata = {}
-        content_hash = None
-        if isinstance(data, dict):
-            if "url" not in data:
-                return data
-            media_metadata = {key: value for key, value in data.items() if key != "url"}
-            content_hash = parse_content_hash(data.get("content_hash"))
-            data = data["url"]
-        try:
-            if modality == Modality.IMAGE:
-                if content_hash is not None:
-                    snapshot = snapshot_media(data)
-                    if snapshot.content_digest != content_hash:
-                        raise BadRequestError(
-                            "Encoder media content hash mismatch: "
-                            f"expected {content_hash}, got {snapshot.content_digest}"
-                        )
-                    data = snapshot.data
-                gpu_image_decode = (
-                    self.encoder_media_processor_config.image_decode_mode
-                    if self.use_image_processor_gpu
-                    else False
-                )
-                img, _ = load_image(data, gpu_image_decode)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    img = img.convert("RGB")
-                if (
-                    media_metadata
-                    and self.encoder_media_processor_config.preserve_media_metadata
-                ):
-                    return {
-                        "type": "image",
-                        "image": img,
-                        **media_metadata,
-                    }
-                return img
-            elif modality == Modality.VIDEO:
-                vid = load_video(data, frame_count_limit)
-                if (
-                    media_metadata
-                    and self.encoder_media_processor_config.preserve_media_metadata
-                ):
-                    return {
-                        "type": "video",
-                        "video": vid,
-                        **media_metadata,
-                    }
-                return vid
-            elif modality == Modality.AUDIO:
-                return load_audio(data, self.model_audio_sr)
-
-        except MMError:
-            raise
-        except CLIENT_MEDIA_EXCEPTIONS as e:
-            # Not ValueError: the DP envelope classifies by `.code`, which only
-            # MMError carries.
-            raise BadRequestError(f"Error while loading data {data}: {e}") from e
-        except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+        return load_media_item(
+            data,
+            modality,
+            **self.load_item_kwargs(frame_count_limit, discard_alpha_channel),
+        )
 
     def _submit_data_loading_tasks(self, items, modalities):
         futures = []
@@ -634,7 +671,7 @@ class EncoderPreprocessor:
     # ------------------------------------------------------------------
 
     async def process_mm_items(
-        self, mm_items, modality: Modality
+        self, mm_items, modality: Modality, preloaded_images=None
     ) -> EncoderPreprocessResult:
         """Process multimodal items through the HF processor pipeline.
 
@@ -642,10 +679,13 @@ class EncoderPreprocessor:
         processor, its normalized grid metadata, and one output token count per
         grid entry. Does not look up ``get_feature_fn``; that stays in
         :class:`MMEncoder`.
+
+        ``preloaded_images`` (IMAGE only) are images the loader processes already
+        decoded, letting this call skip media I/O entirely.
         """
         if modality == Modality.IMAGE:
             mm_inputs = await self._process_image_items(
-                mm_items, self._model_preprocessor
+                mm_items, self._model_preprocessor, preloaded_images=preloaded_images
             )
         elif modality == Modality.VIDEO:
             mm_inputs = await self._process_video_items(
@@ -669,12 +709,37 @@ class EncoderPreprocessor:
         return modality in self._supported_modalities
 
     async def process_batch_mm_items(
-        self, requests: List[dict], modality: Modality
+        self, requests: List[dict], modality: Modality, preloaded_images=None
     ) -> tuple[EncoderPreprocessResult, List[int]]:
-        """Flatten requests, run the processor once, and return batch layout."""
+        """Flatten requests, run the processor once, and return batch layout.
+
+        ``items_per_req`` is always derived from the raw leaves, so a preloaded
+        batch keeps the same grid layout as an inline one.
+        """
         flat_items, items_per_req = self._flatten_batch_requests(requests, modality)
-        result = await self.process_mm_items(flat_items, modality)
+        if preloaded_images is not None and len(preloaded_images) != len(flat_items):
+            # Misalignment here would silently attribute one request's grids to
+            # another, so fail before the HF processor ever sees the batch.
+            raise ValueError(
+                f"Preloaded image count {len(preloaded_images)} does not match "
+                f"{len(flat_items)} flattened items"
+            )
+        result = await self.process_mm_items(
+            flat_items, modality, preloaded_images=preloaded_images
+        )
         return result, items_per_req
+
+    def flatten_batch_refs(self, requests: List[dict]) -> List:
+        """A batch's media refs, flattened in the order preprocessing expects.
+
+        The image loader sends its decoded images back in this order, and
+        _flatten_batch_requests reproduces it to lay out the grids, so both sides
+        go through here to keep them from drifting apart.
+        """
+        flat_items = []
+        for req in requests:
+            flat_items.extend(self._flatten_nested_items(req["mm_items"]))
+        return flat_items
 
     def _flatten_batch_requests(
         self, requests: List[dict], modality: Modality
@@ -682,18 +747,23 @@ class EncoderPreprocessor:
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
         # expand one leaf into multiple grids (e.g. Kimi-VL/K2.5/K3 dict-of-images).
-        flat_items = []
         items_per_req = []
         for req in requests:
             leaves = self._flatten_nested_items(req["mm_items"])
-            flat_items.extend(leaves)
             items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
-        return flat_items, items_per_req
+        return self.flatten_batch_refs(requests), items_per_req
 
-    async def _process_image_items(self, mm_items, model_preprocessor):
+    async def _process_image_items(
+        self, mm_items, model_preprocessor, preloaded_images=None
+    ):
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
-        images = await self._flatten_and_load_images(mm_items)
+        if preloaded_images is not None:
+            # Loader processes already decoded these, flattened in the same order
+            # _flatten_batch_requests produced; skip the synchronous load.
+            images = preloaded_images
+        else:
+            images = await self._flatten_and_load_images(mm_items)
         if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
@@ -904,6 +974,16 @@ class EncoderPreprocessor:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            if self.model_type == "deepseek_v41" and modality == Modality.IMAGE:
+                # DSV4.1 image tokens are a sentinel span, not a merged patch
+                # grid: [START] + ([IMAGE]*w + [NEWLINE])*h + [END], where the
+                # grid is [t, n_llm_h, n_llm_w] (see preprocess_mm_for_encoder).
+                from sglang.srt.multimodal.deepseek_v41_image_processing import (
+                    num_image_tokens,
+                )
+
+                g = grid.tolist() if isinstance(grid, torch.Tensor) else list(grid)
+                return num_image_tokens(int(g[-2]), int(g[-1]))
             if (
                 self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
                 and modality == Modality.IMAGE

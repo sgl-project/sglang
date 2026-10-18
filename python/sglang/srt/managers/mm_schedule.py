@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -92,6 +93,7 @@ def _get_precomputed_embedding(
         host_offload_event.synchronize()
     precomputed_embeddings = []
     max_iterations = min(len(items_size) - 1, len(prefix_length))
+    fast_path = envs.SGLANG_EPD_PRECOMPUTED_EMBEDDING_FAST_PATH.get()
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
@@ -102,6 +104,14 @@ def _get_precomputed_embedding(
 
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
+        elif fast_path and len(items_per_req) == 1:
+            chunk_tensor, _, _ = get_embedding_chunk(
+                embedding=items_per_req[0].precomputed_embeddings,
+                extend_prefix_len=prefix_length[i],
+                extend_seq_len=extend_len,
+                items_offset=items_per_req[0].offsets,
+            )
+            chunk = [chunk_tensor]
         else:
             chunk = [
                 get_embedding_chunk(
@@ -126,6 +136,10 @@ def _get_precomputed_embedding(
         precomputed_embeddings = [
             tensor for chunks in precomputed_embeddings for tensor in chunks
         ]
+        if fast_path and len(precomputed_embeddings) == 1:
+            result = precomputed_embeddings[0]
+            return result.reshape(-1, result.shape[-1])
+
         # Normalize device across chunks before concat.
         target_device = next(
             (t.device for t in precomputed_embeddings if t.is_cuda),
