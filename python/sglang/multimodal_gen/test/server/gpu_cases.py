@@ -728,7 +728,9 @@ else:
         ),
     ]
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
+ONE_GPU_B200_CASES = [
+    replace(case, run_perf_check=True) for case in ONE_GPU_MODELOPT_NVFP4_CASES
+]
 
 MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
