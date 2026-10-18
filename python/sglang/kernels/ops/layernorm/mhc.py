@@ -2208,7 +2208,7 @@ def _hc_combine_kernel(
     tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_mix_stats_partial_kernel(
     x_ptr,
     w_ptr,
@@ -2394,7 +2394,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     return mixes
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["m"])
 def _hc_mix_reduce_sinkhorn_kernel(
     part_mix_ptr,
     part_sq_ptr,
@@ -2571,7 +2571,7 @@ def split_tf32_hc_weight(weight: torch.Tensor):
     return high, weight - high
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_mix_stats_bf16x3_kernel(
     X,
     W_HI,
