@@ -861,24 +861,23 @@ class PrefillAdder:
         mamba_gap_reserve: int = 0,
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
-        compute_charge: Optional[int] = None,
         replay_len: int = 0,
     ):
         """Charge one admitted request against the prefill budgets.
 
         The compute budgets (`rem_chunk_tokens`, `rem_input_tokens`,
-        `rem_dllm_tokens`) take the rows the step runs: `compute_charge` for the
-        extend, plus `replay_len` cached tokens that encoder replay recomputes.
-        The KV budgets take only the page-ceiled extend, which is also the
-        default `compute_charge`. Exact-chunk-fill bills the raw length to every
-        compute budget alike, so none runs out first with rounding slack unspent.
+        `rem_dllm_tokens`) take the rows the step runs: the extend, plus
+        `replay_len` cached tokens that encoder replay recomputes. The KV
+        budgets take only the page-ceiled extend. Exact-chunk-fill bills the
+        compute budgets the raw extend instead, all alike, so none runs out
+        first with rounding slack unspent.
         """
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         raw_extend_input_len = extend_input_len
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
-        if compute_charge is None:
-            compute_charge = extend_input_len
-        compute_charge += replay_len
+        compute_charge = (
+            raw_extend_input_len if self.exact_chunk_fill else extend_input_len
+        ) + replay_len
 
         self.memory_budget.reserve(
             extend_input_len,
@@ -1174,7 +1173,6 @@ class PrefillAdder:
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
-            compute_charge=req.extend_len if self.exact_chunk_fill else None,
         )
 
         # Return if chunked prefill not finished
@@ -1307,7 +1305,6 @@ class PrefillAdder:
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
-                compute_charge=(req.extend_len if self.exact_chunk_fill else None),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -1336,7 +1333,6 @@ class PrefillAdder:
                 request_slot_reserve=self._request_slot_reserve_for_req(
                     req, extend_input_len=trunc_len
                 ),
-                compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
 
         return self.budget_state()
@@ -1638,8 +1634,6 @@ class PrefillAdder:
             request_slot_reserve=self._request_slot_reserve_for_req(
                 req, extend_input_len=admission.extend_len
             ),
-            # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
-            compute_charge=admission.extend_len if self.exact_chunk_fill else None,
             replay_len=admission.replay_len,
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
