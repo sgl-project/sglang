@@ -631,12 +631,16 @@ def broadcast_global_expert_location_metadata(
     if rank_in_group == src_rank:
         return metadata
 
-    metadata = ExpertLocationMetadata.init_by_mapping(
+    updated = ExpertLocationMetadata.init_by_mapping(
         model_config,
         metadata.physical_to_logical_map,
         moe_ep_rank=moe_ep_rank,
     )
-    set_global_expert_location_metadata(metadata, allow_overwrite=True)
+    if get_exec().moe.elastic_ep_reuse_cuda_graph:
+        metadata.adopt_scaled_in_place(updated)
+    else:
+        metadata = updated
+        set_global_expert_location_metadata(metadata, allow_overwrite=True)
     return metadata
 
 
