@@ -1,20 +1,26 @@
 """CPU unit tests for the fixed system-prompt prefix feature.
 
-Covers prompt-text / file resolution, mamba-chunk alignment, the token prefix
-split probe (including BOS handling and probe-disable fallback), the mamba
-boundary seeder, and the mamba donate-length cap that retains only the shared
-system-prefix state. No server / engine is launched.
+Covers prompt-text / file resolution, mamba-chunk alignment (truncate-down),
+the token prefix split probe (including BOS handling and probe-disable
+fallback), the truncate-down invariants (byte-identical token stream, shared
+prefix on the chunk grid), the short-system disable guard, the startup probe
+gate, the static-pool mamba slot budget, the mamba boundary seeder, and the
+mamba donate-length cap that retains only the shared system-prefix state. No
+server / engine is launched.
 """
 
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.system_prompt import (
     SystemPrefix,
-    aligned_prefix_len,
+    aligned_prefix_len_down,
     cap_mamba_donate_len,
     is_system_prefix_warm,
+    probe_system_prefix_or_disable,
     resolve_system_prompt,
     reseed_mamba_boundary_after_match,
     seed_mamba_boundary,
@@ -26,7 +32,7 @@ from sglang.srt.mem_cache.radix_cache import _system_kv_cap
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-_MARKERS = {"<s>": 1, "<|system|>": 10, "<|user|>": 11, "<|assistant|>": 12}
+_MARKERS = {"<s>": 1, "「": 10, "」": 11, "』": 12}
 
 
 class _StubTokenizer:
@@ -60,7 +66,7 @@ class _StubTokenizer:
         for m in messages:
             out += f"<|{m['role']}|>{m['content']}"
         if add_generation_prompt:
-            out += "<|assistant|>"
+            out += "」"
         return out
 
     def encode(self, text, **kw):
@@ -95,12 +101,16 @@ class TestSystemPromptArgs(CustomTestCase):
         finally:
             os.unlink(path)
 
-    def test_aligned_prefix_len(self):
-        self.assertEqual(aligned_prefix_len(0, 64), 0)
-        self.assertEqual(aligned_prefix_len(64, 64), 64)
-        self.assertEqual(aligned_prefix_len(65, 64), 128)
-        self.assertEqual(aligned_prefix_len(100, 32), 128)
-        self.assertEqual(aligned_prefix_len(30, 0), 30)
+    def test_aligned_prefix_len_down(self):
+        # Derived property: the shared prefix must land ON the checkpoint grid
+        # by rounding DOWN, never past the native system block (padding up
+        # would alter the token stream; the crash the down-rounding prevents is
+        # a boundary state that no checkpoint can back).
+        self.assertEqual(aligned_prefix_len_down(0, 64), 0)
+        self.assertEqual(aligned_prefix_len_down(64, 64), 64)
+        self.assertEqual(aligned_prefix_len_down(65, 64), 64)
+        self.assertEqual(aligned_prefix_len_down(100, 32), 96)
+        self.assertEqual(aligned_prefix_len_down(30, 0), 30)
 
 
 class _FakeReq:
@@ -270,26 +280,23 @@ class TestSystemPrefix(CustomTestCase):
         self.assertTrue(sp.enabled, "identity probe should enable caching")
         msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "U"}]
         got = sp.split_request(msgs, encode_kwargs={})
-        real_sys = self._render(tok, msgs[:1], gen=False)
         full = self._render(tok, msgs, gen=True)
-        # system tokens preserved verbatim up to their true length
-        self.assertEqual(got[: len(real_sys)], real_sys)
-        # prefix padded to a chunk boundary
+        real_sys = self._render(tok, msgs[:1], gen=False)
+        # truncate-down invariants (see TestTruncateDownInvariants)
+        self.assertEqual(got, full)
+        self.assertEqual(sp.prefix_len, (len(real_sys) // chunk) * chunk)
         self.assertEqual(sp.prefix_len % chunk, 0)
-        # rest (after the padded prefix) equals the full-render tail
-        self.assertEqual(got[sp.prefix_len :], full[len(real_sys) :])
-        # padding extends the prefix to the chunk boundary without reducing the
-        # system tokens already rendered
-        self.assertEqual(got[: len(real_sys)], real_sys)
-        self.assertEqual(sp.prefix_len % chunk, 0)
+        self.assertEqual(got[: sp.prefix_len], list(sp.prefix_ids))
+        # inject_message carries the ORIGINAL text: no padding ever added
+        self.assertEqual(sp.inject_message()["content"], "SYS")
 
     def test_split_qwen_style(self):
-        for chunk in (30, 64):
+        for chunk in (3, 4):
             with self.subTest(chunk=chunk):
                 self._run(top_bos=False, chunk=chunk)
 
     def test_split_llama_style_top_bos(self):
-        for chunk in (30, 64):
+        for chunk in (3, 4):
             with self.subTest(chunk=chunk):
                 self._run(top_bos=True, chunk=chunk)
 
@@ -299,7 +306,7 @@ class TestSystemPrefix(CustomTestCase):
         # split_request must return None (fall back to the full render).
         tok = _StubTokenizer(top_bos=False, noisy=True)
         sp = SystemPrefix(tok, "SYS")
-        sp.prepare(30, encode_kwargs={})
+        sp.prepare(3, encode_kwargs={})
         self.assertFalse(sp.enabled)
         self.assertIsNone(
             sp.split_request(
@@ -310,20 +317,17 @@ class TestSystemPrefix(CustomTestCase):
 
     def test_measured_path_user_required(self):
         # Qwen-style template rejects a bare system render; the measured path
-        # must still produce an aligned prefix and a split that reproduces full.
+        # must still produce an aligned prefix and a split that reproduces the
+        # native full render (inject_message = original text).
         tok = _StubTokenizer(top_bos=False, require_user=True)
         sp = SystemPrefix(tok, "SYS")
-        sp.prepare(30, encode_kwargs={})
+        sp.prepare(4, encode_kwargs={})
         self.assertTrue(sp.enabled)
-        self.assertTrue(sp.prefix_len % 30 == 0)
+        self.assertTrue(sp.prefix_len % 4 == 0)
         msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "U"}]
-        # The cached prefix is the PADDED system; build the reference full render
-        # from the same injected (padded) content SystemPrefix actually uses.
-        full_msgs = [sp.inject_message(), msgs[1]]
-        full = self._render(tok, full_msgs, gen=True)
-        got = sp.split_request(full_msgs, encode_kwargs={})
+        full = self._render(tok, msgs, gen=True)
+        got = sp.split_request(msgs, encode_kwargs={})
         self.assertEqual(got, full)
-        self.assertEqual(got[sp.prefix_len :], full[sp.prefix_len :])
 
     def test_prefix_len_matches_boundary(self):
         tok = _StubTokenizer(top_bos=False)
@@ -334,12 +338,15 @@ class TestSystemPrefix(CustomTestCase):
 
     def test_auto_strip_default_system(self):
         # Qwen2.5-VL-style template: rendering user alone auto-prepends a default
-        # system block. auto-strip must recover it and reconstruct `full`.
+        # system block. auto-strip must recover it and reconstruct the native
+        # `full` render exactly (no padding — the Qwen3.8-27B crash regression:
+        # auto-strip used to skip chunk alignment entirely).
         tok = _StubTokenizer(top_bos=False, require_user=True, stateful=True)
         sp = SystemPrefix(tok, "SYS")
-        sp.prepare(30, encode_kwargs={})
+        sp.prepare(4, encode_kwargs={})
         self.assertTrue(sp.enabled)
         self.assertIsNotNone(sp._auto_prefix)
+        self.assertEqual(sp.prefix_len % 4, 0)
         msgs = [sp.inject_message(), {"role": "user", "content": "U"}]
         full = self._render(tok, msgs, gen=True)
         got = sp.split_request(msgs, encode_kwargs={})
@@ -347,9 +354,212 @@ class TestSystemPrefix(CustomTestCase):
         self.assertEqual(got, full)
 
 
+class TestTruncateDownInvariants(CustomTestCase):
+    """Derived property: truncate-down never changes the token stream.
+
+    For every chunk size, the shared prefix must be the native system block
+    truncated DOWN to the grid, and prefix + tail + rest must reproduce the
+    native full render token-for-token. A regression to pad-up (or to an
+    off-grid boundary) turns these red: pad-up changes `got` (extra pad tokens
+    not in `full`), an off-grid boundary breaks the `% chunk` check and would
+    put the boundary between mamba checkpoints — the half-enabled crash state.
+    """
+
+    SYS_TEXT = "S" * 40  # "<|system|>" + 40 chars -> 50 tokens with this stub
+
+    def test_boundary_is_floor_and_stream_is_native(self):
+        for chunk in (5, 8, 16, 30, 64):
+            with self.subTest(chunk=chunk):
+                tok = _StubTokenizer(top_bos=False)
+                sp = SystemPrefix(tok, self.SYS_TEXT)
+                sp.prepare(chunk, encode_kwargs={})
+                real_sys = tok.encode(
+                    tok.apply_chat_template(
+                        [{"role": "system", "content": self.SYS_TEXT}],
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                )
+                if len(real_sys) < chunk:
+                    # covered by TestShortSystemDisables; here every chunk fits
+                    self.assertFalse(sp.enabled)
+                    continue
+                self.assertTrue(sp.enabled)
+                self.assertEqual(sp.boundary_len, (len(real_sys) // chunk) * chunk)
+                self.assertEqual(sp.prefix_len, sp.boundary_len)
+                self.assertEqual(sp.suffix_len, len(real_sys) - sp.boundary_len)
+                msgs = [
+                    {"role": "system", "content": self.SYS_TEXT},
+                    {"role": "user", "content": "U"},
+                ]
+                full = tok.encode(
+                    tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                )
+                got = sp.split_request(msgs, encode_kwargs={})
+                self.assertEqual(got, full)
+                self.assertEqual(got[: sp.boundary_len], list(sp.prefix_ids))
+
+
+class TestShortSystemDisables(CustomTestCase):
+    """Bug regression (Qwen3.8-27B crash): a system block shorter than one
+    mamba chunk used to flow through with an unusable boundary — every request
+    stayed cold (3 slots) while the pool was sized for warm (1 slot/req) and
+    the first batch crashed the mamba allocator. A block that leaves no
+    chunk-aligned boundary must disable the feature entirely.
+    """
+
+    def test_short_system_disables(self):
+        tok = _StubTokenizer(top_bos=False)
+        sp = SystemPrefix(tok, "SYS")  # 13 tokens with this stub
+        sp.prepare(30, encode_kwargs={})
+        self.assertFalse(sp.enabled)
+        self.assertEqual(sp.boundary_len, 0)
+        self.assertIsNone(sp.prefix_ids)
+        self.assertIsNone(
+            sp.split_request(
+                [{"role": "system", "content": "SYS"}, {"role": "user", "content": "U"}],
+                encode_kwargs={},
+            )
+        )
+
+
+class TestStartupProbeGate(CustomTestCase):
+    """Bug regression (Qwen3.8-27B crash): the mamba pool sized itself for the
+    warm steady state (ratio 1) purely from ``server_args.system_prompt`` being
+    set, before any probe ran. When the runtime probe later failed, every
+    request was cold on a warm-sized pool -> over-admission crash. The startup
+    gate must clear the flag (end-to-end feature-off) whenever the probe fails.
+    """
+
+    def _args(self, chunk=16):
+        return _FakeArgs(
+            "SYS-TEXT", model_path="/tmp/m", mamba_cache_chunk_size=chunk
+        )
+
+    def test_probe_ok_keeps_flag(self):
+        args = self._args(chunk=8)
+        tok = _StubTokenizer(top_bos=False)
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tok
+        ):
+            probe_system_prefix_or_disable(args)
+        self.assertIsNotNone(args.system_prompt)
+
+    def test_probe_reject_short_system_clears_flag(self):
+        # chunk 64 > the stub's 13-token system block: probe disables -> the
+        # gate must clear server_args.system_prompt before schedulers fork.
+        args = self._args(chunk=64)
+        tok = _StubTokenizer(top_bos=False)
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tok
+        ):
+            probe_system_prefix_or_disable(args)
+        self.assertIsNone(args.system_prompt)
+
+    def test_tokenizer_load_failure_clears_flag(self):
+        # A probe that cannot even load the tokenizer must fall back to the
+        # native path rather than risk the half-enabled state.
+        args = self._args()
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            side_effect=RuntimeError("boom"),
+        ):
+            probe_system_prefix_or_disable(args)
+        self.assertIsNone(args.system_prompt)
+
+    def test_unset_flag_is_noop(self):
+        args = _FakeArgs(None)
+        probe_system_prefix_or_disable(args)
+        self.assertIsNone(args.system_prompt)
+
+
+class TestStaticMambaSlotBudget(CustomTestCase):
+    """Bug regression (Qwen3.8-27B crash): on the static (non-shared) hybrid
+    mamba pool the PrefillAdder charged nothing per request, so a cold burst
+    (each req taking running + ping-pong = 3 slots) over-admitted past the
+    ratio-1-sized pool and died in the fail-loud allocator. The slot budget
+    must charge cold requests the full factor and warm requests 1.
+    """
+
+    def _adder(self, static: bool, lazy: bool = False):
+        adder = SimpleNamespace(
+            _static_mamba_slots=static,
+            tree_cache=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(
+                    enable_mamba_extra_buffer_lazy=lazy
+                )
+            ),
+        )
+        return adder
+
+    def _req(self, boundary, prefix_len=0, branching=None, has_pool_idx=False):
+        return SimpleNamespace(
+            system_prefix_boundary=boundary,
+            prefix_indices=list(range(prefix_len)),
+            mamba_branching_seqlen=branching,
+            mamba_pool_idx=0 if has_pool_idx else None,
+        )
+
+    def _budget(self, adder, req):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        return PrefillAdder._mamba_slot_budget_for_req(adder, req)
+
+    def test_cold_charged_full_factor(self):
+        # Warm-up burst: no boundary coverage -> 3 slots (running+ping-pong).
+        adder = self._adder(static=True)
+        self.assertEqual(self._budget(adder, self._req(64, 0, None)), 3)
+        self.assertEqual(self._budget(adder, self._req(64, 32, None)), 3)
+
+    def test_warm_charged_one(self):
+        # Steady state: boundary covered, no branching -> sentinel-only
+        # ping-pong, 1 slot.
+        adder = self._adder(static=True)
+        self.assertEqual(self._budget(adder, self._req(64, 64, None)), 1)
+        self.assertEqual(self._budget(adder, self._req(64, 100, None)), 1)
+
+    def test_cold_after_eviction(self):
+        # Branching point from the match (mamba state evicted) -> cold again.
+        adder = self._adder(static=True)
+        self.assertEqual(self._budget(adder, self._req(64, 100, 64)), 3)
+
+    def test_lazy_pool_charges_two(self):
+        adder = self._adder(static=True, lazy=True)
+        self.assertEqual(self._budget(adder, self._req(64, 0, None)), 2)
+
+    def test_zero_when_not_static(self):
+        # Shared pool / non-mamba: slot budgeting happens via the token
+        # reserve; charging here too would double-count.
+        adder = self._adder(static=False)
+        self.assertEqual(self._budget(adder, self._req(64, 0, None)), 0)
+
+    def test_zero_when_pool_idx_held(self):
+        # Re-added request that already holds its mamba slot: alloc will not
+        # re-allocate, so admission must not charge again.
+        adder = self._adder(static=True)
+        self.assertEqual(self._budget(adder, self._req(64, 0, None, has_pool_idx=True)), 0)
+
+    def test_feature_off_charges_cold_factor(self):
+        # Without --system-prompt every request is "cold" in slot terms (full
+        # ping-pong); the factor-3 charge matches alloc_req_slots' accounting.
+        adder = self._adder(static=True)
+        self.assertEqual(self._budget(adder, self._req(None, 0, None)), 3)
+
+
 class _FakeArgs:
-    def __init__(self, system_prompt):
+    def __init__(
+        self,
+        system_prompt,
+        model_path="/tmp/model",
+        tokenizer_path=None,
+        trust_remote_code=True,
+        mamba_cache_chunk_size=64,
+    ):
         self.system_prompt = system_prompt
+        self.model_path = model_path
+        self.tokenizer_path = tokenizer_path
+        self.trust_remote_code = trust_remote_code
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size
 
 
 if __name__ == "__main__":

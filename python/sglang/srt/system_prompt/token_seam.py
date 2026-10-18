@@ -12,6 +12,15 @@ per-message loop (a leading BOS token) are handled by stripping the duplicated
 leading BOS from the ``rest`` render. If the probe ever disagrees, prefix
 caching is disabled and the caller falls back to a single full render, so output
 remains byte-identical.
+
+Cache sharing is bounded by the mamba checkpoint grid: linear-attention state
+only exists at multiples of ``mamba_cache_chunk_size``, so the shared prefix is
+truncated DOWN to the previous chunk boundary (see ``SystemPrefix.prepare``).
+The removed tail tokens stay part of every request's private prefill, so the
+model still sees the exact native token stream (byte-identical output) — only
+the tail's cache reuse (typically < one chunk, 2-3% of a long system prompt) is
+given up. A system block shorter than one chunk disables the feature: there is
+no reusable boundary to share.
 """
 
 from __future__ import annotations
@@ -19,7 +28,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-from sglang.srt.system_prompt.system_prompt import aligned_prefix_len
+from sglang.srt.system_prompt.system_prompt import aligned_prefix_len_down
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +40,14 @@ class SystemPrefix:
         self.tokenizer = tokenizer
         self.system_text = system_text
         self._system_msg = {"role": "system", "content": system_text}
+        # Shared prefix, truncated to a chunk boundary; None when disabled.
         self._prefix_ids: Optional[List[int]] = None
+        # Tail of the system block past the boundary — re-prefilled per request
+        # (private, never donated to the radix tree). Empty when the system
+        # block lands exactly on a boundary.
+        self._suffix_ids: List[int] = []
         self._encode_kwargs: dict = {}
         self._enabled: bool = False
-        self._padded_content: str = system_text
         self._boundary_len: int = 0
         # When a chat template auto-injects a default system message into any
         # render whose list does not start with a `system` role (e.g. Qwen2.5-VL
@@ -58,7 +71,7 @@ class SystemPrefix:
 
     @property
     def boundary_len(self) -> int:
-        """System-prefix length in tokens, aligned to the cache chunk boundary.
+        """System-prefix length in tokens, aligned DOWN to the cache chunk grid.
 
         This is the position the scheduler truncates radix KV / mamba state at,
         so it is valid regardless of whether the request is multimodal (the
@@ -67,40 +80,57 @@ class SystemPrefix:
         return self._boundary_len
 
     @property
-    def padded_content(self) -> str:
-        """The system text with padding appended so its render is chunk-aligned."""
-        return self._padded_content
+    def suffix_len(self) -> int:
+        """Per-request tail length: system-block tokens past the boundary."""
+        return len(self._suffix_ids)
 
     def inject_message(self) -> Dict[str, str]:
-        """The message to inject so the real prompt contains the aligned prefix."""
-        return {"role": "system", "content": self._padded_content}
+        """The message to inject so the real prompt contains the system prefix.
 
-    def aligned_prefix_len(self) -> int:
-        """The cached prefix length (padded to a mamba chunk boundary)."""
-        return self.prefix_len
+        The ORIGINAL system text is injected: with truncate-down the shared
+        prefix is a prefix of the native render, so no padding is ever added
+        and every request's full token stream stays byte-identical.
+        """
+        return {"role": "system", "content": self.system_text}
 
     def prepare(self, chunk: int, encode_kwargs: dict) -> None:
         """Run the token-identity probe once and cache the system prefix.
 
-        Two paths, selected by template capability:
+        Three probe paths, selected by template capability; the first whose
+        token-identity check ``prefix + ids(rest) == full`` passes wins:
         * Explicit: the template can render a bare system message (handles
           top-BOS templates correctly).
         * Measured: the template rejects a system-only render (e.g. Qwen 3.5/3.6)
           -> system-block length = ``len([system,user]) - len([user])``.
-        Either way the injected system text is padded to a cache-chunk boundary
-        and token-identity ``prefix + ids(rest) == full`` is verified. On any
-        failure caching stays disabled (callers fall back to the full render).
+        * Auto-strip: the template injects a default system block into any
+          render not starting with `system` (e.g. Qwen2.5-VL), so the split is
+          recovered via a longest-common-suffix match.
+        The recovered FULL system block is then truncated down to a chunk
+        boundary. On any failure caching stays disabled (callers fall back to
+        the full render), so output remains byte-identical.
         """
         self._encode_kwargs = encode_kwargs
         self._enabled = False
-        if _prepare_explicit(self, chunk, encode_kwargs):
-            return
-        if _prepare_measured(self, chunk, encode_kwargs):
-            return
-        if _prepare_auto_strip(self, chunk, encode_kwargs):
-            return
+        self._prefix_ids = None
+        self._suffix_ids = []
         self._boundary_len = 0
-        logger.info("SystemPrompt prefix caching disabled by identity probe")
+        path = (
+            _prepare_explicit(self, chunk, encode_kwargs)
+            or _prepare_measured(self, chunk, encode_kwargs)
+            or _prepare_auto_strip(self, chunk, encode_kwargs)
+        )
+        if path is None:
+            logger.info("SystemPrompt prefix caching disabled by identity probe")
+            return
+        if self._truncate_boundary(chunk):
+            logger.info(
+                "SystemPrompt prefix caching enabled (%s): shared prefix=%d "
+                "tokens, per-request tail=%d tokens (chunk=%d)",
+                path,
+                self._boundary_len,
+                len(self._suffix_ids),
+                chunk,
+            )
 
     # -- request-time ---------------------------------------------------
     def split_request(
@@ -110,7 +140,9 @@ class SystemPrefix:
 
         ``messages_after_system`` is the message list with the system message as
         the first element. Returns None when prefix caching is disabled or only
-        a system message is present (nothing to concatenate).
+        a system message is present (nothing to concatenate). The result starts
+        with the shared boundary-aligned prefix followed by the per-request
+        tail (system-block remainder) — together the full native token stream.
         """
         if not self._enabled or len(messages_after_system) < 2:
             return None
@@ -124,10 +156,39 @@ class SystemPrefix:
             ap = len(self._auto_prefix)
             if len(rest) >= ap and rest[:ap] == self._auto_prefix:
                 rest = rest[ap:]
-        rest = _strip_leading_bos(rest, getattr(self.tokenizer, "bos_token_id", None))
-        return list(self._prefix_ids) + rest
+        rest = self._strip_leading_bos(rest)
+        return list(self._prefix_ids) + list(self._suffix_ids) + rest
 
     # -- internal -------------------------------------------------------
+    def _truncate_boundary(self, chunk: int) -> bool:
+        """Truncate the shared prefix down to a chunk boundary. False = disable.
+
+        Called once by ``prepare`` after a probe path succeeded with the FULL
+        system block in ``_prefix_ids``. Splits it into the shared chunk-aligned
+        prefix and a per-request tail. A block shorter than one chunk leaves
+        nothing shareable: boundary 0 would make every request cold while the
+        mamba pool is planned for the warm steady state — the exact
+        over-admission crash this guard prevents — so the feature is disabled.
+        """
+        full = self._prefix_ids
+        boundary = aligned_prefix_len_down(len(full), chunk)
+        if boundary <= 0:
+            logger.warning(
+                "SystemPrompt prefix (%d tokens) is shorter than one mamba "
+                "chunk (%d): no reusable boundary, prefix caching disabled",
+                len(full),
+                chunk,
+            )
+            self._prefix_ids = None
+            self._boundary_len = 0
+            return False
+        self._suffix_ids = list(full[boundary:])
+        self._prefix_ids = list(full[:boundary])
+        self._boundary_len = boundary
+        self._enabled = True
+        assert self._boundary_len % chunk == 0
+        return True
+
     def _render(self, msgs, add_generation_prompt: bool, encode_kwargs: dict) -> Optional[List[int]]:
         try:
             rendered = self.tokenizer.apply_chat_template(
@@ -148,29 +209,7 @@ def _strip_leading_bos(token_ids: List[int], bos_id: Optional[int]) -> List[int]
     return token_ids[1:]
 
 
-def _one_token_seed(tokenizer, encode_kwargs: dict) -> str:
-    """Return a literal string that tokenizes to exactly one token (with the
-    given encode kwargs). Used to pad the injected system text to a cache-chunk
-    boundary without adding template-controlled characters.
-    """
-    candidates = [
-        getattr(tokenizer, "pad_token", None),
-        getattr(tokenizer, "eos_token", None),
-        getattr(tokenizer, "sep_token", None),
-        "!",
-    ]
-    for cand in candidates:
-        if not cand:
-            continue
-        try:
-            if len(tokenizer.encode(cand, **encode_kwargs)) == 1:
-                return cand
-        except Exception:
-            continue
-    return " "
-
-
-def _prepare_explicit(seam, chunk: int, encode_kwargs: dict) -> bool:
+def _prepare_explicit(seam, chunk: int, encode_kwargs: dict) -> Optional[str]:
     """Probe for templates that can render a bare system message."""
     sample_user = {"role": "user", "content": "hi"}
     try:
@@ -178,7 +217,7 @@ def _prepare_explicit(seam, chunk: int, encode_kwargs: dict) -> bool:
             [seam._system_msg], add_generation_prompt=False, encode_kwargs=encode_kwargs
         )
         if sys_ids is None:
-            return False
+            return None
         user_ids = seam._render(
             [sample_user], add_generation_prompt=True, encode_kwargs=encode_kwargs
         )
@@ -188,36 +227,17 @@ def _prepare_explicit(seam, chunk: int, encode_kwargs: dict) -> bool:
             encode_kwargs=encode_kwargs,
         )
         if full_ids is None or user_ids is None:
-            return False
+            return None
         rest = _strip_leading_bos(user_ids, getattr(seam.tokenizer, "bos_token_id", None))
         if sys_ids + rest != full_ids:
-            return False
-        pad = aligned_prefix_len(len(sys_ids), chunk) - len(sys_ids)
-        if pad > 0:
-            ph = _one_token_seed(seam.tokenizer, encode_kwargs)
-            seam._padded_content = seam.system_text + ph * pad
-            seam._system_msg = {"role": "system", "content": seam._padded_content}
-            sys_ids = seam._render(
-                [seam._system_msg],
-                add_generation_prompt=False,
-                encode_kwargs=encode_kwargs,
-            )
-            if sys_ids is None:
-                return False
+            return None
         seam._prefix_ids = list(sys_ids)
-        seam._boundary_len = len(sys_ids)
-        seam._enabled = True
     except Exception:
-        return False
-    logger.info(
-        "SystemPrompt prefix caching enabled (explicit): prefix=%d tokens (chunk=%d)",
-        seam._boundary_len,
-        chunk,
-    )
-    return True
+        return None
+    return "explicit"
 
 
-def _prepare_measured(seam, chunk: int, encode_kwargs: dict) -> bool:
+def _prepare_measured(seam, chunk: int, encode_kwargs: dict) -> Optional[str]:
     """Fallback for templates that require a user turn to render (e.g. Qwen3.x)."""
     sample_user = {"role": "user", "content": "hi"}
     try:
@@ -230,42 +250,21 @@ def _prepare_measured(seam, chunk: int, encode_kwargs: dict) -> bool:
             encode_kwargs=encode_kwargs,
         )
         if full_ids is None or user_ids is None:
-            return False
+            return None
         sys_len = len(full_ids) - len(user_ids)
-        pad = aligned_prefix_len(max(sys_len, 0), chunk) - max(sys_len, 0)
-        if pad > 0 and sys_len > 0:
-            ph = _one_token_seed(seam.tokenizer, encode_kwargs)
-            seam._padded_content = seam.system_text + ph * pad
-            seam._system_msg = {"role": "system", "content": seam._padded_content}
-            full_ids = seam._render(
-                [seam._system_msg, sample_user],
-                add_generation_prompt=True,
-                encode_kwargs=encode_kwargs,
-            )
-            if full_ids is None:
-                return False
-            sys_len = len(full_ids) - len(user_ids)
         if sys_len <= 0:
-            return False
-        boundary = sys_len
-        prefix = list(full_ids[:boundary])
+            return None
+        prefix = list(full_ids[:sys_len])
         rest = _strip_leading_bos(user_ids, getattr(seam.tokenizer, "bos_token_id", None))
         if prefix + rest != full_ids:
-            return False
+            return None
         seam._prefix_ids = prefix
-        seam._boundary_len = boundary
-        seam._enabled = True
     except Exception:
-        return False
-    logger.info(
-        "SystemPrompt prefix caching enabled (measured): prefix=%d tokens (chunk=%d)",
-        seam._boundary_len,
-        chunk,
-    )
-    return True
+        return None
+    return "measured"
 
 
-def _prepare_auto_strip(seam, chunk: int, encode_kwargs: dict) -> bool:
+def _prepare_auto_strip(seam, chunk: int, encode_kwargs: dict) -> Optional[str]:
     """Last resort for templates that auto-insert a default system message.
 
     When a template injects a default `system` block into any render whose
@@ -289,18 +288,18 @@ def _prepare_auto_strip(seam, chunk: int, encode_kwargs: dict) -> bool:
             encode_kwargs=encode_kwargs,
         )
         if user_ids is None or full_ids is None:
-            return False
+            return None
         n = min(len(full_ids), len(user_ids))
         i = 0
         while i < n and full_ids[-1 - i] == user_ids[-1 - i]:
             i += 1
         if i == 0:
-            return False
+            return None
         shared_tail = i
         sys_prefix = list(full_ids[: len(full_ids) - shared_tail])
         auto_prefix = list(user_ids[: len(user_ids) - shared_tail])
         if not sys_prefix or not auto_prefix:
-            return False
+            return None
 
         # Stability check: the recovered system prefix must not depend on the
         # specific user content, otherwise user tokens leaked into it.
@@ -320,17 +319,10 @@ def _prepare_auto_strip(seam, chunk: int, encode_kwargs: dict) -> bool:
                 j += 1
             sys2 = list(full2[: len(full2) - j])
             if sys2 != sys_prefix:
-                return False
+                return None
 
         seam._auto_prefix = auto_prefix
         seam._prefix_ids = sys_prefix
-        seam._boundary_len = len(sys_prefix)
-        seam._enabled = True
     except Exception:
-        return False
-    logger.info(
-        "SystemPrompt prefix caching enabled (auto-strip): prefix=%d tokens (chunk=%d)",
-        seam._boundary_len,
-        chunk,
-    )
-    return True
+        return None
+    return "auto-strip"
