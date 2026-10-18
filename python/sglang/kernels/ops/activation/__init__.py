@@ -226,18 +226,18 @@ class ReLU2Op(BaseFusedOp):
 class QuickGELUOp(BaseFusedOp):
     """``out = input * sigmoid(1.702 * input)`` (single-input, not gated).
 
-    Only ROCm has a native kernel (``sgl_kernel.gelu_quick``, AOT on HIP); CUDA
-    uses the torch reference in production, so no CUDA backend is registered.
+    CUDA uses the JIT kernel; ROCm uses ``sgl_kernel.gelu_quick`` (AOT).
     """
 
     op = "activation.gelu_quick"
-    priority = (KernelBackend.AOT, KernelBackend.TORCH)
-    capabilities = {KernelBackend.AOT: _HIP}
+    priority = (KernelBackend.JIT, KernelBackend.AOT, KernelBackend.TORCH)
+    capabilities = {KernelBackend.JIT: _CUDA, KernelBackend.AOT: _HIP}
     format_signature = FormatSignature(
-        supported_dtypes=_ACT_DTYPES,
+        supported_dtypes=("float16", "bfloat16", "float32"),
         description="x * sigmoid(1.702 * x); returns tensor",
     )
     descriptions = {
+        KernelBackend.JIT: "quick GELU (sglang.kernels.jit, CUDA).",
         KernelBackend.AOT: "quick GELU (sgl_kernel wheel, ROCm).",
         KernelBackend.TORCH: "quick GELU (pure-torch reference).",
     }
@@ -252,6 +252,13 @@ class QuickGELUOp(BaseFusedOp):
             return result
         out.copy_(result)
         return out
+
+    def forward_jit(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.activation.gelu import quick_gelu
+
+        return quick_gelu(input, out)
 
     def forward_aot(
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
@@ -365,5 +372,19 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.activation._jit_situ_and_mul:situ_and_mul",
         capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="activation.new_gelu",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.activation.gelu:new_gelu",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16", "float32"),
+            description="Standalone tanh-approximated NewGELU; returns tensor.",
+        ),
     )
 )
