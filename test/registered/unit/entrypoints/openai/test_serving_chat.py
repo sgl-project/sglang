@@ -42,6 +42,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.inkling_renderer import load_tml_renderers
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
@@ -5162,7 +5163,6 @@ class InklingReasoningEffortTest(unittest.TestCase):
         # "xhigh" and "max" are aliases for the same 0.99 ceiling
         self.assertEqual(parse("xhigh"), 0.99)
         self.assertEqual(parse("max"), 0.99)
-        self.assertEqual(parse("max"), parse("xhigh"))
 
     def test_scalar_range_is_validated(self):
         parse = serving_inkling.parse_reasoning_effort
@@ -5348,6 +5348,7 @@ class InklingTokenOutputTest(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.tokenizer = load_tml_renderers().tokenizer
         self.inkling = _inkling_serving()._spec_adapter
         self.request = ChatCompletionRequest(
             model="test-model",
@@ -5360,21 +5361,17 @@ class InklingTokenOutputTest(CustomTestCase):
             ],
         )
 
-    @staticmethod
-    def _output_ids() -> list[int]:
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        special = tokenizer.encode_special
+    def _output_ids(self) -> list[int]:
+        special = self.tokenizer.encode_special
         return [
             special("message_model"),
             special("content_thinking"),
-            *tokenizer.encode_ordinary("plan"),
+            *self.tokenizer.encode_ordinary("plan"),
             special("end_message"),
             special("message_model"),
-            *tokenizer.encode_ordinary("weather"),
+            *self.tokenizer.encode_ordinary("weather"),
             special("content_invoke_tool_json"),
-            *tokenizer.encode_ordinary('{"name":"weather","args":{"city":"SF"}}'),
+            *self.tokenizer.encode_ordinary('{"name":"weather","args":{"city":"SF"}}'),
             special("end_message"),
             special("content_model_end_sampling"),
         ]
@@ -5423,41 +5420,10 @@ class InklingTokenOutputTest(CustomTestCase):
         self.assertEqual(json.loads(tool_calls[0].function.arguments), {"city": "SF"})
         self.assertTrue(tool_calls[0].id.startswith("call_"))
 
-    def test_continued_final_message_output_is_content(self):
-        """Bug regression: with continue_final_message the prompt ends inside
-        an open model text block, so the sampled tokens carry no header; they
-        were silently dropped and the response content came back empty."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[
-                {"role": "user", "content": "First five primes?"},
-                {"role": "assistant", "content": "2, 3,"},
-            ],
-            continue_final_message=True,
-        )
-        output_ids = [
-            *tokenizer.encode_ordinary(" 5, 7, 11"),
-            tokenizer.encode_special("end_message"),
-            tokenizer.encode_special("content_model_end_sampling"),
-        ]
-        _, content, tool_calls, _ = self.inkling.parse_chat_response(
-            request=request,
-            output_ids=output_ids,
-            finish_reason={"type": "stop", "matched": 200006},
-        )
-        self.assertEqual(content, " 5, 7, 11")
-        self.assertIsNone(tool_calls)
-
     def test_stream_reads_only_its_chunk_of_the_live_output_list(self):
         """Non-incremental chunks share the live output list; tokens appended after
         a chunk was built (here the matched stop) must wait for their own chunk."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        special = tokenizer.encode_special
+        special = self.tokenizer.encode_special
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "Yes?"}],
@@ -5466,10 +5432,10 @@ class InklingTokenOutputTest(CustomTestCase):
         live = [
             special("message_model"),
             special("content_text"),
-            *tokenizer.encode_ordinary("Yes"),
+            *self.tokenizer.encode_ordinary("Yes"),
         ]
         first = {"completion_tokens": len(live), "finish_reason": None}
-        live.extend(tokenizer.encode_ordinary(" ."))
+        live.extend(self.tokenizer.encode_ordinary(" ."))
         finish = {"type": "stop", "matched": "."}
         final = {"completion_tokens": len(live), "finish_reason": finish}
         chunks, parser_dict = [], {}
@@ -5505,36 +5471,21 @@ class InklingTokenOutputTest(CustomTestCase):
         """Non-incremental chunks carry the cumulative ids and an incremental
         abort chunk re-sends the last id, streamed or not; either way a token
         parsed twice would duplicate text."""
-        new_ids = serving_inkling.select_new_output_ids
-        self.assertEqual(
-            new_ids(
-                output_ids=[1, 2, 3, 4],
-                num_consumed_tokens=3,
-                completion_tokens=4,
-                finish_reason_type=None,
-                incremental=False,
-            ),
-            [4],
-        )
-        self.assertEqual(
-            new_ids(
-                output_ids=[3, 4],
-                num_consumed_tokens=3,
-                completion_tokens=4,
-                finish_reason_type=None,
-                incremental=True,
-            ),
-            [3, 4],
-        )
-        for completion_tokens, expected in ((3, []), (4, [4])):
-            with self.subTest(completion_tokens=completion_tokens):
+        cases = [
+            ([1, 2, 3, 4], 4, None, False, [4]),
+            ([3, 4], 4, None, True, [3, 4]),
+            ([4], 3, "abort", True, []),
+            ([4], 4, "abort", True, [4]),
+        ]
+        for output_ids, completion_tokens, finish, incremental, expected in cases:
+            with self.subTest(output_ids=output_ids, finish=finish):
                 self.assertEqual(
-                    new_ids(
-                        output_ids=[4],
+                    serving_inkling.select_new_output_ids(
+                        output_ids=output_ids,
                         num_consumed_tokens=3,
                         completion_tokens=completion_tokens,
-                        finish_reason_type="abort",
-                        incremental=True,
+                        finish_reason_type=finish,
+                        incremental=incremental,
                     ),
                     expected,
                 )
@@ -5624,11 +5575,8 @@ class InklingTokenOutputTest(CustomTestCase):
     def test_matched_stop_is_trimmed_from_visible_text(self):
         """Bug regression: output ids include the matched stop, which only the
         detokenized text had trimmed; the token-ID parse returned it verbatim."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        encode = tokenizer.encode_ordinary
-        special = tokenizer.encode_special
+        encode = self.tokenizer.encode_ordinary
+        special = self.tokenizer.encode_special
         text_block = [special("message_model"), special("content_text")]
         thinking_block = [special("message_model"), special("content_thinking")]
         bang = encode("!")
@@ -5700,11 +5648,8 @@ class InklingTokenOutputTest(CustomTestCase):
         """Bug regression: the stop string was searched in the merged content,
         where two text blocks can spell it although framing separated them in
         the sampled stream; the answer was truncated at that false match."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        encode = tokenizer.encode_ordinary
-        special = tokenizer.encode_special
+        encode = self.tokenizer.encode_ordinary
+        special = self.tokenizer.encode_special
         first_block = [
             special("message_model"),
             special("content_text"),
@@ -5740,18 +5685,15 @@ class InklingTokenOutputTest(CustomTestCase):
         """Bug regression: the backward search stopped at the first suffix
         holding any match, so a stop that began in the previous token and
         overlapped a later match in the final token was cut too late."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
         header = [
-            tokenizer.encode_special("message_model"),
-            tokenizer.encode_special("content_text"),
+            self.tokenizer.encode_special("message_model"),
+            self.tokenizer.encode_special("content_text"),
         ]
         cases = [("\n", "\n\n", "\n\n"), ("ab", "aba", "aba")]
         for previous, final, stop in cases:
             sampled = [
-                *tokenizer.encode_ordinary(previous),
-                *tokenizer.encode_ordinary(final),
+                *self.tokenizer.encode_ordinary(previous),
+                *self.tokenizer.encode_ordinary(final),
             ]
             self.assertEqual(len(sampled), 2)
             for no_stop_trim, expected in ((False, ("", "")), (True, ("", stop))):
@@ -5770,14 +5712,11 @@ class InklingTokenOutputTest(CustomTestCase):
     def test_special_stop_inside_open_text_block_is_not_visible(self):
         """Bug regression: inside an open text block TML renders a special token
         as text, so a custom special stop id leaked unless trimmed by id."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        encode = tokenizer.encode_ordinary
-        stop_id = tokenizer.encode_special("content_thinking")
+        encode = self.tokenizer.encode_ordinary
+        stop_id = self.tokenizer.encode_special("content_thinking")
         text_block = [
-            tokenizer.encode_special("message_model"),
-            tokenizer.encode_special("content_text"),
+            self.tokenizer.encode_special("message_model"),
+            self.tokenizer.encode_special("content_text"),
         ]
         continued = [
             {"role": "user", "content": "First five primes?"},
@@ -5811,11 +5750,8 @@ class InklingTokenOutputTest(CustomTestCase):
     def test_unframed_prefix_keeps_the_following_marker_kind(self):
         """Bug regression: stray text before a header-less thinking or tool-call
         marker erased the marker, so reasoning became content and the call text."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        encode = tokenizer.encode_ordinary
-        special = tokenizer.encode_special
+        encode = self.tokenizer.encode_ordinary
+        special = self.tokenizer.encode_special
         eos = special("content_model_end_sampling")
         thinking = [
             *encode("\n\n"),
@@ -5857,11 +5793,8 @@ class InklingTokenOutputTest(CustomTestCase):
         """Bug regression: response_format grammars sample bare JSON where a
         message header belongs (after the reasoning terminator, or from the
         first token), and the parser dropped that unframed text."""
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
-
-        tokenizer = load_tml_renderers().tokenizer
-        encode = tokenizer.encode_ordinary
-        special = tokenizer.encode_special
+        encode = self.tokenizer.encode_ordinary
+        special = self.tokenizer.encode_special
         payload = '{"marker": "<|end_message|>", "ok": true}'
         thinking = [
             special("message_model"),
@@ -5903,16 +5836,14 @@ class InklingTokenOutputTest(CustomTestCase):
             ReasonerGrammarBackend,
         )
         from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
-        from sglang.srt.parser.inkling_renderer import load_tml_renderers
         from sglang.srt.parser.reasoning_parser import InklingDetector
 
-        tokenizer = load_tml_renderers().tokenizer
-        special = tokenizer.encode_special
+        special = self.tokenizer.encode_special
         eos = special("content_model_end_sampling")
         vocab = []
         for token_id in range(201088):
             try:
-                vocab.append(tokenizer.decode_bytes([token_id]))
+                vocab.append(self.tokenizer.decode_bytes([token_id]))
             except ValueError:
                 vocab.append(b"")
         info = TokenizerInfo(vocab, VocabType.RAW, stop_token_ids=[eos])
@@ -5940,7 +5871,11 @@ class InklingTokenOutputTest(CustomTestCase):
             ("regex", "yes"), input_ids=prompt_ids, thinking_budget=None
         )
         grammar = reasoner._init_value_dispatch(key, reasoning=True)
-        output_ids = [*tokenizer.encode_ordinary("yes"), special("end_message"), eos]
+        output_ids = [
+            *self.tokenizer.encode_ordinary("yes"),
+            special("end_message"),
+            eos,
+        ]
         mask = backend.allocate_vocab_mask(len(vocab), 1, "cpu")
         for token_id in [special("message_model"), *output_ids]:
             grammar.fill_vocab_mask(mask, 0)

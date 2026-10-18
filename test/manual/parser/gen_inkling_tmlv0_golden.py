@@ -158,7 +158,7 @@ prompt(
         },
         {"role": "tool", "tool_call_id": "c", "content": "result"},
     ],
-    tools=TOOLS,
+    tools=[SEARCH],
 )
 prompt(
     "reasoning_content_renders_as_thinking",
@@ -172,7 +172,7 @@ prompt(
         },
         {"role": "tool", "tool_call_id": "c", "name": "search", "content": "result"},
     ],
-    tools=TOOLS,
+    tools=[SEARCH],
 )
 prompt(
     "literal_control_token_text_stays_ordinary",
@@ -291,40 +291,24 @@ prompt(
         }
     ],
 )
-for label, content in (("empty_string", ""), ("empty_parts", [])):
-    prompt(
-        f"tool_result_{label}",
-        [
-            {"role": "user", "content": "x"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [call("c", "search", "{}")],
-            },
-            {"role": "tool", "tool_call_id": "c", "name": "search", "content": content},
-        ],
-    )
-prompt(
-    "tool_result_null_content",
-    [
+for label, content in (
+    ("empty_string", ""),
+    ("empty_parts", []),
+    ("null_content", None),
+):
+    server_messages = [
         {"role": "user", "content": "x"},
         {
             "role": "assistant",
             "content": None,
             "tool_calls": [call("c", "search", "{}")],
         },
-        {"role": "tool", "tool_call_id": "c", "name": "search"},
-    ],
-    server_messages=[
-        {"role": "user", "content": "x"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [call("c", "search", "{}")],
-        },
-        {"role": "tool", "tool_call_id": "c", "name": "search", "content": None},
-    ],
-)
+        {"role": "tool", "tool_call_id": "c", "name": "search", "content": content},
+    ]
+    messages = copy.deepcopy(server_messages)
+    if content is None:
+        del messages[-1]["content"]
+    prompt(f"tool_result_{label}", messages, server_messages=server_messages)
 prompt(
     "assistant_without_content",
     [

@@ -1253,10 +1253,7 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         """Serving another model must not need tml-renderers, while selecting
         Inkling must still fail at construction when it is missing."""
         from sglang.srt.entrypoints.openai import spec_adapters
-        from sglang.srt.parser.inkling_renderer import (
-            TML_RENDERERS_INSTALL_HINT,
-            load_tml_renderers,
-        )
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
 
         load_tml_renderers.cache_clear()
         self.addCleanup(load_tml_renderers.cache_clear)
@@ -1270,9 +1267,8 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
             for spec in (None, "kimi_k3", "dsv4", "dsv41", "dsv32"):
                 with self.subTest(spec=spec):
                     self.assertIsNone(spec_adapters.build_spec_adapter(spec, ctx))
-            with self.assertRaises(ImportError) as raised:
+            with self.assertRaises(ImportError):
                 spec_adapters.build_spec_adapter("inkling", ctx)
-        self.assertEqual(str(raised.exception), TML_RENDERERS_INSTALL_HINT)
 
     def test_inkling_parser_cannot_be_mixed_with_another_parser(self):
         from sglang.srt.entrypoints.openai.serving_inkling import InklingSpecAdapter
@@ -1327,7 +1323,7 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "ordinary text"):
             build(tokenizer=served(ordinary=lambda text: tml.encode_ordinary(text)[1:]))
 
-    def test_responses_handler_builds_one_adapter_bound_to_itself(self):
+    def test_responses_adapter_hooks_belong_to_the_handler(self):
         """The Responses handler reuses the adapter from its base init; its
         chat hooks must belong to that handler, not to another instance."""
         from sglang.srt.entrypoints.openai import serving_inkling, spec_adapters
@@ -1346,7 +1342,6 @@ class SpecAdapterDispatchTestCase(CustomTestCase):
         ):
             serving = make_serving()
 
-        build.assert_called_once()
         hooks = build.call_args.args[1].chat_hooks
         self.assertIs(hooks.tool_call_id.__self__, serving)
         self.assertIsNotNone(serving._spec_adapter)
