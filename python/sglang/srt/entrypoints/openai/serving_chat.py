@@ -382,6 +382,8 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    openai_error_envelope = True
+
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
 
@@ -2912,7 +2914,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
-                return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+                return self.create_error_response(
+                    text.message, text.type, text.code, text.param
+                )
             text = self._settle_response_template_stop(
                 text, finish_reason, request, text
             )

@@ -12,7 +12,11 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ErrorResponse,
+    OpenAIServingRequest,
+    openai_error_body,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -27,6 +31,10 @@ logger = logging.getLogger(__name__)
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
     """Abstract base class for OpenAI endpoint handlers"""
+
+    # Whether errors use OpenAI's error envelope; set by servings of routes the
+    # OpenAI API defines (protocol.OPENAI_API_ROUTES).
+    openai_error_envelope = False
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
@@ -136,7 +144,7 @@ class OpenAIServingBase(ABC):
         except Exception as e:
             logger.exception(f"Error in request: {e}")
             return self.create_error_response(
-                message=f"Internal server error: {str(e)}",
+                message="Internal server error",
                 err_type="InternalServerError",
                 status_code=500,
             )
@@ -209,8 +217,18 @@ class OpenAIServingBase(ABC):
         status_code: int = 400,
         param: Optional[str] = None,
     ) -> ORJSONResponse:
-        """Create an error response"""
+        """Create an error response.
+
+        Servings of OpenAI API routes answer in OpenAI's ``{"error": {...}}``
+        envelope, where ``error.type`` follows ``status_code`` and ``err_type``
+        is not sent; SGLang's own routes keep the flat ``ErrorResponse``.
+        """
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
+        if self.openai_error_envelope:
+            return ORJSONResponse(
+                content=openai_error_body(message, status_code, param=param),
+                status_code=status_code,
+            )
         error = ErrorResponse(
             object="error",
             message=message,
@@ -226,7 +244,9 @@ class OpenAIServingBase(ABC):
         err_type: str = "BadRequestError",
         status_code: int = 400,
     ) -> str:
-        """Create a streaming error response"""
+        """Create a streaming error frame in the serving's error shape."""
+        if self.openai_error_envelope:
+            return json.dumps(openai_error_body(message, status_code))
         error = ErrorResponse(
             object="error",
             message=message,

@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 class OpenAIServingEmbedding(OpenAIServingBase):
     """Handler for v1/embeddings requests"""
 
+    openai_error_envelope = True
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,

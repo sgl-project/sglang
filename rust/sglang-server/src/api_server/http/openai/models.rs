@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use sglang_api_types::api::v1 as api;
 
-use super::{AppState, openai_error, unix_seconds_u32};
+use super::{AppState, error_payload, unix_seconds_u32};
+use crate::utils::response::error_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -38,11 +39,13 @@ async fn retrieve_model(State(state): State<Arc<AppState>>, Path(model): Path<St
         .into_iter()
         .find(|card| card.id == model)
     else {
-        return openai_error(
+        let mut payload = error_payload(
             StatusCode::NOT_FOUND,
             format!("The model `{model}` does not exist"),
-            false,
         );
+        payload["error"]["param"] = "model".into();
+        payload["error"]["code"] = "model_not_found".into();
+        return error_response(StatusCode::NOT_FOUND, payload, false);
     };
     Json(model_card(card)).into_response()
 }
