@@ -213,6 +213,7 @@ class SanaVideo2DenoisingStage(PipelineStage):
     def __init__(self, transformer):
         super().__init__()
         self.transformer = transformer
+        self._bcg_runner = None
 
     @property
     def role_affinity(self) -> RoleType:
@@ -223,6 +224,38 @@ class SanaVideo2DenoisingStage(PipelineStage):
 
     def default_workload_iterations(self, batch, num_inference_steps):
         return num_inference_steps
+
+    def _prepare_bcg_runner(self, batch, embeds, mask):
+        if self._bcg_runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            self._bcg_runner = DiffusionBreakableCudaGraphRunner(
+                self.transformer, batch.latents.device
+            )
+        if batch.is_warmup:
+            inputs = batch.latents
+            if batch.do_classifier_free_guidance:
+                inputs = torch.cat([inputs, inputs])
+            timestep = torch.full(
+                (inputs.shape[0],), 1000.0, device=inputs.device, dtype=torch.float32
+            )
+            frame_timestep = (
+                timestep[:, None, None, None, None]
+                .expand(-1, 1, inputs.shape[2], 1, 1)
+                .clone()
+            )
+            frame_timestep[:, :, 0] = 0
+            # Capture both T2V and TI2V signatures during startup.
+            for warmup_timestep in (timestep, frame_timestep):
+                self._bcg_runner.capture(
+                    hidden_states=inputs,
+                    timestep=warmup_timestep,
+                    encoder_hidden_states=embeds,
+                    encoder_attention_mask=mask,
+                )
+        return self._bcg_runner
 
     @torch.no_grad()
     def forward(self, batch, server_args):
@@ -236,6 +269,11 @@ class SanaVideo2DenoisingStage(PipelineStage):
             embeds = torch.cat([batch.negative_prompt_embeds[0], embeds])
             mask = torch.cat([batch.negative_attention_mask[0], mask])
         is_ti2v = batch.condition_image is not None
+        model = (
+            self._prepare_bcg_runner(batch, embeds, mask)
+            if server_args.enable_breakable_cuda_graph
+            else self.transformer
+        )
 
         def predict(x, time):
             inputs = torch.cat([x, x]) if cfg else x
@@ -243,7 +281,7 @@ class SanaVideo2DenoisingStage(PipelineStage):
                 timestep = (time * 1000).expand(inputs.shape[0])
             else:
                 timestep = torch.cat([time, time]) if cfg else time
-            prediction = self.transformer(
+            prediction = model(
                 hidden_states=inputs,
                 timestep=timestep,
                 encoder_hidden_states=embeds,

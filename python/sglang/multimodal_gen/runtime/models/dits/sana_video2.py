@@ -33,6 +33,11 @@ class SanaVideo2RotaryPosEmbed(WanRotaryPosEmbed):
         # Keep complex128 frequencies; forward moves them to the input device.
         return self
 
+    def forward(self, fhw, device, frame_index=None):
+        if self._freqs.device != device:
+            self._freqs = self._freqs.to(device)
+        return super().forward(fhw, device, frame_index)
+
 
 class ChannelRMSNorm(_RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:

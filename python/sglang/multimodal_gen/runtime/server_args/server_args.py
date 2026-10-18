@@ -203,8 +203,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
+        "efficient-large-model/sana-video_2.0_5b_720p",
         "sana1.5_1.6b_1024px_diffusers",
         "sana-video_2b_480p_diffusers",
+        "sana-video_2.0_5b_720p",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "flux.1-dev",
@@ -267,6 +269,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
+        "SanaVideo2PipelineConfig",
         "ZImagePipelineConfig",
         "Flux2KleinPipelineConfig",
     }
@@ -839,7 +842,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
                 "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
                 "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, SANA-Video 2.0, "
                 "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
                 pipeline_config_name,
                 self.model_path,
