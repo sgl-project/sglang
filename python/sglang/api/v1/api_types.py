@@ -258,6 +258,11 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
     extra_key: Optional[StringOrList] = None
+    priority: Optional[int] = None
+    cache_salt: Optional[StringOrList] = None
+    require_reasoning: Optional[bool] = None
+    lora_path: Optional[Any] = None
+    session_params: Optional[Any] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -301,6 +306,8 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     input_token_ids_logprobs: List[NullableTopLogprobs] = []
     hidden_states: List[HiddenStateRow] = []
     e2e_latency: Optional[float] = None
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -1099,6 +1106,16 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
         elif key == "extra_key":
             kw["extra_key"] = None if x is None else decode_StringOrList(x)
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "cache_salt":
+            kw["cache_salt"] = None if x is None else decode_StringOrList(x)
+        elif key == "require_reasoning":
+            kw["require_reasoning"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "lora_path":
+            kw["lora_path"] = x
+        elif key == "session_params":
+            kw["session_params"] = x
     return GenerateRequest(**kw)
 
 
@@ -1150,6 +1167,16 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["audio_data"] = encode_MediaInput(v.audio_data)
     if v.extra_key is not None:
         d["extra_key"] = encode_StringOrList(v.extra_key)
+    if v.priority is not None:
+        d["priority"] = v.priority
+    if v.cache_salt is not None:
+        d["cache_salt"] = encode_StringOrList(v.cache_salt)
+    if v.require_reasoning is not None:
+        d["require_reasoning"] = v.require_reasoning
+    if v.lora_path is not None:
+        d["lora_path"] = v.lora_path
+    if v.session_params is not None:
+        d["session_params"] = v.session_params
     return d
 
 
@@ -1252,6 +1279,10 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["hidden_states"] = [] if x is None else [decode_HiddenStateRow(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "cached_tokens":
+            kw["cached_tokens"] = _expect_uint(x, expected="u32")
+        elif key == "reasoning_tokens":
+            kw["reasoning_tokens"] = _expect_uint(x, expected="u64")
     return GenerateMetaInfo(**kw)
 
 
@@ -1277,6 +1308,8 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["hidden_states"] = [encode_HiddenStateRow(e) for e in v.hidden_states]
     if v.e2e_latency is not None:
         d["e2e_latency"] = float(v.e2e_latency)
+    d["cached_tokens"] = v.cached_tokens
+    d["reasoning_tokens"] = v.reasoning_tokens
     return d
 
 

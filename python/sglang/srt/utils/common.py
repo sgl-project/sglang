@@ -51,6 +51,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from ctypes import byref
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -582,6 +583,10 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
@@ -590,6 +595,20 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     on the current stream instead of synchronizing like a pageable copy."""
     pin = is_pin_memory_available(device)
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+
+
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
@@ -3280,6 +3299,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
@@ -4435,7 +4455,9 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-def freeze_gc(context: str):
+def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
+    if gc_threshold is not None:
+        gc.set_threshold(*gc_threshold)
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -5132,6 +5154,59 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``SGLANG_FORCE_CONFIDENTIAL_COMPUTE``.
+    """
+    forced = envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.get()
+    if forced is not None:
+        return forced
+    if not is_cuda():
+        return False
+
+    try:
+        import pynvml
+    except ImportError:
+        logger.warning("pynvml not available; assuming Confidential Computing is off")
+        return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except pynvml.NVMLError:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 def init_cublas():

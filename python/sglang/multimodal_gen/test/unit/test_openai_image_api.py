@@ -1,9 +1,13 @@
 import inspect
 import os
 from dataclasses import fields
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
@@ -36,6 +40,48 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
+
+
+def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
+    monkeypatch.setattr(
+        image_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(input_save_path=None, output_path=None),
+    )
+    monkeypatch.setattr(
+        image_api, "resolve_sampling_params_cls", lambda _: SamplingParams
+    )
+    monkeypatch.setattr(image_api, "maybe_enhance_prompt", AsyncMock(return_value="p"))
+    captured = {}
+
+    def capture(request_id, **kwargs):
+        captured.update(kwargs)
+        raise HTTPException(status_code=400, detail="captured before inference")
+
+    monkeypatch.setattr(image_api, "_build_request_sampling_params", capture)
+    app = FastAPI()
+    app.include_router(image_api.router)
+    image = BytesIO()
+    Image.new("RGB", (16, 16)).save(image, format="PNG")
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "p",
+                "enable_cache_dit": "true",
+                "cache_dit_params": '{"residual_diff_threshold":0.12}',
+            },
+            files={"image": ("reference.png", image.getvalue(), "image/png")},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "captured before inference"
+        assert captured["enable_cache_dit"] is True
+        assert captured["cache_dit_params"] == {"residual_diff_threshold": 0.12}
+        response = client.post(
+            "/v1/images/edits",
+            data={"cache_dit_params": "not json"},
+        )
+        assert response.status_code == 422
 
 
 def test_image_requests_accept_request_level_profiling():

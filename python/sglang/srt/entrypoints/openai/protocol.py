@@ -407,6 +407,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
@@ -966,6 +969,9 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

@@ -81,7 +81,9 @@ class TestRustServerExtension(CustomTestCase):
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
 
-        build_args.assert_called_once_with(scheduler, extension=extension)
+        build_args.assert_called_once_with(
+            scheduler, extension=extension, health_generate_headers={}
+        )
         extension.Server.assert_called_once_with(
             sentinel.args, cores=None, port_offset=1
         )
@@ -89,6 +91,31 @@ class TestRustServerExtension(CustomTestCase):
         self.assertIsInstance(instance, ModelServer)
         self.assertEqual(instance.http_port, 30001)
         self.assertTrue(instance._multimodal_enabled)
+
+    def test_startup_time_takes_the_engine_shape(self):
+        """The frontend's end-to-end phase runs from its process's spawn."""
+        server = RustServer(Mock(), http_port=30000)
+        self.assertIsNone(server.startup_time)
+        process = SimpleNamespace(create_time=lambda: 100.0)
+        with (
+            patch.object(server_module, "time", SimpleNamespace(time=lambda: 110.0)),
+            patch.object(
+                server_module, "psutil", SimpleNamespace(Process=lambda: process)
+            ),
+        ):
+            server.set_startup_time(
+                {
+                    "load_weight": 1.0,
+                    "kv_cache_allocation": 0.5,
+                    "scheduler_e2e": 3.0,
+                    "cuda_graph": {"decode": 2.0},
+                }
+            )
+        startup_time = server.startup_time
+        self.assertEqual(startup_time["tokenizer_e2e"], 10.0)
+        self.assertEqual(startup_time["scheduler_e2e"], 3.0)
+        self.assertEqual(startup_time["load_weight"], 1.0)
+        self.assertEqual(startup_time["cuda_graph"]["decode"], 2.0)
 
     def test_launch_resolves_the_mm_pipeline_before_the_server_starts(self):
         """The listener answers once the server is constructed, so a model

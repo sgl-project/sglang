@@ -618,6 +618,13 @@ class MoEOutput(NamedTuple):
         )
 
 
+class MergedMoEOutput(MoEOutput):
+    """Merged routed rows with a replicated shared output still separate."""
+
+    def get_merged(self) -> torch.Tensor:
+        return self.routed
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -982,10 +989,13 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
+        leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
-        the V2/V3 layer-boundary handoff."""
+        the V2/V3 layer-boundary handoff. ``leave_output_sum`` returns those
+        pieces with the selected finalize kernel, for
+        a boundary that owns reduction and the replicated shared add."""
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
@@ -1007,6 +1017,20 @@ class DeepseekV2MoE(nn.Module):
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
+                if leave_output_sum:
+                    routed, shared = dsv4_flashinfer_moe_dual_stream_outputs(
+                        hidden_states,
+                        self.layer_id,
+                        fwd.mlp_reduce_scatter,
+                        self._shared_expert_tp1,
+                    )
+                    return MergedMoEOutput(
+                        routed,
+                        shared if self._shared_expert_tp1 else None,
+                        self.experts,
+                        1.0,
+                        self._shared_expert_tp1,
+                    )
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
@@ -1027,6 +1051,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
+                    leave_output_sum=leave_output_sum,
                 )
             else:
                 return self.forward_normal(
@@ -1038,6 +1063,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
+                    leave_output_sum=leave_output_sum,
                 )
         else:
             return self.forward_deepep(
@@ -1053,6 +1079,7 @@ class DeepseekV2MoE(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
+        leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -1195,7 +1222,7 @@ class DeepseekV2MoE(nn.Module):
                 reduce=sum_post_experts_output,
             )
 
-        if return_moe_output:
+        if return_moe_output or leave_output_sum:
             return MoEOutput(
                 routed=final_hidden_states,
                 shared=shared_output,
@@ -1238,6 +1265,7 @@ class DeepseekV2MoE(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
+        leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1373,7 +1401,7 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        if return_moe_output:
+        if return_moe_output or leave_output_sum:
             return MoEOutput(
                 routed=final_hidden_states,
                 shared=shared_output,
@@ -3166,7 +3194,7 @@ class DeepseekV2Model(nn.Module):
                 topk_indices = index_topk_share.topk_indices
                 if (
                     not forward_batch.forward_mode.is_idle()
-                    and hidden_states.shape[0] != 0
+                    and proxy_tensors["hidden_states"].shape[0] != 0
                 ):
                     assert topk_indices is not None, (
                         f"PP stage ending at layer {self.end_layer} must forward "
@@ -3174,7 +3202,7 @@ class DeepseekV2Model(nn.Module):
                         "skip-topk layer."
                     )
                 if topk_indices is None:
-                    topk_indices = hidden_states.new_empty(
+                    topk_indices = proxy_tensors["hidden_states"].new_empty(
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
                 proxy_tensors.tensors["topk_indices"] = topk_indices
@@ -3492,6 +3520,50 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         defer_moe_finalize=False,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)
+
+
+def _fake_dsv4_dual_stream_outputs(
+    hidden_states, layer_id, mlp_reduce_scatter, shared_replicated
+):
+    return torch.empty_like(hidden_states), (
+        torch.empty_like(hidden_states)
+        if shared_replicated
+        else hidden_states.new_empty((0,))
+    )
+
+
+@register_custom_op(fake_impl=_fake_dsv4_dual_stream_outputs)
+def dsv4_flashinfer_moe_dual_stream_outputs(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    mlp_reduce_scatter: bool,
+    shared_replicated: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _run_dsv4_dual_stream_outputs(
+        hidden_states, layer_id, mlp_reduce_scatter, shared_replicated
+    )
+
+
+def _run_dsv4_dual_stream_outputs(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    mlp_reduce_scatter: bool,
+    shared_replicated: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    forward_context = get_tc_piecewise_forward_context()
+    assert forward_context is not None and forward_context.moe_fusions is not None
+    moe = forward_context.moe_fusions[layer_id]
+    assert moe is not None
+    with get_forward().scoped(
+        mlp_reduce_scatter=mlp_reduce_scatter,
+        flashinfer_trtllm_bypass=True,
+        lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
+        defer_moe_finalize=False,
+    ):
+        pieces = moe.forward_normal_dual_stream(hidden_states, leave_output_sum=True)
+        assert pieces.shared_is_replicated == shared_replicated
+        merged = pieces.get_merged()
+        return merged, pieces.shared if shared_replicated else merged.new_empty((0,))
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
+from sglang.srt.utils import get_device
 
 
 def _ensure_single_process_parallel_runtime() -> None:
@@ -817,16 +818,20 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
         torch.testing.assert_close(actual[index], expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_ulysses_qkv_pack_is_bit_exact():
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="requires CUDA or XPU",
+)
+def test_ulysses_qkv_pack_is_bit_exact():
     from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 
+    device = get_device()
     torch.manual_seed(23)
     rows, world_size, heads, head_size = 65, 8, 56, 128
     qkv = torch.randn(
         rows,
         3 * heads * head_size,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     q, k, v = (
@@ -839,7 +844,7 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
         rows,
         local_heads,
         3 * head_size,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     for index, tensor in enumerate((q, k, v)):

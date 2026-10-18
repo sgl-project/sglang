@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +65,6 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
     the FA4 varlen fallback runs a prefill-shaped kernel at decode row counts."""
-    from sglang.srt.utils import is_sm100_supported, is_sm120
-
     # This path is numerically validated on SM100 and SM120. Do not widen it
     # to every SM12x device: it silently corrupts long-context decode on
     # SM121/GB10.
@@ -1713,13 +1711,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
-        # paged kernel always runs the bf16 q + bf16 KV path.
+        # TRTLLM-gen takes BF16 q with FP8-E4M3 KV, so an FP8 pool stays FP8 here;
+        # validated on SM10x only, SM120 keeps the BF16 scratch.
+        packed_dtype = (
+            k_buffer.dtype
+            if k_buffer.dtype == torch.float8_e4m3fn and is_sm100_supported()
+            else q.dtype
+        )
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            q.dtype,
+            packed_dtype,
             k_buffer.device,
         )
         if new_kv is not None:

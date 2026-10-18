@@ -63,13 +63,13 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 We recommend deploying the W8A8 variant for reduced resource usage and higher throughput.
-It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 Series node (8 cards, 16 dies) or two A2 Series nodes.
+It (774.08GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full A3 Series node (8 cards, 16 dies).
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
+For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -81,11 +81,17 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-<Tabs>
-  <Tab title="Ascend A3 Series">
+Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following
+command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable
+release tag.
+For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
+{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
+# daily build tag. Once the stable image is published, switch back to the
+# stable release tag.
+docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -113,46 +119,8 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+quay.io/ascend/sglang:main-cann9.1.0-a3
 ```
-
-  </Tab>
-  <Tab title="Ascend A2 Series">
-
-```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-
-docker run -itd --shm-size=16g --name ${NAME} \
---privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /usr/local/sbin:/usr/local/sbin \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
--v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci8:/dev/davinci8  \
---device=/dev/davinci9:/dev/davinci9  \
---device=/dev/davinci10:/dev/davinci10  \
---device=/dev/davinci11:/dev/davinci11  \
---device=/dev/davinci12:/dev/davinci12  \
---device=/dev/davinci13:/dev/davinci13  \
---device=/dev/davinci14:/dev/davinci14  \
---device=/dev/davinci15:/dev/davinci15  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
---entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-```
-
-  </Tab>
-</Tabs>
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
@@ -384,15 +352,15 @@ do
         --disaggregation-transfer-backend ascend --max-running-requests 64 \
         --served-model-name glm-5 --chunked-prefill-size 524288 --max-prefill-tokens 180000 --moe-a2a-backend deepep --deepep-mode normal \
         --disable-shared-experts-fusion --disable-cuda-graph --dtype bfloat16 \
-        --attn-dp-size 4 \
+        --dp-size 4 --enable-dp-attention \
         --load-balance-method round_robin \
         --enable-dp-lm-head --moe-dense-tp 1 \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2
 
         # cp
-        #--enable-nsa-prefill-context-parallel \
-        #--nsa-prefill-cp-mode in-seq-split \
+        #--enable-prefill-cp \
+        #--cp-strategy zigzag \
         #--attn-cp-size 4 \
         NODE_RANK=$i
         break
@@ -418,7 +386,7 @@ do
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --attn-dp-size 16 --ep-size 16 \
+        --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --enable-dp-attention --ep-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --deepep-mode low_latency \
         --cuda-graph-max-bs-decode 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
@@ -494,13 +462,8 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-GLM-5.2 has no standalone best practice page yet, as tuning parameters are not finalized. Instead, the
-[Online service deployment](#online-service-deployment) section above provides ready-to-use scripts for single-node,
-multi-node, and PD disaggregation, each embedding the recommended feature combinations and tuning parameters (e.g.,
-DeepEP mode, speculative decoding, overlap schedule).
-
-For the full catalog of optimization features and their parameter and compatibility details,
-see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+For complete optimal configurations with deployment scripts and benchmark commands, see the
+[GLM-5.2 Best Practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_2) page.
 
 ## Performance tuning
 

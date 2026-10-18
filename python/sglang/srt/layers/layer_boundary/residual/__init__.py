@@ -16,7 +16,7 @@ stage reads its input back from it (its read). The producer of a boundary
 declares the update, the consumer the read; the boundary steps complete sums
 and move tokens around the two."""
 
-from typing import NamedTuple, Optional, Protocol, Tuple
+from typing import Callable, NamedTuple, Optional, Protocol, Tuple
 
 import torch
 
@@ -39,9 +39,19 @@ class ResidualUpdate(Protocol):
             This is a numerical policy, separate from being a plain add; full
             precision is always correct.
 
+    An optional ``bind(forward_batch, context)`` returns an update owning this call's
+    dynamic metadata. The stage binds it once before recording a contribution;
+    every capability must match the declaration. Consumption releases the
+    invocation update with its contribution.
+
     The shard conversion methods must move any update-associated state together
     with the residual. Nonlinear updates must not claim is_plain_add.
     """
+
+    # None explicitly declares a stateless update. Bindings take (batch, context).
+    bind: Optional[Callable] = None
+    # An invocation may export its reusable producer declaration for graph replay.
+    replay_update: Optional["ResidualUpdate"] = None
 
     # A plain add, which one rank may run before the sum it adds into
     # completes (the DP partial order, a residual that joins the attention
@@ -107,6 +117,11 @@ class ResidualReadout(Protocol):
     their kernel's rounding order rather than normalizing a separately rounded
     snapshot.
     """
+
+    # bind(batch, context) may replace callback implementations, preserving the
+    # order and capabilities of completing_fusions and the gathering_reads slots.
+    # None explicitly declares a stateless consumer.
+    bind: Optional[Callable] = None
 
     # The input is the residual's norm, in the quantization the call asks for,
     # and the residual is left as it is: what a fused add + norm kernel computes,
@@ -175,12 +190,85 @@ class ResidualReadout(Protocol):
         """
 
 
+def bind_read(read, forward_batch, context=None):
+    """Bind a consumer invocation without changing its declared read capabilities."""
+    if read.bind is None:
+        return read
+    bound = read.bind(forward_batch, context)
+    for fact in (
+        "is_plain_norm",
+        "reads_before_dp_gather",
+        "reads_after_attn_tp_gather",
+    ):
+        if getattr(bound, fact) != getattr(read, fact):
+            raise ValueError("invocation read changed its declared capability")
+    # Callback slots are selected when the edge is constructed. Binding
+    # replaces their implementations, not their group or row capabilities.
+    declared = read.completing_fusions
+    actual = bound.completing_fusions
+    if len(actual) != len(declared) or len(bound.gathering_reads) != len(
+        read.gathering_reads
+    ):
+        raise ValueError("invocation read changed its declared callbacks")
+    for spec, fused in zip(declared, actual):
+        if (spec.completes, spec.scatters, spec.reads, spec.carried) != (
+            fused.completes,
+            fused.scatters,
+            fused.reads,
+            fused.carried,
+        ) or (spec.accepts_update is None) != (fused.accepts_update is None):
+            raise ValueError("invocation read changed its declared callbacks")
+    return bound
+
+
+def bind_update(update, forward_batch, context=None):
+    """Bind optional per-invocation producer state before recording output.
+
+    ``bind(batch, context)`` must preserve every declared update capability and return
+    an update owning its invocation context with ``bind = None``. Stateless updates
+    are unchanged.
+    """
+    if update.bind is None:
+        return update
+    actual = update.bind(forward_batch, context)
+    for fact in (
+        "is_plain_add",
+        "applied_at_exit",
+        "outlives_layer",
+        "writes_stream",
+        "quantized_sum",
+    ):
+        if getattr(actual, fact) != getattr(update, fact):
+            raise ValueError("invocation update changed a declared capability")
+    if actual.bind is not None:
+        raise ValueError("invocation update must have bind = None")
+    return actual
+
+
+def takes_pending_update(read, update):
+    """Whether a final read explicitly accepts this producer's update."""
+    return isinstance(read, PendingUpdateRead) and read.accepts_pending_update(update)
+
+
+class PendingUpdateRead:
+    """Explicit consumer interface for a terminal pending producer update."""
+
+    def accepts_pending_update(self, update: ResidualUpdate) -> bool:
+        raise NotImplementedError
+
+
 class FinalRead(Protocol):
     """The model's read of the layer stack's output, its final norm.
 
     Called with the output alone on a stream its producer already wrote, else
     with the output and the residual, returning ``(normed, residual)``: the
     residual add followed by the norm, so a pending update must be a plain add.
+
+    A ResidualReadout can instead explicitly supply
+    ``accepts_pending_update(update)`` and consume the pending producer update
+    through residual_batch.read_output(output, batch, read, norm). Construction
+    checks the declared update; execution checks the actual invocation. This
+    does not change the ordinary two-input final norm contract.
 
     Optional, each read where it is used with the default given:
         attn_tp_gather: Its own gather over attention TP of rows the stack's

@@ -65,6 +65,10 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     """Resolve the token-row modes the model's forward actually enters."""
     nemotron = model_type in ("nemotron_h", "nemotron_h_puzzle")
     longcat = model_type == "longcat_flash"
+    inkling = architecture in (
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
+    )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
@@ -75,7 +79,9 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
         raise ValueError(
             "LongCat-Flash does not support --enable-prefill-cp with --attn-cp-size > 1"
         )
-    if (nemotron or longcat or kimi_k3) and cfg.enable_attn_tp_input_scattered:
+    if (
+        nemotron or longcat or kimi_k3 or inkling
+    ) and cfg.enable_attn_tp_input_scattered:
         # None of these models enters the input-scattered attention scope.
         logger.warning(
             "Disabling input-scattered attention for %s: its forward does not enter that scope",

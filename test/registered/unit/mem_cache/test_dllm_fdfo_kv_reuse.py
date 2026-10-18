@@ -27,6 +27,16 @@ class _FakeAllocator:
     def available_size(self):
         return 1 << 30
 
+    def get_extend_allocation_demand(
+        self,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        *,
+        conservative_num_tokens,
+        shard_size,
+    ):
+        return conservative_num_tokens
+
     def alloc(self, need_size):
         self.alloc_calls.append(need_size)
         return torch.arange(self.base, self.base + need_size, dtype=torch.int64)

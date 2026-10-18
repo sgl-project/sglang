@@ -455,7 +455,9 @@ jobs:
     name: Recommend tests from coverage
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    # TEMP-DISABLED: OBS coverage baseline returns 403; re-enable once fixed.
+    if: false
+    # if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
     outputs:
       coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
     env:

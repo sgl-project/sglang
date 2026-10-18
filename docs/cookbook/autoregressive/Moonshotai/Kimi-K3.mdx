@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 <Tab title="NPU">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:main-cann9.0.0-a3   # Ascend A3 Series
+docker pull quay.io/ascend/sglang:main-cann9.1.0-a3   # Ascend A3 Series
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B070   # Ascend 950PR/DT Series
 ```
 

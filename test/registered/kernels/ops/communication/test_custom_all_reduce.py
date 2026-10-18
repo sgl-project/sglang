@@ -63,12 +63,14 @@ TEST_SIZES = [
     32 * 1024,
     256 * 1024,
     2 * 1024 * 1024,
+    3 * 1024 * 1024 + 24,  # chunks not a multiple of world_size
     4 * 1024 * 1024,
 ]
 TEST_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
+    AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
 USE_GRAPH_OPTIONS = [False, True]
@@ -230,6 +232,64 @@ def test_custom_all_reduce(
         # while triton's converts to numpy on the host (~0.6 s per 32 MB
         # tensor) and would dominate the test wall time.
         torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+
+
+def _eager_all_reduce(comm: CustomAllReduceV2, x: torch.Tensor) -> torch.Tensor:
+    outs = []
+    for row in x.clone():
+        outs.append(comm.custom_all_reduce(row))
+        torch.cuda.synchronize()
+    return torch.stack(outs)
+
+
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
+    """Without an override, eager calls launch the tuned algorithm (cached per size)."""
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    comm.override_algo = None
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
+    nbytes = inp[0].numel() * inp.element_size()
+    tuned = comm._pick_config(nbytes, False) is not None
+    assert comm.should_custom_ar(inp[0]) == tuned
+    if not tuned:
+        return
+    out_ref = inp.clone()
+    dist.all_reduce(out_ref, group=nccl_group)
+    for _ in range(2):  # the second pass runs from the cached launch
+        torch.testing.assert_close(
+            out_ref, _eager_all_reduce(comm, inp), atol=0, rtol=0
+        )
+
+
+@torch.inference_mode()
+def test_custom_all_reduce_eager_plan_follows_config() -> None:
+    """The cached eager launch is rebuilt when the config object is replaced."""
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    comm.override_algo = None
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    inp = torch.randint(0, 16, (TEST_LAYERS, 1024), dtype=torch.bfloat16, device=device)
+    assert comm.should_custom_ar(inp[0])  # cached under the tuned config
+    tuned = comm.config
+    try:
+        eager = tuned.eager._replace(
+            one_shot_push_threshold=0,
+            one_shot_pull_threshold=0,
+            two_shot_pull_threshold=0,
+            mc=tuned.eager.mc._replace(min_bytes=0, max_bytes=0),
+        )
+        comm.config = tuned._replace(eager=eager)
+        assert not comm.should_custom_ar(inp[0])
+    finally:
+        comm.config = tuned
+    assert comm.should_custom_ar(inp[0])
+    out_ref = inp.clone()
+    dist.all_reduce(out_ref, group=nccl_group)
+    torch.testing.assert_close(out_ref, _eager_all_reduce(comm, inp), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

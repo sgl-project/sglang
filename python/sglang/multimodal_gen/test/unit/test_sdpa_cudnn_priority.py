@@ -21,6 +21,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS,
     SDPAImpl,
+    torch_default_sdpa_backends,
 )
 
 NUM_HEADS, HEAD_DIM, SEQ_LEN = 8, 128, 512
@@ -92,3 +93,19 @@ def test_opting_out_leaves_backend_selection_alone():
 def test_cpu_tensors_do_not_get_a_cuda_context():
     cpu_q = torch.randn(1, NUM_HEADS, 16, HEAD_DIM)
     assert isinstance(_impl(True)._sdpa_context(cpu_q), type(nullcontext()))
+
+
+def test_reference_sdpa_does_not_inherit_a_previous_attention_priority():
+    q, k, v = _qkv()
+    with sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True):
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            try:
+                F.scaled_dot_product_attention(q, k, v)
+            except RuntimeError:
+                pytest.skip("no cuDNN attention kernel for this shape")
+        for priority in (
+            _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS,
+            list(reversed(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)),
+        ):
+            with sdpa_kernel(priority, set_priority=True):
+                assert _kernel_under(torch_default_sdpa_backends(), q, k, v) == "cudnn"

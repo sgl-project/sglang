@@ -57,6 +57,8 @@ pub enum ResponseItem {
     /// bytes for the core to decode (e.g. detokenized text), not a
     /// client-facing wire payload and not a generation frame.
     Data(Bytes),
+    /// Reply to `RequestKind::Tokenize`: the encoded token ids.
+    TokenIds(TokenIds),
     /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
@@ -133,9 +135,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
+/// Columnar scalar header for a whole decode batch. The first six fields are
+/// required; every field after `reasoning_tokens` defaults empty, so the hot
+/// path emits a six-element header. Field order is the wire ABI and must match
 /// `RustTokenizerManager.push_generation`'s `header_cols` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
@@ -155,6 +157,9 @@ pub struct BatchHeader {
     pub finish_reasons: Vec<Option<FinishReason>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
+    /// Python's `cached_tokens` / `reasoning_tokens`: running totals, not deltas.
+    pub cached_tokens: Vec<u32>,
+    pub reasoning_tokens: Vec<u64>,
     #[serde(default)]
     pub out_lp_lens: Vec<u32>,
     #[serde(default)]
@@ -276,8 +281,13 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // `tok_lens` delivered a 200 with an empty completion, and a short
     // `finish_reasons` dropped the terminal marker so the request never completed
     // and its unary drain pended forever. The producer already asserts this for the
-    // extras columns; the four core ones were unchecked.
-    if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+    // extras columns; the core ones were unchecked.
+    if h.finish_reasons.len() != n
+        || h.prompt_tokens.len() != n
+        || h.tok_lens.len() != n
+        || h.cached_tokens.len() != n
+        || h.reasoning_tokens.len() != n
+    {
         reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
@@ -465,6 +475,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            cached_tokens: h.cached_tokens.get(i).copied().unwrap_or(0),
+            reasoning_tokens: h.reasoning_tokens.get(i).copied().unwrap_or(0),
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -472,6 +484,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // compiled clean and silently shipped zeros.
             text: String::new(),
             completion_tokens: 0,
+            stop_token_trimmed: false,
         })
     };
 
@@ -568,11 +581,18 @@ pub struct ChunkEvent {
     pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
+    /// Prefix-cache hits and reasoning tokens so far: running totals, so the
+    /// latest chunk's value is the request's.
+    pub cached_tokens: u32,
+    pub reasoning_tokens: u64,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
     /// filled by the detok shard. `token_ids` doubles as `output_ids`;
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Set by the detok shard when the last of `token_ids` is a matched stop
+    /// token kept in `output_ids` but left out of `text`.
+    pub stop_token_trimmed: bool,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
@@ -665,7 +685,8 @@ mod tests {
     fn decodes_batch_frame() {
         use rmpv::Value;
         // 3 requests: rids "1","2","3"; finish [nil, {type:stop,matched:5}, nil];
-        // prompt_tokens [4,5,6]; tok_lens [2,0,1] -> ids [10,11 | (none) | 12].
+        // prompt_tokens [4,5,6]; tok_lens [2,0,1] -> ids [10,11 | (none) | 12];
+        // cached_tokens [3,0,1]; reasoning_tokens [0,0,7].
         let stop = Value::Map(vec![
             (Value::from("type"), Value::from("stop")),
             (Value::from("matched"), Value::from(5)),
@@ -683,6 +704,16 @@ mod tests {
                 Value::from(0u32),
                 Value::from(1u32),
             ]),
+            Value::Array(vec![
+                Value::from(3u32),
+                Value::from(0u32),
+                Value::from(1u32),
+            ]),
+            Value::Array(vec![
+                Value::from(0u64),
+                Value::from(0u64),
+                Value::from(7u64),
+            ]),
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -699,6 +730,8 @@ mod tests {
         assert_eq!(events[0].rid, Rid::from("1"));
         assert_eq!(events[0].token_ids, vec![10, 11]);
         assert_eq!(events[0].prompt_tokens, 4);
+        assert_eq!(events[0].cached_tokens, 3);
+        assert_eq!(events[2].reasoning_tokens, 7);
         assert!(events[0].finish_reason.is_none());
         assert_eq!(events[1].rid, Rid::from("2"));
         assert!(events[1].token_ids.is_empty());
@@ -738,6 +771,8 @@ mod tests {
             Value::Array(vec![Value::Nil]),         // finish_reasons
             Value::Array(vec![Value::from(0u32)]),  // prompt_tokens
             Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 80 bytes)
+            Value::Array(vec![Value::from(0u32)]),  // cached_tokens
+            Value::Array(vec![Value::from(0u32)]),  // reasoning_tokens
             Value::Array(vec![Value::from(1u32)]),  // out_lp_lens (base now past data)
         ]);
         let mut header = Vec::new();
@@ -776,6 +811,8 @@ mod tests {
             finish.clone(),
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // cached_tokens
+            arr_u(&[0, 0]), // reasoning_tokens
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[2, 1]), // out_top_reqlens — 3 positions claimed
@@ -800,6 +837,8 @@ mod tests {
             finish,
             arr_u(&[0, 0]), // prompt
             arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // cached_tokens
+            arr_u(&[0, 0]), // reasoning_tokens
             arr_u(&[0, 0]), // out_lp_lens
             arr_u(&[0, 0]), // in_lp_lens
             arr_u(&[0, 0]), // out_top_reqlens
@@ -837,6 +876,8 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),
             Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
             Value::Array(vec![Value::from(9u32), Value::from(9u32)]), // tok_lens past data
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]), // cached_tokens
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]), // reasoning_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -863,6 +904,8 @@ mod tests {
             Value::Array(vec![Value::Nil]),
             Value::Array(vec![Value::from(0u32)]),
             Value::Array(vec![Value::from(1u32)]), // tok_lens: 1 id = 8 bytes
+            Value::Array(vec![Value::from(0u32)]), // cached_tokens
+            Value::Array(vec![Value::from(0u32)]), // reasoning_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -885,6 +928,8 @@ mod tests {
             Value::Array(vec![Value::Nil]),                   // finish_reasons
             Value::Array(vec![Value::from(1u32)]),            // prompt_tokens
             Value::Array(vec![Value::from(1u32)]),            // tok_lens
+            Value::Array(vec![Value::from(0u32)]),            // cached_tokens
+            Value::Array(vec![Value::from(0u32)]),            // reasoning_tokens
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -929,7 +974,8 @@ mod tests {
         let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let q = |xs: &[i64]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
-        // header: rids, finish, prompt, tok_lens, out_lp_lens, in_lp_lens,
+        // header: rids, finish, prompt, tok_lens, cached_tokens, reasoning_tokens,
+        //   out_lp_lens, in_lp_lens,
         //   out_top_reqlens, out_top_poslens, in_top_*, out_tokids_lp_*,
         //   in_tokids_lp_*,
         //   hidden_reqlens, hidden_poslens
@@ -938,6 +984,8 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),             // finish
             arr_u(&[3, 4]),                                         // prompt
             arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[0, 0]),                                         // cached_tokens
+            arr_u(&[0, 0]),                                         // reasoning_tokens
             arr_u(&[2, 0]),                                         // out_lp_lens
             arr_u(&[0, 0]),                                         // in_lp_lens
             arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
@@ -1011,6 +1059,8 @@ mod tests {
                 Value::Array(vec![Value::Nil, Value::Nil]),             // finish
                 arr_u(&[3, 4]),                                         // prompt
                 arr_u(&[1, 1]),                                         // tok_lens
+                arr_u(&[0, 0]),                                         // cached_tokens
+                arr_u(&[0, 0]),                                         // reasoning_tokens
                 arr_u(&[2, 0]),                                         // out_lp_lens (ACTIVE)
                 reqlens.clone(),                                        // in_lp_lens
                 reqlens.clone(),                                        // out_top_reqlens
@@ -1092,6 +1142,8 @@ mod tests {
             Value::Array(vec![Value::Nil]),       // finish
             arr_u(&[9]),                          // prompt
             arr_u(&[1]),                          // tok_lens
+            arr_u(&[0]),                          // cached_tokens
+            arr_u(&[0]),                          // reasoning_tokens
             arr_u(&[2]),                          // out_lp_lens      (2 flat)
             arr_u(&[1]),                          // in_lp_lens       (1 flat)
             arr_u(&[1]),                          // out_top_reqlens  (1 position…
@@ -1165,6 +1217,8 @@ mod tests {
             Value::Array(vec![Value::Nil, Value::Nil]),
             Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
             Value::Array(vec![Value::from(1u32), Value::from(1u32)]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
@@ -1179,12 +1233,12 @@ mod tests {
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// `ChunkExtras`. 152 since the matched stop token rides in the frame (#42637).
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 152,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }

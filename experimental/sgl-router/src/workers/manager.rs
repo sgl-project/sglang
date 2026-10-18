@@ -580,6 +580,7 @@ async fn register_one(
         protocol,
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
+        grpc_port: info.grpc_port,
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -599,6 +600,12 @@ async fn register_one(
     // traffic — a spec refused above never reaches the wire at all.
     if previous_protocol != Some(protocol) {
         log_protocol_resolution(&worker_url, info.enable_http2, cleartext);
+        if info.grpc_port.is_none() && cfg.is_some_and(|c| c.server.grpc_port.is_some()) {
+            tracing::warn!(
+                worker_url = %worker_url,
+                "worker reports no --grpc-port; gRPC requests routed to it fail",
+            );
+        }
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -637,6 +644,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 dp_aware: false,
+                dp_rank_policy: Default::default(),
                 bucket_config: None,
                 reorg_buckets: None,
                 reorg_admission: Default::default(),

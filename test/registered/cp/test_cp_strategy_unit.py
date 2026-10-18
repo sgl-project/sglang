@@ -129,6 +129,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
         return runner

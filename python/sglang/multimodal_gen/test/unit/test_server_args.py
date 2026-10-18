@@ -413,7 +413,7 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             )
 
     def test_fasth3_selects_vsa_h3_for_the_transformer(self):
-        for capability in ((9, 0), (10, 0), (10, 3)):
+        for capability in ((8, 0), (9, 0), (10, 0), (10, 3)):
             with self.subTest(capability=capability):
                 args = self._fasth3_args(capability)
                 self.assertEqual(
@@ -429,7 +429,11 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             ({"component_attention_backends": {"transformer": "fa"}}, (9, 0)),
             ({"attention_backend": "fa"}, (9, 0)),
             ({"enable_torch_compile": True}, (9, 0)),
-            ({}, (8, 0)),
+            ({"component_attention_backends": {"transformer": "fa"}}, (8, 0)),
+            ({"attention_backend": "fa"}, (8, 0)),
+            ({"enable_torch_compile": True}, (8, 0)),
+            ({}, (8, 6)),
+            ({}, (8, 9)),
         )
         for kwargs, capability in cases:
             with self.subTest(kwargs=kwargs, capability=capability):

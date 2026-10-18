@@ -71,6 +71,68 @@ class TestHostGateCapacity(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestTransferStreamOrdering(unittest.TestCase):
+    def test_write_back_drain_waits_for_forward_before_copying_queued_nodes(self):
+        from sglang.srt.managers.cache_controller import (
+            CacheOperation,
+            HiCacheController,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        values = torch.full((8,), -1, dtype=torch.int64, device="cuda")
+        expected = torch.arange(8, dtype=torch.int64, device="cuda")
+        copied = torch.empty(8, dtype=torch.int64, pin_memory=True)
+        forward = torch.cuda.Stream()
+        engine = L2TransferEngine("kernel")
+        host = SimpleNamespace(
+            prepare_transfer_indices=lambda h, d, backend: (h, d),
+            backup_from_device_all_layer_physical=lambda pool, h, d, backend: (
+                copied.copy_(values[d], non_blocking=True)
+            ),
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_fence_stream = forward
+        controller.l2_transfer_engine = engine
+        controller.mem_pool_device_allocator = Mock()
+        controller.ack_write_queue = []
+        # A tick's queued backup and the eviction victim share one drain.
+        controller.write_queue = [
+            CacheOperation(torch.arange(4), torch.arange(4, device="cuda"), 1),
+            CacheOperation(torch.arange(4, 8), torch.arange(4, 8, device="cuda"), 2),
+        ]
+        controller._move_write_operation = lambda op: (
+            op.host_indices,
+            op.device_indices,
+            op.pool_transfers,
+        )
+        controller._l2_transfers = lambda h, d, extra: [
+            L2Transfer(host, SimpleNamespace(), h, d)
+        ]
+        controller._num_tokens_by_pool = lambda op: {}
+        controller._transfer_num_bytes = lambda op: 64
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = controller
+        cache.ongoing_write_through = {1: None, 2: None}
+        cache._finish_write_through_ack = cache.ongoing_write_through.pop
+        cache.metrics_collector = None
+        # Warm up temporary allocations so cudaMalloc cannot hide a missing fence.
+        operations = list(controller.write_queue)
+        cache.writing_check(write_back=True)
+        controller.write_queue = operations
+        cache.ongoing_write_through.update({1: None, 2: None})
+        torch.cuda.synchronize()
+
+        with torch.cuda.stream(forward):
+            torch.cuda._sleep(100_000_000)
+            values.copy_(expected)
+        try:
+            cache.writing_check(write_back=True)
+            self.assertTrue(torch.equal(copied, torch.arange(8)))
+            self.assertEqual(controller.write_queue, [])
+            self.assertEqual(controller.ack_write_queue, [])
+            self.assertEqual(cache.ongoing_write_through, {})
+        finally:
+            forward.synchronize()
+
     def test_load_translation_follows_supplied_start_event(self):
         # The start event precedes translation; transfer must wait for both.
         engine = L2TransferEngine("kernel")

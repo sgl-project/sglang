@@ -41,6 +41,7 @@ import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
 from sglang.srt.utils import ceil_align
+from sglang.srt.utils.common import async_h2d
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -336,6 +337,9 @@ class SparsePrefillChunkCache:
     # Compressed caches keyed by compress ratio: c128 (every block, combined once
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
+    # Per-layer scratch only: combine overwrites all entries before attention.
+    # c0/c128 are cached across layers and must retain separate storage.
+    low_ratio_combined: dict = field(default_factory=dict)
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
     # Host lengths avoid a device synchronization when sizing ragged gathers.
@@ -563,7 +567,7 @@ class SparsePrefillChunkCache:
             seq_lens_cpu = self.seq_lens.tolist()
         lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
         total_compressed = sum(lengths_cpu)
-        lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
+        lengths = async_h2d(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)
         compressed_base = ends - lengths
         swa_base = total_compressed + self.swa_offsets[:-1]
@@ -601,6 +605,11 @@ class SparsePrefillChunkCache:
         """
         gather = self.compressed[compress_ratio]
         topk = sparse_raw_indices.shape[-1]
+        width = combined_topk_width(topk, self.swa_window_size)
+        if compress_ratio in (1, 2) and width in self.low_ratio_combined:
+            gather.combined_indices, gather.combined_lens = self.low_ratio_combined[
+                width
+            ]
         if gather.combined_indices is None:
             device = self.seq_lens.device
             gather.combined_indices = torch.full(
@@ -611,6 +620,11 @@ class SparsePrefillChunkCache:
             )
             gather.combined_lens = torch.zeros(
                 self.num_qo_tokens, dtype=torch.int32, device=device
+            )
+        if compress_ratio in (1, 2):
+            self.low_ratio_combined[width] = (
+                gather.combined_indices,
+                gather.combined_lens,
             )
         return combine_topk_swa_indices(
             topk_indices=sparse_raw_indices,

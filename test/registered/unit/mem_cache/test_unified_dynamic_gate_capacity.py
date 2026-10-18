@@ -32,12 +32,12 @@ class TestDynamicGateCapacity(CustomTestCase):
             self.assertEqual(allocator.verify_byte_accounting(), [])
             values = []
             with contextlib.ExitStack() as stack:
-                # Every page copy goes through a member's `move_kv_cache`.
+                # Every page copy goes through a member's `move_physical_pages`.
                 for kv in {id(x._kvcache): x._kvcache for x in members}.values():
                     stack.enter_context(
                         patch.object(
                             kv,
-                            "move_kv_cache",
+                            "move_physical_pages",
                             side_effect=AssertionError("query moved"),
                         )
                     )

@@ -2075,10 +2075,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
         self.components.iter().any(|component| {
             let component_type = component.component_type();
-            // Write-back defers Full and Mamba to eviction; SWA still publishes
-            // its window here because out-of-window frees never reach eviction.
             component_type != BASE_COMPONENT_TYPE
-                && (!self.is_write_back || component_type == SWA)
                 && component.needs_incremental_backup(self, node_id)
         })
     }
@@ -2089,6 +2086,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state: &InsertWalkState<K>,
         target_node_id: NodeIdx_,
     ) -> bool {
+        if self.is_write_back {
+            return false;
+        }
         if state.is_new_leaf {
             // The new leaf runs to the end of the aligned key.
             return state.aligned_key_len > state.inserted_len
@@ -3257,13 +3257,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
-        if value && self.components_by_type[MAMBA.idx()].is_some() {
-            return Err(
-                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-                    component_type: MAMBA,
-                },
-            );
-        }
         self.enable_external_cache_linker = value;
         Ok(())
     }

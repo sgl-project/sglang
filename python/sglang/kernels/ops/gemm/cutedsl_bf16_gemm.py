@@ -39,7 +39,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import get_device_core_count, is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -1302,8 +1302,6 @@ def _run_tgv(
     return out
 
 
-_TGV_NUM_SMS = 148
-
 # (tactic, cta_m, cta_n, num_mma_ctas), smallest cta_n first.
 _TGV_TACTIC_LADDER = (
     (18, 64, 16, 2),
@@ -1324,10 +1322,11 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 
 def _pick_tactic(m: int, n: int, k: int) -> int:
     """Pick the first ladder tactic whose grid fits one wave of the SMs."""
+    num_sms = get_device_core_count(torch.cuda.current_device())
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
-        if ctas <= _TGV_NUM_SMS:
+        if ctas <= num_sms:
             return tactic
         if best_ctas is None or ctas < best_ctas:
             best, best_ctas = tactic, ctas
@@ -1354,6 +1353,21 @@ _K3_TGV_WIN_SHAPES = frozenset(
 )
 
 
+# MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
+_MUSE_SPARK_TGV_M_RANGES = {
+    (4096, 8192): (1, 16),  # replicated pooler
+    (8192, 4096): (1, 128),  # replicated unpooler
+    (4608, 8192): (1, 256),  # TP4 qkvg
+    (8192, 2048): (1, 128),  # TP4 o_proj
+    (1024, 8192): (1, 256),  # TP4 pooler slice
+    (2048, 4096): (1, 256),  # TP4 unpooler slice
+    (2304, 8192): (40, 512),  # TP8 qkvg
+    (8192, 1024): (1, 64),  # TP8 o_proj
+    (512, 8192): (256, 512),  # TP8 pooler slice
+    (1024, 4096): (1, 512),  # TP8 unpooler slice
+}
+
+
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
@@ -1365,6 +1379,9 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
+    m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
+    if m_range is not None:
+        return m_range[0] <= m <= m_range[1]
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
     if n < 1024 or k < 2048 or k > 6144:

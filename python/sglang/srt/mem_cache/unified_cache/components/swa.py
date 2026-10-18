@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -90,6 +89,7 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        self.gates_prefix_match = params.swa_gates_prefix_match
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -358,10 +358,7 @@ class SWAComponent(TreeComponent):
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
-
-        # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
-        # must not gate prefix matching.
-        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
+        gates_prefix_match = self.gates_prefix_match
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -369,7 +366,7 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if swa_req_ring and (node.backuped or not node.evicted):
+                if not gates_prefix_match and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)

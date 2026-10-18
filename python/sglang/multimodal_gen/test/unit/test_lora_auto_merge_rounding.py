@@ -5,8 +5,10 @@ weights, so a merge into BF16 drops most of them. These check the estimate again
 an actual merge on CPU, and the decision the pipeline takes from it.
 """
 
+import logging
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -96,3 +98,23 @@ def test_auto_decision_measures_once_and_follows_the_threshold() -> None:
     # measured once per configuration, attached unmerged to measure
     assert len(calls) == 2 and all(c["merge_weights"] is False for c in calls)
     assert AUTO_MERGE_MAX_ROUNDING_LOSS == 0.5
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("norms", [(0.81, 1.0), (1e-4, 1.0), None])
+def test_auto_decision_logs_only_new_lossy_configurations(rank, norms, caplog):
+    layers = {"l": SimpleNamespace(merge_rounding_norms=lambda: norms)}
+    stub = SimpleNamespace(
+        auto_merge_rounding_loss={},
+        loaded_adapter_alphas={},
+        _apply_lora_to_layers=lambda *args, **kwargs: None,
+    )
+    with caplog.at_level(logging.INFO):
+        for strength in (1.0, 1.0, 0.5, 1.0, 0.5):
+            LoRAPipeline._auto_merge_rounds_away(
+                stub, "transformer", layers, ["a"], ["adapter"], rank, [strength]
+            )
+
+    messages = [r.message for r in caplog.records if "stays unmerged" in r.message]
+    expected = 2 if rank == 0 and norms == (0.81, 1.0) else 0
+    assert len(messages) == expected

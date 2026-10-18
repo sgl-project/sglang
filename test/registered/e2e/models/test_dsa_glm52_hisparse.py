@@ -147,6 +147,7 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
                     "top_p": 0.95,
                     "max_new_tokens": 128,
                     "ignore_eos": True,
+                    "skip_special_tokens": False,
                 },
             },
             timeout=600,

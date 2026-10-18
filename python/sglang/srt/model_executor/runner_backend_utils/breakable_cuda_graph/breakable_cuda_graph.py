@@ -219,6 +219,29 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
+class _EagerOnGraphCallable:
+    """Bind both graph-aware and explicit eager entry points to the same instance."""
+
+    def __init__(self, graph_call: Callable, eager_call: Callable):
+        self._graph_call = graph_call
+        self._eager_call = eager_call
+
+    def __call__(self, *args, **kwargs):
+        return self._graph_call(*args, **kwargs)
+
+    def run_eager(self, *args, **kwargs):
+        return self._eager_call(*args, **kwargs)
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        bound = _EagerOnGraphCallable(
+            functools.partial(self._graph_call, instance),
+            functools.partial(self._eager_call, instance),
+        )
+        return bound
+
+
 def eager_on_graph(
     fn: Optional[Callable] = None,
     capture_stub: Optional[Callable] = None,
@@ -230,6 +253,10 @@ def eager_on_graph(
     Arguments retain their capture-time identity. Tensors must use the static
     buffers owned by the graph runner; request-specific state must be read
     inside the eager function at execution time.
+
+    Use ``fn.run_eager(...)`` to call the body inside an existing eager region.
+    This explicit entry bypasses graph segmentation and capture stubs; methods
+    bind their instance automatically.
     """
 
     # Transitional support while model callers migrate to the bare decorator.
@@ -286,7 +313,7 @@ def eager_on_graph(
             capture._begin_new_segment()
             return output
 
-        return wrapper
+        return functools.update_wrapper(_EagerOnGraphCallable(wrapper, inner), inner)
 
     return decorator(fn) if fn is not None else decorator
 

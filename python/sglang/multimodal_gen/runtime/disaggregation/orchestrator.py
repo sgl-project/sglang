@@ -190,6 +190,7 @@ class DiffusionServer:
         self._context = zmq.Context(io_threads=2)
         self._running = False
         self._ready = threading.Event()
+        self._startup_error: Exception | None = None
         self._thread: threading.Thread | None = None
 
         self._pending: dict[str, bytes] = {}  # request_id -> client ZMQ identity
@@ -258,6 +259,8 @@ class DiffusionServer:
     def start(self) -> None:
         if self._running:
             return
+        self._ready.clear()
+        self._startup_error = None
         self._running = True
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -280,8 +283,14 @@ class DiffusionServer:
         )
 
     def wait_ready(self, timeout: float = 30.0) -> bool:
-        """Block until the event loop has bound all sockets, or *timeout* elapses."""
-        return self._ready.wait(timeout=timeout)
+        """Wait for bound sockets, propagating initialization errors to the caller."""
+        if not self._ready.wait(timeout=timeout):
+            return False
+        if self._startup_error is not None:
+            raise RuntimeError(
+                "DiffusionServer failed to bind sockets"
+            ) from self._startup_error
+        return True
 
     def stop(self) -> None:
         self._running = False
@@ -294,8 +303,24 @@ class DiffusionServer:
             )
 
     def _event_loop(self) -> None:
+        try:
+            self._run_event_loop()
+        except Exception as error:
+            self._startup_error = error
+            logger.exception("DiffusionServer socket initialization failed")
+        finally:
+            self._running = False
+            self._context.destroy(linger=0)
+            self._ready.set()
+
+    def _run_event_loop(self) -> None:
+        # Peers connect to the configured endpoints, so never move to another port.
         frontend, _ = get_zmq_socket(
-            self._context, zmq.ROUTER, self._frontend_endpoint, bind=True
+            self._context,
+            zmq.ROUTER,
+            self._frontend_endpoint,
+            bind=True,
+            same_port=True,
         )
 
         encoder_pushes: list[zmq.Socket] = []
@@ -321,13 +346,25 @@ class DiffusionServer:
             decoder_pushes.append(sock)
 
         encoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._encoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._encoder_result_endpoint,
+            bind=True,
+            same_port=True,
         )
         denoiser_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._denoiser_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._denoiser_result_endpoint,
+            bind=True,
+            same_port=True,
         )
         decoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._decoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._decoder_result_endpoint,
+            bind=True,
+            same_port=True,
         )
 
         poller = zmq.Poller()
@@ -387,7 +424,6 @@ class DiffusionServer:
         finally:
             for sock in all_sockets:
                 sock.close()
-            self._context.destroy(linger=0)
 
     def _handle_role_result(self, result_pull: zmq.Socket, role: RoleType) -> None:
         try:

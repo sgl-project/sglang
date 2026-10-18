@@ -1368,6 +1368,8 @@ class Gemma3RMSNorm(BaseFusedOp):
         return self.forward_native(x, residual)
 
     def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
+            return self.forward_native(x, residual)
         if residual is not None:
             return self.forward_native(x, residual)
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)

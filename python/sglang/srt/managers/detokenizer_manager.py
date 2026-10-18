@@ -511,7 +511,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
-        freeze_gc("Detokenizer Manager")
+        freeze_gc("Detokenizer Manager", recv_req.gc_threshold)
         return None
 
     def handle_configure_logging_req(self, recv_req: ConfigureLoggingReq):

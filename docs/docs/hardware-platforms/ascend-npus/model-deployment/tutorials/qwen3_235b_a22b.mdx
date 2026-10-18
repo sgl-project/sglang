@@ -16,9 +16,9 @@ This document demonstrates the deployment of Qwen3-235B-A22B on Ascend NPUs usin
 mode, multi-node PD disaggregation mode, 256k long-sequence inference, Prefill Context Parallel, feature configuration,
 and performance optimization.
 
-This document is validated and written based on **SGLang v0.5.16**. The current model (Qwen3-235B-A22B) is fully supported in
-this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is recommended to use
-v0.5.16 or a later version.
+This document is validated and written based on **SGLang v0.5.18**. The current model (Qwen3-235B-A22B) is fully supported in
+this version. It is recommended to use exactly v0.5.18 (the `v0.5.18-cann9.0.0-a3` image); later versions are not covered
+by this document and may introduce breaking changes.
 
 ## Supported features
 
@@ -34,7 +34,7 @@ v0.5.16 or a later version.
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| Context Parallelism           | `--enable-prefill-context-parallel \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
+| Context Parallelism           | `--enable-prefill-cp \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -71,15 +71,15 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 The BF16 variant (470.21GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full
-A3 Series node (8 cards, 16 dies) or two A2 Series nodes.
+A3 Series node (8 cards, 16 dies).
 
-The W8A8 variant (236.80GB) can be deployed on 8 × 64GB (`--tp-size 8`), which corresponds to one full A2 Series node or 8 dies on A3 Series (4 cards).
+The W8A8 variant (236.80GB) can be deployed on 8 × 64GB (`--tp-size 8`), which corresponds to 8 dies on an A3 Series node (4 cards).
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
+For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -91,14 +91,11 @@ The Docker image requires at least **30GB** of free space. Ensure sufficient dis
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
+The following command is based on the stable release tag `v0.5.18-cann9.0.0-a3`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-<Tabs>
-  <Tab title="Ascend A3 Series">
-
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -126,38 +123,8 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 ```
-
-  </Tab>
-  <Tab title="Ascend A2 Series">
-
-```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-
-docker run -itd --shm-size=16g --name ${NAME} \
---privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /usr/local/sbin:/usr/local/sbin \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
--v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
---entrypoint=bash \
-quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
-```
-
-  </Tab>
-</Tabs>
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
@@ -188,14 +155,15 @@ The following command is based on the **W8A8** quantized model.
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
 #   PREFILL_HOST_IP: prefill node IP address
-#   NETWORK_IFACE: network interface name (use ifconfig to find)
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL (use ifconfig to find)
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo (use ifconfig to find)
 #============================================================
 
 export ASCEND_USE_FIA=1
 export SGLANG_SET_CPU_AFFINITY=1
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:12345"
-export HCCL_SOCKET_IFNAME=<NETWORK_IFACE>
-export GLOO_SOCKET_IFNAME=<NETWORK_IFACE>
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
 
 MODEL_PATH=/path/to/model-weights
 ```
@@ -287,13 +255,12 @@ python3 -m sglang_router.launch_router \
     --prefill http://<PREFILL_HOST_IP>:8000 8995 \
     --decode http://<DECODE_HOST_IP>:8232 \
     --host <ROUTER_HOST_IP> \
-    --port 6689 \
-    --prometheus-port 29010
+    --port 6689
 ```
 
 #### Prefill Context Parallel (PCP) on 2 x Ascend A3 Series nodes
 
-This configuration enables **Prefill Context Parallel** (`--enable-prefill-context-parallel`) to split the context
+This configuration enables **Prefill Context Parallel** (`--enable-prefill-cp`) to split the context
 across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences.
 PD disaggregation is required. The following command is based on the **W8A8** quantized model.
 
@@ -330,7 +297,7 @@ python3 -m sglang.launch_server \
     --device npu \
     --base-gpu-id 0 \
     --tp-size 16 \
-    --enable-prefill-context-parallel \
+    --enable-prefill-cp \
     --attn-cp-size 2 \
     --moe-dp-size 2 \
     --max-running-requests 1 \
@@ -345,7 +312,7 @@ Key parameters for PCP:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `--enable-prefill-context-parallel` | flag | Enable PCP feature |
+| `--enable-prefill-cp` | flag | Enable PCP feature |
 | `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
 | `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
 | `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |

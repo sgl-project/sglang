@@ -12,17 +12,20 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from array import array
 from itertools import chain
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
+import psutil
 
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
@@ -67,6 +70,15 @@ class RustServer:
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
         self._max_per_poll = max_per_poll
+        # The engine-level startup timings `/server_info` reports, set once
+        # the scheduler finishes initializing (see `set_startup_time`).
+        self.startup_time: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
+        """Headers a healthy ``/health_generate`` carries; a deployment's
+        router may read its metadata off the deep health probe."""
+        return {}
 
     @classmethod
     def _load_extension(cls) -> ModuleType:
@@ -167,7 +179,11 @@ class RustServer:
 
         extension = cls._load_extension()
         server = extension.Server(
-            _build_server_args(scheduler, extension=extension),
+            _build_server_args(
+                scheduler,
+                extension=extension,
+                health_generate_headers=cls._health_generate_headers(scheduler),
+            ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
             port_offset=local_dp_rank,
@@ -225,6 +241,17 @@ class RustServer:
         because ``drain`` settles its ownership after the wrapper returns."""
         assert self.mm_spec is not None
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def set_startup_time(self, scheduler_startup_time: Dict[str, Any]) -> None:
+        """Record the startup timings in the shape of Python's
+        ``TokenizerManager.startup_time``. That frontend's end-to-end phase
+        (``tokenizer_e2e``) runs from launch until the schedulers are ready;
+        this one serves from inside the scheduler process, so it runs from
+        the process's spawn until its initialization ends, now."""
+        self.startup_time = build_engine_startup_time(
+            [scheduler_startup_time],
+            tokenizer_e2e=time.time() - psutil.Process().create_time(),
+        )
 
     def mm_transport_stats(self) -> Dict[str, int]:
         """Snapshot of the zero-copy accounting at the multimodal hand-off
@@ -354,7 +381,8 @@ class RustServer:
         bulk numeric columns never go through msgpack:
 
           - ``header``: msgpack ``BatchHeader`` positional array — the per-request
-            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
+            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens,
+            cached_tokens, reasoning_tokens``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones).
@@ -402,7 +430,14 @@ class RustServer:
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
-        header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
+        header_cols = [
+            rids,
+            finish_reasons,
+            prompt_tokens,
+            tok_lens,
+            payload.cached_tokens,
+            payload.reasoning_tokens,
+        ]
         data_cols = [flat_ids]
 
         if has_extra:

@@ -1020,6 +1020,13 @@ def handle_model_capability_adjustments(server_args: Any):
             f"{hf_config.model_type}"
         )
 
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_encoder_replay_budget,
+        )
+
+        validate_deepseek_v41_encoder_replay_budget(server_args)
+
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:

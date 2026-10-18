@@ -76,7 +76,7 @@ class TestZeroMatchResult(unittest.TestCase):
 class TestMatchKvCacheForceMiss(unittest.TestCase):
     def test_swa_branching_seqlen_is_cleared_without_new_branch(self):
         class _StubTreeCache:
-            def swa_reprefill_tail_tokens(self):
+            def swa_reprefill_tail_tokens(self, req=None):
                 return 0
 
             def match_prefix(self, params):

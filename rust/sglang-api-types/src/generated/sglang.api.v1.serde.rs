@@ -1593,6 +1593,31 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.extra_key {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
         }
+        if let Some(v) = &self.priority {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
+        }
+        if let Some(v) = &self.cache_salt {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cache_salt", v)?;
+        }
+        if let Some(v) = &self.require_reasoning {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "require_reasoning", v)?;
+        }
+        if let Some(v) = &self.lora_path {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "lora_path",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.session_params {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "session_params",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1632,6 +1657,11 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_video_data = None;
                 let mut f_audio_data = None;
                 let mut f_extra_key = None;
+                let mut f_priority = None;
+                let mut f_cache_salt = None;
+                let mut f_require_reasoning = None;
+                let mut f_lora_path = None;
+                let mut f_session_params = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1794,6 +1824,44 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_extra_key = Some(map.next_value::<Option<StringOrList>>()?);
                         }
+                        "priority" => {
+                            if f_priority.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("priority"));
+                            }
+                            f_priority = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "cache_salt" => {
+                            if f_cache_salt.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cache_salt"));
+                            }
+                            f_cache_salt = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "require_reasoning" => {
+                            if f_require_reasoning.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "require_reasoning",
+                                ));
+                            }
+                            f_require_reasoning = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "lora_path" => {
+                            if f_lora_path.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("lora_path"));
+                            }
+                            f_lora_path = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "session_params" => {
+                            if f_session_params.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("session_params"));
+                            }
+                            f_session_params = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1823,6 +1891,11 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     video_data: f_video_data.flatten(),
                     audio_data: f_audio_data.flatten(),
                     extra_key: f_extra_key.flatten(),
+                    priority: f_priority.flatten(),
+                    cache_salt: f_cache_salt.flatten(),
+                    require_reasoning: f_require_reasoning.flatten(),
+                    lora_path: f_lora_path.flatten(),
+                    session_params: f_session_params.flatten(),
                 })
             }
         }
@@ -2073,6 +2146,16 @@ impl ::serde::Serialize for GenerateMetaInfo {
         if let Some(v) = &self.e2e_latency {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "e2e_latency", v)?;
         }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cached_tokens",
+            &self.cached_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "reasoning_tokens",
+            &self.reasoning_tokens,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2101,6 +2184,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_input_token_ids_logprobs = None;
                 let mut f_hidden_states = None;
                 let mut f_e2e_latency = None;
+                let mut f_cached_tokens = None;
+                let mut f_reasoning_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2206,6 +2291,20 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             }
                             f_e2e_latency = Some(map.next_value::<Option<f64>>()?);
                         }
+                        "cached_tokens" => {
+                            if f_cached_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cached_tokens"));
+                            }
+                            f_cached_tokens = Some(map.next_value::<u32>()?);
+                        }
+                        "reasoning_tokens" => {
+                            if f_reasoning_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_tokens",
+                                ));
+                            }
+                            f_reasoning_tokens = Some(map.next_value::<u64>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2224,6 +2323,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     input_token_ids_logprobs: f_input_token_ids_logprobs.unwrap_or_default(),
                     hidden_states: f_hidden_states.unwrap_or_default(),
                     e2e_latency: f_e2e_latency.flatten(),
+                    cached_tokens: f_cached_tokens.unwrap_or_default(),
+                    reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
                 })
             }
         }

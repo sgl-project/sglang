@@ -1,28 +1,25 @@
-"""DeepSeek-V4.1-Flash accuracy with DSPARK on four GB300 GPUs.
+"""Shared DeepSeek-V4.1-Flash + DSPARK accuracy recipe for the GB300 tests.
 
-Run GSM8K and MMLU in TP4+EP4 and DP-attention4 + EP4 configurations,
-plus TRT-LLM attention with decoder bounded replay and breakable prefill.
-The DP+EP recipe is intentionally exercised rather than skipped: startup or
-accuracy failures must be visible in CI while this path is being validated.
+Each server configuration lives in its own file under
+``test/registered/e2e/models/test_deepseek_v41_flash_gb300_*.py`` so the
+configurations partition independently across GB300 runners. All use default
+decoder bounded replay and explicitly enabled breakable prefill graphs.
 """
-
-import unittest
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, _run_accuracy_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1650, stage="base-c", runner_config="4-gpu-gb300")
-
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
+
+# Tensor-parallel attention and expert-parallel MoE, without DP attention.
+TP4_EP4_ARGS = ["--attn-dp-size", "1", "--ep-size", "4"]
 
 
 class DSV41FlashAccuracyMixin(GSM8KMixin):
@@ -32,11 +29,25 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     gsm8k_num_examples = 200
     gsm8k_num_threads = 64
     gsm8k_max_tokens = 4096
-    mmlu_score_threshold = 0.90
-    mmlu_num_examples = 500
-    mmlu_num_threads = 64
-    mmlu_max_tokens = 4096
+    mmmu_pro_score_threshold = 0.75
+    mmmu_pro_num_examples = 200
+    mmmu_pro_num_threads = 64
+    # Bound long reasoning responses consistently across all CI recipes.
+    mmmu_pro_max_tokens = 32768
+    mmmu_pro_load_preset_from_model_id = MODEL
 
+    mem_fraction_static = "0.8"
+    max_running_requests = "32"
+    graph_args = [
+        "--cuda-graph-backend-prefill",
+        "breakable",
+        "--cuda-graph-max-bs-prefill",
+        "8192",
+        "--cuda-graph-max-seq-len-prefill",
+        "16384",
+        "--chunked-prefill-size",
+        "8192",
+    ]
     parallel_args = []
     server_env = {}
 
@@ -57,16 +68,18 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
                 "--speculative-dspark-block-size",
                 "5",
                 "--mem-fraction-static",
-                "0.8",
+                cls.mem_fraction_static,
                 "--cuda-graph-max-bs-decode",
                 "64",
                 "--max-running-requests",
-                "64",
+                cls.max_running_requests,
                 "--reasoning-parser",
                 "auto",
                 "--tool-call-parser",
                 "auto",
+                "--disable-flashinfer-autotune",
                 *cls.parallel_args,
+                *cls.graph_args,
             ],
             env=cls.server_env,
         )
@@ -88,62 +101,15 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
         super().test_gsm8k()
         self.assert_dspark_accepts_draft_tokens()
 
-    def test_mmlu(self):
+    def test_mmmu_pro(self):
         _run_accuracy_eval(
             self,
-            eval_name="mmlu",
-            score_threshold=self.mmlu_score_threshold,
-            num_examples=self.mmlu_num_examples,
-            num_threads=self.mmlu_num_threads,
-            max_tokens=self.mmlu_max_tokens,
+            eval_name="mmmu_pro",
+            score_threshold=self.mmmu_pro_score_threshold,
+            num_examples=self.mmmu_pro_num_examples,
+            num_threads=self.mmmu_pro_num_threads,
+            model=None,
+            load_preset_from_model_id=self.mmmu_pro_load_preset_from_model_id,
+            max_tokens=self.mmmu_pro_max_tokens,
         )
         self.assert_dspark_accepts_draft_tokens()
-
-
-class TestDSV41FlashTP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
-    """Tensor-parallel attention and expert-parallel MoE, without DP attention."""
-
-    parallel_args = ["--attn-dp-size", "1", "--ep-size", "4"]
-
-
-class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
-    """DP attention and EP MoE using the built-in gather/reduce path.
-
-    DSPARK with DP attention does not support the DeepEP backend.
-    """
-
-    parallel_args = [
-        "--attn-dp-size",
-        "4",
-        "--ep-size",
-        "4",
-        "--enable-dp-lm-head",
-        "--moe-a2a-backend",
-        "none",
-    ]
-
-
-class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):
-    """TRT-LLM varlen attention through the full and bounded-tail graph breaks."""
-
-    parallel_args = [
-        "--attn-dp-size",
-        "1",
-        "--ep-size",
-        "4",
-        "--dsv4-attn-backend",
-        "trtllm",
-        "--enable-decoder-swa-bounded-replay",
-        "--cuda-graph-backend-prefill",
-        "breakable",
-        "--cuda-graph-max-bs-prefill",
-        "4096",
-        "--cuda-graph-max-seq-len-prefill",
-        "16384",
-        "--chunked-prefill-size",
-        "4096",
-    ]
-
-
-if __name__ == "__main__":
-    unittest.main()

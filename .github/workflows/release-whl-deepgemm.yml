@@ -115,7 +115,7 @@ jobs:
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
-            timeout: 60
+            timeout: 180
           # The sm120 tests require a runner with RTX 6000. It causes OOM on 5090 runners.
           # - arch_label: sm120
           #   runner: 1-gpu-5090

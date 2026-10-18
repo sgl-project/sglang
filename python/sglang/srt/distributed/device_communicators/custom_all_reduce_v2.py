@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.kernels.kernel_api_logging import _KERNEL_API_LOG_LEVEL
 from sglang.kernels.ops.communication.all_reduce import (
     AllReduceAlgo,
     Communicator,
@@ -39,6 +40,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     PullPlane,
     PushPlane,
     custom_all_reduce,
+    get_all_reduce_module,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
@@ -145,7 +147,7 @@ class CustomAllReduceV2:
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
+            max_push_size = min(base_config.max_push_bytes(self.world_size), max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -185,9 +187,15 @@ class CustomAllReduceV2:
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
         self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
+            max_push_bytes=self.max_push_size,
+            max_pull_bytes=self.max_pull_size,
+            world_size=self.world_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
+        # (nbytes, dtype) -> (module, algo name, multicast) or None, for
+        # eager calls under `_eager_plans_config`; rebuilt when config changes.
+        self._eager_plans: dict = {}
+        self._eager_plans_config = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
         # node-local VMM remap) does not — force eager pull inside graphs.
@@ -338,6 +346,8 @@ class CustomAllReduceV2:
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+        if nbytes <= heuristic.two_shot_push_threshold:
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
         if can_use_multicast and heuristic.mc.contains(nbytes):
@@ -358,7 +368,27 @@ class CustomAllReduceV2:
             return False
         if self.override_algo is not None:
             return inp_size <= self.max_size
+        if not self._graph_mode_allowed:
+            return self._eager_plan(inp_size, inp.dtype) is not None
         return self._pick_config(inp_size, self._can_use_graph()) is not None
+
+    def _eager_plan(self, nbytes: int, dtype: torch.dtype):
+        """The launch an eager all-reduce of this size takes, resolved once."""
+        if self._eager_plans_config is not self.config:
+            self._eager_plans, self._eager_plans_config = {}, self.config
+        key = (nbytes, dtype)
+        if key not in self._eager_plans:
+            config = self._pick_config(nbytes, False)
+            self._eager_plans[key] = (
+                None
+                if config is None
+                else (
+                    get_all_reduce_module(dtype, self.world_size),
+                    config.algo.algo_name,
+                    config.use_multicast,
+                )
+            )
+        return self._eager_plans[key]
 
     # ------------------------------------------------------------------
     # All-reduce
@@ -366,6 +396,16 @@ class CustomAllReduceV2:
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         nbytes = input.numel() * input.element_size()
+        if (
+            self.override_algo is None
+            and not self._graph_mode_allowed
+            and not _KERNEL_API_LOG_LEVEL
+        ):
+            plan = self._eager_plan(nbytes, input.dtype)
+            assert plan is not None, f"No config for {nbytes = }"
+            module, algo_name, use_multicast = plan
+            out = module.all_reduce(self.obj, input, algo_name, None, use_multicast)
+            return out if isinstance(out, torch.Tensor) else torch.from_dlpack(out)
         if self.override_algo is not None:
             # TODO: enhance this override pattern
             algo = self.override_algo

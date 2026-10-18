@@ -12,6 +12,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.runner_utils.forward_batch import (
+    set_forward_batch,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    prefill_graph_scope,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -241,21 +248,15 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         )
 
     def test_attention_narrows_padded_positions(self):
-        from sglang.srt.layers.radix_attention import unified_attention_with_output
 
         num_tokens = 3
         padded_num_tokens = 5
         forward_batch = SimpleNamespace(
             global_num_token_non_padded_cpu=num_tokens,
+            mha_return_lse=False,
+            _attn_output=None,
             out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
             positions=torch.arange(padded_num_tokens, device=self.device),
-        )
-        context = SimpleNamespace(
-            forward_batch=forward_batch,
-            attention_layers=[object()],
-            mha_companion_layers=None,
-            num_tokens=padded_num_tokens,
-            raw_num_tokens=num_tokens,
         )
         observed = {}
 
@@ -266,22 +267,19 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 
         output = torch.full((padded_num_tokens, 2), float("nan"), device=self.device)
         with (
-            patch(
-                "sglang.srt.layers.radix_attention.get_tc_piecewise_forward_context",
-                return_value=context,
-            ),
+            set_forward_batch(forward_batch),
+            prefill_graph_scope(full_graph=False, raw_num_tokens=num_tokens),
             patch(
                 "sglang.srt.layers.radix_attention.get_attn_backend",
                 return_value=SimpleNamespace(forward=attention_forward),
             ),
         ):
-            unified_attention_with_output(
+            RadixAttention(1, 2, 1.0, 1, 0)._eager_attention(
                 torch.zeros((padded_num_tokens, 2), device=self.device),
                 torch.zeros((padded_num_tokens, 1, 2), device=self.device),
                 torch.zeros((padded_num_tokens, 1, 2), device=self.device),
                 output,
                 True,
-                0,
             )
 
         expected = torch.arange(num_tokens, device=self.device)

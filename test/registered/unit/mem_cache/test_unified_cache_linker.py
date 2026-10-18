@@ -183,7 +183,7 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
@@ -661,6 +661,148 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
             )
             self.assertEqual(unpublished.device_prefix_len, 3)
+        consumer.sanity_check()
+
+    def _mamba_linker_consumer(self, tokens):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            sliding_window_size=2,
+            kv_size=64,
+            max_context_len=64,
+        )
+        stored_keys = defaultdict(set)
+
+        producer, producer_allocator, producer_req_pool = build_fixture(self.cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        inserted = self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        # Ancestors of the chain carry no state; only the checkpoint node does.
+        *ancestors, offload = producer_linker.offload_calls
+        for transfers in ancestors:
+            self.assertEqual(
+                {transfer.name for transfer in transfers}, {PoolName.KV, PoolName.SWA}
+            )
+        offloads = {transfer.name: transfer for transfer in offload}
+        self.assertEqual(set(offloads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        mamba_offload = offloads[PoolName.MAMBA]
+        self.assertEqual(mamba_offload.keys, offloads[PoolName.KV].keys[-1:])
+        self.assertEqual(mamba_offload.hit_policy, PoolHitPolicy.TRAILING_PAGES)
+        self.assertTrue(
+            torch.equal(
+                mamba_offload.device_indices,
+                _device_value(producer, inserted.last_device_node, ComponentType.MAMBA),
+            )
+        )
+        for _ in producer_linker.offload_calls:
+            producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(self.cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+
+        return consumer, consumer_req_pool, consumer_linker
+
+    def test_mamba_state_round_trips_only_at_its_checkpoint(self):
+        tokens = list(range(1, 7))
+        consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
+            tokens
+        )
+
+        # Every KV and SWA page is stored, but only the full prefix has a state.
+        short = consumer.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens[:5])),
+                req=self._make_req(consumer_req_pool),
+            )
+        )
+        self.assertEqual(short.host_hit_length, 0)
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self.assertEqual(match.mamba_host_hit_length, 1)
+        self._apply_match_to_req(req, match)
+        loaded, _ = consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        self.assertEqual(loaded, len(tokens))
+        loads = {
+            transfer.name: transfer
+            for transfer in consumer_linker.queued_loads[req.rid]
+        }
+        self.assertEqual(set(loads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        self.assertEqual(loads[PoolName.MAMBA].keys, loads[PoolName.KV].keys[-1:])
+        loaded_state = loads[PoolName.MAMBA].device_indices
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertFalse(req.kv.mamba_needs_clear)
+
+        loaded_indices = consumer.linker.private_load_indices[req.rid]
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        self._bind_loaded_request(
+            consumer, consumer_req_pool, req, tokens, loaded_indices
+        )
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+        consumer.checkpoint(req, up_to=req.extend_end)
+        consumer.unlock(req.lock)
+        req.lock = None
+        final_match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(final_match.device_prefix_len, len(tokens))
+        for _ in consumer_linker.offload_calls:
+            consumer_linker.complete_next_offload(True)
+        consumer.check_hicache_events()
+        consumer.sanity_check()
+
+    def test_mamba_load_supersedes_a_shorter_device_cow(self):
+        tokens = list(range(1, 7))
+        consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
+            tokens
+        )
+        self._insert(
+            consumer,
+            consumer.token_to_kv_pool_allocator,
+            consumer_req_pool,
+            tokens[:3],
+        )
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req, cow_mamba=True)
+        )
+        self.assertEqual(match.device_prefix_len, 3)
+        self.assertEqual(match.host_hit_length, 3)
+        self.assertIsNotNone(req.kv.mamba_cow_src_index)
+        self._apply_match_to_req(req, match)
+        allocator = consumer_req_pool.mamba_allocator
+        before = allocator.available_size()
+
+        consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        # The CoW from the shorter checkpoint would overwrite the loaded state.
+        loaded_state = next(
+            transfer.device_indices
+            for transfer in consumer_linker.queued_loads[req.rid]
+            if transfer.name == PoolName.MAMBA
+        )
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(allocator.available_size(), before)
+
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         consumer.sanity_check()
 
 
@@ -1143,10 +1285,12 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
+    component.gates_prefix_match = not unified_kv
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
     cache.cache_controller = object() if enable_hicache else None
+    cache.decoder_swa_bounded_replay = False
     cache.tree_core = SimpleNamespace(
         enable_hicache=enable_hicache,
         has_swa_host_pool=enable_hicache and not unified_kv,

@@ -351,6 +351,13 @@ def _patchify_latents(latents):
     return latents
 
 
+def flux2_vae_bn_stats(vae, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(like)
+    variance = vae.bn.running_var.view(1, -1, 1, 1)
+    std = torch.sqrt(variance + vae.config.arch_config.batch_norm_eps).to(like)
+    return mean, std
+
+
 def _unpatchify_latents(latents):
     batch_size, num_channels_latents, height, width = latents.shape
     latents = latents.reshape(

@@ -228,7 +228,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                     member.disagg_move_gate = lambda: False
                     with patch.object(
                         member._kvcache,
-                        "move_kv_cache",
+                        "move_physical_pages",
                         side_effect=AssertionError("gated flush copied"),
                     ):
                         # Unfired: even an urgent flush leaves them pending.

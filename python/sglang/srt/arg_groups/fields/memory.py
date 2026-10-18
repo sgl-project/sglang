@@ -95,7 +95,10 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Hierarchical cache
     # -------------------------------------------------------------------------
-    enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_hierarchical_cache: A[
+        bool,
+        Arg(help="Enable hierarchical cache", aliases=["--enable-hicache"]),
+    ] = False
     hicache_host_memory_mode: A[
         str,
         Arg(

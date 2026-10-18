@@ -1,4 +1,4 @@
-"""Unit tests for ``get_new_expanded_mm_items`` per-image splitting.
+"""Unit tests for multimodal item splitting and token padding.
 
 This is the load-bearing behavioral path for multi-image requests: a bundled
 ``MultimodalDataItem`` (one item carrying N image offsets + a concatenated
@@ -12,12 +12,27 @@ mis-split a degenerate flat grid. No server / GPU / weight loading involved.
 """
 
 import unittest
+import warnings
+from array import array
+from functools import partial
 
 import numpy as np
 import torch
 
-from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPattern,
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    MultiModalityDataPaddingPatternTokenPairs,
+    duplicate_pad_mm_input_ids,
+    get_new_expanded_mm_items,
+    pad_mm_token_pairs,
+    pad_mm_tokens,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -139,6 +154,156 @@ class TestGetNewExpandedMMItems(CustomTestCase):
 
         self.assertEqual(len(out), 1)
         self.assertIs(out[0], item)
+
+
+class TestMMPadding(CustomTestCase):
+    def test_padding_requires_int64_arrays(self):
+        mm_inputs = MultimodalInputs(mm_items=[])
+        for pad in (
+            pad_mm_tokens,
+            partial(pad_mm_token_pairs, data_token_pairs=[(10, 11)]),
+            MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens,
+            MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens,
+        ):
+            for input_ids in ([1, 2], array("i", [1, 2])):
+                with self.subTest(pad=pad, input_ids=input_ids):
+                    with self.assertRaisesRegex(AssertionError, "input_ids must be"):
+                        pad(input_ids, mm_inputs)
+
+    def test_multimodal_offsets_and_input_ownership(self):
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE, pad_value=1000, offsets=[(1, 2), (7, 7)]
+                ),
+                MultimodalDataItem(
+                    modality=Modality.IMAGE, pad_value=1001, offsets=[(3, 3)]
+                ),
+                MultimodalDataItem(
+                    modality=Modality.AUDIO, pad_value=1002, offsets=[(4, 5)]
+                ),
+                MultimodalDataItem(
+                    modality=Modality.VIDEO, pad_value=1003, offsets=[(8, 9)]
+                ),
+            ],
+            im_token_id=10,
+            audio_token_id=20,
+            video_token_id=30,
+        )
+        original = array("q", [1, 10, 10, 10, 20, 20, 2, 10, 30, 30, 3])
+        expected = array("q", [1, 1000, 1000, 1001, 1002, 1002, 2, 1000, 1003, 1003, 3])
+        for pad in (
+            pad_mm_tokens,
+            MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens,
+        ):
+            with self.subTest(pad=pad):
+                input_ids = original[:]
+                padded = pad(input_ids, mm_inputs)
+                self.assertEqual(padded, expected)
+                self.assertEqual(input_ids, original)
+                self.assertIsNot(padded, input_ids)
+
+    def test_missing_modality_token_is_not_padded(self):
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.AUDIO, pad_value=1000, offsets=[(0, 1)]
+                )
+            ],
+            im_token_id=10,
+        )
+        input_ids = array("q", [20, 20])
+        self.assertEqual(pad_mm_tokens(input_ids, mm_inputs), input_ids)
+
+    def test_noop_preserves_identity_but_scheduler_owns_copy(self):
+        for input_ids in (array("q"), array("q", [1, 2])):
+            mm_inputs = MultimodalInputs(mm_items=[])
+            for pad in (
+                pad_mm_tokens,
+                MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens,
+            ):
+                with self.subTest(input_ids=input_ids, pad=pad):
+                    self.assertIs(pad(input_ids, mm_inputs), input_ids)
+                    owned = duplicate_pad_mm_input_ids(input_ids, mm_inputs, pad)
+                    self.assertEqual(owned, input_ids)
+                    self.assertIsNot(owned, input_ids)
+
+    def test_token_pairs_reuse_item_for_slices(self):
+        pairs = [(10, 11), (12, 13), (20, 21)]
+        starts = [10, 20]
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, pad_value=1000),
+                MultimodalDataItem(modality=Modality.AUDIO, pad_value=2000),
+            ]
+        )
+        original = array("q", [1, 10, 0, 0, 11, 12, 0, 13, 2, 20, 0, 21, 3])
+        expected = array("q", [1, 10, 1000, 1000, 11, 12, 1000, 13, 2, 20, 2000, 21, 3])
+        for pad in (
+            partial(
+                pad_mm_token_pairs, data_token_pairs=pairs, data_start_token_ids=starts
+            ),
+            MultiModalityDataPaddingPatternTokenPairs(pairs, starts).pad_input_tokens,
+        ):
+            with self.subTest(pad=pad):
+                mm_inputs.data_offsets = [999]
+                input_ids = original[:]
+                self.assertEqual(pad(input_ids, mm_inputs), expected)
+                self.assertEqual(input_ids, original)
+                self.assertEqual(mm_inputs.data_offsets, [1, 9])
+
+    def test_token_pairs_default_starts_and_repeated_regions(self):
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, pad_value=1000),
+                MultimodalDataItem(modality=Modality.IMAGE, pad_value=2000),
+            ]
+        )
+        input_ids = array("q", [10, 0, 11, 10, 11, 10, 0, 11])
+        expected = array("q", [10, 1000, 11, 10, 11, 10, 2000, 11])
+        for pad in (
+            partial(pad_mm_token_pairs, data_token_pairs=[(10, 11)]),
+            MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens,
+        ):
+            with self.subTest(pad=pad):
+                self.assertEqual(pad(input_ids, mm_inputs), expected)
+                self.assertEqual(mm_inputs.data_offsets, [0, 3, 5])
+
+    def test_unmatched_pairs_return_original_and_reset_offsets(self):
+        mm_inputs = MultimodalInputs(
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE, pad_value=1000)]
+        )
+        for pad in (
+            partial(pad_mm_token_pairs, data_token_pairs=[(10, 11)]),
+            MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens,
+        ):
+            with self.subTest(pad=pad):
+                mm_inputs.data_offsets = [999]
+                input_ids = array("q", [1, 10, 0])
+                self.assertIs(pad(input_ids, mm_inputs), input_ids)
+                self.assertEqual(mm_inputs.data_offsets, [])
+
+    def test_legacy_configuration_remains_mutable_without_warnings(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pattern = MultiModalityDataPaddingPatternTokenPairs(
+                data_token_pairs=[(10, 11)], data_start_token_ids=[10]
+            )
+            self.assertIsInstance(pattern, MultiModalityDataPaddingPattern)
+            pattern.data_token_id_pairs = [(20, 21)]
+            pattern.data_start_token_ids = []
+            mm_inputs = MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, pad_value=1000),
+                    MultimodalDataItem(modality=Modality.IMAGE, pad_value=2000),
+                ]
+            )
+            self.assertEqual(
+                pattern.pad_input_tokens(array("q", [20, 0, 21]), mm_inputs),
+                array("q", [20, 2000, 21]),
+            )
+            self.assertEqual(mm_inputs.data_offsets, [])
+        self.assertEqual(caught, [])
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from contextlib import ExitStack, contextmanager
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
@@ -26,18 +28,43 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     per_tensor_dequantize,
 )
+from sglang.srt.utils.common import temp_set_env
 
 logger = logging.getLogger(__name__)
+_nvfp4_weight_quantization_lock = threading.Lock()
+_nvfp4_weight_quantization_users = 0
+_nvfp4_weight_quantization_env = ExitStack()
+
+
+@contextmanager
+def _nvfp4_weight_quantization_scope():
+    """Share the exact-math override across concurrent weight quantizers."""
+    global _nvfp4_weight_quantization_users
+    with _nvfp4_weight_quantization_lock:
+        if _nvfp4_weight_quantization_users == 0:
+            _nvfp4_weight_quantization_env.enter_context(
+                temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1")
+            )
+        _nvfp4_weight_quantization_users += 1
+    # Quantizer work runs outside the lock.
+    try:
+        yield
+    finally:
+        with _nvfp4_weight_quantization_lock:
+            _nvfp4_weight_quantization_users -= 1
+            if _nvfp4_weight_quantization_users == 0:
+                _nvfp4_weight_quantization_env.close()
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
-    """Load-time NVFP4 with online per-token FP32 activation scales.
+    """Load-time NVFP4 expert weights with online activation handling.
 
-    `--quantization nvfp4_online` exclusively means online per-token FP32
-    activation scaling. Use `modelopt_fp4` for per-tensor FP32 activation scales
-    or serialized NVFP4 checkpoints. This path converts BF16/FP16/FP8 MoE expert
-    weights as they load; dense layers retain their source precision or
-    quantization.
+    `--quantization nvfp4_online` uses per-token FP32 activation scales by
+    default. With `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl
+    and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
+    for per-tensor FP32 activation scales or serialized NVFP4 checkpoints.
+    This path converts BF16/FP16/FP8 MoE expert weights as they load; dense
+    layers retain their source precision or quantization.
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -208,13 +235,19 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             else layer_prefix
         )
         if quant_config.use_per_token_activation and not (
-            self.enable_flashinfer_trtllm_moe or self._is_cutedsl_v2_standard
+            self.enable_flashinfer_trtllm_moe
+            or self._is_cutedsl_v2_standard
+            or (
+                get_moe_runner_backend().is_flashinfer_megamoe()
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            )
         ):
             raise ValueError(
-                "--quantization nvfp4_online requires online per-token FP32 "
-                "activation scales and supports flashinfer_trtllm, "
+                "--quantization nvfp4_online supports flashinfer_trtllm, "
                 "flashinfer_trtllm_routed, or flashinfer_cutedsl with no A2A "
-                "or FlashInfer A2A. Use --quantization modelopt_fp4 for "
+                "or FlashInfer A2A, or flashinfer_megamoe with "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1. "
+                "Use --quantization modelopt_fp4 for "
                 "per-tensor FP32 activation scales."
             )
 
@@ -246,7 +279,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         scale when multiple shards must share one global scale, for example the
         gated w1/w3 pair.
         """
-        from flashinfer import SfLayout, nvfp4_quantize
+        from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 
         if weight.ndim != 2:
             raise ValueError(
@@ -265,6 +298,11 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 f"a multiple of 16, got shape {tuple(weight.shape)}."
             )
 
+        # Pin the weight recipe independently of the activation quantization
+        # environment, including the E4M3 maximum used by the global scale.
+        nvfp4_4over6_config = NVFP44Over6Config(
+            e4m3_max=448, err_mode="MSE", err_use_fast_math=True
+        )
         if weight_scale_2 is None:
             # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
             # reciprocal as the global encode scale, matching 448 * 6 / amax.
@@ -274,13 +312,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 .amax()
                 .to(device=weight.device, dtype=torch.float32)
             )
-            e4m3_max = (
-                256.0
-                if envs.FLASHINFER_NVFP4_4OVER6.get()
-                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-                else float(torch.finfo(torch.float8_e4m3fn).max)
-            )
-            fp8_fp4_max = e4m3_max * 6.0
+            fp8_fp4_max = nvfp4_4over6_config.e4m3_max * 6.0
             weight_scale_2 = torch.where(
                 weight_amax > 0,
                 weight_amax / fp8_fp4_max,
@@ -290,12 +322,15 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight_scale_2 = weight_scale_2.to(
                 device=weight.device, dtype=torch.float32
             )
-        fp4_weight, weight_sf = nvfp4_quantize(
-            weight.contiguous(),
-            1.0 / weight_scale_2,
-            sfLayout=SfLayout.layout_linear,
-            backend="cute-dsl",
-        )
+        # FlashInfer still uses an environment flag for exact FP4 math.
+        with _nvfp4_weight_quantization_scope():
+            fp4_weight, weight_sf = nvfp4_quantize(
+                weight.contiguous(),
+                1.0 / weight_scale_2,
+                sfLayout=SfLayout.layout_linear,
+                backend="cute-dsl",
+                nvfp4_4over6=nvfp4_4over6_config,
+            )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
         return (

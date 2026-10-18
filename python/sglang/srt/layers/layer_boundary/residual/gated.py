@@ -134,6 +134,8 @@ class _AttnReadout:
     the previous layer's output: such a layer takes its input written back. A
     ``post_residual_addition`` is not applied."""
 
+    bind = None
+
     is_plain_norm = False
     completing_fusions = ()
     gathering_reads = ()
@@ -167,6 +169,9 @@ class _AttnUpdate:
     residual its read produced. The injection is not a plain add, so it runs
     only once the sum it writes in is complete."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
@@ -188,6 +193,8 @@ class _AttnUpdate:
 
 class _FfnReadout:
     """The attention output's injection and the FFN input's mix."""
+
+    bind = None
 
     is_plain_norm = False
     completing_fusions = ()
@@ -219,6 +226,9 @@ class _FfnReadout:
 class _FfnUpdate:
     """The gated injection of the FFN output, which this layer runs itself. The
     streams stay widened: the layer stack's terminal read mixes them down."""
+
+    bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = True

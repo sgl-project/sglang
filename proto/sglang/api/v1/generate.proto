@@ -2,7 +2,7 @@
 // rust/sglang-server/src/message/request.rs's GenerateBody (request) and
 // api_core/frame.rs's frame shape (response). Unknown JSON keys on the
 // request are IGNORED: `deny_unknown_fields` broke real clients that send
-// Python-only `GenerateReqInput` fields (priority, session_id,
+// Python-only `GenerateReqInput` fields (session_id,
 // ...), pinned by request.rs's unported-fields test.
 
 syntax = "proto3";
@@ -57,6 +57,21 @@ message GenerateRequest {
   // key. One key for every batch item, or one per item; an empty key means
   // none.
   StringOrList extra_key = 23;
+  // Scheduling priority, one value for every batch item; the scheduler
+  // validates it against its priority-scheduling mode.
+  optional int64 priority = 24;
+  // Prefix-cache salt: a second namespace beside `extra_key`, normalized the
+  // same way.
+  StringOrList cache_salt = 25;
+  // Apply grammar constraints only after the reasoning section, for every
+  // batch item.
+  optional bool require_reasoning = 26;
+  // Fields this server cannot honour. Unknown keys are ignored, but
+  // dropping these would silently change the result (base-model output for a
+  // LoRA request, a stateless answer for a session request), so a non-null
+  // value is rejected instead.
+  optional string lora_path = 27 [(sglang.json.v1.field_json).raw_json = true];
+  optional string session_params = 28 [(sglang.json.v1.field_json).raw_json = true];
 }
 
 message SamplingParamsOrList {
@@ -126,6 +141,10 @@ message GenerateMetaInfo {
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;
+  // Prompt tokens served from the prefix cache, and output tokens spent
+  // reasoning so far; reported on every frame.
+  uint32 cached_tokens = 13;
+  uint64 reasoning_tokens = 14;
 }
 
 message GenerateResponse {

@@ -437,20 +437,47 @@ class BuildCausalSwaPageIndices:
         )
 
 
+def late_layer_tail_lens(
+    extend_lens_cpu: list[int],
+    tail_len: int,
+    whole_extend: Optional[list[bool]] = None,
+) -> list[int]:
+    """Each request's late-layer tail: its last min(tail_len, extend_len) tokens,
+    or its whole extend where whole_extend is set."""
+    if whole_extend is None:
+        return [min(tail_len, n) for n in extend_lens_cpu]
+    return [
+        n if whole else min(tail_len, n)
+        for n, whole in zip(extend_lens_cpu, whole_extend)
+    ]
+
+
 def late_layer_tail_layout(
     *,
     extend_lens_cpu: list[int],
     seq_lens_cpu: list[int],
     tail_len: int,
     device: torch.device,
+    whole_extend: Optional[list[bool]] = None,
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-    """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
+    """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens,
+    or its whole extend where whole_extend is set.
     Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
-    tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    absolute window floor). The floor is seq_len - tail_len, so a tail shorter
+    than tail_len reads rows the request wrote before this extend. A whole
+    extend keeps every row's plain window."""
+    if whole_extend is not None and any(whole_extend):
+        return _whole_extend_tail_layout(
+            extend_lens_cpu=extend_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            tail_len=tail_len,
+            device=device,
+            whole_extend=whole_extend,
+        )
+    tail_lens_cpu = late_layer_tail_lens(extend_lens_cpu, tail_len)
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
@@ -464,8 +491,34 @@ def late_layer_tail_layout(
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
     return token_indices, tail_lens_cpu, floor
+
+
+def _whole_extend_tail_layout(
+    *,
+    extend_lens_cpu: list[int],
+    seq_lens_cpu: list[int],
+    tail_len: int,
+    device: torch.device,
+    whole_extend: list[bool],
+) -> tuple[torch.Tensor, list[int], torch.Tensor]:
+    tail_lens_cpu = late_layer_tail_lens(extend_lens_cpu, tail_len, whole_extend)
+    token_indices, floor, start = [], [], 0
+    for n, t, s, whole in zip(
+        extend_lens_cpu, tail_lens_cpu, seq_lens_cpu, whole_extend
+    ):
+        token_indices.append(torch.arange(start + n - t, start + n))
+        # A whole extend's rows sit at s - t or later, so its floor never cuts
+        # their plain window.
+        row_floor = max(0, s - t - tail_len) if whole else max(0, s - tail_len)
+        floor.append(torch.full((t,), row_floor, dtype=torch.int32))
+        start += n
+    return (
+        torch.cat(token_indices).to(device, non_blocking=True),
+        tail_lens_cpu,
+        torch.cat(floor).to(device, non_blocking=True),
+    )
 
 
 def build_causal_swa_page_indices(

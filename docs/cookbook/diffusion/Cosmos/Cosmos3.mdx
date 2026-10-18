@@ -122,6 +122,56 @@ sglang serve \
 
 For distilled I2V, replace the model path with `nvidia/Cosmos3-Super-Image2Video-4Step`. SGLang detects both checkpoints from `scheduler/scheduler_config.json`, uses the checkpoint's fixed four-step sigma schedule, and forces `guidance_scale=1.0`. Do not tune `num_inference_steps` or `flow_shift` for these checkpoints.
 
+### Simulation and multiview checkpoints
+
+These checkpoints use native pipelines with checkpoint-specific conditioning:
+
+| Checkpoint | Inputs | Rollout |
+| --- | --- | --- |
+| `nvidia/Cosmos3-Nano-Sim-Bimanual` | Image, prompt, camera or robot actions | Causal chunks with committed KV history |
+| `nvidia/Cosmos3-Nano-Sim-Transfer` | Control video and prompt | Causal control-video transfer |
+| `nvidia/Cosmos3-Nano-Transfer-Auto` | Per-camera WSM clips and captions; optional LiDAR | Bidirectional multiview generation |
+| `nvidia/Cosmos3-Nano-Sim-Auto` | Per-camera WSM clips and captions; optional LiDAR | Causal multiview generation |
+
+For example, start the Bimanual server:
+
+```bash
+sglang serve --model-path nvidia/Cosmos3-Nano-Sim-Bimanual
+```
+
+Submit image-conditioned video requests through `/v1/videos`. Supply `action`
+rows according to the checkpoint's embodiment contract, selected by `domain_name`
+or `domain_id`. Native contracts accept raw rows with `action_normalization="contract"`;
+unified contracts require normalized 59-dimensional rows and default to
+`action_normalization="none"`. Without actions, Bimanual uses null-action conditioning.
+These pipelines predict video from actions, not actions from video; use the policy
+checkpoints above for action prediction.
+
+For realtime Bimanual sessions, add
+`--pipeline-class-name CosmosDreamsRealtimePipeline` and use
+[`/v1/realtime_video`](/docs/sglang-diffusion/realtime_models).
+Each tick consumes one action block and preserves causal KV history.
+
+Transfer-Auto and Sim-Auto take a `multiview` object with `views`, each containing
+`camera_key`, `control_path`, optional `vision_path`, and optional `prompt`. Joint checkpoints
+also accept `lidar`; set `lidar.decode=true` to return decoded range maps and previews.
+Outputs pack all frames of each camera consecutively, in request camera order.
+
+LiDAR uses built-in compiled FlexAttention by default. The optional NATTEN path
+requires a wheel matching your PyTorch/CUDA versions and
+`SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN=1`; it is not installed by default.
+
+Bimanual and Sim-Transfer support TP, but not SP or CFG parallelism. Transfer-Auto
+supports Ulysses without TP or Ring; Sim-Auto supports TP and Ulysses subject to
+the checkpoint's query/KV head divisibility, but not Ring or CFG parallelism.
+Causal pipelines use the exported fixed-step schedule and require guidance `1.0`.
+
+Use `--component-residency` for memory-constrained deployments. Joint checkpoints
+register `lidar_encoder` and `lidar_decoder` separately from the camera `vae`.
+Bimanual overlaps causal VAE decode only when the VAE is resident; offloaded VAEs
+use the final serial decode stage. History-window reduction and frustum retrieval
+change the attention context and are not lossless acceleration settings.
+
 ## 4. OpenAI-Compatible Requests
 
 ### Text to image

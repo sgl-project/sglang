@@ -68,6 +68,22 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
+@lru_cache(2)
+def precompute_cos_sin_table(
+    dim,
+    seqlen,
+    original_seq_len,
+    base,
+    factor,
+    beta_fast,
+    beta_slow,
+) -> torch.Tensor:
+    freqs_cis = precompute_freqs_cis(
+        dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
+    )
+    return torch.view_as_real(freqs_cis).transpose(1, 2).reshape(seqlen, -1)
+
+
 @triton.jit
 def apply_rotary_emb_triton_kernel(
     x_ptr,

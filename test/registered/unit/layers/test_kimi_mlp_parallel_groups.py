@@ -49,6 +49,7 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
     # test. The real MoE constructor still builds its real shared MLP.
     backend = SimpleNamespace(
         is_megamoe=lambda: False,
+        is_flashinfer_megamoe=lambda: False,
         is_deepep=lambda: ep_a2a,
         is_mooncake=lambda: False,
         is_ascend_fuseep=lambda: False,

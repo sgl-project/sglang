@@ -166,6 +166,8 @@ def mega_moe_pre_dispatch(
     shared_x_sf: Optional[torch.Tensor] = None,
     shared_block_m: int = 0,
 ) -> None:
+    if x.shape[0] == 0 and x.stride(0) != x.shape[1]:
+        x = x.new_empty(x.shape)
     # shared_block_m must match the consuming MoE's paged scale layout
     module = _jit_mega_moe_pre_dispatch_module(
         quant_group_size, shared_x_sf is not None

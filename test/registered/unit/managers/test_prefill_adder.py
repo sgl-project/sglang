@@ -497,7 +497,9 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.discard_storage_prefetch_accounting.assert_called_once_with(
             req.cache_request_handle
         )
-        self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
+        self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
+            req.cache_request_handle, fulfilled_tokens=0, reason=None
+        )
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

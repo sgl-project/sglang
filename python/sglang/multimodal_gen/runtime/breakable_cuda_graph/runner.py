@@ -31,7 +31,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, ClassVar
 
 import torch
@@ -86,6 +86,14 @@ def _map_tensors(obj, fn):
         return [_map_tensors(o, fn) for o in obj]
     if isinstance(obj, dict):
         return {k: _map_tensors(v, fn) for k, v in obj.items()}
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return replace(
+            obj,
+            **{
+                field.name: _map_tensors(getattr(obj, field.name), fn)
+                for field in fields(obj)
+            },
+        )
     return obj
 
 
@@ -100,6 +108,9 @@ def _flatten_tensors(obj, out: list):
     elif isinstance(obj, dict):
         for k in sorted(obj):
             _flatten_tensors(obj[k], out)
+    elif is_dataclass(obj) and not isinstance(obj, type):
+        for field in fields(obj):
+            _flatten_tensors(getattr(obj, field.name), out)
 
 
 def _flatten_kwargs(kwargs: dict[str, Any]) -> list[torch.Tensor]:
@@ -120,6 +131,16 @@ def _signature_leaf(obj: Any) -> Any:
         return (
             "dict",
             tuple((k, _signature_leaf(obj[k])) for k in sorted(obj)),
+        )
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return (
+            "dataclass",
+            type(obj).__module__,
+            type(obj).__qualname__,
+            tuple(
+                (field.name, _signature_leaf(getattr(obj, field.name)))
+                for field in fields(obj)
+            ),
         )
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return ("const", obj)
@@ -163,6 +184,15 @@ def _signature_summary_leaf(sig: Any, *, depth: int = 0) -> Any:
         if len(items) > 4:
             preview += (("...", len(items) - 4),)
         return (tag, len(items), preview)
+    if tag == "dataclass":
+        items = sig[3]
+        preview = tuple(
+            (name, _signature_summary_leaf(value, depth=depth + 1))
+            for name, value in items[:4]
+        )
+        if len(items) > 4:
+            preview += (("...", len(items) - 4),)
+        return (tag, sig[2], preview)
     return sig
 
 
@@ -179,6 +209,16 @@ def _clone_output(out: Any) -> Any:
         return tuple(_clone_output(o) for o in out)
     if isinstance(out, list):
         return [_clone_output(o) for o in out]
+    if isinstance(out, dict):
+        return {k: _clone_output(v) for k, v in out.items()}
+    if is_dataclass(out) and not isinstance(out, type):
+        return replace(
+            out,
+            **{
+                field.name: _clone_output(getattr(out, field.name))
+                for field in fields(out)
+            },
+        )
     return out
 
 

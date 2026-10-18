@@ -1,6 +1,7 @@
 import pickle
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
 
 import numpy as np
@@ -14,6 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.entrypoints import http_server
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -35,6 +37,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     _send_output_to_tokenizer_workers,
     get_tokenizer_worker_class,
 )
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -200,6 +203,44 @@ def _make_router() -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_each_tokenizer_worker_freezes_locally(self):
+        threshold = [700, 10, 1000]
+        server_args = mock.Mock(gc_threshold=threshold)
+        timeline = mock.Mock()
+        execution = mock.Mock(moe=mock.Mock(is_ep_scale_joiner=False))
+        with (
+            get_context().override_server_args(
+                checkpoint_engine_wait_weights_before_ready=False,
+                delete_ckpt_after_loading=False,
+                skip_server_warmup=False,
+                debug_tensor_dump_input_file=None,
+            ),
+            mock.patch.object(http_server, "get_exec", return_value=execution),
+            mock.patch.object(http_server, "freeze_gc", side_effect=timeline.worker),
+            mock.patch.object(
+                http_server,
+                "_freeze_gc_after_server_warmup",
+                side_effect=timeline.routed,
+            ),
+        ):
+            for worker_id in range(4):
+                timeline.reset_mock()
+                kwargs = http_server._multi_tokenizer_warmup_kwargs(
+                    server_args, worker_id
+                )
+                http_server._wait_and_warmup(
+                    **kwargs,
+                    execute_warmup_func=lambda _: timeline.warmup() or True,
+                )
+                self.assertEqual(
+                    timeline.mock_calls,
+                    [
+                        mock.call.warmup(),
+                        mock.call.worker(f"Tokenizer worker {worker_id}", threshold),
+                        mock.call.routed(server_args),
+                    ],
+                )
+
     def test_router_cpu_metric_started_only_when_enabled(self):
         for enabled in (False, True):
             with self.subTest(enable_metrics=enabled):

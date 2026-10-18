@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import async_h2d, get_num_new_pages
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 logger = logging.getLogger(__name__)
@@ -398,9 +398,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device = self.device
         swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
         swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
+        swa_seq_lens = async_h2d([swa_tail_len], dtype=torch.int64, device=device)
         swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        swa_last_loc = async_h2d([-1], dtype=torch.int64, device=device)
 
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             swa_prefix_lens,

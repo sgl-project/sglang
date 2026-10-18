@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.third_party import pynvml
+from sglang.srt.environ import envs as srt_envs
 
 logger = init_logger(__name__)
 
@@ -154,15 +155,21 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        try:
-            from sageattention import sageattn  # noqa: F401
-        except ImportError:
-            logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
-            )
-            return AttentionBackendEnum.FA
+        trtllm_gen = srt_envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower() in {
+            "trtllm_gen",
+            "trtllm-gen",
+        }
 
-        if platform.is_hopper():
+        if not trtllm_gen:
+            try:
+                from sageattention import sageattn  # noqa: F401
+            except ImportError:
+                logger.info(
+                    "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+                )
+                return AttentionBackendEnum.FA
+
+        if not trtllm_gen and platform.is_hopper():
             try:
                 # fixed SM90 bindings retain the fake implementation under its own name
                 from sageattention.sm90_compile import (  # noqa: F401
@@ -258,8 +265,11 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
 
 
 # The vendored Triton tile-64 kernel is written against Hopper and Blackwell
-# block-sparse geometry; older architectures fail closed.
-VSA_H3_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
+# block-sparse geometry. sm80 (A100) is supported too: there the kernel selects
+# a raw-pointer load path, because Triton does not lower TMA descriptor loads
+# natively before Hopper (see vsa_h3_kernels.py). Older architectures still
+# fail closed.
+VSA_H3_CAPABILITIES = frozenset({(8, 0), (9, 0), (10, 0), (10, 3)})
 
 
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
@@ -275,9 +285,9 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
-                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
-                f"this device reports {found}."
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 8.0 "
+                "(A100), 9.0 (Hopper), 10.0 (B200 / GB200) or 10.3 "
+                f"(B300 / GB300); this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401

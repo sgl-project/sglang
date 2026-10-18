@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 
-use super::{info, metrics, native_api, openai};
+use super::{info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
 use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
@@ -80,6 +80,7 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
         .merge(info::routes())
+        .merge(loads::routes())
         .merge(native_api::routes())
         .merge(openai::routes());
     if server_args.metrics.is_some() && metrics_listener {

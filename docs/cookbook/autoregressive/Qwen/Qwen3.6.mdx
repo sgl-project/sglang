@@ -101,6 +101,24 @@ This section provides deployment configurations optimized for different hardware
 
 <Qwen36Deployment />
 
+### RTX Spark: 35B-A3B NVFP4
+
+Select **RTX Spark** in the generator above to use the single-node, single-GPU recipe for
+[nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
+on [NVIDIA RTX Spark](https://www.nvidia.com/en-us/products/rtx-spark/), which
+pairs a Blackwell RTX GPU with a Grace CPU and offers up to 128GB of unified
+memory. The contributor tested this command on SGLang `main`. The recipe uses
+the FlashInfer CUTLASS MoE runner,
+`extra_buffer` Mamba radix caching, and a static memory fraction of `0.8`.
+Speculative decoding is not enabled.
+
+The contributor reported **75 output tokens/s for a single request** on SGLang
+`main`. The exact commit, OS/runtime, memory configuration, input/output lengths,
+and timing method were not provided. This is a reported generation speed, not
+an input-plus-output throughput measurement or a measured P50 TPOT. The Docker
+selector uses the nightly `dev` fallback; that image was not the reported test
+environment.
+
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
@@ -115,12 +133,12 @@ This section provides deployment configurations optimized for different hardware
 - Hardware requirements:
     - **35B-A3B BF16**: ~70GB for weights. TP=1 fits on all supported hardware.
     - **35B-A3B FP8**: ~35GB for weights. TP=1 fits on all supported hardware.
-    - **35B-A3B NVFP4**: ~23GB for weights. TP=1 fits on B200/B300.
+    - **35B-A3B NVFP4**: ~23GB for weights. TP=1 fits on B200/B300 and RTX Spark.
     - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
     - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
     - **27B NVFP4**: ~22GB for weights. TP=1 fits on B200/B300.
 
-All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. NVFP4 is available on B200/B300:
+All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. The table below covers B200/B300 NVFP4; the 35B-A3B RTX Spark recipe is provided above:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>

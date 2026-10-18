@@ -72,6 +72,8 @@ pub struct ServerInfo {
     pub dp_ranks: u32,
     /// The engine's OpenAI-layer server args; `None` when `/server_info` did not report them.
     pub openai: Option<OpenAiSettings>,
+    /// The engine's native gRPC port (`--grpc-port`), served beside HTTP.
+    pub grpc_port: Option<u16>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -197,6 +199,7 @@ impl WorkerIntrospector {
                 .unwrap_or(1)
                 .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
             openai,
+            grpc_port: parsed.grpc_port,
         }
     }
 
@@ -411,6 +414,8 @@ struct ServerInfoBody {
     /// Absent on engines that express attention DP through `dp_size`.
     #[serde(default)]
     attn_dp_size: Option<u32>,
+    #[serde(default)]
+    grpc_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]

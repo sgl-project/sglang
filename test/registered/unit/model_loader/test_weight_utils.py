@@ -7,8 +7,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
+    initialize_dummy_weights,
     maybe_add_mtp_safetensors,
 )
 from sglang.srt.utils import runai_utils
@@ -197,6 +200,24 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class TestInitializeDummyWeights(CustomTestCase):
+    def test_nvfp4_dummy_scales_are_neutral(self):
+        model = torch.nn.Linear(8, 4, bias=False)
+        for name, shape in (
+            ("w13_weight_scale_2", (4, 2)),
+            ("w2_weight_scale_2", (4,)),
+        ):
+            model.register_parameter(
+                name, torch.nn.Parameter(torch.empty(shape), requires_grad=False)
+            )
+
+        initialize_dummy_weights(model, low=0.25, high=0.75)
+
+        self.assertTrue(torch.equal(model.w13_weight_scale_2, torch.ones(4, 2)))
+        self.assertTrue(torch.equal(model.w2_weight_scale_2, torch.ones(4)))
+        self.assertTrue(torch.all((model.weight >= 0.25) & (model.weight <= 0.75)))
 
 
 if __name__ == "__main__":

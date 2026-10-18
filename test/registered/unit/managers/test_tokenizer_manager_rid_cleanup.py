@@ -269,14 +269,17 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
         """
         self.tm.incremental_streaming_output = False
         key = "request_score"
+        hidden_key = "hidden_metric"
         stream = self.tm._wait_one_response(self.state.obj)
-        self.state.customized_info_accumulated[key] = [386.25]
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
         self.state.out_list.extend(
             [
-                {
-                    "output_ids": [1],
-                    "meta_info": {"finish_reason": None, key: [386.25]},
-                },
+                {"output_ids": [1], "meta_info": first_meta_info},
                 {
                     "output_ids": [1, 2],
                     "meta_info": {"finish_reason": {"type": "length"}},
@@ -290,6 +293,7 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(out["output_ids"], [1, 2])
         self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
 

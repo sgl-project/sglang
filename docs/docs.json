@@ -10,6 +10,14 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
+      "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
+    },
+    {
+      "source": "/cookbook/autoregressive/Meta/MuseSpark",
+      "destination": "/cookbook/autoregressive/Meta/MuseSparkOpen"
+    },
+    {
       "source": "/docs/references/learn_more",
       "destination": "/"
     },
@@ -1221,6 +1229,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "Reflection",
+                    "pages": [
+                      "cookbook/autoregressive/Reflection/Beam-1_0"
+                    ]
+                  },
+                  {
                     "group": "IQuestLab",
                     "pages": [
                       "cookbook/autoregressive/IQuestLab/IQuest-Q1"
@@ -1229,6 +1243,7 @@
                   {
                     "group": "IFM",
                     "pages": [
+                      "cookbook/autoregressive/IFM/Jais-3",
                       "cookbook/autoregressive/IFM/K2-Horizon"
                     ]
                   },
@@ -1314,6 +1329,7 @@
                   {
                     "group": "Meta",
                     "pages": [
+                      "cookbook/autoregressive/Meta/MuseSparkOpen",
                       "cookbook/autoregressive/Meta/MuseGlimmer",
                       "cookbook/autoregressive/Meta/Llama4",
                       "cookbook/autoregressive/Meta/Llama3.3-70B",
@@ -1371,6 +1387,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Super",
                       "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
@@ -1516,7 +1533,9 @@
                   },
                   {
                     "group": "FLUX",
+                    "tag": "NEW",
                     "pages": [
+                      "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
                     ]
                   },
@@ -1608,6 +1627,12 @@
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
+                    ]
+                  },
+                  {
+                    "group": "MOSS-Image",
+                    "pages": [
+                      "cookbook/diffusion/OpenMOSS/MOSS-Image"
                     ]
                   },
                   {
