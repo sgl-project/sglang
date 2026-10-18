@@ -39,18 +39,18 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_dtype):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.empty(x.shape[:-1], dtype=scale_dtype, device=x.device),
         )
     rotated = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
         rotated.reshape(-1, 128), dst_type=dst_type
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    return quantized.reshape(x.shape), scale.to(scale_dtype).reshape(x.shape[:-1])
 
 
 class DSANPUIndexerMixin:
@@ -229,7 +229,10 @@ class DSANPUIndexerMixin:
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k,
+                pool.indexer_hadamard_128,
+                pool.indexer_kv_dtype,
+                pool.indexer_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -329,7 +332,8 @@ class DSANPUIndexerMixin:
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
                     pool.indexer_hadamard_128,
-                    pool.dtype,
+                    pool.indexer_kv_dtype,
+                    pool.indexer_scale_dtype,
                 )
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=query,
