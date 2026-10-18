@@ -34,9 +34,11 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
+    get_draft_swa_ring_size,
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
     resolve_compress_state_ring_size,
+    uses_draft_swa_ring,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -1171,13 +1173,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        self.paged_draft_layers = 0
+        draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
             aux = kvc.spec_aux_config
-            self.paged_draft_layers = int(
+            draft_layers = int(
                 aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
             )
-            assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
+            assert draft_layers > 0, "DSpark draft layer count is required"
+        # A draft SWA ring is budgeted with the request windows, not per SWA token.
+        draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
+        self.paged_draft_layers = draft_layers - draft_ring_layers
         self.request_window_bytes = 0
         if self.encoder_replay:
             slots = self.requested_max_running_requests_per_worker + 1
@@ -1194,10 +1199,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + slots * 128
                 + self.page_size
             )
+            draft_ring_size = get_draft_swa_ring_size(
+                self.sliding_window_size,
+                self.online_c128_mtp_max_draft_tokens,
+                self.page_size,
+            )
             self.request_window_bytes = (
                 (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)
                 + 4 * scratch * (self.kv_bytes + 16)
                 + slots * 3 * 16 * self.attn_head_dim * 8
+                + (slots * draft_ring_size + self.page_size)
+                * draft_ring_layers
+                * self.kv_bytes
             )
             if not self.paged_draft_layers:
                 self.swa_ratio = 0
