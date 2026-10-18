@@ -26,12 +26,12 @@ from .base import SGLDiffusionExecutor
 
 # FLUX.2 VAE: 8x spatial compression, then 2x2 patchify folded into channels.
 _PIXELS_PER_LATENT = 16
-_DEFAULT_GUIDANCE = 4.0
-
-
-def _guidance_scale(guidance) -> float:
+def _guidance_scale(guidance) -> float | None:
     if guidance is None:
-        return _DEFAULT_GUIDANCE
+        # ComfyUI's FluxDisableGuidance deliberately omits the embedded
+        # guidance input; replacing it with the pipeline default changes the
+        # native model's computation.
+        return None
     if torch.is_tensor(guidance):
         return float(guidance.detach().reshape(-1)[0].item())
     return float(guidance)

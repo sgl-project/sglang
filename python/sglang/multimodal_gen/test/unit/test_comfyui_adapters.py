@@ -118,6 +118,17 @@ def test_flux2_pack_flattens_latents_and_keeps_every_row() -> None:
     assert torch.equal(out, x)
 
 
+def test_flux2_pack_preserves_disabled_embedded_guidance() -> None:
+    adapter = Flux2Adapter()
+    packed = adapter.pack(
+        torch.randn(1, 128, 4, 6),
+        torch.tensor([0.5]),
+        torch.randn(1, 512, 15360),
+        guidance=None,
+    )
+    assert packed.guidance_scale is None
+
+
 def test_flux_pack_zero_fills_missing_pooled() -> None:
     from sglang.multimodal_gen.runtime.layers.visual_embedding import (
         CombinedTimestepGuidanceTextProjEmbeddings,

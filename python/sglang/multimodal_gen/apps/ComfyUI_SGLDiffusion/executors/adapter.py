@@ -26,7 +26,7 @@ class PackedForward:
     prompt_embeds: list[torch.Tensor]
     height: int
     width: int
-    guidance_scale: float = 1.0
+    guidance_scale: float | None = 1.0
     prompt_seq_lens: list[list[int]] | None = None
     pooled_embeds: list[torch.Tensor] | None = None
     extra_req: dict[str, Any] = field(default_factory=dict)

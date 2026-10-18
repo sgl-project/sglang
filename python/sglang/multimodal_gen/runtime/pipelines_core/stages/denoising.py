@@ -1266,7 +1266,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         preventing repeated tensor creation within the denoising loop.
         """
         if self.server_args.pipeline_config.should_use_guidance:
-            # ComfyUI owns guidance (FluxGuidance), so its per-request value wins.
+            # ComfyUI owns FLUX.2 guidance.  ``None`` is meaningful here: it is
+            # FluxDisableGuidance and must skip the embedded guidance input,
+            # rather than falling back to the pipeline default.
+            if (
+                self.server_args.comfyui_mode
+                and isinstance(self.server_args.pipeline_config, Flux2PipelineConfig)
+                and request_guidance_scale is None
+            ):
+                return None
             guidance_val = (
                 request_guidance_scale
                 if request_guidance_scale is not None
