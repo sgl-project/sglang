@@ -12,16 +12,12 @@ from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
-    DSV4CompressedBufferInfo,
-    DSV4CompressedGroupInfo,
-    DSV4RootBufferInfo,
-    DSV4StateBufferInfo,
-)
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
 )
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -326,18 +322,25 @@ class TestDSV4PoolAssembly(CustomTestCase):
             c4_kv_pool=c4_pool,
             c4_indexer_kv_pool=indexer_pool,
             start_layer=5,
-            buffer_info=lambda: DSV4RootBufferInfo(
-                layer_ids=(5,),
-                swa=None,
-                compressed=(
-                    DSV4CompressedGroupInfo(
-                        ratio=4,
-                        layer_ids=(5,),
-                        kv=DSV4CompressedBufferInfo(kv=c4_pool.paged_buffer_info()),
-                        indexer=indexer_pool.indexer_buffer_info(),
-                        checkpoint=None,
+            stage_layer_ids=(5,),
+            get_device_pool_infos=lambda: tuple(
+                DevicePoolInfo(
+                    pool_name=name,
+                    indices_from_pool=PoolName.KV,
+                    layer_ids=(5,),
+                    buffer_info=region,
+                )
+                for name, region in (
+                    (PoolName.DEEPSEEK_V4_C4, c4_pool.paged_buffer_info()),
+                    (
+                        PoolName.DEEPSEEK_V4_C4_INDEXER,
+                        indexer_pool.indexer_buffer_info().key,
                     ),
-                ),
+                    (
+                        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+                        indexer_pool.indexer_buffer_info().scale,
+                    ),
+                )
             ),
         )
         params = SimpleNamespace(

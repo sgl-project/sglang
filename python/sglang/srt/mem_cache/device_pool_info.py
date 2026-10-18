@@ -12,6 +12,10 @@ from enum import Enum
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
@@ -219,7 +223,13 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     indices_from_pool: PoolName
     # Model layer IDs, including the PP stage offset, in buffer-axis order.
     layer_ids: tuple[int, ...]
-    buffer_info: MambaStateBufferInfo | MHABufferInfo | MLABufferInfo
+    buffer_info: (
+        MambaStateBufferInfo
+        | MHABufferInfo
+        | MLABufferInfo
+        | DSV4PagedBufferInfo
+        | DSV4CheckpointBufferInfo
+    )
 
     def __post_init__(self) -> None:
         # A PP stage may own no checkpoint layers. Buffer validation decides

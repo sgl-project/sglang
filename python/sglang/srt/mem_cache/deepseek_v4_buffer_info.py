@@ -62,29 +62,7 @@ class DSV4StateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     dtype: torch.dtype
 
 
-class DSV4CheckpointGroupInfo(msgspec.Struct, frozen=True, kw_only=True):
-    attention: tuple[DSV4StateBufferInfo, ...]
-    indexer: tuple[DSV4StateBufferInfo, ...]
+class DSV4CheckpointBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Persistent compressor rings of one region, one entry per owner layer."""
 
-
-class DSV4CompressedGroupInfo(msgspec.Struct, frozen=True, kw_only=True):
-    """One physical store per owner, in buffer-axis order.
-
-    C1/C2 readers share their owner's store and do not add duplicate buffers.
-    Checkpoint tuples, when present, follow the same model-layer order.
-    """
-
-    ratio: Literal[1, 2, 4, 128]
-    layer_ids: tuple[int, ...]
-    kv: DSV4CompressedBufferInfo
-    indexer: DSV4IndexerBufferInfo | None
-    checkpoint: DSV4CheckpointGroupInfo | None
-
-
-class DSV4RootBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
-    layer_ids: tuple[int, ...]
-    swa: DSV4PagedBufferInfo | None
-    compressed: tuple[DSV4CompressedGroupInfo, ...]
-
-    def compressed_group(self, ratio: int) -> DSV4CompressedGroupInfo | None:
-        return next((group for group in self.compressed if group.ratio == ratio), None)
+    states: tuple[DSV4StateBufferInfo, ...]

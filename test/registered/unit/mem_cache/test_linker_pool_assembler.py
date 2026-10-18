@@ -195,6 +195,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.end_layer = 4
         kvcache._stage_start = 1
         kvcache._stage_end = 4
+        kvcache.stage_layer_ids = (1, 2, 3)
         kvcache.swa_page_size = 2
         kvcache.swa_kv_pool = _dsv4_pool(
             DeepSeekV4SingleKVPool,
@@ -245,6 +246,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         end_layer=2,
                         _stage_start=0,
                         _stage_end=2,
+                        stage_layer_ids=(0, 1),
+                        sources_by_ratio={},
                         swa_kv_pool=_dsv4_pool(
                             DeepSeekV4SingleKVPool,
                             page_size=2,
@@ -360,6 +363,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     end_layer=3,
                     _stage_start=0,
                     _stage_end=3,
+                    stage_layer_ids=(0, 1, 2),
                     sources_by_ratio={4: [0, 2], 128: [1]},
                     index_pools={4: indexer},
                     # Unified KV has neither paged KV nor an index-addressed SWA pool.
@@ -418,6 +422,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             end_layer=3,
             _stage_start=0,
             _stage_end=3,
+            stage_layer_ids=(0, 1, 2),
             sources_by_ratio={4: [0, 2], 128: [1]},
             swa_kv_pool=None,
             c4_kv_pool=None,

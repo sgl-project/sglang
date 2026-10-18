@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _num_dsv4_physical_kv_pages,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -108,7 +109,7 @@ class TestDSV4CompressedPools(CustomTestCase):
         self,
     ):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-            _dsv4_indexer_region_names,
+            _check_dsv4_indexer_page_size,
         )
 
         pool = DeepSeekV4IndexerPool.__new__(DeepSeekV4IndexerPool)
@@ -130,9 +131,9 @@ class TestDSV4CompressedPools(CustomTestCase):
                 self.assertEqual(view.data_ptr(), native.data_ptr())
                 self.assertEqual(view.nbytes, native.nbytes)
                 self.assertEqual(tuple(view.shape), (3, page_bytes))
-        self.assertEqual(len(_dsv4_indexer_region_names(info, 256)), 2)
+        _check_dsv4_indexer_page_size(info.key, 256)
         with self.assertRaisesRegex(ValueError, "Tree page size 96"):
-            _dsv4_indexer_region_names(info, 96)
+            _check_dsv4_indexer_page_size(info.key, 96)
         pool.index_k_scale_buffer[0] = torch.empty((3, 1, 4, 32), dtype=torch.uint8)
         with self.assertRaisesRegex(ValueError, "payload=64, scale=32"):
             pool.indexer_buffer_info()
@@ -449,28 +450,38 @@ class TestV41KVPoolLayouts(CustomTestCase):
             c4_state_pool_size=16,
             c128_state_pool_size=16,
         )
-        info = pool.buffer_info()
-        self.assertEqual(info.layer_ids, (1, 2, 3))
-        self.assertEqual([group.ratio for group in info.compressed], [4])
-        self.assertIsNone(info.compressed_group(128))
-        c4 = info.compressed_group(4)
+        infos = {info.pool_name: info for info in pool.get_device_pool_infos()}
+        self.assertEqual(pool.stage_layer_ids, (1, 2, 3))
+        self.assertEqual(infos[PoolName.SWA].layer_ids, (1, 2, 3))
+        self.assertTrue(
+            all(
+                name.value.startswith("deepseek_v4_c4")
+                for name in infos
+                if name != PoolName.SWA
+            )
+        )
+        c4 = infos[PoolName.DEEPSEEK_V4_C4]
         self.assertEqual(c4.layer_ids, (1, 3))
+        attention = infos[PoolName.DEEPSEEK_V4_C4_STATE].buffer_info.states
+        indexer = infos[PoolName.DEEPSEEK_V4_C4_INDEXER_STATE].buffer_info.states
         for index, layer in enumerate(c4.layer_ids):
-            self.assertIs(c4.kv.kv.buffers[index], pool.c4_kv_pool.kv_buffer[index])
+            self.assertIs(
+                c4.buffer_info.buffers[index], pool.c4_kv_pool.kv_buffer[index]
+            )
             self.assertEqual(
-                c4.checkpoint.attention[index].pages.data_ptr(),
+                attention[index].pages.data_ptr(),
                 pool.compress_state_pools[layer].kv_score_buffer.kv_score.data_ptr(),
             )
             self.assertEqual(
-                c4.checkpoint.indexer[index].pages.data_ptr(),
+                indexer[index].pages.data_ptr(),
                 pool.indexer_compress_state_pools[
                     layer
                 ].kv_score_buffer.kv_score.data_ptr(),
             )
-        self.assertEqual(len(info.swa.buffers), 3)
+        self.assertEqual(len(infos[PoolName.SWA].buffer_info.buffers), 3)
         pool.swa_kv_pool.kv_buffer.pop()
         with self.assertRaisesRegex(ValueError, "PP-stage-local"):
-            pool.swa_buffer_info()
+            pool.get_device_pool_infos()
 
     def test_root_inventory_describes_shared_ced_owners_once(self):
         pool = self.make_pool([0, 2, 2, 1, 1, 2], [1, 3, 5], KVLayout.V41)
@@ -478,39 +489,57 @@ class TestV41KVPoolLayouts(CustomTestCase):
             _build_deepseek_v4_device_pool_group,
         )
 
-        info = pool.buffer_info()
+        infos = {info.pool_name: info for info in pool.get_device_pool_infos()}
         with self.assertRaisesRegex(ValueError, "C1/C2 shared stores"):
             _build_deepseek_v4_device_pool_group(pool, PAGE_SIZE)
-        self.assertEqual(info.layer_ids, (0, 1, 2, 3, 4, 5))
-        self.assertEqual(len(info.swa.buffers), 6)
-        self.assertEqual(info.compressed_group(1).layer_ids, (3,))
-        self.assertEqual(info.compressed_group(2).layer_ids, (1, 5))
-        for group in info.compressed:
-            self.assertIsNone(group.checkpoint)
-            for index, layer in enumerate(group.layer_ids):
+        self.assertEqual(pool.stage_layer_ids, (0, 1, 2, 3, 4, 5))
+        self.assertEqual(len(infos[PoolName.SWA].buffer_info.buffers), 6)
+        self.assertEqual(infos[PoolName.DEEPSEEK_V4_C1].layer_ids, (3,))
+        self.assertEqual(infos[PoolName.DEEPSEEK_V4_C2].layer_ids, (1, 5))
+        self.assertNotIn(PoolName.DEEPSEEK_V4_C4_STATE, infos)
+        for ratio, names in (
+            (
+                1,
+                (
+                    PoolName.DEEPSEEK_V4_C1,
+                    PoolName.DEEPSEEK_V4_C1_INDEXER,
+                    PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+                ),
+            ),
+            (
+                2,
+                (
+                    PoolName.DEEPSEEK_V4_C2,
+                    PoolName.DEEPSEEK_V4_C2_INDEXER,
+                    PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+                ),
+            ),
+        ):
+            kv = infos[names[0]]
+            index_pool = pool.index_pools[ratio]
+            regions = (
+                ((infos[names[1]], index_pool.index_k_with_scale_buffer),)
+                if names[2] not in infos
+                else (
+                    (infos[names[1]], index_pool.index_k_payload_buffer),
+                    (infos[names[2]], index_pool.index_k_scale_buffer),
+                )
+            )
+            for index, layer in enumerate(kv.layer_ids):
                 self.assertEqual(pool.layer_mapping[layer].compress_layer_id, index)
                 self.assertIs(
-                    group.kv.kv.buffers[index],
-                    pool.kv_pools[group.ratio].kv_buffer[index],
-                )
-                index_pool = pool.index_pools[group.ratio]
-                regions = (
-                    ((group.indexer.key, index_pool.index_k_with_scale_buffer),)
-                    if group.indexer.scale is None
-                    else (
-                        (group.indexer.key, index_pool.index_k_payload_buffer),
-                        (group.indexer.scale, index_pool.index_k_scale_buffer),
-                    )
+                    kv.buffer_info.buffers[index], pool.kv_pools[ratio].kv_buffer[index]
                 )
                 for region, buffers in regions:
                     self.assertEqual(
-                        region.buffers[index].data_ptr(), buffers[index].data_ptr()
+                        region.buffer_info.buffers[index].data_ptr(),
+                        buffers[index].data_ptr(),
                     )
         self.assertEqual(pool.layer_mapping[1], pool.layer_mapping[2])
         self.assertEqual(pool.layer_mapping[3], pool.layer_mapping[4])
         pool.sources_by_ratio[2].append(2)
         with self.assertRaisesRegex(ValueError, "owner and buffer counts differ"):
-            pool.buffer_info()
+            pool.get_device_pool_infos()
 
     def test_ced_host_uses_captured_owner_pages_and_full_page_units(self):
         for split_indexer in (False, True):
@@ -529,7 +558,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
         from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 
-        info = pool.buffer_info()
+        infos = assembler._dsv4_pool_infos(pool)
         # The description owns the binding even if the pool's private lists change.
         for ratio in (1, 2):
             pool.kv_pools[ratio].kv_buffer = []
@@ -551,20 +580,19 @@ class TestV41KVPoolLayouts(CustomTestCase):
                 partial(DeepSeekV4PagedHostPool, pin_memory=False),
             ),
         ):
-            entries = assembler._dsv4_low_ratio_entries(pool, info, PAGE_SIZE, 2, 6)
+            entries = assembler._dsv4_low_ratio_entries(pool, infos, PAGE_SIZE, 2, 6)
         self.assertEqual(len(entries), 6 if split_indexer else 4)
         entry_map = {entry.name: entry for entry in entries}
-        for ratio, name in (
-            (1, PoolName.DEEPSEEK_V4_C1_INDEXER),
-            (2, PoolName.DEEPSEEK_V4_C2_INDEXER),
+        for ratio, kv_name, name in (
+            (1, PoolName.DEEPSEEK_V4_C1, PoolName.DEEPSEEK_V4_C1_INDEXER),
+            (2, PoolName.DEEPSEEK_V4_C2, PoolName.DEEPSEEK_V4_C2_INDEXER),
         ):
-            group = info.compressed_group(ratio)
             entry = entry_map[name]
-            for compact_id, layer in enumerate(group.layer_ids):
+            for compact_id, layer in enumerate(infos[kv_name].layer_ids):
                 self.assertEqual(entry.layer_mapper(layer), compact_id)
             for reader in (2, 4):
                 self.assertIsNone(entry.layer_mapper(reader))
-            native = group.indexer.key
+            native = infos[name].buffer_info
             pages_per_full = (PAGE_SIZE // ratio) // native.page_slots
             self.assertEqual(
                 entry.host_pool.item_bytes, native.page_bytes * pages_per_full
@@ -747,12 +775,11 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "request-window SWA"):
             _build_deepseek_v4_device_pool_group(target, PAGE_SIZE)
-        self.assertIsNone(target.buffer_info().swa)
-        self.assertEqual(target.buffer_info().compressed, ())
-        draft_info = draft.buffer_info()
-        self.assertEqual(draft_info.layer_ids, (0, 1, 2))
-        self.assertEqual(len(draft_info.swa.buffers), 3)
-        self.assertEqual(draft_info.compressed, ())
+        self.assertEqual(target.get_device_pool_infos(), ())
+        (draft_swa,) = draft.get_device_pool_infos()
+        self.assertEqual(draft_swa.pool_name, PoolName.SWA)
+        self.assertEqual(draft_swa.layer_ids, (0, 1, 2))
+        self.assertEqual(len(draft_swa.buffer_info.buffers), 3)
 
     def test_pd_swa_state_pairs_with_a_paged_decode(self):
         target = self.make_pool(draft=False)

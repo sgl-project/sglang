@@ -38,14 +38,14 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
-    DSV4CheckpointGroupInfo,
+    DSV4CheckpointBufferInfo,
     DSV4CompressedBufferInfo,
-    DSV4CompressedGroupInfo,
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
-    DSV4RootBufferInfo,
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
@@ -972,6 +972,30 @@ class DeepSeekV4UnifiedKVPool:
         return data_ptrs, data_lens, item_lens
 
 
+# Per compression ratio: KV, RoPE, indexer key and indexer scale region names.
+_DSV4_REGION_NAMES = {
+    1: (
+        PoolName.DEEPSEEK_V4_C1,
+        None,
+        PoolName.DEEPSEEK_V4_C1_INDEXER,
+        PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+    ),
+    2: (
+        PoolName.DEEPSEEK_V4_C2,
+        None,
+        PoolName.DEEPSEEK_V4_C2_INDEXER,
+        PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+    ),
+    4: (
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_ROPE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+    ),
+    128: (PoolName.DEEPSEEK_V4_C128, PoolName.DEEPSEEK_V4_C128_ROPE, None, None),
+}
+
+
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
@@ -1122,6 +1146,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self._stage_start = 0
             self._stage_end = len(compression_ratios)
+        self.stage_layer_ids = tuple(range(self._stage_start, self._stage_end))
         stage_ratios = compression_ratios[self._stage_start : self._stage_end]
 
         assert page_size % swa_page_size == 0
@@ -1441,77 +1466,93 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             append_ring(self.unified_kv_pool.kv_buffer_rope)
         return data_ptrs, data_lens, item_lens
 
-    def swa_buffer_info(self) -> DSV4PagedBufferInfo | None:
+    def _swa_buffer_info(self) -> DSV4PagedBufferInfo | None:
         if self.swa_kv_pool is None:
             return None
         info = self.swa_kv_pool.paged_buffer_info()
-        layer_count = self._stage_end - self._stage_start
-        if len(info.buffers) != layer_count:
+        if len(info.buffers) != len(self.stage_layer_ids):
             raise ValueError(
                 "DeepSeek V4 SWA KV pool must be PP-stage-local: "
-                f"got {len(info.buffers)} buffers for {layer_count} local layers"
+                f"got {len(info.buffers)} buffers for "
+                f"{len(self.stage_layer_ids)} local layers"
             )
         return info
 
-    def buffer_info(self) -> DSV4RootBufferInfo:
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         """Describe allocated owner stores without consumer transfer policy.
 
         Empty PP-stage groups are absent even when an empty pool is retained for
         PD wire alignment. Request-window SWA and request-private compressor
         state are rebuilt after prefix restore and have no page description.
         """
-        groups = []
+        infos = []
+        swa = self._swa_buffer_info()
+        if swa is not None:
+            infos.append(
+                DevicePoolInfo(
+                    pool_name=PoolName.SWA,
+                    indices_from_pool=PoolName.SWA,
+                    layer_ids=self.stage_layer_ids,
+                    buffer_info=swa,
+                )
+            )
         for ratio, sources in self.sources_by_ratio.items():
-            if not sources:
-                continue
-            layer_ids = tuple(sources)
-            kv = (
-                self.compressed_buffer_info(ratio)
-                if ratio in (4, 128)
-                else DSV4CompressedBufferInfo(
-                    kv=self.kv_pools[ratio].paged_buffer_info()
-                )
-            )
-            index_pool = self.index_pools.get(ratio)
-            indexer = (
-                index_pool.indexer_buffer_info() if index_pool is not None else None
-            )
-            checkpoint = None
-            if ratio == 4 and not self._unified_kv:
-                checkpoint = DSV4CheckpointGroupInfo(
-                    attention=tuple(
-                        self.compress_state_pools[layer].checkpoint_buffer_info()
-                        for layer in layer_ids
-                    ),
-                    indexer=tuple(
-                        self.indexer_compress_state_pools[
-                            layer
-                        ].checkpoint_buffer_info()
-                        for layer in layer_ids
-                    ),
-                )
-            regions = [kv.kv, kv.rope]
-            if indexer is not None:
-                regions.extend((indexer.key, indexer.scale))
-            if any(
-                region is not None and len(region.buffers) != len(layer_ids)
-                for region in regions
-            ):
-                raise ValueError(f"DeepSeek V4 C{ratio} owner and buffer counts differ")
-            groups.append(
-                DSV4CompressedGroupInfo(
-                    ratio=ratio,
-                    layer_ids=layer_ids,
-                    kv=kv,
-                    indexer=indexer,
-                    checkpoint=checkpoint,
-                )
-            )
-        return DSV4RootBufferInfo(
-            layer_ids=tuple(range(self._stage_start, self._stage_end)),
-            swa=self.swa_buffer_info(),
-            compressed=tuple(groups),
+            if sources:
+                infos.extend(self._compressed_pool_infos(ratio, tuple(sources)))
+        return tuple(infos)
+
+    def _compressed_pool_infos(
+        self, ratio: int, layer_ids: tuple[int, ...]
+    ) -> list[DevicePoolInfo]:
+        kv_name, rope_name, index_name, index_scale_name = _DSV4_REGION_NAMES[ratio]
+        kv = (
+            self.compressed_buffer_info(ratio)
+            if ratio in (4, 128)
+            else DSV4CompressedBufferInfo(kv=self.kv_pools[ratio].paged_buffer_info())
         )
+        regions = [(kv_name, PoolName.KV, kv.kv), (rope_name, PoolName.KV, kv.rope)]
+        index_pool = self.index_pools.get(ratio)
+        if index_pool is not None:
+            indexer = index_pool.indexer_buffer_info()
+            regions.append((index_name, PoolName.KV, indexer.key))
+            regions.append((index_scale_name, PoolName.KV, indexer.scale))
+        if ratio == 4 and not self._unified_kv:
+            # Compressor rings advance with the SWA window, not with KV pages.
+            for name, state_pools in (
+                (PoolName.DEEPSEEK_V4_C4_STATE, self.compress_state_pools),
+                (
+                    PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                    self.indexer_compress_state_pools,
+                ),
+            ):
+                states = tuple(
+                    state_pools[layer].checkpoint_buffer_info() for layer in layer_ids
+                )
+                regions.append(
+                    (name, PoolName.SWA, DSV4CheckpointBufferInfo(states=states))
+                )
+        infos = []
+        for name, indices_from_pool, region in regions:
+            if region is None:
+                continue
+            if name is None:
+                raise ValueError(f"DeepSeek V4 C{ratio} has no pool name for a region")
+            count = (
+                len(region.states)
+                if isinstance(region, DSV4CheckpointBufferInfo)
+                else len(region.buffers)
+            )
+            if count != len(layer_ids):
+                raise ValueError(f"DeepSeek V4 C{ratio} owner and buffer counts differ")
+            infos.append(
+                DevicePoolInfo(
+                    pool_name=name,
+                    indices_from_pool=indices_from_pool,
+                    layer_ids=layer_ids,
+                    buffer_info=region,
+                )
+            )
+        return infos
 
     def compressed_buffer_info(
         self, ratio: Literal[4, 128]
