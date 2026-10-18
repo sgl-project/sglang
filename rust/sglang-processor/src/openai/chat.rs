@@ -13,7 +13,7 @@ use super::request::{
     format_json_schema, lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
+    Payload, Reply, StreamState, is_abort_status, malformed_output_reply, meta_u64, now,
     stream_error_event, unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
@@ -850,7 +850,7 @@ impl ChatResponder {
                 json!({"content": self.token_logprobs(&meta["output_token_logprobs"], &meta["output_top_logprobs"])})
             });
             let Some(text) = item["text"].as_str() else {
-                return Some(malformed_output_reply("text"));
+                return Some(malformed_output_reply());
             };
             let mut text = text.to_owned();
             let mut reasoning = String::new();
@@ -964,13 +964,13 @@ impl ChatResponder {
             // `HTTPStatus`, which `/generate` serializes as its integer.
             if finish_type == "abort"
                 && let Some(code) = finish_reason["status_code"].as_u64()
-                && let Some(name) = http_status_name(code)
+                && is_abort_status(code)
             {
                 let message = finish_reason["message"]
                     .as_str()
                     .unwrap_or("Generation aborted.");
                 self.stream.stopped = true;
-                return vec![stream_error_event(message, name, code as u16)];
+                return vec![stream_error_event(message, code as u16)];
             }
             self.finish_reasons.push((index, finish_reason.clone()));
         }
