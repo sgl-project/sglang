@@ -652,6 +652,26 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             requires_grad=False,
         )
 
+    @torch.no_grad()
+    def prepare_fp4_weights(self) -> None:
+        if _moe_backend() != "flydsl":
+            raise RuntimeError("MUSE_PREPARED_FP4 requires MUSE_MOE_BACKEND=flydsl")
+        from sglang.srt.rocm_muse_spark.muse_prepared_weights import prepare
+
+        for weight in (self.w13_weight, self.w2_weight):
+            if not getattr(weight, "_muse_prepared_fp4", False):
+                weight.copy_(prepare(weight))
+                weight._muse_prepared_fp4 = True
+
+    @torch.no_grad()
+    def restore_native_fp4_weights(self) -> None:
+        from sglang.srt.rocm_muse_spark.muse_prepared_weights import restore
+
+        for weight in (self.w13_weight, self.w2_weight):
+            if getattr(weight, "_muse_prepared_fp4", False):
+                weight.copy_(restore(weight))
+                weight._muse_prepared_fp4 = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1394,6 +1414,12 @@ class MuseSpark1xForCausalLM(nn.Module):
         return True
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        # Checkpoint loaders write native row-major bytes. Undo the lossless
+        # prepared layout before a full or partial update, keeping storage
+        # addresses stable for captured graphs. post_load_weights repacks once.
+        for module in self.model.modules():
+            if isinstance(module, MuseSpark1xMxfp4Experts):
+                module.restore_native_fp4_weights()
         params = dict(self.named_parameters())
         params.update(
             {name: value for name, value in self.named_buffers() if name not in params}
@@ -1492,6 +1518,10 @@ class MuseSpark1xForCausalLM(nn.Module):
 
     @torch.no_grad()
     def post_load_weights(self) -> None:
+        if os.environ.get("MUSE_PREPARED_FP4", "0") == "1":
+            for module in self.model.modules():
+                if isinstance(module, MuseSpark1xMxfp4Experts):
+                    module.prepare_fp4_weights()
         for layer in self.model.layers:
             for residual in (
                 layer.post_attention_residual_gate,

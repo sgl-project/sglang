@@ -2,16 +2,37 @@
 """FlyDSL Muse Spark MoE: same contract as ``muse_moe_triton``.
 
 BF16 and Quark MXFP4 share one Python entry (``w13.dtype == uint8`` selects MXFP4)
-and keep Triton / checkpoint weight layouts — no aiter preshuffle. Alignment is
-reused from the Triton module. Grouped GEMM and finalize (per-expert RMSNorm
-then weighted sum) are FlyDSL kernels.
+and support native or losslessly prepared MXFP4 weight layouts. Small-batch
+route alignment can use the parallel SGLang kernel. Grouped GEMM and finalize
+(per-expert RMSNorm then weighted sum) retain their FlyDSL arithmetic.
 """
 
 import functools
+import os
 
 import torch
 
-from sglang.srt.rocm_muse_spark.muse_moe_triton import moe_align_block_size
+from sglang.srt.rocm_muse_spark.muse_moe_triton import (
+    moe_align_block_size as _native_align,
+)
+
+_USE_PREPARED = os.environ.get("MUSE_PREPARED_FP4", "0") == "1"
+_USE_ADAPTIVE_N = os.environ.get("MUSE_PREPARED_ADAPTIVE_N", "0") == "1"
+_USE_MID_N64 = os.environ.get("MUSE_PREPARED_MID_N64", "0") == "1"
+
+
+def moe_align_block_size(ids, num_local_experts, local_start, block_m):
+    if (
+        _USE_PREPARED
+        and num_local_experts == 32
+        and block_m == 16
+        and 0 < ids.numel() <= 512
+    ):
+        from sglang.srt.rocm_muse_spark.muse_prepared_alignment import parallel_align
+
+        return parallel_align(ids, num_local_experts, local_start, block_m)
+    return _native_align(ids, num_local_experts, local_start, block_m)
+
 
 # Pre-fusion Triton tiles. Do not copy muse_moe_triton._pick_config — decode-fusion
 # returned mid/large MXFP4 to BLOCK_K=256 / BLOCK_N=64, which FlyDSL did not sweep.
@@ -161,7 +182,10 @@ def _launch_gemm(
     cfg,
     split_k=1,
 ):
-    from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
+    if cfg.get("PREPARED_FP4", False):
+        from sglang.srt.rocm_muse_spark.muse_prepared_gemm import launch_muse_moe_gemm
+    else:
+        from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
 
     # Gate/up carries twice as many accumulator fragments as down projection,
     # so one tile is not generally optimal for both stages.  Preserve the
@@ -285,8 +309,19 @@ def muse_moe_flydsl(
             raise ValueError("MXFP4 scales must use contiguous uint8 E8M0 layout")
     else:
         assert K == kw and I == iw, "shape mismatch between w13/w2/hidden"
-    if cfg is None:
+    default_cfg = cfg is None
+    if default_cfg:
         cfg = _pick_flydsl_config(M, topk, E, mxfp4)
+    if _USE_PREPARED and mxfp4:
+        if not all(getattr(w, "_muse_prepared_fp4", False) for w in (w13, w2)):
+            raise RuntimeError("Muse FP4 preparation must finish before forward")
+        cfg = dict(cfg, PREPARED_FP4=True)
+        if _USE_MID_N64 and default_cfg and E == 32 and topk == 8 and 16 < M <= 64:
+            # Prepared weights change the small-grid tradeoff: more N tiles
+            # beat the pre-packing BN128 choice without changing arithmetic.
+            cfg["BLOCK_N"] = 64
+        if _USE_ADAPTIVE_N and 0 < M <= 16 and E == 32 and topk == 8:
+            cfg.update(BLOCK_N=64, num_warps=2, PERSISTENT_CTA=1024, ADAPTIVE_N=True)
     assert (
         K % cfg["BLOCK_K"] == 0 and I % cfg["BLOCK_K"] == 0 and cfg["BLOCK_K"] % 32 == 0
     )
