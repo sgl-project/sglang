@@ -92,23 +92,42 @@ class CosmosDreamsPipeline(ComposedPipelineBase):
         "scheduler",
     ]
 
-    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+    def _causal_components(
+        self, server_args: ServerArgs, config_type: type[CosmosDreamsConfig]
+    ):
         pipeline_config = server_args.pipeline_config
-        if not isinstance(pipeline_config, CosmosDreamsConfig):
+        if not isinstance(pipeline_config, config_type):
             raise TypeError(
-                "CosmosDreamsPipeline requires CosmosDreamsConfig, got "
-                f"{type(pipeline_config).__name__}; pass --model-id nvidia/Cosmos3-Nano-Sim-Bimanual "
-                "or make the checkpoint's model_index.json name CosmosDreamsPipeline."
+                f"{self.pipeline_name} requires {config_type.__name__}, got "
+                f"{type(pipeline_config).__name__}."
             )
         transformer = self.get_module("transformer")
         if not isinstance(transformer, CosmosDreamsTransformer):
             raise TypeError(
-                "CosmosDreamsPipeline loaded the wrong transformer type: "
+                f"{self.pipeline_name} loaded the wrong transformer type: "
                 f"{type(transformer).__name__}."
             )
-        manifest = transformer.manifest
-        vae = self.get_module("vae")
+        return (
+            pipeline_config,
+            transformer,
+            transformer.manifest,
+            self.get_module("vae"),
+        )
 
+    def _log_profile(self, manifest, profile) -> None:
+        logger.info(
+            "%s stages created (checkpoint %s, chunk_size=%d, denoise steps per chunk %s, %s)",
+            self.pipeline_name,
+            manifest.checkpoint_id,
+            manifest.chunk_size,
+            [len(schedule) for schedule in profile.frame_sigma_schedules],
+            profile.describe(),
+        )
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        pipeline_config, transformer, manifest, vae = self._causal_components(
+            server_args, CosmosDreamsConfig
+        )
         profile = pipeline_config.inference_profile(manifest)
         self.add_stage(CosmosDreamsImageStage(canvas_tier=pipeline_config.canvas_tier))
         self.add_stage(
@@ -134,14 +153,7 @@ class CosmosDreamsPipeline(ComposedPipelineBase):
         self.add_stage(
             Cosmos3DecodingStage(vae, guardrails=False, sound_tokenizer=None)
         )
-        logger.info(
-            "Cosmos-Dreams pipeline stages created (checkpoint %s, chunk_size=%d, "
-            "denoise steps per chunk %s, %s)",
-            manifest.checkpoint_id,
-            manifest.chunk_size,
-            [len(schedule) for schedule in profile.frame_sigma_schedules],
-            profile.describe(),
-        )
+        self._log_profile(manifest, profile)
 
 
 class Cosmos3NanoSimBimanualPipeline(CosmosDreamsPipeline):
@@ -164,21 +176,9 @@ class CosmosDreamsRealtimePipeline(CosmosDreamsPipeline):
     sampling_params_cls = CosmosDreamsSamplingParams
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        pipeline_config = server_args.pipeline_config
-        if not isinstance(pipeline_config, CosmosDreamsRealtimeConfig):
-            raise TypeError(
-                "CosmosDreamsRealtimePipeline requires CosmosDreamsRealtimeConfig, got "
-                f"{type(pipeline_config).__name__}; launch with "
-                "--pipeline-class-name CosmosDreamsRealtimePipeline."
-            )
-        transformer = self.get_module("transformer")
-        if not isinstance(transformer, CosmosDreamsTransformer):
-            raise TypeError(
-                "CosmosDreamsRealtimePipeline loaded the wrong transformer type: "
-                f"{type(transformer).__name__}."
-            )
-        manifest = transformer.manifest
-        vae = self.get_module("vae")
+        pipeline_config, transformer, manifest, vae = self._causal_components(
+            server_args, CosmosDreamsRealtimeConfig
+        )
         self.add_stage(CosmosDreamsImageStage(canvas_tier=pipeline_config.canvas_tier))
         self.add_stage(
             CosmosDreamsRealtimePrepareStage(
@@ -200,46 +200,18 @@ class CosmosDreamsRealtimePipeline(CosmosDreamsPipeline):
         self.add_stage(
             CosmosDreamsCausalDecodingStage(vae, guardrails=False, sound_tokenizer=None)
         )
-        logger.info(
-            "Cosmos-Dreams realtime pipeline stages created (checkpoint %s, chunk_size=%d, "
-            "denoise steps per chunk %s, %s)",
-            manifest.checkpoint_id,
-            manifest.chunk_size,
-            [len(schedule) for schedule in profile.frame_sigma_schedules],
-            profile.describe(),
-        )
+        self._log_profile(manifest, profile)
 
 
-class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
+class Cosmos3NanoSimTransferPipeline(CosmosDreamsPipeline):
     """Control video + prompt to video, one chunk at a time."""
 
     pipeline_name = "Cosmos3NanoSimTransferPipeline"
-    is_video_pipeline = True
-
-    _required_config_modules = [
-        "text_tokenizer",
-        "vae",
-        "transformer",
-        "scheduler",
-    ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        pipeline_config = server_args.pipeline_config
-        if not isinstance(pipeline_config, CosmosDreamsTransferConfig):
-            raise TypeError(
-                "Cosmos3NanoSimTransferPipeline requires CosmosDreamsTransferConfig, got "
-                f"{type(pipeline_config).__name__}; pass --model-id nvidia/Cosmos3-Nano-Sim-Transfer "
-                "or make the checkpoint's model_index.json name Cosmos3NanoSimTransferPipeline."
-            )
-        transformer = self.get_module("transformer")
-        if not isinstance(transformer, CosmosDreamsTransformer):
-            raise TypeError(
-                "Cosmos3NanoSimTransferPipeline loaded the wrong transformer type: "
-                f"{type(transformer).__name__}."
-            )
-        manifest = transformer.manifest
-        vae = self.get_module("vae")
-
+        pipeline_config, transformer, manifest, vae = self._causal_components(
+            server_args, CosmosDreamsTransferConfig
+        )
         self.add_stage(
             CosmosDreamsControlVideoStage(
                 manifest=manifest,

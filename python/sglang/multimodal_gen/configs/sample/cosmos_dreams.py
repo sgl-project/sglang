@@ -70,11 +70,6 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
     def actions_pre_normalized(self) -> bool:
         return str(self.action_normalization).strip().lower() == "none"
 
-    def is_explicit(self, name: str) -> bool:
-        """Whether the request set ``name`` itself (tracked as in Cosmos3SamplingParams)."""
-        explicit = getattr(self, "_explicit_fields", None)
-        return explicit is not None and name in explicit
-
     # Set during adjustment when the request left height/width unset: the image
     # stage then snaps the canvas to the trained size closest to the image aspect.
     canvas_from_image: bool = False

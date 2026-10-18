@@ -734,15 +734,23 @@ def format_dreams_prompt(
 
 
 def tokenize_dreams_prompt(
-    tokenizer: Any, prompt: str, *, device: torch.device
+    tokenizer: Any,
+    prompt: str,
+    *,
+    device: torch.device,
+    system_prompt: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Qwen2 chat-template tokens for the prompt plus EOS and vision start.
 
-    Cosmos-Dreams uses neither the Cosmos3 system prompt nor the duration
-    suffix, and the K/V is trimmed to the real length, so nothing is padded.
+    Bimanual has no system prompt; Transfer supplies its trained system prompt.
+    K/V is trimmed to the real length, so nothing is padded.
     """
+    messages = []
+    if system_prompt is not None:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
     result = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
+        messages,
         tokenize=True,
         add_generation_prompt=True,
     )

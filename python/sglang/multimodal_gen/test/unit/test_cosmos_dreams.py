@@ -1406,6 +1406,9 @@ class TestCosmosDreamsSamplingParams(unittest.TestCase):
         self.assertTrue(params.format_prompt_as_json)
         self.assertFalse(params.canvas_from_image)
         self.assertEqual(CosmosDreamsConfig().canvas_tier, "480")
+        params._explicit_fields = {"guidance_scale"}
+        self.assertTrue(params.is_explicit("guidance_scale"))
+        self.assertFalse(CosmosDreamsSamplingParams().is_explicit("guidance_scale"))
 
     def test_frustum_geometry_accepts_json_text_and_rejects_other_shapes(self):
         """Multipart requests deliver frustum_geometry as text; it must become the dict

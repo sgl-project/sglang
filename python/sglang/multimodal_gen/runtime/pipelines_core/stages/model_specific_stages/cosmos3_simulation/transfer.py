@@ -24,7 +24,6 @@ import torchvision.transforms.functional as TF
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CONTROL_VIDEO_CONDITIONING_MODE,
-    TEXT_TOKENS_TRAINING_MAX,
     TRANSFER_MAX_ASPECT_DISTORTION,
     TRANSFER_OUTPUT_ORIGINAL,
     TRANSFER_RESIZE_CENTER_CROP,
@@ -71,6 +70,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     resolve_geometry,
     run_fixed_step_sde,
     single_prompt,
+    tokenize_dreams_prompt,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -178,26 +178,6 @@ def format_transfer_prompt(
     if emphasize_control:
         text = text.rstrip() + CONTROL_EMPHASIS_TEMPLATE.format(hint=hint)
     return text
-
-
-def tokenize_transfer_prompt(
-    tokenizer: Any, prompt: str, *, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen2 chat template with the Transfer system prompt, plus EOS and vision start."""
-    result = tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": TRANSFER_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    token_ids = list(result) if isinstance(result, list) else list(result["input_ids"])
-    token_ids = token_ids[:TEXT_TOKENS_TRAINING_MAX]
-    token_ids.append(tokenizer.eos_token_id)
-    token_ids.append(tokenizer.convert_tokens_to_ids("<|vision_start|>"))
-    text_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-    return text_ids, torch.ones_like(text_ids)
 
 
 def read_video_fps(path: str) -> float | None:
@@ -625,8 +605,8 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
 
         prompt = self._format_prompt(batch, geometry)
         self.log_info(f"Prompt: {prompt}")
-        text_ids, text_mask = tokenize_transfer_prompt(
-            self.tokenizer, prompt, device=device
+        text_ids, text_mask = tokenize_dreams_prompt(
+            self.tokenizer, prompt, device=device, system_prompt=TRANSFER_SYSTEM_PROMPT
         )
 
         frames = batch.extra[EXTRA_PREPROCESSED_CONTROL][0][0]

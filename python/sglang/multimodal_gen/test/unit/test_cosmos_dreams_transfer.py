@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     append_kv_history,
+    tokenize_dreams_prompt,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.transfer import (
     CONTROL_EMPHASIS_TEMPLATE,
@@ -52,7 +53,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     restore_transfer_output_size,
     select_direct_canvas,
     synthetic_control_frames,
-    tokenize_transfer_prompt,
     transfer_scale_ratio,
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
@@ -357,8 +357,11 @@ class TestTransferFramesAndHistory(unittest.TestCase):
     def test_long_prompt_is_truncated_like_training(self):
         tokenizer = _FakeTokenizer()
         tokenizer.template_ids = list(range(5000))
-        ids, _ = tokenize_transfer_prompt(
-            tokenizer, "x" * 10, device=torch.device("cpu")
+        ids, _ = tokenize_dreams_prompt(
+            tokenizer,
+            "x" * 10,
+            device=torch.device("cpu"),
+            system_prompt=TRANSFER_SYSTEM_PROMPT,
         )
         self.assertEqual(ids.shape[1], 4096 + 2)
         self.assertEqual(ids[0, -2:].tolist(), [7, 9])
@@ -435,8 +438,11 @@ class TestTransferPrompt(unittest.TestCase):
 
     def test_tokenizer_uses_transfer_system_prompt(self):
         tokenizer = _FakeTokenizer()
-        ids, mask = tokenize_transfer_prompt(
-            tokenizer, "hello", device=torch.device("cpu")
+        ids, mask = tokenize_dreams_prompt(
+            tokenizer,
+            "hello",
+            device=torch.device("cpu"),
+            system_prompt=TRANSFER_SYSTEM_PROMPT,
         )
         conversation = tokenizer.conversations[0]
         self.assertEqual(

@@ -449,10 +449,6 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             kwargs["negative_metadata_mode"] = kwargs["negative_metadata_mode"].lower()
         return kwargs
 
-    def is_explicit(self, name: str) -> bool:
-        explicit = getattr(self, "_explicit_fields", None)
-        return explicit is not None and name in explicit
-
     def _is_unset(self, name: str, default: Any) -> bool:
         """A field the request neither passed nor changed from its class default."""
         return not self.is_explicit(name) and getattr(self, name) == default

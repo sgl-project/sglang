@@ -383,8 +383,8 @@ class FixedStepSamplerConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=
     num_train_timesteps: int
 
 
-class CosmosDreamsManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """The complete schema-v1 artifact; every field is required."""
+class _ManifestBody(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Shared artifact fields; conditioning is converted separately by schema."""
 
     schema_version: int
     checkpoint_id: str
@@ -401,11 +401,16 @@ class CosmosDreamsManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
     vae_spatial_compression_factor: int
     temporal_compression_factor: int
     fixed_step_sampler_config: FixedStepSamplerConfig
-    conditioning: CosmosDreamsConditioning
     temporal_modality_margin: int
     unified_3d_mrope_reset_spatial_ids: bool
     base_fps: float
     enable_fps_modulation: bool
+
+
+class CosmosDreamsManifest(_ManifestBody):
+    """The complete schema-v1 artifact; every field is required."""
+
+    conditioning: CosmosDreamsConditioning
 
     @property
     def t_list(self) -> tuple[float, ...]:
@@ -472,29 +477,6 @@ class CosmosDreamsManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
     @property
     def max_action_dim(self) -> int:
         return self.action_contract.model_action_dim
-
-
-class _ManifestBody(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """``CosmosDreamsManifest`` without ``conditioning``, which is converted separately."""
-
-    schema_version: int
-    checkpoint_id: str
-    checkpoint_iteration: int
-    checkpoint_hash: str
-    chunk_size: int
-    window_frames: int | None
-    sink_frames: int
-    text_cache_max_len: int
-    attention_mode: str
-    video_temporal_causal: bool
-    latent_patch_size: int
-    vae_spatial_compression_factor: int
-    temporal_compression_factor: int
-    fixed_step_sampler_config: FixedStepSamplerConfig
-    temporal_modality_margin: int
-    unified_3d_mrope_reset_spatial_ids: bool
-    base_fps: float
-    enable_fps_modulation: bool
 
 
 def _require_positive(name: str, value: int) -> None:

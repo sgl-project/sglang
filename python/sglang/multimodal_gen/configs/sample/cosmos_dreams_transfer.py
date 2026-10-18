@@ -84,11 +84,6 @@ class CosmosDreamsTransferSamplingParams(Cosmos3SamplingParams):
             )
         return hints[0]
 
-    def is_explicit(self, name: str) -> bool:
-        """Whether the request set ``name`` itself (tracked as in Cosmos3SamplingParams)."""
-        explicit = getattr(self, "_explicit_fields", None)
-        return explicit is not None and name in explicit
-
     def _validate(self) -> None:
         super()._validate()
         # Default construction (offload planning) carries no control input; a
