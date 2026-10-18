@@ -1,4 +1,6 @@
+import ast
 import difflib
+import functools
 import glob
 import json
 import os
@@ -969,6 +971,44 @@ def _dispatch_err(suite, msg):
     }
 
 
+@functools.cache
+def _valid_rerun_suites(backend):
+    """Read the suite catalog without importing SGLang or executing PR code."""
+    path = Path(__file__).resolve().parents[3] / "test/run_suite.py"
+    tree = ast.parse(path.read_text())
+    catalogs = {"PER_COMMIT_SUITES", "NIGHTLY_SUITES", "OTHER_SUITES"}
+    found = set()
+    valid = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {t.id for t in node.targets if isinstance(t, ast.Name)} & catalogs
+        if not names:
+            continue
+        found.update(names)
+        for key, value in zip(node.value.keys, node.value.values):
+            if (
+                isinstance(key, ast.Attribute)
+                and isinstance(key.value, ast.Name)
+                and key.value.id == "HWBackend"
+                and key.attr == backend
+            ):
+                valid.update(ast.literal_eval(value))
+    if found != catalogs:
+        raise ValueError(f"Missing suite catalogs in {path}: {catalogs - found}")
+    return valid
+
+
+def _invalid_suite_error(backend, suite, full_path):
+    if suite not in _valid_rerun_suites(backend):
+        return (
+            f"Invalid {backend} suite `{suite}` in `{full_path}`: not defined in "
+            "`test/run_suite.py` (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES). "
+            "Fix the test's CI registration before rerunning."
+        )
+    return None
+
+
 def _resolve_runner_config(rc, full_path, suite):
     """Resolve a runner_config key into a detect_suite dispatch dict.
 
@@ -984,6 +1024,9 @@ def _resolve_runner_config(rc, full_path, suite):
             f"— not in scripts/ci/runner_configs.yml.\n\n"
             f"Known runner_configs: {known}",
         )
+    error = _invalid_suite_error("CUDA", suite, full_path)
+    if error:
+        return _dispatch_err(suite, error)
     install_script = cfg["install"]
     if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
         return _dispatch_err(
@@ -1036,12 +1079,17 @@ def detect_suite(file_path_from_test):
             stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
             suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
             results.append(_resolve_runner_config(rc, full_path, suite))
-        return results
+        errors = [result for result in results if result["error"]]
+        return errors or results
 
     legacy_suites = _extract_legacy_suites(content)
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         cpu_suites = sorted(set(_extract_suites(content, "register_cpu_ci")))
+        for suite in cpu_suites:
+            error = _invalid_suite_error("CPU", suite, full_path)
+            if error:
+                return [_dispatch_err(suite, error)]
         if cpu_suites and not set(cpu_suites) & _partition.UBUNTU_CPU_SUITES:
             suite = cpu_suites[0]
             pool, workflow = next(
