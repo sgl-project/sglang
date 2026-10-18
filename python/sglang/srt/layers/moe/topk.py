@@ -1883,6 +1883,12 @@ def _mask_topk_ids_padded_region(
 ) -> None:
     if num_token_non_padded is None:
         return
+    if not topk_ids.is_cuda:
+        if _is_npu:
+            return
+        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        topk_ids.masked_fill_((rows >= num_token_non_padded)[:, None], fill_value)
+        return
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
@@ -1900,6 +1906,10 @@ def _zero_topk_weights_padded_region(
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     if num_token_non_padded is None:
+        return
+    if not topk_weights.is_cuda:
+        rows = torch.arange(topk_weights.shape[0], device=topk_weights.device)
+        topk_weights.masked_fill_((rows >= num_token_non_padded)[:, None], 0.0)
         return
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
