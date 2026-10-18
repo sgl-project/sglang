@@ -849,7 +849,8 @@ class CPUGraphRunner:
         )
         with skip_ctx:
             with forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=forward_batch,
             ):
                 self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
                     bs,

@@ -23,7 +23,6 @@ import torch
 
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
@@ -263,12 +262,6 @@ def _run_mega_routed(
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
-        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
         if (
             not moe.is_hash
             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
@@ -277,15 +270,11 @@ def _run_mega_routed(
                 moe,
                 router_logits,
                 input_ids_global,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
             )
         else:
             topk_output = moe.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
         topk_ids = topk_output.topk_ids

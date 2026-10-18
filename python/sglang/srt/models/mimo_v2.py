@@ -29,7 +29,6 @@ from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -559,11 +558,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if self._uses_expert_remap
-                    else None
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -595,10 +589,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -628,10 +618,6 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)

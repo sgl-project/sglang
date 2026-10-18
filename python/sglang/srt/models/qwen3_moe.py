@@ -28,7 +28,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -360,10 +359,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -398,14 +393,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.moe_num_token_non_padded()
-                    if forward_batch is not None
-                    else None
-                ),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
             assert TopKOutputChecker.format_is_standard(topk_output), (
                 "MegaMoE pre-dispatch consumes raw topk ids/weights; "
@@ -444,10 +431,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
