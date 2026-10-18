@@ -217,6 +217,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             # Large ROCm retraction restores can fault the GPU process. Keep
             # host_pool opt-in on HIP until the retraction path is safe at scale.
             and not is_hip()
+            # Ascend KV buffers use a blocked tensor layout; the generic
+            # HiCache host-pool transfer path does not support that layout.
+            and not is_npu()
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.

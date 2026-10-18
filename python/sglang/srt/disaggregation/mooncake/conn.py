@@ -478,16 +478,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception:
             logger.exception("Failed to destroy mooncake zmq context during teardown")
 
-        # Deregister memory from the transfer engine.
-        try:
-            self.deregister_buffer_to_engine()
-        except Exception:
-            logger.exception("Failed to deregister buffers during teardown")
+        self._teardown_transfer_engine()
 
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
             self.disaggregation_mode.value,
         )
+
+    def _teardown_transfer_engine(self) -> None:
+        # Mooncake uses a shared engine; release only this manager's buffers.
+        try:
+            self.deregister_buffer_to_engine()
+        except Exception:
+            logger.exception("Failed to deregister buffers during teardown")
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
