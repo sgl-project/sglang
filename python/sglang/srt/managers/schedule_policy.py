@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.model_executor.encoder_swa_replay import replay_len
+from sglang.srt.model_executor import encoder_swa_replay
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -577,6 +577,7 @@ class _PrefillAdmission:
     extend_len: int
     max_new_tokens: int
     is_chunked: bool
+    replay_len: int
 
 
 class PrefillAdder:
@@ -861,23 +862,28 @@ class PrefillAdder:
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         compute_charge: Optional[int] = None,
+        replay_len: int = 0,
     ):
         """Charge one admitted request against the prefill budgets.
 
-        `compute_charge` is what the compute budgets (`rem_chunk_tokens`,
-        `rem_input_tokens`, `rem_dllm_tokens`) are billed, counted in
-        forward-pass tokens; the KV budgets are always billed page-ceiled
-        tokens. It defaults to the ceiled count, so only the exact-chunk-fill
-        path parts from upstream behaviour. Both compute budgets have to take
-        it: they are usually configured to the same value, so leaving either one
-        ceiled makes it hit zero first and stop admission with the rounding
-        slack unspent.
+        The compute budgets (`rem_chunk_tokens`, `rem_input_tokens`,
+        `rem_dllm_tokens`) count the rows the step runs for the request:
+        - its extend, billed `compute_charge` tokens. It defaults to the ceiled
+          count, so only the exact-chunk-fill path parts from upstream
+          behaviour. Both compute budgets have to take it: they are usually
+          configured to the same value, so leaving either one ceiled makes it
+          hit zero first and stop admission with the rounding slack unspent.
+        - `replay_len` cached tokens that encoder SWA replay recomputes in
+          front of the extend.
+        The KV budgets are always billed the page-ceiled extend: replay rows
+        are cached prefix tokens and take no new KV slots.
         """
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         raw_extend_input_len = extend_input_len
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
         if compute_charge is None:
             compute_charge = extend_input_len
+        compute_charge += replay_len
 
         self.memory_budget.reserve(
             extend_input_len,
@@ -906,24 +912,20 @@ class PrefillAdder:
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += raw_extend_input_len
+        self.log_replay_tokens += replay_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
-    def _replay_rows(self, req: Req, prefix_len: int) -> int:
-        """Cached rows encoder replay folds in front of this request's extend."""
+    def _replay_len(self, req: Req, prefix_len: int) -> int:
+        """Cached tokens encoder replay recomputes in front of this request's extend."""
         if get_exec().features.enable_encoder_swa_bounded_replay and (
             req.kv.req_pool_idx is None or req.is_retracted
         ):
-            return replay_len(prefix_len)
+            return encoder_swa_replay.replay_len(prefix_len)
         return 0
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
-        if replay_tokens := self._replay_rows(req, prefix_len):
-            self.log_replay_tokens += replay_tokens
-            self.rem_input_tokens -= replay_tokens
-            if self.rem_chunk_tokens is not None:
-                self.rem_chunk_tokens -= replay_tokens
         if req.retracted_stain:
             # Retraction attribution is intentionally omitted for now; discard
             # its lifecycle state so a later abort cannot report it as a drop.
@@ -1014,6 +1016,7 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            replay_len=self._replay_len(req, prefix_len),
         )
         self._account_prefill_cache_admission(req, prefix_len)
 
@@ -1497,7 +1500,11 @@ class PrefillAdder:
                             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                         )
                     admission = _PrefillAdmission(
-                        prefix_len, extend_len, max_new_tokens, is_chunked
+                        prefix_len,
+                        extend_len,
+                        max_new_tokens,
+                        is_chunked,
+                        self._replay_len(req, prefix_len),
                     )
                 elif req.host_loaded_length < promised_host_hit:
                     # No FULL was loaded; recomputation may no longer fit.
@@ -1544,13 +1551,12 @@ class PrefillAdder:
         # exact-chunk-fill, so a request whose ceiled length would spill is
         # not needlessly split into a second chunk.
         chunk_fit_tokens = extend_len if self.exact_chunk_fill else input_tokens
+        replay_len = self._replay_len(req, prefix_len)
         chunk_limit = self.rem_chunk_tokens
-        if chunk_limit is not None and (
-            replay_rows := self._replay_rows(req, prefix_len)
-        ):
-            # The step also runs the replay rows, so they share the chunk: an
-            # extend sized to the whole chunk would pass the MegaMoE token cap.
-            chunk_limit -= replay_rows
+        if chunk_limit is not None and replay_len:
+            # The step runs the replay rows too, so the extend gets what is
+            # left of the chunk.
+            chunk_limit -= replay_len
             if chunk_limit <= 0:
                 return AddReqResult.OTHER
         can_admit, chunk_tokens_limit = self._check_prefill_budget(
@@ -1617,7 +1623,9 @@ class PrefillAdder:
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
 
-        return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, is_chunked)
+        return _PrefillAdmission(
+            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len
+        )
 
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
@@ -1639,6 +1647,7 @@ class PrefillAdder:
             ),
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
+            replay_len=admission.replay_len,
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
