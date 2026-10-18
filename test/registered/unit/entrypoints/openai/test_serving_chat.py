@@ -1932,6 +1932,213 @@ class ServingChatTestCase(CustomTestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
+    def _named_tool_choice_request(self):
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"Run {name}.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+
+        return ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Summarize what you found."}],
+            tools=[tool("search_logs"), tool("query_metrics"), tool("submit")],
+            tool_choice={"type": "function", "function": {"name": "submit"}},
+        )
+
+    def test_named_tool_choice_renders_only_the_named_tool_by_default(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        req = self._named_tool_choice_request()
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_can_keep_every_tool_in_the_prompt(self):
+        """An agent that names a tool on one turn must not lose its prefix cache:
+        the template gets the same tool list as on a turn with automatic choice,
+        and the structural tag lists only the named tool."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        req = self._named_tool_choice_request()
+        auto_req = req.model_copy(update={"tool_choice": "auto"})
+
+        self.chat._process_messages(auto_req, is_multimodal=False)
+        auto_tools = self.tm.tokenizer.apply_chat_template.call_args.kwargs["tools"]
+        with (
+            get_context().override_server_args(grammar_backend="xgrammar"),
+            envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(True),
+        ):
+            result = self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(len(auto_tools), len(req.tools))
+        self.assertEqual(kwargs["tools"], auto_tools)
+        kind, tag = result.tool_call_constraint
+        self.assertEqual(kind, "structural_tag")
+        self.assertTrue(tag.at_least_one)
+        self.assertEqual(len(tag.structures), 1)
+        self.assertIn('"submit"', tag.structures[0].begin)
+
+    def test_named_tool_choice_without_constraint_keeps_the_one_tool_prompt(self):
+        """Without an output constraint the one-tool prompt is the only thing
+        that selects the named tool, so the switch must not change the prompt."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "hunyuan"
+        req = self._named_tool_choice_request()
+
+        with envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(True):
+            result = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertIsNone(result.tool_call_constraint)
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_nonforcing_backend_keeps_the_one_tool_prompt(self):
+        """When the backend cannot force a named call, the prompt must keep
+        advertising only the named tool despite a requested forcing tag."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "inkling"
+        req = self._named_tool_choice_request()
+
+        for backend in ("llguidance", "outlines", "none"):
+            with (
+                get_context().override_server_args(grammar_backend=backend),
+                envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(True),
+                self.subTest(backend=backend),
+            ):
+                result = self.chat._process_messages(req, is_multimodal=False)
+
+                kind, tag = result.tool_call_constraint
+                self.assertEqual(kind, "structural_tag")
+                self.assertTrue(tag.at_least_one)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_json_constraint_requires_an_active_backend(self):
+        """llguidance can enforce a named JSON call even though its legacy
+        structural tags cannot; disabling grammar removes that protection."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = None
+        req = self._named_tool_choice_request()
+
+        for backend, tools in (
+            ("llguidance", req.tools),
+            ("none", [req.tools[2]]),
+            (None, [req.tools[2]]),
+        ):
+            with (
+                get_context().override_server_args(grammar_backend=backend),
+                envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(True),
+                self.subTest(backend=backend),
+            ):
+                result = self.chat._process_messages(req, is_multimodal=False)
+
+                self.assertEqual(result.tool_call_constraint[0], "json_schema")
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["tools"], [tool.model_dump() for tool in tools])
+
+    def test_named_tool_choice_keeps_one_tool_when_output_constraint_wins(self):
+        """An explicit output constraint can discard the tool grammar, so the
+        prompt must still advertise only the named tool."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        constraints = [
+            {"regex": "plain assistant text"},
+            {"ebnf": 'root ::= "plain assistant text"'},
+            {"response_format": {"type": "json_object"}},
+            {
+                "response_format": {
+                    "type": "structural_tag",
+                    "structures": [
+                        {
+                            "begin": "<result>",
+                            "schema": {"type": "object"},
+                            "end": "</result>",
+                        }
+                    ],
+                    "triggers": ["<result>"],
+                }
+            },
+        ]
+        constraints.extend(
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "result",
+                        "schema": {"type": "object"},
+                        "strict": strict,
+                    },
+                }
+            }
+            for strict in (None, False, True)
+        )
+        for constraint in constraints:
+            with (
+                get_context().override_server_args(grammar_backend="xgrammar"),
+                envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(True),
+                self.subTest(constraint=constraint),
+            ):
+                req = ChatCompletionRequest(
+                    **(self._named_tool_choice_request().model_dump() | constraint)
+                )
+                result = self.chat._process_messages(req, is_multimodal=False)
+                params = req.to_sampling_params(
+                    stop=[],
+                    model_generation_config={},
+                    tool_call_constraint=result.tool_call_constraint,
+                )
+
+                self.assertEqual(result.tool_call_constraint[0], "full_assistant_ebnf")
+                self.assertNotIn("ebnf_full_assistant", params)
+                self.assertTrue(
+                    params.get("regex")
+                    or params.get("ebnf")
+                    or params.get("json_schema")
+                    or params.get("structural_tag")
+                )
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["tools"], [req.tools[2].model_dump()])
+
+    def test_named_tool_choice_keeps_all_tools_with_empty_output_constraints(self):
+        """Empty constraints and text response format leave the tool grammar
+        active, so they must not disable the prompt cache switch."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        req = ChatCompletionRequest(
+            **(
+                self._named_tool_choice_request().model_dump()
+                | {"regex": "", "ebnf": "", "response_format": {"type": "text"}}
+            )
+        )
+        with (
+            get_context().override_server_args(grammar_backend="xgrammar"),
+            envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(True),
+        ):
+            result = self.chat._process_messages(req, is_multimodal=False)
+            params = req.to_sampling_params(
+                stop=[],
+                model_generation_config={},
+                tool_call_constraint=result.tool_call_constraint,
+            )
+
+        self.assertTrue(params["ebnf_full_assistant"])
+        self.assertEqual(params["ebnf"], result.tool_call_constraint[1])
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tools"], [tool.model_dump() for tool in req.tools])
+
     def test_glm47_without_tools_has_no_tool_call_constraint(self):
         """A plain GLM47 chat must not get the full-assistant EBNF: its
         terminal state finishes the request even under ignore_eos."""

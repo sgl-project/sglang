@@ -11,7 +11,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.runtime_context import get_exec, get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -1588,6 +1588,54 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+            if not isinstance(request.tool_choice, str):
+                # By default the Jinja template and the Inkling encoder render only
+                # the named tool. With the switch every tool stays in the prompt,
+                # so a turn that names a tool still extends the prompt of the turns
+                # before it and reuses their prefix cache. The switch needs an
+                # output constraint enforced by the active backend. Only XGrammar
+                # honors the forcing property of structural tags; llguidance's
+                # legacy tags ignore at_least_one and allow free text. Otherwise
+                # the one-tool prompt is the only thing that selects the tool.
+                grammar_backend = get_exec().kernel.grammar_backend
+                response_format = request.response_format
+                has_output_constraint = (
+                    request.regex
+                    or request.ebnf
+                    or (
+                        response_format is not None
+                        and (
+                            response_format.type in ("json_object", "structural_tag")
+                            or (
+                                response_format.type == "json_schema"
+                                and (
+                                    response_format.json_schema.strict is not False
+                                    or self.chat_encoding_spec != "kimi_k3"
+                                )
+                            )
+                        )
+                    )
+                )
+                keep_tools = (
+                    envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.get()
+                    and tool_call_constraint is not None
+                    # Explicit output constraints take precedence over the
+                    # full-assistant tool grammar in to_sampling_params.
+                    and not has_output_constraint
+                    and grammar_backend in ("xgrammar", "llguidance", "outlines")
+                    and (
+                        tool_call_constraint[0] != "structural_tag"
+                        or grammar_backend == "xgrammar"
+                    )
+                )
+                tools = [
+                    item.model_dump()
+                    for item in request.tools or []
+                    if keep_tools
+                    or item.function.name == request.tool_choice.function.name
+                ] or None
+            elif request.tools:
+                tools = [item.model_dump() for item in request.tools]
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
