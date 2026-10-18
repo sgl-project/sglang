@@ -37,6 +37,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -299,6 +300,7 @@ def build_kv_cache(
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     dynamo_kv_event_format: bool = False,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
+    draft_swa_window: int = 0,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -323,9 +325,22 @@ def build_kv_cache(
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
+    assert draft_swa_window == 0 or sliding_window_size is not None, (
+        "a fused draft reads an swa sub-pool this target does not build"
+    )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
+    # SWA the tree does not own must not gate prefix matching: a per-request ring,
+    # or paged SWA beside the target's encoder-replay request window, which then
+    # only the draft uses.
+    swa_gates_prefix_match = not (
+        is_swa_req_ring(token_to_kv_pool_allocator)
+        or (
+            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is not None
+        )
+    )
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
@@ -386,9 +401,18 @@ def build_kv_cache(
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        swa_gates_prefix_match=swa_gates_prefix_match,
+        draft_swa_window=draft_swa_window,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
     )
+    if params.swa_retain_window != sliding_window_size:
+        logger.info(
+            "SWA eviction keeps %d tokens back: the fused draft reads past the "
+            "%d-token window.",
+            params.swa_retain_window,
+            sliding_window_size,
+        )
 
     tree_context = TreeCacheBuildContext(
         server_args=server_args,

@@ -68,6 +68,8 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
     _prefill_graph_max_seq_len,
     _tail_rows,
+    late_layer_num_tokens,
+    late_layer_whole_extend,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -972,6 +974,9 @@ class DeepseekV4HipRadixBackend(
                 )
         # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Read by the shared forward_low_ratio_sources; the ROCm tail starts after
+        # the source layer, so nothing sets it.
+        self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -2172,6 +2177,11 @@ class DeepseekV4HipRadixBackend(
             else None
         )
 
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
+            return None
+        return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
+
     def _init_forward_metadata_prefill_from_batch(
         self,
         forward_batch: ForwardBatch,
@@ -2215,7 +2225,8 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
-        replay: each request's last SWA_WINDOW extend tokens."""
+        replay: each request's last SWA_WINDOW extend tokens, or its whole extend
+        when it reads prompt rows (late_layer_whole_extend)."""
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
@@ -2225,6 +2236,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu.tolist(),
             tail_len=SWA_WINDOW,
             device=device,
+            whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
         )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
