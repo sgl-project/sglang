@@ -58,8 +58,14 @@ from sglang.srt.rocm_muse_spark.muse_router_gemv import (
     router_gemv,
     router_gemv_supported,
 )
+from sglang.srt.rocm_muse_spark.muse_router_helpers import (
+    can_share_router_preproject,
+    share_router_preproject,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
+
+_MUSE_SHARED_PREPROJECT = os.environ.get("MUSE_SHARED_PREPROJECT", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -797,28 +803,37 @@ class MuseSpark1xMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if (
-            _USE_ROUTER_GEMV
-            and self.router_in_fp32
-            and router_gemv_supported(hidden_states, self.router.weight)
+            _MUSE_SHARED_PREPROJECT
+            and _USE_ROUTER_GEMV
+            and can_share_router_preproject(self, hidden_states)
         ):
-            # bf16 -> fp32 conversion happens inside the kernel (exact), IEEE fp32 accumulate
-            router_logits = router_gemv(hidden_states, self.router.weight)
-        else:
-            router_input = (
-                hidden_states.float() if self.router_in_fp32 else hidden_states
+            topk_scores, topk_ids, expert_input = share_router_preproject(
+                self, hidden_states
             )
-            router_logits = self.router(router_input)
-        topk_scores, topk_ids = self._routing_op().forward(
-            None, router_logits, self.top_k, True
-        )
+        else:
+            if (
+                _USE_ROUTER_GEMV
+                and self.router_in_fp32
+                and router_gemv_supported(hidden_states, self.router.weight)
+            ):
+                # bf16 -> fp32 conversion happens inside the kernel (exact), IEEE fp32 accumulate
+                router_logits = router_gemv(hidden_states, self.router.weight)
+            else:
+                router_input = (
+                    hidden_states.float() if self.router_in_fp32 else hidden_states
+                )
+                router_logits = self.router(router_input)
+            topk_scores, topk_ids = self._routing_op().forward(
+                None, router_logits, self.top_k, True
+            )
 
-        expert_input = (
-            _dense_linear(hidden_states, self.pre_expert_proj, max_m=128)
-            if self.pre_expert_proj is not None
-            else hidden_states
-        )
-        if self.pre_expert_norm is not None:
-            expert_input = self.pre_expert_norm(expert_input)
+            expert_input = (
+                _dense_linear(hidden_states, self.pre_expert_proj, max_m=128)
+                if self.pre_expert_proj is not None
+                else hidden_states
+            )
+            if self.pre_expert_norm is not None:
+                expert_input = self.pre_expert_norm(expert_input)
         if self.nvfp4_checkpoint:
             output = self.experts(
                 expert_input, topk_scores, topk_ids, self.post_expert_norm
