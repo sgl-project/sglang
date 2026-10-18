@@ -5,13 +5,14 @@
         "description": "B200 diffusion references with stage, denoise and allocated-memory checks enabled; previously enforced E2E/load references and runner overrides retained.",
         "last_updated": "2026-10-18",
         "calibration_runs": [
+            38482436865,
             38554777367,
             38725436953,
             38979902269,
             39027561441,
             39077836460
         ],
-        "calibration_policy": "Newly enabled timing checks use the observed maximum plus 5%; memory references use the maximum plus 1%. Existing tolerances, E2E/load references and runner overrides remain unchanged. Four comparable runs for FLUX.2; five for the other cases."
+        "calibration_policy": "At least five comparable main CI runs per case. Newly enabled timing checks use the observed maximum plus 5%; memory references use the maximum plus 1%. Existing tolerances, E2E/load references and runner overrides remain unchanged."
     },
     "runner_overrides": {
         "b200-cirrascale1-0123": {
@@ -141,31 +142,31 @@
         "flux2_modelopt_nvfp4_t2i": {
             "expected_load_ms": 71333.99,
             "stages_ms": {
-                "InputValidationStage": 0.06,
-                "TextEncodingStage": 482.25,
+                "InputValidationStage": 0.1,
+                "TextEncodingStage": 701.31,
                 "ImageVAEEncodingStage": 0.01,
-                "LatentPreparationStage": 0.54,
-                "TimestepPreparationStage": 2.45,
-                "DenoisingStage": 1269.83,
+                "LatentPreparationStage": 0.82,
+                "TimestepPreparationStage": 4.35,
+                "DenoisingStage": 1501.8,
                 "DecodingStage": 15.72
             },
             "denoise_step_ms": {
-                "0": 104.34,
+                "0": 143.39,
                 "1": 30.93,
-                "2": 69.66,
+                "2": 121.58,
                 "3": 98.59,
-                "4": 104.24,
+                "4": 130.89,
                 "5": 100.31,
                 "6": 100.42,
-                "7": 106.3,
+                "7": 138.77,
                 "8": 97.93,
                 "9": 106.67,
                 "10": 99.03,
                 "11": 106.87
             },
             "expected_e2e_ms": 1990.84,
-            "expected_avg_denoise_ms": 96.58,
-            "expected_median_denoise_ms": 105.6,
+            "expected_avg_denoise_ms": 115.55,
+            "expected_median_denoise_ms": 125.74,
             "estimated_full_test_time_s": 592.3,
             "load_peak_vram_mb": 26684.2,
             "runtime_peak_vram_mb": 33020.94,
