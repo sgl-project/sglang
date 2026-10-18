@@ -417,6 +417,101 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(first.calls, [])
         self.assertEqual(second.normal_text, " tail")
 
+    def test_streaming_drops_unknown_tool_unless_forward_unknown_enabled(self):
+        """Streaming and non-streaming must agree on unknown tool calls: drop by
+        default, keep following known calls at index 0, and forward when
+        SGLANG_FORWARD_UNKNOWN_TOOLS is enabled."""
+        text = "Checking.\n\n" + _wrapped(
+            _invoke("unknown_tool", _param("city", "true", "SF"))
+            + "\n"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+
+        one_shot = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        normal, calls = self._feed([text])
+        self.assertEqual(normal, one_shot.normal_text)
+        self.assertEqual(
+            [(call.tool_index, call.name, call.parameters) for call in calls],
+            [(0, "get_weather", '{"city": "NY"}')],
+        )
+        self.assertEqual(
+            [(call.name, call.parameters) for call in calls],
+            [(call.name, call.parameters) for call in one_shot.calls],
+        )
+
+        with patch(
+            "sglang.srt.function_call.deepseekv32_detector.envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get",
+            return_value=True,
+        ), patch(
+            "sglang.srt.function_call.base_format_detector.envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get",
+            return_value=True,
+        ):
+            one_shot_fwd = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+            normal_fwd, calls_fwd = self._feed([text])
+            self.assertEqual(normal_fwd, one_shot_fwd.normal_text)
+            self.assertEqual(
+                [(call.tool_index, call.name, call.parameters) for call in calls_fwd],
+                [
+                    (0, "unknown_tool", '{"city": "SF"}'),
+                    (1, "get_weather", '{"city": "NY"}'),
+                ],
+            )
+            self.assertEqual(
+                [(call.name, call.parameters) for call in calls_fwd],
+                [(call.name, call.parameters) for call in one_shot_fwd.calls],
+            )
+
+    def test_unknown_only_invoke_withholds_trailing_dsml_on_finish(self):
+        """When the only invoke in a block is for an unknown tool, the preamble
+        is emitted once and finish() does not leak the trailing </｜DSML｜...>."""
+        text = "Checking.\n\n" + _wrapped(
+            _invoke("unknown_tool", _param("city", "true", "SF"))
+        )
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        normal, calls = "", []
+        for idx in range(0, len(text), 5):
+            chunk_normal, chunk_calls = parser.parse_stream_chunk(text[idx : idx + 5])
+            normal += chunk_normal
+            calls.extend(chunk_calls)
+        end_normal, end_calls = parser.parse_stream_end()
+        normal += end_normal
+        calls.extend(end_calls)
+
+        self.assertEqual(normal, "Checking.")
+        self.assertEqual(calls, [])
+
+    def test_non_dsml_fullwidth_bar_tag_does_not_stall_streaming(self):
+        """A fullwidth bar tag like `<｜end｜>` is not a DSML tool tag and must
+        stream immediately instead of stalling in the buffer until finish()."""
+        detector = DeepSeekV4Detector()
+        first = detector.parse_streaming_increment("hello <｜end｜>", self.tools)
+        second = detector.parse_streaming_increment(" world", self.tools)
+
+        self.assertEqual(first.normal_text, "hello <｜end｜>")
+        self.assertEqual(second.normal_text, " world")
+        self.assertEqual(detector.finish(self.tools).normal_text, "")
+
+    def test_literal_dsml_token_in_plain_prose_streams_without_truncation(self):
+        """Prose mentioning the bare `｜DSML｜` marker without `<` / `</` must
+        not stall streaming or be truncated by finish()."""
+        text = f"The tag {DSML} marks tool calls."
+        for width in (1, 3, 7, len(text)):
+            with self.subTest(width=width):
+                parser = FunctionCallParser(self.tools, "deepseekv4")
+                normal, calls = "", []
+                for idx in range(0, len(text), width):
+                    chunk_normal, chunk_calls = parser.parse_stream_chunk(
+                        text[idx : idx + width]
+                    )
+                    normal += chunk_normal
+                    calls.extend(chunk_calls)
+                end_normal, end_calls = parser.parse_stream_end()
+                normal += end_normal
+                calls.extend(end_calls)
+
+                self.assertEqual(normal, text)
+                self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
