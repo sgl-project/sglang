@@ -26,6 +26,8 @@ from .base import SGLDiffusionExecutor
 
 # FLUX.2 VAE: 8x spatial compression, then 2x2 patchify folded into channels.
 _PIXELS_PER_LATENT = 16
+
+
 def _guidance_scale(guidance) -> float | None:
     if guidance is None:
         # ComfyUI's FluxDisableGuidance deliberately omits the embedded
