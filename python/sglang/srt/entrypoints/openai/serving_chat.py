@@ -8,7 +8,6 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
-from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -88,6 +87,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    abort_error_status,
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
@@ -96,6 +96,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_spec_tokens_details_from_ret,
     should_include_usage,
     spec_tokens_details_from_meta_info,
+    to_openai_finish_reason,
     token_id_to_bytes,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
@@ -2567,16 +2568,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     # (timeout, OOM, validation): emit a streaming error chunk.
                     # A graceful abort (no status_code, e.g. user-initiated via
                     # /abort_request or session lifecycle cleanup) falls through
-                    # to the normal chunk path, matching the non-stream behavior
-                    # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
-                    ):
-                        code = finish_reason["status_code"]
+                    # to the normal chunk path and is reported as "stop".
+                    error_status = abort_error_status(finish_reason)
+                    if error_status is not None:
                         error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            finish_reason.get("message") or "Generation aborted.",
+                            status_code=error_status,
                         )
                         yield f"data: {error}\n\n"
                         error_aborted = True
@@ -2647,7 +2644,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason_type = finish_reason_data["type"]
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
-                final_finish_reason = finish_reason_type
+                final_finish_reason = to_openai_finish_reason(finish_reason_type)
                 if (
                     has_tool_calls.get(idx, False)
                     and finish_reason_type == "stop"
@@ -2840,6 +2837,16 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> ChatCompletionResponse | ORJSONResponse:
         """Build chat completion response from generation results"""
+        # One choice aborted with an error status fails the whole request.
+        for ret_item in ret:
+            finish_reason = ret_item["meta_info"]["finish_reason"]
+            error_status = abort_error_status(finish_reason)
+            if error_status is not None:
+                return self.create_error_response(
+                    finish_reason.get("message") or "Generation aborted.",
+                    status_code=error_status,
+                )
+
         if self.chat_encoding_spec == "kimi_k3":
             ret = [
                 {
@@ -3010,7 +3017,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                 ),
                 logprobs=choice_logprobs,
-                finish_reason=finish_reason["type"] if finish_reason else None,
+                finish_reason=(
+                    to_openai_finish_reason(finish_reason["type"])
+                    if finish_reason
+                    else None
+                ),
                 matched_stop=(
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason

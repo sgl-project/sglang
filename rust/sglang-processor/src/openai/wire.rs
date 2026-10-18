@@ -72,12 +72,30 @@ pub(super) fn malformed_output_reply() -> Reply {
     error_reply("Internal server error", 500)
 }
 
-/// Whether `code` is an `HTTPStatus` error code, as Python 3.12 defines them.
-pub(super) fn is_http_error_status(code: u64) -> bool {
-    matches!(
-        code,
-        400..=418 | 421..=426 | 428 | 429 | 431 | 451 | 500..=508 | 510 | 511
-    )
+/// `utils.abort_error_status`: an abort carrying an error status is an
+/// error, as its status and message.
+pub(super) fn abort_error(reason: Option<&FinishReason>) -> Option<(u16, &str)> {
+    let finish_reason::Kind::Abort(abort) = reason?.kind.as_ref()? else {
+        return None;
+    };
+    let code = u16::try_from(abort.status_code?)
+        .ok()
+        .filter(|code| (400..600).contains(code))?;
+    let message = abort
+        .message
+        .as_deref()
+        .filter(|message| !message.is_empty())
+        .unwrap_or("Generation aborted.");
+    Some((code, message))
+}
+
+/// `utils.to_openai_finish_reason`: an abort without an error status is a
+/// deliberate stop, and OpenAI defines no "abort".
+pub(super) fn openai_finish_reason(finish_type: Option<String>) -> Option<String> {
+    match finish_type.as_deref() {
+        Some("abort") => Some("stop".into()),
+        _ => finish_type,
+    }
 }
 
 /// `UsageProcessor.calculate_token_usage`, dumped as `UsageInfo`.
@@ -250,16 +268,8 @@ pub(super) fn finish_fields(reason: Option<&FinishReason>) -> (Option<String>, V
 }
 
 pub(super) fn abort_event(reason: Option<&FinishReason>) -> Option<String> {
-    let finish_reason::Kind::Abort(abort) = reason?.kind.as_ref()? else {
-        return None;
-    };
-    let code = u64::from(abort.status_code?);
-    is_http_error_status(code).then(|| {
-        stream_error_event(
-            abort.message.as_deref().unwrap_or("Generation aborted."),
-            code as u16,
-        )
-    })
+    let (code, message) = abort_error(reason)?;
+    Some(stream_error_event(message, code))
 }
 
 pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, incremental: bool) -> &[T] {

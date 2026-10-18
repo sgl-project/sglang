@@ -4373,6 +4373,146 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(finish["finish_reason"], "stop")
         self.assertEqual(finish["matched_stop"], "CUSTOM_STOP")
 
+    @staticmethod
+    def _abort_result(finish_reason, text="partial"):
+        return {
+            "text": text,
+            "meta_info": {
+                "id": "chatcmpl-abort",
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": finish_reason,
+                "weight_version": "default",
+                "output_token_logprobs": None,
+                "output_top_logprobs": None,
+            },
+            "index": 0,
+        }
+
+    def test_streaming_abort_without_status_reports_stop(self):
+        # OpenAI's finish_reason has no "abort"; a deliberate stop keeps its output.
+        async def _mock_generate():
+            yield self._abort_result({"type": "abort", "message": "Aborted."})
+
+        self.tm.generate_request.return_value = _mock_generate()
+        chunks = self._run_chat_stream(Mock(), self.stream_req)
+
+        self.assertNotIn('"abort"', "".join(chunks))
+        finishes = [
+            choice
+            for c in self._parse_chunks(chunks)
+            for choice in c["choices"]
+            if choice.get("finish_reason") is not None
+        ]
+        self.assertEqual(len(finishes), 1)
+        self.assertEqual(finishes[0]["finish_reason"], "stop")
+        self.assertIsNone(finishes[0]["matched_stop"])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_streaming_abort_with_int_status_yields_error(self):
+        # After msgpack IPC status_code is a plain int, not an HTTPStatus.
+        async def _mock_generate():
+            yield self._abort_result(
+                {"type": "abort", "status_code": 503, "message": "Queue full"}
+            )
+
+        self.tm.generate_request.return_value = _mock_generate()
+        chunks = self._run_chat_stream(Mock(), self.stream_req)
+
+        self.assertNotIn('"finish_reason": "abort"', "".join(chunks))
+        error = json.loads(chunks[0][len("data: ") :])["error"]
+        self.assertEqual(error["message"], "Queue full")
+        self.assertEqual(error["type"], "service_unavailable_error")
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_non_streaming_abort_with_status_returns_http_error(self):
+        # The tokenizer manager raises for 400/500/503 aborts; other statuses
+        # (EPD encoder 404/408/502/504) reach the response builder. One
+        # failed choice fails the whole request, as a raised abort does.
+        stop = self._abort_result({"type": "stop", "matched": None})
+        for status, error_type in (
+            (504, "server_error"),
+            (408, "invalid_request_error"),
+        ):
+            with self.subTest(status=status):
+                failed = self._abort_result(
+                    {
+                        "type": "abort",
+                        "status_code": status,
+                        "message": "Encoder failed",
+                    }
+                )
+
+                async def _mock_generate():
+                    yield [stop, failed]
+
+                self.tm.generate_request.return_value = _mock_generate()
+                req = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi?"}], n=2
+                )
+                response = get_or_create_event_loop().run_until_complete(
+                    self.chat._handle_non_streaming_request(Mock(), req, Mock())
+                )
+
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(
+                    json.loads(response.body),
+                    {
+                        "error": {
+                            "message": "Encoder failed",
+                            "type": error_type,
+                            "param": None,
+                            "code": None,
+                        }
+                    },
+                )
+
+    def test_abort_error_without_message_uses_the_fallback(self):
+        for message in (None, ""):
+            with self.subTest(message=message):
+                ret = [
+                    self._abort_result(
+                        {"type": "abort", "status_code": 504, "message": message}
+                    )
+                ]
+                response = self.chat._build_chat_response(
+                    self.basic_req, ret, created=123
+                )
+                self.assertEqual(response.status_code, 504)
+                self.assertEqual(
+                    json.loads(response.body)["error"]["message"],
+                    "Generation aborted.",
+                )
+
+    def test_non_streaming_abort_without_status_reports_stop(self):
+        ret = [self._abort_result({"type": "abort", "message": "Aborted."})]
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.choices[0].finish_reason, "stop")
+        self.assertIsNone(response.choices[0].matched_stop)
+        self.assertEqual(response.choices[0].message.content, "partial")
+
+    def test_non_streaming_abort_is_not_promoted_to_tool_calls(self):
+        # Only a natural stop becomes "tool_calls"; an aborted turn did not finish.
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        )
+        text = '<tool_call>\n{"name": "f", "arguments": {}}\n</tool_call>'
+        for finish_reason, expected in (
+            ({"type": "stop", "matched": None}, "tool_calls"),
+            ({"type": "abort", "message": "Aborted."}, "stop"),
+        ):
+            with self.subTest(finish_reason=finish_reason["type"]):
+                ret = [self._abort_result(dict(finish_reason), text=text)]
+                response = self.chat._build_chat_response(req, ret, created=123)
+                self.assertEqual(response.choices[0].finish_reason, expected)
+                self.assertEqual(
+                    response.choices[0].message.tool_calls[0].function.name, "f"
+                )
+
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
             chunks = []

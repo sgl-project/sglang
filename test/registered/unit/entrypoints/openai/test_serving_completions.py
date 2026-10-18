@@ -321,6 +321,95 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def _abort_ret(self, finish_reason):
+        return [
+            {
+                "text": "partial",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "finish_reason": finish_reason,
+                    "weight_version": "v1",
+                },
+            }
+        ]
+
+    def test_streaming_abort_with_int_status_yields_error(self):
+        """After msgpack IPC the abort status is a plain int; it is still an error."""
+
+        async def _mock_generate_abort(*args, **kwargs):
+            yield {
+                "text": "Partial ",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": 503,
+                        "message": "Overloaded",
+                    },
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_abort
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=8, stream=True)
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream())
+        error = json.loads(chunks[0][len("data: ") :])["error"]
+        self.assertEqual(error["message"], "Overloaded")
+        self.assertEqual(error["type"], "service_unavailable_error")
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertFalse(any('"finish_reason"' in c for c in chunks))
+
+    def test_non_streaming_abort_with_status_returns_http_error(self):
+        # Statuses the tokenizer manager does not raise for (EPD encoder
+        # 404/408/502/504) reach the builder; one failed choice fails the request.
+        (stop,) = self._abort_ret({"type": "stop", "matched": None})
+        (failed,) = self._abort_ret(
+            {"type": "abort", "status_code": 504, "message": "Encoder timed out"}
+        )
+
+        async def _mock_generate(*args, **kwargs):
+            yield [stop, failed]
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=8, n=2)
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        response = get_or_create_event_loop().run_until_complete(
+            self.sc._handle_non_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
+        )
+
+        self.assertEqual(response.status_code, 504)
+        error = json.loads(response.body)["error"]
+        self.assertEqual(error["message"], "Encoder timed out")
+        self.assertEqual(error["type"], "server_error")
+
+    def test_non_streaming_abort_without_status_reports_stop(self):
+        """An abort without an error status keeps its partial output as a stop."""
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=8)
+        response = self.sc._build_completion_response(
+            req, self._abort_ret({"type": "abort", "message": "Aborted."}), 123
+        )
+
+        self.assertEqual(response.choices[0].finish_reason, "stop")
+        self.assertIsNone(response.choices[0].matched_stop)
+        self.assertEqual(response.choices[0].text, "partial")
+
     def test_echo_with_zero_logprobs_streaming(self):
         """logprobs=0 requests token logprobs without top-logprobs, so the
         scheduler never fills the top-logprob keys. The echo branch must not

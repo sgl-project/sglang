@@ -62,9 +62,9 @@ logger = logging.getLogger(__name__)
 
 # Map OpenAI finish reasons to Anthropic stop reasons. Only the four
 # values in ``AnthropicMessagesResponse.stop_reason``'s Literal are valid
-# on the wire; ``content_filter`` and ``abort`` have no perfect mapping
-# so they fall through to the ``end_turn`` default with a WARNING at the
-# call site so operators don't lose the safety/abort signal in logs.
+# on the wire; ``content_filter`` has no perfect mapping so it falls
+# through to the ``end_turn`` default with a WARNING at the call site so
+# operators don't lose the safety signal in logs.
 STOP_REASON_MAP = {
     "stop": "end_turn",
     "length": "max_tokens",

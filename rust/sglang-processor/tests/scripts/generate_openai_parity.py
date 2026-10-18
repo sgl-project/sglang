@@ -18,7 +18,6 @@ import copy
 import dataclasses
 import json
 import sys
-from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,26 +164,22 @@ def record_frames(engine_url, body):
 
 
 def replay(output):
-    """`generate_request` as the OpenAI handler sees the recorded `/generate` output."""
+    """`generate_request` as the OpenAI handler sees the recorded `/generate` output.
 
-    def internal(output):
-        for frame in output if isinstance(output, list) else [output]:
-            reason = frame.get("meta_info", {}).get("finish_reason") or {}
-            if isinstance(reason.get("status_code"), int):
-                reason["status_code"] = HTTPStatus(reason["status_code"])
-        return output
+    Abort statuses stay plain ints, as they reach the handler after msgpack IPC.
+    """
 
     async def generate_request(obj, raw_request=None):
         if "frames" not in output:
             body = output["body"]
             if output["status"] != 200:
                 raise ValueError(body["error"]["message"])
-            yield internal(json.loads(json.dumps(body)))
+            yield json.loads(json.dumps(body))
             return
         for frame in json.loads(json.dumps(stream_frames(output["frames"], False))):
             if "error" in frame:
                 raise ValueError(frame["error"]["message"])
-            yield internal(frame)
+            yield frame
 
     return generate_request
 

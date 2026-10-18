@@ -1803,11 +1803,11 @@ class TestAnthropicServing(unittest.TestCase):
     def test_stop_reason_content_filter_falls_back_with_warning(self):
         """Unmapped OpenAI finish_reasons default to 'end_turn' + log a warning.
 
-        ``content_filter`` and ``abort`` have no entry in STOP_REASON_MAP
-        because Anthropic's ``stop_reason`` Literal (end_turn/max_tokens/
+        ``content_filter`` has no entry in STOP_REASON_MAP because
+        Anthropic's ``stop_reason`` Literal (end_turn/max_tokens/
         stop_sequence/tool_use) has no perfect target. The fallback must
         produce a spec-valid stop_reason and a WARNING so operators don't
-        silently lose the safety/abort signal.
+        silently lose the safety signal.
         """
         import logging
 

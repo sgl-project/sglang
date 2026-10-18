@@ -17,8 +17,8 @@ use super::request::{
     lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
-    unary_reply, without_nulls,
+    Reply, StreamState, abort_error, abort_event, error_reply, finish_fields, logprob_slice,
+    logprobs_length, now, openai_finish_reason, unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 
@@ -335,6 +335,13 @@ pub struct CompletionResponder {
 impl CompletionResponder {
     /// `_handle_non_streaming_request` over a `/generate` response.
     pub fn unary(self, ret: Vec<GenerateResponse>) -> Option<Reply> {
+        // One choice aborted with an error status fails the whole request.
+        if let Some((code, message)) = ret
+            .iter()
+            .find_map(|item| abort_error(item.meta_info.as_ref()?.finish_reason.as_ref()))
+        {
+            return Some(error_reply(message, code));
+        }
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
             let default_meta = GenerateMetaInfo::default();
@@ -461,7 +468,7 @@ impl CompletionResponder {
             "index": index,
             "text": delta,
             "logprobs": logprobs,
-            "finish_reason": finish_type,
+            "finish_reason": openai_finish_reason(finish_type),
             "matched_stop": matched_stop,
         });
         if let Some(ids) = token_ids {
@@ -520,7 +527,7 @@ impl CompletionResponder {
             "index": index,
             "text": text,
             "logprobs": logprobs,
-            "finish_reason": finish_type,
+            "finish_reason": openai_finish_reason(finish_type),
             "matched_stop": matched_stop,
         });
         if self.return_token_ids {
@@ -599,5 +606,71 @@ impl CompletionResponder {
             }
             _ => fallback,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn responder(stream: bool, n: u64) -> CompletionResponder {
+        let body = json!({"model": "m", "prompt": "hi", "stream": stream, "n": n});
+        let settings = OpenAiSettings::default();
+        lower_completion(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            None,
+        )
+        .unwrap()
+        .1
+    }
+
+    fn item(finish: Value) -> GenerateResponse {
+        serde_json::from_value(json!({"text": "a", "output_ids": [2], "meta_info": {
+            "id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1,
+        }}))
+        .unwrap()
+    }
+
+    /// An abort without an error status is reported as "stop"; one with a
+    /// status is an error with that status, even when another choice finished.
+    #[test]
+    fn unary_abort_is_stop_or_an_error() {
+        let reply = responder(false, 1)
+            .unary(vec![item(json!({"type": "abort", "message": "Aborted."}))])
+            .unwrap();
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+
+        let ret = vec![
+            item(json!({"type": "stop"})),
+            item(json!({"type": "abort", "message": "Encoder timed out", "status_code": 504})),
+        ];
+        let reply = responder(false, 2).unary(ret).unwrap();
+        assert_eq!(reply.status, 504);
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Encoder timed out");
+    }
+
+    #[test]
+    fn stream_abort_without_status_finishes_with_stop() {
+        let mut responder = responder(true, 1);
+        let mut events = Vec::new();
+        for frame in [
+            item(Value::Null),
+            item(json!({"type": "abort", "message": "Aborted."})),
+        ] {
+            events.extend(responder.stream_data(Ok(frame)).unwrap());
+        }
+        events.extend(responder.stream_end());
+        let reasons: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .map(|chunk| chunk["choices"][0]["finish_reason"].clone())
+            .filter(|reason| !reason.is_null())
+            .collect();
+        assert_eq!(reasons, [json!("stop")], "{events:?}");
     }
 }
