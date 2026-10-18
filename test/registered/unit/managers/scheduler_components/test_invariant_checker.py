@@ -14,12 +14,14 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
+    kv_private_swa_tokens,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
@@ -40,13 +42,14 @@ class TestCheckTreeCacheGate(CustomTestCase):
             envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.clear()
             yield
 
-    def _make_checker(self):
+    def _make_checker(self, prefix_sharing=True, hybrid_swa=True, hybrid_ssm=False):
         tree_cache = MagicMock()
-        tree_cache.supports_prefix_sharing.return_value = True
-        tree_cache.supports_swa.return_value = True
+        tree_cache.supports_prefix_sharing.return_value = prefix_sharing
+        tree_cache.supports_swa.return_value = hybrid_swa
+        tree_cache.supports_mamba.return_value = hybrid_ssm
         return SchedulerInvariantChecker(
-            is_hybrid_swa=True,
-            is_hybrid_ssm=False,
+            is_hybrid_swa=hybrid_swa,
+            is_hybrid_ssm=hybrid_ssm,
             disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
             full_tokens_per_layer=None,
@@ -100,6 +103,32 @@ class TestCheckTreeCacheGate(CustomTestCase):
                 checker._check_tree_cache()
 
             checker.tree_cache.sanity_check.assert_called_once()
+
+    def test_skipped_without_prefix_sharing(self):
+        with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
+            checker = self._make_checker(
+                prefix_sharing=False, hybrid_swa=False, hybrid_ssm=True
+            )
+
+            checker._check_tree_cache()
+
+            checker.tree_cache.sanity_check.assert_not_called()
+
+
+class TestPrivateSwaTokens(CustomTestCase):
+    def test_floor_shielded_prefix_stays_private(self):
+        # A prefill-aware SWA request with radix off: the window cursor jumps to
+        # the floor (278) without freeing it, then frees [278, 300).
+        kv = ReqKvInfo(
+            req_pool_idx=0,
+            kv_allocated_len=280,
+            swa_evict_floor=278,
+            component_evicted_seqlens={ComponentType.SWA: 278},
+        )
+        self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 280)
+        kv.kv_allocated_len = 450
+        kv.set_evicted_seqlen(ComponentType.SWA, 300)
+        self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 428)
 
 
 class TestShardedFullPoolInvariant(CustomTestCase):

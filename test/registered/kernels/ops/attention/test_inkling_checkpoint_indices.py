@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -461,6 +462,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
         composite.buffers = buffers
         composite.captured_req_width = 4
         composite.draft_extend_attn_backend_list = [wrapper]
+        composite._out_cache_loc_virtual = None
+        composite._kv_loc_plan = None
+        composite._kv_loc_cols = None
         for step, tracking in enumerate((True, False, True)):
             with self.subTest(tracking=tracking, step=step):
                 ids = slots[-4:].roll(step).clone()
@@ -814,6 +818,15 @@ class TestInklingCheckpointIndices(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             device_timer=None,
             canary_manager=None,
+            # The KV side is not under test: a static pool's translator binds
+            # the captured batch to its own write ids.
+            kv_index_translator=KVIndexTranslator(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int32, device="cuda"),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=object(),
+                page_size=1,
+                device="cuda",
+            ),
         )
         return runner, backend, allocator, pool, slots, buffers
 
@@ -926,6 +939,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     input_ids=buffers.input_ids[: live * 4],
                     positions=buffers.positions[: live * 4],
                     out_cache_loc=buffers.out_cache_loc[: live * 4],
+                    out_cache_loc_virtual=None,
+                    kv_loc_plan=None,
+                    kv_loc_cols=None,
                     req_pool_indices=torch.arange(1, live + 1, device="cuda"),
                     seq_lens=torch.full((live,), 6, dtype=torch.int64, device="cuda"),
                     seq_lens_sum=6 * live,
@@ -973,7 +989,13 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         composite._stage_metadata = Mock()
                     composite.prepare(fresh)
                     runner.replay(
-                        4, composite.seq_lens_sum, composite._replay_spec_info, None
+                        4,
+                        composite.seq_lens_sum,
+                        composite._replay_spec_info,
+                        None,
+                        out_cache_loc_virtual=composite._out_cache_loc_virtual,
+                        kv_loc_plan=composite._kv_loc_plan,
+                        kv_loc_cols=composite._kv_loc_cols,
                     )
                 else:
                     runner.execute(fresh, torch.arange(live, device="cuda") * 4 + 1)

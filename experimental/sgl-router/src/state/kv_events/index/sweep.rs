@@ -981,6 +981,8 @@ mod tests {
     /// A snapshot with real content, carried by `carrier` only.
     fn warm_snapshot(carrier: &str, block_size: u32) -> PeerSnapshot {
         PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size,
             is_bigram: false,

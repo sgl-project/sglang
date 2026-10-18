@@ -175,6 +175,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                dmd_denoising_steps=(
+                    release_metadata.dmd_denoising_steps
+                    if release_metadata is not None
+                    else None
+                ),
             )
         )
         self.add_stage(
@@ -201,7 +206,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
 
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
-    """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only).
 
     The flat single-partition repo is materialized into the base-H3 layout by
     the bundled model overlay (see model_overlays/), so every stage, loader,

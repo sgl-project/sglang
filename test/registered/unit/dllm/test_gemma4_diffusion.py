@@ -71,6 +71,7 @@ def _diffusion_model_stub():
 def _dispatch_batch(*, encoder):
     return SimpleNamespace(
         forward_mode=(ForwardMode.EXTEND if encoder else ForwardMode.DLLM_EXTEND),
+        dllm_input_preparation_state=None,
         contains_image_inputs=lambda: True,
     )
 

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use tch::Tensor;
 
 use crate::components::ComponentType;
+use crate::node::ChildKeyType;
 
 // Tensor-backed shapes for the torch tests; test modules import these
 // explicitly so they shadow the generic definitions from `use super::*`.
@@ -18,6 +19,14 @@ pub(crate) type PoolTransfer = crate::unified_tree_core::PoolTransfer<Tensor>;
 pub(crate) type EvictionStepResult = crate::unified_tree_core::EvictionStepResult<Tensor>;
 pub(crate) type Node<K> = crate::node::Node<K, Tensor>;
 pub(crate) type NodeArena<K> = crate::node::NodeArena<K, Tensor>;
+
+pub(crate) fn matched_device_indices<K: ChildKeyType>(
+    tc: &UnifiedTreeCore<K>,
+    result: &MatchResult,
+) -> Tensor {
+    tc.collect_full_device_indices(result.last_device_node_id, tc.root_node_handle(None))
+        .expect("live match node")
+}
 
 /// Fold an eviction step into a caller's running accumulators (the Controller
 /// consumption contract: deltas add, freed tensors append).

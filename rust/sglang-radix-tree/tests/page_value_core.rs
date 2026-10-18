@@ -55,14 +55,19 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         key: &partial_key,
         namespace: KeyNamespaceRef::default(),
     });
-    assert_eq!(admitted.device_indices.len(), 2);
+    assert_eq!(admitted.device_prefix_len, 2);
 
     let prefix_key = vec![10, 20];
     let prefix = tree.match_prefix(&MatchPrefixParams {
         key: &prefix_key,
         namespace: KeyNamespaceRef::default(),
     });
-    assert_eq!(prefix.device_indices.as_slice(), &[1, 2]);
+    assert_eq!(
+        tree.collect_full_device_indices(prefix.last_device_node_id, tree.root_node_handle(None))
+            .unwrap()
+            .as_slice(),
+        &[1, 2]
+    );
     let prefix_lock = tree
         .inc_lock_ref(prefix.last_device_node_id, ComponentSet::EMPTY)
         .expect("live node");
@@ -119,7 +124,12 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         key: &partial_key,
         namespace: KeyNamespaceRef::default(),
     });
-    assert_eq!(matched.device_indices.as_slice(), &[1, 2, 5, 6]);
+    assert_eq!(
+        tree.collect_full_device_indices(matched.last_device_node_id, tree.root_node_handle(None))
+            .unwrap()
+            .as_slice(),
+        &[1, 2, 5, 6]
+    );
 }
 
 #[test]
@@ -218,7 +228,7 @@ fn full_kv_prefix_len_is_the_full_hit_not_the_admitted_prefix_on_mamba_trees() {
     });
     assert_eq!(read_only, 2);
     assert_eq!(admitted.full_kv_hit_length, read_only);
-    assert_eq!(admitted.device_indices.len(), 0);
+    assert_eq!(admitted.device_prefix_len, 0);
 }
 
 fn continuation(

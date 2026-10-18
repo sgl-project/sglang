@@ -567,6 +567,8 @@ mod tests {
         // Warm, silent on `first` (so its sweep keeps looking), and naming
         // `late` as a rank it holds nothing for (so a sweep for it settles).
         let body = PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 64,
             is_bigram: false,
@@ -634,6 +636,8 @@ mod tests {
             worker_id("http://w2:30000", 0),
         );
         let body = PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 64,
             is_bigram: false,
