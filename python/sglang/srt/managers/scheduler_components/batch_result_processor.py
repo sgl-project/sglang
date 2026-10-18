@@ -723,11 +723,12 @@ class SchedulerBatchResultProcessor:
             except ValueError as e:
                 # Grammar accept_token can raise ValueError if the token is not in the
                 # grammar. This can happen if the grammar is not set correctly or the
-                # token is invalid.
-                logger.error(
-                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                # token is invalid. It is a server error, as in the PD paths.
+                error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                logger.error(error_message)
+                req.to_finish = FINISH_ABORT(
+                    error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                 )
-                req.to_finish = FINISH_ABORT()
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -862,12 +863,16 @@ class SchedulerBatchResultProcessor:
                     break
         except ValueError as e:
             # accept_token raises ValueError if the token is not in the grammar
-            # (misconfigured grammar or invalid token); abort the request.
-            logger.error(
+            # (misconfigured grammar or invalid token); abort the request with a
+            # server error, as in the PD paths.
+            error_message = (
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT()
+            logger.error(error_message)
+            req.to_finish = FINISH_ABORT(
+                error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+            )
         return retained
 
     def advance_grammar_fsm(

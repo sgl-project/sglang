@@ -1,11 +1,13 @@
 """Unit tests for Spec V2 grammar truncation in _resolve_spec_v2_tokens.
 
 The grammar-constrained spec path stops accepting at the grammar-terminating
-token, so the over-drafted suffix is never committed to KV nor emitted.
+token, so the over-drafted suffix is never committed to KV nor emitted. A token
+the grammar rejects aborts the request with a server error.
 """
 
 import unittest
 from dataclasses import replace
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -155,6 +157,30 @@ def _commit_disagg_handoff(
     )
 
     queue._commit_transfer_to_req(decode_req)
+
+
+class _RejectingGrammar(_FakeGrammar):
+    def accept_token(self, token_id: int):
+        raise ValueError(f"token {token_id} not allowed")
+
+
+class TestGrammarRejection(CustomTestCase):
+    def test_rejected_token_aborts_with_server_error(self):
+        # Matches the PD paths, so the OpenAI layer reports an error rather
+        # than a successful stop.
+        proc = _make_processor()
+        for advance in (
+            lambda req: proc._accept_grammar_tokens(req, 7),
+            lambda req: proc._apply_prefill_grammar(req=req, next_token_id=7),
+        ):
+            req = _make_req(terminate_after=99)
+            req.grammar = _RejectingGrammar(terminate_after=99)
+            with self.assertLogs(level="ERROR"):
+                advance(req)
+            finish = req.to_finish.to_json()
+            self.assertEqual(finish["type"], "abort")
+            self.assertEqual(finish["status_code"], HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.assertIn("Grammar accept_token failed", finish["message"])
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):

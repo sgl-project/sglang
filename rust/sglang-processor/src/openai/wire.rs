@@ -68,12 +68,31 @@ pub(super) fn malformed_output_reply() -> Reply {
     error_reply("Internal server error", 500)
 }
 
-/// Whether `code` is one of the `HTTPStatus` codes SGLang aborts with.
-pub(super) fn is_abort_status(code: u64) -> bool {
-    matches!(
-        code,
-        400 | 401 | 403 | 404 | 408 | 413 | 422 | 429 | 500 | 501 | 502 | 503 | 504
-    )
+/// `utils.abort_error_status`: an abort carrying an error status is an
+/// error, as its status and message.
+pub(super) fn abort_error(finish_reason: &Value) -> Option<(u16, &str)> {
+    if finish_reason["type"] != "abort" {
+        return None;
+    }
+    let code = finish_reason["status_code"].as_u64()?;
+    let code = u16::try_from(code)
+        .ok()
+        .filter(|code| (400..600).contains(code))?;
+    let message = finish_reason["message"]
+        .as_str()
+        .filter(|message| !message.is_empty())
+        .unwrap_or("Generation aborted.");
+    Some((code, message))
+}
+
+/// `utils.to_openai_finish_reason`: an abort without an error status is a
+/// deliberate stop, and OpenAI defines no "abort".
+pub(super) fn openai_finish_reason(finish_type: &Value) -> Value {
+    if finish_type == "abort" {
+        "stop".into()
+    } else {
+        finish_type.clone()
+    }
 }
 
 /// `UsageProcessor.calculate_token_usage`, dumped as `UsageInfo`.

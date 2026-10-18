@@ -17,6 +17,7 @@ Usage:
 import os
 import unittest
 from concurrent.futures import Future
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -35,6 +36,7 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_THINKING,
@@ -471,6 +473,33 @@ class TestAbortRequests(unittest.TestCase):
         mgr.abort_requests(abort_req)
         future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
+
+    def test_abort_status_matches_running_requests(self):
+        # A deliberate abort carries no error status, so the OpenAI layer
+        # reports a stop; a timeout's SLA message is a 503.
+        for abort_message, expected in (
+            (None, ("Aborted by AbortReq.", None)),
+            (
+                "Request timed out",
+                ("Request timed out", HTTPStatus.SERVICE_UNAVAILABLE),
+            ),
+        ):
+            with self.subTest(abort_message=abort_message):
+                mgr = self._make_mgr_with_queue()
+                req = _make_req(rid="req-123")
+                req.grammar = MagicMock(spec=Future)
+                mgr.grammar_queue.append(req)
+
+                mgr.abort_requests(AbortReq(rid="req-123", abort_message=abort_message))
+                args, kwargs = req.set_finish_with_abort.call_args
+                message = args[0]
+                # set_finish_with_abort defaults to a 400.
+                status = (
+                    args[1]
+                    if len(args) > 1
+                    else kwargs.get("status_code", HTTPStatus.BAD_REQUEST)
+                )
+                self.assertEqual((message, status), expected)
 
     def test_abort_non_matching_rid(self):
         mgr = self._make_mgr_with_queue()
