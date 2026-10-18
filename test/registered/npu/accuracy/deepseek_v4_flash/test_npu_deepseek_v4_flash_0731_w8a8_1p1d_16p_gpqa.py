@@ -4,7 +4,8 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH, BENCHMARK_TOOL_DEFAULT,
+    TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -44,19 +45,24 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
+    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
+    # PD-sep: required when prefill enables CP but decode does not
+    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "DEEPEP_HCCL_BUFFSIZE": "2600",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
-    "HCCL_BUFFSIZE": "2048",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
+    "SGLANG_PROFILE_WITH_STACK": "False",
     # send cached prefix to decode early for radix-cache hits
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
@@ -69,17 +75,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
-    "SGLANG_NPU_USE_MULTI_STREAM": "0",
+    "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
-# Prefill node (1 node x 16 NPUs, TP16 DP16) launch arguments.
+# Prefill node (1 node x 16 NPUs, TP8 PP2 DP8) launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
     128,
     "--tp-size",
-    16,
+    8,
+    "--pp-size",
+    2,
     "--trust-remote-code",
     "--device",
     "npu",
@@ -92,18 +100,20 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-transfer-backend",
     "ascend",
     "--mem-fraction-static",
-    0.68,
+    0.62,
     "--prefill-max-requests",
     256,
     "--max-prefill-tokens",
-    67000,
-    "--chunked-prefill-size",
-    65536,
+    70000,
     "--max-running-requests",
     256,
+    "--chunked-prefill-size",
+    131072,
     "--dp-size",
-    16,
+    8,
     "--enable-dp-attention",
+    "--tokenizer-worker-num",
+    16,
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -116,6 +126,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disable-cuda-graph",
     "--load-balance-method",
     "round_robin",
+    "--enable-prefill-cp",
+    "--cp-strategy",
+    "interleave",
+    "--enable-cache-report",
+    "--enable-hierarchical-cache",
+    "--hicache-io-backend",
+    "kernel_ascend",
+    "--hicache-ratio",
+    1.5,
+    "--hicache-write-policy",
+    "write_through",
+    "--max-total-tokens",
+    140000,
 ]
 
 # Decode node (1 node x 16 NPUs, TP16 DP16) launch arguments.
@@ -132,7 +155,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.68,
+    0.71,
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
@@ -160,10 +183,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     4,
     5,
     6,
-    7,
-    8,
-    9,
-    10,
     # DSPARK speculative decoding with the bundled W8A8 draft.
     "--speculative-algorithm",
     "DSPARK",
@@ -215,6 +234,28 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
         self.run_accuracy()
+
+class TestNPUDeepSeekV4Flash0731W8A81P1D16PIn128kOut1k90PrefixCache(TestNpuPerfMultiNodePdSepTestCaseBase):
+    """Test NPU performance for Qwen3.6-27B-w8a8 2p in128k out1k 50ms"""
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
+    model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
+    dataset_name = "generated-shared-prefix"
+    max_concurrency = 20
+    num_prompts = 20
+    input_len = 131072
+    output_len = 1024
+    random_range_ratio = 1
+    seed = 1
+    repeat_rate = 0.9
+    request_rate = float("inf")
+    warmup_requests = 16
+    pop_sglang_is_in_ci_for_gsp = True
+
+
+    def test_npu_qwen3_6_27b_2p_in128k_out1k_50ms(self):
+        """Run NPU performance test for Qwen3.6-27B-w8a8 in128k out1k 50ms"""
+        self.run_throughput()
 
 
 if __name__ == "__main__":
