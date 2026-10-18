@@ -17,6 +17,7 @@ import torch
 
 try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        TRITON_DEVICE_TYPES,
         _require_entry_contiguous_dst,
         fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
@@ -25,6 +26,8 @@ try:
 
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
+    # No importable kernel means no Triton device here, whatever the host is.
+    TRITON_DEVICE_TYPES = ()
     _require_entry_contiguous_dst = None
     fused_conv_window_scatter_multi = None
     fused_conv_window_scatter_with_mask = None
@@ -39,9 +42,6 @@ from sglang.srt.utils import get_device
 from sglang.srt.utils.common import get_device_module
 from sglang.test.test_utils import CustomTestCase
 
-# Backends the multi-type scatter is verified against; extend as others gain Triton.
-TRITON_DEVICES = ("cuda", "xpu")
-
 
 def _triton_device():
     # get_device() raises when the host has no accelerator; the layout-contract
@@ -50,7 +50,7 @@ def _triton_device():
         device = get_device()
     except RuntimeError:
         return None
-    return device if device in TRITON_DEVICES else None
+    return device if device in TRITON_DEVICE_TYPES else None
 
 
 DEVICE = _triton_device()
@@ -390,7 +390,7 @@ class TestMambaStateScatterEnvelopeDst(unittest.TestCase):
 
 @unittest.skipUnless(
     DEVICE is not None,
-    f"multi-type conv scatter needs one of {TRITON_DEVICES}",
+    f"multi-type conv scatter needs one of {TRITON_DEVICE_TYPES}",
 )
 class TestFusedConvWindowScatterMulti(CustomTestCase):
     """Multi-type conv scatter must place every conv type correctly; it reaches

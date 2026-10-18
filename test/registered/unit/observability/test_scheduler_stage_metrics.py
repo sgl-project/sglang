@@ -130,16 +130,19 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
 
     def test_forward_query_distinguishes_queued_active_and_completed_intervals(self):
         samples = []
-        timer = DeviceTimer(lambda **sample: samples.append(sample))
         start, end, next_start, next_end = (
             Mock(query=Mock(return_value=False)) for _ in range(4)
         )
         start.elapsed_time.return_value = 2.0
         next_start.elapsed_time.return_value = 3.0
+        # The first Event is DeviceTimer.__init__'s timing-support probe.
+        device_module = Mock()
+        device_module.Event.side_effect = [Mock(), start, end, next_start, next_end]
         with patch(
-            "sglang.srt.utils.device_timer.torch.cuda.Event",
-            side_effect=[start, end, next_start, next_end],
+            "sglang.srt.utils.device_timer.get_device_module",
+            return_value=device_module,
         ):
+            timer = DeviceTimer(lambda **sample: samples.append(sample))
             self.assertFalse(timer.is_active())
             with timer.wrap(metadata={"category": "extend"}):
                 self.assertFalse(timer.is_active())  # Queued, not started.
