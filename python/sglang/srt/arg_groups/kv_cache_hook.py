@@ -754,6 +754,12 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     )
 
 
+# Unified-memory backends that carry v_head_dim through to the kernel, so a
+# V row narrower than K (MiMoV2: 192 / 128) reads correctly. FlashInfer's
+# paged_kv_t compiles ONE head_dim for both; trtllm_mha refuses unequal dims.
+ASYMMETRIC_KV_BACKENDS = frozenset({"triton", "fa3", "fa4"})
+
+
 def handle_page_major_kv_layout(server_args: Any):
     # --enable-unified-memory implies --enable-page-major-kv-layout, so the
     # unified pool goes through this one gate (declared before the guard).
@@ -774,23 +780,7 @@ def handle_page_major_kv_layout(server_args: Any):
         "reimplementation. Run with --enable-unified-memory, or drop "
         "--enable-page-major-kv-layout."
     )
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        unified_memory_supported_for_model,
-    )
-
     model_config = model_config_of(server_args)
-    assert unified_memory_supported_for_model(
-        model_config, use_mla_backend=use_mla_backend(server_args)
-    ), (
-        "--enable-unified-memory does not yet admit asymmetric K/V rows "
-        "(head_dim != v_head_dim); this model has "
-        f"head_dim={model_config.head_dim}, "
-        f"v_head_dim={model_config.v_head_dim}, "
-        f"swa_head_dim={model_config.swa_head_dim}, "
-        f"swa_v_head_dim={model_config.swa_v_head_dim}. The token-major "
-        "views can hold them, but the backends' write and read paths are "
-        "not audited for it; run this model without --enable-unified-memory."
-    )
     # Allow-list. Every backend below reads through the translator, so what
     # gates one is only whether its kernels address the per-layer views by
     # their strides (the slot stride is the whole entry, not one row):
@@ -798,6 +788,8 @@ def handle_page_major_kv_layout(server_args: Any):
     #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
+    #   * MHA/SWA models with asymmetric K/V rows: only the backends that
+    #     carry v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS).
     # Names are the RESOLVED ids from attention_backends_of.
     if use_mla_backend(server_args):
         allowed_full = {
@@ -809,6 +801,8 @@ def handle_page_major_kv_layout(server_args: Any):
             "tokenspeed_mla",
             "flashmla",
         }
+    elif model_config.has_asymmetric_kv:
+        allowed_full = set(ASYMMETRIC_KV_BACKENDS)
     else:
         allowed_full = {
             "triton",
@@ -822,9 +816,8 @@ def handle_page_major_kv_layout(server_args: Any):
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "
-        f"{sorted(allowed_full)} for this configuration (unified memory "
-        "allows the stride-aware per-layer-view families). Pass a "
-        "compatible --attention-backend."
+        f"{sorted(allowed_full)} for this configuration. Pass a compatible "
+        "--attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):
@@ -832,14 +825,15 @@ def handle_page_major_kv_layout(server_args: Any):
     #   stride as a free int64); helion (specializes KDA state strides 0-3
     #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
     #   gating update is stride-safe) on KDA-hybrid models only.
-    # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
-    #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
+    # - prefill: triton; flashinfer (GDN gathers/scatters contiguous state);
+    #   flashkda (the wrapper gathers/scatters a contiguous per-slot copy);
+    #   helion; cutedsl (kernel_h compiles h0/ht with dynamic
     #   int64 strides), with the same KDA-only caveat.
     # - mamba (mamba2/short-conv state): triton only.
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
     decode_allowed = {"triton", "flashinfer"}
-    prefill_allowed = {"triton", "flashkda"}
+    prefill_allowed = {"triton", "flashkda", "flashinfer"}
     if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})
