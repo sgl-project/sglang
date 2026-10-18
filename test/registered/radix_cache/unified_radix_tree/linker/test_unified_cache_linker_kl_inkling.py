@@ -27,7 +27,6 @@ register_cuda_ci(
     est_time=300,
     stage="extra-a",
     runner_config="1-gpu-large",
-    disabled="Re-enable after #44220 merges: Full prefill graph must wait for layer-wise loads; until 2026-10-29",
 )
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
