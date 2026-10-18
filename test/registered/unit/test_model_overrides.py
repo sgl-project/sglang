@@ -226,6 +226,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "mm_enable_dp_encoder",
                 }
             ),
         )

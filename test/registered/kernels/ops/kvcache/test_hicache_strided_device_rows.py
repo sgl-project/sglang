@@ -72,35 +72,31 @@ class TestHiCacheStridedDeviceRows(CustomTestCase):
                     end_layer=device.end_layer,
                     write_back_staging=device.hicache_write_back_staging,
                 )
-                try:
-                    if not host.can_use_jit:
-                        self.skipTest(
-                            "strided device rows need the JIT HiCache kernels"
-                        )
+                self.addCleanup(host.destroy)
+                if not host.can_use_jit:
+                    self.skipTest("strided device rows need the JIT HiCache kernels")
 
-                    src = torch.tensor([3, 7, 20, 41], device="cuda")
-                    dst = torch.tensor([5, 9, 30, 50], device="cuda")
-                    want = [
-                        (k[src].clone(), v[src].clone())
-                        for k, v in zip(device.k_buffer, device.v_buffer)
-                    ]
-                    host_slots = host.alloc(len(src)).to("cuda")
+                src = torch.tensor([3, 7, 20, 41], device="cuda")
+                dst = torch.tensor([5, 9, 30, 50], device="cuda")
+                want = [
+                    (k[src].clone(), v[src].clone())
+                    for k, v in zip(device.k_buffer, device.v_buffer)
+                ]
+                host_slots = host.alloc(len(src)).to("cuda")
 
-                    host.backup_from_device_all_layer(device, host_slots, src, "kernel")
-                    for layer in range(_L):
-                        host.load_to_device_per_layer(
-                            device, host_slots, dst, layer, "kernel"
-                        )
-                    torch.cuda.synchronize()
+                host.backup_from_device_all_layer(device, host_slots, src, "kernel")
+                for layer in range(_L):
+                    host.load_to_device_per_layer(
+                        device, host_slots, dst, layer, "kernel"
+                    )
+                torch.cuda.synchronize()
 
-                    for layer, (k, v) in enumerate(want):
-                        self.assertTrue(torch.equal(device.k_buffer[layer][dst], k))
-                        self.assertTrue(torch.equal(device.v_buffer[layer][dst], v))
-                    # The staged write-back reads whole device pages: packed rows only.
-                    self.assertEqual(host.device_row_stride_bytes, _E * 2)
-                    self.assertFalse(host.can_use_write_back_jit)
-                finally:
-                    host.destroy()
+                for layer, (k, v) in enumerate(want):
+                    self.assertTrue(torch.equal(device.k_buffer[layer][dst], k))
+                    self.assertTrue(torch.equal(device.v_buffer[layer][dst], v))
+                # The staged write-back reads whole device pages: packed rows only.
+                self.assertEqual(host.device_row_stride_bytes, _E * 2)
+                self.assertFalse(host.can_use_write_back_jit)
 
 
 if __name__ == "__main__":

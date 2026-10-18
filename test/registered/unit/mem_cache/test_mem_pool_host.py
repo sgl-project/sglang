@@ -133,6 +133,38 @@ class TestHostKVCache(CustomTestCase):
             info.buffer_info.validate(layer_ids=info.layer_ids)
             self.assertEqual(len(info.buffer_info.buffers.k), len(layers))
 
+    def test_direct_page_first_direct_rejects_strided_rows(self):
+        device = self.device_pool
+        device.k_buffer = [
+            torch.empty((buf.shape[0] * 2, *buf.shape[1:]), dtype=buf.dtype)[::2]
+            for buf in device.k_buffer
+        ]
+        device.v_buffer = [
+            torch.empty((buf.shape[0] * 2, *buf.shape[1:]), dtype=buf.dtype)[::2]
+            for buf in device.v_buffer
+        ]
+        device._init_data_ptrs_and_strides()
+        host = MHATokenToKVPoolHost(
+            buffer_info=device.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="page_first_direct",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+            device_capacity_tokens=device.size,
+            start_layer=device.start_layer,
+            end_layer=device.end_layer,
+        )
+        self.addCleanup(host.destroy)
+        src = torch.tensor([0, 1])
+        host_slots = host.alloc(len(src))
+        with self.assertRaisesRegex(NotImplementedError, "direct_lf_pf"):
+            host.backup_from_device_all_layer(device, host_slots, src, "direct")
+        with self.assertRaisesRegex(NotImplementedError, "direct_pf_lf"):
+            host.load_to_device_per_layer(device, host_slots, src, 0, "direct")
+
     def test_packed_transfers_use_captured_target_and_draft_buffers(self):
         """Target and draft rows retain their bound destinations during transfer."""
 
