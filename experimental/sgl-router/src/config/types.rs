@@ -394,7 +394,7 @@ pub struct ModelConfig {
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
     pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
-    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// Reorg admission for groups that leave a limit unset: `--max-inflight-requests`
     /// and `--max-kv-usage`.
     pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
