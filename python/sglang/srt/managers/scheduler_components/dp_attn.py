@@ -177,6 +177,7 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    live_scale_target: Optional[int] = None
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -208,9 +209,10 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
-                # Read as the last column; new fields go before it.
-                int(departure_pending()),
-            ],
+            ]
+            + ([] if self.live_scale_target is None else [self.live_scale_target])
+            # Departure is always the last column.
+            + [int(departure_pending())],
             device=device,
             dtype=dtype,
         )
@@ -231,8 +233,9 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
-                0,  # departure_pending: an absent slot cannot post an mlp_sync.
-            ],
+            ]
+            + ([] if self.live_scale_target is None else [0])
+            + [0],
             device=device,
             dtype=dtype,
         )
@@ -717,6 +720,7 @@ def prepare_mlp_sync_batch_raw(
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
 
+    live_scale = getattr(model_runner, "live_scale", None)
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
         tp_size=attn_tp_size,
@@ -736,6 +740,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        live_scale_target=(live_scale.local_control_target() if live_scale else None),
     )
 
     if num_dp_ranks == 1:
@@ -752,6 +757,10 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if live_scale is not None:
+        if not metadata_ready:
+            raise RuntimeError("Live scale requires synchronized DP batch metadata")
+        live_scale.observe_control_targets(mlp_sync_info.tp0_info_cpu[:, -2].tolist())
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
