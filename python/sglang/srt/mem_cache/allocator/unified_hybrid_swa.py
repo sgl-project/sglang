@@ -24,6 +24,7 @@ from typing import Callable, Hashable, List, Optional, Sequence, Tuple
 import torch
 from torch.profiler import record_function
 
+from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
 from sglang.srt.mem_cache.allocator.swa import (
@@ -45,7 +46,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_disagg, get_memory
 from sglang.srt.utils.common import get_num_new_pages
-from sglang.srt.utils.invariants import expect
+from sglang.srt.utils.invariants import expect, resolve_level
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 logger = logging.getLogger(__name__)
@@ -426,10 +427,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         if not self.ensure_capacity(need_tokens, swa_tokens):
             return None
 
-        # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
-        # its view after the slice is consumed.
+        # free_virtual_ids is rebound (slice/cat), never mutated in place,
+        # so this prefix view stays valid for SWA after FULL consumes it.
         fa = self.full_attn_allocator
-        new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+        new_virtual_pages = fa.free_virtual_ids[:num_new_pages]
 
         out_indices = fa.alloc_extend(
             prefix_lens,
@@ -630,11 +631,14 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
 
     def _free_swa_page_reps(self, reps: torch.Tensor) -> None:
         v_pages = reps // self.page_size
-        expect(
-            UNIFIED_SWA_SEGMENT_BOUND,
-            self.swa_attn_allocator.virtual_to_physical[v_pages] > 0,
-            msg="caller wants free_full_segment",
-        )
+        # Signal-only invariant: avoid launching its lookup and comparison
+        # when detection is disabled. This invariant has no recovery action.
+        if resolve_level() >= InvariantCheckLevel.WARN:
+            expect(
+                UNIFIED_SWA_SEGMENT_BOUND,
+                self.swa_attn_allocator.virtual_to_physical[v_pages] > 0,
+                msg="caller wants free_full_segment",
+            )
         self.swa_attn_allocator.free(reps, _pages=v_pages)
 
     def free_full(self, free_index: torch.Tensor) -> None:
@@ -655,11 +659,15 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         reps = self.full_attn_allocator._page_reps(
             free_index.detach().to(torch.int64), start_pos
         )
-        expect(
-            UNIFIED_SWA_SEGMENT_RELEASED,
-            self.swa_attn_allocator.virtual_to_physical[reps // self.page_size] <= 0,
-            msg="caller wants free_segment",
-        )
+        # Signal-only invariant: avoid launching its lookup and comparison
+        # when detection is disabled. This invariant has no recovery action.
+        if resolve_level() >= InvariantCheckLevel.WARN:
+            expect(
+                UNIFIED_SWA_SEGMENT_RELEASED,
+                self.swa_attn_allocator.virtual_to_physical[reps // self.page_size]
+                <= 0,
+                msg="caller wants free_segment",
+            )
         if self.free_page_reps_group is None:
             self._release_page_reps((), (reps,))
         else:
@@ -1685,10 +1693,32 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         h_s = sa._hole_pages()
         r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
         r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
+        # Allocator state is stable throughout this query. Snapshot the band
+        # geometry once instead of walking the chain at every binary-search step.
+        full_gap = fa._current_gap_bytes()
+        full_low = fa._byte_low_frontier()
+        full_page_bytes = fa.entry_bytes_per_page
+        swa_chain_low = sa._chain_high_frontier_below_bytes()
+        if sa._is_frontier_transparent():
+            swa_high_band_low = swa_chain_low
+            swa_low_room = 0
+        else:
+            swa_high_band_low = sa._byte_high_frontier()
+            swa_low_room = sa.pages_in_band(
+                low_byte=swa_chain_low, high_byte=sa._byte_low_frontier()
+            )
+
         lo_n, hi_n = 0, min(h_f + r_f, h_s + r_s)
         while lo_n < hi_n:
             mid = (lo_n + hi_n + 1) // 2
-            if self._fits_page_demand(mid, mid):
+            full_bytes = max(0, mid - h_f) * full_page_bytes
+            swa_room = max(
+                swa_low_room,
+                sa.pages_in_band(
+                    low_byte=swa_high_band_low, high_byte=full_low - full_bytes
+                ),
+            )
+            if full_bytes <= full_gap and max(0, mid - h_s) <= swa_room:
                 lo_n = mid
             else:
                 hi_n = mid - 1
