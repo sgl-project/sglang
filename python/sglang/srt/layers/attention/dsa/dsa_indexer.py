@@ -426,12 +426,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             num_init_tokens=self.num_init_tokens,
             num_local_tokens=self.num_local_tokens,
         )
-        # The fused GEMV pre-merges [wk ; weights_proj] into one bf16 weight,
-        # so both must be bf16; a checkpoint that quantises one of them cannot
-        # take this path. Resolve every module defensively: use_dsa_indexer_fusion
-        # builds wk_weights_proj and leaves wk/weights_proj undefined, and a
-        # quantised checkpoint names its parameter something other than `weight`,
-        # so neither the modules nor their `.weight` can be assumed to exist.
+        # Node 2 takes bf16 head weights, so weights_proj must be bf16. wq_b and
+        # wk must be both bf16 (merged into the fused GEMV) or both block-FP8
+        # (their own GEMMs run); Gfx950FusedIndexer._constants and run() handle
+        # no mix of the two. Resolve every module defensively:
+        # use_dsa_indexer_fusion builds wk_weights_proj and leaves wk/weights_proj
+        # undefined, and a quantised checkpoint may name its parameter something
+        # other than `weight`, so neither the modules nor their `.weight` can be
+        # assumed to exist.
         wk_w = getattr(getattr(self, "wk", None), "weight", None)
         wp_w = getattr(getattr(self, "weights_proj", None), "weight", None)
         wq_b_w = getattr(getattr(self, "wq_b", None), "weight", None)
@@ -439,14 +441,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             wk_w is not None
             and wp_w is not None
             and wq_b_w is not None
-            and wk_w.dtype == torch.bfloat16
             and wp_w.dtype == torch.bfloat16
-            and wq_b_w.dtype == torch.bfloat16
+            and wk_w.dtype == wq_b_w.dtype
+            and wk_w.dtype in (torch.bfloat16, fp8_dtype)
         )
         if gfx950_shape_ok and not gfx950_weights_ok:
             logger.info(
-                "gfx950 fused DSA indexer disabled: needs bf16 wk/weights_proj/"
-                "wq_b, got %s/%s/%s",
+                "gfx950 fused DSA indexer disabled: needs bf16 weights_proj and "
+                "wk/wq_b both bf16 or both fp8, got wk=%s weights_proj=%s wq_b=%s",
                 getattr(wk_w, "dtype", None),
                 getattr(wp_w, "dtype", None),
                 getattr(wq_b_w, "dtype", None),
@@ -469,7 +471,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ):
             logger.info(
                 "gfx950 fused DSA indexer not used on this layer: "
-                "dsa_indexer_fusion=%s shape_supported=%s weights_bf16=%s",
+                "dsa_indexer_fusion=%s shape_supported=%s weights_supported=%s",
                 self.use_dsa_indexer_fusion,
                 gfx950_shape_ok,
                 gfx950_weights_ok,
@@ -488,6 +490,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
             self._gfx950_fused = Gfx950FusedIndexer(self)
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported while the gfx950 fused "
+                "DSA indexer is enabled: it keeps one-time copies of k_norm (and "
+                "of [wk ; weights_proj] on bf16 checkpoints). Restart with "
+                "--no-enable-dsa-fused-indexer to allow online updates."
+            )
 
             # Take the workspace here, while weights load, so calculate_pool_sizes still
             # sees the real free memory. Deferring it left the pools sized against memory
@@ -726,9 +734,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if forward_batch.attn_cp_metadata is not None:
             _decline_fused("context parallelism gathers K outside the kernel")
             return None
-        # The fused GEMV takes bf16 hidden states, not the quantised tuple.
-        if isinstance(x, tuple) or x.dtype != torch.bfloat16:
-            _decline_fused("hidden states are not plain bf16")
+        # bf16 hidden states, or the (fp8, scale, bf16) tuple of the gfx95 fused
+        # RMSNorm + quant; run() hands each GEMM the form it takes.
+        x_bf16 = x[2] if isinstance(x, tuple) and len(x) == 3 else x
+        if not isinstance(x_bf16, torch.Tensor) or x_bf16.dtype != torch.bfloat16:
+            _decline_fused("hidden states carry no bf16 copy")
             return None
         # LoRA owns base+delta; the weights this path consumes are base only --
         # wk/weights_proj pre-merged into one bf16 tensor and wq_b taken straight
@@ -760,7 +770,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             _decline_fused("the DSA cache layer-split pool needs store-then-read")
             return None
 
-        rows = x.shape[0]
+        rows = x_bf16.shape[0]
         if not (1 <= rows <= MAX_ROWS):
             _decline_fused(f"row count is outside [1, {MAX_ROWS}]")
             return None
@@ -786,7 +796,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         state = self._gfx950_fused
         if not state.ensure_workspace(
-            device=x.device,
+            device=x_bf16.device,
             max_cols=page_table_64.shape[1] * PAGE_SIZE,
             fp8_dtype=fp8_dtype,
         ):
@@ -2010,26 +2020,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             if return_indices:
                 topk_result = torch.full(
-                    (x.shape[0], self.index_topk),
+                    (x_meta.shape[0], self.index_topk),
                     -1,
-                    device=x.device,
+                    device=x_meta.device,
                     dtype=torch.int32,
                 )
             else:
                 topk_result = torch.empty(
-                    (0, self.index_topk), device=x.device, dtype=torch.int32
+                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             graph_dispatch_fn = (
                 bcg_dsa_indexer_prefill_split
                 if is_in_breakable_cuda_graph()
                 else pcg_dsa_indexer_prefill_split
             )
+            # ROCm aiter fused RMSNorm+quant hands over (x, x_s[, x_bf16]).
+            x_parts = x if isinstance(x, tuple) else (x,)
             graph_dispatch_fn(
                 layer_id=layer_id,
-                x=x,
+                x=x_parts[0],
                 q_lora=q_lora,
                 positions=positions,
                 topk_result=topk_result,
+                x_s=x_parts[1] if len(x_parts) > 1 else None,
+                x_bf16=x_parts[2] if len(x_parts) > 2 else None,
             )
             result = _broadcast_indexer_topk_from_rank0(
                 topk_result if return_indices else None
