@@ -80,14 +80,22 @@ def _kda_track_ssm_kernel(
     mask = offs < numel
     if mode == 1:
         src = tl.load(cache_indices + r).to(tl.int64)
-        val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
+        # Distinct per-arm names: ssm_pool is bf16 while h_track is fp32, and
+        # triton >=3.8 make_ir asserts a type match for ANY same-named variable
+        # assigned in both arms of a runtime if -- even when it is never read
+        # after the join ("Mismatched type for val between then block and else
+        # block"); per-branch stores alone are not enough (the D2-5 boot-7
+        # attempt failed on this same shape with the stores already per-arm),
+        # and 3.7 accepted even the shared-name join.
+        val_ssm = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
+        tl.store(ssm_pool + dst * stride_ssm_slot + offs, val_ssm, mask=mask)
     else:
-        val = tl.load(h_track + r.to(tl.int64) * stride_h_row + offs, mask=mask)
-    tl.store(
-        ssm_pool + dst * stride_ssm_slot + offs,
-        val.to(ssm_pool.dtype.element_ty),
-        mask=mask,
-    )
+        val_h = tl.load(h_track + r.to(tl.int64) * stride_h_row + offs, mask=mask)
+        tl.store(
+            ssm_pool + dst * stride_ssm_slot + offs,
+            val_h.to(ssm_pool.dtype.element_ty),
+            mask=mask,
+        )
 
 
 def kda_track_conv_window(
