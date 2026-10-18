@@ -18,6 +18,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import torch
+from packaging.version import Version
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,9 @@ def helion_supported(
     if forced_backend is not None and forced_backend is not KernelBackend.HELION:
         return False
     helion_version = _base_package_version("helion")
-    if helion_version != "1.4.0":
+    if helion_version is None or Version(helion_version) < Version("1.5.0"):
         return _warn_unsupported(
-            f"Helion 1.4.0 is required, found {helion_version or 'not installed'}"
+            f"Helion >=1.5.0 is required, found {helion_version or 'not installed'}"
         )
     if not tensor.is_cuda:
         return False
