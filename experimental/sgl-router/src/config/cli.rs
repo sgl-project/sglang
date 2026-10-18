@@ -271,8 +271,9 @@ pub struct RoutingArgs {
     pub filter: Vec<FilterKind>,
 
     /// Router-local in-flight limit: for `--filter overloaded`, or reorg admission.
-    #[arg(long)]
-    pub max_in_flight: Option<usize>,
+    /// `--max-in-flight` is still accepted as an alias.
+    #[arg(long, visible_alias = "max-in-flight")]
+    pub max_inflight_requests: Option<usize>,
 
     /// Reorg admission: reject an engine whose KV tokens have reached this share
     /// of its reported capacity, in (0, 1].
@@ -789,17 +790,17 @@ impl RoutingArgs {
         }
         let has = |k: FilterKind| self.filter.contains(&k);
         ensure!(
-            !has(FilterKind::Overloaded) || self.max_in_flight.is_some(),
-            "`--filter overloaded` requires --max-in-flight"
+            !has(FilterKind::Overloaded) || self.max_inflight_requests.is_some(),
+            "`--filter overloaded` requires --max-inflight-requests"
         );
-        // Reorg applies --max-in-flight as admission; legacy only through the filter.
+        // Reorg applies --max-inflight-requests as admission; legacy only through the filter.
         ensure!(
-            reorg || self.max_in_flight.is_none() || has(FilterKind::Overloaded),
-            "--max-in-flight requires `--filter overloaded` or --chat-routing reorg"
+            reorg || self.max_inflight_requests.is_none() || has(FilterKind::Overloaded),
+            "--max-inflight-requests requires `--filter overloaded` or --chat-routing reorg"
         );
         ensure!(
-            self.max_in_flight != Some(0),
-            "--max-in-flight must be greater than 0"
+            self.max_inflight_requests != Some(0),
+            "--max-inflight-requests must be greater than 0"
         );
         ensure!(
             (self.prefix_cache_min_share.is_some() == has(FilterKind::PrefixCache)),
@@ -816,7 +817,7 @@ impl RoutingArgs {
         );
         let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
             filters: self.filter.clone(),
-            max_in_flight: self.max_in_flight,
+            max_in_flight: self.max_inflight_requests,
             min_prefix_share: self.prefix_cache_min_share,
         });
 
@@ -830,7 +831,7 @@ impl RoutingArgs {
             max_kv_usage: self.max_kv_usage,
             max_waiting_requests: self.max_waiting_requests,
             max_pending_prefill_tokens: self.max_pending_prefill_tokens,
-            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_inflight_requests: self.max_inflight_requests.map(|n| n as u64),
         };
         limits
             .validate()
@@ -1215,16 +1216,24 @@ mod tests {
             session.model.affinity.unwrap().session_id_header,
             "x-session"
         );
-        let overloaded = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+        let overloaded = parse(&["--filter", "overloaded", "--max-inflight-requests", "2"])
             .unwrap()
             .model;
         assert_eq!(overloaded.eligibility.unwrap().max_in_flight, Some(2));
         assert_eq!(overloaded.reorg_admission.max_inflight_requests, Some(2));
+        let alias = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+            .unwrap()
+            .model;
+        assert_eq!(
+            alias.reorg_admission.max_inflight_requests,
+            Some(2),
+            "--max-in-flight stays an alias of --max-inflight-requests"
+        );
         let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
         assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
         assert!(kv.eligibility.is_none());
         let admission = parse(&[
-            "--max-in-flight",
+            "--max-inflight-requests",
             "96",
             "--max-running-usage",
             "0.9",
@@ -1251,7 +1260,7 @@ mod tests {
             ["--max-running-usage", "0.9"],
             ["--max-waiting-requests", "48"],
             ["--max-pending-prefill-tokens", "32768"],
-            ["--max-in-flight", "96"],
+            ["--max-inflight-requests", "96"],
         ] {
             let legacy = Cli::try_parse_from(base.iter().chain(&args));
             assert!(
@@ -2336,7 +2345,7 @@ mod tests {
             "round_robin",
             "--filter",
             "overloaded,prefix_cache",
-            "--max-in-flight",
+            "--max-inflight-requests",
             "64",
             "--prefix-cache-min-share",
             "0.6",
@@ -2362,12 +2371,23 @@ mod tests {
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
         let cases: [(&[&str], &str); 8] = [
-            (&["--filter", "overloaded"], "requires --max-in-flight"),
-            (&["--max-in-flight", "64"], "or --chat-routing reorg"),
+            (
+                &["--filter", "overloaded"],
+                "requires --max-inflight-requests",
+            ),
+            (
+                &["--max-inflight-requests", "64"],
+                "or --chat-routing reorg",
+            ),
             (&["--filter", "prefix_cache"], "require each other"),
             (&["--prefix-cache-min-share", "0.6"], "require each other"),
             (
-                &["--filter", "overloaded,overloaded", "--max-in-flight", "64"],
+                &[
+                    "--filter",
+                    "overloaded,overloaded",
+                    "--max-inflight-requests",
+                    "64",
+                ],
                 "listed more than once",
             ),
             (
@@ -2380,7 +2400,7 @@ mod tests {
                 "must be in (0, 1]",
             ),
             (
-                &["--filter", "overloaded", "--max-in-flight", "0"],
+                &["--filter", "overloaded", "--max-inflight-requests", "0"],
                 "must be greater than 0",
             ),
             (
@@ -2389,7 +2409,7 @@ mod tests {
                     "sticky",
                     "--filter",
                     "overloaded",
-                    "--max-in-flight",
+                    "--max-inflight-requests",
                     "1",
                 ],
                 "cannot be combined with --policy sticky",
