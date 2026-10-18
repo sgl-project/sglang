@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import torchaudio.functional as AF
 from transformers.feature_extraction_utils import BatchFeature, FeatureExtractionMixin
 
+from sglang.srt.multimodal.audio_limits import configured_audio_decode_limits
+
 
 @dataclass
 class InklingAudioEncoderParams:
@@ -56,12 +58,49 @@ def _to_exact_int(value: float, name: str, tolerance: float = 1e-6) -> int:
 
 
 def _decode_audio(audio_bytes: bytes, sample_rate: int) -> torch.Tensor:
-    samples, src_sample_rate = sf.read(
-        io.BytesIO(audio_bytes), dtype="float32", always_2d=True
+    limits = configured_audio_decode_limits()
+    with sf.SoundFile(io.BytesIO(audio_bytes)) as source:
+        src_sample_rate = int(source.samplerate)
+        limits.check_samples(
+            int(source.frames),
+            src_sample_rate,
+            int(source.channels),
+            4,
+            kind="source audio",
+        )
+        samples = source.read(dtype="float32", always_2d=True)
+    limits.check_samples(
+        int(samples.shape[0]),
+        src_sample_rate,
+        int(samples.shape[1]),
+        int(samples.dtype.itemsize),
+        kind="decoded audio",
     )
-    mono = samples.mean(axis=1)
+    mono = samples.mean(axis=1) if samples.shape[1] > 1 else samples[:, 0]
+    limits.check_samples(
+        int(mono.shape[0]),
+        src_sample_rate,
+        1,
+        int(mono.dtype.itemsize),
+        kind="decoded audio",
+    )
     if src_sample_rate != sample_rate:
+        expected_samples = math.ceil(mono.shape[0] * sample_rate / src_sample_rate)
+        limits.check_samples(
+            expected_samples,
+            sample_rate,
+            1,
+            int(mono.dtype.itemsize),
+            kind="resampled audio",
+        )
         mono = _resample(mono, src_sample_rate, sample_rate)
+        limits.check_samples(
+            int(mono.shape[0]),
+            sample_rate,
+            1,
+            int(mono.dtype.itemsize),
+            kind="resampled audio",
+        )
     return torch.from_numpy(np.ascontiguousarray(mono, dtype=np.float32))
 
 

@@ -18,6 +18,12 @@ import logging
 
 import numpy as np
 
+from sglang.srt.multimodal.audio_limits import (
+    AudioDecodeLimits,
+    AudioLimitExceeded,
+    resolve_audio_decode_limits,
+)
+
 logger = logging.getLogger(__name__)
 
 _INVALID_AUDIO_CONTAINER_MESSAGE = (
@@ -50,10 +56,23 @@ def _append_resampled_frames(
     frames,
     *,
     mono: bool,
-) -> None:
+    limits: AudioDecodeLimits,
+    target_sr: int,
+    total_samples: int,
+) -> int:
     for frame in frames:
+        channels = 1 if mono else frame.layout.nb_channels
+        sample_count = frame.samples
+        limits.check_samples(
+            total_samples + sample_count,
+            target_sr,
+            channels,
+            np.dtype(np.float32).itemsize,
+        )
         array = frame.to_ndarray()
         chunks.append(array.reshape(-1) if mono else array.T)
+        total_samples += sample_count
+    return total_samples
 
 
 def decode_audio_container(
@@ -61,12 +80,15 @@ def decode_audio_container(
     *,
     target_sr: int,
     mono: bool,
+    max_duration_seconds: float | None = None,
+    max_decoded_bytes: int | None = None,
 ) -> np.ndarray:
     """Strictly decode the first audio stream from a supported container."""
     if not isinstance(target_sr, int) or target_sr <= 0:
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
     if isinstance(source, bytes) and not source:
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+    limits = resolve_audio_decode_limits(max_duration_seconds, max_decoded_bytes)
 
     try:
         import av
@@ -77,6 +99,10 @@ def decode_audio_container(
                 raise _AudioContainerDecodeError(_INVALID_AUDIO_CONTAINER_MESSAGE)
 
             audio_stream = container.streams.audio[0]
+            if audio_stream.duration is not None and audio_stream.time_base is not None:
+                limits.check_duration(
+                    float(audio_stream.duration * audio_stream.time_base)
+                )
             if mono:
                 resampler = av.audio.resampler.AudioResampler(
                     format="fltp", layout="mono", rate=target_sr
@@ -89,23 +115,40 @@ def decode_audio_container(
             chunks: list[np.ndarray] = []
             skipped_packets = 0
             first_decode_error = None
+            total_source_samples = 0
+            total_samples = 0
             for packet in container.demux(audio_stream):
                 try:
                     for frame in packet.decode():
-                        _append_resampled_frames(
+                        if frame.sample_rate and frame.layout:
+                            total_source_samples += frame.samples
+                            limits.check_samples(
+                                total_source_samples,
+                                frame.sample_rate,
+                                frame.layout.nb_channels,
+                                np.dtype(np.float32).itemsize,
+                                kind="source audio",
+                            )
+                        total_samples = _append_resampled_frames(
                             chunks,
                             resampler.resample(frame),
                             mono=mono,
+                            limits=limits,
+                            target_sr=target_sr,
+                            total_samples=total_samples,
                         )
                 except av.error.FFmpegError as error:
                     skipped_packets += 1
                     if first_decode_error is None:
                         first_decode_error = error
 
-            _append_resampled_frames(
+            total_samples = _append_resampled_frames(
                 chunks,
                 resampler.resample(None),
                 mono=mono,
+                limits=limits,
+                target_sr=target_sr,
+                total_samples=total_samples,
             )
             if skipped_packets:
                 logger.warning(
@@ -116,6 +159,8 @@ def decode_audio_container(
                     first_decode_error,
                 )
     except _AudioContainerDecodeError:
+        raise
+    except AudioLimitExceeded:
         raise
     except Exception as error:
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE) from error
@@ -143,6 +188,8 @@ def extract_audio_from_video_bytes(
             target_sr=target_sr,
             mono=True,
         )
+    except AudioLimitExceeded:
+        raise
     except Exception:
         logger.warning("Error extracting audio from video", exc_info=True)
         return None

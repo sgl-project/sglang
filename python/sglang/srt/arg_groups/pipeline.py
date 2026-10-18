@@ -99,6 +99,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(validate_prefill_cp_platform, server_args)
     run_hook(handle_hardware_runtime_validation, server_args)
+    run_hook(handle_multimodal, server_args)
     if cfg.model_path.lower() in ["none", "dummy"]:
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
@@ -112,7 +113,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
-    run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
 
