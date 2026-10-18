@@ -98,6 +98,9 @@ message SamplingParams {
   // the number of returned sequences (n <= beam_width).
   optional int64 beam_width = 26;
   WatermarkRequestConfig watermark = 27;
+  // NGRAM speculative decoding: external corpus ids to draft from. Absent uses
+  // every loaded corpus; an empty list uses none.
+  StringList ngram_corpus_ids = 28;
 }
 
 message WatermarkRequestConfig {

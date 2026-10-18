@@ -156,6 +156,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
     watermark: Optional[WatermarkRequestConfig] = None
+    # NGRAM speculative decoding: external corpus ids to draft from.
+    # None uses every loaded corpus; [] uses none.
+    ngram_corpus_ids: Optional[List[str]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -286,6 +289,16 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 raise ValueError(
                     "sampling_seed must be in [-2**63, 2**63 - 1], got "
                     f"{self.sampling_seed}."
+                )
+
+        if self.ngram_corpus_ids is not None:
+            if not isinstance(self.ngram_corpus_ids, list) or not all(
+                isinstance(c, str) and c and "\n" not in c and "\t" not in c
+                for c in self.ngram_corpus_ids
+            ):
+                raise ValueError(
+                    "ngram_corpus_ids must be a list of non-empty corpus id "
+                    f"strings, got {self.ngram_corpus_ids!r}."
                 )
 
         get_request_reasoning_end_token_ids(

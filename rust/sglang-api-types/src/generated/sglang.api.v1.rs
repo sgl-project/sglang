@@ -306,6 +306,10 @@ pub struct SamplingParams {
     pub beam_width: ::core::option::Option<i64>,
     #[prost(message, optional, tag = "27")]
     pub watermark: ::core::option::Option<WatermarkRequestConfig>,
+    /// NGRAM speculative decoding: external corpus ids to draft from. Absent uses
+    /// every loaded corpus; an empty list uses none.
+    #[prost(message, optional, tag = "28")]
+    pub ngram_corpus_ids: ::core::option::Option<StringList>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatermarkRequestConfig {
