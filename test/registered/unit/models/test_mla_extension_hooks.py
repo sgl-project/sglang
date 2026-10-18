@@ -90,7 +90,7 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
     monkeypatch.setattr(forward_mla, "_ENABLE_DSA_Q8KV8_BORN_FP8_Q", born_fp8)
     monkeypatch.setattr(forward_mla, "_is_cpu", False)
     monkeypatch.setattr(forward_mla, "_is_hip", False)
-    monkeypatch.setattr(forward_mla, "get_tc_piecewise_forward_context", lambda: None)
+    monkeypatch.setattr(forward_mla, "is_in_full_prefill_graph", lambda: False)
     monkeypatch.setattr(forward_mla, "is_in_breakable_cuda_graph", lambda: False)
     backend = SimpleNamespace(q8kv8_born_fp8_q_eligible=lambda batch, heads: True)
     monkeypatch.setattr(forward_mla, "get_attn_backend", lambda: backend)
@@ -137,6 +137,7 @@ def test_default_prepare_keeps_bmm_attention_fusion(monkeypatch):
     attn.prepare_mla_qkv = MethodType(MLA.prepare_mla_qkv, attn)
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
     monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: True)
+    monkeypatch.setattr(forward_mla, "is_in_prefill_graph_scope", lambda: True)
     assert MLA._can_fuse_bmm_into_attention(attn, SimpleNamespace())
 
 
@@ -162,7 +163,7 @@ def test_born_fp8_requires_default_query_preparation(monkeypatch, custom_prepare
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
     monkeypatch.setattr(forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
     monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: False)
-    monkeypatch.setattr(forward_mla, "get_tc_piecewise_forward_context", lambda: None)
+    monkeypatch.setattr(forward_mla, "is_in_full_prefill_graph", lambda: False)
     monkeypatch.setattr(forward_mla, "is_in_breakable_cuda_graph", lambda: False)
     backend = SimpleNamespace(q8kv8_born_fp8_q_eligible=lambda batch, heads: True)
     monkeypatch.setattr(forward_mla, "get_attn_backend", lambda: backend)
@@ -172,9 +173,8 @@ def test_born_fp8_requires_default_query_preparation(monkeypatch, custom_prepare
     assert result is (None if custom_prepare else backend)
 
 
-@pytest.mark.parametrize("piecewise", [False, True])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_default_value_projection_matches_bmm(monkeypatch, piecewise, fp8):
+def test_default_value_projection_matches_bmm(monkeypatch, fp8):
     torch.manual_seed(1)
     weight = torch.randn(2, 4, 3)
     attn = SimpleNamespace(
@@ -187,7 +187,6 @@ def test_default_value_projection_matches_bmm(monkeypatch, piecewise, fp8):
     values = torch.randn(5, 2, 4)
     monkeypatch.setattr(forward_mla, "_is_cpu", True)
     monkeypatch.setattr(forward_mla, "_is_musa", False)
-    monkeypatch.setattr(forward_mla, "is_in_tc_piecewise_cuda_graph", lambda: piecewise)
     expected = (
         torch.bmm(
             values.to(torch.bfloat16).transpose(0, 1),
