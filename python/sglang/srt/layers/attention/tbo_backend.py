@@ -33,6 +33,10 @@ class TboAttnBackend(AttentionBackend):
         return self.primary.supports_prefill_cuda_graph_max_context_size
 
     @property
+    def prefill_cuda_graph_context_unbounded(self) -> bool:
+        return self.primary.prefill_cuda_graph_context_unbounded
+
+    @property
     def dllm_attention(self):
         return self.primary.dllm_attention
 

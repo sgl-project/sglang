@@ -3848,6 +3848,10 @@ class DeepseekV4AttnBackend(
         replay has to refresh them in place."""
         return not isinstance(self.prefill_candidates, SparseTableBackend)
 
+    @property
+    def prefill_cuda_graph_context_unbounded(self) -> bool:
+        return self._prefill_graph_context_unbounded()
+
     def _prefill_graph_context_unbounded(self) -> bool:
         """Whether a prefill graph replay admits any context length: the flat
         index layers score as an eager break and the consumers score a fixed
