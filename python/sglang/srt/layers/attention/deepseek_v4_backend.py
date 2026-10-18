@@ -122,6 +122,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
+    is_capturing,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -3904,7 +3905,25 @@ class DeepseekV4AttnBackend(
             # whole bucket: live rows first, padding rows read row 0
             rows = torch.arange(x.shape[0], device=x.device).clamp_max(real - 1)
         table = published.tail_rows(rows)
-        return (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
+        out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
+        if is_capturing():
+            # Every bucket's graph reads this layer's table at one address: a
+            # replay copies its live table there, and one graph replays at a time.
+            out = self._shared_candidate_table(layer.layer_id, out)
+        return out
+
+    def _shared_candidate_table(self, layer_id: int, tensors) -> tuple:
+        sets = getattr(self, "_candidate_table_bufs", None) or {}
+        bufs = sets.setdefault(layer_id, [None] * len(tensors))
+        views = []
+        for i, t in enumerate(tensors):
+            buf = bufs[i]
+            if buf is None or buf.dtype != t.dtype or buf.numel() < t.numel():
+                # Graphs captured on a smaller buffer keep it alive themselves.
+                buf = bufs[i] = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
+            views.append(buf[: t.numel()].view(t.shape).copy_(t))
+        self._candidate_table_bufs = sets
+        return tuple(views)
 
     def _prefill_graph_set_candidate_table(self, table_tensors) -> None:
         """Capture time: bind the consumers' metadata to the bridge tensors the
