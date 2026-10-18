@@ -467,6 +467,31 @@ def test_fused_linear_gelu_guards_and_lossless_path():
 
 
 @requires_cuda
+def test_linear_gelu_verdict_is_reused_until_remount(monkeypatch):
+    if torch.cuda.get_device_capability() >= (12, 0):
+        pytest.skip(
+            "SM120 keeps these sites on the eager path before reading the linear"
+        )
+    site = _GeluSite()
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(site)
+    reads = []
+    static = linear_gelu.can_use_linear_gelu_static
+    monkeypatch.setattr(
+        linear_gelu,
+        "can_use_linear_gelu_static",
+        lambda linear: reads.append(linear) or static(linear),
+    )
+    for _ in range(3):
+        assert linear_gelu.can_use_linear_gelu(site.proj, x)
+    assert reads == [site.proj]
+    linear_gelu.FUSED_LINEAR_GELU.unmount(site)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(site)
+    assert linear_gelu.can_use_linear_gelu(site.proj, x)
+    assert reads == [site.proj, site.proj]
+
+
+@requires_cuda
 @torch.no_grad()
 def test_mounted_gelu_site_compiles_fullgraph():
     site = _GeluSite()

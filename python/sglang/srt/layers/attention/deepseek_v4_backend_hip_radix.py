@@ -973,6 +973,9 @@ class DeepseekV4HipRadixBackend(
                 )
         # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Read by the shared forward_low_ratio_sources; the ROCm tail starts after
+        # the source layer, so nothing sets it.
+        self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"

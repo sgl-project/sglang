@@ -24,6 +24,7 @@ single opaque op under ``torch.compile`` -- no graph break.
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import torch
@@ -115,10 +116,12 @@ def can_use_linear_gelu_static(linear: Any) -> bool:
     return _static_reject_reason(linear) is None
 
 
-def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
-    """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
-    if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
-        return False
+# Input-independent verdict per linear, computed on first use; mounting and
+# unmounting clear it so a re-mount re-reads the linear.
+_VERDICTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _input_independent_ok(linear: Any) -> bool:
     arch = get_jit_cuda_arch()
     if arch.major * 10 + arch.minor >= 120:
         # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
@@ -126,9 +129,19 @@ def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
         # production shape (1, 512, 3072 -> 12288).  Keep quality-gated sites
         # on their existing eager path on RTX 5090; SM90 dispatch is unchanged.
         return False
+    return can_use_linear_gelu_static(linear)
+
+
+def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
+    """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
+    if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+        return False
     if getattr(linear, "weight", None) is None or x.dtype != linear.weight.dtype:
         return False
-    return can_use_linear_gelu_static(linear)
+    verdict = _VERDICTS.get(linear)
+    if verdict is None:
+        verdict = _VERDICTS[linear] = _input_independent_ok(linear)
+    return verdict
 
 
 def _site_reject_reason(site: nn.Module) -> str | None:
@@ -136,9 +149,19 @@ def _site_reject_reason(site: nn.Module) -> str | None:
     return "missing linear" if linear is None else _static_reject_reason(linear)
 
 
+class _LinearGeluFusion(QualityGatedFusion):
+    def mount(self, root: nn.Module) -> bool:
+        _VERDICTS.clear()
+        return super().mount(root)
+
+    def unmount(self, root: nn.Module) -> None:
+        _VERDICTS.clear()
+        super().unmount(root)
+
+
 # A site's marker metadata names its up-projection linear, whose output feeds
 # ``F.gelu(..., approximate="tanh")``.
-FUSED_LINEAR_GELU = QualityGatedFusion(
+FUSED_LINEAR_GELU = _LinearGeluFusion(
     name="fused linear+GELU",
     marker_attr="_sgl_fused_gelu_linear_attr",
     enabled_attr="_sgl_fused_gelu_enabled",

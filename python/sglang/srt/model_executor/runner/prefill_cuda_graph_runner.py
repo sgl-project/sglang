@@ -117,9 +117,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import (
-    maybe_publish_prefill_shared_read_done,
-)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -127,6 +124,10 @@ from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mo
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
@@ -803,6 +804,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ):
         with (
             set_forward_batch(forward_batch),
+            prefill_graph_scope(
+                full_graph=self._is_full_backend, raw_num_tokens=raw_num_tokens
+            ),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -936,6 +940,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         with (
             set_forward_batch(fb),
+            prefill_graph_scope(full_graph=self._is_full_backend),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
