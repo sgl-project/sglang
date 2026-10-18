@@ -851,6 +851,7 @@ class TopK(BaseFusedOp):
         """router_logits_partials (ROCm decode router): fp32 split-K partials whose
         fixed-order sum is the logits; router_logits is then a buffer the fused gate
         fills, and any other reader first reduces the partials into it."""
+        explicit_dispatch_info = expert_location_dispatch_info is not None
         num_token_non_padded, expert_location_dispatch_info = (
             self._resolve_routing_inputs(
                 num_token_non_padded, expert_location_dispatch_info
@@ -868,6 +869,11 @@ class TopK(BaseFusedOp):
         if (
             output_format != TopKOutputFormat.STANDARD
             and expert_location_dispatch_info is not None
+            and (
+                explicit_dispatch_info
+                or is_expert_remapping_enabled()
+                or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
+            )
         ):
             raise NotImplementedError(
                 "Expert placement remapping requires a MoE runner with standard TopK routing; "

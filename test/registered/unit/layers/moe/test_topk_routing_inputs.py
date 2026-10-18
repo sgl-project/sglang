@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat, fused_topk_torch_native
@@ -309,6 +310,92 @@ class TestTopKRoutingInputs(CustomTestCase):
                         NotImplementedError, "placement remapping requires"
                     ):
                         router.forward_cuda(self.hidden, self.logits)
+
+    def test_identity_placement_keeps_in_kernel_routing_available(self):
+        identity = torch.arange(4).view(1, 4)
+        self.metadata.logical_to_rank_dispatch_physical_map.copy_(identity)
+        self.metadata.logical_to_all_physical_map[:, :, 0].copy_(identity)
+        self.metadata.physical_to_logical_map.copy_(identity)
+        with get_exec().moe.override(
+            enable_eplb=False,
+            init_expert_location="trivial",
+            ep_num_redundant_experts=0,
+            ep_dispatch_algorithm="dynamic",
+        ):
+            for output_format in (
+                TopKOutputFormat.BYPASSED,
+                TopKOutputFormat.TRITON_KERNEL,
+            ):
+                with self.subTest(output_format=output_format):
+                    router = self._router(output_format=output_format)
+                    with patch.object(
+                        topk_module, "routing", return_value=(None, None, None, None, 2)
+                    ):
+                        output = router.forward_cuda(self.hidden, self.logits)
+                    self.assertEqual(output.format, output_format)
+            for algorithm in ("fake", "lp"):
+                with (
+                    self.subTest(algorithm=algorithm),
+                    get_exec().moe.override(ep_dispatch_algorithm=algorithm),
+                ):
+                    router = self._router(output_format=TopKOutputFormat.BYPASSED)
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "placement remapping requires"
+                    ):
+                        router.forward_cuda(self.hidden, self.logits)
+
+    def test_hash_npu_keeps_valid_ids_and_zero_padded_weights(self):
+        router = HashTopK(2, 4, 0, 4, scoring_func="softmax", layer_id=0)
+        with (
+            patch.object(hash_topk_module, "_is_npu", True),
+            envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
+        ):
+            with forward_context(
+                ForwardContext(attn_backend=object()), forward_batch=_batch(2)
+            ):
+                output = router(self.hidden, self.logits, torch.arange(4))
+        self.assertEqual(output.topk_ids.tolist(), [[2, 0], [0, 3], [3, 1], [1, 2]])
+        torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
+
+    def test_hash_global_shared_column_stays_outside_expert_map(self):
+        router = HashTopK(
+            3,
+            4,
+            1,
+            4,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=2.0,
+            layer_id=0,
+        )
+        with envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+            with forward_context(
+                ForwardContext(attn_backend=object()), forward_batch=_batch(2)
+            ):
+                output = router(self.hidden, self.logits, torch.arange(4))
+        self.assertEqual(
+            output.topk_ids.tolist(), [[2, 0, 4], [0, 3, 4], [-1, -1, -1], [-1, -1, -1]]
+        )
+
+    def test_empty_target_participates_in_lp_without_caller_layer_id(self):
+        class Solver:
+            def __init__(self):
+                self.participations = []
+
+            def solve(self, ids):
+                self.participations.append(tuple(ids.shape))
+
+        solver = Solver()
+        get_resources().lplb_solvers[0] = solver
+        self.addCleanup(get_resources().lplb_solvers.pop, 0)
+        target = self._router()
+        with draft_model_build_scope():
+            draft = self._router()
+        with get_parallel().override(tp_group=SimpleNamespace(world_size=1)):
+            output = target.empty_topk_output(torch.device("cpu"))
+            draft_output = draft.empty_topk_output(torch.device("cpu"))
+        self.assertEqual(output.topk_ids.shape, (0, 2))
+        self.assertEqual(draft_output.topk_ids.shape, (0, 2))
+        self.assertEqual(solver.participations, [(0, 2)])
 
     def test_compile_reads_current_buffer(self):
         router = self._router(is_draft=True)
