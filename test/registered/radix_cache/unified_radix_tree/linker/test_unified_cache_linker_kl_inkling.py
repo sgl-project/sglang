@@ -26,7 +26,8 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=300,
     stage="extra-a",
-    runner_config="1-gpu-large",
+    # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
+    runner_config="4-gpu-h100",
 )
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
