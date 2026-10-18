@@ -200,6 +200,17 @@ SGLDiffusionServerAPI = SERVER_API.SGLDiffusionServerAPI
 SGLDModelPatcher = MODEL_PATCHER.SGLDModelPatcher
 
 
+def test_native_model_size_counts_weight_files(tmp_path):
+    model_dir = tmp_path / "native"
+    weights = model_dir / "transformer"
+    weights.mkdir(parents=True)
+    (weights / "config.json").write_bytes(b"{}")
+    (weights / "model-00001.safetensors").write_bytes(b"weights")
+    (weights / "model-00002.safetensors").write_bytes(b"more weights")
+
+    assert GENERATOR._native_model_size_bytes(str(model_dir)) == 19
+
+
 class _Response:
     def __init__(self, payload, status_code=200):
         self._payload = payload

@@ -185,6 +185,17 @@ def native_model_type(model_dir: str) -> str:
     return _NATIVE_MODEL_TYPES[class_name]
 
 
+def _native_model_size_bytes(model_dir: str) -> int:
+    """Return the on-disk weight size used for ComfyUI VRAM accounting."""
+    weight_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
+    return sum(
+        os.path.getsize(os.path.join(root, name))
+        for root, _, names in os.walk(model_dir)
+        for name in names
+        if name.lower().endswith(weight_suffixes)
+    )
+
+
 def _h3_unet_config_from_native(model_dir: str) -> dict:
     """ComfyUI MiniMaxH3 unet_config built from a native transformer/config.json."""
     with open(os.path.join(model_dir, "transformer", "config.json")) as f:
@@ -590,7 +601,12 @@ class SGLDiffusionGenerator:
             )
             model_config.set_inference_dtype(torch.bfloat16, None)
             model_config.unet_config["disable_unet_model_creation"] = True
-            return model_config.get_model({}), model_config, "minimax_h3"
+            return (
+                model_config.get_model({}),
+                model_config,
+                "minimax_h3",
+                _native_model_size_bytes(model_path),
+            )
 
         sd = _load_state_dict_for_detection(model_path)
         diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
