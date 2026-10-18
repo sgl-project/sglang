@@ -765,7 +765,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   };
 
   // Lookup walks most-specific to least so a config that drops the variant/quant
-  // dims can key its HF slug on `hw` alone, or on the single "default" entry.
+  // dims can key its HF slug on `variant` or `hw` alone, or on "default".
   // The `hw|quant` and bare `quant` rungs cover a `matchDims` config that declares
   // no variant dim at all — there `sel.variant` is undefined, so the two leading
   // keys can never hit.
@@ -776,6 +776,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       `${sel.hw}|${sel.quant}`,
       sel.quant,
       sel.hw,
+      sel.variant,
       "default",
     ];
     for (const k of keys) {

@@ -33,7 +33,22 @@ export const config = {
     },
   ],
 
+  // Both checkpoints share the same recipes; only the model path changes.
+  overlayDims: [
+    {
+      id: "variant",
+      title: "Model Variant",
+      default: "flash",
+      options: [
+        { id: "flash", label: "DeepSeek-V4.1-Flash" },
+        { id: "flash-1017", label: "DeepSeek-V4.1-Flash-1017" },
+      ],
+    },
+  ],
+
   modelNames: {
+    flash: "deepseek-ai/DeepSeek-V4.1-Flash",
+    "flash-1017": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     default: "deepseek-ai/DeepSeek-V4.1-Flash",
   },
 

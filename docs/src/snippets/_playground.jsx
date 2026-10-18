@@ -188,7 +188,7 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → hw|quant → quant → hw → default.
+  // hw|variant|quant → variant|quant → hw|quant → quant → hw → variant → default.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
@@ -196,6 +196,7 @@ export const Playground = ({ config }) => {
       `${sel.hw}|${sel.quant}`,
       sel.quant,
       sel.hw,
+      sel.variant,
       "default",
     ];
     for (const k of keys) {
