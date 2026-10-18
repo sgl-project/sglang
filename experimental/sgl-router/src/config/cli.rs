@@ -100,7 +100,7 @@ pub struct ModelArgs {
     /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
     /// frequency_penalty, presence_penalty, and n. Numeric values fill absent
     /// fields; {"min": LO, "max": HI} bands only constrain supplied values
-    /// and require reject mode. See README for domains and null handling.
+    /// and require reject mode. See REFERENCE.md for domains and null handling.
     #[arg(long, value_name = "JSON")]
     pub override_sampling_params: Option<String>,
 
@@ -125,6 +125,11 @@ pub struct ServerArgs {
     /// Port to bind the HTTP server to.
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
+
+    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
+    #[arg(long)]
+    pub grpc_port: Option<u16>,
 
     /// Keep serving after SIGTERM with /readyz returning 503 before stopping accepts.
     /// Leave time in the pod grace period for in-flight requests; cover readiness
@@ -598,6 +603,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
+                grpc_port: self.server.grpc_port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,

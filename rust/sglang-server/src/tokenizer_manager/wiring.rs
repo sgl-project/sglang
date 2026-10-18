@@ -81,9 +81,9 @@ impl RequestAdmission {
     }
 }
 
-/// The source of the abort request. Both variants do the same work in
-/// [`Intake::on_abort`] — deregister the detok entry, tell the scheduler to
-/// stop — and the source is kept for diagnostics.
+/// The source of the abort request. [`Intake::on_abort`] deregisters the
+/// detok entry for every source and tells the scheduler to stop for all but
+/// [`Self::Local`]; the source is otherwise kept for diagnostics.
 ///
 /// There is no in-flight rid registry to keep consistent, and so no release
 /// ordering to get wrong: [`Rid::from_client`] makes every client-supplied rid
@@ -95,12 +95,15 @@ pub enum AbortSource {
     Guard(Rid),
     /// From a detokenizer terminal path. Aborts the scheduler work.
     Detok(Rid),
+    /// From a dropped call that never reaches the scheduler (tokenize,
+    /// detokenize): only its Rust-side state is released.
+    Local(Rid),
 }
 
 impl AbortSource {
     pub fn rid(&self) -> &Rid {
         match self {
-            Self::Guard(rid) | Self::Detok(rid) => rid,
+            Self::Guard(rid) | Self::Detok(rid) | Self::Local(rid) => rid,
         }
     }
 }
