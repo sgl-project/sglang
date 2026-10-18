@@ -15,6 +15,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.elastic_ep import elastic_ep
 from sglang.srt.elastic_ep.elastic_ep import mooncake_all_gather_settling
@@ -81,6 +83,59 @@ class TestRefusalIsWaitedOut(CustomTestCase):
         """300s is the default watchdog; a budget near it would park the cohort."""
         self.assertLess(elastic_ep._GATHER_SETTLE_BUDGET_S, 60.0)
         self.assertGreater(elastic_ep._GATHER_SETTLE_BUDGET_S, 1.0)
+
+
+class TestMlpSyncPostsOneCollectiveOnMooncake(CustomTestCase):
+    """The retry above is safe for one collective only. exchange_sync_rows posts a
+    gather and then a broadcast, so a Mooncake group must keep the single
+    all-gather; every other group keeps exchange_sync_rows."""
+
+    def _posted(self, on_mooncake):
+        import torch
+
+        from sglang.srt.managers.scheduler_components import dp_attn
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=4,
+            num_tokens_for_logprob=1,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=True,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.DECODE.value,
+        )
+        local = info._get_local_tensor(device="cpu")
+        posted = []
+
+        def gather_as(name):
+            def gather(output, input_, *, group):
+                posted.append(name)
+                output.copy_(torch.cat([local, local]))
+
+            return gather
+
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(active_ranks_cpu=torch.ones(2, dtype=torch.int64))
+        )
+        with (
+            patch.object(elastic_ep, "is_mooncake_pg", return_value=on_mooncake),
+            patch.object(dp_attn, "get_parallel", return_value=parallel),
+            patch.object(dp_attn, "all_gather_single", gather_as("all_gather")),
+            patch.object(dp_attn, "exchange_sync_rows", gather_as("exchange")),
+        ):
+            info.all_gather(device="cpu", group=object())
+        return posted
+
+    def test_a_mooncake_group_posts_the_single_all_gather(self):
+        self.assertEqual(self._posted(on_mooncake=True), ["all_gather"])
+
+    def test_other_groups_keep_the_gather_and_broadcast_exchange(self):
+        self.assertEqual(self._posted(on_mooncake=False), ["exchange"])
 
 
 if __name__ == "__main__":
