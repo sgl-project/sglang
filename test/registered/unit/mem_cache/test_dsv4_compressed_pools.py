@@ -464,11 +464,20 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
                 prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
             )
 
-    def test_pd_decode_paged_draft_keeps_a_valid_from(self):
-        for mode, expected in (("decode", True), ("null", False)):
-            with self.subTest(mode=mode):
+    def test_pd_draft_mark_pairs_as_request_row_state(self):
+        # A replay prefill's draft ring and a paged draft on either PD role send
+        # the mark as one request-row item per slot; a server without PD and
+        # without a ring keeps none.
+        item = torch.zeros(1, dtype=torch.int64).nbytes
+        for encoder_replay, mode, expected in (
+            (True, "prefill", [item]),
+            (False, "prefill", [item]),
+            (False, "decode", [item]),
+            (False, "null", []),
+        ):
+            with self.subTest(encoder_replay=encoder_replay, mode=mode):
                 override = get_context().override_server_args(
-                    enable_encoder_swa_bounded_replay=False,
+                    enable_encoder_swa_bounded_replay=encoder_replay,
                     disaggregation_mode=mode,
                 )
                 override.install()
@@ -477,9 +486,8 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
                     draft = self.make_pool(draft=True)
                 finally:
                     override.restore()
-                self.assertIsNone(draft.swa_req_ring_size)
-                self.assertIsNone(target.swa_valid_from)
-                self.assertEqual(draft.swa_valid_from is not None, expected)
+                self.assertEqual(draft.get_request_row_buf_infos()[2], expected)
+                self.assertEqual(target.get_request_row_buf_infos(), ([], [], []))
 
     def test_pd_window_pages_carry_the_last_window(self):
         window = self.make_pool(draft=False).request_window

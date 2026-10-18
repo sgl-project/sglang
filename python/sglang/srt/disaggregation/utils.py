@@ -535,15 +535,13 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req, draft_swa_valid_from: int = 0):
+    def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts, slots 4-6 are reused for multimodal prompt token counts and
-        # slot 7 for the draft SWA valid-from (slots 8-15 remain spare). This
-        # avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video
-        # 7=draft SWA valid-from.
+        # counts and slots 4-6 are reused for multimodal prompt token counts
+        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -555,7 +553,6 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
-        self.cached_tokens[req.metadata_buffer_index][7] = draft_swa_valid_from
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -1782,6 +1779,13 @@ def setup_state_kv_args(
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+            )
+        row_ptrs, row_lens, row_item_lens = (
+            draft_token_to_kv_pool.get_request_row_buf_infos()
+        )
+        if row_ptrs:
+            append_state_component(
+                kv_args, StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens
             )
 
     if (

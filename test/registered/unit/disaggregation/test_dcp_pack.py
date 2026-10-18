@@ -267,9 +267,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                         translate_mamba_indices=lambda x: x,
                     ),
                     disagg_metadata_buffers=Mock(),
-                    disagg_prefill_bootstrap_queue=SimpleNamespace(
-                        kv_manager=mgr, draft_token_to_kv_pool=None
-                    ),
+                    disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=mgr),
                     disagg_prefill_pending_chunk_rids=set(),
                 )
                 SchedulerDisaggregationPrefillMixin._send_kv_chunk(

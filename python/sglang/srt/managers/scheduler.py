@@ -1550,7 +1550,6 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
             )
 
             # The decode requests pending for pre-allocation

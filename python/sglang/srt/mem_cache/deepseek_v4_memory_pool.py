@@ -1115,8 +1115,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.request_window = None
         self.full_to_swa_index_mapping = None
         # Per req slot, the first position whose draft SWA rows this request
-        # wrote: the ring restarts at the cached prefix, and a PD decode takes the
-        # prefill's mark with the rows it receives.
+        # wrote: the ring restarts at the cached prefix, and a PD decode receives
+        # the prefill's mark as request-row state.
         self.swa_valid_from: Optional[torch.Tensor] = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # Under encoder replay the target keeps SWA in a per-request window. A
@@ -1238,12 +1238,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         if (
             is_draft_worker
+            and not _is_hip
             and self.swa_kv_pool is not None
             and self.swa_valid_from is None
-            and get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_mode != "null"
         ):
             # A prefill whose draft keeps a ring sends window rows below the
-            # cached prefix that it never wrote for this request.
+            # cached prefix that it never wrote for this request. Both PD roles
+            # keep the mark so their request-row state pairs; a paged prefill's
+            # stays 0.
             self.swa_valid_from = torch.zeros(
                 self.num_req_slots, dtype=torch.int64, device=device
             )
@@ -1308,12 +1311,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def set_swa_valid_from(
-        self, slots: Union[torch.Tensor, int], valid_from: Union[torch.Tensor, int]
-    ) -> None:
+    def set_swa_valid_from(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
         """The draft SWA rows of ``slots`` below ``valid_from`` are not this
         request's: the slot's previous owner wrote them, or no one did."""
         self.swa_valid_from[slots] = valid_from
+
+    def get_request_row_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Request-row state for PD: one item per req slot, sent slot to slot."""
+        if self.swa_valid_from is None:
+            return [], [], []
+        mark = self.swa_valid_from
+        return [mark.data_ptr()], [mark.nbytes], [mark[0].nbytes]
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
