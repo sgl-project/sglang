@@ -1539,10 +1539,10 @@ class TestSWAPoolFloor(CustomTestCase):
         paged = self._dspark_replay_planner(draft_ring=False)
         self.assertEqual(planner.bytes_per_swa_token, 0)
         self.assertEqual(planner.swa_cap_tokens, 0)
-        # Three draft stages of one (128 + 6)-row ring per request slot.
+        # Three draft stages of one ring per request slot: 128 + 6 rows in a page.
         self.assertEqual(
             planner.request_window_bytes - paged.request_window_bytes,
-            (3 * (128 + 6) + 256) * 3 * 584,
+            (3 * 256 + 256) * 3 * 584,
         )
         sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
         self.assertEqual(sizes.swa_max_total_num_tokens, 0)

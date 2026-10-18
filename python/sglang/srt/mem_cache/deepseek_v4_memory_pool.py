@@ -39,8 +39,10 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +130,12 @@ def uses_draft_swa_ring() -> bool:
     return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
 
 
-def get_draft_swa_ring_size(sliding_window: int, max_draft_tokens: int) -> int:
-    # A draft block and a verify commit write past the committed window.
-    return sliding_window + max_draft_tokens
+def get_draft_swa_ring_size(
+    sliding_window: int, max_draft_tokens: int, page_size: int
+) -> int:
+    # A draft block and a verify commit write past the committed window; whole
+    # pages match the target request window's rows, so PD sends both as one list.
+    return ceil_div(sliding_window + max_draft_tokens, page_size) * page_size
 
 
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
@@ -1138,6 +1143,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             from sglang.srt.runtime_context import get_schedule
 
             chunk = get_schedule().chunked_prefill_size or 0
+            # A prefill graph pads its layouts to the captured bucket, which can
+            # exceed this rank's chunk (DP attention divides the chunk budget).
+            graph_config = get_exec().graph.cuda_graph_config
+            prefill_graph = graph_config.prefill if graph_config is not None else None
+            graph_rows = (
+                get_cuda_graph_max_batch_size(max(prefill_graph.bs))
+                if prefill_graph is not None
+                and prefill_graph.backend == Backend.BREAKABLE
+                and prefill_graph.bs
+                else 0
+            )
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
@@ -1147,6 +1163,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
                 + max(
                     chunk,
+                    graph_rows,
                     (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
                 ),
             )
@@ -1155,7 +1172,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # while attending, so it addresses its ring directly with no workspace.
             self.unified_kv_pool = None
             self.swa_req_ring_size = get_draft_swa_ring_size(
-                self.sliding_window, online_mtp_max_draft_tokens or 0
+                self.sliding_window, online_mtp_max_draft_tokens or 0, swa_page_size
             )
             self.swa_req_ring_valid_from = torch.zeros(
                 self.num_req_slots, dtype=torch.int64, device=device
@@ -1437,11 +1454,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self.swa_kv_pool is not None:
-            physical_pages_per_logical_page = (
-                self.swa_page_size // self.swa_kv_pool.page_size
-            )
-            for buf in self.swa_kv_pool.kv_buffer:
+        # Under encoder replay the target's SWA lives in the request window, whose
+        # pages pair with decode's paged SWA pages (RequestWindow.page_indices).
+        swa_pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        if swa_pool is not None:
+            physical_pages_per_logical_page = self.swa_page_size // swa_pool.page_size
+            for buf in swa_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
