@@ -34,7 +34,8 @@ register_xpu_ci(
     suite="nightly-xpu-kernel-main-2-gpu",
     nightly=True,
     disabled="XPU full decode graph with --tp 2: TP ranks diverge on draft graph "
-    "replay, so DecodeGraph drafts are all rejected (accept_length ~1.0)",
+    "replay, so DecodeGraph drafts are all rejected (accept_length ~1.0); "
+    "https://github.com/sgl-project/sglang/issues/45034",
 )
 
 
