@@ -48,11 +48,16 @@ def defer_full_gc_for_imports() -> Iterator[None]:
     yet each full collection traces the whole growing heap, and how many of them
     fall inside an import depends on the import order rather than on the work
     done. Young collections still run, so short-lived cyclic garbage is freed as
-    usual, and a full collection that came due runs after the block. The
-    thresholds at entry are restored, and nested or concurrent blocks restore
-    them when the last one exits.
+    usual. Restoring the entry thresholds lets automatic full collections resume
+    after the block; nested or concurrent blocks restore them when the last one
+    exits.
     """
     global _full_gc_deferrals, _gc_thresholds
+    # Python 3.14.0-3.14.4 uses incremental GC and ignores threshold2
+    if (3, 14) <= sys.version_info < (3, 14, 5):
+        yield
+        return
+
     pid = os.getpid()
     with _full_gc_lock:
         if _full_gc_deferrals == 0:
