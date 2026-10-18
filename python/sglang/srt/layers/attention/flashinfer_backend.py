@@ -2420,8 +2420,9 @@ def _build_draft_indptr_host(
     """Mirror the draft kernel's prefix sums from resolved host lengths.
 
     At draft entry, positions repeat each committed sequence length ``topk``
-    times. Step i adds i+1 tokens per branch. This also covers the graph
-    runner's padded rows, whose CPU lengths have already been filled.
+    times. Step i adds i+1 tokens per branch. Only live entries match the
+    device prefix sums: graph padding fills CPU lengths with 1 while device
+    positions stay 0, so padded entries differ.
     """
     assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
     offsets = [0]
