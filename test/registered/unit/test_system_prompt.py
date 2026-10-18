@@ -545,6 +545,30 @@ class TestStaticMambaSlotBudget(CustomTestCase):
         adder = self._adder(static=True)
         self.assertEqual(self._budget(adder, self._req(None, 0, None)), 3)
 
+    def test_match_headroom(self):
+        # Bug regression (match-COW crash, deep waiting queue): the scheduler
+        # must stop pulling new requests once the remaining slot budget is
+        # below a worst-case cold request, because init_next_round_input's
+        # mamba COW allocates BEFORE add_one_req can reject. Headroom = the
+        # cold factor on the static pool (lazy variant = 2), on the shared
+        # pool too, and 0 (pre-check disabled) without a mamba pool.
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        self.assertEqual(PrefillAdder._mamba_match_headroom(self._adder(static=True)), 3)
+        self.assertEqual(
+            PrefillAdder._mamba_match_headroom(self._adder(static=True, lazy=True)), 2
+        )
+        no_mamba = SimpleNamespace(
+            _mamba_slot_cost=0, _static_mamba_slots=False, tree_cache=None
+        )
+        self.assertEqual(PrefillAdder._mamba_match_headroom(no_mamba), 0)
+        shared = SimpleNamespace(
+            _mamba_slot_cost=64,
+            _static_mamba_slots=False,
+            tree_cache=self._adder(static=True).tree_cache,
+        )
+        self.assertEqual(PrefillAdder._mamba_match_headroom(shared), 3)
+
 
 class _FakeArgs:
     def __init__(

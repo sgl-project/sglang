@@ -4560,6 +4560,21 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            # The mamba COW inside init_next_round_input allocates the
+            # request's running mamba slot BEFORE add_one_req's budget gate
+            # can reject it. With a deep waiting queue the match COWs drain
+            # the hard free list and die on free=0 (observed as "Can not alloc
+            # mamba cache") even though the gate would have throttled one
+            # request later — so stop pulling new requests from the queue once
+            # the remaining mamba slot budget can't cover a worst-case cold
+            # request. No-op without a mamba pool.
+            if (
+                adder.rem_mamba_slots is not None
+                and adder.rem_mamba_slots < adder._mamba_match_headroom()
+            ):
+                running_batch.batch_is_full = True
+                break
+
             req.init_next_round_input(self.tree_cache)
             if (
                 self.uocr_doc_hooks is not None

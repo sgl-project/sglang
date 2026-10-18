@@ -915,6 +915,30 @@ class PrefillAdder:
             return 1
         return cold_factor
 
+    def _mamba_match_headroom(self) -> int:
+        """Slot budget a new request needs BEFORE its match-time mamba COW.
+
+        ``init_next_round_input`` COW-allocates the request's running mamba
+        slot BEFORE ``add_one_req``'s budget gate can reject it. With a deep
+        waiting queue ``alloc_group_begin(len(queue))`` over-requests and
+        degrades to per-request hard allocation, so consecutive match COWs can
+        drain the hard free list and die on free=0 even though the gate would
+        have answered NO_TOKEN one request later. The scheduler calls this
+        before pulling each new request: stop once the remaining slot budget
+        can't cover a worst-case (cold) request. 0 disables the pre-check
+        (no mamba pool).
+        """
+        if not (self._mamba_slot_cost or self._static_mamba_slots):
+            return 0
+        from sglang.srt.mem_cache.common import (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+        )
+
+        if self.tree_cache.req_to_token_pool.enable_mamba_extra_buffer_lazy:
+            return MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+        return MAMBA_STATE_PER_REQ_PREFIX_CACHE
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
