@@ -34,6 +34,9 @@ class DllmAlgorithm:
     supported_architectures: Tuple[str, ...] = ()
     requires_separate_context_encoding = False
     required_attention_backend: Optional[str] = None
+    reuse_forward_metadata: bool = False
+    supported_attention_backends: Tuple[str, ...] = ()
+    capture_input_preparation: bool = False
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
@@ -113,11 +116,9 @@ class DllmAlgorithm:
         if all(start == self.block_size for start in start_list):
             return out.logits_output, [], None, None, out.can_run_graph
 
-        # NPU: attention metadata is stable across a block's denoise steps (the
-        # first forward above already planned it), so mark it ready once and let
-        # every later forward skip re-planning.
-        if _is_npu:
-            forward_batch.mark_forward_metadata_ready()
+        # The first forward has planned the fixed canvas's attention metadata.
+        if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
+            forward_batch.mark_forward_metadata_ready(replan_equivalent=not _is_npu)
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
             if all(done):

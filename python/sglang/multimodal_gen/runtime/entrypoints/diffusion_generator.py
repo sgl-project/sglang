@@ -398,7 +398,11 @@ class DiffGenerator:
                         save_outputs(
                             output_batch.output,
                             requests[0].data_type,
-                            requests[0].fps,
+                            (
+                                output_batch.fps
+                                if output_batch.fps is not None
+                                else requests[0].fps
+                            ),
                             requests[0].save_output,
                             lambda idx: output_requests[idx].output_file_path(),
                             audio=output_batch.audio,
@@ -575,6 +579,7 @@ class DiffGenerator:
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
             action=output_batch.action_pred,
+            lidar=output_batch.lidar,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=select_output_rollout_trajectory(

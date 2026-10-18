@@ -32,8 +32,8 @@ from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -209,8 +209,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         im_end_id: int = image_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-        ids = pattern.pad_input_tokens(input_ids, image_inputs)
+        ids = pad_mm_token_pairs(
+            input_ids, image_inputs, data_token_pairs=media_token_pairs
+        )
         return ids
 
     def prepare_attn_masks(
@@ -493,6 +494,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         else:
             # For EAGLE3, head might not be needed
             return embed, None
+
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.language_model.get_embed_and_head_for_draft(draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):

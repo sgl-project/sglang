@@ -15,7 +15,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+    from collections.abc import Callable
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
@@ -23,10 +23,11 @@ _ALIGN_BYTES = 16
 
 
 @cache_once
-def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
+def _jit_modulate_scale_shift_kernel(dtype: torch.dtype) -> Callable:
     if dtype not in _SUPPORTED_DTYPES:
         raise RuntimeError(f"Unsupported modulate_scale_shift dtype: {dtype}")
     args = make_cpp_args(dtype)
+    # Cache the exported function too, avoiding repeated FFI attribute lookup.
     return load_jit(
         "diffusion_modulate_scale_shift",
         *args,
@@ -37,7 +38,7 @@ def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
                 f"modulate_scale_shift::ModulateScaleShiftKernel<{args}>::run",
             ),
         ],
-    )
+    ).modulate_scale_shift
 
 
 def _fake_impl(
@@ -56,8 +57,8 @@ def modulate_scale_shift_cuda(
 ) -> torch.Tensor:
     """Fused ``x * (1 + scale[:, None]) + shift[:, None]``; validated by CUDA."""
     out = torch.empty_like(x)
-    module = _jit_modulate_scale_shift_module(x.dtype)
-    module.modulate_scale_shift(out, x, scale, shift)
+    kernel = _jit_modulate_scale_shift_kernel(x.dtype)
+    kernel(out, x, scale, shift)
     return out
 
 

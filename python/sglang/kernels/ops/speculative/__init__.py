@@ -6,12 +6,19 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
     ("cache_locs", "assign_extend_cache_locs_func"),
+    ("cache_locs", "assign_extend_cache_locs_uniform_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
+    ("cache_locs", "generate_draft_decode_window_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
@@ -36,5 +43,18 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="speculative.div_argmax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32",),
+            description="Row-wise division and argmax on matching 2D tensors with unit column strides.",
+        ),
+    )
+)
 
 __all__ = []

@@ -26,15 +26,16 @@ namespace sglang {
 /// Counting sort over a per-row bitmap (one bit per block, 16 KiB for a 1M-token
 /// row): single-bit words are emitted by their owner, denser words go to a
 /// block-wide queue the warps drain one lane per bit.
+template <uint32_t kWords = 4>
 struct CandidateBlockTableConfig {
   static constexpr uint32_t kBlockSize = 1024;
   static constexpr uint32_t kOccupancy = 2;
   static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
   static constexpr uint32_t kBlockTokens = 8;
-  static constexpr uint32_t kMaxSeqLen = 128 * 1024;  // blocks: 1M tokens / kBlockTokens
+  static constexpr uint32_t kMaxSeqLen = kWords * 32 * kBlockSize;  // blocks
   static constexpr uint32_t kMaxTopK = 2048;
   static constexpr uint32_t kWordsPerThread = kMaxSeqLen / 32 / kBlockSize;
-  static_assert(kWordsPerThread == 4 && kNumWarps == device::kWarpThreads);
+  static_assert((kWords == 4 || kWords == 8) && kNumWarps == device::kWarpThreads);
   static constexpr int32_t kPad = std::numeric_limits<int32_t>::max();
   using word_vec_t = device::AlignedVector<uint32_t, kWordsPerThread>;
   struct WriteItem {
@@ -64,12 +65,13 @@ struct CandidateBlockTableParams {
 };
 
 /// One CTA per row.
-template <bool kUsePDL>
-__global__ __launch_bounds__(CandidateBlockTableConfig::kBlockSize, CandidateBlockTableConfig::kOccupancy)  //
-    void sort_128k_transform(const __grid_constant__ CandidateBlockTableParams params) {
+template <bool kUsePDL, uint32_t kWords>
+__global__
+__launch_bounds__(CandidateBlockTableConfig<kWords>::kBlockSize, CandidateBlockTableConfig<kWords>::kOccupancy)  //
+    void sort_blocks_transform(const __grid_constant__ CandidateBlockTableParams params) {
   using namespace device;
-  using C = CandidateBlockTableConfig;
-  __shared__ C::Smem smem;
+  using C = CandidateBlockTableConfig<kWords>;
+  __shared__ typename C::Smem smem;
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
@@ -104,7 +106,7 @@ __global__ __launch_bounds__(CandidateBlockTableConfig::kBlockSize, CandidateBlo
   }
 
   // 1. the selected blocks as a bitmap
-  C::word_vec_t words;
+  typename C::word_vec_t words;
   words.fill(0u);
   words.store(smem.bitmap, tx);
   if (tx == 0) smem.queue_size = 0;
@@ -170,11 +172,20 @@ struct CandidateBlockTableKernel {
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView out_pages,
       const uint32_t page_size) {
-    launch<sort_128k_transform<kPDL>>(indices, seq_lens, page_table, out_pages, page_size);
+    // Speculative verification can extend past the model's 1M-token context.
+    // Size the bitmap from the padded page table, not the model context limit.
+    host::RuntimeCheck(page_table.ndim() == 2, "page_table must be two-dimensional");
+    const auto capacity = static_cast<uint64_t>(page_table.size(1)) * page_size;
+    host::RuntimeCheck(capacity <= 2 * 1024 * 1024, "candidate block table supports at most 2M tokens");
+    if (capacity <= 1024 * 1024) {
+      launch<4>(indices, seq_lens, page_table, out_pages, page_size);
+    } else {
+      launch<8>(indices, seq_lens, page_table, out_pages, page_size);
+    }
   }
 
  private:
-  template <auto kKernel>
+  template <uint32_t kWords>
   static void launch(
       const tvm::ffi::TensorView indices,
       const tvm::ffi::TensorView seq_lens,
@@ -182,7 +193,7 @@ struct CandidateBlockTableKernel {
       const tvm::ffi::TensorView out_pages,
       const uint32_t page_size) {
     using namespace host;
-    using C = CandidateBlockTableConfig;
+    using C = CandidateBlockTableConfig<kWords>;
     auto B = SymbolicSize{"batch_size"};
     auto K = SymbolicSize{"topk_blocks"};
     auto Si = SymbolicSize{"indices_stride"};
@@ -211,7 +222,7 @@ struct CandidateBlockTableKernel {
     };
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), C::kBlockSize, device_.unwrap())
         .config({.use_pdl = kPDL})
-        .launch(kKernel, params);
+        .launch(sort_blocks_transform<kPDL, kWords>, params);
   }
 };
 

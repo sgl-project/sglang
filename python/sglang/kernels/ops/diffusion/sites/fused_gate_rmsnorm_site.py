@@ -14,7 +14,7 @@ statistics round through bf16) but **not bit-exact**. Following the
 fused-linear-GELU precedent, sites are therefore mounted only for
 ``quality="high"`` requests via :func:`mount_fused_gate_rmsnorm` /
 :func:`unmount_fused_gate_rmsnorm` at batch boundaries; the default
-``"lossless"`` path keeps the unmodified reference chain bit-for-bit.
+``"exact"`` path keeps the unmodified reference chain bit-for-bit.
 
 Mounting is all-or-nothing per transformer: if any marked site fails the
 static guards (non-bf16 norm weight, hidden size above the kernel limit, ...)
