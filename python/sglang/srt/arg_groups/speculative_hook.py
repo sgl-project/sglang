@@ -253,6 +253,18 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "--speculative-skip-dp-mlp-sync is only supported with "
             f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
         )
+        # Only the non-disaggregated event loops take the skipped sync.
+        if (
+            cfg.attn_dp_size > 1
+            and cfg.disaggregation_mode == "null"
+            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        ):
+            raise ValueError(
+                "--speculative-skip-dp-mlp-sync with attention DP lets one DP rank "
+                "prefill while another decodes, and the decoding rank then runs "
+                "the prefill path; set SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=1 "
+                "to mix them."
+            )
 
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
