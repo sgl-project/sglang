@@ -37,6 +37,14 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointGroupInfo,
+    DSV4CompressedBufferInfo,
+    DSV4CompressedGroupInfo,
+    DSV4IndexerBufferInfo,
+    DSV4PagedBufferInfo,
+    DSV4RootBufferInfo,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -267,6 +275,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
         self._create_buffers()
+
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        return DSV4PagedBufferInfo.from_buffers(
+            self.kv_buffer, page_slots=self.page_size, layout=self.kv_layout.value
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -641,14 +654,41 @@ class DeepSeekV4IndexerPool(KVCache):
         return self.index_k_with_scale_buffer[layer_id]
 
     def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
-        """Every indexer buffer as 2D page rows for PD and HiCache: one fused key+scale
-        buffer per layer under FP8, separate payload and scale buffers under FP4."""
+        """2D page rows: fused key/scale for CUDA FP8 or FP4; separate payload
+        and scale for the HIP FP4 layout."""
         if self.index_k_with_scale_buffer is not None:
             return self.index_k_with_scale_buffer
         return [
             buf.view(torch.uint8).flatten(1)
             for buf in (*self.index_k_payload_buffer, *self.index_k_scale_buffer)
         ]
+
+    def indexer_buffer_info(self) -> DSV4IndexerBufferInfo:
+        if self.index_k_with_scale_buffer is not None:
+            return DSV4IndexerBufferInfo(
+                key=DSV4PagedBufferInfo.from_buffers(
+                    self.index_k_with_scale_buffer,
+                    page_slots=self.index_page_size,
+                    layout="index_fused",
+                )
+            )
+        page_slots = self.index_k_payload_buffer[0].shape[3]
+        scale_slots = self.index_k_scale_buffer[0].shape[3]
+        if scale_slots != page_slots:
+            raise ValueError(
+                "FP4 indexer payload and scale must agree on slots per page: "
+                f"payload={page_slots}, scale={scale_slots}"
+            )
+        rows = self.contiguous_page_row_buffers()
+        key_layers = len(self.index_k_payload_buffer)
+        return DSV4IndexerBufferInfo(
+            key=DSV4PagedBufferInfo.from_buffers(
+                rows[:key_layers], page_slots=page_slots, layout="index_fp4"
+            ),
+            scale=DSV4PagedBufferInfo.from_buffers(
+                rows[key_layers:], page_slots=page_slots, layout="index_fp4"
+            ),
+        )
 
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_k_payload_buffer[layer_id]
@@ -1400,6 +1440,108 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self._unified_kv_fp8:
             append_ring(self.unified_kv_pool.kv_buffer_rope)
         return data_ptrs, data_lens, item_lens
+
+    def swa_buffer_info(self) -> DSV4PagedBufferInfo | None:
+        if self.swa_kv_pool is None:
+            return None
+        info = self.swa_kv_pool.paged_buffer_info()
+        layer_count = self._stage_end - self._stage_start
+        if len(info.buffers) != layer_count:
+            raise ValueError(
+                "DeepSeek V4 SWA KV pool must be PP-stage-local: "
+                f"got {len(info.buffers)} buffers for {layer_count} local layers"
+            )
+        return info
+
+    def buffer_info(self) -> DSV4RootBufferInfo:
+        """Describe allocated owner stores without consumer transfer policy.
+
+        Empty PP-stage groups are absent even when an empty pool is retained for
+        PD wire alignment. Request-window SWA and request-private compressor
+        state are rebuilt after prefix restore and have no page description.
+        """
+        groups = []
+        for ratio, sources in self.sources_by_ratio.items():
+            if not sources:
+                continue
+            layer_ids = tuple(sources)
+            kv = (
+                self.compressed_buffer_info(ratio)
+                if ratio in (4, 128)
+                else DSV4CompressedBufferInfo(
+                    kv=self.kv_pools[ratio].paged_buffer_info()
+                )
+            )
+            index_pool = self.index_pools.get(ratio)
+            indexer = (
+                index_pool.indexer_buffer_info() if index_pool is not None else None
+            )
+            checkpoint = None
+            if ratio == 4 and not self._unified_kv:
+                checkpoint = DSV4CheckpointGroupInfo(
+                    attention=tuple(
+                        self.compress_state_pools[layer].checkpoint_buffer_info()
+                        for layer in layer_ids
+                    ),
+                    indexer=tuple(
+                        self.indexer_compress_state_pools[
+                            layer
+                        ].checkpoint_buffer_info()
+                        for layer in layer_ids
+                    ),
+                )
+            regions = [kv.kv, kv.rope]
+            if indexer is not None:
+                regions.extend((indexer.key, indexer.scale))
+            if any(
+                region is not None and len(region.buffers) != len(layer_ids)
+                for region in regions
+            ):
+                raise ValueError(f"DeepSeek V4 C{ratio} owner and buffer counts differ")
+            groups.append(
+                DSV4CompressedGroupInfo(
+                    ratio=ratio,
+                    layer_ids=layer_ids,
+                    kv=kv,
+                    indexer=indexer,
+                    checkpoint=checkpoint,
+                )
+            )
+        return DSV4RootBufferInfo(
+            layer_ids=tuple(range(self._stage_start, self._stage_end)),
+            swa=self.swa_buffer_info(),
+            compressed=tuple(groups),
+        )
+
+    def compressed_buffer_info(
+        self, ratio: Literal[4, 128]
+    ) -> DSV4CompressedBufferInfo:
+        if ratio not in (4, 128):
+            raise ValueError(f"Expected C4 or C128 compressed region, got {ratio}")
+        if not self._unified_kv:
+            pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
+            return DSV4CompressedBufferInfo(kv=pool.paged_buffer_info())
+        buffers, item_bytes = self.unified_region_buffers(ratio)
+        page_slots = self.page_size // ratio
+        rope_region = self.unified_rope_region_buffers(ratio)
+        rope = None
+        if rope_region is not None:
+            rope_buffers, rope_bytes = rope_region
+            rope = DSV4PagedBufferInfo(
+                buffers=tuple(rope_buffers),
+                page_bytes=rope_bytes,
+                page_slots=page_slots,
+                layout="unified",
+            )
+        return DSV4CompressedBufferInfo(
+            kv=DSV4PagedBufferInfo(
+                buffers=tuple(buffers),
+                page_bytes=item_bytes,
+                page_slots=page_slots,
+                layout="unified",
+            ),
+            rope=rope,
+        )
 
     def _unified_page_views(
         self, buffers: List[torch.Tensor], ratio: int

@@ -6,6 +6,11 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4IndexerPool,
+    DeepSeekV4SingleKVPool,
+    DeepSeekV4TokenToKVPool,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -160,47 +165,61 @@ class TestDevicePoolGroup(CustomTestCase):
         self.assertEqual(resolved[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
 
 
+def _dsv4_pool(pool_type, **fields):
+    pool = pool_type.__new__(pool_type)
+    pool.__dict__.update(fields)
+    return pool
+
+
 class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_deepseek_v4_maps_sparse_sidecars(self):
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+            CompressStatePool,
+            KVAndScore,
+        )
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4LayerItem,
             DeepSeekV4TokenToKVPool,
         )
 
         def state_pool():
-            return SimpleNamespace(
+            return _dsv4_pool(
+                CompressStatePool,
+                request_scoped=False,
                 ring_size=2,
-                kv_score_buffer=SimpleNamespace(kv_score=torch.zeros((8, 3))),
+                kv_score_buffer=KVAndScore(torch.zeros((9, 4))),
             )
 
         kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         kvcache._unified_kv = False
         kvcache.start_layer = 1
         kvcache.end_layer = 4
+        kvcache._stage_start = 1
+        kvcache._stage_end = 4
         kvcache.swa_page_size = 2
-        kvcache.swa_kv_pool = SimpleNamespace(
+        kvcache.swa_kv_pool = _dsv4_pool(
+            DeepSeekV4SingleKVPool,
             page_size=2,
             kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)],
         )
-        kvcache.c4_kv_pool = SimpleNamespace(
+        kvcache.c4_kv_pool = _dsv4_pool(
+            DeepSeekV4SingleKVPool,
+            page_size=1,
             kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)],
             bytes_per_page_padded=5,
         )
-        kvcache.c4_indexer_kv_pool = SimpleNamespace(
+        kvcache.c4_indexer_kv_pool = _dsv4_pool(
+            DeepSeekV4IndexerPool,
+            index_page_size=1,
             index_k_with_scale_buffer=[
                 torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
-            ]
+            ],
         )
-        kvcache.c128_kv_pool = SimpleNamespace(
+        kvcache.c128_kv_pool = _dsv4_pool(
+            DeepSeekV4SingleKVPool,
+            page_size=1,
             kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)],
             bytes_per_page_padded=11,
         )
-        kvcache.layer_mapping = [
-            DeepSeekV4LayerItem(0, -1),
-            DeepSeekV4LayerItem(4, 0),
-            DeepSeekV4LayerItem(128, 0),
-            DeepSeekV4LayerItem(4, 1),
-        ]
         kvcache.compress_state_pools = [None, state_pool(), None, state_pool()]
         kvcache.indexer_compress_state_pools = [
             None,
@@ -208,6 +227,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             None,
             state_pool(),
         ]
+        kvcache.sources_by_ratio = {4: [1, 3], 128: [2]}
+        kvcache.index_pools = {4: kvcache.c4_indexer_kv_pool}
         draft_swa_buffers = [
             torch.zeros((8, 13), dtype=torch.uint8),
             torch.zeros((8, 17), dtype=torch.uint8),
@@ -218,8 +239,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             page_size=2,
             params=SimpleNamespace(
                 mtp_draft_device_pools=(
-                    SimpleNamespace(
-                        swa_kv_pool=SimpleNamespace(kv_buffer=draft_swa_buffers)
+                    _dsv4_pool(
+                        DeepSeekV4TokenToKVPool,
+                        start_layer=0,
+                        end_layer=2,
+                        _stage_start=0,
+                        _stage_end=2,
+                        swa_kv_pool=_dsv4_pool(
+                            DeepSeekV4SingleKVPool,
+                            page_size=2,
+                            kv_buffer=draft_swa_buffers,
+                        ),
                     ),
                 )
             ),
@@ -242,6 +272,27 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(group.sources[PoolName.DEEPSEEK_V4_C4], PoolName.KV)
         self.assertEqual(group.sources[PoolName.DEEPSEEK_V4_C4_STATE], PoolName.SWA)
 
+        for name, pools in (
+            (PoolName.DEEPSEEK_V4_C4_STATE, kvcache.compress_state_pools),
+            (
+                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                kvcache.indexer_compress_state_pools,
+            ),
+        ):
+            pointers, sizes = group.entry_map[name].get_page_buffer_meta(
+                torch.tensor([2, 3])
+            )
+            self.assertEqual(sizes, [32, 32])
+            self.assertEqual(
+                pointers,
+                [
+                    pools[layer].kv_score_buffer.kv_score.data_ptr() + 32
+                    for layer in (1, 3)
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "exceeds buffer shapes"):
+                group.entry_map[name].get_page_buffer_meta(torch.tensor([8, 9]))
+
         c4_pool = group.entry_map[PoolName.DEEPSEEK_V4_C4]
         pointers, sizes = c4_pool.get_page_buffer_meta(torch.tensor([0, 1]))
         self.assertEqual(len(pointers), 2)
@@ -260,7 +311,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(offsets, [[3, 22]])
 
     def test_unified_deepseek_v4_uses_only_compressed_pools(self):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 
         for split_indexer in (False, True):
             with self.subTest(split_indexer=split_indexer):
@@ -278,7 +328,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     scale = [
                         torch.zeros((4, 1, 4, 1), dtype=torch.uint8) for _ in range(2)
                     ]
-                    indexer = SimpleNamespace(
+                    indexer = _dsv4_pool(
+                        DeepSeekV4IndexerPool,
+                        index_page_size=1,
                         index_k_with_scale_buffer=None,
                         index_k_payload_buffer=payload,
                         index_k_scale_buffer=scale,
@@ -293,18 +345,23 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     buffers = [
                         torch.zeros((4, width), dtype=torch.uint8) for width in (13, 17)
                     ]
-                    indexer = SimpleNamespace(index_k_with_scale_buffer=buffers)
+                    indexer = _dsv4_pool(
+                        DeepSeekV4IndexerPool,
+                        index_page_size=1,
+                        index_k_with_scale_buffer=buffers,
+                    )
                     expected[PoolName.DEEPSEEK_V4_C4_INDEXER] = buffers
                 regions = {4: (c4, 7), 128: (c128, 11)}
-                kvcache = SimpleNamespace(
+                kvcache = _dsv4_pool(
+                    DeepSeekV4TokenToKVPool,
+                    page_size=256,
                     _unified_kv=True,
                     start_layer=0,
                     end_layer=3,
-                    layer_mapping=[
-                        DeepSeekV4LayerItem(4, 1),
-                        DeepSeekV4LayerItem(128, 0),
-                        DeepSeekV4LayerItem(4, 0),
-                    ],
+                    _stage_start=0,
+                    _stage_end=3,
+                    sources_by_ratio={4: [0, 2], 128: [1]},
+                    index_pools={4: indexer},
                     # Unified KV has neither paged KV nor an index-addressed SWA pool.
                     swa_kv_pool=None,
                     c4_kv_pool=None,
@@ -345,7 +402,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
     def test_unified_deepseek_v4_fp8_ships_the_rope_half(self):
         """fp8 rows are two pools; shipping nope alone leaves stale rope."""
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 
         c4 = [torch.zeros((4, width), dtype=torch.uint8) for width in (5, 7)]
         c128 = [torch.zeros((4, 11), dtype=torch.uint8)]
@@ -354,23 +410,28 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         indexer = [torch.zeros((4, width), dtype=torch.uint8) for width in (13, 17)]
         regions = {4: (c4, 7), 128: (c128, 11)}
         rope_regions = {4: (c4_rope, 3), 128: (c128_rope, 3)}
-        kvcache = SimpleNamespace(
+        kvcache = _dsv4_pool(
+            DeepSeekV4TokenToKVPool,
+            page_size=256,
             _unified_kv=True,
             start_layer=0,
             end_layer=3,
-            layer_mapping=[
-                DeepSeekV4LayerItem(4, 1),
-                DeepSeekV4LayerItem(128, 0),
-                DeepSeekV4LayerItem(4, 0),
-            ],
+            _stage_start=0,
+            _stage_end=3,
+            sources_by_ratio={4: [0, 2], 128: [1]},
             swa_kv_pool=None,
             c4_kv_pool=None,
             c128_kv_pool=None,
             swa_page_size=3,
-            c4_indexer_kv_pool=SimpleNamespace(index_k_with_scale_buffer=indexer),
+            c4_indexer_kv_pool=_dsv4_pool(
+                DeepSeekV4IndexerPool,
+                index_page_size=1,
+                index_k_with_scale_buffer=indexer,
+            ),
             unified_region_buffers=Mock(side_effect=regions.__getitem__),
             unified_rope_region_buffers=Mock(side_effect=rope_regions.__getitem__),
         )
+        kvcache.index_pools = {4: kvcache.c4_indexer_kv_pool}
         group = _build_deepseek_v4_device_pool_group(kvcache, page_size=2)
 
         expected_rope = {
