@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
     _prefill_graph_max_seq_len,
     _tail_rows,
+    late_layer_num_tokens,
     late_layer_whole_extend,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -2175,6 +2176,11 @@ class DeepseekV4HipRadixBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
+            return None
+        return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
 
     def _init_forward_metadata_prefill_from_batch(
         self,
