@@ -98,11 +98,11 @@ def _worker(rank, devices, port, dtype, large):
         model_path="dummy",
         device="npu",
         tp_size=2,
-        dp_size=2,
+        dp_size=1,
+        attn_dp_size=2,
         ep_size=2,
         dwdp_size=2,
         moe_dense_tp_size=1,
-        enable_dp_attention=True,
         disable_cuda_graph=True,
         quantization="modelslim" if dtype == torch.int8 else None,
     )
@@ -304,10 +304,10 @@ def test_npu_dwdp_resolution():
         cfg = resolving_view(args)
         assert envs.SGLANG_SHARED_EXPERT_TP1.get()
         assert cfg.disable_shared_experts_fusion
-        assert cfg.dp_size == cfg.ep_size == 2
+        assert cfg.attn_dp_size == cfg.ep_size == 2
+        assert cfg.dp_size == 1
         assert cfg.moe_dense_tp_size == 1
         assert cfg.moe_a2a_backend == "none"
-        assert cfg.enable_dp_attention
         assert cfg.enable_dp_lm_head
 
 
@@ -342,7 +342,8 @@ def test_npu_dwdp_full_resolution(tmp_path):
         args.resolve_once()
         cfg = resolved_view(args)
         assert envs.SGLANG_SHARED_EXPERT_TP1.get()
-        assert cfg.dp_size == cfg.ep_size == 2
+        assert cfg.attn_dp_size == cfg.ep_size == 2
+        assert cfg.dp_size == 1
         assert cfg.disable_shared_experts_fusion
         assert cfg.cuda_graph_config.prefill.backend == "disabled"
         assert cfg.cuda_graph_config.decode.backend == "disabled"
