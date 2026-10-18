@@ -103,6 +103,8 @@ class _AttnReadout:
     already hold the previous layer's output: an iHC layer takes its input
     written back. A ``post_residual_addition`` is not applied."""
 
+    bind = None
+
     is_plain_norm = False
     completing_fusions = ()
     gathering_reads = ()
@@ -129,6 +131,9 @@ class _AttnUpdate:
     It is not a plain add, so it runs only once the sum it writes in is
     complete."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
@@ -151,6 +156,8 @@ class _AttnUpdate:
 class _FfnReadout:
     """The attention output's write-back and the FFN input's gated mix and
     norm, fused in post_pre when the layer provides it."""
+
+    bind = None
 
     is_plain_norm = False
     completing_fusions = ()
@@ -180,6 +187,9 @@ class _FfnUpdate:
     which this layer runs itself. The streams stay widened: unlike mhc.py the
     layer stack's terminal read is a learned head rather than a contraction,
     so it belongs to the final norm."""
+
+    bind = None
+    replay_update = None
 
     is_plain_add = False
     applied_at_exit = True

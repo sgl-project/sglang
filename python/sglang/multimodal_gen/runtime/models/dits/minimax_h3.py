@@ -31,7 +31,10 @@ from sglang.kernels.ops.diffusion import (
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_gate_fp32,
+    indexed_gate_fp32_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     mark_minimax_h3_norm_modulate_site,
     minimax_h3_norm_modulate_active,
@@ -437,11 +440,15 @@ def _modulate_scale_shift(
         x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
-        and shift.dtype == _BF16_DTYPE
-        and scale.dtype == _BF16_DTYPE
+        and shift.dtype == scale.dtype
         and x.is_contiguous()
+        and shift.stride(-1) == scale.stride(-1) == 1
     ):
-        return indexed_scale_shift_bf16_(x, shift, scale, indices)
+        # Serialized INT8 checkpoints keep the AdaLN tables in FP32.
+        if shift.dtype == _BF16_DTYPE:
+            return indexed_scale_shift_bf16_(x, shift, scale, indices)
+        if shift.dtype == _FP32_DTYPE:
+            return indexed_scale_shift_fp32_(x, shift, scale, indices)
     return (
         x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
     ).to(dtype)
@@ -462,14 +469,19 @@ def _modulate_gate(
         x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
-        and gate.dtype == _BF16_DTYPE
         and other.dtype == _BF16_DTYPE
         and x.is_contiguous()
         and other.is_contiguous()
+        and gate.stride(-1) == 1
     ):
-        if allow_inplace:
-            return indexed_gate_bf16_(x, gate, other, indices)
-        return indexed_gate_bf16(x, gate, other, indices)
+        if gate.dtype == _BF16_DTYPE:
+            if allow_inplace:
+                return indexed_gate_bf16_(x, gate, other, indices)
+            return indexed_gate_bf16(x, gate, other, indices)
+        if gate.dtype == _FP32_DTYPE:
+            if allow_inplace:
+                return indexed_gate_fp32_(x, gate, other, indices)
+            return indexed_gate_fp32(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
