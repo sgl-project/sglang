@@ -226,6 +226,19 @@ class KVIndexTranslator:
         None when its pool has no such sub-pool."""
         return self._spaces.get(kind)
 
+    @property
+    def window_kv_kind(self) -> IdSpaceKind:
+        """Storage used by window attention, independent of its attention mask.
+
+        A fused window draft may live in FULL when SWA cannot host its window.
+        Such a draft still clips its reads, but uses FULL physical addresses.
+        """
+        return (
+            IdSpaceKind.SLIDING_WINDOW
+            if IdSpaceKind.SLIDING_WINDOW in self._spaces
+            else IdSpaceKind.FULL
+        )
+
     def write_ids(
         self, forward_batch, kind: IdSpaceKind = IdSpaceKind.FULL
     ) -> Optional[torch.Tensor]:

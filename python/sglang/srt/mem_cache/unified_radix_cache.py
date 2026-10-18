@@ -227,9 +227,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # SWA window size (None when SWA is not enabled).
+        # Required cache history, shared by retention, budgeting and transfers.
         self._sliding_window_size = (
-            params.sliding_window_size if self.is_swa_enabled else None
+            params.swa_retain_window if self.is_swa_enabled else None
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         self.draft_swa_window = params.draft_swa_window

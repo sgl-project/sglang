@@ -76,8 +76,9 @@ class CacheInitParams:
 
     @property
     def swa_retain_window(self) -> Optional[int]:
-        # What the frees and unlocks of a running request's SWA keep behind it;
-        # every other SWA rule uses sliding_window_size.
+        # Cache history required by every reader of the SWA sub-pool. Retention,
+        # tree locks, prefix matching and host transfers must use the same span.
+        # The model's attention window remains sliding_window_size.
         if self.sliding_window_size is None:
             return None
         return max(self.sliding_window_size, self.draft_swa_window)
