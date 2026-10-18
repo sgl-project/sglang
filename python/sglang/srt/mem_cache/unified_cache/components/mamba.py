@@ -235,7 +235,21 @@ class MambaComponent(TreeComponent):
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
                 )
-                assert dst_index is not None, "Can not alloc mamba cache"
+                if dst_index is None:
+                    # Fail-loud (upstream contract), but with context: this is
+                    # the request's running mamba slot, allocated at match time.
+                    # Admission (PrefillAdder static-pool budget) should have
+                    # throttled before this point; reaching it means over-admit
+                    # or a pool too small for --max-running-requests.
+                    raise RuntimeError(
+                        "Can not alloc mamba cache: match COW for the request's "
+                        "running mamba slot failed even after evicting 1 "
+                        f"(free={self.cache.req_to_token_pool.mamba_allocator.schedulable_available_size()}). "
+                        "The mamba pool is exhausted — with --system-prompt the "
+                        "admission budget should throttle this; otherwise the "
+                        "pool is too small for --max-running-requests, try "
+                        "increasing --mamba-full-memory-ratio."
+                    )
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False

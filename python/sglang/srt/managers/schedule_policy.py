@@ -703,9 +703,20 @@ class PrefillAdder:
         )
         self.rem_mamba_slots = None
         if self._static_mamba_slots:
+            # HARD free slots only — deliberately NOT counting
+            # mamba_evictable_size(). On the shared pool the evictable part is
+            # cashed in by alloc_req_slots' explicit evict before allocation,
+            # but on the static pool the request's running mamba slot is
+            # allocated EARLIER, inside match_prefix's COW
+            # (finalize_match_result_in_cache), which can only draw from the
+            # hard free list — its internal evict-retry can be blocked by locks
+            # on the shared boundary node. Counting evictable here admits
+            # requests on phantom credit that then die in the match COW
+            # ("Can not alloc mamba cache"). Conservative but always realizable;
+            # evictable slots come back into play once running requests finish
+            # and their slots are freed.
             self.rem_mamba_slots = (
                 self.tree_cache.req_to_token_pool.mamba_allocator.schedulable_available_size()
-                + self.tree_cache.mamba_evictable_size()
             )
 
         self.priority_scheduling_preemption_threshold = (
