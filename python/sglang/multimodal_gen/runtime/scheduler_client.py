@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    AbortReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -47,6 +48,8 @@ logger = init_logger(__name__)
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they must reach every replica rather than one.
 _CONTROL_REQ_TYPES = (
+    # the request to abort may be queued on any replica
+    AbortReq,
     SetLoraReq,
     MergeLoraWeightsReq,
     UnmergeLoraWeightsReq,
