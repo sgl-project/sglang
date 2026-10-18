@@ -533,11 +533,6 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
             self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
         )
 
-    def _forward_mixer(self, hidden_states, forward_batch):
-        if isinstance(self.mixer, NemotronHMoE):
-            return self.mixer.forward(hidden_states, forward_batch)
-        return self.mixer.forward(hidden_states)
-
     def forward(
         self,
         *,
@@ -545,7 +540,7 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ):
         hidden_states = self.boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self._forward_mixer(hidden_states, forward_batch)
+        hidden_states = self.mixer.forward(hidden_states)
         return self.boundary.finish(hidden_states, forward_batch)
 
 
