@@ -1492,7 +1492,7 @@ class TestSWAPoolFloor(CustomTestCase):
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
 
-    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+    def _dspark_replay_planner(self, *, draft_ring):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         _publish_config(
@@ -1528,7 +1528,27 @@ class TestSWAPoolFloor(CustomTestCase):
                 dflash_draft_num_layers=40, dspark_num_stages=3
             ),
         )
-        planner = DSV4PoolConfigurator(kvc)
+        with patch(
+            "sglang.srt.model_executor.pool_configurator.uses_draft_swa_ring",
+            return_value=draft_ring,
+        ):
+            return DSV4PoolConfigurator(kvc)
+
+    def test_dsv4_dspark_draft_ring_budget_is_fixed(self):
+        planner = self._dspark_replay_planner(draft_ring=True)
+        paged = self._dspark_replay_planner(draft_ring=False)
+        self.assertEqual(planner.bytes_per_swa_token, 0)
+        self.assertEqual(planner.swa_cap_tokens, 0)
+        # Three draft stages of one ring per request slot: 128 + 6 rows in a page.
+        self.assertEqual(
+            planner.request_window_bytes - paged.request_window_bytes,
+            (3 * 256 + 256) * 3 * 584,
+        )
+        sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 0)
+
+    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+        planner = self._dspark_replay_planner(draft_ring=False)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
         budget = 256 * 1024 * 1024
         sizes = planner.calculate_pool_sizes(budget, 256)

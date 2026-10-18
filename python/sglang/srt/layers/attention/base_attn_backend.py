@@ -245,6 +245,11 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Rows this rank runs from a late-layer row switch on (DeepSeek-V4.1
+        decoder SWA bounded replay); None for backends without one."""
+        return None
+
     def on_after_cuda_graph_warmup(self):
         """Hook between cuda graph warmup pass and the actual capture.
 
