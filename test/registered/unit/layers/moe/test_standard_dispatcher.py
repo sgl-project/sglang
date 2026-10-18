@@ -295,6 +295,43 @@ class TestLayerRunnerDispatch(CustomTestCase):
             self.assertIsNone(layer.runner_backend)
             self.assertFalse(layer.dispatcher.skip_local_expert_mapping)
 
+    def test_borrowed_inkling_dense_loader_keeps_canonical_weights(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization import unquant
+        from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
+
+        layer = InklingBatchDenseMLP(
+            n_shared_experts=2,
+            d_model=4,
+            shared_d_mlp=8,
+            layer_id=0,
+            prefix="model.layers.0.mlp.shared_experts",
+            linearized_bf16=True,
+        )
+        self.assertIsNone(layer.quant_method.get_moe_runner_backend(layer))
+        for offset in (0, 100):
+            w13 = torch.arange(128).reshape(2, 16, 4).float() + offset
+            w2 = torch.arange(64).reshape(2, 4, 8).float() + offset
+            layer.weight_loader_fused(
+                layer.w13_weight, w13, "model.layers.0.mlp.experts.w13_weight", "w13"
+            )
+            layer.weight_loader_fused(
+                layer.w2_weight, w2, "model.layers.0.mlp.experts.w2_weight", "w2"
+            )
+            with (
+                envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.override(True),
+                patch.object(unquant, "_is_cuda", True),
+                patch.object(unquant, "_is_cpu", False),
+            ):
+                layer.quant_method.process_weights_after_loading(layer)
+            torch.testing.assert_close(layer.w13_weight, w13, rtol=0, atol=0)
+            torch.testing.assert_close(layer.w2_weight, w2, rtol=0, atol=0)
+            w13_linear, w2_linear = layer.get_bf16_linearized_weights()
+            torch.testing.assert_close(w13_linear, w13.reshape(32, 4), rtol=0, atol=0)
+            torch.testing.assert_close(
+                w2_linear, w2.transpose(1, 2).reshape(16, 4), rtol=0, atol=0
+            )
+
     def test_topk_does_not_re_read_the_target_backend(self):
         """A constructed router keeps its layer's format across draft scopes."""
         topk = TopK(top_k=2, layer_id=0, allow_routed_experts_capture=False)

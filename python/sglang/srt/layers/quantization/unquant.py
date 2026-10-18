@@ -749,6 +749,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
+        self.runner: Optional[MoeRunner] = None
         self._aiter_runner: Optional[MoeRunner] = None
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
@@ -983,10 +984,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return
 
         moe_runner_config = layer.moe_runner_config
+        runner_backend = self.get_moe_runner_backend(layer)
         if not (
             _is_cuda
-            and self._aiter_runner is None
-            and self.runner.runner_backend.is_triton()
+            and runner_backend is not None
+            and runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()
             and not self.with_bias
             and layer.w13_weight.dtype == torch.bfloat16
@@ -1030,7 +1032,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        if not self.runner.runner_backend.is_flashinfer_trtllm_routed():
+        runner_backend = self.get_moe_runner_backend(layer)
+        if runner_backend is None or not runner_backend.is_flashinfer_trtllm_routed():
             return
 
         expected_shape = None
