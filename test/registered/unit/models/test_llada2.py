@@ -78,7 +78,7 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
             expert_capacity=48,
         )
 
-        with get_parallel().override(tp_size=4, moe_ep_size=4):
+        with get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4):
             with self.assertRaisesRegex(
                 ValueError,
                 r"does not support expert parallelism.*moe_ep_size=4",
