@@ -103,6 +103,11 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
     UNWIRED_BACKENDS = ("aiter",)
 
+    def test_explicit_flashinfer_gdn_prefill_matches_the_default(self):
+        """Pinning the automatically selected GDN prefill backend must not
+        make an otherwise valid unified-memory configuration fail at startup."""
+        self.assertTrue(_accepts("triton", use_mla=False, linear_prefill="flashinfer"))
+
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither
         the MLA nor the MHA arm can narrow away."""
