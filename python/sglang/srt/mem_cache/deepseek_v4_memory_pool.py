@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
@@ -1114,8 +1114,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.request_window = None
         self.full_to_swa_index_mapping = None
-        # Per req slot, the first position the draft SWA ring holds KV for.
-        self.swa_req_ring_valid_from: Optional[torch.Tensor] = None
+        # Per req slot, the first position whose draft SWA rows this request
+        # wrote: the ring restarts at the cached prefix, and a PD decode takes the
+        # prefill's mark with the rows it receives.
+        self.swa_valid_from: Optional[torch.Tensor] = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # Under encoder replay the target keeps SWA in a per-request window. A
         # draft without its own ring still reads the target's full-to-SWA mapping,
@@ -1174,7 +1176,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = get_draft_swa_ring_size(
                 self.sliding_window, online_mtp_max_draft_tokens or 0, swa_page_size
             )
-            self.swa_req_ring_valid_from = torch.zeros(
+            self.swa_valid_from = torch.zeros(
                 self.num_req_slots, dtype=torch.int64, device=device
             )
             self.swa_kv_pool = self._make_kv_pool(
@@ -1232,6 +1234,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 global_page_size=swa_page_size,
                 kv_layout=self.kv_layout,
                 cls=kv_pool_cls,
+            )
+
+        if (
+            is_draft_worker
+            and self.swa_kv_pool is not None
+            and self.swa_valid_from is None
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            # A prefill whose draft keeps a ring sends window rows below the
+            # cached prefix that it never wrote for this request.
+            self.swa_valid_from = torch.zeros(
+                self.num_req_slots, dtype=torch.int64, device=device
             )
 
         if self.request_window is not None:
@@ -1294,10 +1308,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
-        """Restart the draft SWA ring of ``slots`` at ``valid_from``; the rows
-        before it belong to the slot's previous owner, not this request."""
-        self.swa_req_ring_valid_from[slots] = valid_from
+    def set_swa_valid_from(
+        self, slots: Union[torch.Tensor, int], valid_from: Union[torch.Tensor, int]
+    ) -> None:
+        """The draft SWA rows of ``slots`` below ``valid_from`` are not this
+        request's: the slot's previous owner wrote them, or no one did."""
+        self.swa_valid_from[slots] = valid_from
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

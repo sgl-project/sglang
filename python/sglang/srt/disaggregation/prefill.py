@@ -1510,7 +1510,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            # A DSpark draft ring restarts at the cached prefix, so the window
+            # rows sent below it were never written for this request.
+            draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+            self.disagg_metadata_buffers.set_buf(
+                req,
+                draft_swa_valid_from=(
+                    req.cached_tokens
+                    if getattr(draft_pool, "swa_valid_from", None) is not None
+                    else 0
+                ),
+            )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request

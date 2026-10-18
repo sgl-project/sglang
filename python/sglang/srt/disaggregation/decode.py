@@ -2476,6 +2476,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     enable_host_receive: bool = False
+    draft_token_to_kv_pool: Optional[KVCache] = None
 
     def __init__(
         self,
@@ -2483,8 +2484,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        draft_token_to_kv_pool: Optional[KVCache] = None,
     ):
         self.queue: List[DecodeRequest] = []
+        self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
@@ -2644,6 +2647,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
         decode_req.req.mm_token_counts_ready = True
+        # Slot 7: the prefill's draft holds no SWA rows below this position.
+        if getattr(self.draft_token_to_kv_pool, "swa_valid_from", None) is not None:
+            self.draft_token_to_kv_pool.set_swa_valid_from(
+                decode_req.req.kv.req_pool_idx, cached_tokens[7].item()
+            )
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
