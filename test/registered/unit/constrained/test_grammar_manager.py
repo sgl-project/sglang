@@ -971,9 +971,7 @@ class TestStrictReasoningPaths(unittest.TestCase):
         mgr.grammar_backend = _make_strict_inkling_backend(max_think_tokens=10)
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
         budgets = [0, 1, 2, 3, 4, 5, 6, 12, None, 10, -1, -2, 0]
-        with patch.object(
-            reasoner_grammar_backend, "_INKLING_BUDGET_VARIANT_CACHE_SIZE", 4
-        ):
+        with patch.object(reasoner_grammar_backend, "_BUDGET_VARIANT_CACHE_SIZE", 4):
             served = [self._serve_inkling_regex(mgr, budget) for budget in budgets]
         self.assertEqual(
             [compiled for compiled, _ in served],

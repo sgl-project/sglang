@@ -179,6 +179,7 @@ class TestReasonerGrammarBackend(CustomTestCase):
             get_think_end_token_ids=lambda tokenizer: tokenizer.encode(
                 "</think>", add_special_tokens=False
             ),
+            get_answer_frame=lambda: None,
         )
         return SimpleNamespace(detector=detector)
 
