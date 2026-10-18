@@ -272,7 +272,7 @@ def _maybe_precompute_flashmla_sched_meta(
 
 
 def _low_ratio_source_projections(
-    layer, x, q_lora, positions, bufs, project_index: bool = True
+    layer, x, q_lora, positions, bufs, run_compressor, run_indexer
 ):
     real = (
         get_tc_piecewise_forward_context().forward_batch.global_num_token_non_padded_cpu
@@ -294,12 +294,12 @@ def _low_ratio_source_projections(
             buf.zero_()
         return
 
-    if layer.compressor is not None:
+    if run_compressor and layer.compressor is not None:
         kv, score = layer.compressor.project(x[:real])
         put("kv", kv)
         if score is not None:
             put("score", score)
-    if layer.indexer is not None and project_index:
+    if run_indexer and layer.indexer is not None:
         # Only the captured consumers read these; a flat index layer projects
         # once inside its eager break (_index_q_and_weights), so skip them there.
         indexer = layer.indexer
@@ -727,6 +727,8 @@ class DSV4AttnMetadata:
             "trtllm_prefill_c4_indices",
             "trtllm_prefill_c128",
         ]
+        if self.request_window_layout is not None:
+            self.request_window_layout.copy_(other.request_window_layout)
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
         for field_name in tensor_copy_fields:
@@ -937,8 +939,8 @@ class DSV4AttnMetadata:
 
 
 class LateLayerTail(msgspec.Struct, frozen=True):
-    """Rows the layers after the last kv_source layer run over under decoder SWA
-    bounded replay: the last tail tokens of each request in the extend."""
+    """Rows the layers from late_layer_start on run over under decoder SWA bounded
+    replay: the last tail tokens of each request in the extend."""
 
     token_indices: torch.Tensor
     positions: torch.Tensor
@@ -1011,6 +1013,19 @@ def late_layer_whole_extend(
         ),
         full_hidden_states=forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
         and not dspark,
+    )
+
+
+def late_layer_num_tokens(forward_batch: ForwardBatch, *, dspark: bool) -> int:
+    """Rows a rank runs from late_layer_start on: an extend's tail rows, as
+    late_layer_tail_layout picks them, and every row otherwise."""
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return forward_batch.input_ids.shape[0]
+    whole_extend = late_layer_whole_extend(forward_batch, dspark=dspark)
+    return sum(
+        late_layer_tail_lens(
+            forward_batch.extend_seq_lens_cpu, SWA_WINDOW, whole_extend
+        )
     )
 
 
@@ -1281,6 +1296,8 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Set by write_tail_source_kv until exit_late_layer_tail.
+        self.tail_source_kv_layer_id: Optional[int] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
         self._bcg_tail_capacity: Optional[int] = None
@@ -1519,6 +1536,9 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_tensor=extend_seq_lens,
             extend_start_loc=extend_start_loc,
         )
+        graph_window = (
+            use_prefill_cuda_graph and self.token_to_kv_pool.request_window is not None
+        )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1531,7 +1551,14 @@ class DeepseekV4AttnBackend(
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_write_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
-            num_groups=len(extend_seq_lens_cpu),
+            # Captured kernels read the window history by address, so a graph
+            # keeps one group per request slot, at most one per row.
+            num_groups=(
+                min(self.req_to_token.shape[0], padded_num_tokens)
+                if graph_window
+                else len(extend_seq_lens_cpu)
+            ),
+            request_window_live_rows=num_tokens if graph_window else None,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -1671,6 +1698,13 @@ class DeepseekV4AttnBackend(
             ):
                 return False
         return True
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay:
+            return None
+        return late_layer_num_tokens(
+            forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+        )
 
     def vote_prefill_cuda_graph(self, batch: ScheduleBatch) -> bool:
         """`can_run_prefill_cuda_graph`'s late-layer tail check judged from the
@@ -1988,6 +2022,22 @@ class DeepseekV4AttnBackend(
             pad_rows=pad_rows,
         )
 
+    def write_tail_source_kv(
+        self, *, layer, x, positions, forward_batch: ForwardBatch
+    ) -> None:
+        """Write every row's compressed KV for the source layer the tail starts at,
+        before enter_late_layer_tail; the layer's own pass inside the tail then
+        skips its compressor."""
+        self.forward_low_ratio_sources(
+            layer=layer,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_indexer=False,
+        )
+        self.tail_source_kv_layer_id = layer.layer_id
+
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail; the return value goes back to
         exit_late_layer_tail."""
@@ -2017,31 +2067,7 @@ class DeepseekV4AttnBackend(
                 )
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
-        # The layers before the switch published top-k into the full metadata's
-        # buffers; carry the tail rows into the tail metadata's (padding stays -1).
-        full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
-        for ratio in tail_core.low_ratios:
-            for full_buf, tail_buf in (
-                (
-                    full_core.sparse_page_indices(ratio),
-                    tail_core.sparse_page_indices(ratio),
-                ),
-                (
-                    full_core.sparse_topk_lengths(ratio),
-                    tail_core.sparse_topk_lengths(ratio),
-                ),
-                (
-                    full_core.sparse_raw_indices(ratio),
-                    tail_core.sparse_raw_indices(ratio),
-                ),
-            ):
-                if full_buf is None or tail_buf is None:
-                    continue
-                rows = tail.real_rows(full_buf)
-                if tail.real_rows_count is not None:
-                    rows = rows[: tail.real_rows_count]
-                tail_buf[: rows.shape[0]].copy_(rows)
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
@@ -2065,6 +2091,7 @@ class DeepseekV4AttnBackend(
         forward_batch.global_num_token_non_padded_cpu = non_padded
         forward_batch.global_num_token_non_padded = non_padded_gpu
         forward_batch.num_token_non_padded = local_non_padded
+        self.tail_source_kv_layer_id = None
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
@@ -2700,8 +2727,6 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
-        self.encoder_replay = forward_batch.encoder_swa_replay
-        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2711,6 +2736,9 @@ class DeepseekV4AttnBackend(
             else None
         )
 
+        self._activate_request_window()
+
+    def _activate_request_window(self) -> None:
         if self.token_to_kv_pool.request_window is not None:
             self.token_to_kv_pool.request_window.activate(
                 self.forward_metadata.core_attn_metadata.request_window_layout
@@ -2787,6 +2815,8 @@ class DeepseekV4AttnBackend(
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
+        if request_layout is not None:
+            request_layout = request_layout.leading_rows(num_qo_tokens)
         seq_lens_cpu_list = seq_lens_cpu.tolist()
         total_swa = sum(
             min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
@@ -2831,13 +2861,17 @@ class DeepseekV4AttnBackend(
         )
 
     @staticmethod
-    def _compressor_out_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+    def _compressor_out_loc(
+        forward_batch: ForwardBatch, *, own_buffer: bool = False
+    ) -> torch.Tensor:
         """Slot 0 for folded replay rows: their main KV, compressed groups and index
-        keys are cached, so the compressors write only the new rows."""
+        keys are cached, so the compressors write only the new rows. A prefill graph
+        refreshes the captured slots in place, so it takes its own buffer rather
+        than the static out_cache_loc."""
         loc = forward_batch.out_cache_loc
         keep = forward_batch.encoder_swa_compress_rows
         if keep is None:
-            return loc
+            return loc.clone() if own_buffer else loc
         return torch.zeros_like(loc).index_copy_(0, keep, loc[keep])
 
     def _build_forward_metadata(
@@ -2847,6 +2881,9 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ):
+        # make_core_attn_metadata reads the fold's window state from here.
+        self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -2946,7 +2983,9 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
-                out_cache_loc=self._compressor_out_loc(forward_batch),
+                out_cache_loc=self._compressor_out_loc(
+                    forward_batch, own_buffer=use_prefill_cuda_graph
+                ),
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -2964,15 +3003,22 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        if self.low_ratios == (1, 2):
+            graph_context_limit = _prefill_graph_max_seq_len()
+            if graph_context_limit is not None:
+                max_seq_len = min(max_seq_len, graph_context_limit)
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        self._activate_request_window()
         with_tail = (
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
+        if self.low_ratios == (1, 2):
+            self._share_bcg_low_ratio_index_buffers(self.forward_metadata.core_metadata)
         self.forward_metadata.prefill_graph_tail = with_tail
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(forward_batch, max_seq_len)
@@ -2985,6 +3031,25 @@ class DeepseekV4AttnBackend(
                     forward_batch.out_cache_loc.shape[0], ratio
                 )
         return self.forward_metadata
+
+    def _share_bcg_low_ratio_index_buffers(self, core) -> None:
+        # BCG buckets replay serially. Share only full-metadata output buffers;
+        # both ratios must survive the later full-to-tail metadata transition.
+        # Keep old allocations alive if capture order ever grows the capacity.
+        pools = getattr(self, "_bcg_low_ratio_index_buffers", None)
+        if pools is None:
+            pools = self._bcg_low_ratio_index_buffers = {}
+        for ratio in (1, 2):
+            for kind in ("page", "raw"):
+                name = f"c{ratio}_sparse_{kind}_indices"
+                value = getattr(core, name)
+                if value is None:
+                    continue
+                key = (name, value.shape[1], value.dtype, value.device)
+                retained = pools.setdefault(key, [])
+                if not retained or retained[0].shape[0] < value.shape[0]:
+                    retained.insert(0, value)
+                setattr(core, name, retained[0][: value.shape[0]])
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
@@ -3028,6 +3093,10 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        if self.low_ratios == (1, 2):
+            graph_context_limit = _prefill_graph_max_seq_len()
+            if graph_context_limit is not None:
+                max_seq_len = min(max_seq_len, graph_context_limit)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -3039,6 +3108,7 @@ class DeepseekV4AttnBackend(
             low_ratio_index_captured=self._prefill_graph_low_ratio_index_captured(),
         )
         self.forward_metadata = capture_metadata
+        self._activate_request_window()
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(metadata_batch, max_seq_len)
             if capture_metadata.prefill_graph_tail
@@ -3168,6 +3238,9 @@ class DeepseekV4AttnBackend(
             return
         if forward_batch.encoder_swa_replay:
             run_compressor = False
+        if layer.layer_id == self.tail_source_kv_layer_id:
+            run_compressor = False
+        meta = self.forward_metadata
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -3179,7 +3252,6 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
-        meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
         if (
@@ -3205,7 +3277,7 @@ class DeepseekV4AttnBackend(
                 and (layer.indexer.uses_candidates or not two_level)
             )
             _bcg_low_ratio_source_projections(
-                layer, x, q_lora, pos, bufs, captured_index
+                layer, x, q_lora, pos, bufs, run_compressor, captured_index
             )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
@@ -3768,15 +3840,6 @@ class DeepseekV4AttnBackend(
         if published is None:
             return
         self.forward_metadata.candidate_metadata = published
-        tail_metadata = self.tail_forward_metadata
-        if tail_metadata is None or tail_metadata is self.forward_metadata:
-            return
-        tail = tail_metadata.late_layer_tail
-        tail_metadata.candidate_metadata = published.tail(
-            tail.local_lens_cpu
-            if tail.cp_metadata is not None
-            else tail.extend_seq_lens_cpu
-        )
 
     def _prefill_graph_low_ratio_index_captured(self) -> bool:
         """Whether a prefill graph replay reads the ratio-1/2 indexer metadata by
@@ -4504,6 +4567,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        request_window_live_rows: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -4557,12 +4621,14 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
+            live = request_window_live_rows
             request_layout = window_layout(
-                req_pool_indices_repeated,
-                raw_positions,
+                req_pool_indices_repeated[:live],
+                raw_positions[:live],
                 capacity=self.token_to_kv_pool.request_window.capacity,
-                floor=swa_replay_start,
+                floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,
+                padded_rows=None if live is None else raw_positions.numel(),
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
