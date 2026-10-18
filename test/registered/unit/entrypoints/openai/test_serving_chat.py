@@ -1718,6 +1718,28 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.input_ids, [11, 22, 33])
         self.assertIsNone(adapted.text)
 
+    def test_text_only_prompt_is_not_decoded_into_the_template_cache(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = None
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        tokenizer = self.tm.tokenizer
+        tokenizer.apply_chat_template.side_effect = lambda messages, **_: "".join(
+            m["content"] for m in messages
+        )
+        tokenizer.encode.side_effect = lambda text, **_: [ord(c) for c in text]
+        tokenizer.decode.side_effect = lambda ids, **_: "".join(map(chr, ids))
+
+        adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, [ord(c) for c in "Hi?"])
+        self.assertEqual(len(self.chat._chat_template_cache), 0)
+
+        # The Responses API sends text on multimodal models, decoded on demand.
+        processed = self.chat._process_messages(self.basic_req, is_multimodal=True)
+        self.assertEqual(self.chat._engine_prompt(processed, True), ("text", "Hi?"))
+
     def test_prompt_reuse_keeps_media_path(self):
         self.tm.model_config.is_multimodal = True
         self.chat.chat_encoding_spec = None
