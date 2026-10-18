@@ -26,6 +26,7 @@ single opaque op under ``torch.compile`` -- no graph break.
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
 import torch
@@ -128,10 +129,12 @@ def can_use_linear_gelu_static(linear: Any) -> bool:
     return _static_reject_reason(linear) is None
 
 
-def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
-    """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
-    if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
-        return False
+# Input-independent verdict per linear, computed on first use; mounting and
+# unmounting clear it so a re-mount re-reads the linear.
+_VERDICTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _input_independent_ok(linear: Any) -> bool:
     arch = get_jit_cuda_arch()
     if arch.major * 10 + arch.minor >= 120:
         # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
@@ -139,9 +142,19 @@ def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
         # production shape (1, 512, 3072 -> 12288).  Keep quality-gated sites
         # on their existing eager path on RTX 5090; SM90 dispatch is unchanged.
         return False
+    return can_use_linear_gelu_static(linear)
+
+
+def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
+    """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
+    if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+        return False
     if getattr(linear, "weight", None) is None or x.dtype != linear.weight.dtype:
         return False
-    return can_use_linear_gelu_static(linear)
+    verdict = _VERDICTS.get(linear)
+    if verdict is None:
+        verdict = _VERDICTS[linear] = _input_independent_ok(linear)
+    return verdict
 
 
 def mark_fused_gelu_site(module: nn.Module, linear_attr: str) -> None:
@@ -172,9 +185,11 @@ def mount_fused_linear_gelu(root: nn.Module) -> bool:
     left (or reset) on the reference path and False is returned. Returns False
     as well when ``root`` has no marked sites.
     """
+    _VERDICTS.clear()
     return _FUSION.mount(root, reject_reason=_site_reject_reason, logger=logger)
 
 
 def unmount_fused_linear_gelu(root: nn.Module) -> None:
     """Reset every marked site under ``root`` to the bit-exact reference path."""
+    _VERDICTS.clear()
     _FUSION.unmount(root)

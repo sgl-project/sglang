@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Side-by-side implementation of POLICY_DESIGN.md. Chat routing can opt into
+//! Routing policies described in ARCHITECTURE.md. Chat routing can opt into
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;

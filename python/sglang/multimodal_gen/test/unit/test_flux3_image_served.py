@@ -619,11 +619,16 @@ class TestFlux3RequestControls(unittest.TestCase):
 
 
 class TestFlux3Lora(unittest.TestCase):
-    def test_rejects_late_lora_before_wrapping_prims_ts_weights(self):
+    _SUPPORTS_LORA = (
+        "sglang.multimodal_gen.runtime.pipelines.flux3_image."
+        "flux3_prims_ts_supports_lora"
+    )
+
+    @staticmethod
+    def _pipeline_with_one_prims_ts_layer():
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
         from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
             Flux3PrimsTsMethodMixin,
-            Flux3PrimsTsRole,
         )
         from sglang.multimodal_gen.runtime.pipelines.flux3_image import (
             Flux3ImagePipeline,
@@ -635,11 +640,30 @@ class TestFlux3Lora(unittest.TestCase):
         pipeline = Flux3ImagePipeline.__new__(Flux3ImagePipeline)
         pipeline.modules = {"transformer": torch.nn.Sequential(layer)}
         pipeline.lora_target_modules = None
-        pipeline._reject_lora_on_packed_weights()
-        layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
-        with self.assertRaisesRegex(ValueError, "--lora-path"):
+        return pipeline, layer
+
+    def test_rejects_late_lora_before_wrapping_prims_ts_weights(self):
+        from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
+            Flux3PrimsTsRole,
+        )
+
+        pipeline, layer = self._pipeline_with_one_prims_ts_layer()
+        with mock.patch(self._SUPPORTS_LORA, return_value=False):
             pipeline._reject_lora_on_packed_weights()
+            layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
+            with self.assertRaisesRegex(ValueError, "--lora-path"):
+                pipeline._reject_lora_on_packed_weights()
         self.assertIs(pipeline.get_module("transformer")[0], layer)
+
+    def test_accepts_late_lora_when_prims_ts_takes_a_delta(self):
+        from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
+            Flux3PrimsTsRole,
+        )
+
+        pipeline, layer = self._pipeline_with_one_prims_ts_layer()
+        layer.quant_method.prims_ts_role = Flux3PrimsTsRole.SWIGLU
+        with mock.patch(self._SUPPORTS_LORA, return_value=True):
+            pipeline._reject_lora_on_packed_weights()
 
     def test_prefixed_adapter_keys_reach_the_native_modules(self):
         """Prefixed adapters (BFL/ostris ``dit.``, diffusers ``transformer.``)

@@ -1531,9 +1531,21 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                request_window = kvcache.request_window
+                # Under encoder replay the scheduler is not hybrid SWA and keeps no
+                # window size; the pool holds it.
+                window_size = (
+                    self.sliding_window_size
+                    if request_window is None
+                    else kvcache.sliding_window
+                )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
+                if request_window is not None:
+                    return request_window.page_indices(
+                        int(req.kv.req_pool_idx), window_start, seq_len
+                    )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]

@@ -53,6 +53,7 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import re
 import sys
@@ -160,6 +161,10 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
+_MM_IDENTITY_BYTES = 32
+_MM_WIDE_PAD_TAG = b"sglang-mm-wide-pad-v1"
+# Keep MM_PAD_SHIFT_VALUE + sentinel below 2**63 so it fits an int64 token ID.
+_MM_WIDE_PAD_MASK = (1 << 62) - 1
 
 logger = logging.getLogger(__name__)
 
@@ -255,9 +260,15 @@ def split_cached_prefix_by_tier(
     return device, host, storage
 
 
-def _compute_pad_value(hash: int) -> int:
-    """Compute pad value from hash."""
-    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
+def _compute_pad_values(identity: bytes) -> Tuple[int, ...]:
+    """derive shared wide sentinels from an item hash or full identity digest"""
+    digest = hashlib.sha256(_MM_WIDE_PAD_TAG + identity).digest()
+    # prefix matching can stop after one sentinel, so each must retain wide bits
+    return tuple(
+        MM_PAD_SHIFT_VALUE
+        + (int.from_bytes(digest[i : i + 8], byteorder="big") & _MM_WIDE_PAD_MASK)
+        for i in range(0, _MM_IDENTITY_BYTES, 8)
+    )
 
 
 class BaseFinishReason:
@@ -391,6 +402,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         default_factory=dict
     )
 
+    # optional full identity; otherwise sentinels derive from the 64-bit item hash
+    # pad_value remains the first sentinel for scalar-padding consumers
+    identity: Optional[bytes] = None
+    pad_values: Optional[Tuple[int, ...]] = None
+
     def __post_init__(self) -> None:
         if self.hash is not None:
             msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
@@ -419,7 +435,33 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def set_hash(self, hash_value: int) -> None:
         self.hash = hash_value
-        self.pad_value = _compute_pad_value(hash_value)
+        self.identity = None
+        self.pad_values = _compute_pad_values(self.hash.to_bytes(8, byteorder="big"))
+        self.pad_value = self.pad_values[0]
+
+    def set_identity(self, identity: bytes) -> None:
+        """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
+
+        ``hash`` keeps the leading 64 bits for scalar consumers such as the
+        embedding cache; the radix key uses the full sentinel pattern.
+        """
+        if len(identity) != _MM_IDENTITY_BYTES:
+            raise ValueError(
+                f"multimodal identity must be {_MM_IDENTITY_BYTES} bytes, "
+                f"got {len(identity)}"
+            )
+        self.identity = bytes(identity)
+        self.hash = int.from_bytes(identity[:8], byteorder="big", signed=False)
+        self.pad_values = _compute_pad_values(self.identity)
+        self.pad_value = self.pad_values[0]
+
+    def padding_values(self) -> Tuple[int, ...]:
+        return self.pad_values or (self.pad_value,)
+
+    def padding_sequence(self, length: int) -> List[int]:
+        values = self.padding_values()
+        repeats, remainder = divmod(length, len(values))
+        return list(values) * repeats + list(values[:remainder])
 
     @staticmethod
     def is_empty_list(l):
@@ -433,12 +475,13 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
         from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        self.hash = resolve_multimodal_item_hash(
-            existing_hash=self.hash,
-            feature=self.feature,
-            precomputed_embeddings=self.precomputed_embeddings,
+        self.set_hash(
+            resolve_multimodal_item_hash(
+                existing_hash=self.hash,
+                feature=self.feature,
+                precomputed_embeddings=self.precomputed_embeddings,
+            )
         )
-        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -650,7 +693,9 @@ class MultimodalProcessorOutput(
 
         for item in mm_items:
             for start, end in item.offsets:
-                padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
+                padded_input_ids[start : end + 1] = item.padding_sequence(
+                    end - start + 1
+                )
         return padded_input_ids
 
     @staticmethod
@@ -3931,7 +3976,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
-            sliding_window_size = self.tree_cache.sliding_window_size
+            retain_window = self.tree_cache.swa_retain_window
             # Auxiliary windows check their own cursors and prefix locks.
             has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
@@ -3940,9 +3985,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            swa_evict_due = self._swa_eviction_trigger(
-                sliding_window_size, eviction_interval
-            )
+            swa_evict_due = self._swa_eviction_trigger(retain_window, eviction_interval)
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
@@ -3964,12 +4007,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Past the window the request no longer reads its prefill's SWA;
-                    # release that part of the tree lock so SWA LRU can reclaim it.
-                    if (
-                        release_leaf_lock
-                        and req.decode_batch_idx >= sliding_window_size
-                    ):
+                    # Past the retain window the request no longer reads its prefill's
+                    # SWA; release that part of the tree lock so SWA LRU can reclaim it.
+                    if release_leaf_lock and req.decode_batch_idx >= retain_window:
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (
                     self.forward_mode.is_extend()

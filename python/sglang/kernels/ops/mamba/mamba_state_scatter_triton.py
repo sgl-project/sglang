@@ -614,7 +614,11 @@ def _conv_multi_eligible(pairs) -> bool:
             return False
         if src.shape[0] != layers or src.shape[3:] != dst.shape[2:]:
             return False
-        if not dst.is_contiguous():
+        # The descriptor carries layer/slot strides. Only the trailing
+        # feature block is flat-copied, including for unified pool views.
+        if (dst.shape[3] != 1 and dst.stride(3) != 1) or (
+            dst.shape[2] != 1 and dst.stride(2) != dst.shape[3]
+        ):
             return False
         if src.shape[1:3] != pairs[0][1].shape[1:3]:
             return False
@@ -640,7 +644,10 @@ def fused_conv_window_scatter_multi(
 
     BLOCK_SIZE = 1024
     key = tuple(
-        (dst.data_ptr(), src.data_ptr()) + tuple(src.stride()) + tuple(dst.shape)
+        (dst.data_ptr(), src.data_ptr())
+        + tuple(src.stride())
+        + tuple(dst.stride())
+        + tuple(dst.shape)
         for dst, src in pairs
     )
     cached = _conv_multi_meta_cache.get(key)

@@ -100,7 +100,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MHABufferInfo
 
 
 logger = logging.getLogger(__name__)
@@ -1971,6 +1971,8 @@ class KVWriteLoc:
         # swa_loc / full_loc are resolved once at metadata-init from the full
         # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
         # layer, so slice these pre-resolved locs to match (same per-token order).
+        # A multi-step draft step's slice is NOT a prefix of the all-steps loc;
+        # its backend derives per-step locs and never relies on this.
         if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
@@ -2072,6 +2074,14 @@ class KVCache(abc.ABC):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Persistent buffers for migrated host consumers; see device_pool_info.py.
+
+        Unmigrated formats retain their existing construction entry points.
+        Consumers must not use exceptions or empty descriptions to pick a path.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no device pool provider")
 
     def host_pool_decls(self):
         """Host pools HiCache keeps for the buffers this device pool (and its
@@ -2223,6 +2233,11 @@ class MHATokenToKVPool(KVCache):
     ):
         self.k_buffer = None
         self.v_buffer = None
+        if not _is_npu:
+            self.k_data_ptrs = None
+            self.v_data_ptrs = None
+            self.k_scale_buffer = None
+            self.v_scale_buffer = None
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
             # (size + page_size) % page_size == 0 holds for paged layouts.
@@ -2322,6 +2337,64 @@ class MHATokenToKVPool(KVCache):
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.v_row_dim = self.head_num * self.v_head_dim
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Describe persistent KV buffers for host assembly without allocating."""
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=self._mha_buffer_info(),
+            ),
+        )
+
+    def _mha_buffers(self):
+        from sglang.srt.mem_cache.device_pool_info import KVBufferLayout, KVBuffers
+
+        return KVBuffers(
+            k=tuple(self.k_buffer),
+            v=tuple(self.v_buffer),
+            k_data_ptrs=self.k_data_ptrs,
+            v_data_ptrs=self.v_data_ptrs,
+            layout=KVBufferLayout.NHD
+            if self.kv_cache_layout == "page_major"
+            else KVBufferLayout(self.kv_cache_layout),
+        )
+
+    def _mha_scale_buffers(self):
+        from sglang.srt.mem_cache.device_pool_info import KVScaleBuffers, KVScaleLayout
+
+        if self.k_scale_buffer is None:
+            return None
+        return KVScaleBuffers(
+            k=tuple(self.k_scale_buffer),
+            v=tuple(self.v_scale_buffer),
+            layout=KVScaleLayout.TOKEN,
+        )
+
+    def _mha_buffer_info(self) -> MHABufferInfo:
+        from sglang.srt.mem_cache.device_pool_info import MHABufferInfo
+
+        buffers = self._mha_buffers()
+        return MHABufferInfo(
+            buffers=buffers,
+            page_size=self.page_size,
+            head_num=self.row_dim // self.head_dim
+            if self.head_dim == self.v_head_dim
+            else self.head_num,
+            head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
+            dtype=self.store_dtype,
+            device=buffers.k[0].device if len(buffers.k) else torch.device(self.device),
+            scales=self._mha_scale_buffers(),
+        )
 
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -3787,6 +3860,17 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
     MXFP8_SCALE_BLOCK_SIZE = 32
 
+    def _mha_scale_buffers(self):
+        from sglang.srt.mem_cache.device_pool_info import KVScaleBuffers, KVScaleLayout
+
+        return KVScaleBuffers(
+            k=tuple(self.k_scale_buffer),
+            v=tuple(self.v_scale_buffer),
+            layout=KVScaleLayout.MXFP8_INTERLEAVED
+            if self.mxfp8_sf_interleaved
+            else KVScaleLayout.TOKEN,
+        )
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -4270,6 +4354,9 @@ class HybridLinearKVPool(KVCache):
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
             )
+        if isinstance(self.full_kv_pool, MHATokenToKVPool):
+            # Only the hybrid root knows the model IDs of its compact child.
+            self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
@@ -4714,6 +4801,11 @@ class MLATokenToKVPool(KVCache):
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
+        self.kv_scale_buffer = None
+
         self._create_buffers()
 
         self.data_ptrs = torch.tensor(
@@ -4724,6 +4816,47 @@ class MLATokenToKVPool(KVCache):
         if not use_dsa:
             # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        info = self._mla_buffer_info()
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                layer_ids=tuple(self.model_layer_ids[i] for i in info.layer_indices),
+                buffer_info=info,
+            ),
+        )
+
+    def _mla_buffer_info(self):
+        from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
+
+        start, end = (
+            self._owned_local_layer_range()
+            if self.layer_shard_enabled
+            else (0, self.layer_num)
+        )
+        return MLABufferInfo(
+            buffers=tuple(self.kv_buffer[start:end]),
+            data_ptrs=self.data_ptrs
+            if (start, end) == (0, self.layer_num)
+            else self.data_ptrs[start:end],
+            layer_indices=tuple(range(start, end)),
+            device_layer_num=self.layer_num,
+            page_size=self.page_size,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            kv_cache_dim=self.kv_cache_dim,
+            dtype=self.store_dtype,
+            device=self.data_ptrs.device,
+            packed_fp8=self.dsa_kv_cache_store_fp8,
+            scales=None
+            if self.kv_scale_buffer is None
+            else tuple(self.kv_scale_buffer[start:end]),
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -5855,6 +5988,13 @@ class MiniMaxSparseKVPool(KVCache):
             if local_k_only_sparse_layer_ids
             else None
         )
+
+        if enable_hisparse:
+            self.main_pool.model_layer_ids = tuple(local_sparse_layer_ids)
+            if self.dense_pool is not None:
+                self.dense_pool.model_layer_ids = tuple(local_dense_layer_ids)
+        if self.index_kv_pool is not None:
+            self.index_kv_pool.model_layer_ids = tuple(local_kv_sparse_layer_ids)
 
         self.mem_usage = self.main_pool.mem_usage
         if self.dense_pool is not None:

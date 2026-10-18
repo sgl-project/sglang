@@ -5,7 +5,8 @@ request scale, add) and only drops multiplications by 1.0, which are exact. At
 "lossless" the second GEMM accumulates the scaled delta onto the base output and
 rounds once, and a row-parallel bias moves into the base GEMM's epilogue. A
 forward whose stage does not put its request in the forward context runs the
-exact chain.
+exact chain. ``fused_lora_delta`` returns the same delta for GEMM epilogues
+that add it themselves.
 """
 
 from types import SimpleNamespace
@@ -17,7 +18,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
+    BaseLayerWithLoRA,
+    ColumnParallelLinearWithLoRA,
     LinearWithLoRA,
+    MergedColumnParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,
     _compute_lora_delta,
     _request_allows_lossless,
@@ -188,3 +192,109 @@ def test_row_parallel_bias_moves_into_the_gemm_only_above_exact():
         candidate=lossless,
         label="row-parallel LoRA with the bias in the GEMM",
     )
+
+
+class _ColumnLinear(nn.Module):
+    """The ColumnParallelLinear surface the LoRA wrapper reads, at TP 1."""
+
+    def __init__(self, output_sizes: list[int]):
+        super().__init__()
+        g = torch.Generator().manual_seed(6)
+        self.weight = nn.Parameter(
+            torch.randn(sum(output_sizes), IN_DIM, generator=g) * 0.05
+        )
+        self.bias = None
+        self.output_sizes = output_sizes
+        self.output_partition_sizes = output_sizes
+        self.skip_bias_add = False
+        self.gather_output = False
+        self.quant_method = SimpleNamespace(
+            apply=lambda layer, x, bias=None: F.linear(x, layer.weight, bias)
+        )
+
+    def forward(self, x):
+        return F.linear(x, self.weight), None
+
+
+def _column_layer(*, stacked=False, alpha=RANK, strength=1.0, output_offset=None):
+    a, b = _adapter(stacked, torch.float32)
+    if stacked:
+        layer = MergedColumnParallelLinearWithLoRA(
+            _ColumnLinear([OUT_DIM // 3] * 3), lora_rank=RANK, lora_alpha=alpha
+        )
+    else:
+        layer = ColumnParallelLinearWithLoRA(
+            _ColumnLinear([OUT_DIM]), lora_rank=RANK, lora_alpha=alpha
+        )
+    layer.set_lora_weights(
+        a, b, strength=strength, merge_weights=False, output_offset=output_offset
+    )
+    return layer
+
+
+def _forward_delta(layer, x):
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer(x)
+        base, _ = layer.base_layer(x)
+    return (out - base).reshape(-1, out.shape[-1])
+
+
+def _fused_delta(layer, x, **kwargs):
+    with patch(_TP_RANK_PATCH, return_value=0):
+        return layer.fused_lora_delta(x, **kwargs)
+
+
+def _assert_fused_delta(actual, expected):
+    assert actual.dtype == torch.bfloat16 and actual.is_contiguous()
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+def test_fused_delta_matches_the_forward_delta(stacked):
+    layer = _column_layer(stacked=stacked, alpha=2 * RANK, strength=0.7)
+    x = _activations(TOKENS, IN_DIM, seed=7).reshape(2, TOKENS // 2, IN_DIM)
+    delta = _fused_delta(layer, x)
+    assert delta.shape == (TOKENS, OUT_DIM)
+    _assert_fused_delta(delta, _forward_delta(layer, x))
+
+
+def test_fused_delta_follows_the_runtime_scale_and_output_offset():
+    layer = _column_layer(output_offset=torch.randn(OUT_DIM))
+    x = _activations(TOKENS, IN_DIM, seed=8)
+    with patch.object(BaseLayerWithLoRA, "_runtime_lora_scale", return_value=0.5):
+        _assert_fused_delta(_fused_delta(layer, x), _forward_delta(layer, x))
+    with patch.object(BaseLayerWithLoRA, "_runtime_lora_scale", return_value=0.0):
+        assert _fused_delta(layer, x) is None
+
+
+def test_fused_delta_interleaves_swiglu_value_and_gate_columns():
+    layer = _column_layer(output_offset=torch.randn(OUT_DIM))
+    x = _activations(TOKENS, IN_DIM, seed=9)
+    gate, value = _forward_delta(layer, x).chunk(2, dim=-1)
+    interleaved = torch.stack((value, gate), dim=-1).flatten(-2)
+    _assert_fused_delta(_fused_delta(layer, x, swiglu_rows=True), interleaved)
+
+
+def test_fused_delta_drops_cached_factors_for_new_adapter_weights():
+    layer = _column_layer()
+    x = _activations(TOKENS, IN_DIM, seed=10)
+    _fused_delta(layer, x)
+    a, b = _adapter(False, torch.float32, seed=11)
+    layer.set_lora_weights(a, b, merge_weights=False)
+    _assert_fused_delta(_fused_delta(layer, x), _forward_delta(layer, x))
+
+
+@pytest.mark.parametrize("state", ["no_adapter", "disabled", "merged"])
+def test_inactive_layers_have_no_fused_delta(state):
+    if state == "no_adapter":
+        layer = ColumnParallelLinearWithLoRA(
+            _ColumnLinear([OUT_DIM]), lora_rank=RANK, lora_alpha=RANK
+        )
+    else:
+        layer = _column_layer()
+    if state == "disabled":
+        layer.disable_lora = True
+    if state == "merged":
+        layer.merged = True
+    assert not layer.lora_active
+    assert _fused_delta(layer, _activations(TOKENS, IN_DIM, seed=12)) is None

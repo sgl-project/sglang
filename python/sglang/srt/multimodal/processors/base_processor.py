@@ -1001,7 +1001,7 @@ class BaseMultimodalProcessor(ABC):
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                return load_video(data, use_gpu=cls.video_preprocessing_device != "cpu")
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 

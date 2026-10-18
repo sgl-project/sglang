@@ -1263,16 +1263,20 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
         prefill.agent = _MemcpyNixlAgent(memory)
-        handles = prefill.maybe_send_extra(
-            "decode",
-            [np.array(self.SRC_PAGES, dtype=np.int32)],
-            [dst_ptrs],
-            [self.DST_PAGES],
-            0,
-            "7_state_0",
-            decode_tp,
-            decode_tp_rank=dst_rank,
-            dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+        prefill._prepared_state_plans = {}
+        prefill._state_layout_rejections = {}
+        handles = list(
+            prefill.maybe_send_extra(
+                "decode",
+                [np.array(self.SRC_PAGES, dtype=np.int32)],
+                [dst_ptrs],
+                [self.DST_PAGES],
+                0,
+                "7_state_0",
+                decode_tp,
+                decode_tp_rank=dst_rank,
+                dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+            )
         )
         self.assertEqual(len(handles), 1)
 

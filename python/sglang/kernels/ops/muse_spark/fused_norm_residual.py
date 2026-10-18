@@ -24,7 +24,7 @@ from sglang.kernels.ops.muse_spark.all_gather_norm_residual import (
     all_gather_norm_residual,
 )
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
-from sglang.srt.layers.muse_spark_layers import (
+from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
     MuseSpark1xRMSNormWithInputScale,
 )

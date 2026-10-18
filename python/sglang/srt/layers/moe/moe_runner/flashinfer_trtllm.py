@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils.common import (
     is_flashinfer_available,
     next_power_of_2,
@@ -53,7 +53,11 @@ _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
-    return is_arch_support_pdl() and num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
+    return (
+        not getattr(get_forward(), "sp_active", False)
+        and is_arch_support_pdl()
+        and num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
+    )
 
 
 @dataclass
@@ -99,6 +103,7 @@ def _make_deferred_finalize_output(
     result,
     *,
     top_k: int,
+    materialized_routing: bool = False,
 ) -> FlashInferTrtllmDeferredFinalizeOutput:
     """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
     gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
@@ -1450,12 +1455,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         use_routed_topk = True
 
     # Deferred outputs keep the padded width, so padded weights always finalize.
-    defer_finalize = (
-        _deferred_finalize_enabled.get()
-        and not use_routed_topk
-        and TopKOutputChecker.format_is_bypassed(topk_output)
-        and hidden_pad == 0
-    )
+    defer_finalize = _deferred_finalize_enabled.get() and hidden_pad == 0
+    if defer_finalize:
+        valid_deferred_input = (
+            use_routed_topk and TopKOutputChecker.format_is_standard(topk_output)
+        ) or (not use_routed_topk and TopKOutputChecker.format_is_bypassed(topk_output))
+        if not valid_deferred_input:
+            raise RuntimeError(
+                "FP4 deferred finalize requires either materialized routed TopK "
+                "or the logits-based bypassed TopK input"
+            )
 
     symm_output = None
     if not defer_finalize:
@@ -1480,7 +1489,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
-        result = trtllm_fp4_block_scale_routed_moe(
+        moe_kwargs = dict(
             topk_ids=routing,
             routing_bias=None,
             hidden_states=hs_fp4,
@@ -1507,12 +1516,22 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             local_num_experts=quant_info.local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
-            do_finalize=True,
+            do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
-        )[0]
+        )
+        if not defer_finalize:
+            moe_kwargs["output"] = symm_output
+        result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
+        if defer_finalize:
+            result = _make_deferred_finalize_output(
+                result,
+                top_k=_routing_top_k(routing),
+                materialized_routing=isinstance(routing, tuple),
+            )
+        else:
+            result = result[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -1641,8 +1660,14 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     defer_finalize = _deferred_finalize_enabled.get()
-    if defer_finalize and use_routed_topk:
-        raise RuntimeError("BF16 deferred finalize requires bypassed TopK")
+    if (
+        defer_finalize
+        and use_routed_topk
+        and not TopKOutputChecker.format_is_standard(topk_output)
+    ):
+        raise RuntimeError(
+            "BF16 deferred finalize with routed TopK requires materialized input"
+        )
 
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -1657,8 +1682,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
+            routing = _get_routing_for_flashinfer_routed(topk_output)
             final_hidden_states = trtllm_bf16_routed_moe(
-                topk_ids=_get_routing_for_flashinfer_routed(topk_output),
+                topk_ids=routing,
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
@@ -1675,9 +1701,17 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                     if runner_config.routed_scaling_factor is not None
                     else 1.0
                 ),
+                do_finalize=not defer_finalize,
+                enable_pdl=trtllm_moe_enable_pdl(hidden_states.shape[0]),
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
             )
+            if defer_finalize:
+                final_hidden_states = _make_deferred_finalize_output(
+                    final_hidden_states,
+                    top_k=runner_config.top_k,
+                    materialized_routing=isinstance(routing, tuple),
+                )
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
             topk_config = topk_output.topk_config
@@ -1769,17 +1803,22 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
 @register_fused_func("flashinfer", "flashinfer_trtllm")
 @register_fused_func("flashinfer", "flashinfer_trtllm_routed")
 def fused_experts_flashinfer_to_flashinfer_trtllm(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     """Fused function for FlashInfer A2A + TRT-LLM Gen MoE.
 
-    A2A dispatch materializes routing IDs and weights, so the regular and
-    explicitly-routed backend names both enter TRT-LLM's routed kernel.
+    Both one-sided decode and AG+RS prefill materialize routing IDs and weights,
+    so the regular and explicitly-routed backend names enter TRT-LLM's routed
+    kernel. The dispatch formats share the fields consumed by the implementation;
+    only the combine wrapper differs.
     """
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatchOutput,
     )
 
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
@@ -1836,6 +1875,8 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             "FlashInfer A2A + TRT-LLM Gen FP8 MoE must return a BF16 combine "
             f"payload, got {result.hidden_states.dtype}."
         )
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return result
     return FlashinferCombineInput(hidden_states=result.hidden_states)
 
 

@@ -173,8 +173,8 @@ def _engram_history(*, reqs, starts, runner):
     n = hasher.max_ngram_size - 1
     hist = []
     for r, s in zip(reqs, starts):
-        ids = list(r.full_untruncated_fill_ids[max(0, s - n) : s])
-        hist.append([0] * (n - len(ids)) + ids)
+        ids = r.full_untruncated_fill_ids[max(0, s - n) : s]
+        hist.append(hasher.history_row(ids))
     return torch.tensor(hist, dtype=torch.int32, device=runner.device)
 
 

@@ -43,12 +43,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features

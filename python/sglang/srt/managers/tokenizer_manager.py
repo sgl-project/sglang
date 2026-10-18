@@ -1914,10 +1914,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
-        if finish_reason.get("type") != "abort" or status_code not in (
-            HTTPStatus.BAD_REQUEST,
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
+        if (
+            finish_reason.get("type") != "abort"
+            or status_code is None
+            or not HTTPStatus.BAD_REQUEST <= status_code < 600
         ):
             return None
 

@@ -581,6 +581,14 @@ def fused_sigmoid_gating_delta_rule_update(
             "match_cutedsl_decode is defined for the KDA softplus gate only "
             "(is_kda=True, lower_bound=None)."
         )
+    if match_cutedsl_decode and _is_hip:
+        # The parity branch emits PTX (ex2/lg2.approx) to reproduce FlashInfer's
+        # CuTe DSL decode kernel. AMDGCN rejects it at compile time but the launch
+        # still runs, so without this check ROCm silently returns wrong values.
+        raise NotImplementedError(
+            "match_cutedsl_decode reproduces an NVIDIA-only kernel and is not "
+            "available on ROCm."
+        )
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]

@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/utils.py
 
+import contextlib
 import ctypes
+import gc
 import os
 import signal
 import sys
 import threading
+from collections.abc import Iterator
 
 import psutil
 
@@ -28,6 +31,61 @@ def kill_itself_when_parent_died() -> None:
     # parent (e.g. running as a container's init process).
     if os.getppid() != parent_pid:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+_full_gc_lock = threading.Lock()
+_full_gc_deferrals = 0
+_gc_thresholds = gc.get_threshold()
+# The largest third threshold the collector accepts, a C int, so never reached.
+_NO_FULL_GC = 2**31 - 1
+
+
+@contextlib.contextmanager
+def defer_full_gc_for_imports() -> Iterator[None]:
+    """Run no automatic full garbage collection while a process imports its runtime.
+
+    Imports create long-lived modules, classes and functions and little garbage,
+    yet each full collection traces the whole growing heap, and how many of them
+    fall inside an import depends on the import order rather than on the work
+    done. Young collections still run, so short-lived cyclic garbage is freed as
+    usual. Restoring the entry thresholds lets automatic full collections resume
+    after the block; nested or concurrent blocks restore them when the last one
+    exits.
+    """
+    global _full_gc_deferrals, _gc_thresholds
+    # Python 3.14.0-3.14.4 uses incremental GC and ignores threshold2
+    if (3, 14) <= sys.version_info < (3, 14, 5):
+        yield
+        return
+
+    pid = os.getpid()
+    with _full_gc_lock:
+        if _full_gc_deferrals == 0:
+            _gc_thresholds = gc.get_threshold()
+            gc.set_threshold(*_gc_thresholds[:2], _NO_FULL_GC)
+        _full_gc_deferrals += 1
+    try:
+        yield
+    finally:
+        # A child forked inside the block restored the thresholds at fork.
+        if os.getpid() == pid:
+            with _full_gc_lock:
+                _full_gc_deferrals -= 1
+                if _full_gc_deferrals == 0:
+                    gc.set_threshold(*_gc_thresholds)
+
+
+def _restore_gc_thresholds_in_forked_child() -> None:
+    # The parent restores the thresholds in the parent only, so a child forked
+    # inside the block would otherwise never run a full collection.
+    global _full_gc_lock, _full_gc_deferrals
+    _full_gc_lock = threading.Lock()
+    if _full_gc_deferrals:
+        _full_gc_deferrals = 0
+        gc.set_threshold(*_gc_thresholds)
+
+
+os.register_at_fork(after_in_child=_restore_gc_thresholds_in_forked_child)
 
 
 def kill_process_tree(

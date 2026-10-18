@@ -378,8 +378,12 @@ def fused_kda_conv_gating_verify_kernel(
                     )
 
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            # Reciprocal then multiply, as fused_sigmoid_gating_delta_rule_update does:
+            # this kernel must match it bit for bit, and x / y is not x * (1 / y).
+            q_rsqrt = 1.0 / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            k_rsqrt = 1.0 / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q *= q_rsqrt
+            b_k *= k_rsqrt
 
         b_q = b_q * scale
 

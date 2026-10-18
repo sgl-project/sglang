@@ -24,6 +24,9 @@ from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
+    generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
+)
+from sglang.kernels.ops.speculative.cache_locs import (
     get_src_tgt_cache_loc as get_src_tgt_cache_loc,
 )
 from sglang.kernels.ops.speculative.cache_locs import (

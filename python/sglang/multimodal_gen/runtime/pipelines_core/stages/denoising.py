@@ -565,6 +565,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     moved.append(module)
         return moved
 
+    def _explicit_dit_layerwise_offload(self) -> bool:
+        """True when the user asked for layerwise DiT residency, not a compile-only window."""
+        args = self.server_args
+        if args.dit_layerwise_offload:
+            return True
+        return bool(getattr(args, "is_dit_layerwise_offload_selected", False))
+
     def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -2073,9 +2080,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 for module in moved:
                     module.to(device)
             return
-        # prepare for first real request: restore the user-configured residency
-        for module in self._offloaded_dit_modules_for_compile:
-            module.disable_offload()
+        # Compile-only offload is undone so the real request is GPU-resident.
+        # An explicit layerwise request must stay enabled: disable_offload()
+        # clears manager.enabled, and the next use-site then raises
+        # ComponentResidencyError (Wan transformer_2).
+        if not self._explicit_dit_layerwise_offload():
+            for module in self._offloaded_dit_modules_for_compile:
+                module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
         # The warmup traced the offload hooks, whose graph breaks inside the

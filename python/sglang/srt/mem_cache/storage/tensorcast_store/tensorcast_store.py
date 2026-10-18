@@ -489,7 +489,7 @@ def _validate_storage_config(
             "TensorCast FULL v1 supports only page_first and page_first_direct, "
             f"got layout={mem_pool_host.layout!r}"
         )
-    if mem_pool_host.mtp_draft_device_pools:
+    if mem_pool_host.layer_num != mem_pool_host.target_layer_num:
         raise NotImplementedError(
             "TensorCast FULL v1 does not support packed MTP draft pools"
         )

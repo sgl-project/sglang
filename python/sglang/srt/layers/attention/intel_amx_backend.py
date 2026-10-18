@@ -39,6 +39,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
         self.swa_out_cache_loc = None
+        self._swa_req_to_token = None
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -146,14 +147,53 @@ class IntelAMXAttnBackend(AttentionBackend):
             self.extend_metadata = self._build_extend_metadata(forward_batch)
         self.forward_metadata = (attn_logits, max_extend_len)
 
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+        self._init_swa_forward_metadata(forward_batch.out_cache_loc)
+
+    def _init_swa_forward_metadata(self, out_cache_loc: torch.Tensor | None) -> None:
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             self.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         else:
             self.swa_out_cache_loc = None
+        self._swa_req_to_token = None
+
+    def _is_swa_layer(self, layer_id: int) -> bool:
+        return (
+            self.use_sliding_window_kv_pool
+            and self.token_to_kv_pool.layers_mapping[layer_id][1]
+        )
+
+    def _swa_kv_indices(
+        self,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """This batch's rows of ``req_to_token``, in the SWA pool's index space.
+
+        ``req_to_token`` holds full-pool indices, but a sliding-window layer's
+        K/V buffer only has ``swa_size`` rows. Feeding it full indices reads out
+        of bounds as soon as the allocator hands one out past that -- and since
+        the allocator walks its free list in order, that first happens long
+        after startup, once cumulative allocations exceed ``swa_size``.
+
+        Returns the compacted table plus the ``req_pool_indices`` that address
+        it; the kernels take their row stride from ``req_to_token.size(1)``.
+        """
+        cached = self._swa_req_to_token
+        if cached is not None and cached[0] is req_to_token:
+            return cached[1], cached[2]
+
+        rows = req_to_token[req_pool_indices, : int(seq_lens.max())]
+        translated = self.token_to_kv_pool.translate_loc_from_full_to_swa(rows).to(
+            req_to_token.dtype
+        )
+        indices = torch.arange(
+            translated.shape[0], dtype=torch.int64, device=translated.device
+        )
+        self._swa_req_to_token = (req_to_token, translated, indices)
+        return translated, indices
 
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
@@ -164,6 +204,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens,
         forward_mode,
         spec_info,
@@ -181,6 +222,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         max_extend_len = None
         self.forward_metadata = (attn_logits, max_extend_len)
         self.extend_metadata = None
+        self._init_swa_forward_metadata(out_cache_loc)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -239,6 +281,12 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         # Gemma4's KV-shared layers pass k=v=None - the layer they share with
         # already wrote their extend K/V to the cache
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+        if self._is_swa_layer(layer.layer_id) and not layer.is_cross_attention:
+            req_to_token, req_pool_indices = self._swa_kv_indices(
+                req_to_token, req_pool_indices, seq_lens
+            )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -248,8 +296,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             value_buffer,
             key_scale,
             value_scale,
-            self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
+            req_to_token,
+            req_pool_indices,
             seq_lens,
             extend_seq_lens,
             extend_start_loc,
@@ -325,6 +373,13 @@ class IntelAMXAttnBackend(AttentionBackend):
             )
             k = None
             v = None
+        if self._is_swa_layer(layer.layer_id) and not layer.is_cross_attention:
+            # When k/v survive the block above the kernel writes them itself, so
+            # the write location needs the same translation set_kv_buffer got.
+            cache_loc = self.swa_out_cache_loc
+            req_to_token, req_pool_indices = self._swa_kv_indices(
+                req_to_token, req_pool_indices, seq_lens
+            )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             key_buffer,

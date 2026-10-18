@@ -11,12 +11,12 @@ kernels.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,31 +28,23 @@ PHYSICAL_PAGE = 64
 WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
 
 
-def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
-    buffers = [
-        torch.empty(size + PHYSICAL_PAGE, 1, 12, dtype=torch.float16) for _ in range(2)
-    ]
-    return SimpleNamespace(
-        kv_buffer=buffers,
-        data_ptrs=torch.tensor([b.data_ptr() for b in buffers], dtype=torch.uint64),
+def _fake_mla_device_pool(size: int = 1024) -> MLATokenToKVPool:
+    return MLATokenToKVPool(
         size=size,
-        # Match KVCache's default: this static pool's size already counts tokens.
-        host_capacity_tokens=None,
-        store_dtype=torch.float16,
+        page_size=PHYSICAL_PAGE,
+        dtype=torch.float16,
         kv_lora_rank=8,
         qk_rope_head_dim=4,
         layer_num=2,
-        start_layer=0,
-        end_layer=1,
         device="cpu",
-        layers_to_capture=None,
-        layer_shard_enabled=False,
+        enable_memory_saver=False,
     )
 
 
 def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolHost:
+    device_pool = _fake_mla_device_pool(device_size)
     return MLATokenToKVPoolHost(
-        _fake_mla_device_pool(device_size),
+        device_pool.get_device_pool_infos()[0].buffer_info,
         host_to_device_ratio=2.0,
         host_size=0,
         page_size=WIDENED_PAGE,
@@ -61,6 +53,20 @@ def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolH
         device="cpu",
         dcp_size=DCP_SIZE,
         dcp_rank=dcp_rank,
+        device_capacity_tokens=(
+            device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens
+        ),
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        target_layer_num=(
+            (device_pool.layer_num + device_pool.layer_shard_size - 1)
+            // device_pool.layer_shard_size
+            if device_pool.layer_shard_enabled
+            else device_pool.layer_num
+        ),
+        layer_shard_enabled=device_pool.layer_shard_enabled,
     )
 
 
@@ -149,14 +155,29 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
 
     def test_non_dcp_pool_unchanged(self):
+        device_pool = _fake_mla_device_pool()
         pool = MLATokenToKVPoolHost(
-            _fake_mla_device_pool(),
+            device_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=PHYSICAL_PAGE,
             layout="layer_first",
             pin_memory=False,
             device="cpu",
+            device_capacity_tokens=(
+                device_pool.size
+                if device_pool.host_capacity_tokens is None
+                else device_pool.host_capacity_tokens
+            ),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=(
+                (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                // device_pool.layer_shard_size
+                if device_pool.layer_shard_enabled
+                else device_pool.layer_num
+            ),
+            layer_shard_enabled=device_pool.layer_shard_enabled,
         )
         self.assertEqual(pool.page_size, PHYSICAL_PAGE)
         self.assertEqual(pool.logical_size, pool.size)
@@ -165,7 +186,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
 
 class TestTransferEntryPointsTranslate(CustomTestCase):
     def _run_backup(self, pool, host_indices, device_indices):
-        device_pool = pool.device_pool
+        device_pool = None
         # create=True: mla.py imports the kernel only under `if _is_cuda or
         # _is_hip`, so the name is absent on the CPU runner this test targets.
         with mock.patch(
@@ -204,7 +225,25 @@ class TestLayerShardedHostTransfers(CustomTestCase):
         pool.layer_shard_size = 2
         pool._owned_local_layer_range = lambda: (0, 1)
         host = MLATokenToKVPoolHost(
-            pool, 2, 0, PHYSICAL_PAGE, "layer_first", pin_memory=False
+            pool.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            PHYSICAL_PAGE,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            ),
+            layer_shard_enabled=pool.layer_shard_enabled,
         )
         self.addCleanup(host.destroy)
         # Ascend has no CUDA-style per-layer KV buffers.
@@ -222,7 +261,8 @@ class TestLayerShardedHostTransfers(CustomTestCase):
         # Rank 1 owns device layers 2/3, which occupy host layers 0/1.
         pool = _fake_mla_device_pool(size=128)
         pool.layer_num = 4
-        pool.end_layer = 3
+        pool.end_layer = 4
+        pool.model_layer_ids = tuple(range(4))
         pool.layer_shard_enabled = True
         pool.layer_shard_size = 2
         pool._owned_local_layer_range = lambda: (2, 4)
@@ -236,12 +276,25 @@ class TestLayerShardedHostTransfers(CustomTestCase):
             [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
         )
         host = MLATokenToKVPoolHost(
-            pool,
+            pool.get_device_pool_infos()[0].buffer_info,
             2,
             0,
             PHYSICAL_PAGE,
             "layer_first",
             pin_memory=False,
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            ),
+            layer_shard_enabled=pool.layer_shard_enabled,
         )
         self.addCleanup(host.destroy)
         self.assertEqual(host.layer_num, 2)

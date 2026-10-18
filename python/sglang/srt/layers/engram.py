@@ -273,6 +273,13 @@ class EngramHasher(nn.Module):
         )
         self.pad_row = num_req_slots
 
+    def history_row(self, ids: list[int]) -> list[int]:
+        """Left-pad up to n - 1 predecessors into a history row. The hash reads every
+        id at or above MM_PAD_SHIFT_VALUE as an image token, so multimodal pad ids
+        clamp to it and fit the int32 history."""
+        n1 = self.max_ngram_size - 1
+        return [0] * (n1 - len(ids)) + [min(t, MM_PAD_SHIFT_VALUE) for t in ids]
+
     @classmethod
     def from_config(
         cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None

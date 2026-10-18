@@ -29,6 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
+from sglang.srt.arg_groups.muse_spark_hook import muse_spark_chat_template_default
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
@@ -838,9 +839,39 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
     return resolved
 
 
+def _architecture_parser_defaults(server_args) -> Dict[str, str]:
+    """Parser defaults implied by an architecture when the caller omitted them."""
+    cfg = resolving_view(server_args)
+    missing = tuple(
+        attr
+        for attr in ("reasoning_parser", "tool_call_parser")
+        if getattr(cfg, attr) is None
+    )
+    if not missing:
+        return {}
+
+    model_config = getattr(server_args, "_model_config", None)
+    if model_config is None:
+        return {}
+    config = model_config.hf_config
+    architectures = getattr(config, "architectures", None) or []
+    arch = architectures[0] if architectures else ""
+    if arch != "MuseSparkForConditionalGeneration":
+        return {}
+
+    defaults = {attr: "muse" for attr in missing}
+    for attr, value in defaults.items():
+        logger.info(
+            "Defaulting --%s to '%s' for model architecture '%s'",
+            attr.replace("_", "-"),
+            value,
+            arch,
+        )
+    return defaults
+
+
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, before anything publishes ``server_args``.
+    """Resolve architecture defaults and explicit ``auto`` parser requests.
 
     Performs a lightweight tokenizer load, so it runs once in engine init. The
     decision goes to this instance's declaration stash, so every holder of it
@@ -848,6 +879,22 @@ def resolve_auto_parsers(server_args) -> None:
     workers it is serialized for -- and each publishes bags projected from it.
     The fields stay what the operator passed.
     """
+    architecture_defaults = _architecture_parser_defaults(server_args)
+    if architecture_defaults:
+        declare_resolution(
+            server_args,
+            "architecture-parser-defaults",
+            **architecture_defaults,
+        )
+
+    chat_template_default = muse_spark_chat_template_default(server_args)
+    if chat_template_default is not None:
+        declare_resolution(
+            server_args,
+            "architecture-chat-template-default",
+            chat_template=chat_template_default,
+        )
+
     cfg = resolving_view(server_args)
     needs = tuple(
         attr
