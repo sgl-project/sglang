@@ -769,6 +769,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             backend = object.__new__(DeepseekV4AttnBackend)
             backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
             backend.prefill_candidates = candidates
+            backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+            backend.low_ratios = ()
             backend._build_forward_metadata = lambda *_, **__: replay
 
             backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
