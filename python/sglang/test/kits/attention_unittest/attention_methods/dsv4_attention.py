@@ -1665,6 +1665,8 @@ def run_dsv4_compress_attention_case(
         torch.no_grad(),
         forward_context(ForwardContext(attn_backend=fixture.backend)),
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(sparse_prefill),
+        envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW.override(0),
+        envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH.override(0),
     ):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         _seed_c4_if_needed(fixture, num_entries=extra_entries)
