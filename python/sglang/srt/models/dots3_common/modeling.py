@@ -94,8 +94,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -1667,9 +1667,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
         if mm_inputs.audio_start_id is not None and mm_inputs.audio_end_id is not None:
             token_pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
-        return MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=token_pairs or None
-        ).pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=token_pairs or None
+        )
 
     def _get_precomputed_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         embed_param = next(self.model.embed_tokens.parameters())

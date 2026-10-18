@@ -2950,7 +2950,11 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len_delta,
             self.page_size,
             metadata.swa_page_table,
-            self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+            full_to_swa_index_mapping=(
+                self.token_to_kv_pool.full_to_swa_index_mapping
+                if self.use_sliding_window_kv_pool
+                else None
+            ),
             skip_page_table=translated,
         )
         if translated:
