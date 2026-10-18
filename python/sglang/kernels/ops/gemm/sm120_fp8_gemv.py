@@ -28,8 +28,11 @@ _MAX_N = 32768  # very large N is served well by cuBLAS already
 
 def _config(n: int) -> tuple[int, int, int]:
     """(rows_per_warp, k_unroll, num_warps); tuned DRAM-cold on RTX PRO 6000."""
-    if n >= 8192:
+    if n > 8192:
         return (4, 1, 8)
+    if n == 8192:
+        # Four rows measured slower than two at (8192, 5120) DRAM-cold.
+        return (2, 1, 8)
     return (1, 1, 8)
 
 
