@@ -254,8 +254,11 @@ mod tests {
             token_ids: vec![token_id],
             finish_reason: finished.then(stop_reason),
             prompt_tokens: 3,
+            cached_tokens: 2,
+            reasoning_tokens: 0,
             text: text.into(),
             completion_tokens: 1,
+            stop_token_trimmed: false,
             extras: None,
         }
     }
@@ -361,6 +364,7 @@ mod tests {
         let first_meta = meta(&first);
         assert_eq!(first_meta.id, "request-1");
         assert_eq!(first_meta.prompt_tokens, 3);
+        assert_eq!(first_meta.cached_tokens, 2);
         assert_eq!(first_meta.completion_tokens, 1);
         assert!(first_meta.finish_reason.is_none());
         assert!(first_meta.e2e_latency.is_none());
