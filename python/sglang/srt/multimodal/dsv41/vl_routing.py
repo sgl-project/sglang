@@ -35,7 +35,7 @@ def vision_topk(
     config = moe.topk.topk_config
     num_shared_topk_slots = config.num_shared_topk_slots
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
-    if num_shared_topk_slots and not use_mega_moe:
+    if num_shared_topk_slots and not use_mega_moe and not is_cuda():
         # This path bypasses _post_process_topk_ids, which appends the per-rank slots.
         assert not has_per_rank_fused_shared_slots(num_shared_topk_slots), (
             "VL routing does not support per-rank fused shared slots"
@@ -44,12 +44,13 @@ def vision_topk(
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        # Same admission as _fused_gate_emits_packed_ids: the shared-expert slots
-        # rescaled below would rewrite weights after the router.
+        # As in _fused_gate_emits_packed_ids, the router's packed output is valid
+        # only when finalization cannot rewrite its expert IDs or weights.
         packed_topk = None
         if (
             num_shared_topk_slots == 0
             and not use_mega_moe
+            and expert_location_dispatch_info is None
             and get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
             packed_topk = torch.empty(
@@ -136,9 +137,9 @@ def _finish_vision_topk(
 ):
     config = moe.topk.topk_config
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
-    if use_mega_moe:
-        # Use the same EPLB mapping, recording and home-rank shared slots as
-        # ordinary top-k before handing physical expert IDs to MegaMoE.
+    if use_mega_moe or is_cuda():
+        # Keep modality-specific scoring, then use ordinary TopK's capture,
+        # EPLB mapping, shared-slot scaling and recording contracts.
         indices, weights, recorder_ids = _post_process_topk_ids(
             indices,
             weights,
@@ -162,7 +163,8 @@ def _finish_vision_topk(
     # Shared-slot remapping can overwrite padded weights; mask last so idle
     # and partially padded DP ranks never dispatch a phantom shared expert.
     if num_token_non_padded is not None and (
-        not padded_rows_masked or (use_mega_moe and config.num_shared_topk_slots)
+        not padded_rows_masked
+        or ((use_mega_moe or is_cuda()) and config.num_shared_topk_slots)
     ):
         _mask_topk_ids_padded_region(indices, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
