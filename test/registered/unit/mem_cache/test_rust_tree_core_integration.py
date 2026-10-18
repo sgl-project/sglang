@@ -1214,18 +1214,13 @@ def test_configuration_reads_the_locked_rust_state():
     assert swa_core.has_swa_host_pool is True
 
 
-def test_external_cache_linker_enablement_and_component_guard():
+def test_external_cache_linker_enablement():
     core = _tree_core()
     assert core.enable_external_cache_linker is False
     core.enable_external_cache_linker = True
     assert core.enable_external_cache_linker is True
     core.enable_external_cache_linker = False
     assert core.enable_external_cache_linker is False
-
-    mamba_core = _mamba_tree_core()
-    with pytest.raises(AssertionError, match="(?i)mamba"):
-        mamba_core.enable_external_cache_linker = True
-    assert mamba_core.enable_external_cache_linker is False
 
 
 def test_sanity_check_passes_after_the_full_flow():

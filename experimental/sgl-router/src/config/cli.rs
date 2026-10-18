@@ -100,7 +100,7 @@ pub struct ModelArgs {
     /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
     /// frequency_penalty, presence_penalty, and n. Numeric values fill absent
     /// fields; {"min": LO, "max": HI} bands only constrain supplied values
-    /// and require reject mode. See README for domains and null handling.
+    /// and require reject mode. See REFERENCE.md for domains and null handling.
     #[arg(long, value_name = "JSON")]
     pub override_sampling_params: Option<String>,
 
