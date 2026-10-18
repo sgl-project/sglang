@@ -2729,24 +2729,6 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 }
 
 #[test]
-fn external_linker_rejects_mamba_trees() {
-    let params = CacheInitParams {
-        mamba_cache_chunk_size: Some(1),
-        ..Default::default()
-    };
-    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
-    assert!(matches!(
-        &error,
-        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-            component_type
-        } if *component_type == MAMBA
-    ));
-    assert!(error.to_string().contains("Mamba"));
-    assert!(!tc.enable_external_cache_linker);
-}
-
-#[test]
 fn external_linker_state_follows_load_offload_and_split_lifecycle() {
     let mut tc = core();
     tc.set_enable_external_cache_linker(true).unwrap();

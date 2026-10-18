@@ -422,6 +422,9 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
+    # that skips the per-layer load wait reads unloaded layers
+    SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES = EnvInt(0)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
