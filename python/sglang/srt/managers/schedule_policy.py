@@ -912,8 +912,9 @@ class PrefillAdder:
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
     def _replay_len(self, req: Req, prefix_len: int) -> int:
-        if get_exec().features.enable_encoder_swa_bounded_replay and (
-            req.kv.req_pool_idx is None or req.is_retracted
+        if (
+            get_exec().features.enable_encoder_swa_bounded_replay
+            and encoder_swa_replay.resets_swa_window(req)
         ):
             return encoder_swa_replay.replay_len(prefix_len)
         return 0
