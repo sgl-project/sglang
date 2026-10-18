@@ -2900,7 +2900,13 @@ class DeepseekV4AttnBackend(
             max_seq_len = max_seq_len_override
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 actual_max_seq_len = int(seq_lens_cpu.max().item())
-                if actual_max_seq_len > max_seq_len:
+                if use_prefill_cuda_graph and self._prefill_graph_context_unbounded():
+                    # Nothing captured is sized by the context: the page
+                    # tables are per-replay objects and the flat index
+                    # scoring runs as an eager break, so they span the live
+                    # context rather than the captured width.
+                    max_seq_len = actual_max_seq_len
+                elif actual_max_seq_len > max_seq_len:
                     if self._prefill_graph_context_unbounded():
                         # Nothing captured is sized by the context: the page
                         # tables are per-replay objects and the flat index
