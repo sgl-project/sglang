@@ -58,8 +58,14 @@ from sglang.srt.rocm_muse_spark.muse_router_gemv import (
     router_gemv,
     router_gemv_supported,
 )
+from sglang.srt.rocm_muse_spark.muse_unpool_boundary import (
+    can_fuse_unpool,
+    unpool_boundary,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
+
+_MUSE_FUSED_UNPOOL_BOUNDARY = os.environ.get("MUSE_FUSED_UNPOOL_BOUNDARY", "0") == "1"
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +801,9 @@ class MuseSpark1xMoE(nn.Module):
             object.__setattr__(self, "_fused_routing_op", op)
         return op
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, *, skip_post_expert_proj: bool = False
+    ) -> torch.Tensor:
         if (
             _USE_ROUTER_GEMV
             and self.router_in_fp32
@@ -833,7 +841,7 @@ class MuseSpark1xMoE(nn.Module):
             )
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
-        if self.post_expert_proj is not None:
+        if self.post_expert_proj is not None and not skip_post_expert_proj:
             output = _dense_linear(output, self.post_expert_proj, max_m=64)
         return output
 
@@ -926,6 +934,22 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ffn_input, stream, _ = self._fused_attn_boundary.forward(
             stream, attn_output, branch_dtype=torch.bfloat16
         )
+        if _MUSE_FUSED_UNPOOL_BOUNDARY and can_fuse_unpool(
+            self, ffn_input, ffn_boundary
+        ):
+            # MoE keeps its existing per-expert norm/combine and TP reduction.
+            # Only the final projection is deferred into the next boundary.
+            expert_output = self.mlp(ffn_input, skip_post_expert_proj=True)
+            next_attn_input, stream = unpool_boundary(
+                expert_output,
+                self.mlp.post_expert_proj.weight,
+                stream,
+                ffn_boundary,
+                dict(bn=64, bk=128, sk=4),
+                pre_bf16=pre_norm_dtype is torch.bfloat16,
+                warps=16,
+            )
+            return stream, next_attn_input
         ffn_output = self.mlp(ffn_input)
         if ffn_boundary is None:
             return self.post_feedforward_residual_gate(
