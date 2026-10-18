@@ -1715,9 +1715,24 @@ def triton_w8a8_block_fp8_linear(
                 input_2d, block_size[1], column_major_scales=False
             )
 
+    from sglang.kernels.ops.gemm.fp8_block32_sm90 import (
+        fp8_block32_gemm_m1,
+        use_fp8_block32_gemm_m1,
+    )
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
-    if (
+    # NVIDIA H20-3e only. The predicate rejects every other GPU, including
+    # other SM90 parts, so those stay on the Triton block-FP8 kernel.
+    if not is_batch_invariant_mode_enabled() and use_fp8_block32_gemm_m1(
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        block_size,
+        output_dtype,
+    ):
+        output = fp8_block32_gemm_m1(q_input, weight, x_scale, weight_scale)
+    elif (
         weight_bf16 is not None
         and input_scale is None
         and act_scale_ue8m0
