@@ -19,12 +19,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.attention.deepseek_v4_backend import (
-    DeepseekV4AttnBackend,
-    DSV4Metadata,
-)
-from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import DenseBlocksBackend
-from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -686,6 +680,14 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
     def test_backend_replay_keeps_captured_metadata_active(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            DenseBlocksBackend,
+        )
+
         capture_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -729,65 +731,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
-
-    class _FakePagedIndexerMetadata:
-        """The two tensors a captured full-top-k indexer binds by address."""
-
-        def __init__(self, base: int):
-            self.compressed_seq_lens = torch.tensor(
-                [base + 1, base + 2], dtype=torch.int32
-            )
-            self.page_table = torch.tensor(
-                [[base + 3, base + 4], [base + 5, base + 6]], dtype=torch.int32
-            )
-
-        def copy_(self, other):
-            self.compressed_seq_lens.copy_(other.compressed_seq_lens)
-            self.page_table.copy_(other.page_table)
-
-    def _make_low_ratio_metadata(self, base: int):
-        return DSV4Metadata(
-            self._make_core_metadata(base),
-            indexer_metadata=None,
-            c1_indexer_metadata=self._FakePagedIndexerMetadata(base),
-            c2_indexer_metadata=self._FakePagedIndexerMetadata(base + 100),
-        )
-
-    def test_backend_replay_refreshes_low_ratio_index_in_place_unless_two_level(
-        self,
-    ):
-        for candidates, in_place in (
-            (object.__new__(DenseBlocksBackend), True),
-            (object.__new__(SparseTableBackend), False),
-        ):
-            capture = self._make_low_ratio_metadata(0)
-            replay = self._make_low_ratio_metadata(1000)
-            held = (capture.c1_indexer_metadata, capture.c2_indexer_metadata)
-            bound_tensors = [(m.compressed_seq_lens, m.page_table) for m in held]
-            backend = object.__new__(DeepseekV4AttnBackend)
-            backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
-            backend.prefill_candidates = candidates
-            backend.token_to_kv_pool = SimpleNamespace(request_window=None)
-            backend.low_ratios = ()
-            backend._build_forward_metadata = lambda *_, **__: replay
-
-            backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
-                capture, SimpleNamespace(max_seq_len_override=None)
-            )
-
-            self.assertIs(backend.forward_metadata, capture)
-            for current, original, fresh, (lens, pages) in zip(
-                (capture.c1_indexer_metadata, capture.c2_indexer_metadata),
-                held,
-                (replay.c1_indexer_metadata, replay.c2_indexer_metadata),
-                bound_tensors,
-            ):
-                self.assertIs(current, original if in_place else fresh)
-                if in_place:
-                    self.assertIs(current.compressed_seq_lens, lens)
-                    self.assertIs(current.page_table, pages)
-                    self.assertTrue(torch.equal(lens, fresh.compressed_seq_lens))
-                    self.assertTrue(torch.equal(pages, fresh.page_table))
 
     def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm

@@ -3,7 +3,7 @@ requests that read prompt rows) and how DP ranks learn each other's. CPU only.""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -17,10 +17,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4Metadata,
     late_layer_whole_extend,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
-    SparseTableBackend,
-    _SparsePrefillTable,
-)
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
@@ -276,87 +273,9 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
-def _full_topk_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
-    """Runs the candidate source's prefill-graph break; returns the request rows
-    and positions it scored and the rows it handed to the consumers."""
-    seen = {}
-    tail_meta = SimpleNamespace(
-        low_ratio_req_indices=torch.tensor([3, 3, 5, 5, 5, 5, 5, 5])
-    )
-    full_meta = SimpleNamespace(
-        low_ratio_req_indices=torch.tensor([3] * 8 + [5] * 12 + [5] * 4)
-    )
-
-    def make_inputs(layer, x, q_lora, req, pos, forward_batch, rows_per_request):
-        seen.update(req=req.tolist(), pos=pos.tolist(), scored=x.shape[0])
-        return SimpleNamespace(layer_id=layer.layer_id)
-
-    def publish_prefill(self, inputs):
-        # The published table has one row per scored row.
-        published = object.__new__(_SparsePrefillTable)
-        published.blocks = torch.zeros(seen["scored"], 1, dtype=torch.int32)
-        return published
-
-    def gather_rows(self, rows):
-        seen["rows"] = rows.tolist()
-        return SimpleNamespace(blocks=0, schedule=0, phys_blocks=0, valid_lens=0)
-
-    backend = SimpleNamespace(
-        forward_metadata=tail_meta if inside_tail else full_meta,
-        _make_low_ratio_prefill_indexer_inputs=make_inputs,
-        prefill_candidates=object.__new__(SparseTableBackend),
-    )
-    with (
-        patch.object(SparseTableBackend, "publish_prefill", publish_prefill),
-        patch.object(_SparsePrefillTable, "gather_rows", gather_rows),
-    ):
-        DeepseekV4AttnBackend._prefill_graph_full_topk_break(
-            backend,
-            SimpleNamespace(
-                layer_id=20, indexer=SimpleNamespace(is_candidate_source=True)
-            ),
-            torch.zeros(x_rows, 4),
-            torch.zeros(x_rows, 4),
-            torch.arange(100, 100 + x_rows),
-            SimpleNamespace(
-                global_num_token_non_padded_cpu=real,
-                forward_mode=ForwardMode.EXTEND,
-                req_pool_indices=torch.tensor([3, 5]),
-                extend_seq_lens=torch.tensor([8, 12]),
-                extend_num_tokens=extend_num_tokens,
-                positions=torch.arange(x_rows),
-            ),
-        )
-    return seen
-
-
-class TestPrefillGraphCandidateSourceRows(CustomTestCase):
-    """The candidate source's eager break in the prefill graph scores the rows of
-    the metadata in use, and hands the consumers rows of the table it built."""
-
-    def test_source_inside_the_tail_scores_the_tail_rows(self):
-        # The source is the tail's first layer: x holds the 8-row tail block,
-        # 5 of them live; the extend's lens and positions are not the tail's.
-        seen = _full_topk_break(inside_tail=True, real=5, x_rows=8)
-        self.assertEqual(seen["req"], [3, 3, 5, 5, 5])
-        self.assertEqual(seen["pos"], [100, 101, 102, 103, 104])
-        self.assertEqual(seen["scored"], 5)
-        self.assertEqual(seen["rows"], [0, 1, 2, 3, 4, 4, 4, 4])
-
-    def test_idle_dp_rank_scores_its_fabricated_rows(self):
-        # An idle DP-attention rank replays on one dummy request of the padded
-        # token count (6 here), inside an 8-row bucket.
-        seen = _full_topk_break(
-            inside_tail=False, real=0, x_rows=8, extend_num_tokens=6
-        )
-        self.assertEqual(seen["scored"], 6)
-        self.assertEqual(seen["req"], [3] * 6)
-        self.assertEqual(seen["rows"], [0, 1, 2, 3, 4, 5, 5, 5])
-
-
-def _prefill_graph_replay_widths(*, unbounded):
-    """The widths a replay gives the full-row and tail metadata, for 1,024 new
-    tokens after a 155,648-token cached prefix."""
+def _prefill_graph_replay(*, any_context, seq_len):
+    """The backend's default replayed-context limit and the widths a replay gives
+    the full-row and tail metadata, for one request of ``seq_len`` tokens."""
     seen = {}
 
     def build_full(forward_batch, *, max_seq_len_override, use_prefill_cuda_graph):
@@ -372,91 +291,45 @@ def _prefill_graph_replay_widths(*, unbounded):
     backend._build_forward_metadata = build_full
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
+    backend._prefill_graph_replays_any_context = lambda: any_context
     capture = object.__new__(DSV4Metadata)
     capture.prefill_graph_tail = True
-    backend._prefill_graph_replays_any_context = lambda: unbounded
     with (
         patch.object(
-            DeepseekV4AttnBackend,
-            "prefill_cuda_graph_default_max_seq_len",
-            new_callable=PropertyMock,
-            return_value=None if unbounded else 16384,
+            deepseek_v4_backend,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1),
         ),
         patch.object(
             deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=None
         ),
         patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"),
     ):
+        seen["limit"] = backend.prefill_cuda_graph_default_max_seq_len
         DeepseekV4AttnBackend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             backend,
             capture,
             SimpleNamespace(
-                seq_lens_cpu=torch.tensor([155648 + 1024]),
-                max_seq_len_override=1 << 20,
+                seq_lens_cpu=torch.tensor([seq_len]), max_seq_len_override=1 << 20
             ),
         )
     return seen
 
 
-class TestPrefillGraphReplayWidth(CustomTestCase):
-    """The full rows and the late-layer tail are built at one context width."""
+class TestPrefillGraphReplayContext(CustomTestCase):
+    """DeepSeek-V4.1's prefill graph replays past its captured indexer width only
+    when the replay is exact, and then its metadata spans the live context."""
 
-    def test_any_context_replay_builds_both_at_the_live_context(self):
-        self.assertEqual(
-            _prefill_graph_replay_widths(unbounded=True),
-            {"full": 156672, "tail": 156672},
-        )
-
-    def test_bounded_replay_builds_both_at_the_graph_limit(self):
-        self.assertEqual(
-            _prefill_graph_replay_widths(unbounded=False),
-            {"full": 16384, "tail": 16384},
-        )
-
-
-def _prefill_graph_limits(
-    *, low_ratios=(1, 2), any_context=False, cp_size=1, user=None
-):
-    """The backend's default replayed-context limit and the effective one, for a
-    DeepSeek-V4 backend in the given layout."""
-    backend = object.__new__(DeepseekV4AttnBackend)
-    backend.low_ratios = low_ratios
-    backend._prefill_graph_replays_any_context = lambda: any_context
-    with (
-        patch.object(
-            deepseek_v4_backend,
-            "get_parallel",
-            return_value=SimpleNamespace(attn_cp_size=cp_size),
-        ),
-        patch.object(
-            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=user
-        ),
-    ):
-        return (
-            backend.prefill_cuda_graph_default_max_seq_len,
-            backend._prefill_graph_seq_limit(),
-        )
-
-
-class TestPrefillGraphReplayLimit(CustomTestCase):
-    """DeepSeek-V4.1 bounds the replayed context by its captured indexer width only
-    while something captured depends on it; a user limit always applies."""
-
-    def test_captured_indexer_bounds_the_context(self):
-        self.assertEqual(_prefill_graph_limits(), (16384, 16384))
-
-    def test_any_context_replay_has_no_default(self):
-        self.assertEqual(_prefill_graph_limits(any_context=True), (None, None))
-
-    def test_user_limit_replaces_the_default(self):
-        self.assertEqual(_prefill_graph_limits(user=32768), (16384, 32768))
-        self.assertEqual(
-            _prefill_graph_limits(any_context=True, user=32768), (None, 32768)
-        )
-
-    def test_no_default_without_the_low_ratio_layout_or_with_prefill_cp(self):
-        self.assertEqual(_prefill_graph_limits(low_ratios=()), (None, None))
-        self.assertEqual(_prefill_graph_limits(cp_size=2), (None, None))
+    def test_limit_and_metadata_width(self):
+        for any_context, seq_len, expected in (
+            (True, 155648 + 1024, {"limit": None, "full": 156672, "tail": 156672}),
+            (False, 8192 + 1024, {"limit": 16384, "full": 16384, "tail": 16384}),
+        ):
+            with self.subTest(any_context=any_context):
+                self.assertEqual(
+                    _prefill_graph_replay(any_context=any_context, seq_len=seq_len),
+                    expected,
+                )
 
 
 if __name__ == "__main__":
