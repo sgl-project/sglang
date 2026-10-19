@@ -37,7 +37,7 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -229,6 +229,40 @@ def make_boundary(
 # ---------------------------------------------------------------------------
 # Step 1 -- the mix GEMM and the triplet it splits into
 # ---------------------------------------------------------------------------
+
+
+def use_prefill_stats_overlap(
+    cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
+) -> bool:
+    """Wide target prefill runs each triplet on the stats stream beside its
+    sublayer's TP all-reduce. The boundary transport forks the stream right
+    before that collective rather than before the combine, so the mix GEMM and
+    Sinkhorn overlap the reduction instead of competing with the sublayer itself
+    (see `issue_prefill_stats`)."""
+    if not (
+        cfg.pre_from_prev
+        and not cfg.cp_prefill
+        and x.is_cuda
+        and 4096 <= x.shape[0] <= 65536
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and get_platform().is_blackwell
+        and get_parallel().attn_dp_size == 1
+        and not get_forward().sp_active
+    ):
+        return False
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return not is_batch_invariant_mode_enabled()
+
+
+def issue_prefill_stats(
+    hc: HcSubLayer, residual: torch.Tensor, stats_stream: torch.cuda.Stream
+) -> HcTriplet:
+    """Fork the stats stream here, right before the sublayer's TP all-reduce, and
+    issue the triplet on it. The caller joins the stream before the post reads
+    the triplet."""
+    fork_stats_stream(stats_stream)
+    return mix_stats(hc, residual, stats_stream)
 
 
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):

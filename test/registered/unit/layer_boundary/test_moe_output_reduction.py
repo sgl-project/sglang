@@ -202,6 +202,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                     model = types.SimpleNamespace(
                         dsa_enable_prefill_cp=False,
                         boundary_mhc_fusions=False,
+                        _can_overlap_ffn_stats=False,
                         config=types.SimpleNamespace(model_type="deepseek_v4"),
                         mlp=compute,
                     )

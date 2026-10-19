@@ -132,7 +132,9 @@ class TestAttentionCompletion(unittest.TestCase):
         torch.nn.Module.__init__(attention)
         attention.attn_tp_size = 2
         attention.wo_b = Projection()
-        layer = SimpleNamespace(boundary_mhc_fusions=False)
+        layer = SimpleNamespace(
+            boundary_mhc_fusions=False, _can_overlap_attn_stats=False
+        )
         value = torch.arange(12.0).view(3, 4)
         rows = TransportRows(
             Layout(frozenset()),
