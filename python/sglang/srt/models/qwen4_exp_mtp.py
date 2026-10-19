@@ -51,6 +51,9 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
+        # The draft passes the fused HC stream in the inputs_embeds position.
+        # Register the replay slot at HC width, not the token embedding width.
+        self.input_embeds_hidden_size = self.hidden_size * self.hc_count
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
 
         self.model = Qwen4ExpModel(

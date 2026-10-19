@@ -31,6 +31,9 @@ pub struct Limits {
     pub allow_auto_truncate: bool,
     /// Whether the server can produce hidden states at all.
     pub enable_return_hidden_states: bool,
+    /// Priority for a generation request that sets none (see
+    /// `ServerArgs::default_priority_value`).
+    pub default_priority: Option<i64>,
 }
 
 impl From<&ServerArgs> for Limits {
@@ -42,6 +45,7 @@ impl From<&ServerArgs> for Limits {
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,
+            default_priority: sa.default_priority_value,
         }
     }
 }

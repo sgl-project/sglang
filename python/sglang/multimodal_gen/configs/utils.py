@@ -1,10 +1,21 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import argparse
+import math
 import os
 from dataclasses import fields
 from operator import attrgetter
 from typing import Any
+
+
+def optional_positive_finite_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a number")
+    out = float(value)
+    if not math.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{field_name} must be a positive finite number")
+    return out
 
 
 def expand_path_fields(obj) -> None:
@@ -81,15 +92,3 @@ def update_config_from_args(
                 args_dict.pop(key)
 
     return len(args_to_remove) > 0
-
-
-def clean_cli_args(args: argparse.Namespace) -> dict[str, Any]:
-    """
-    Clean the arguments by removing the ones that not explicitly provided by the user.
-    """
-    provided_args = {}
-    for k, v in vars(args).items():
-        if v is not None and hasattr(args, "_provided") and k in args._provided:
-            provided_args[k] = v
-
-    return provided_args

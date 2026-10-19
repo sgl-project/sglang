@@ -100,6 +100,10 @@ pub(super) fn spawn_pump_with_bootstrap(
 
 pub(super) fn stored(parent: Option<i64>, hashes: Vec<i64>) -> KvCacheEvent {
     KvCacheEvent::BlockStored(BlockStored {
+        lora_name: None,
+        cache_salt: None,
+        is_bigram: false,
+
         parent_block_hash: parent,
         block_hashes: hashes,
         token_ids: vec![],
@@ -196,6 +200,8 @@ pub(super) async fn graft_with_deferred_proof(
 /// producer serves it. With no entries it is a cold peer's answer.
 pub(super) fn witness_snapshot(entries: &[(&str, u32, i64)]) -> PeerSnapshot {
     PeerSnapshot {
+        lora_blocks: Vec::new(),
+
         format: SNAPSHOT_FORMAT,
         block_size: 64,
         is_bigram: false,

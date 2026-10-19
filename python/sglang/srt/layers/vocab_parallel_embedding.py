@@ -27,6 +27,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.linear import _resolve_linear_group
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -248,6 +249,11 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        self.tp_group = (
+            _resolve_linear_group("attn_tp" if use_attn_tp_group else "tp")
+            if enable_tp
+            else None
+        )
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank
@@ -264,10 +270,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
         # Support the case where the vocab size is not divisible by the TP size.
-        if (
-            _is_cpu
-            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
-        ):
+        if pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0:
             padding_size *= self.tp_size
         self.padding_size = padding_size
 
@@ -516,7 +519,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
         output_parallel = self._embed_local_shard(input_)
-        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+        # Replicated attention-TP peers have matching shapes, so all of them
+        # can skip the collective for an empty idle batch.
+        if (
+            output_parallel.numel() > 0
+            and self.tp_size > 1
+            and not get_attn_tp_context().input_scattered
+        ):
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
             else:

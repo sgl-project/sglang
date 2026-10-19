@@ -296,6 +296,13 @@ def generate_dashboard(
 
     Returns the markdown string.
     """
+    history_count = len(history)
+    history = [
+        run
+        for run in history
+        if run.get("methodology") == current.get("methodology")
+        and run.get("warmup_requests") == current.get("warmup_requests")
+    ]
     lines: list[str] = []
     lines.append("# SGLang-Diffusion Nightly Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
@@ -310,6 +317,13 @@ def generate_dashboard(
             f"{warmups} identical client warmup request(s) per case, discarded. "
             "First request = the first request after the server reports ready. "
             "Server perf dumps are telemetry only.*\n"
+        )
+    excluded_runs = history_count - len(history)
+    if excluded_runs:
+        lines.append(
+            f"*Excluded {excluded_runs} historical run(s) from baselines and trends "
+            "because their measurement methodology or warmup count differs. "
+            "Missing metadata is not treated as matching explicit metadata.*\n"
         )
 
     current_cases = _extract_case_results(current)

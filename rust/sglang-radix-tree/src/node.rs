@@ -112,6 +112,12 @@ impl KeyNamespace {
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
     }
+
+    pub fn extra_key_arc(&self) -> Option<Arc<str>> {
+        self.0
+            .as_ref()
+            .and_then(|namespace| namespace.extra_key.clone())
+    }
 }
 
 impl PartialEq for KeyNamespace {
@@ -172,6 +178,8 @@ pub struct Node<K: ChildKeyType> {
     pub swa_uuid: Option<i64>,
     /// SWA lock-window uuid for host locks; stamped where a host lock walk fills the window.
     pub swa_host_uuid: Option<i64>,
+    /// Full host-lock segment boundary uuid. A split migrates it to the new prefix.
+    pub full_host_uuid: Option<i64>,
     /// Per-page hash chain; None when the node was never hashed.
     /// TODO: Store raw digests and hex-encode only at the Python or storage boundary.
     pub hash_value: Option<Vec<String>>,
@@ -404,6 +412,7 @@ impl<K: ChildKeyType> Node<K> {
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
+            full_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
             rotation_base: None,
@@ -430,6 +439,7 @@ impl<K: ChildKeyType> Node<K> {
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
+            full_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
             rotation_base: None,
@@ -726,6 +736,20 @@ pub enum TreeCoreRuntimeError {
     /// A public NodeId no longer names a live arena node.
     #[error(transparent)]
     NodeAccess(#[from] NodeAccessError),
+    /// The requested component is not configured for this core.
+    #[error("component {component_type:?} is not enabled")]
+    ComponentNotEnabled { component_type: ComponentType },
+    /// A signed adjustment would underflow or overflow the selected device ledger.
+    #[error(
+        "invalid size delta {delta} for node {node_id} component {component_type:?}: current={current}, protected={protected}"
+    )]
+    InvalidComponentSizeDelta {
+        node_id: NodeId,
+        component_type: ComponentType,
+        current: usize,
+        delta: i64,
+        protected: bool,
+    },
     /// `begin_insert`/`insert` called while a resumable insert is suspended.
     #[error("concurrent insert walks")]
     ConcurrentInsertWalk,
@@ -770,9 +794,6 @@ pub enum TreeCoreRuntimeError {
     #[cfg(any(test, feature = "inspection"))]
     #[error("{0}")]
     InspectionAssertion(String),
-    /// Direct external-cache linking does not support this tree component.
-    #[error("external cache linker does not support component {component_type:?}")]
-    ExternalCacheLinkerUnsupportedComponent { component_type: ComponentType },
     /// The existing device anchor must be on the restored endpoint's root path.
     #[error("node {until_node_id} is not an ancestor of node {from_node_id}")]
     ExternalCachePathNotAncestor {
@@ -815,8 +836,8 @@ pub trait ChildKeyType:
     /// through, so the unigram key never copies.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self>;
 
-    /// The atom's token ids as u32 storage-hash words.
-    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32>;
+    /// The atom's token ids as non-negative storage-hash words.
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64>;
 
     /// The raw token ids spanned by `atoms`; the unigram view borrows, bigram
     /// atoms (overlapping by one) materialize.
@@ -894,9 +915,9 @@ pub trait ChildKeyType:
     }
 }
 
-/// A token id as a u32 storage-hash word; token ids beyond u32 are rejected.
-fn hash_word(token_id: i64) -> u32 {
-    u32::try_from(token_id).expect("token id does not fit in uint32")
+/// Wide multimodal sentinels use the same non-negative int64 domain as tree keys.
+fn hash_word(token_id: i64) -> u64 {
+    u64::try_from(token_id).expect("token id must be a non-negative int64")
 }
 
 impl ChildKeyType for Vec<i64> {
@@ -907,7 +928,7 @@ impl ChildKeyType for Vec<i64> {
         token_ids
     }
 
-    fn hash_words(atom: &i64) -> impl Iterator<Item = u32> {
+    fn hash_words(atom: &i64) -> impl Iterator<Item = u64> {
         std::iter::once(hash_word(*atom))
     }
 
@@ -925,7 +946,7 @@ impl ChildKeyType for Vec<(i64, i64)> {
         Cow::Owned(token_ids.windows(2).map(|w| (w[0], w[1])).collect())
     }
 
-    fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u32> {
+    fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u64> {
         [hash_word(atom.0), hash_word(atom.1)].into_iter()
     }
 
@@ -946,7 +967,7 @@ impl ChildKeyType for Vec<(i64, i64)> {
 pub(crate) const DIGEST_LEN: usize = 32;
 pub(crate) type HashDigest = [u8; DIGEST_LEN];
 
-/// SHA256(prior_digest || page atom words as little-endian u32 bytes).
+/// Preserve u32 page hashes; wide pages use a 0xff tag and little-endian u64 words.
 pub(crate) fn hash_page<K: ChildKeyType>(
     page: &[K::Atom],
     prior: Option<&HashDigest>,
@@ -955,9 +976,21 @@ pub(crate) fn hash_page<K: ChildKeyType>(
     if let Some(prior) = prior {
         hasher.update(prior);
     }
+    let wide = page
+        .iter()
+        .flat_map(K::hash_words)
+        .any(|word| word > u32::MAX as u64);
+    if wide {
+        // match hash_binding.cpp; the tag makes the encoding length odd
+        hasher.update([0xff]);
+    }
     for atom in page {
         for word in K::hash_words(atom) {
-            hasher.update(word.to_le_bytes());
+            if wide {
+                hasher.update(word.to_le_bytes());
+            } else {
+                hasher.update((word as u32).to_le_bytes());
+            }
         }
     }
     hasher.finalize().into()

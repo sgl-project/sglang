@@ -1,10 +1,14 @@
 ---
 title: Install SGLang Diffusion
-description: Run SGLang Diffusion with Docker, or install with pip, uv, or from source.
+description: Run SGLang's built-in diffusion engine with Docker, or install the diffusion extra with pip, uv, or from source.
 ---
+SGLang Diffusion is SGLang's built-in image and video generation engine. It ships in the same [repository](https://github.com/sgl-project/sglang) and **`sglang` Python package**, using `sglang generate` and `sglang serve`.
+
 Docker is the recommended setup for Linux GPU deployments. The official NVIDIA images include SGLang, its diffusion dependencies, and the optimized kernel stack; no separate Python installation or `pip install` inside the container is needed for the standard diffusion runtime. Optional backends and model-specific dependencies are documented in the [cookbook](/cookbook/diffusion/intro).
 
-## Standard installation (NVIDIA GPUs)
+For Python installation, use `sglang[diffusion]`: `[diffusion]` adds optional dependencies to the same package, not a separate engine.
+
+## Install on NVIDIA GPUs
 
 <Tabs>
 <Tab title="Docker (recommended)" id="method-3-using-docker">
@@ -46,6 +50,8 @@ source .venv/bin/activate
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
+With pip, use `pip install "sglang[diffusion]" --pre` in your activated environment.
+
 </Tab>
 <Tab title="From source" id="method-2-from-source">
 
@@ -59,6 +65,8 @@ uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e "python[diffusion]" --prerelease=allow
 ```
+
+The diffusion implementation lives in [`python/sglang/multimodal_gen`](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen).
 
 </Tab>
 </Tabs>
@@ -81,11 +89,14 @@ sglang serve --model-path Qwen/Qwen-Image --host 0.0.0.0 --port 30000
 
 Choose a model and GPU configuration from the [cookbook](/cookbook/diffusion/intro). See the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api) to send requests.
 
-## Platform-Specific: ROCm (AMD GPUs)
+## AMD GPUs (ROCm)
 
 Docker is also recommended for AMD GPUs. Use a ROCm image matched to your GPU and host driver, not the NVIDIA `latest` image. Follow [AMD GPUs](/docs/hardware-platforms/amd_gpu) for the current image tags, device passthrough flags, and source installation options.
 
+For **Strix Halo / gfx1151**, use `rocm/sgl-dev:*-gfx1151*` (image sets `SGLANG_USE_AITER=0`) and pass `--attention-backend torch_sdpa --num-gpus 1`. Do not use AITER on wave32 gfx115x. See the Strix Halo section in [AMD GPUs](../hardware-platforms/amd_gpu).
+
 ## Platform-Specific: MUSA (Moore Threads GPUs)
+## Moore Threads GPUs (MUSA)
 
 For Moore Threads GPUs (MTGPU) with the MUSA software stack, follow the platform guide first. If the source tree still requires the alternate platform `pyproject` fallback, keep a backup of the default file before switching:
 
@@ -101,11 +112,11 @@ cp python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[all_musa]"
 ```
 
-## Platform-Specific: Intel XPU
+## Intel XPU
 
 For Intel Data Center GPU Max or Arc GPUs, follow the Docker instructions in the [XPU installation guide](/docs/hardware-platforms/xpu). The Dockerfile already includes diffusion dependencies.
 
-## Platform-Specific: Ascend NPU
+## Ascend NPU
 
 For Ascend NPU, please follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation).
 
