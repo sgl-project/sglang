@@ -10,37 +10,13 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.deepseek_v4.common import (
-    ceil_ue8m0_exp_ref,
-    fp4_e2m1_code_ref,
-)
+from sglang.test.kernels.deepseek_v4.common import quantize_fp4_indexer_ref
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
 GROUP_SIZE = 32
-SCALE_GROUPS = HEAD_DIM // GROUP_SIZE
-E2M1_MAX = 6.0
-
-
-def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x = x.contiguous().view(-1, HEAD_DIM).float()
-    groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
-    scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
-    scale_exp = ceil_ue8m0_exp_ref(scale_raw)
-    scale = (scale_exp << 23).contiguous().view(torch.float32)
-
-    scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = fp4_e2m1_code_ref(scaled)
-    packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
-        torch.uint8
-    )
-
-    packed_sf = scale_exp[:, 0].clone()
-    for group_id in range(1, SCALE_GROUPS):
-        packed_sf |= scale_exp[:, group_id] << (8 * group_id)
-    return packed, packed_sf
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 96])
@@ -54,7 +30,7 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     )
 
     x_fp4, x_sf = quantize_fp4_indexer_tensor(x)
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(x)
 
     torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(x_sf, ref_sf)

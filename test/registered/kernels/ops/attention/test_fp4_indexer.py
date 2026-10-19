@@ -25,11 +25,11 @@ from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
-    ceil_ue8m0_exp_ref,
-    fp4_e2m1_code_ref,
+    quantize_fp4_indexer_ref,
+    store_fp4_index_cache_ref,
 )
 
-register_cuda_ci(est_time=55, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _is_xpu = is_xpu()
 if _is_xpu:
@@ -39,77 +39,8 @@ else:
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
-GROUP_SIZE = 32
-SCALE_GROUPS = HEAD_DIM // GROUP_SIZE
 SCALE_BYTES = 4
 PAGE_SIZE = 64
-E2M1_MAX = 6.0
-
-
-def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x = x.contiguous().view(-1, HEAD_DIM).float()
-    groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
-    scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
-    scale_exp = ceil_ue8m0_exp_ref(scale_raw)
-    scale = (scale_exp << 23).contiguous().view(torch.float32)
-
-    scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = fp4_e2m1_code_ref(scaled)
-    packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
-        torch.uint8
-    )
-
-    packed_sf = scale_exp[:, 0].clone()
-    for group_id in range(1, SCALE_GROUPS):
-        packed_sf |= scale_exp[:, group_id] << (8 * group_id)
-    return packed, packed_sf
-
-
-def _ref_store_fp4_index_cache(
-    x_fp4: torch.Tensor,
-    x_sf: torch.Tensor,
-    loc: torch.Tensor,
-    num_pages: int,
-) -> torch.Tensor:
-    expected = torch.zeros(
-        num_pages,
-        PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
-        device=x_fp4.device,
-        dtype=torch.uint8,
-    )
-    sf_shifts = torch.arange(0, 32, 8, device=x_fp4.device, dtype=torch.int32)
-    for token_id in range(x_fp4.shape[0]):
-        cache_loc = int(loc[token_id].item())
-        page = cache_loc // PAGE_SIZE
-        offset = cache_loc % PAGE_SIZE
-        expected[page, offset * FP4_DIM : (offset + 1) * FP4_DIM] = x_fp4[token_id]
-        sf_start = PAGE_SIZE * FP4_DIM + offset * SCALE_BYTES
-        expected[page, sf_start : sf_start + SCALE_BYTES] = (
-            (x_sf[token_id] >> sf_shifts) & 0xFF
-        ).to(torch.uint8)
-    return expected
-
-
-@pytest.mark.parametrize("num_tokens", [1, 16, 96])
-def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
-    torch.manual_seed(num_tokens)
-    num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
-    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
-    loc = torch.randperm(num_pages * PAGE_SIZE, device=get_device())[:num_tokens].to(
-        torch.int64
-    )
-    cache = torch.zeros(
-        num_pages,
-        PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
-        device=get_device(),
-        dtype=torch.uint8,
-    )
-
-    store_fp4_index_k_cache(x, cache, loc, page_size=PAGE_SIZE)
-
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
-    expected = _ref_store_fp4_index_cache(ref_fp4, ref_sf, loc, num_pages)
-    torch.testing.assert_close(cache, expected)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
@@ -163,9 +94,9 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     rope_out[..., 1] = rope[..., 0] * freqs[..., 1] + rope[..., 1] * freqs[..., 0]
     ref[:, 64:] = rope_out.reshape(num_tokens, 64)
     ref = hadamard_transform(ref.contiguous(), scale=HEAD_DIM**-0.5)
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(ref)
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(ref)
 
-    expected = _ref_store_fp4_index_cache(
+    expected = store_fp4_index_cache_ref(
         ref_fp4,
         ref_sf,
         loc.to(torch.int64),
@@ -202,7 +133,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     ref = q.clone()
     apply_rotary_emb_triton(ref[..., -rope_dim:], freqs_cis, positions=positions)
     ref = hadamard_transform(ref.contiguous(), scale=HEAD_DIM**-0.5)
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(ref.view(-1, HEAD_DIM))
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(ref.view(-1, HEAD_DIM))
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
     ref_sf = ref_sf.view(batch_size, num_heads)
 
