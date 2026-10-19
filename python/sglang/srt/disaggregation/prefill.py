@@ -219,7 +219,6 @@ class PrefillBootstrapQueue:
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
                 state_item_lens=kv_args.state_item_lens,
-                state_types=kv_args.state_types,
             )
         else:
             self.scheduler.kv_checksum_computer = None

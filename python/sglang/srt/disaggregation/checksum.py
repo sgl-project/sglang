@@ -86,7 +86,6 @@ class KvChecksumComputer:
         kv_item_lens: Sequence[int],
         state_data_ptrs: NestedInts = (),
         state_item_lens: NestedInts = (),
-        state_types: Optional[Sequence[str]] = None,
     ):
         assert len(kv_data_ptrs) == len(kv_item_lens)
         assert len(kv_data_ptrs) > 0

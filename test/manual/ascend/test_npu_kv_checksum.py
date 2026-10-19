@@ -129,7 +129,6 @@ class TestNPUKvChecksum(unittest.TestCase):
             [kv[0].nbytes],
             [[states[0].data_ptr()], [states[1].data_ptr()]],
             [[states[0][0].nbytes], [states[1][0].nbytes]],
-            state_types=["mamba", "mamba"],
         )
         expected = reference(
             [kv] + states,
