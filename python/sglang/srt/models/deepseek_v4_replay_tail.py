@@ -1,15 +1,11 @@
-"""DeepSeek-V4.1's decoder-replay tail layers (``late_layer_start`` on), replayed
-from `RowBucketGraphRunner` graphs on eager prefill steps. The SWA KV store, the
-attention and the low-ratio sources stay eager breaks of those graphs.
+"""DeepSeek-V4.1's decoder-replay tail layers, run from row-bucket graphs.
 
-A prefill-graph step runs them from one eager break of its own graph, on
-exact-row tail metadata, and writes the tail rows into bridge buffers that the
-later captured segments read.
+Eager prefill steps replay them directly. A prefill-graph shape of at least
+``SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS`` tokens replays them from one
+eager break, through bridge buffers; smaller shapes keep the tail captured.
 
-Under DP attention every rank replays the bucket of the largest rank's tail: a
-TP MoE gathers that many rows from every rank; MegaMoE sees only the local
-bucket, and the ranks agree on it through a host gather. An idle rank takes part
-with no rows of its own.
+Under DP attention every rank replays the largest rank's bucket. MegaMoE agrees
+on it through a host gather, so it needs the prefill graph off.
 """
 
 from __future__ import annotations
