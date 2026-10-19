@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
@@ -295,7 +295,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ):
             raise ValueError(
                 "--dsv41-encoder-only-prefill requires a text-only model "
-                "(vision_n_layers=0 or --language-model-only)"
+                "(checkpoint vision_n_layers=0 or language_model_only=True)"
             )
         if getattr(hf_config, "window_size", None) != DSV41_REPLAY_WINDOW:
             raise ValueError(
@@ -334,6 +334,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
         _validate_dsv41_encoder_only_ratio_layout(hf_config)
         incompatible = (
+            ("hardware other than CUDA", not get_platform().is_cuda),
             ("pipeline parallelism", cfg.pp_size != 1),
             ("data parallelism", cfg.dp_size != 1),
             ("context parallelism", cfg.attn_cp_size != 1 or cfg.dcp_size != 1),
@@ -365,8 +366,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "to be disabled"
             )
         if cfg.disaggregation_mode == "decode":
-            # Reuse encoder replay's token-input validation and DSpark paged
-            # draft budgeting. The cache-only EXTEND itself performs replay;
+            # Reuse encoder replay's token-input validation.
+            # The cache-only EXTEND itself performs replay;
             # this role retains paged SWA and never allocates RequestWindow.
             declare_resolution(
                 server_args,
@@ -417,7 +418,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             # Decode receives the last SWA window from prefill and never replays.
-            ("PD decode", cfg.disaggregation_mode == "decode" and not cfg.dsv41_encoder_only_prefill),
+            (
+                "PD decode",
+                cfg.disaggregation_mode == "decode"
+                and not cfg.dsv41_encoder_only_prefill,
+            ),
             # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
             (
                 "PD prefill on ROCm",

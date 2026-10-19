@@ -3412,35 +3412,6 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             )
         return hc_boundary.MoeTransport(self, hidden_states, batch, call, rows)
 
-    def write_global_cache_only(
-        self,
-        positions: torch.Tensor,
-        state: mhc.HcState,
-        forward_batch: ForwardBatch,
-    ) -> None:
-        """Consume the previous mHC state and write only Main-KV/Indexer-K."""
-        if self.self_attn.compress_ratio not in (1, 2):
-            raise RuntimeError("cache-only boundary must have compression ratio 1/2")
-        if (
-            self.self_attn.compressor is None
-            or self.self_attn.indexer is None
-            or not self.self_attn.indexer.owns_k
-        ):
-            raise RuntimeError(
-                "cache-only boundary must own both Main-KV and Indexer-K producers"
-            )
-        state = state.materialized(self.hc_cfg)
-        x = mhc.combine_input(self.hc_cfg, self.input_layernorm, state)
-        get_attn_backend().forward_low_ratio_sources(
-            layer=self.self_attn,
-            x=x,
-            q_lora=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            run_compressor=True,
-            run_indexer=False,
-        )
-
     def forward(
         self,
         positions,
@@ -3687,7 +3658,6 @@ class DeepseekV41EncoderBoundaryLayer(DeepseekV4DecoderLayer):
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.engram = None
         self.attn_hc = None
-        self._next_layer = None
         self.hc_cfg = mhc.HcConfig(
             mult=config.hc_mult,
             sinkhorn_iters=config.hc_sinkhorn_iters,
@@ -3696,6 +3666,35 @@ class DeepseekV41EncoderBoundaryLayer(DeepseekV4DecoderLayer):
             hidden=config.hidden_size,
             pre_from_prev=config.hc_pre_from_prev_sublayer,
             cp_prefill=self.dsa_enable_prefill_cp,
+        )
+
+    def write_global_cache_only(
+        self,
+        positions: torch.Tensor,
+        state: mhc.HcState,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Consume the previous mHC state and write only Main-KV/Indexer-K."""
+        if self.self_attn.compress_ratio not in (1, 2):
+            raise RuntimeError("cache-only boundary must have compression ratio 1/2")
+        if (
+            self.self_attn.compressor is None
+            or self.self_attn.indexer is None
+            or not self.self_attn.indexer.owns_k
+        ):
+            raise RuntimeError(
+                "cache-only boundary must own both Main-KV and Indexer-K producers"
+            )
+        state = state.materialized(self.hc_cfg)
+        x = mhc.combine_input(self.hc_cfg, self.input_layernorm, state)
+        get_attn_backend().forward_low_ratio_sources(
+            layer=self.self_attn,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_compressor=True,
+            run_indexer=False,
         )
 
     def refresh_mhc_norm_weight_cache(self) -> None:
@@ -3708,6 +3707,7 @@ class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    encoder_only_boundary_layer: Optional[int] = None
 
     def __init__(
         self,
@@ -3862,7 +3862,10 @@ class DeepseekV4Model(nn.Module):
         # The tail starts at the last kv_source layer, whose compressed KV is first
         # written for every row (DeepseekV4AttnBackend.write_tail_source_kv).
         self.tail_writes_source_kv = False
-        if get_exec().features.enable_decoder_swa_bounded_replay:
+        if (
+            get_exec().features.enable_decoder_swa_bounded_replay
+            and not self.encoder_only_prefill
+        ):
             assert config.kv_source_layer_ids, (
                 "decoder SWA bounded replay needs kv_source_layer_ids"
             )
@@ -4054,6 +4057,17 @@ class DeepseekV4Model(nn.Module):
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
         for i in range(self.start_layer, self.end_layer):
+            if i == self.encoder_only_boundary_layer:
+                layer = self.layers[i]
+                # Complete the previous layer's deferred MoE update before the
+                # cache-only producer reads its mHC state. It has no next triplet.
+                state = hc_boundary.materialize(
+                    hidden_states,
+                    forward_batch,
+                    next=mhc.make_boundary(layer.input_layernorm, accepts_mxfp8=False),
+                )
+                layer.write_global_cache_only(positions, state, forward_batch)
+                return None, None, None
             if _is_cuda:
                 layer = self.layers[i]
                 if (
@@ -4151,13 +4165,6 @@ class DeepseekV4Model(nn.Module):
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
-            if i == self.encoder_only_boundary_layer:
-                self.layers[i].write_global_cache_only(
-                    positions=positions,
-                    state=state,
-                    forward_batch=forward_batch,
-                )
-                return None, None, None
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)

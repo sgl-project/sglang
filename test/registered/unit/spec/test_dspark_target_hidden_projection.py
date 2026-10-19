@@ -139,6 +139,10 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         worker._kv_injector = SimpleNamespace(
             inject_target_hidden=mock.Mock(),
             ids_for=mock.Mock(side_effect=lambda _plan: batch.out_cache_loc),
+            swa_ring_size=None,
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(swa_valid_from=None)
+            ),
         )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),
@@ -154,10 +158,6 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_worker_v2.compute_position",
                 return_value=(torch.arange(4), None),
-            ),
-            mock.patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2.is_unified_kv_triton",
-                return_value=False,
             ),
         ):
             result = DSparkWorkerV2._forward_prefill(worker, batch, on_publish=None)

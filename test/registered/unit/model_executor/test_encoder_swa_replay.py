@@ -415,6 +415,7 @@ def _extend_batch(fx):
         out_cache_loc=fb.out_cache_loc,
         positions=fx.folded_positions(),
         encoder_swa_replay=False,
+        dsv41_cache_only_replay=False,
         encoder_swa_row_floor=fx.folded.row_floor,
         encoder_swa_compress_rows=fx.folded.keep_rows,
     )
@@ -737,6 +738,7 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
         from sglang.srt.runtime_context import override_platform
 
         view = _View(
+            dsv41_encoder_only_prefill=False,
             dsv4_attn_backend="dsv4",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend=Backend.DISABLED)

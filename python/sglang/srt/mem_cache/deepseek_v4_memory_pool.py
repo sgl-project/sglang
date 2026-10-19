@@ -136,8 +136,13 @@ def is_dspark_spec() -> bool:
 def uses_draft_swa_ring() -> bool:
     """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
     state is tree-owned under encoder replay. The HIP backend still addresses the
-    draft SWA through the target's paged full-to-SWA mapping."""
-    return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
+    draft SWA through the target's paged full-to-SWA mapping. Cache-only PD also
+    keeps target and draft on that shared paged mapping."""
+    return (
+        get_exec().features.enable_encoder_swa_bounded_replay
+        and not get_disagg().dsv41_encoder_only_prefill
+        and not _is_hip
+    )
 
 
 def get_draft_swa_ring_size(
@@ -1128,7 +1133,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # wrote: the ring restarts at the cached prefix, and a PD decode receives
         # the prefill's mark as request-row state.
         self.swa_valid_from: Optional[torch.Tensor] = None
-        encoder_replay = (get_exec().features.enable_encoder_swa_bounded_replay and not get_disagg().dsv41_encoder_only_prefill)
+        encoder_replay = (
+            get_exec().features.enable_encoder_swa_bounded_replay
+            and not get_disagg().dsv41_encoder_only_prefill
+        )
         # Under encoder replay the target keeps SWA in a per-request window. A
         # draft without its own ring still reads the target's full-to-SWA mapping,
         # so the target then keeps its paged SWA allocator.

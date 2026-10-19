@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 
-from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (

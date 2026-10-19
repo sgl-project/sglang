@@ -2963,6 +2963,15 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=True,
+                swa_replay_start=(
+                    torch.repeat_interleave(
+                        forward_batch.extend_prefix_lens,
+                        extend_seq_lens.to(torch.int64),
+                        output_size=sum(extend_seq_lens_cpu),
+                    )
+                    if forward_batch.dsv41_cache_only_replay
+                    else None
+                ),
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
             )

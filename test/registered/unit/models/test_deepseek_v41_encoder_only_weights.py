@@ -1,11 +1,17 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 from torch import nn
 
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models import deepseek_v4, deepseek_v4_boundary
 from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4Model,
     DeepseekV41EncoderBoundaryLayer,
     dsv41_encoder_only_prefill_weight_needed,
 )
@@ -80,6 +86,52 @@ class TestDsv41EncoderOnlyWeights(CustomTestCase):
                 self.assertIsNone(call.kwargs["q_lora"])
                 self.assertTrue(call.kwargs["run_compressor"])
                 self.assertFalse(call.kwargs["run_indexer"])
+
+        # The model loop must finish the previous layer's deferred MoE update,
+        # rather than hand the embedding-time HcState to the cache producer.
+        class PreviousLayer(nn.Module):
+            engram = None
+
+            def forward(self, hidden_states, forward_batch, **kwargs):
+                stream = residual_batch.stream_of(forward_batch)
+                stream.check(hidden_states)
+                update = deepseek_v4_boundary.HcUpdate(self, False)
+                update.post = lambda value, state, **kw: HcState(state.residual + value)
+                return stream.record(torch.full_like(residual, 3.0), update)
+
+        layer.input_layernorm = RMSNorm(16)
+        model = object.__new__(DeepseekV4Model)
+        nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(world_size=1)
+        model.layers = nn.ModuleList([PreviousLayer(), layer])
+        model.start_layer, model.end_layer = 0, 2
+        model.encoder_only_boundary_layer = 1
+        model.engram_hasher = model.late_layer_start = None
+        positions = torch.zeros(1, dtype=torch.long)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=positions,
+            positions=positions,
+            residual_stream=None,
+        )
+        recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
+        self.addCleanup(residual_batch.clear, batch)
+        with (
+            patch.object(deepseek_v4, "_is_cuda", True),
+            patch.object(deepseek_v4, "is_cp_active", return_value=False),
+            patch.object(deepseek_v4, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                deepseek_v4,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            output = model._forward_layers_hc_pre_from_prev(
+                positions, residual, batch, positions, positions, False, []
+            )
+        self.assertEqual(output, (None, None, None))
+        actual = backend.return_value.forward_low_ratio_sources.call_args.kwargs["x"]
+        torch.testing.assert_close(actual, layer.input_layernorm((residual + 3)[:, 0]))
 
 
 if __name__ == "__main__":

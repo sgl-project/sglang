@@ -21,7 +21,6 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
@@ -398,6 +397,40 @@ class TestDSV41CacheOnlyReplayAllocation(CustomTestCase):
 
 
 class TestReplayPairStateIsolation(CustomTestCase):
+    def test_cache_only_metadata_floors_each_request_at_replay_start(self):
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.req_to_token = torch.empty(0)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
+        backend.page_size = 256
+        backend.is_dspark_draft = False
+        backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *a, **kw: 0)
+        backend.init_forward_metadata_prefill = lambda **metadata: metadata
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            req_pool_indices=torch.tensor([5, 2]),
+            seq_lens=torch.tensor([257, 512]),
+            seq_lens_cpu=torch.tensor([257, 512]),
+            extend_prefix_lens=torch.tensor([129, 384]),
+            extend_seq_lens=torch.tensor([128, 128]),
+            extend_seq_lens_cpu=[128, 128],
+            extend_start_loc=torch.tensor([0, 128]),
+            out_cache_loc=torch.arange(256),
+            max_seq_len_override=None,
+            encoder_swa_row_floor=None,
+            encoder_swa_compress_rows=None,
+        )
+        for cache_only in (False, True):
+            with self.subTest(cache_only=cache_only):
+                batch.dsv41_cache_only_replay = cache_only
+                batch.encoder_swa_replay = cache_only
+                metadata = backend._build_forward_metadata(batch)
+                floor = metadata["swa_replay_start"]
+                if cache_only:
+                    self.assertEqual(floor.tolist(), [129] * 128 + [384] * 128)
+                else:
+                    self.assertIsNone(floor)
+
     def test_only_cache_only_replay_rebuilds_pending_pair(self):
         """Non-PD replay stays read-only; cache-only replay never rewrites global KV."""
         override = get_context().override_server_args()
@@ -420,6 +453,7 @@ class TestReplayPairStateIsolation(CustomTestCase):
                 before = state.kv_score_buffer.clone()
                 backend = object.__new__(DeepseekV4AttnBackend)
                 backend.low_ratios = ()
+                backend.tail_source_kv_layer_id = None
                 backend.forward_metadata = SimpleNamespace(
                     low_ratio_req_indices=torch.tensor([0]),
                     low_ratio_pos_i64=torch.tensor([126]),
@@ -635,19 +669,22 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         target = self.make_pool(draft=False)
         draft = self.make_pool(draft=True)
         self.assertEqual(target.request_window.capacity, draft.swa_req_ring_size)
-        override = get_context().override_server_args(
-            enable_encoder_swa_bounded_replay=False
-        )
-        override.install()
-        try:
-            decode_target = self.make_pool(draft=False)
-            decode_draft = self.make_pool(draft=True)
-        finally:
-            override.restore()
-        for prefill, decode in ((target, decode_target), (draft, decode_draft)):
-            self.assertEqual(
-                prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
-            )
+        for cache_only in (False, True):
+            with self.subTest(cache_only=cache_only):
+                with get_context().override_server_args(
+                    enable_encoder_swa_bounded_replay=cache_only,
+                    dsv41_encoder_only_prefill=cache_only,
+                ):
+                    decode_target = self.make_pool(draft=False)
+                    decode_draft = self.make_pool(draft=True)
+                for prefill, decode in ((target, decode_target), (draft, decode_draft)):
+                    self.assertIsNone(decode.request_window)
+                    self.assertIsNone(decode.swa_req_ring_size)
+                    self.assertTrue(decode.needs_paged_swa_allocator)
+                    self.assertEqual(
+                        prefill.get_state_buf_infos()[2],
+                        decode.get_state_buf_infos()[2],
+                    )
 
     def test_dspark_draft_keeps_the_mark_for_either_storage(self):
         # Ring or paged, a DSpark draft sends one request-row item, so the PD

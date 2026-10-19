@@ -1618,27 +1618,10 @@ class TestSWAPoolFloor(CustomTestCase):
         _publish_config(self, swa_prefix_tails=1024)
         self.assertEqual(cfg._resolve_swa_prefix_tails(), 1024)
 
-    def test_dsv4_trtllm_kv_bytes(self):
-        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-
-        kvc = _make_model_runner(self, num_layers=1, page_size=256)
-        _publish_config(self, dsv4_attn_backend="trtllm", page_size=256)
-        kvc.kv_cache_dtype_str = "fp8_e4m3"
-        cfg = kvc.model_config
-        cfg.qk_nope_head_dim = 448
-        cfg.index_head_dim = 128
-        cfg.compress_ratios = [0]
-        cfg.window_size = 128
-        cfg.hf_config.kv_source_layer_ids = []
-        planner = DSV4PoolConfigurator(kvc)
-        self.assertEqual(planner.kv_bytes, 512)
-        self.assertEqual(planner.bytes_per_swa_token, 512)
-
     def test_dsv4_encoder_replay_reserves_paged_target_window(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
-        _publish_config(
-            self,
+        fields = dict(
             enable_encoder_swa_bounded_replay=True,
             dsv41_encoder_only_prefill=True,
             disaggregation_mode="decode",
@@ -1647,6 +1630,7 @@ class TestSWAPoolFloor(CustomTestCase):
             max_running_requests=2,
             chunked_prefill_size=256,
         )
+        _publish_config(self, **fields)
         cfg = SimpleNamespace(
             qk_nope_head_dim=448,
             qk_rope_head_dim=64,
@@ -1675,6 +1659,24 @@ class TestSWAPoolFloor(CustomTestCase):
 
         self.assertGreater(sizes.swa_max_total_num_tokens, 0)
         self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
+
+        _publish_config(
+            self,
+            **fields,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+        )
+        kvc.spec_algorithm = SimpleNamespace(
+            is_dspark=lambda: True, is_none=lambda: False
+        )
+        kvc.spec_aux_config = SimpleNamespace(
+            dspark_num_stages=3, dflash_draft_num_layers=40
+        )
+        speculative = DSV4PoolConfigurator(kvc)
+        self.assertAlmostEqual(speculative.bytes_per_swa_token, 43 * 585)
+        self.assertAlmostEqual(
+            speculative.bytes_per_full_token, planner.bytes_per_full_token * 43 / 40
+        )
 
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
