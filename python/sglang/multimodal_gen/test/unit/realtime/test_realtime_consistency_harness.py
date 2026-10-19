@@ -8,12 +8,7 @@ import msgspec.msgpack
 import numpy as np
 import pytest
 
-from sglang.multimodal_gen.runtime.realtime.video import (
-    RAW_RGB_CONTENT_TYPE,
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
-    RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
-    build_delta_gzip_raw_rgb_payload,
-)
+from sglang.multimodal_gen.runtime.realtime.video import RAW_RGB_CONTENT_TYPE
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server import test_server_common
 from sglang.multimodal_gen.test.server.realtime_consistency import (
@@ -40,9 +35,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
-    LONGLIVE2_I2V_CI_sampling_params,
-    LONGLIVE2_T2V_CI_sampling_params,
-    REALTIME_MODEL_sampling_params,
     ScenarioConfig,
 )
 
@@ -183,58 +175,6 @@ def test_decode_realtime_raw_rgb_frames_rejects_truncated_payload():
 
     with pytest.raises(ValueError, match="payload size mismatch"):
         decode_realtime_raw_rgb_frames(header, b"too-short")
-
-
-def test_decode_realtime_delta_gzip_raw_rgb_frames_roundtrips():
-    first = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
-    second = (np.arange(12, dtype=np.uint8) + 1).reshape(2, 2, 3)
-    header = {
-        "type": "frame_batch_header",
-        "content_type": RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
-        "num_frames": 2,
-        "width": 2,
-        "height": 2,
-        "channels": 3,
-        "bytes_per_frame": 12,
-    }
-
-    frames = decode_realtime_raw_rgb_frames(
-        header,
-        build_delta_gzip_raw_rgb_payload([first.tobytes(), second.tobytes()]),
-    )
-
-    assert len(frames) == 2
-    np.testing.assert_array_equal(frames[0], first)
-    np.testing.assert_array_equal(frames[1], second)
-
-
-def test_decode_realtime_rgba_delta_gzip_strips_alpha():
-    first = np.array(
-        [[[1, 2, 3, 255], [4, 5, 6, 255]]],
-        dtype=np.uint8,
-    )
-    second = np.array(
-        [[[1, 2, 4, 255], [4, 6, 6, 255]]],
-        dtype=np.uint8,
-    )
-    header = {
-        "type": "frame_batch_header",
-        "content_type": RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
-        "num_frames": 2,
-        "width": 2,
-        "height": 1,
-        "channels": 4,
-        "bytes_per_frame": 8,
-    }
-
-    frames = decode_realtime_raw_rgb_frames(
-        header,
-        build_delta_gzip_raw_rgb_payload([first.tobytes(), second.tobytes()]),
-    )
-
-    assert len(frames) == 2
-    np.testing.assert_array_equal(frames[0], first[:, :, :3])
-    np.testing.assert_array_equal(frames[1], second[:, :, :3])
 
 
 # Stream collection and realtime performance stats
@@ -633,72 +573,3 @@ def test_realtime_sampling_params_route_to_realtime_video_generator():
     )
 
     assert generate_fn.__name__ == "generate_realtime_video"
-
-
-def test_realtime_model_params_are_lossless_gt_ready():
-    params = REALTIME_MODEL_sampling_params
-
-    assert "floating island hotel" in params.prompt
-    assert "825646291038" in str(params.image_path)
-    assert params.output_size == "832x480"
-    assert params.realtime_num_chunks == 4
-    assert params.realtime_output_format is None
-    assert params.realtime_perf_ignore_initial_chunks == 2
-    assert params.realtime_perf_thresholds["p95_chunk_total_ms"] == 5000.0
-    assert params.realtime_perf_thresholds["p95_scheduler_forward_ms"] == 4500.0
-    assert params.realtime_events == []
-    assert params.extras["condition_inputs"]["camera_actions"] == [
-        ["w"],
-        ["w"],
-        ["w"],
-        ["w"],
-        ["w"],
-        ["w"],
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    ]
-
-
-def test_longlive2_cases_share_realtime_model_sampling_profile():
-    for params in (
-        LONGLIVE2_T2V_CI_sampling_params,
-        LONGLIVE2_I2V_CI_sampling_params,
-    ):
-        assert params.prompt == REALTIME_MODEL_sampling_params.prompt
-        assert params.fps == REALTIME_MODEL_sampling_params.fps
-        assert params.extras == {
-            "seed": 42,
-            "num_inference_steps": 4,
-            "guidance_scale": 1.0,
-        }
-        assert params.realtime_num_chunks is None
-        assert params.realtime_perf_thresholds == {}
-
-    assert LONGLIVE2_T2V_CI_sampling_params.image_path is None
-    assert (
-        LONGLIVE2_T2V_CI_sampling_params.output_size
-        == REALTIME_MODEL_sampling_params.output_size
-    )
-    assert (
-        LONGLIVE2_I2V_CI_sampling_params.image_path
-        == REALTIME_MODEL_sampling_params.image_path
-    )
-    assert LONGLIVE2_I2V_CI_sampling_params.output_size == "960x928"
-
-
-def test_lingbot_realtime_case_is_registered_by_default():
-    from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES
-
-    case = next(
-        item
-        for item in ONE_GPU_CASES
-        if item.id == "lingbot_world_realtime_plastic_beach"
-    )
-    assert case.id == "lingbot_world_realtime_plastic_beach"
-    assert case.run_consistency_check is True
-    assert case.run_perf_check is True
-    assert case.sampling_params.realtime_output_format is None

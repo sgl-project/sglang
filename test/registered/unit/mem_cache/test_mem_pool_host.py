@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolFP4,
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -29,8 +30,9 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
+    get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -53,7 +55,7 @@ class TestHostKVCache(CustomTestCase):
             enable_memory_saver=False,
         )
         self.host_pool = MHATokenToKVPoolHost(
-            device_pool=self.device_pool,
+            buffer_info=self.device_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=self.page_size,
@@ -61,7 +63,75 @@ class TestHostKVCache(CustomTestCase):
             pin_memory=False,
             device="cpu",
             allocator_type="default",
+            device_capacity_tokens=self.device_pool.size
+            if self.device_pool.host_capacity_tokens is None
+            else self.device_pool.host_capacity_tokens,
+            start_layer=self.device_pool.start_layer,
+            end_layer=self.device_pool.end_layer,
+            write_back_staging=self.device_pool.hicache_write_back_staging,
         )
+
+    def test_info_host_does_not_retain_owner_or_rebuild_pointer_tables(self):
+        """Host construction preserves physical allocations without retaining pools."""
+        import gc
+        import weakref
+
+        pool = MHATokenToKVPool(
+            size=16,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=2,
+            start_layer=7,
+            end_layer=9,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        info = pool.get_device_pool_infos()[0]
+        self.assertEqual(info.layer_ids, (7, 8))
+        pointer_table = pool.k_data_ptrs
+        owner = weakref.ref(pool)
+        del pool
+        gc.collect()
+        self.assertIsNone(owner())
+        host = MHATokenToKVPoolHost(
+            info.buffer_info,
+            2,
+            0,
+            2,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=8,
+            start_layer=7,
+            end_layer=9,
+        )
+        self.addCleanup(host.destroy)
+        self.assertIs(host.device_k_data_ptrs, pointer_table)
+        self.assertEqual(host.size, 18)
+        self.assertIs(host.device_k_buffers[0], info.buffer_info.buffers.k[0])
+        self.assertNotIn("device_pool", vars(host))
+        self.assertNotIn("mtp_draft_device_pools", vars(host))
+
+    def test_mha_model_layer_ids_follow_hybrid_and_empty_stage(self):
+        """Hybrid compact buffer positions must not become model layer IDs."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        for layers in ([7, 12], []):
+            root = HybridLinearKVPool(
+                size=8,
+                page_size=2,
+                dtype=torch.float16,
+                head_num=1,
+                head_dim=4,
+                full_attention_layer_ids=layers,
+                device="cpu",
+                mamba_pool=None,
+            )
+            info = root.full_kv_pool.get_device_pool_infos()[0]
+            self.assertEqual(info.layer_ids, tuple(layers))
+            info.buffer_info.validate(layer_ids=info.layer_ids)
+            self.assertEqual(len(info.buffer_info.buffers.k), len(layers))
 
     def test_direct_page_first_direct_rejects_strided_rows(self):
         device = self.device_pool
@@ -75,7 +145,7 @@ class TestHostKVCache(CustomTestCase):
         ]
         device._init_data_ptrs_and_strides()
         host = MHATokenToKVPoolHost(
-            device_pool=device,
+            buffer_info=device.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=self.page_size,
@@ -83,6 +153,9 @@ class TestHostKVCache(CustomTestCase):
             pin_memory=False,
             device="cpu",
             allocator_type="default",
+            device_capacity_tokens=device.size,
+            start_layer=device.start_layer,
+            end_layer=device.end_layer,
         )
         self.addCleanup(host.destroy)
         src = torch.tensor([0, 1])
@@ -120,14 +193,25 @@ class TestHostKVCache(CustomTestCase):
                     )
                     for layers in (2, 1, 1)
                 )
+                host_inputs = dict(
+                    device_capacity_tokens=pools[0].size,
+                    start_layer=pools[0].start_layer,
+                    end_layer=pools[0].end_layer,
+                    draft_buffer_infos=tuple(
+                        pool.get_device_pool_infos()[0].buffer_info
+                        for pool in pools[1:]
+                    ),
+                )
+                if mla:
+                    host_inputs["target_layer_num"] = pools[0].layer_num
                 host = host_type(
-                    pools[0],
+                    pools[0].get_device_pool_infos()[0].buffer_info,
                     host_to_device_ratio=2,
                     host_size=0,
                     page_size=2,
                     layout="layer_first",
                     pin_memory=False,
-                    mtp_draft_device_pools=pools[1:],
+                    **host_inputs,
                 )
                 self.addCleanup(host.destroy)
                 names = ("kv_buffer",) if mla else ("k_buffer", "v_buffer")
@@ -208,6 +292,115 @@ class TestHostKVCache(CustomTestCase):
         )
         self.assertFalse(group.can_use_write_back_jit)
 
+    def test_reject_packed_scaled_kv_before_host_allocation(self):
+        """Packed target or draft KV previously lost scales and used wrong row bytes."""
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            FP4MXBlock16KVCacheMethod,
+            NVFP4KVCacheMethod,
+        )
+
+        for pool_cls, method in (
+            (MHATokenToKVPool, FP4MXBlock16KVCacheMethod()),
+            (
+                MHATokenToKVPool,
+                NVFP4KVCacheMethod(
+                    num_layers=1, device="cpu", native_scale_layout=False
+                ),
+            ),
+            (MHATokenToKVPoolFP4, None),
+        ):
+            pool = pool_cls(
+                size=32,
+                page_size=16,
+                dtype=torch.bfloat16,
+                head_num=2,
+                head_dim=64,
+                layer_num=1,
+                device="cpu",
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+                quant_method=method,
+            )
+            for target, drafts in ((pool, ()), (self.device_pool, (pool,))):
+                with self.subTest(
+                    pool=type(pool).__name__, method=method, draft=bool(drafts)
+                ):
+                    with unittest.mock.patch.object(
+                        base.HostKVCache,
+                        "__init__",
+                        side_effect=AssertionError(
+                            "unsupported format reached allocation"
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError, "KV scale layout 'token'"
+                        ):
+                            MHATokenToKVPoolHost(
+                                buffer_info=target.get_device_pool_infos()[
+                                    0
+                                ].buffer_info,
+                                host_to_device_ratio=2,
+                                host_size=0,
+                                page_size=16,
+                                layout="layer_first",
+                                pin_memory=False,
+                                draft_buffer_infos=tuple(
+                                    pool.get_device_pool_infos()[0].buffer_info
+                                    for pool in drafts
+                                ),
+                                device_capacity_tokens=target.size
+                                if target.host_capacity_tokens is None
+                                else target.host_capacity_tokens,
+                                start_layer=target.start_layer,
+                                end_layer=target.end_layer,
+                                write_back_staging=target.hicache_write_back_staging,
+                            )
+
+    def test_unscaled_fp8_and_asymmetric_host_capacity(self):
+        """The FP4 guard must not reject byte-backed FP8 or asymmetric rows."""
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            CPUFP8KVCacheMethod,
+        )
+
+        for dtype, method, v_head_dim in (
+            (torch.float8_e4m3fn, None, 64),
+            (torch.bfloat16, CPUFP8KVCacheMethod(), 64),
+            (torch.bfloat16, None, 32),
+        ):
+            with self.subTest(dtype=dtype, method=method, v_head_dim=v_head_dim):
+                pool = MHATokenToKVPool(
+                    size=32,
+                    page_size=16,
+                    dtype=dtype,
+                    head_num=2,
+                    head_dim=64,
+                    v_head_dim=v_head_dim,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    enable_alt_stream=False,
+                    quant_method=method,
+                )
+                host = get_mha_host_pool_cls(
+                    pool.get_device_pool_infos()[0].buffer_info
+                )(
+                    buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+                    device_capacity_tokens=pool.size,
+                    start_layer=pool.start_layer,
+                    end_layer=pool.end_layer,
+                    host_to_device_ratio=2,
+                    host_size=0,
+                    page_size=16,
+                    layout="page_first",
+                    pin_memory=False,
+                )
+                self.addCleanup(host.destroy)
+                expected_bytes = sum(
+                    buf.numel() * buf.element_size()
+                    for buf in (*pool.k_buffer, *pool.v_buffer)
+                ) // (pool.size + pool.page_size)
+                self.assertEqual(host.get_size_per_token(), expected_bytes)
+
     def test_multiple_attention_rows_per_token(self):
         for rows_per_token in (1, 3):
             device_pool = MHATokenToKVPool(
@@ -230,12 +423,18 @@ class TestHostKVCache(CustomTestCase):
             ):
                 with self.subTest(rows_per_token=rows_per_token, layout=layout):
                     host_pool = MHATokenToKVPoolHost(
-                        device_pool=device_pool,
+                        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
                         host_to_device_ratio=2.0,
                         host_size=0,
                         page_size=self.page_size,
                         layout=layout,
                         pin_memory=False,
+                        device_capacity_tokens=device_pool.size
+                        if device_pool.host_capacity_tokens is None
+                        else device_pool.host_capacity_tokens,
+                        start_layer=device_pool.start_layer,
+                        end_layer=device_pool.end_layer,
+                        write_back_staging=device_pool.hicache_write_back_staging,
                     )
                     device_row = device_pool.k_buffer[0][0]
                     row_bytes = device_row.numel() * device_row.element_size()
@@ -292,7 +491,7 @@ class TestHostKVCache(CustomTestCase):
 
     def test_shm_allocator(self):
         shm_host_pool = MHATokenToKVPoolHost(
-            device_pool=self.device_pool,
+            buffer_info=self.device_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=self.page_size,
@@ -300,6 +499,12 @@ class TestHostKVCache(CustomTestCase):
             pin_memory=False,
             device="cpu",
             allocator_type="shm",
+            device_capacity_tokens=self.device_pool.size
+            if self.device_pool.host_capacity_tokens is None
+            else self.device_pool.host_capacity_tokens,
+            start_layer=self.device_pool.start_layer,
+            end_layer=self.device_pool.end_layer,
+            write_back_staging=self.device_pool.hicache_write_back_staging,
         )
         self.assertIsNotNone(shm_host_pool.fd)
         self.assertGreaterEqual(shm_host_pool.fd, 0)
@@ -648,13 +853,24 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         decl = make_dsa_indexer_pool_decl(stub)
         storage_info = decl.storage_info
         anchor = MLATokenToKVPoolHost(
-            stub,
+            MLAHostAllocation(
+                dtype=stub.store_dtype,
+                kv_lora_rank=stub.kv_lora_rank,
+                qk_rope_head_dim=stub.qk_rope_head_dim,
+                kv_cache_dim=stub.kv_lora_rank + stub.qk_rope_head_dim,
+                size_per_token=(stub.kv_lora_rank + stub.qk_rope_head_dim)
+                * stub.store_dtype.itemsize
+                * stub.layer_num,
+            ),
+            device_capacity_tokens=stub.size,
+            start_layer=stub.start_layer,
+            end_layer=stub.end_layer,
+            target_layer_num=stub.layer_num,
             host_to_device_ratio=2,
             host_size=0,
             page_size=64,
             layout="page_first",
             pin_memory=False,
-            is_dummy=True,
         )
         mirror = DSAIndexerPoolHost(
             decl=decl,
@@ -684,13 +900,24 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         decl = make_dsa_indexer_pool_decl(stub)
         self.assertEqual(decl.owned_device_layers, (0, 3))
         anchor = MLATokenToKVPoolHost(
-            stub,
+            MLAHostAllocation(
+                dtype=stub.store_dtype,
+                kv_lora_rank=stub.kv_lora_rank,
+                qk_rope_head_dim=stub.qk_rope_head_dim,
+                kv_cache_dim=stub.kv_lora_rank + stub.qk_rope_head_dim,
+                size_per_token=(stub.kv_lora_rank + stub.qk_rope_head_dim)
+                * stub.store_dtype.itemsize
+                * stub.layer_num,
+            ),
+            device_capacity_tokens=stub.size,
+            start_layer=stub.start_layer,
+            end_layer=stub.end_layer,
+            target_layer_num=stub.layer_num,
             host_to_device_ratio=2,
             host_size=0,
             page_size=64,
             layout="page_first",
             pin_memory=False,
-            is_dummy=True,
         )
         mirror = DSAIndexerPoolHost(
             decl=decl,
