@@ -94,6 +94,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.model_config = None
         s.enable_overlap = False
         s.spec_algorithm = None
+        s.log_schedule_decisions = False
         # The final chunk and the running requests hold rows; one row is free.
         s.req_to_token_pool = SimpleNamespace(
             available_size=lambda: NUM_ROWS - len(running) - 1
