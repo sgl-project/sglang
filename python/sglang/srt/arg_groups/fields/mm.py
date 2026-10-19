@@ -3,21 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import (
-    Any,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Union,
-)
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import (
-    A,
-    Arg,
-)
+from sglang.srt.arg_groups.arg_utils import A, Arg
 
 
 class Mm(msgspec.Struct):

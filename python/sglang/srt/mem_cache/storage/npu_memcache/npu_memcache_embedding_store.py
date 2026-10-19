@@ -19,6 +19,8 @@ import json
 import logging
 from typing import Any, List
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 from sglang.srt.mem_cache.storage.npu_memcache.npu_memcache_store import (
@@ -129,7 +131,7 @@ class NpuMemcacheEmbeddingStore(EmbeddingStore):
     def get_key(self, mm_hash: str) -> str:
         return f"emb_{mm_hash}"
 
-    def register_buffer(self, tensor: "torch.Tensor") -> None:
+    def register_buffer(self, tensor: torch.Tensor) -> None:
         if self.store is None:
             raise RuntimeError("Ascend MemCache embedding store is not initialized.")
         ptr = tensor.data_ptr()
@@ -217,7 +219,7 @@ class NpuMemcacheEmbeddingStore(EmbeddingStore):
         out: List[bool] = []
         for i in range(len(hashes)):
             end = offsets[i + 1] if i + 1 < len(offsets) else len(results)
-            chunk = results[offsets[i]:end]
+            chunk = results[offsets[i] : end]
             out.append(all(code == 0 for code in chunk) if chunk else False)
         return out
 
@@ -257,6 +259,6 @@ class NpuMemcacheEmbeddingStore(EmbeddingStore):
         results = self.store.batch_put_from(flat_keys, flat_ptrs, flat_sizes)
         for gi, hidx in enumerate(put_indices):
             end = offsets[gi + 1] if gi + 1 < len(offsets) else len(results)
-            chunk = results[offsets[gi]:end]
+            chunk = results[offsets[gi] : end]
             success_map[hidx] = all(code == 0 for code in chunk) if chunk else True
         return success_map

@@ -59,11 +59,7 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
 )
-from sglang.srt.managers.io_struct import (
-    ProfileReq,
-    ProfileReqType,
-    async_sock_recv,
-)
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType, async_sock_recv
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
