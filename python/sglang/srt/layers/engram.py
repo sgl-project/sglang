@@ -400,8 +400,9 @@ class EngramHasher(nn.Module):
                 kmode = MODE_VERIFY
             else:
                 # Packed (compact) verify: each request's run starts at its
-                # qo_indptr entry. Graph padding hashes as part of the last row;
-                # those rows are discarded and verify commits no history.
+                # qo_indptr entry. Graph padding hashes with the row the layout
+                # gives it (the tail with the last row); padding outputs are
+                # discarded and verify commits no history.
                 row = ragged_verify_token_rows(layout, num_tokens).clamp_max(bs - 1)
                 starts = layout.qo_indptr_device[:-1]
                 kmode = MODE_EXTEND
