@@ -127,6 +127,11 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+    LanguageModelInputPreparation,
+)
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -4484,7 +4489,9 @@ def _v41_vision_a2a_supported() -> bool:
     return backend.is_none() or (_is_cuda and backend.is_megamoe())
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+class DeepseekV4ForCausalLM(
+    nn.Module, LanguageModelInputPreparation, CPBoundedTailLogits
+):
     supports_cuda_vmm_feature_transport = True
 
     @classmethod
@@ -4743,6 +4750,25 @@ class DeepseekV4ForCausalLM(nn.Module):
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
+
+    def prepare_cp_logits_inputs(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> CPLogitsInputs:
+        if not (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return CPLogitsInputs(input_ids, forward_batch)
+
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        if tail is None:
+            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        return CPLogitsInputs(tail.rows(input_ids), logits_metadata, tail.token_indices)
 
     def prepare_language_model_inputs(
         self,

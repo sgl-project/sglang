@@ -769,6 +769,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+    # Capture-stable local views, populated only by PrefillCPBCGInput.prepare.
+    cp_positions: Optional[torch.Tensor] = None
+    cp_input_ids: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
@@ -1067,6 +1070,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            cp_positions=None,
+            cp_input_ids=None,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags

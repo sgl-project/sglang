@@ -80,9 +80,14 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
             def __call__(self, residual, *args, **kwargs):
                 return residual + 10
 
-        layer = SimpleNamespace(
+        class Layer(SimpleNamespace):
+            def __call__(self, *, hidden_states, **kwargs):
+                return hidden_states
+
+        layer = Layer(
             engram=Engram(),
             hc_cfg=None,
+            boundary_mhc_fusions=False,
             forward_hc_pre_from_prev=lambda **kw: kw["state"],
         )
         model = SimpleNamespace(

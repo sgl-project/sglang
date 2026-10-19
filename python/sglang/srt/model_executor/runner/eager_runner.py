@@ -50,6 +50,7 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.model_interfaces import prepare_language_model_inputs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
@@ -382,11 +383,9 @@ class EagerRunner(BaseRunner):
         else:
             input_embeds = kwargs.get("input_embeds")
             # Prepare multimodal embeddings and model IDs in global token order.
-            prepare_inputs = getattr(model, "prepare_language_model_inputs", None)
-            if prepare_inputs is not None:
-                input_ids, input_embeds = prepare_inputs(
-                    input_ids, forward_batch, input_embeds
-                )
+            input_ids, input_embeds = prepare_language_model_inputs(
+                model, input_ids, forward_batch, input_embeds
+            )
             if input_embeds is None:
                 input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions

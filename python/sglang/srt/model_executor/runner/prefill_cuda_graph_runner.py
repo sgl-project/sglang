@@ -610,14 +610,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.backend, BreakableCudaGraphBackend
         ) and supports_prefill_cp_bcg(server_args)
         if self.enable_cp_bcg_capture:
-            if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+            if (
+                self.max_context_size is not None
+                and not self.prefill_cp_bcg_input.supports_max_context_size
+            ):
+                self._ignore_max_context_size("CP breakable prefill CUDA graph")
             logger.info(
                 "Prefill CP breakable CUDA graph enabled: strategy=%s, cp_size=%d",
                 get_parallel().cp_strategy,
@@ -780,7 +781,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
-        if self.enable_cp_bcg_capture:
+        if getattr(self, "enable_cp_bcg_capture", False):
             cp_positions = self.prefill_cp_bcg_input.model_positions(forward_batch)
             if cp_positions is not None:
                 return cp_positions
@@ -870,9 +871,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                input_ids = getattr(
-                    forward_batch, "_cp_input_ids", forward_batch.input_ids
-                )
+                input_ids = forward_batch.input_ids
+                if getattr(self, "enable_cp_bcg_capture", False):
+                    input_ids = self.prefill_cp_bcg_input.model_input_ids(forward_batch)
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -2354,9 +2355,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._wait_for_layer_loads()
 
             if self.enable_cp_bcg_capture:
-                assert self.max_context_size is None, (
-                    "CP-v2 BCG replay does not support a fixed prefill context size"
-                )
+                # assert self.max_context_size is None, (
+                #     "CP-v2 BCG replay does not support a fixed prefill context size"
+                # )
                 output = execute_prefill_cp_bcg(
                     self,
                     forward_batch,
