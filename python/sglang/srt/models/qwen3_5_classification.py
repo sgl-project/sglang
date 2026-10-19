@@ -27,6 +27,7 @@ from sglang.srt.layers.pooler import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 
 logger = logging.getLogger(__name__)
@@ -89,19 +90,20 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
         return score_and_pool(self.score, self.pooler, hidden_states, forward_batch, input_ids)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Materialize once so we can handle score.* before delegating to parent.
+        # Materialize once so score.* can be intercepted before the parent loop,
+        # which would silently skip any key not in its own params_dict.
         weights = list(weights)
         params_dict = dict(self.named_parameters())
 
         remaining = []
         for name, loaded_weight in weights:
             if name.startswith("lm_head"):
-                # No lm_head in this checkpoint; skip silently.
-                continue
+                continue  # no lm_head in this checkpoint
             if name.startswith("score."):
                 if name in params_dict:
-                    from sglang.srt.model_loader.weight_utils import default_weight_loader
-                    weight_loader = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        params_dict[name], "weight_loader", default_weight_loader
+                    )
                     weight_loader(params_dict[name], loaded_weight)
                 else:
                     logger.warning(f"score weight {name} not found in params_dict")
@@ -112,3 +114,30 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
 
 
 EntryClass = [Qwen3_5VLForSequenceClassification]
+
+
+# ---------------------------------------------------------------------------
+# Processor registry injection
+#
+# SGLang's multimodal processor registry (PROCESSOR_MAPPING in
+# sglang.srt.managers.multimodal_processor) maps model classes to processor
+# classes. It is built by import_processors(), which scans
+# sglang.srt.multimodal.processors — it does NOT scan sglang.srt.models.
+#
+# Because SGLang Engine uses spawn-mode multiprocessing, any registry
+# mutation made in the parent process is invisible to worker subprocesses.
+# Workers import sglang.srt.models (via import_model_classes) before they
+# call import_processors, so mutations made here at module-level survive:
+# import_processors only appends to PROCESSOR_MAPPING, never resets it.
+#
+# We register Qwen3_5VLForSequenceClassification against QwenVLImageProcessor
+# here so that config.json architectures: ["Qwen3_5VLForSequenceClassification"]
+# resolves to the correct VL processor in every worker process.
+# ---------------------------------------------------------------------------
+try:
+    from sglang.srt.managers.multimodal_processor import PROCESSOR_MAPPING
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    PROCESSOR_MAPPING[Qwen3_5VLForSequenceClassification] = QwenVLImageProcessor
+except Exception as _e:
+    logger.warning(f"Could not register processor for Qwen3_5VLForSequenceClassification: {_e}")
