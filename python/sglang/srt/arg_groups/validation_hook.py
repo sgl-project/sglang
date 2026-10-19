@@ -10,8 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
     _hisparse_validation,
+    declare_resolution,
     resolved_view,
     resolving_view,
     run_post_process_pass,
