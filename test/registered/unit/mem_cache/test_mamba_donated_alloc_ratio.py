@@ -354,9 +354,6 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         fixture = dict(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
-            fused_entry_bytes=lambda name: (
-                fused_state_entry if name == "mamba" else None
-            ),
             server_args=SimpleNamespace(),
             is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
@@ -370,12 +367,17 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         )
         for name, value in fixture.items():
             setattr(configurator, name, value)
-        with rc.get_context().override_server_args(
-            disable_radix_cache=False,
-            max_mamba_cache_size=None,
-            max_running_requests=None,
-            mamba_full_memory_ratio=0.5,
-            enable_linear_replayssm_spec=False,
+        with (
+            rc.get_context().override_server_args(
+                disable_radix_cache=False,
+                max_mamba_cache_size=None,
+                max_running_requests=None,
+                mamba_full_memory_ratio=0.5,
+                enable_linear_replayssm_spec=False,
+            ),
+            patch.object(
+                KVCacheConfigurator, "fused_entry_bytes", return_value=fused_state_entry
+            ),
         ):
             configurator._handle_max_mamba_cache(cls.BUDGET_GB)
             return get_schedule().max_mamba_cache_size
@@ -431,7 +433,6 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
-            fused_entry_bytes=lambda name: None,
             is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
@@ -452,6 +453,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         with (
             rc.get_context().override_server_args(**args),
             patch.object(KVCacheConfigurator, "_calculate_mamba_ratio", return_value=2),
+            patch.object(KVCacheConfigurator, "fused_entry_bytes", return_value=None),
         ):
             remaining = configurator._handle_max_mamba_cache(120 / 1024)
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)

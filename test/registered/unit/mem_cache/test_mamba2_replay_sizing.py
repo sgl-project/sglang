@@ -89,6 +89,8 @@ class TestMamba2ReplaySizing(CustomTestCase):
         )
         configurator.spec_algorithm = SpeculativeAlgorithm.EAGLE
         configurator.is_draft_worker = False
+        configurator.is_hybrid_swa = False
+        configurator.spec_aux_config = None
         for fixed, no_radix, cap, dp in (
             (None, False, 256, 1),
             (238, False, 256, 1),
