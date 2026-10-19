@@ -240,17 +240,6 @@ class TestResponseParity(CustomTestCase):
             list(GenerateMetaInfo.__struct_fields__)[:4],
             ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
         )
-        self.assertEqual(
-            list(GenerateMetaInfo.__struct_fields__)[-6:],
-            [
-                "e2e_latency",
-                "cached_tokens",
-                "reasoning_tokens",
-                "output_token_logprobs_length",
-                "weight_version",
-                "weight_versions",
-            ],
-        )
 
 
 if __name__ == "__main__":

@@ -107,14 +107,7 @@ pub fn into_requests(
         extra_key,
         cache_salt,
         session_params,
-        session_id: _,
-        custom_logit_processor: _,
-        custom_labels: _,
-        images_config: _,
-        return_prompt_token_ids: _,
-        routed_experts_start_len: _,
-        return_sampling_mask: _,
-        modalities: _,
+        ..
     } = req;
     if session_params.is_some() {
         return Err(Error::Validation(
