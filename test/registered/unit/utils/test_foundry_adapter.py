@@ -83,8 +83,8 @@ def _fake_api(
     api.configure_subprocess = lambda server_args=None: scope(
         "configure_subprocess", server_args
     )
-    api.capture_scope = lambda phase, *, model, req_slots=None: scope(
-        "capture_scope", phase, model, req_slots
+    api.capture_scope = lambda phase, *, model, req_slots=None, kind=None: scope(
+        "capture_scope", phase, model, req_slots, kind
     )
     return api
 
@@ -202,7 +202,15 @@ class TestFoundryAdapter(CustomTestCase):
             by_name = {name: (args, kwargs) for name, args, kwargs in api.calls}
             self.assertEqual(by_name["after_runner_distributed_init"], ((False,), {}))
             self.assertEqual(by_name["after_alloc_memory_pool"], ((cfg, False), {}))
-            self.assertEqual(by_name["capture_scope"], (("prefill", model, 4), {}))
+            self.assertEqual(
+                by_name["capture_scope"], (("prefill", model, 4, None), {})
+            )
+            with adapter.capture_scope("decode", model=model, kind="draft_extend"):
+                pass
+            self.assertEqual(
+                api.calls[-1],
+                ("capture_scope", ("decode", model, None, "draft_extend"), {}),
+            )
             self.assertEqual(
                 adapter.capture_one("key", None, pool="pool", stream="stream"),
                 ("graph", "out"),
@@ -210,7 +218,7 @@ class TestFoundryAdapter(CustomTestCase):
             name, args, kwargs = api.calls[-1]
             self.assertEqual((name, args), ("capture_one", ("key", None)))
             self.assertEqual(kwargs, {"pool": "pool", "stream": "stream"})
-        called = [name for name, _, _ in api.calls]
+        called = sorted({name for name, _, _ in api.calls})
         methods = [
             name
             for name, value in vars(FoundryAdapter).items()
@@ -301,7 +309,8 @@ _CALL_ARGS = [
      "get_foundry_adapter().after_alloc_memory_pool("
      "memory_pool_config=self.memory_pool_config, is_draft_worker=self.is_draft_worker)"),
     (_DECODE, "DecodeCudaGraphRunner.capture",
-     "get_foundry_adapter().capture_scope('decode', model=self.model_runner.model)"),
+     "get_foundry_adapter().capture_scope('decode', model=self.model_runner.model, "
+     "kind=self._foundry_graph_kind())"),
     (_PREFILL, "PrefillCudaGraphRunner.capture",
      "get_foundry_adapter().capture_scope('prefill', model=self.model_runner.model, "
      "req_slots=self._capture_req_slots)"),

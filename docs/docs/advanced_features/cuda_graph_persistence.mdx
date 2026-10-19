@@ -58,4 +58,4 @@ Run engines with and without `--cuda-graph-persistence` in separate processes.
 
 - Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are rejected.
 - Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value stops the launch with the reason.
-- Speculative decoding, LoRA, PD multiplexing, elastic-EP graph recapture and post-capture KV sizing are not supported.
+- Speculative decoding is supported for EAGLE / EAGLE3 (target-verify, draft-decode and draft-extend graphs; not adaptive or multi-layer EAGLE); other speculative algorithms, LoRA, PD multiplexing, elastic-EP graph recapture and post-capture KV sizing are not supported.

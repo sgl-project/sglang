@@ -1118,9 +1118,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Foundry CUDA graph persistence: SAVE archives the graphs captured by
         # this loop, LOAD restores them in place of capturing (capture_one).
         with get_foundry_adapter().capture_scope(
-            "decode", model=self.model_runner.model
+            "decode", model=self.model_runner.model, kind=self._foundry_graph_kind()
         ):
             self._capture_graphs()
+
+    def _foundry_graph_kind(self) -> str:
+        # Names this runner's graph set in Foundry's archive (EAGLE subclasses
+        # included): target_decode, target_verify, draft_decode, draft_extend.
+        role = "draft" if self.model_runner.is_draft_worker else "target"
+        mode = self.capture_forward_mode
+        if mode.is_target_verify():
+            return f"{role}_verify"
+        if mode.is_draft_extend_v2():
+            return f"{role}_extend"
+        return f"{role}_{mode.name.lower()}"
 
     def _capture_graphs(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the

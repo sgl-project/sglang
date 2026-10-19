@@ -16,7 +16,12 @@ Call sites: the resolution steps in ``arg_groups/cuda_graph_hook.py``,
 decode / prefill runners' ``capture``, and
 ``FullCudaGraphBackend.capture_one``. Every call passes the values Foundry
 needs (the loaded model, the draft-worker flag, the resolved pool config, the
-prefill request slots); no runner or backend object crosses the boundary.
+prefill request slots, the decode-type runner's graph kind); no runner or
+backend object crosses the boundary. The decode runner's ``capture`` is also
+reached by its speculative-decoding subclasses (the EAGLE draft and
+draft-extend runners) and by the target-verify runner; each passes its
+``kind`` (``target_decode``, ``target_verify``, ``draft_decode``,
+``draft_extend``) so Foundry archives and restores the graph sets apart.
 Restored decode graphs carry no in-graph shared-read marker; the decode
 runner's own fallback for that case (POST_REPLAY) is the fence they need.
 
@@ -41,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Version of foundry.integration.sglang.api this adapter calls: same major,
 # at least this minor.
 FOUNDRY_INTEGRATION_API_MAJOR = 2
-FOUNDRY_INTEGRATION_API_MIN_MINOR = 0
+FOUNDRY_INTEGRATION_API_MIN_MINOR = 1
 # Distribution name (import name ``foundry``) and minimum version, checked
 # when the flag is set.
 FOUNDRY_PACKAGE = "foundry-core"
@@ -110,9 +115,17 @@ class FoundryAdapter:
         pass
 
     @contextmanager
-    def capture_scope(self, phase: str, *, model: Any, req_slots: Optional[int] = None):
-        """``phase`` is "decode" or "prefill" (with the runner's fixed request
-        slots); ``model`` is the loaded model."""
+    def capture_scope(
+        self,
+        phase: str,
+        *,
+        model: Any,
+        req_slots: Optional[int] = None,
+        kind: Optional[str] = None,
+    ):
+        """``phase`` is "decode" (with the runner's graph ``kind``) or
+        "prefill" (with the runner's fixed request slots); ``model`` is the
+        runner's loaded model."""
         yield
 
     def capture_one(
@@ -171,8 +184,10 @@ class _FoundryAdapterReal(FoundryAdapter):
     def after_alloc_memory_pool(self, memory_pool_config, is_draft_worker):
         self._api.after_alloc_memory_pool(memory_pool_config, is_draft_worker)
 
-    def capture_scope(self, phase, *, model, req_slots=None):
-        return self._api.capture_scope(phase, model=model, req_slots=req_slots)
+    def capture_scope(self, phase, *, model, req_slots=None, kind=None):
+        return self._api.capture_scope(
+            phase, model=model, req_slots=req_slots, kind=kind
+        )
 
     def capture_one(self, shape_key, forward_fn, *, pool, stream):
         return self._api.capture_one(shape_key, forward_fn, pool=pool, stream=stream)
