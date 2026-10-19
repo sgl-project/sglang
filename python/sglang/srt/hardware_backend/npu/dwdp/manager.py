@@ -150,9 +150,18 @@ class NPUDwdpManager(DwdpPrefetch):
         self._position = {li: pos for pos, li in enumerate(self._moe_layer_indices)}
         self._vmm = NPUWeightVMM(self.acl, self.device)
         self._init_prefetch(torch.npu, self.device)
+        local_handles = {}
         for li, layer in layers:
             for name in _WEIGHTS:
-                self._migrate_weight((li, name), getattr(layer, name), peer_pids)
+                local_handles[li, name] = self._migrate_weight(
+                    (li, name), getattr(layer, name), peer_pids
+                )
+        self._weights = self._vmm.create_weights(
+            self._specs,
+            self.dwdp_rank,
+            local_handles,
+            {li: self._buffer_index_for_layer(li) for li in self._moe_layer_indices},
+        )
         for li, layer in layers:
             self._replicate_small_params(layer)
             layer.bind_full_expert_weights(
@@ -191,11 +200,7 @@ class NPUDwdpManager(DwdpPrefetch):
         torch.npu.current_stream(self.device).synchronize()
         param.data = data
         spec = self._specs[key]
-        li, name = key
-        full, ptr, handle, _ = self._vmm.create_weight(
-            spec, self.dwdp_rank, (self._position[li] % 2, name, spec.dtype)
-        )
-        self._weights[key] = full
+        ptr, handle = self._vmm.create_local(spec, self.dwdp_rank)
         _check(
             self.acl.rt.memcpy(
                 ptr, spec.chunk_bytes, param.data_ptr(), spec.chunk_bytes, 3
@@ -213,6 +218,7 @@ class NPUDwdpManager(DwdpPrefetch):
         param.untyped_storage().resize_(0)
         # Return cached storage before the next driver-owned allocation.
         torch.npu.empty_cache()
+        return handle
 
     def _replicate_small_params(self, layer):
         count = layer.num_global_routed_experts // self.dwdp_size

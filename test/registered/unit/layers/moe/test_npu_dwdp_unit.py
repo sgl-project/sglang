@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.dwdp.vmm import (
     tensor_from_pointer,
 )
 from sglang.srt.layers.moe.dwdp.layout import WeightSpec
+from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -133,7 +134,7 @@ def test_remote_slices_cover_all_remote_weights(world, expert_bytes):
         )
         assert page.page_start == start // 1024 * 1024
         assert page.page_end == (end + 1023) // 1024 * 1024
-        assert page.total_size == (total + 1023) // 1024 * 1024
+        assert page.total_size >= total + page.pre_padding
         manager._specs, manager._weights = {}, {}
         manager._remote_slices, manager._peer_ranges = {}, {}
         for name in ("w13_weight", "w2_weight"):
@@ -272,7 +273,7 @@ def test_migration_releases_source_only_after_success(monkeypatch, fail):
     manager._position = {5: 0}
     manager._specs = {(5, "w13_weight"): WeightSpec(4, (2, 3), (4, 3), torch.float16)}
     manager._weights, manager._exports = {}, {}
-    manager._vmm = NS(create_weight=lambda *args: (torch.empty(4, 3), 100, 1, object()))
+    manager._vmm = NS(create_local=lambda *args: (100, 1))
     manager.acl = NS(
         rt=NS(
             memcpy=lambda *args: int(fail),
@@ -299,9 +300,279 @@ def test_migration_releases_source_only_after_success(monkeypatch, fail):
         with pytest.raises(RuntimeError, match="copy local shard"):
             manager._migrate_weight((5, "w13_weight"), source, [123])
     else:
-        manager._migrate_weight((5, "w13_weight"), source, [123])
+        assert manager._migrate_weight((5, "w13_weight"), source, [123]) == 1
     assert (source.untyped_storage().nbytes() > 0) == fail
     assert calls == ([] if fail else ["cache"])
+
+
+class _FakeACL:
+    """Enforce whole-handle mapping and resource ownership without a device."""
+
+    def __init__(self):
+        self.allocations, self.reservations, self.mappings = {}, {}, {}
+        self.freed, self.unmapped = [], []
+        self.next_handle, self.next_pointer = 1, 0x100000
+        self.fail_free_after = None
+        self.fail_once, self.fail_after_allocations, self.fail_after_maps = (
+            None,
+            None,
+            None,
+        )
+
+    def mem_get_allocation_granularity(self, *args):
+        return 4, 0
+
+    def malloc_physical(self, size, *args):
+        if len(self.allocations) == self.fail_after_allocations:
+            self.fail_after_allocations = None
+            return None, 1
+        handle = self.next_handle
+        self.next_handle += 1
+        self.allocations[handle] = size
+        return handle, 0
+
+    def reserve_mem_address(self, size, *args):
+        ptr = self.next_pointer
+        self.next_pointer += size + 0x1000
+        self.reservations[ptr] = size
+        return ptr, 0
+
+    def map_mem(self, ptr, size, offset, handle, flags):
+        if len(self.mappings) == self.fail_after_maps:
+            self.fail_after_maps = None
+            return 1
+        assert offset == 0 and size == self.allocations[handle]
+        assert any(
+            base <= ptr and ptr + size <= base + span
+            for base, span in self.reservations.items()
+        )
+        assert all(
+            ptr + size <= base or ptr >= base + span
+            for base, (span, _) in self.mappings.items()
+        )
+        self.mappings[ptr] = size, handle
+        return 0
+
+    def unmap_mem(self, ptr):
+        assert ptr not in self.unmapped
+        self.unmapped.append(ptr)
+        del self.mappings[ptr]
+        return 0
+
+    def release_mem_address(self, ptr):
+        if self.fail_once == "release_mem_address":
+            self.fail_once = None
+            return 1
+        size = self.reservations[ptr]
+        assert all(
+            base + span <= ptr or base >= ptr + size
+            for base, (span, _) in self.mappings.items()
+        )
+        del self.reservations[ptr]
+        return 0
+
+    def free_physical(self, handle):
+        if len(self.freed) == self.fail_free_after:
+            self.fail_free_after = None
+            return 1
+        assert handle not in self.freed
+        assert all(
+            mapped_handle != handle for _, mapped_handle in self.mappings.values()
+        )
+        self.freed.append(handle)
+        del self.allocations[handle]
+        return 0
+
+
+def test_shared_page_pool_reuses_maximum_not_each_size():
+    allocated, freed, mappings = [], [], []
+
+    def allocate(size):
+        allocated.append(size)
+        return len(allocated)
+
+    layouts = {
+        li: {"w": NS(pre_size=size, post_size=0)}
+        for li, size in zip((2, 7, 11), (6, 10, 6))
+    }
+    sizes = compute_slot_sizes(layouts, {li: 0 for li in layouts})
+    assert sizes == [10, 0]
+    pool = PagePool(
+        sizes,
+        0,
+        granularity=1,
+        page_size=2,
+        allocate_page=allocate,
+        release_page=freed.append,
+    )
+    reservation = NS(map_existing=lambda *args: mappings.append(args))
+    for size in (6, 10, 6):
+        mappings.clear()
+        pool.map_pages(0, reservation, 0, size)
+        assert mappings == [(2 * i, 2, i + 1) for i in range(size // 2)]
+    assert allocated == [2] * 5
+    assert pool.num_pages(0) == 5 and pool.slot_size(0) == 10
+    pool.release()
+    pool.release()
+    assert freed == list(range(1, 6))
+
+
+def test_shared_page_pool_preserves_cuda_driver_order(monkeypatch):
+    trace = []
+
+    def granularity(device):
+        trace.append(("granularity", device))
+        return 2
+
+    def prop(device, handle_types):
+        trace.append(("prop", device, handle_types))
+        return "prop"
+
+    class Reservation:
+        def __init__(self, size, prop, device, alignment):
+            trace.append(("reserve", size, prop, device, alignment))
+
+        def map(self, offset, size, retain_handle):
+            handle = 100 + sum(item[0] == "map" for item in trace)
+            trace.append(("map", offset, size, retain_handle, handle))
+            return handle
+
+        def close(self, release_handles):
+            trace.append(("close", release_handles))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.utils.cuda_vmm_utils",
+        NS(
+            get_device_granularity=granularity,
+            make_device_allocation_prop=prop,
+            VmmReservation=Reservation,
+            check_drv=lambda value, label: value,
+        ),
+    )
+    bindings = NS(
+        driver=NS(cuMemRelease=lambda handle: trace.append(("release", handle)))
+    )
+    monkeypatch.setitem(sys.modules, "cuda", NS(bindings=bindings))
+    monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
+    pool = PagePool([17, 1], 3)
+    reservation = NS(map_existing=lambda *args: trace.append(("existing", *args)))
+    pool.map_pages(0, reservation, 32, 17)
+    pool.release()
+    pool.release()
+    expected = [("granularity", 3), ("prop", 3, None)]
+    for handle in (100, 101, 102):
+        expected += [
+            ("reserve", 16, "prop", 3, 2),
+            ("map", 0, 16, True, handle),
+            ("close", False),
+        ]
+    assert trace == expected + [
+        ("existing", 32, 16, 100),
+        ("existing", 48, 16, 101),
+        ("release", 100),
+        ("release", 101),
+        ("release", 102),
+    ]
+
+
+def _fake_weight_vmm(monkeypatch):
+    import sglang.srt.hardware_backend.npu.dwdp.vmm as module
+
+    monkeypatch.setattr(
+        module,
+        "tensor_from_pointer",
+        lambda pointer, nbytes, **metadata: NS(
+            pointer=pointer, nbytes=nbytes, **metadata
+        ),
+    )
+    rt = _FakeACL()
+    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
+    assignments = {2: 0, 4: 1, 7: 0, 9: 1}
+    specs = {
+        (li, name): WeightSpec(4, (1, width), (4, width), torch.uint8)
+        for li, widths in zip(assignments, ((9, 13), (17, 19), (35, 29), (7, 11)))
+        for name, width in zip(("w13_weight", "w2_weight"), widths)
+    }
+    return vmm, rt, specs, assignments
+
+
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_npu_reuses_shared_pool_pages_across_weights_and_layers(monkeypatch, rank):
+    vmm, rt, specs, assignments = _fake_weight_vmm(monkeypatch)
+    local = {key: vmm.create_local(spec, rank) for key, spec in specs.items()}
+    assert len(rt.allocations) == len(specs)  # No pool before old weights are released.
+    views = vmm.create_weights(
+        specs, rank, {key: value[1] for key, value in local.items()}, assignments
+    )
+    pool = vmm._page_pool
+    assert type(pool) is PagePool
+    assert pool.page_size == 8 * vmm.granularity
+    required = [0, 0]
+    for li, slot in assignments.items():
+        cursor = 0
+        for key in (key for key in specs if key[0] == li):
+            layout, view = vmm.layout(specs[key], rank), views[key]
+            base = view.pointer - layout.pre_padding
+            assert rt.mappings[base + layout.pre_size] == (
+                layout.mnnvl_size,
+                local[key][1],
+            )
+            assert (
+                view.pointer + rank * specs[key].chunk_bytes
+                == base + layout.pre_size + layout.data_offset
+            )
+            assert local[key][0] - layout.data_offset in rt.mappings
+            for offset, size in (
+                (0, layout.pre_size),
+                (layout.pre_size + layout.mnnvl_size, layout.post_size),
+            ):
+                for page in range(size // pool.page_size):
+                    assert rt.mappings[base + offset + page * pool.page_size] == (
+                        pool.page_size,
+                        pool._page_handles[slot][cursor],
+                    )
+                    cursor += 1
+        required[slot] = max(required[slot], cursor)
+    assert [pool.num_pages(slot) for slot in (0, 1)] == required
+    if rank == 1:
+        assert vmm.layout(specs[2, "w13_weight"], rank).pre_padding > 0
+    handles = set(rt.allocations)
+    vmm.close()
+    vmm.close()
+    assert set(rt.freed) == handles
+    assert not rt.allocations and not rt.mappings and not rt.reservations
+
+
+@pytest.mark.parametrize(
+    "failure", ["allocate", "map", "release_mem_address", "free_physical"]
+)
+def test_npu_pool_partial_failure_cleanup_is_retryable(monkeypatch, failure):
+    vmm, rt, specs, assignments = _fake_weight_vmm(monkeypatch)
+    local = {key: vmm.create_local(spec, 1)[1] for key, spec in specs.items()}
+    if failure == "allocate":
+        rt.fail_after_allocations = len(rt.allocations) + 1
+    elif failure == "map":
+        rt.fail_after_maps = len(rt.mappings) + 1
+    if failure in ("allocate", "map"):
+        with pytest.raises(RuntimeError, match="ACL error"):
+            vmm.create_weights(specs, 1, local, assignments)
+    else:
+        vmm.create_weights(specs, 1, local, assignments)
+        if failure == "free_physical":
+            rt.fail_free_after = 1
+        else:
+            rt.fail_once = failure
+        with pytest.raises(RuntimeError, match="ACL error"):
+            vmm.close()
+        if failure == "free_physical":
+            assert len(rt.freed) == 1
+            assert rt.freed[0] not in vmm._handles
+    handles = set(rt.allocations) | set(rt.freed)
+    vmm.close()
+    vmm.close()
+    assert set(rt.freed) == handles
+    assert not rt.allocations and not rt.mappings and not rt.reservations
 
 
 @pytest.mark.parametrize(

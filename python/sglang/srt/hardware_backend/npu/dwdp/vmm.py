@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.moe.dwdp.layout import PageAlignedLayout
+from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
 from sglang.srt.utils.alignment import align_down, align_up
 
 
@@ -51,7 +53,7 @@ class NPUWeightVMM:
         )
         self.granularity, ret = self.rt.mem_get_allocation_granularity(self.prop, 0)
         _check(ret, "mem_get_allocation_granularity")
-        self.slots = {}
+        self._page_pool = None
         self._handles = []
         self._reservations = []
         self._mappings = []
@@ -73,47 +75,73 @@ class NPUWeightVMM:
         _check(self.rt.map_mem(ptr, size, 0, handle, 0), "map_mem")
         self._mappings.append(ptr)
 
+    def _release_page(self, handle):
+        _check(self.rt.free_physical(handle), "free pool page")
+        self._handles.remove(handle)
+
     def layout(self, spec, rank):
         start, end = rank * spec.local_experts, (rank + 1) * spec.local_experts
         size = align_up(end * spec.expert_bytes, self.granularity) - align_down(
             start * spec.expert_bytes, self.granularity
         )
         return PageAlignedLayout.compute(
-            spec.expert_bytes, spec.num_experts, start, end, self.granularity, size
+            spec.expert_bytes,
+            spec.num_experts,
+            start,
+            end,
+            self.granularity,
+            size,
+            pool_granularity=PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self.granularity,
         )
 
-    def create_weight(self, spec, rank, slot_key):
-        """Return a full view, local source pointer, handle and page boundaries.
-
-        Pages intersecting the local shard are private to this layer. Pages
-        completely outside it reuse a slot. Runtime prefetch refreshes all
-        remote experts, including the bytes on private boundary pages.
-        """
-        shape, dtype = spec.full_shape, spec.dtype
-        nbytes = spec.num_experts * spec.expert_bytes
+    def create_local(self, spec, rank):
         layout = self.layout(spec, rank)
-        local_size = layout.mnnvl_size
-        handle = self._allocate(local_size)
-        source = self._reserve(local_size)
-        self._map(source, local_size, handle)
-        full = self._reserve(layout.total_size)
-        self._map(full + layout.pre_size, local_size, handle)
-        for side, offset, size in (
-            ("pre", 0, layout.pre_size),
-            ("post", layout.pre_size + local_size, layout.post_size),
-        ):
-            if not size:
-                continue
-            # ACL requires mapping the entire allocation at offset zero. Pool
-            # by exact size so heterogeneous layers never map a partial handle.
-            key = (*slot_key, side, size)
-            if key not in self.slots:
-                self.slots[key] = self._allocate(size)
-            self._map(full + offset, size, self.slots[key])
-        tensor = tensor_from_pointer(
-            full, nbytes, shape=shape, dtype=dtype, device=self.device
+        handle = self._allocate(layout.mnnvl_size)
+        source = self._reserve(layout.mnnvl_size)
+        self._map(source, layout.mnnvl_size, handle)
+        return source + layout.data_offset, handle
+
+    def create_weights(self, specs, rank, handles, assignments):
+        """Map local shards and shared fixed-size pages after source migration."""
+        layouts = {}
+        for (li, name), spec in specs.items():
+            layouts.setdefault(li, {})[name] = self.layout(spec, rank)
+        self._page_pool = PagePool(
+            compute_slot_sizes(layouts, assignments),
+            self.device.index,
+            granularity=self.granularity,
+            allocate_page=self._allocate,
+            release_page=self._release_page,
         )
-        return tensor, source + layout.data_offset, handle, layout
+        tensors = {}
+        for li, weight_layouts in layouts.items():
+            page_offset = 0
+            for name, layout in weight_layouts.items():
+                spec = specs[li, name]
+                full = self._reserve(layout.total_size)
+                self._map(full + layout.pre_size, layout.mnnvl_size, handles[li, name])
+                reservation = SimpleNamespace(
+                    map_existing=lambda offset, size, handle, base=full: self._map(
+                        base + offset, size, handle
+                    )
+                )
+                for offset, size in (
+                    (0, layout.pre_size),
+                    (layout.pre_size + layout.mnnvl_size, layout.post_size),
+                ):
+                    if size:
+                        self._page_pool.map_pages(
+                            assignments[li], reservation, offset, size, page_offset
+                        )
+                        page_offset += size // self._page_pool.page_size
+                tensors[li, name] = tensor_from_pointer(
+                    full + layout.pre_padding,
+                    spec.num_experts * spec.expert_bytes,
+                    shape=spec.full_shape,
+                    dtype=spec.dtype,
+                    device=self.device,
+                )
+        return tensors
 
     def import_shard(self, share, size, offset):
         handle, ret = self.rt.mem_import_from_shareable_handle(share, self.device.index)
@@ -149,9 +177,11 @@ class NPUWeightVMM:
                 self.rt.release_mem_address(self._reservations[-1]), "release address"
             )
             self._reservations.pop()
+        if self._page_pool is not None:
+            self._page_pool.release()
+            self._page_pool = None
         while self._handles:
             _check(
                 self.rt.free_physical(self._handles[-1]), "free physical weight memory"
             )
             self._handles.pop()
-        self.slots.clear()

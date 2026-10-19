@@ -10,6 +10,7 @@ import os
 import socket
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -66,6 +67,7 @@ def _int8_layer(layer_id, hidden, width, rank, large):
 def _worker(rank, devices, port, dtype, large):
     import torch_npu  # noqa: F401
 
+    from sglang.srt.hardware_backend.npu.dwdp.vmm import NPUWeightVMM
     from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
     from sglang.srt.layers.moe.dwdp import DwdpManager
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -131,7 +133,7 @@ def _worker(rank, devices, port, dtype, large):
         int8 = dtype == torch.int8
         input_dtype = torch.bfloat16 if int8 else dtype
         hidden = (512 if int8 else 256) if large else 64
-        for pos, layer_id in enumerate((2, 5, 8, 11)):
+        for pos, layer_id in enumerate((2, 4, 7, 9)):
             width = (2048 + 256 * (pos // 2)) if large else 64 * (1 + pos % 2)
             if int8:
                 with torch.device(f"npu:{devices[rank]}"):
@@ -174,13 +176,35 @@ def _worker(rank, devices, port, dtype, large):
 
         def checked_migrate(key, param, peers):
             assert all(source.untyped_storage().nbytes() == 0 for source in migrated)
-            original_migrate(key, param, peers)
+            handle = original_migrate(key, param, peers)
             assert param.untyped_storage().nbytes() == 0
             migrated.append(param)
+            return handle
 
         manager._migrate_weight = checked_migrate
-        manager.setup(model)
+        mappings, original_map = {}, NPUWeightVMM._map
+
+        def record_map(vmm, ptr, size, handle):
+            original_map(vmm, ptr, size, handle)
+            mappings[ptr] = (size, handle)
+
+        with patch.object(NPUWeightVMM, "_map", record_map):
+            manager.setup(model)
         assert len(migrated) == len(model) * 2
+        if large:
+            pool = manager._vmm._page_pool
+            assert all(pool.num_pages(slot) >= 2 for slot in (0, 1))
+            for li in (2, 7):
+                assert manager._buffer_index_for_layer(li) == 0
+                layout = manager._vmm.layout(manager._specs[li, "w13_weight"], rank)
+                base = (
+                    manager._weights[li, "w13_weight"].data_ptr() - layout.pre_padding
+                )
+                offset = 0 if layout.pre_size else layout.mnnvl_size
+                assert mappings[base + offset] == (
+                    pool.page_size,
+                    pool._page_handles[0][0],
+                )
         set_global_dwdp_manager(manager)
         # Every size uses the same remote-expert copy path, including remote
         # bytes inside local boundary pages. Large weights also reuse remote

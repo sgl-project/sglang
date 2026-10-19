@@ -4,17 +4,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
-from cuda.bindings import driver as cuda
+from sglang.srt.utils.alignment import align_up
 
-from sglang.srt.utils.cuda_vmm_utils import (
-    VmmReservation,
-    align_up,
-    check_drv,
-    get_device_granularity,
-    make_device_allocation_prop,
-)
+if TYPE_CHECKING:
+    from sglang.srt.utils.cuda_vmm_utils import VmmReservation
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +26,27 @@ class PagePool:
         device_id: int,
         granularity: Optional[int] = None,
         page_size: Optional[int] = None,
+        *,
+        allocate_page: Optional[Callable[[int], int]] = None,
+        release_page: Optional[Callable[[int], None]] = None,
     ):
         self._device_id = device_id
-        self._granularity = granularity or get_device_granularity(device_id)
-        self._prop = make_device_allocation_prop(device_id, handle_types=None)
+        if allocate_page is None:
+            from sglang.srt.utils.cuda_vmm_utils import (
+                get_device_granularity,
+                make_device_allocation_prop,
+            )
+
+            self._granularity = granularity or get_device_granularity(device_id)
+            self._prop = make_device_allocation_prop(device_id, handle_types=None)
+            allocate_page = self._allocate_cuda_page
+        else:
+            if not granularity or release_page is None:
+                raise ValueError(
+                    "Custom page allocation requires granularity and release"
+                )
+            self._granularity = granularity
+        self._release_page = release_page or self._release_cuda_page
 
         if page_size is None:
             self._page_size = self.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
@@ -52,19 +64,29 @@ class PagePool:
         for slot_idx, num_pages in enumerate(self._slot_pages):
             handles = []
             for _ in range(num_pages):
-                reservation = VmmReservation(
-                    self._page_size,
-                    self._prop,
-                    device_id,
-                    alignment=self._granularity,
-                )
-                handle = reservation.map(0, self._page_size, retain_handle=True)
-                reservation.close(release_handles=False)
-                handles.append(int(handle))
+                handles.append(int(allocate_page(self._page_size)))
             self._page_handles.append(handles)
             logger.debug(
                 f"PagePool slot {slot_idx}: {num_pages} pages × {self._page_size} B"
             )
+
+    def _allocate_cuda_page(self, size: int) -> int:
+        from sglang.srt.utils.cuda_vmm_utils import VmmReservation
+
+        reservation = VmmReservation(
+            size, self._prop, self._device_id, alignment=self._granularity
+        )
+        handle = reservation.map(0, size, retain_handle=True)
+        reservation.close(release_handles=False)
+        return int(handle)
+
+    @staticmethod
+    def _release_cuda_page(handle: int) -> None:
+        from cuda.bindings import driver as cuda
+
+        from sglang.srt.utils.cuda_vmm_utils import check_drv
+
+        check_drv(cuda.cuMemRelease(handle), "cuMemRelease")
 
     @classmethod
     def create(
@@ -110,7 +132,7 @@ class PagePool:
         self._released = True
         for handles in self._page_handles:
             for h in handles:
-                check_drv(cuda.cuMemRelease(h), "cuMemRelease")
+                self._release_page(h)
         self._page_handles = [[], []]
 
 
