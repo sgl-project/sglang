@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""UltraQuant 4-bit KV cache format: FP4 E2M1 codes + UE8M0 group scales.
+"""UltraQuant KV cache format: MXFP4 (FP4 E2M1 codes + UE8M0 group scales).
 
 For each group of ``GROUP_SIZE`` elements along the head dimension::
 
@@ -20,6 +20,8 @@ For each group of ``GROUP_SIZE`` elements along the head dimension::
 
 Dequantization is ``code * s``; ``CONSTANT_C`` is folded into the stored
 exponent and never appears on the read side.
+The stored bytes are standard MXFP4; UltraQuant's own choices are this scale
+rule and the key rotation below.
 
 Keys are Hadamard-rotated before quantization, values are not. The rotation is
 orthonormal, so rotating queries and keys alike leaves attention scores

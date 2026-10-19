@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Attention backend for the UltraQuant 4-bit KV cache.
+"""Attention backend for the UltraQuant MXFP4 KV cache.
 
 Everything about metadata, CUDA/HIP graph capture, and scheduling is inherited
 from the Triton backend. Only the two kernel calls change: K and V are read as

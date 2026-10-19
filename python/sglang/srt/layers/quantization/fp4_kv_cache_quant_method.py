@@ -938,7 +938,8 @@ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
 
 
 class UltraQuantKVCacheMethod(KVCacheQuantMethodBase):
-    """UltraQuant: FP4 E2M1 codes with one UE8M0 scale per group of 32.
+    """UltraQuant: an MXFP4 KV cache, FP4 E2M1 codes with one UE8M0 scale per
+    group of 32.
 
     Keys are Hadamard-rotated before quantization to spread channel outliers,
     so queries must be rotated to match, which the UltraQuant attention backend

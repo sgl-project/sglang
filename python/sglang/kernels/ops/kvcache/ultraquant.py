@@ -11,16 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Triton store and gather-dequant kernels for the UltraQuant 4-bit KV cache.
+"""Triton store and gather-dequant kernels for the UltraQuant MXFP4 KV cache.
 
 One program handles one (token, head) pair: it rotates the key in registers,
 quantizes key and value to FP4 E2M1 with UE8M0 group scales, and writes packed
 codes and scale bytes into the four structure-of-arrays pool buffers.
 
 ``ultraquant_gather_dequant`` materializes cached slots back into contiguous
-fp16/bf16 for dense prefill. The device helpers are shared with the UltraQuant
-attention kernels. See ``sglang.srt.layers.quantization.quark.ultraquant_tensor`` for
-the format and the PyTorch reference.
+fp16/bf16, or exactly into E4M3, for dense prefill. The device helpers are
+shared with the UltraQuant attention kernels. See
+``sglang.srt.layers.quantization.quark.ultraquant_tensor`` for the format and
+the PyTorch reference.
 """
 
 from typing import Optional

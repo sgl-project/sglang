@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Extend attention over an UltraQuant 4-bit KV cache.
+"""Extend attention over an UltraQuant MXFP4 KV cache.
 
 Modeled on ``extend_attention._fwd_kernel_unified``: prefix and current-chunk
 keys are both read through the unified ``kv_indices``, so prefill attends to

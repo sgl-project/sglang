@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Decode attention over an UltraQuant 4-bit KV cache.
+"""Decode attention over an UltraQuant MXFP4 KV cache.
 
 This is a stage-1 kernel in the same split-KV shape as
 ``decode_attention._fwd_grouped_kernel_stage1``, so the stock stage-2 softmax
