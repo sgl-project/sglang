@@ -89,7 +89,8 @@ def _prefill_cache_hit_rate(
     """Prefix-cache hit rate for one prefill report.
 
     Returns None when the report carried no prefill tokens: there is nothing to
-    measure, and publishing 0.0 would read as a total cache miss.
+    measure, so the caller must keep the last valid rate rather than publish a
+    fabricated 0.0 that reads as a total cache miss.
     """
     if total_tokens <= 0:
         return None
@@ -706,6 +707,22 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def _record_prefill_cache_hit_rate(
+        self, effective_hit_tokens: int, total_tokens: int
+    ) -> None:
+        """Publish this report's hit rate, or keep the last valid one.
+
+        A report that carried no prefill tokens has nothing to measure. Publishing
+        0.0 for it would read as a total cache miss and drag avg_over_time()/
+        Grafana down, so the previously published rate is left in place -
+        mirroring the decode-path guard in report_decode_stats.
+        """
+        cache_hit_rate = _prefill_cache_hit_rate(
+            effective_hit_tokens, total_tokens
+        )
+        if cache_hit_rate is not None:
+            self.stats.cache_hit_rate = cache_hit_rate
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -826,16 +843,9 @@ class SchedulerMetricsReporter:
                 total_tokens,
                 now,
             )
-            # A report with no prefill tokens carries no cache information, so it
-            # must not publish a 0.0: overwriting the gauge there makes
-            # avg_over_time()/Grafana read a healthy ~96% cache as broken. Leave
-            # the last known rate in place instead (mirrors the decode-path guard
-            # in report_decode_stats).
-            cache_hit_rate = _prefill_cache_hit_rate(
+            self._record_prefill_cache_hit_rate(
                 effective_hit_tokens, total_tokens
             )
-            if cache_hit_rate is not None:
-                self.stats.cache_hit_rate = cache_hit_rate
             self.metrics_collector.increment_effective_prefill_tokens(
                 input_tokens=effective_input_tokens,
                 device_hit_tokens=prefill_stats.log_device_hit_tokens,
