@@ -7,7 +7,11 @@ from typing import Any
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    merge_source_transfers,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
@@ -242,15 +246,7 @@ class HostPoolGroup:
                     transfer.device_indices = primary_device_indices
                 continue
 
-            source = next(
-                (
-                    candidate
-                    for candidate in transfers
-                    if candidate.indices_from_pool is None
-                    and candidate.name == transfer.indices_from_pool
-                ),
-                None,
-            )
+            source = merge_source_transfers(transfers, transfer.indices_from_pool)
             if source is None:
                 rollback()
                 return None
