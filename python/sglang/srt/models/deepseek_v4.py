@@ -172,6 +172,11 @@ from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
     forward_layer_fused_boundary,
 )
+from sglang.srt.models.deepseek_v4_replay_tail import (
+    DecoderReplayTail,
+    bcg_tail_kv_store,
+    in_replay_tail_graph,
+)
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -2305,6 +2310,10 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
+            elif in_replay_tail_graph():
+                assert not fuse_q_rope
+                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                kv = None
             else:
                 self._compute_kv_to_cache(
                     x_linear,
@@ -2324,7 +2333,10 @@ class MQALayer(MqaAttentionBase):
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                and (
+                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                    or in_replay_tail_graph()
+                )
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -3532,6 +3544,8 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
+    # Class-level default for instances built without running __init__.
+    decoder_replay_tail: Optional[DecoderReplayTail] = None
 
     def __init__(
         self,
@@ -3698,6 +3712,7 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
+        self.decoder_replay_tail = DecoderReplayTail.maybe_create(self)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3831,6 +3846,13 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
+        use_tail_graph = (
+            self.decoder_replay_tail is not None
+            and tail is not None
+            and self.decoder_replay_tail.plan(
+                tail, num_tokens=input_ids.shape[0], tail_in_graph=tail_in_graph
+            )
+        )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -3890,6 +3912,19 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+                if use_tail_graph:
+                    residual, pre, aux = self.decoder_replay_tail.run(
+                        state=state,
+                        positions=positions,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        forward_batch=forward_batch,
+                        capture_dspark=capture_dspark,
+                    )
+                    dspark_aux_hidden_states.extend(aux)
+                    residual_batch.clear(forward_batch)
+                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+                    return residual, pre, tail
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():

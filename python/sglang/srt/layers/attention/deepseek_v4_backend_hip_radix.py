@@ -66,8 +66,8 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _as_int_list,
-    _prefill_graph_max_seq_len,
     _tail_rows,
+    late_layer_num_tokens,
     late_layer_whole_extend,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -106,6 +106,8 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.monokernels.runtime import is_metadata_unread
+from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -887,6 +889,13 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
+    prefill_cuda_graph_default_max_seq_len = (
+        DeepseekV4AttnBackend.prefill_cuda_graph_default_max_seq_len
+    )
+    _prefill_graph_replays_any_context = (
+        DeepseekV4AttnBackend._prefill_graph_replays_any_context
+    )
+    _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
     _low_ratio_compress_decode = DeepseekV4AttnBackend._low_ratio_compress_decode
@@ -906,6 +915,7 @@ class DeepseekV4HipRadixBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -1767,6 +1777,11 @@ class DeepseekV4HipRadixBackend(
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
                         )
+                        and not is_metadata_unread(
+                            self.model_runner.model,
+                            forward_batch,
+                            StepMetadata.LOW_RATIO_DECODE_SCHEDULE,
+                        )
                     },
                     max_context_len=self.max_context_len,
                     num_requests=forward_batch.batch_size,
@@ -2176,6 +2191,11 @@ class DeepseekV4HipRadixBackend(
             else None
         )
 
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
+            return None
+        return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
+
     def _init_forward_metadata_prefill_from_batch(
         self,
         forward_batch: ForwardBatch,
@@ -2378,14 +2398,13 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
         )
 
-    @staticmethod
-    def _graph_metadata_max_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
+    def _graph_metadata_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """
         Capture and replay build the metadata at this fixed context length, so a
         replay's metadata is never larger than the captured one. Longer contexts run
         eager.
         """
-        return forward_batch.max_seq_len_override or _prefill_graph_max_seq_len()
+        return forward_batch.max_seq_len_override or self._prefill_graph_seq_limit()
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
