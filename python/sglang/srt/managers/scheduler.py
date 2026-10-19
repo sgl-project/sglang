@@ -4377,15 +4377,15 @@ class Scheduler(
         allocator = self.req_to_token_pool.mamba_allocator
         stats = allocator.debug_stats()
         running_hold = sum(
-            1 for r in running_batch.reqs if r.mamba_pool_idx is not None
+            1 for r in running_batch.reqs if r.kv.mamba_pool_idx is not None
         )
         can_run_hold = sum(
-            1 for r in adder.can_run_list if r.mamba_pool_idx is not None
+            1 for r in adder.can_run_list if r.kv.mamba_pool_idx is not None
         )
         chunked_hold = (
             1
             if self.chunked_req is not None
-            and self.chunked_req.mamba_pool_idx is not None
+            and self.chunked_req.kv.mamba_pool_idx is not None
             else 0
         )
         evictable = self.tree_cache.mamba_evictable_size()
