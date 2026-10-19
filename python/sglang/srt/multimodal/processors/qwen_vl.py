@@ -14,6 +14,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from transformers import BaseImageProcessor
 
+from sglang.srt.configs.volundr import VolundrConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import (
@@ -37,6 +38,7 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneratio
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+from sglang.srt.models.volundr import VolundrForConditionalGeneration
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
@@ -346,10 +348,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         Qwen3OmniMoeForConditionalGeneration,
         Cosmos3ForConditionalGeneration,
         Qwen4ExpForConditionalGeneration,
+        VolundrForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        if self.model_type == VolundrConfig.model_type:
+            # Volundr serves the Qwen3.5 vision tower and its MRoPE layout unchanged.
+            self.model_type = hf_config.vision_config.model_type
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",

@@ -479,6 +479,45 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class AgensDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Agens models (e.g., Blockway/Agens-Volundr-32B).
+    Assumes reasoning format:
+      (<|think|>)*(.*)<|/think|>
+
+    The generation prompt opens <|think|> (or emits <|think|><|/think|> when
+    enable_thinking is false), so the output starts inside the think block. A
+    <|call|> before <|/think|> closes the reasoning implicitly.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<|think|>",
+            "<|/think|>",
+            think_excluded_tokens=[
+                "<|call|>",
+                "<|/call|>",
+                "<|agens_end|>",
+                "<|endoftext|>",
+            ],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<|call|>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -2265,6 +2304,7 @@ class ReasoningParser:
     """
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
+        "agens": AgensDetector,
         "apertus2509": Apertus2509Detector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,

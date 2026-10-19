@@ -53,6 +53,10 @@ def hybrid_lightning_config(model_config: ModelConfig):
 
 
 def hybrid_gdn_config(model_config: ModelConfig):
+    # An explicit linear-attention registration names its own backend and wins over the
+    # isinstance chain below (e.g. a config subclassing Qwen3_5TextConfig whose linear layers are KDA).
+    if _get_linear_attn_registry_result(model_config):
+        return None
     config = model_config.hf_config.get_text_config()
     if isinstance(
         config,

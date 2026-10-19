@@ -92,6 +92,7 @@ from sglang.srt.configs.step3_vl import (
 from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
+from sglang.srt.configs.volundr import VolundrConfig, VolundrTextConfig
 from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
@@ -177,5 +178,7 @@ __all__ = [
     "InklingModelConfig",
     "InklingVisionConfig",
     "UnlimitedVLConfig",
+    "VolundrConfig",
+    "VolundrTextConfig",
     "ZayaConfig",
 ]

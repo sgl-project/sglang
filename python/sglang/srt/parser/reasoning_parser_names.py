@@ -4,6 +4,7 @@
 """
 
 REASONING_PARSER_NAMES = [
+    "agens",
     "apertus2509",
     "deepseek-r1",
     "deepseek-v3",

@@ -167,6 +167,14 @@ class InklingThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     NEW_LINE_TOKEN_ID: int = 198
 
 
+class AgensThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """A logit processor that controls the length of thinking for Agens models."""
+
+    THINKING_START_TOKEN_ID: int = 248068
+    THINKING_END_TOKEN_ID: int = 248069
+    NEW_LINE_TOKEN_ID: int = 198
+
+
 # Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py
 class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
     """Block n-gram repetitions within a sliding window for DeepSeek-OCR outputs."""
