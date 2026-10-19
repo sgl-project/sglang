@@ -57,6 +57,7 @@ from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspection_
 from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspector import (
     UnifiedTreeCoreInspector,
 )
+from sglang.test.test_utils import CustomTestCase
 
 # The Rust re-run entry point overrides this without changing the process-wide
 # production backend selection. Every cache built by build_fixture follows it;
@@ -502,6 +503,36 @@ def _supports_hicache(cfg):
 _requires_hicache = _requires(
     _supports_hicache, "HiCache unit fixture does not support SWA + Mamba stacks"
 )
+_requires_swa = _requires(lambda cfg: cfg.has_swa, "requires SWA")
+_requires_mamba = _requires(lambda cfg: cfg.has_mamba, "requires Mamba")
+_requires_swa_only = _requires(
+    lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
+)
+_requires_swa_and_mamba = _requires(
+    lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba"
+)
+_requires_paged = _requires(lambda cfg: cfg.page_size != 1, "requires page_size > 1")
+_requires_ps1_window4 = _requires(
+    lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
+    "requires page_size=1, sliding_window_size=4",
+)
+_requires_full_swa_ps1 = _requires(
+    lambda cfg: cfg.has_swa and not cfg.has_mamba and cfg.page_size == 1,
+    "requires page_size=1 Full+SWA",
+)
+_requires_full_swa_ps1_window4 = _requires(
+    lambda cfg: (
+        cfg.has_swa
+        and not cfg.has_mamba
+        and cfg.page_size == 1
+        and cfg.sliding_window_size == 4
+    ),
+    "requires page_size=1 Full+SWA with window_size=4",
+)
+_requires_full_mamba_ps1 = _requires(
+    lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+    "requires page_size=1 Full+Mamba",
+)
 
 
 def _config_attrs(suite, cfg):
@@ -512,6 +543,15 @@ def _config_attrs(suite, cfg):
         if not all(predicate(cfg) for predicate, _ in requirements):
             attrs[name] = None
     return attrs
+
+
+def _define_config_test_classes(suite, namespace):
+    """Define ``Test_<label>`` in ``namespace`` for each config, binding ``suite``."""
+    for cfg in _CONFIGS:
+        name = f"Test_{cfg.label}"
+        test_class = type(name, (suite, CustomTestCase), _config_attrs(suite, cfg))
+        test_class.__module__ = namespace["__name__"]
+        namespace[name] = test_class
 
 
 class UnifiedRadixCacheFixtures:
@@ -594,7 +634,7 @@ class UnifiedRadixCacheFixtures:
         return chain
 
     def _skip_unsupported_hicache_test(self):
-        if self.cfg.has_swa and self.cfg.has_mamba:
+        if not _supports_hicache(self.cfg):
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
 

@@ -52,10 +52,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
-    _CONFIGS,
     CacheConfig,
     UnifiedRadixCacheFixtures,
-    _config_attrs,
+    _define_config_test_classes,
     _device_lock_ref,
     _device_value,
     _match_prefix,
@@ -63,6 +62,13 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _node_key_length,
     _node_parent,
     _requires,
+    _requires_full_swa_ps1_window4,
+    _requires_mamba,
+    _requires_paged,
+    _requires_ps1_window4,
+    _requires_swa,
+    _requires_swa_and_mamba,
+    _requires_swa_only,
     build_fixture,
 )
 from sglang.test.mem_cache_utils import finish_req
@@ -831,13 +837,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
-    )
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_swa_only
+    @_requires_ps1_window4
     def test_swa_unfinished_req_repoints_whole_insert_below_window(self):
         # A request whose live SWA tail inside the inserted range is shorter
         # than the window must still end up protected for the whole insert:
@@ -895,13 +896,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
             swa_avail,
         )
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
-    )
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_swa_only
+    @_requires_ps1_window4
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -954,7 +950,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         cache.pretty_print()
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.page_size != 1, "page_size > 1 only")
+    @_requires_paged
     def test_paged_match_truncates_unaligned_key(self):
         """match_prefix internally aligns keys to page boundary."""
         ps = self.cfg.page_size
@@ -973,7 +969,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
 
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.page_size != 1, "page_size > 1 only")
+    @_requires_paged
     def test_paged_page_boundary_mismatch(self):
         ps = self.cfg.page_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -995,7 +991,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(m.device_prefix_len, 0)
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.page_size != 1, "page_size > 1 only")
+    @_requires_paged
     @_requires(
         lambda cfg: not cfg.has_swa, "SWA paged allocator accounts in pages, not tokens"
     )
@@ -1030,7 +1026,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(m.device_prefix_len, len(aligned))
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_mamba, "requires Mamba component")
+    @_requires_mamba
     def test_mamba_evict_breaks_match(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq_short = self._make_seq(1, 2)
@@ -1045,7 +1041,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(m.device_prefix_len, 0)
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_mamba, "requires Mamba component")
+    @_requires_mamba
     def test_mamba_evict_cascades_on_full_leaf(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
@@ -1056,7 +1052,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self.assertGreaterEqual(result.mamba_num_evicted, 1)
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_mamba, "requires Mamba component")
+    @_requires_mamba
     def test_mamba_cow_on_match(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         mamba_pool = req_to_token_pool.mamba_pool
@@ -1080,13 +1076,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         )
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
-    )
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_swa_only
+    @_requires_ps1_window4
     def test_swa_unfinished_recovery_preserves_locked_full_value(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1150,9 +1141,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         cache.dec_lock_ref(last_device_node, lock_result.to_dec_params())
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
-    )
+    @_requires_swa_only
     def test_swa_insert_keeps_full_leaf_when_entire_span_is_outside_window(self):
         # A leaf survives on its Full value alone: even when the whole span is
         # past the SWA window (swa_evicted_seqlen >= total), the Full leaf must
@@ -1186,9 +1175,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba components"
-    )
+    @_requires_swa_and_mamba
     def test_leaf_transition_swa_evict_spares_locked_full(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1266,9 +1253,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba components"
-    )
+    @_requires_swa_and_mamba
     def test_mamba_opt_out_holder_cannot_release_another_holders_mamba_lock(self):
         """Holder A takes the mamba lock; holder B opts out (skip_lock_components=(ComponentType.MAMBA,))
         on the same node. B's early SWA release and final release must leave
@@ -1314,9 +1299,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         cache.dec_lock_ref(node, lock_a.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba components"
-    )
+    @_requires_swa_and_mamba
     def test_swa_early_release_drops_co_located_mamba_lock(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1360,9 +1343,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
             "Full stays locked",
         )
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba components"
-    )
+    @_requires_swa_and_mamba
     def test_cascade_evict_asserts_on_locked_internal_mamba(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1403,9 +1384,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         # Clean up the forced lock so teardown/sanity is consistent.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 0)
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba components"
-    )
+    @_requires_swa_and_mamba
     def test_cascade_evict_asserts_on_locked_leaf_mamba(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1443,7 +1422,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         # Clean up the forced lock so teardown/sanity is consistent.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 0)
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA component")
+    @_requires_swa
     def test_swa_leaf_capped_to_window_on_insert(self):
         """A long SWA leaf is split so locking it protects one window of SWA
         while full attention still protects the whole sequence."""
@@ -1629,10 +1608,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "requires SWA without Mamba (mamba alters effective_cache_len)",
     )
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_ps1_window4
     def test_swa_eager_eviction_on_unfinished_req(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -1714,13 +1690,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
 
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
-    )
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_swa_only
+    @_requires_ps1_window4
     def test_swa_eager_eviction_noop_when_within_window(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -2023,7 +1994,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(m.device_prefix_len, len(seq_b))
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA component")
+    @_requires_swa
     def test_swa_evict_internal_tombstone(self):
         """SWA eviction on internal node cascades to lower-priority components."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -2097,15 +2068,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         lock = cache.inc_lock_ref(zeroed.best_match_node)
         cache.dec_lock_ref(zeroed.best_match_node, lock.to_dec_params())
 
-    @_requires(
-        lambda cfg: (
-            cfg.has_swa
-            and not cfg.has_mamba
-            and cfg.page_size == 1
-            and cfg.sliding_window_size == 4
-        ),
-        "requires page_size=1 Full+SWA with window_size=4",
-    )
+    @_requires_full_swa_ps1_window4
     def test_swa_branch_insert_releases_forward_overshoot(self):
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -2168,15 +2131,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         )
 
 
-for _cfg in _CONFIGS:
-    _name = f"Test_{_cfg.label}"
-    globals()[_name] = type(
-        _name,
-        (UnifiedRadixCacheCoreSuite, CustomTestCase),
-        _config_attrs(UnifiedRadixCacheCoreSuite, _cfg),
-    )
-    globals()[_name].__module__ = __name__
-del _cfg, _name
+_define_config_test_classes(UnifiedRadixCacheCoreSuite, globals())
 
 
 class UnifiedLRUListBoundedRefreshTest(CustomTestCase):

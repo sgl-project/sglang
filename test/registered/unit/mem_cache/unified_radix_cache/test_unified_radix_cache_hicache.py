@@ -26,10 +26,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
-    _CONFIGS,
     CacheConfig,
     UnifiedRadixCacheFixtures,
-    _config_attrs,
+    _define_config_test_classes,
     _device_lock_ref,
     _device_value,
     _host_lock_ref,
@@ -40,11 +39,17 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _node_parent,
     _node_token_ids,
     _requires,
+    _requires_full_mamba_ps1,
+    _requires_full_swa_ps1,
+    _requires_full_swa_ps1_window4,
     _requires_hicache,
+    _requires_mamba,
+    _requires_swa,
+    _requires_swa_and_mamba,
+    _requires_swa_only,
     _selected_tree_core_test_backend,
     build_fixture,
 )
-from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=12, suite="stage-b-test-1-gpu-small-amd")
@@ -75,9 +80,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, seq_b)
         return cache, req_to_token_pool, seq_a, seq_b
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba components"
-    )
+    @_requires_swa_and_mamba
     def test_dec_swa_lock_only_hicache_child_on_host_treated_as_device_leaf(self):
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -513,7 +516,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(len(_node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires_swa
     @_requires(
         lambda cfg: not cfg.has_mamba, "SWA-only path keeps the split setup simple"
     )
@@ -546,7 +549,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(split_leaf))
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires_swa
     @_requires_hicache
     @_requires(
         lambda cfg: not cfg.has_mamba, "SWA-only keeps the deep-tree topology precise"
@@ -647,7 +650,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
                 self.assertTrue(cache.tree_core.is_node_in_host_lru(node, aux))
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_mamba, "requires Mamba component")
+    @_requires_mamba
     def test_hicache_write_back_internal_mamba_evict_demotes_state(self):
         """write_back: an internal node's tombstoned mamba state is demoted
         to host, keeping the node a valid match boundary so the KV beneath
@@ -707,10 +710,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
-    @_requires(
-        lambda cfg: cfg.has_swa and cfg.has_mamba,
-        "requires Full, SWA and Mamba components",
-    )
+    @_requires_swa_and_mamba
     def test_hicache_internal_mamba_backup_waits_for_pending_swa(self):
         page = self.cfg.page_size
         cache, allocator, req_pool = build_fixture(
@@ -756,7 +756,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
             cache.dec_lock_ref(leaf, leaf_lock)
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_mamba, "requires Mamba component")
+    @_requires_mamba
     def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         cache, _, seq_a = self._build_internal_mamba_fixture("write_through")
@@ -771,7 +771,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         )
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA component")
+    @_requires_swa
     def test_hicache_write_back_internal_swa_evict_demotes_kv(self):
         """write_back: an internal node's tombstoned SWA KV is demoted to
         host, keeping the node a valid match boundary so the KV beneath it
@@ -829,7 +829,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA component")
+    @_requires_swa
     def test_hicache_write_through_internal_swa_evict_keeps_drop(self):
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_through")
@@ -861,7 +861,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(result.last_host_node, result.last_device_node)
         self.assertEqual(result.host_hit_length, 0)
 
-    @_requires(lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA-only")
+    @_requires_swa_only
     @_requires(
         lambda cfg: cfg.sliding_window_size > cfg.page_size,
         "the window must reach past the leaf's own page",
@@ -926,10 +926,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
             # the drain must return every freed host value to the pool
             self.assertGreater(pool.available_size(), available_before)
 
-    @_requires(
-        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
-        "requires page_size=1 Full+Mamba",
-    )
+    @_requires_full_mamba_ps1
     def test_hicache_mamba_host_best_match_keeps_device_anchor(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
@@ -952,10 +949,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         )
         self.assertEqual(result.host_hit_length, _node_key_length(cache, leaf))
 
-    @_requires(
-        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
-        "requires page_size=1 Full+Mamba",
-    )
+    @_requires_full_mamba_ps1
     def test_mamba_has_host_value_only_predicate(self):
         """Needs a slot only when mamba is host-only (device evicted, host backed up)."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -987,10 +981,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
             cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
         )
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba and cfg.page_size == 1,
-        "requires page_size=1 Full+SWA",
-    )
+    @_requires_full_swa_ps1
     def test_hicache_swa_host_best_match_keeps_device_anchor(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
@@ -1034,15 +1025,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
 
-    @_requires(
-        lambda cfg: (
-            cfg.has_swa
-            and not cfg.has_mamba
-            and cfg.page_size == 1
-            and cfg.sliding_window_size == 4
-        ),
-        "requires page_size=1 Full+SWA with window_size=4",
-    )
+    @_requires_full_swa_ps1_window4
     def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -1094,7 +1077,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(d))
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires_swa
     @_requires(
         lambda cfg: not cfg.has_mamba,
         "SWA-only path keeps the chain construction simple",
@@ -1175,7 +1158,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, ps)
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires_swa
     @_requires(
         lambda cfg: not cfg.has_mamba,
         "SWA-only path keeps the chain construction simple",
@@ -1293,7 +1276,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(_device_lock_ref(cache, y, ComponentType.FULL), 0)
         self.assertEqual(_device_lock_ref(cache, a, ComponentType.FULL), 0)
 
-    @_requires(lambda cfg: cfg.has_mamba, "requires Mamba component")
+    @_requires_mamba
     @_requires(
         lambda cfg: not cfg.has_swa,
         "Mamba-only path keeps the chain construction simple",
@@ -1463,7 +1446,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         cache.sanity_check()
 
-    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires_swa
     @_requires_hicache
     def test_write_back_defers_swa_window_backup_until_eviction(self):
         """Reinserting backed Full nodes must not publish freshly recovered SWA."""
@@ -1517,15 +1500,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertFalse(cache.tree_core.is_backuped(d))
 
 
-for _cfg in _CONFIGS:
-    _name = f"Test_{_cfg.label}"
-    globals()[_name] = type(
-        _name,
-        (UnifiedRadixCacheHiCacheSuite, CustomTestCase),
-        _config_attrs(UnifiedRadixCacheHiCacheSuite, _cfg),
-    )
-    globals()[_name].__module__ = __name__
-del _cfg, _name
+_define_config_test_classes(UnifiedRadixCacheHiCacheSuite, globals())
 
 
 if __name__ == "__main__":

@@ -57,10 +57,9 @@ from sglang.srt.server_args import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
-    _CONFIGS,
     CacheConfig,
     UnifiedRadixCacheFixtures,
-    _config_attrs,
+    _define_config_test_classes,
     _device_lock_ref,
     _device_value,
     _drop_hicache_atexit_pin,
@@ -70,7 +69,12 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _node_parent,
     _node_token_ids,
     _requires,
+    _requires_full_mamba_ps1,
+    _requires_full_swa_ps1,
     _requires_hicache,
+    _requires_ps1_window4,
+    _requires_swa,
+    _requires_swa_only,
     _write_backup,
     build_fixture,
 )
@@ -1320,7 +1324,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
     # ================================================================
 
     @_requires_hicache
-    @_requires(lambda cfg: cfg.has_swa, "requires an SWA component")
+    @_requires_swa
     def test_buffer_only_swa_tail_only_backups(self):
         """Tail-only backups: SWA reaches storage as the window ending at
         each node, a hit falls back to the last node end whose window is
@@ -2186,10 +2190,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons2.sanity_check()
 
     @_requires_hicache
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_ps1_window4
     def test_buffer_only_storage_prefetch_miss_marker_and_retry(self):
         """A too-early storage query misses; the miss must arm the retry
         marker exactly once, a re-issued check must serve once the content
@@ -2275,10 +2276,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.sanity_check()
 
     @_requires_hicache
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_ps1_window4
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
         """Deadlock invariant: cap <= pool - context_length (floor 0), so
         pinned anchors always leave room to admit the largest request."""
@@ -2707,10 +2705,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                 )
 
     @_requires_hicache
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_ps1_window4
     def test_buffer_only_load_back_trims_head_published_by_sibling(self):
         """Growth-waste regression: a sibling publishing the span HEAD after
         enqueue used to invalidate the whole staged fetch at consumption
@@ -2738,10 +2733,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self._assert_sibling_head_is_trimmed(storage_dir, seq, window_sized=True)
 
     @_requires_hicache
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_ps1_window4
     def test_buffer_only_plan_frees_covered_hold(self):
         """A hold whose whole span became device-resident can never splice:
         the surface-time plan must report (0, 0) and free it (bounce, anchor
@@ -2793,10 +2785,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.sanity_check()
 
     @_requires_hicache
-    @_requires(
-        lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-        "requires page_size=1, sliding_window_size=4",
-    )
+    @_requires_ps1_window4
     def test_buffer_only_hit_commit_cancels_device_covered_fetch(self):
         """A sibling that publishes the span while the storage hit query is
         in flight makes the fetch unconsumable; the IO-commit gate must
@@ -2845,7 +2834,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.sanity_check()
 
     @_requires_hicache
-    @_requires(lambda cfg: cfg.has_swa, "requires an SWA component")
+    @_requires_swa
     def test_buffer_only_swa_window_semantics(self):
         """Root and mid-tree requests and hits share a complete-window minimum."""
         window = self.cfg.sliding_window_size
@@ -3047,10 +3036,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.drain_storage_control_queues()  # Drain the release queue.
         self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba and cfg.page_size == 1,
-        "requires page_size=1 Full+SWA",
-    )
+    @_requires_full_swa_ps1
     def test_prepare_prefetch_swa(self):
         cache, _, _ = self._build_hicache_fixture()
         sw = cache.sliding_window_size
@@ -3090,10 +3076,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(cache.swa_kv_pool_host.available_size(), avail)
         self.assertEqual(int(swa.alloc_prefetch_staging(sw).numel()), sw)
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba and cfg.page_size == 1,
-        "requires page_size=1 Full+SWA",
-    )
+    @_requires_full_swa_ps1
     def test_prepare_prefetch_swa_pool_exhausted(self):
         cache, _, _ = self._build_hicache_fixture()
         sw = cache.sliding_window_size
@@ -3107,10 +3090,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # the retry must evict the SWA host pool, not the default (FULL) one
         evict_host.assert_called_once_with(sw, ComponentType.SWA)
 
-    @_requires(
-        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
-        "requires page_size=1 Full+Mamba",
-    )
+    @_requires_full_mamba_ps1
     def test_prepare_prefetch_mamba(self):
         cache, _, _ = self._build_hicache_fixture()
         # mamba always participates with exactly one state slot
@@ -3123,9 +3103,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self.assertEqual(int(mamba.alloc_prefetch_staging(1).numel()), 1)
 
-    @_requires(
-        lambda cfg: cfg.has_swa and not cfg.has_mamba, "SWA-only fixture required"
-    )
+    @_requires_swa_only
     @_requires_hicache
     def test_buffer_only_hit_parks_on_swa_staging_shortfall(self):
         """A hit whose SWA window cannot be staged parks whole and launches
@@ -3174,15 +3152,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.sanity_check()
 
 
-for _cfg in _CONFIGS:
-    _name = f"Test_{_cfg.label}"
-    globals()[_name] = type(
-        _name,
-        (UnifiedRadixCacheStorageSuite, CustomTestCase),
-        _config_attrs(UnifiedRadixCacheStorageSuite, _cfg),
-    )
-    globals()[_name].__module__ = __name__
-del _cfg, _name
+_define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
