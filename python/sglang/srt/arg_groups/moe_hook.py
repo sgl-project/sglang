@@ -40,6 +40,33 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _flashinfer_a2a_topology_is_supported(
+    *,
+    architecture: str | None,
+    tp_size: int,
+    ep_size: int,
+    attn_dp_size: int,
+    attn_dp_enabled: bool,
+    enable_layernorm_sp: bool,
+) -> bool:
+    """Return whether FlashInfer A2A has a rank-uniform source geometry.
+
+    The ordinary path obtains that geometry from DP attention. Muse prefill
+    sequence parallelism instead assigns one uniform sequence shard to every
+    TP/EP rank, so its dedicated dispatch/combine lifecycle can safely use the
+    same TP4/EP4 or TP8/EP8 process group without enabling DP attention.
+    """
+    if attn_dp_enabled and attn_dp_size == tp_size:
+        return True
+    return (
+        architecture == "MuseSparkForConditionalGeneration"
+        and enable_layernorm_sp
+        and not attn_dp_enabled
+        and attn_dp_size == 1
+        and (tp_size, ep_size) in ((4, 4), (8, 8))
+    )
+
+
 def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
@@ -185,6 +212,11 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
 
 def validate_flashinfer_megamoe_envs() -> None:
     combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() and combine_dtype != "bf16":
+        raise ValueError(
+            "FlashInfer MegaMOE NVFP4 W4A16 requires "
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=bf16."
+        )
     if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
         raise ValueError(
             "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
@@ -215,6 +247,8 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         "NemotronHPuzzleForCausalLM",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
     )
     if not any(
         architecture in validated_architectures for architecture in architectures
@@ -228,13 +262,18 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
     quantization = resolved_view(server_args).quantization
     supports_megamoe_quantization = (
         quantization in ("mxfp8", "modelopt_fp4")
+        or (
+            quantization == "nvfp4_online"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
         or model_config.is_fp4_experts
         or model_config.nvfp4_moe_meta is not None
     )
     if not supports_megamoe_quantization:
         raise ValueError(
             "FlashInfer MegaMOE currently supports only MXFP8, ModelOpt "
-            "NVFP4, FP4-expert, or hybrid NVFP4 MoE checkpoints; got "
+            "NVFP4, FP4-expert, hybrid NVFP4 MoE checkpoints, or nvfp4_online "
+            "with SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1; got "
             f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
             "are not supported."
         )
@@ -274,6 +313,13 @@ def handle_a2a_moe(server_args: Any):
     if a2a_backend == "flashinfer_megamoe":
         validate_flashinfer_megamoe_model(server_args)
         validate_flashinfer_megamoe_envs()
+        if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+            import torch
+
+            if model_config_of(server_args).dtype != torch.bfloat16:
+                raise ValueError(
+                    "FlashInfer MegaMOE NVFP4 W4A16 requires --dtype bfloat16."
+                )
         assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
             "FlashInfer MegaMOE is only supported with --attn-dp-size equal to --tp-size"
         )
@@ -289,6 +335,22 @@ def handle_a2a_moe(server_args: Any):
                 "FlashInfer MegaMOE currently requires an SM100-family "
                 "CUDA device for all supported quantization formats."
             )
+        if cfg.nnodes == 1 and (
+            cfg.speculative_algorithm is None
+            or cfg.speculative_moe_a2a_backend in (None, "none")
+        ):
+            # An unset draft A2A backend defaults to none for this target.
+            # MegaMoE kernels use directly mapped peer memory. Avoid NVSHMEM's
+            # uninitialized proxy global-exit request; see
+            # https://github.com/NVIDIA/nvshmem/pull/110.
+            # Disable remote transports too: the local-only flag cannot disable
+            # a full transport proxy.
+            # Device-side global_exit and proxy timeout polling are unavailable
+            # with these defaults. Preserve explicit NVSHMEM configuration and
+            # exclude drafts with their own A2A backend: these are process-wide.
+            os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
+            os.environ.setdefault("NVSHMEM_IB_ENABLE_IBGDA", "0")
+            os.environ.setdefault("NVSHMEM_DISABLE_LOCAL_ONLY_PROXY", "1")
         logger.info(
             "FlashInfer MegaMOE is enabled. The expert parallel size is "
             "adjusted to be the same as the tensor parallel size[%s].",
@@ -405,8 +467,20 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_now == "flashinfer":
-        assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
-            "Flashinfer MoE A2A is only supported with --attn-dp-size equal to --tp-size"
+        view = resolved_view(server_args)
+        architectures = model_config_of(server_args).hf_config.architectures
+        architecture = architectures[0] if architectures else None
+        assert _flashinfer_a2a_topology_is_supported(
+            architecture=architecture,
+            tp_size=cfg.tp_size,
+            ep_size=view.ep_size,
+            attn_dp_size=cfg.attn_dp_size,
+            attn_dp_enabled=attn_dp_enabled_of(cfg),
+            enable_layernorm_sp=view.enable_layernorm_sp,
+        ), (
+            "Flashinfer MoE A2A requires --attn-dp-size equal to --tp-size, "
+            "except for Muse Spark TP4/EP4 or TP8/EP8 prefill "
+            "sequence parallelism."
         )
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
