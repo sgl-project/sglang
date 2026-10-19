@@ -1,5 +1,7 @@
 #include <sgl_kernel/distributed/communicator.cuh>
 
+#include <tvm/ffi/extra/stl.h>
+
 #include "../../moe/route_quant_fused.cuh"
 
 namespace sglang {
@@ -26,6 +28,8 @@ struct RouteQuantGatherParams {
   device::distributed::Semaphore* sem_local;
   device::distributed::Semaphore* sem_mc;
   uint32_t rank;
+  bf16_t* metadata_weights;
+  int32_t* metadata_batch;
 };
 
 template <uint32_t kWorld, uint32_t kHidden, bool kUsePDL>
@@ -36,7 +40,18 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize) void route_quant
   const uint32_t rows = p.route.M;
   if (blockIdx.x < rows) {
     __shared__ LargeRouterRadixTrait::Smem smem;
-    route_radix_block<kUsePDL, fp32_t>(p.route, smem);
+    if (p.metadata_weights != nullptr) {
+      device::PDLWaitPrimary<kUsePDL>();
+      route_radix_block<false, fp32_t>(p.route, smem);
+      if (threadIdx.x < LargeRouterRadixTrait::kTopK) {
+        p.metadata_batch[threadIdx.x] = smem.wid[threadIdx.x];
+        p.metadata_weights[threadIdx.x] = __ushort_as_bfloat16(static_cast<uint16_t>(p.route.out_packed[threadIdx.x]));
+      }
+      __syncthreads();
+      device::PDLTriggerSecondary<kUsePDL>();
+    } else {
+      route_radix_block<kUsePDL, fp32_t>(p.route, smem);
+    }
     return;
   }
 
@@ -103,7 +118,9 @@ struct RouteQuantGatherKernel {
       int64_t scales_mc,
       double scale,
       bool renormalize,
-      bool apply_scale) {
+      bool apply_scale,
+      std::optional<tvm::ffi::TensorView> metadata_weights,
+      std::optional<tvm::ffi::TensorView> metadata_batch) {
     using namespace host;
     using Layout = ShardedFrontLayout<kWorld, kHidden>;
     using Router = LargeRouterRadixTrait;
@@ -135,6 +152,11 @@ struct RouteQuantGatherKernel {
     const auto& pull = comm->get_pull_obj();
     const auto num_rows = static_cast<uint32_t>(rows.unwrap());
     CHECK_HOST(pull.world_size == kWorld && pull.num_blocks >= 2 * num_rows && pull.mc_semaphore != nullptr);
+    if (metadata_weights.has_value()) {
+      CHECK_HOST(num_rows == 1 && metadata_batch.has_value());
+      TensorMatcher({1, Router::kTopK}).with_dtype<bf16_t>().with_device(device).verify(*metadata_weights);
+      TensorMatcher({Router::kTopK}).with_dtype<int32_t>().with_device(device).verify(*metadata_batch);
+    }
     if (num_rows == 0) return;
     const RouteQuantGatherParams params{
         .route =
@@ -159,7 +181,9 @@ struct RouteQuantGatherKernel {
         .scales_out = static_cast<uint32_t*>(global_s.data_ptr()),
         .sem_local = pull.semaphores[pull.rank],
         .sem_mc = pull.mc_semaphore,
-        .rank = pull.rank};
+        .rank = pull.rank,
+        .metadata_weights = metadata_weights ? static_cast<bf16_t*>(metadata_weights->data_ptr()) : nullptr,
+        .metadata_batch = metadata_batch ? static_cast<int32_t*>(metadata_batch->data_ptr()) : nullptr};
     LaunchKernel(2 * num_rows, Router::kBlockSize, device.unwrap())
         .enable_pdl(kUsePDL)(route_quant_gather_kernel<kWorld, kHidden, kUsePDL>, params);
   }

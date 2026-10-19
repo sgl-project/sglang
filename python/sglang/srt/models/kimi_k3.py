@@ -1301,7 +1301,7 @@ class KimiK3MoE(nn.Module):
         try:
             if routed_input.shape[1] != self.moe_hidden_size:
                 config = self.topk.topk_config
-                prepared = self._sharded_front_workspace.route(
+                prepared, routing = self._sharded_front_workspace.route(
                     self.layer_idx,
                     router_logits,
                     config.correction_bias,
@@ -1312,7 +1312,9 @@ class KimiK3MoE(nn.Module):
                 topk_output = build_precomputed_topk_output(
                     weights, ids, config, self.layer_idx
                 )
-                route_quant_handoff.publish(routed_input, packed, routed_input, scales)
+                route_quant_handoff.publish(
+                    routed_input, packed, routed_input, scales, routing=routing
+                )
             else:
                 if self._route_quant_fuse_eligible:
                     route_quant_handoff.stage(routed_input)
