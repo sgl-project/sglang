@@ -930,14 +930,9 @@ class PrefillAdder:
         """
         if not (self._mamba_slot_cost or self._static_mamba_slots):
             return 0
-        from sglang.srt.mem_cache.common import (
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
-        )
-
-        if self.tree_cache.req_to_token_pool.enable_mamba_extra_buffer_lazy:
-            return MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-        return MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        # Matches the slots alloc_req_slots actually allocates (1 + 2 overlap
+        # / 1 + 1 lazy); the worst case is a cold request.
+        return 1 + self.tree_cache.req_to_token_pool.mamba_initial_tracking_slots
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
