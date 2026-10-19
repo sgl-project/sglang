@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    _replay_gpt_oss_reasoning_content_as_thinking,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -5093,6 +5094,80 @@ class TestNormalizeToolContent(unittest.TestCase):
             "tool", ["plain", {"type": "text", "text": "rich"}]
         )
         self.assertEqual(result, "plain rich")
+
+
+class TestReplayGptOssReasoningContentAsThinking(unittest.TestCase):
+    """Unit tests for _replay_gpt_oss_reasoning_content_as_thinking()."""
+
+    @staticmethod
+    def _tool_call_message(**kwargs):
+        message = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": {}},
+                }
+            ],
+        }
+        message.update(kwargs)
+        return message
+
+    def test_reasoning_content_copied_to_thinking(self):
+        messages = [self._tool_call_message(reasoning_content="the CoT")]
+        _replay_gpt_oss_reasoning_content_as_thinking(messages)
+        self.assertEqual(messages[0]["thinking"], "the CoT")
+        # The source field is kept; the gpt-oss template simply ignores it.
+        self.assertEqual(messages[0]["reasoning_content"], "the CoT")
+
+    def test_explicit_thinking_never_overwritten(self):
+        messages = [
+            self._tool_call_message(
+                thinking="client thinking", reasoning_content="the CoT"
+            )
+        ]
+        _replay_gpt_oss_reasoning_content_as_thinking(messages)
+        self.assertEqual(messages[0]["thinking"], "client thinking")
+
+    def test_tool_call_with_preamble_merged_not_dropped(self):
+        # The gpt-oss template raises when a tool-call turn carries both
+        # content and thinking; folding the preamble into the analysis
+        # channel keeps both without tripping that guard.
+        messages = [
+            self._tool_call_message(
+                content="Let me check.", reasoning_content="the CoT"
+            )
+        ]
+        _replay_gpt_oss_reasoning_content_as_thinking(messages)
+        self.assertEqual(messages[0]["thinking"], "the CoT\nLet me check.")
+        self.assertEqual(messages[0]["content"], "")
+
+    def test_parts_list_preamble_flattened(self):
+        messages = [
+            self._tool_call_message(
+                content=[{"type": "text", "text": "One moment."}],
+                reasoning_content="the CoT",
+            )
+        ]
+        _replay_gpt_oss_reasoning_content_as_thinking(messages)
+        self.assertEqual(messages[0]["thinking"], "the CoT\nOne moment.")
+        self.assertEqual(messages[0]["content"], "")
+
+    def test_non_assistant_messages_untouched(self):
+        messages = [
+            {"role": "user", "content": "hi", "reasoning_content": "the CoT"},
+            {"role": "tool", "content": "ok", "reasoning_content": "the CoT"},
+        ]
+        _replay_gpt_oss_reasoning_content_as_thinking(messages)
+        for message in messages:
+            self.assertNotIn("thinking", message)
+
+    def test_no_reasoning_content_noop(self):
+        messages = [self._tool_call_message()]
+        _replay_gpt_oss_reasoning_content_as_thinking(messages)
+        self.assertNotIn("thinking", messages[0])
 
 
 class InklingReasoningEffortTest(unittest.TestCase):

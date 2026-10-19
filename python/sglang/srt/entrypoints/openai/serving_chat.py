@@ -190,6 +190,45 @@ def normalize_assistant_tool_call_arguments(
                     raise
 
 
+def _replay_gpt_oss_reasoning_content_as_thinking(
+    messages: list[dict[str, Any]],
+) -> None:
+    """Copy replayed ``reasoning_content`` into ``thinking`` in-place (gpt-oss only).
+
+    The stock gpt-oss chat template reads prior chain-of-thought only from the
+    assistant message's ``thinking`` field and ignores ``reasoning_content``,
+    so a client that faithfully replays the ``reasoning_content`` it received
+    would silently lose the CoT on every tool-calling turn
+    (sgl-project/sglang#44931). An explicitly provided ``thinking`` field is
+    never overwritten.
+    """
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning_content = message.get("reasoning_content")
+        if not reasoning_content or message.get("thinking"):
+            continue
+        content = message.get("content")
+        if message.get("tool_calls") and content:
+            # The gpt-oss template raises on an assistant tool-call message
+            # that carries both content and thinking, so fold the preamble
+            # into the analysis channel (generation order: analysis, then
+            # commentary) instead of dropping the CoT or erroring out.
+            if isinstance(content, list):
+                content = " ".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict)
+                    and part.get("type") in ("text", "input_text")
+                )
+            message["thinking"] = (
+                f"{reasoning_content}\n{content}" if content else reasoning_content
+            )
+            message["content"] = ""
+        else:
+            message["thinking"] = reasoning_content
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -1685,6 +1724,11 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
+            if self.reasoning_parser == "gpt-oss":
+                # The stock gpt-oss chat template reads prior chain-of-thought
+                # from the assistant message's `thinking` field and ignores
+                # `reasoning_content` (sgl-project/sglang#44931).
+                _replay_gpt_oss_reasoning_content_as_thinking(messages)
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
