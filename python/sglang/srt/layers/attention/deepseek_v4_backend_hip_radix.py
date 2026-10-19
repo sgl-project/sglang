@@ -3578,16 +3578,9 @@ class DeepseekV4HipRadixBackend(
                 out_loc=out_loc,
                 block_size=dspark_block_size,
             )
-        elif swa_replay_start is None:
-            swa_page_indices = self.get_swa_page_indices(
-                seq_lens_casual=seq_lens_casual,
-                req_pool_indices_repeated=req_pool_indices_repeated,
-            )
-            swa_page_indices = _pad_last_dim(
-                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-            )
-            swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
         else:
+            # one launch for the window's slots, -1 where empty (the mapping's
+            # trailing -1 is what an empty slot translated to)
             swa_page_indices = BuildCausalSwaPageIndices.execute(
                 req_to_token=self.req_to_token,
                 full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
@@ -3597,11 +3590,11 @@ class DeepseekV4HipRadixBackend(
                 page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
                 swa_replay_start=swa_replay_start,
             )
-            # Slots below the floor are -1; the valid count shrinks to match.
-            floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
-            swa_topk_lengths = torch.minimum(
-                torch.clamp(seq_lens_casual, max=SWA_WINDOW), floored.clamp_min(0)
-            )
+            swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+            if swa_replay_start is not None:
+                # Slots below the floor are -1; the valid count shrinks to match.
+                floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
+                swa_topk_lengths = torch.minimum(swa_topk_lengths, floored.clamp_min(0))
 
         # the gather, the floor division and the cast in one launch
         page_table = page_table_from_req_to_token(
@@ -3639,25 +3632,6 @@ class DeepseekV4HipRadixBackend(
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
         return core_attn_metadata
-
-    def get_swa_page_indices(
-        self,
-        seq_lens_casual: torch.Tensor,
-        req_pool_indices_repeated: torch.Tensor,
-    ) -> torch.Tensor:
-        pos_causal = seq_lens_casual - 1
-        num_qo_tokens = seq_lens_casual.size(0)
-        offsets = pos_causal.unsqueeze(1) - torch.arange(
-            SWA_WINDOW, **self.cuda_int32_kwargs
-        ).unsqueeze(0)
-        invalid_offset_mask = offsets < 0
-        offsets.masked_fill_(invalid_offset_mask, 0)
-        raw_indices = self.req_to_token[req_pool_indices_repeated[:, None], offsets]
-        assert raw_indices.shape == (num_qo_tokens, SWA_WINDOW)
-        raw_indices.masked_fill_(invalid_offset_mask, -1)
-        swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
-        # flash_mla attention requires int32 page indices.
-        return swa_indices.to(torch.int32)
 
     get_dspark_swa_page_indices = DeepseekV4AttnBackend.get_dspark_swa_page_indices
 
