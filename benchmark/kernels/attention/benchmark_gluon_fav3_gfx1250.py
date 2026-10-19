@@ -18,6 +18,7 @@ from aiter.jit.core import ENABLE_CK
 from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
     FAv3LaunchConfig,
     gluon_fav3_attention,
+    resolve_fav3_execution_policy,
     select_fav3_launch_config,
 )
 
@@ -262,16 +263,31 @@ def main():
         )
         config = config._replace(llvm_fn_attrs=scheduler)
 
+    launch_config = (
+        None if args.schedule in (None, "auto") and args.scheduler is None else config
+    )
+    policy = resolve_fav3_execution_policy(
+        query, key, value, launch_config=launch_config
+    )
+    config = policy.launch_config
+    print(
+        "execution_policy="
+        + json.dumps(
+            {
+                "launch_config": config._asdict(),
+                "numerical_mode": policy.numerical_mode.value,
+                "softmax_scale": policy.softmax_scale,
+            },
+            sort_keys=True,
+        )
+    )
+
     def gluon_attention():
         return gluon_fav3_attention(
             query,
             key,
             value,
-            launch_config=(
-                None
-                if args.schedule in (None, "auto") and args.scheduler is None
-                else config
-            ),
+            launch_config=launch_config,
         )
 
     if args.trace_provider is not None:

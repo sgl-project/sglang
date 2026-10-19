@@ -15,7 +15,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
 
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA. On SM100/B200, dense non-causal fp16/bf16 native attention prefers cuDNN SDPA and falls back to FA4 if cuDNN has no compatible kernel.
-- **ROCm**: AITER is the default. gfx1250 can explicitly select Gluon FAv3 for compatible BF16 dense attention; unsupported dense Gluon contracts fall back to AITER, while shared masked-attention routing may use SDPA.
+- **ROCm**: AITER is the default. gfx1250 can explicitly select Gluon FAv3 for compatible BF16/FP16 dense attention; unsupported dense Gluon contracts fall back to AITER, while shared masked-attention routing may use SDPA.
 - **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
 - **MUSA**: uses FlashAttention when available; also supports Sage Attention when installed; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
@@ -895,24 +895,81 @@ sglang generate \
   --attention-backend gluon_fav3
 ```
 
-Gluon uses stable softmax with FP32 state and probabilities rounded to the
-input dtype (BF16 or FP16). Dispatch depends on tensor geometry and device
-occupancy:
+Gluon accumulates scores, softmax state, and outputs in FP32. Dispatch depends on
+tensor geometry, layout, and device occupancy:
 
 - Head dimension 256 and small grids use the four-wave pipeline.
 - Other grids that fill the device use the eight-wave ping-pong kernel.
-- Contiguous BF16/D128 workloads with 257–512 K/V tokens can use persistent K/V reuse
-  when its LDS and occupancy requirements are satisfied.
+- Contiguous BF16/D128 workloads with 257–512 K/V tokens can use persistent K/V
+  reuse when the resulting grid fills the device. Noncontiguous inputs use
+  ping-pong instead.
+- FP16 pipelines drain pending TDM loads before consuming K/V. Automatic FP16
+  pipeline selection uses the default scheduler; explicit scheduler overrides
+  retain the full waits.
 
-For automatically selected BF16/D128 ping-pong workloads with both sequence lengths
-at least 65,536 and the default scale, GPU checks of Q/K norms and V magnitudes
-can enable a fixed softmax shift. This keeps exponents bounded and normalizes
-the rounded BF16 probabilities with FP32 sums. Inputs outside these bounds use
-the existing guarded fused exponents or maximum subtraction before scaling.
-The checks run again on every graph replay. Short-KV persistent attention uses
-one maximum across its cached keys. FP16 and other supported head dimensions
-use the stable generic schedules; the BF16 fixed-shift optimization is not
-used for FP16 probabilities.
+#### Numerical contract
+
+Let `a = softmax_scale * log2(e)`. All modes round probabilities to nearest,
+ties to even, before the probability/value matrix product (PV). The table
+distinguishes those rounded probabilities from the FP32 denominator.
+
+| Numerical mode | Prerequisites and bounds | Softmax and probability rounding | Graph replay |
+| --- | --- | --- | --- |
+| Online (`online`) | All supported BF16/FP16 head dimensions; also the final guarded fallback. | Subtract the running maximum before scaling. Rescale FP32 accumulators as the maximum changes. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
+| Persistent (`persistent`) | Contiguous BF16/D128, 257–512 K/V tokens, and a valid persistent launch. | Subtract one maximum across all cached keys before scaling. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
+| Norm-bounded fixed shift (inside `guarded`) | Every Q/K row has squared L2 norm at most `(32/a) * (1 - 1e-4)`. Every V magnitude is zero or in `[2^-32, 2^64]`. | Use `exp2(score*a - 32)`, with exponent arguments in `[-64, 0]`. PV and the FP32 denominator use the same rounded BF16 probabilities. | Clear and recompute Q/K/V guard flags on every replay. |
+| Element-bounded fused exponent (inside `guarded`) | The norm route is unavailable, but every Q/K magnitude is at most `sqrt(1024/(128*a)) * (1 - 1e-5)`. | Use an online maximum and a fused scaled subtraction. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | Recompute the guards on every replay; use online subtraction if this bound fails too. |
+
+Automatic `guarded` policy is limited to BF16/D128 ping-pong, both sequence
+lengths at least 65,536, K/V length below `2^31`, and the default scale
+`128**-0.5`. An explicit launch configuration uses the stable schedule without
+these automatic guards. Nonfinite Q/K values reject both bounded routes;
+nonfinite V values reject the norm route. Guard fallback does not sanitize
+nonfinite inputs or make overflowing FP32 dot products finite.
+
+The device flags `NORM_UNSAFE` and `FUSED_EXP_UNSAFE` describe independent
+failed checks. A passing norm check takes priority even if the element bound
+fails, as can happen with sparse rows. The two bounded algorithms share a JIT
+entry point; the online fallback has its own entry point to preserve register
+allocation.
+
+For tests and benchmarks, `resolve_fav3_execution_policy` in
+`sglang.kernels.ops.attention.gluon_fav3_gfx1250_policy` reports the effective
+launch configuration, scale, and numerical mode after layout fallback.
+Supplying `num_cus` allows inspection with CPU or meta tensors. A reported
+`guarded` mode describes the available GPU routes; it does not read inputs or
+cache the route chosen for a particular tensor's values. The benchmark prints
+this result as `execution_policy`.
+
+#### Upstream validation
+
+The host policy and adapter checks are registered in the existing upstream
+`stage-a-test-1-gpu-small-amd` and `nightly-amd-1-gpu` suites. They can run on
+the existing AMD runners without compiling gfx1250 kernels.
+
+Numerical tests are registered in upstream's `nightly-amd-1-gpu-mi45x` suite,
+alongside the existing MI45x tests. The checked-in workflows currently do not
+consume that suite; the ROCm image workflow documents the missing MI450 runner
+pool. Recurring gfx1250 execution therefore remains an upstream CI
+infrastructure dependency. Host tests and API availability probes do not
+establish GPU compiler compatibility.
+
+Run the numerical suite on gfx1250 when changing these kernels or updating the
+supported Triton/ROCm image. It includes independent FP64 comparisons, guard
+boundaries, graph replay with mutated inputs, and repeated FP16 storage-offset
+regressions. Its CI entry point fails on the wrong architecture instead of
+reporting an entirely skipped run as success. From a source checkout in the
+supported ROCm environment:
+
+```bash
+python test/registered/amd/test_gluon_fav3_policy.py
+python test/registered/amd/test_gluon_fav3_gfx1250.py
+```
+
+These tests do not require model weights or generation. On a shared development
+host, run them through the site's GPU lock wrapper.
+
+#### Compilation and benchmarking
 
 Sequence lengths and softmax scale are JIT compile-time constants. A new
 resolution, frame count, prompt length, or scale can trigger a separate
