@@ -1617,6 +1617,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     for tool in request_tools
                 ]
+            if request.response_format:
+                messages[0]["response_format"] = request.response_format.model_dump()
 
             # Default encoding (dsv4/dsv41/dsv32)
             if self.chat_encoding_spec == "dsv4":
