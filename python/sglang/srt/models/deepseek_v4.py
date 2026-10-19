@@ -1019,7 +1019,7 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
         )
 
-        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+        from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
         self.rope_scaling = dict(rope_scaling) if rope_scaling else None
@@ -1329,7 +1329,7 @@ class MQALayer(MqaAttentionBase):
         )
         self.mega_cos_sin_cache = None
         if self.use_mega_attention:
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            from sglang.kernels.ops.attention.dsv4.rope import (
                 precompute_cos_sin_table,
             )
 
@@ -4336,7 +4336,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
-            from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
+            from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
             from sglang.srt.layers.quantization.fp8_utils import (
                 set_dense_mxscale,
                 set_force_ck_w8a8,

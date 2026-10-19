@@ -19,6 +19,13 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    BuildPageTablePositions,
+    ExpandPrefillCausally,
+    late_layer_tail_layout,
+    late_layer_tail_lens,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
@@ -37,13 +44,6 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-    BuildCausalSwaPageIndices,
-    BuildPageTablePositions,
-    ExpandPrefillCausally,
-    late_layer_tail_layout,
-    late_layer_tail_lens,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
@@ -4416,11 +4416,11 @@ class DeepseekV4AttnBackend(
         )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
+            from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+                build_page_table_positions_small,
+            )
             from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
                 build_low_ratio_metadata,
-            )
-            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-                build_page_table_positions_small,
             )
 
             build_pages = build_page_table_positions_small

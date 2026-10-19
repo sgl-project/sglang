@@ -13,7 +13,8 @@ from .compress import (
     compress_forward,
     compress_norm_rope_store,
 )
-from .elementwise import (
+from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
+from .norm_rope import (
     fused_k_norm_rope_flashmla,
     fused_norm_rope_inplace,
     fused_q_indexer_rope_first_quant,
@@ -22,7 +23,6 @@ from .elementwise import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
-from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .topk import (
     plan_topk_v2,
     topk_transform_kpool_ragged_v2,

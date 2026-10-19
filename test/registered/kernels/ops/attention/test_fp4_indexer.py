@@ -7,10 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
-    precompute_freqs_cis,
-)
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
@@ -22,6 +18,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_paged,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
+)
+from sglang.kernels.ops.attention.dsv4.rope import (
+    apply_rotary_emb_triton,
+    precompute_freqs_cis,
 )
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci

@@ -214,7 +214,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+                "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels."
                 "ExpandPrefillCausally.execute",
                 return_value=SimpleNamespace(
                     seq_lens_casual=core.seq_lens_casual,
@@ -279,7 +279,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+                "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels."
                 "ExpandPrefillCausally.execute",
                 return_value=SimpleNamespace(
                     seq_lens_casual=torch.ones(4, dtype=torch.int32),

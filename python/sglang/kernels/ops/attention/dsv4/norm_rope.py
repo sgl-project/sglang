@@ -171,7 +171,7 @@ def fused_rope_inplace(
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
     if _is_hip or _is_xpu:
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+        from sglang.kernels.ops.attention.dsv4.rope import (
             apply_rotary_emb_triton,
         )
 

@@ -12,18 +12,18 @@ from typing import Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
 from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
-from sglang.kernels.ops.attention.dsv4.elementwise import (
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.norm_rope import (
     fused_k_norm_rope_flashmla,
     fused_rope_inplace,
 )
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
 from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci

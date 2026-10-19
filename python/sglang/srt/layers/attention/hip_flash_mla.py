@@ -156,7 +156,7 @@ def _apply_inverse_rope(
 ) -> None:
     """The model's standalone inverse RoPE on out [n, h, d] (last 64 dims of
     every head), for the paths that did not fold it into their combine."""
-    from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
+    from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
 
     freqs_real, positions = inv_rope
     n = out.shape[0]
@@ -228,7 +228,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         return dpsk_v4_fp8_attention_fwd(**kwargs)
 
     if backend == "triton":
-        from sglang.kernels.ops.attention.nsa_triton_decode import (
+        from sglang.kernels.ops.attention.dsv4.triton_sparse_decode import (
             triton_fp8_attention_fwd,
         )
 

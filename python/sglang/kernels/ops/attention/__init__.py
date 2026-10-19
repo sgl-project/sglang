@@ -33,9 +33,9 @@ _TRITON_KERNELS = [
     ("metadata", "get_num_kv_splits_triton"),
     ("metadata", "prepare_swa_spec_page_table_triton"),
     ("metadata", "normal_decode_set_metadata"),
-    ("dsa_metadata", "fused_dsa_decode_metadata"),
-    ("dsa_metadata", "fused_dsa_target_verify_metadata"),
-    ("dsa_metadata", "fused_dsa_draft_extend_metadata"),
+    ("dsa.metadata", "fused_dsa_decode_metadata"),
+    ("dsa.metadata", "fused_dsa_target_verify_metadata"),
+    ("dsa.metadata", "fused_dsa_draft_extend_metadata"),
     ("rocm_mla_decode_rope", "decode_attention_fwd_grouped_rope"),
     ("verify_splitkv", "verify_splitkv_fwd"),
     ("unified_attention_3d_mtp", "unified_attention_3d_mtp_func"),
@@ -44,9 +44,9 @@ _TRITON_KERNELS = [
     ("pad", "unpad_draft_extend_output"),
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
-    ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
-    ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
-    ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
+    ("dsv4.attn_metadata_kernels", "expand_prefill_causally"),
+    ("dsv4.attn_metadata_kernels", "build_page_table_positions"),
+    ("dsv4.attn_metadata_kernels", "build_causal_swa_page_indices"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -197,7 +197,7 @@ for _mod, _fn in [
     ("dcp_kernels", "dcp_lse_combine_triton"),
     ("dcp_kernels", "dcp_pack_a2a_send"),
     ("pa_page_table", "_build_pa_page_table"),
-    ("nsa_triton_decode", "triton_sparse_attn_decode"),
+    ("dsv4.triton_sparse_decode", "triton_sparse_attn_decode"),
 ]:
     register_kernel(
         KernelSpec(
@@ -211,7 +211,7 @@ del _mod, _fn
 # RoPE / QK-norm fusion kernels migrated from srt/layers top-level strays
 # (RFC #29630, Phase 2.5); registered for inventory.
 for _mod, _fn in [
-    ("deepseek_v4_rope", "precompute_freqs_cis"),
+    ("dsv4.rope", "precompute_freqs_cis"),
     ("fused_qk_norm_rope_store", "fused_qk_norm_rope_swa_store"),
     ("fused_qk_rmsnorm_rope_gate", "fused_qk_gemma_rmsnorm_rope_gate"),
     ("rotary_triton", "triton_mrope_fused"),

@@ -22,7 +22,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
@@ -76,6 +75,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4,
 )
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,

@@ -272,7 +272,7 @@ class CompressorBackendMixin:
         layer_id: int,
     ) -> None:
         """HIP-specific forward path using PyTorch/Triton fallbacks."""
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+        from sglang.kernels.ops.attention.dsv4.rope import (
             fused_norm_rope_inplace_triton,
         )
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation

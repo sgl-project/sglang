@@ -28,6 +28,10 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     sparse_buffers,
     widen_pair_i64,
 )
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    late_layer_tail_layout,
+)
 from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     CandidateBlocks,
     slice_candidate_blocks,
@@ -55,10 +59,6 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-    BuildCausalSwaPageIndices,
-    late_layer_tail_layout,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1179,7 +1179,7 @@ class DeepseekV4HipRadixBackend(
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
 
-        from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
             ExpandPrefillCausally,
         )
 
