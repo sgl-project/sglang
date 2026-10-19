@@ -224,7 +224,7 @@ class KDAKernelDispatcher:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
-                # CuTe DSL prefill kernels need SM100 (Blackwell); on older GPUs
+                # CuTe DSL prefill kernels need SM10x (tcgen05); elsewhere
                 # fall back to the Triton chunk kernel.
                 self.extend_kernel = triton_kernel
                 rank0_log(
