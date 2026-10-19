@@ -427,12 +427,7 @@ register_kernel(
         op="gemm.bf16_skinny_gemm",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.bf16_skinny_gemm:bf16_skinny_gemm",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="[m, k] @ [n, k].T for m <= 16, k % 128 == 0; batch-invariant rows",
-        ),
-        description="Weight-streaming BF16 GEMM for decode-sized LM heads (Triton).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
