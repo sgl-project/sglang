@@ -386,7 +386,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         logger.warning(
             "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
-            "DeepSeek-V4.1; longer contexts run eager prefill."
+            "DeepSeek-V4.1, the captured indexer width; longer contexts still "
+            "replay the graph with the DeepGEMM candidate indexer and run eager "
+            "prefill otherwise."
         )
 
     incompatible = (

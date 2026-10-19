@@ -1037,8 +1037,9 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
-# Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
-# its width is the graph's max_seq_len, and longer contexts replay eagerly.
+# Rows per logits chunk of the ratio-1/2 indexer metadata under the prefill CUDA
+# graph; its width is the captured max_seq_len, or the live context when any
+# context replays.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
