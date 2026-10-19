@@ -155,14 +155,19 @@ class Compressor(BaseFusedOp):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        return kv_score
+        return kv_score.float() if self._wkv_gate_on_aiter else kv_score
+
+    @property
+    def _wkv_gate_on_aiter(self) -> bool:
+        weight = getattr(self.wkv_gate, "weight", None)
+        return _use_aiter and weight is not None and weight.dtype == torch.bfloat16
 
     def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
         weight = getattr(self.wkv_gate, "weight", None)
         if weight is not None:
-            if _use_aiter and weight.dtype == torch.bfloat16:
+            if self._wkv_gate_on_aiter:
                 # aiter's tuned GEMM for these shapes; kv_score is bf16-rounded
-                return tgemm.mm(x, weight, otype=x.dtype).float()
+                return tgemm.mm(x, weight, otype=x.dtype)
             return linear_bf16_fp32(x, weight)
 
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
