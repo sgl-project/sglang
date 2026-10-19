@@ -13,6 +13,7 @@ from sglang.srt.eplb.lplb_solver import (
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
@@ -131,6 +132,10 @@ def check_quantized_moe_compatibility(
     moe_ep_size: int,
     moe_dp_size: int,
 ) -> None:
+    # AFD attention workers do not shard or execute routed expert weights.
+    if get_moe_a2a_backend().is_afd_attn():
+        return
+
     if (
         quantization_config := getattr(
             model_config.hf_config, "quantization_config", None
