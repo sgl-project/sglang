@@ -33,7 +33,7 @@ from typing import NamedTuple
 import torch
 
 
-class FAv3LaunchConfig(NamedTuple):
+class LaunchConfig(NamedTuple):
     schedule: str
     block_m: int
     block_n: int
@@ -42,21 +42,21 @@ class FAv3LaunchConfig(NamedTuple):
     llvm_fn_attrs: str
 
 
-class FAv3NumericalMode(str, Enum):
+class NumericalMode(str, Enum):
     ONLINE = "online"
     PERSISTENT = "persistent"
     GUARDED = "guarded"
 
 
-class FAv3Guard(IntFlag):
+class GuardFlag(IntFlag):
     NONE = 0
     NORM_UNSAFE = 1
     FUSED_EXP_UNSAFE = 2
 
 
-class FAv3ExecutionPolicy(NamedTuple):
-    launch_config: FAv3LaunchConfig
-    numerical_mode: FAv3NumericalMode
+class ExecutionPolicy(NamedTuple):
+    launch_config: LaunchConfig
+    numerical_mode: NumericalMode
     softmax_scale: float
 
 
@@ -111,7 +111,7 @@ def _get_persistent_query_groups(
     return aligned_groups if aligned_tiles < original_tiles else query_groups
 
 
-def select_fav3_launch_config(
+def select_launch_config(
     batch: int,
     num_heads: int,
     seqlen_q: int,
@@ -120,7 +120,7 @@ def select_fav3_launch_config(
     num_cus: int | None = None,
     head_size: int = 128,
     dtype: torch.dtype = torch.bfloat16,
-) -> FAv3LaunchConfig:
+) -> LaunchConfig:
     """Select a gfx1250 launch while retaining the BF16/D128 specializations."""
     if head_size not in (64, 128, 256):
         raise ValueError(
@@ -144,7 +144,7 @@ def select_fav3_launch_config(
         and 257 <= seqlen_k <= 512
         and persistent_workgroups >= num_cus
     ):
-        return FAv3LaunchConfig(
+        return LaunchConfig(
             "persistent",
             128,
             256,
@@ -165,10 +165,10 @@ def select_fav3_launch_config(
             if seqlen_k is not None and (seqlen_k <= 512 or seqlen_k >= 16_384)
             else ""
         )
-        return FAv3LaunchConfig("pingpong", 256, 64, 8, head_size == 128, scheduler)
+        return LaunchConfig("pingpong", 256, 64, 8, head_size == 128, scheduler)
     # max-ilp intermittently corrupts FP16 inputs with nonzero storage offsets.
     # Use default pipeline scheduling until the affected cases are understood.
-    return FAv3LaunchConfig(
+    return LaunchConfig(
         "pipeline",
         128,
         64,
@@ -178,15 +178,15 @@ def select_fav3_launch_config(
     )
 
 
-def resolve_fav3_execution_policy(
+def resolve_execution_policy(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     *,
     softmax_scale: float | None = None,
-    launch_config: FAv3LaunchConfig | None = None,
+    launch_config: LaunchConfig | None = None,
     num_cus: int | None = None,
-) -> FAv3ExecutionPolicy:
+) -> ExecutionPolicy:
     """Resolve the effective launch and numerical policy from tensor metadata.
 
     The caller validates the Q/K/V tensor contract. Supplying num_cus allows
@@ -202,7 +202,7 @@ def resolve_fav3_execution_policy(
 
     config = launch_config
     if config is None:
-        config = select_fav3_launch_config(
+        config = select_launch_config(
             batch,
             num_heads,
             seqlen_q,
@@ -235,8 +235,8 @@ def resolve_fav3_execution_policy(
             config = config._replace(
                 llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp"
             )
-            return FAv3ExecutionPolicy(config, FAv3NumericalMode.PERSISTENT, scale)
-        config = FAv3LaunchConfig(
+            return ExecutionPolicy(config, NumericalMode.PERSISTENT, scale)
+        config = LaunchConfig(
             "pingpong", 256, 64, 8, True, "amdgpu-sched-strategy=max-ilp"
         )
     if config.schedule not in ("pipeline", "pingpong"):
@@ -249,7 +249,7 @@ def resolve_fav3_execution_policy(
             f"{expected_geometry}, got {actual_geometry}"
         )
 
-    mode = FAv3NumericalMode.ONLINE
+    mode = NumericalMode.ONLINE
     if (
         launch_config is None
         and config.schedule == "pingpong"
@@ -259,5 +259,5 @@ def resolve_fav3_execution_policy(
         and seqlen_k < 2**31
         and scale == head_size**-0.5
     ):
-        mode = FAv3NumericalMode.GUARDED
-    return FAv3ExecutionPolicy(config, mode, scale)
+        mode = NumericalMode.GUARDED
+    return ExecutionPolicy(config, mode, scale)
