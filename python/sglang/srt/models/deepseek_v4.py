@@ -3712,44 +3712,7 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
-        self.decoder_tail_graphs: Optional[DecoderTailGraphs] = None
-        tail_graph_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
-        if (
-            self.tail_writes_source_kv
-            and _is_cuda
-            and tail_graph_rows > 0
-            # Borrowed graph-pool storage forbids capturing mid-serving.
-            and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
-        ):
-            from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
-
-            self.decoder_tail_graphs = DecoderTailGraphs(
-                model=self,
-                layer_ids=range(self.late_layer_start, self.end_layer),
-                row_step=SWA_WINDOW,
-                max_rows=tail_graph_rows,
-            )
-
-    def _tail_graph_plan(
-        self, tail: Optional[LateLayerTail], *, tail_in_graph: bool
-    ) -> bool:
-        """Whether an eager step runs the tail layers from a decoder tail graph;
-        prefill-graph steps keep the tail in their own graph."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        return not (
-            tail is None
-            or tail_in_graph
-            or get_parallel().attn_dp_size > 1
-            or get_is_capture_mode()
-            or is_unified_kv_triton()
-            or get_global_expert_distribution_recorder().recording
-            or not self.decoder_tail_graphs.warm
-            or tail.cp_metadata is not None
-            or self.decoder_tail_graphs.bucket_rows(tail.positions.shape[0]) is None
-        )
+        self.decoder_tail_graphs = DecoderTailGraphs.maybe_create(self)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3883,10 +3846,13 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
-        use_tail_graph = False
-        if self.decoder_tail_graphs is not None and tail is not None:
-            self.decoder_tail_graphs.ready(input_ids.shape[0])
-            use_tail_graph = self._tail_graph_plan(tail, tail_in_graph=tail_in_graph)
+        use_tail_graph = (
+            self.decoder_tail_graphs is not None
+            and tail is not None
+            and self.decoder_tail_graphs.plan(
+                tail, num_tokens=input_ids.shape[0], tail_in_graph=tail_in_graph
+            )
+        )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes

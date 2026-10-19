@@ -1,30 +1,21 @@
 """CUDA graphs of DeepSeek-V4.1's decoder-replay tail on eager prefill steps.
 
 Under decoder SWA bounded replay the layers from ``late_layer_start`` on run over
-each request's last SWA_WINDOW extend rows. An eager prefill step pays one host
-launch per kernel for those few rows, so it replays a breakable graph captured for
-the tail's row bucket (a multiple of SWA_WINDOW) instead. Inside the graph the SWA
-KV store, the attention and the low-ratio sources are eager breaks that read the
-step's live tail metadata and its real row count; everything else reads static
-row buffers shared by every bucket. A bucket is captured on its first use, on
-every TP rank in the same step, into the global graph pool on the global capture
-stream, so it reuses memory the other graphs already hold.
+each request's last SWA_WINDOW extend rows. An eager prefill step replays them
+from a `RowBucketGraphRunner` graph of the tail's row bucket (a multiple of
+SWA_WINDOW) instead of launching each kernel from the host. Inside the graph the
+SWA KV store, the attention and the low-ratio sources are eager breaks that read
+the step's live tail metadata and its real row count.
 """
 
 from __future__ import annotations
 
-import copy
-import logging
-import time
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    set_graph_pool_id,
-)
-from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -36,9 +27,10 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
+from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
+    RowBucketGraphRunner,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    BreakableCUDAGraph,
-    BreakableCUDAGraphCapture,
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
@@ -46,20 +38,15 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.cont
     get_tc_piecewise_forward_context,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils.pool import (
-    get_or_create_global_graph_capture_stream,
-    get_or_create_global_graph_memory_pool,
-    graph_pool_capture_scope,
-    graph_pool_replay_scope,
-)
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models.deepseek_v4_mhc import HcState
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-logger = logging.getLogger(__name__)
 
 _in_tail_graph = False
 
@@ -112,25 +99,9 @@ def _flatten_state(state: HcState):
     return leaves, has_pre, rebuild
 
 
-class _TailGraph:
-    __slots__ = ("graph", "num_token_non_padded", "residual", "pre", "aux", "batch")
-
-    def __init__(self, graph, num_token_non_padded, residual, pre, aux, batch):
-        self.graph = graph
-        # MoE top-k masks rows at or past this count; captured by address.
-        self.num_token_non_padded = num_token_non_padded
-        self.residual = residual
-        self.pre = pre
-        self.aux = aux
-        # The capture step's batch and tail attention metadata: kernels write
-        # buffers cached on them, so the graph keeps them alive.
-        self.batch = batch
-
-
 class DecoderTailGraphs:
-    """Breakable CUDA graphs of the decoder-replay tail layers, keyed by padded
-    tail rows; the static input buffers are sized once for the largest bucket and
-    shared by every bucket."""
+    """The decoder-replay tail layers of one DeepSeek-V4.1 model, run from
+    `RowBucketGraphRunner` graphs on eager prefill steps."""
 
     def __init__(
         self,
@@ -142,34 +113,54 @@ class DecoderTailGraphs:
     ) -> None:
         self._model = model
         self._layer_ids = layer_ids
-        self.row_step = row_step
-        self.max_rows = max_rows - max_rows % row_step
-        self._graphs: dict[tuple, _TailGraph] = {}
-        self._static: dict[tuple, List[torch.Tensor]] = {}
         self._layers = None
-        self._warm = False
-        self.capture_seconds = 0.0
-        self.capture_bytes = 0
+        self.runner = RowBucketGraphRunner(
+            row_step=row_step, max_rows=max_rows, label="Decoder tail graph"
+        )
 
-    def ready(self, num_tokens: int) -> bool:
-        """Whether graphs may run from this step on; every extend forward reports
-        its token count here. Some kernels size cached workspaces lazily by row
-        count and reallocate them when a bigger step comes, which would leave an
-        earlier capture reading freed memory; a forward of a full prefill chunk
-        (the prefill graphs' own capture warmups included) has grown them all."""
-        if not self._warm:
-            chunk = get_schedule().chunked_prefill_size
-            self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
-        return self._warm
-
-    @property
-    def warm(self) -> bool:
-        return self._warm
-
-    def bucket_rows(self, num_rows: int) -> Optional[int]:
-        if num_rows == 0 or num_rows > self.max_rows:
+    @classmethod
+    def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderTailGraphs]:
+        """The tail graphs of a model whose tail writes the source layer's KV, or
+        None where they stay off."""
+        max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
+        if not (
+            model.tail_writes_source_kv
+            and is_cuda()
+            and max_rows > 0
+            # Borrowed graph-pool storage forbids capturing mid-serving.
+            and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
+        ):
             return None
-        return -(-num_rows // self.row_step) * self.row_step
+        from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+        return cls(
+            model=model,
+            layer_ids=range(model.late_layer_start, model.end_layer),
+            row_step=SWA_WINDOW,
+            max_rows=max_rows,
+        )
+
+    def plan(
+        self, tail: LateLayerTail, *, num_tokens: int, tail_in_graph: bool
+    ) -> bool:
+        """Whether this step runs its tail layers from a graph. Every extend step
+        with a tail reports its token count to the warm gate here; prefill-graph
+        steps keep the tail in their own graph."""
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        self.runner.ready(num_tokens)
+        return not (
+            tail_in_graph
+            or get_parallel().attn_dp_size > 1
+            or get_is_capture_mode()
+            or is_unified_kv_triton()
+            or get_global_expert_distribution_recorder().recording
+            or not self.runner.warm
+            or tail.cp_metadata is not None
+            or self.runner.bucket_rows(tail.positions.shape[0]) is None
+        )
 
     def run(
         self,
@@ -184,45 +175,28 @@ class DecoderTailGraphs:
         """Run the tail layers on the tail rows. Returns the materialized residual
         and pre of those rows and the DSpark auxiliary states, all views of graph
         buffers that stay valid until the next replay."""
-        num_rows = positions.shape[0]
-        rows = self.bucket_rows(num_rows)
-        assert rows is not None, num_rows
-        leaves, structure, rebuild = _flatten_state(state)
-        live = [*leaves, positions, input_ids, input_ids_global]
-        shape_key = (structure, tuple((t.dtype, t.shape[1:]) for t in live))
-        static = self._static_inputs(shape_key, live)
-        for buf, t in zip(static, live):
-            buf[:num_rows].copy_(t)
-        key = (rows, capture_dspark, shape_key)
-        # The eager breaks read the step's real row count off this view.
-        tail_batch = copy.copy(forward_batch)
-        tail_batch.global_num_token_non_padded_cpu = num_rows
-        with self._break_context(tail_batch), _tail_graph_scope():
-            if key not in self._graphs:
-                # Largest first, so smaller buckets reuse the pool memory the
-                # larger ones took; a bucket below this step's rows cannot be
-                # captured here (the breaks write every live row).
-                for r in range(self.max_rows, rows - 1, -self.row_step):
-                    if (r, *key[1:]) not in self._graphs:
-                        self._graphs[(r, *key[1:])] = self._capture(
-                            r, num_rows, static, rebuild, forward_batch, capture_dspark
-                        )
-            graph = self._graphs[key]
-            if graph.num_token_non_padded is not None:
-                graph.num_token_non_padded.fill_(num_rows)
-            with graph_pool_replay_scope():
-                graph.graph.replay()
-        pre = None if graph.pre is None else graph.pre[:num_rows]
-        aux = [t[:num_rows] for t in graph.aux]
-        return graph.residual[:num_rows], pre, aux
+        leaves, has_pre, rebuild = _flatten_state(state)
+        num_state = len(leaves)
 
-    def _static_inputs(self, shape_key, live) -> List[torch.Tensor]:
-        static = self._static.get(shape_key)
-        if static is None:
-            static = self._static[shape_key] = [
-                t.new_zeros((self.max_rows, *t.shape[1:])) for t in live
-            ]
-        return static
+        def body(inputs: List[torch.Tensor], batch: ForwardBatch):
+            residual, pre, aux = self._layer_stack(
+                rebuild(inputs[:num_state]),
+                positions=inputs[num_state],
+                input_ids=inputs[num_state + 1],
+                input_ids_global=inputs[num_state + 2],
+                forward_batch=batch,
+                capture_dspark=capture_dspark,
+            )
+            return [residual, pre, *aux]
+
+        residual, pre, *aux = self.runner.run(
+            key=(capture_dspark, has_pre),
+            live=[*leaves, positions, input_ids, input_ids_global],
+            forward_batch=forward_batch,
+            body=body,
+            context=self._break_context,
+        )
+        return residual, pre, aux
 
     @contextmanager
     def _break_context(self, tail_batch: ForwardBatch):
@@ -240,6 +214,7 @@ class DecoderTailGraphs:
                 mha_companion_layers=layers.mha_companion_layers,
             ),
             enable_breakable_cuda_graph(),
+            _tail_graph_scope(),
         ):
             yield
 
@@ -295,107 +270,3 @@ class DecoderTailGraphs:
             residual_batch.clear(forward_batch)
         state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
         return state.residual, state.pre, aux
-
-    def _capture(
-        self,
-        rows: int,
-        num_rows: int,
-        static: List[torch.Tensor],
-        rebuild: Callable[[List[torch.Tensor]], HcState],
-        forward_batch: ForwardBatch,
-        capture_dspark: bool,
-    ) -> _TailGraph:
-        start = time.perf_counter()
-        free_before = torch.cuda.mem_get_info()[0]
-        inputs = [buf[:rows] for buf in static]
-        # The state leaves, then positions, IDs and global IDs.
-        num_state = len(inputs) - 3
-        # The layers read the step's batch; the copy's count tensor is the graph's.
-        # Host-side row counts read during capture cover the whole bucket.
-        capture_batch = copy.copy(forward_batch)
-        capture_batch.global_num_token_non_padded_cpu = rows
-        num_token_non_padded = None
-        if forward_batch.num_token_non_padded is not None:
-            num_token_non_padded = torch.full_like(
-                forward_batch.num_token_non_padded, num_rows
-            )
-            capture_batch.num_token_non_padded = num_token_non_padded
-
-        def body():
-            return self._layer_stack(
-                rebuild(inputs[:num_state]),
-                positions=inputs[num_state],
-                input_ids=inputs[num_state + 1],
-                input_ids_global=inputs[num_state + 2],
-                forward_batch=capture_batch,
-                capture_dspark=capture_dspark,
-            )
-
-        return self._record(
-            body,
-            rows,
-            capture_dspark,
-            num_token_non_padded,
-            capture_batch,
-            start,
-            free_before,
-        )
-
-    def _record(
-        self,
-        body,
-        rows,
-        capture_dspark,
-        num_token_non_padded,
-        capture_batch,
-        start,
-        free_before,
-    ) -> _TailGraph:
-        pool = get_or_create_global_graph_memory_pool(torch.cuda)
-        set_graph_pool_id(pool)
-        tp_group = get_parallel().tp_group
-        graph = BreakableCUDAGraph()
-        with graph_capture(stream=get_or_create_global_graph_capture_stream()) as ctx:
-            # The warmups run eagerly; their KV writes repeat the replay's.
-            for _ in range(2):
-                torch.cuda.synchronize()
-                tp_group.barrier()
-                body()
-            with (
-                graph_pool_capture_scope(),
-                BreakableCUDAGraphCapture(
-                    cuda_graph=graph,
-                    pool=pool,
-                    stream=ctx.stream,
-                    barrier_fn=tp_group.barrier,
-                ),
-            ):
-                residual, pre, aux = body()
-        torch.cuda.current_stream().wait_stream(ctx.stream)
-        torch.cuda.synchronize()
-        tail_graph = _TailGraph(
-            graph,
-            num_token_non_padded,
-            residual,
-            pre,
-            aux,
-            (capture_batch, get_attn_backend().forward_metadata),
-        )
-        seconds = time.perf_counter() - start
-        used = free_before - torch.cuda.mem_get_info()[0]
-        self.capture_seconds += seconds
-        self.capture_bytes += used
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "Decoder tail graph: captured %d rows (dspark=%s, %d segments) in "
-                "%.2f s, %.3f GiB; %d graphs, %.2f s, %.3f GiB",
-                rows,
-                capture_dspark,
-                len(graph._segments),
-                seconds,
-                used / 2**30,
-                len(self._graphs) + 1,
-                self.capture_seconds,
-                self.capture_bytes / 2**30,
-            )
-        return tail_graph
