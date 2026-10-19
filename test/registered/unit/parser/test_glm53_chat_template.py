@@ -508,9 +508,10 @@ class TestAutoParsersFromPythonChatTemplate(CustomTestCase):
         tokenizer = SimpleNamespace(chat_template=jinja_template, get_vocab=dict)
         self.get_tokenizer = Mock(return_value=tokenizer)
         self.get_config = Mock(return_value=_hf_config(architecture))
-        with _patch_hf_transformers_utils(
-            self.get_tokenizer, self.get_config
-        ), self.assertLogs("sglang.srt.parser.template_detection", "INFO") as logs:
+        with (
+            _patch_hf_transformers_utils(self.get_tokenizer, self.get_config),
+            self.assertLogs("sglang.srt.parser.template_detection", "INFO") as logs,
+        ):
             resolve_auto_parsers(server_args)
 
         from sglang.srt.arg_groups.overrides import resolution_result
