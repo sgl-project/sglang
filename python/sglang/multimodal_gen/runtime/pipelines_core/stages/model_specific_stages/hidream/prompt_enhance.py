@@ -154,10 +154,6 @@ def _wrap_result(raw: str, user_input: str) -> dict[str, Any]:
         }
 
 
-# PE calls cost a full LLM generation (minutes cold)
-_PROMPT_CACHE: dict[str, str] = {}
-_PROMPT_CACHE_MAX = 256
-
 _PE_TIMEOUT_SECONDS = 600
 
 
@@ -172,9 +168,6 @@ def _chat_endpoint(base_url: str) -> str:
 def enhance_prompt(prompt: str, base_url: str) -> str:
     """Rewrite `prompt` via the PE server; fall back to the raw prompt on
     any failure so generation never blocks on the enhancement service."""
-    cached = _PROMPT_CACHE.get(prompt)
-    if cached is not None:
-        return cached
     try:
         response = requests.post(
             _chat_endpoint(base_url),
@@ -200,7 +193,4 @@ def enhance_prompt(prompt: str, base_url: str) -> str:
         return prompt
 
     logger.info("Prompt enhanced: %r -> %r", prompt, refined)
-    if len(_PROMPT_CACHE) >= _PROMPT_CACHE_MAX:
-        _PROMPT_CACHE.clear()
-    _PROMPT_CACHE[prompt] = refined
     return refined

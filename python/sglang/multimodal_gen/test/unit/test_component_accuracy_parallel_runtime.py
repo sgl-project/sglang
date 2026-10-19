@@ -137,45 +137,57 @@ def test_srt_attention_tp_group_tracks_diffusion_tp_group():
     # implies -- the shared `srt` vision layers ask for `attn_tp_size`, and this
     # package publishes no `srt` config for that read to resolve against.
     tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+    pp_group = SimpleNamespace(world_size=1, rank_in_group=0)
 
     with (
         patch.object(parallel_state, "_TP", tp_group),
+        patch.object(parallel_state, "_PP", pp_group),
         patch.object(srt_parallel_state, "_TP", None),
         patch.object(srt_parallel_state, "_ATTN_TP", None),
+        patch.object(srt_parallel_state, "_PP", None),
     ):
         parallel_state._sync_srt_tp_group()
 
         assert srt_parallel_state._TP is tp_group
         assert srt_parallel_state._ATTN_TP is tp_group
+        assert srt_parallel_state._PP is pp_group
         assert get_parallel().attn_tp_size == 2
         assert get_parallel().tp_group is tp_group
         assert get_parallel().attn_tp_group is tp_group
         assert get_parallel().tp_rank == 1
         assert get_parallel().attn_tp_rank == 1
+        assert get_parallel().pp_group is pp_group
+        assert get_parallel().pp_size == 1
 
         parallel_state._clear_srt_tp_group()
 
         assert srt_parallel_state._TP is None
         assert srt_parallel_state._ATTN_TP is None
+        assert srt_parallel_state._PP is None
         with pytest.raises(RuntimeError):
             get_parallel().tp_group
+        with pytest.raises(RuntimeError):
+            get_parallel().pp_group
 
 
 def test_srt_owned_groups_are_not_overwritten_or_cleared():
     diffusion_tp_group = object()
     srt_tp_group = object()
     srt_attention_tp_group = object()
+    srt_pp_group = object()
 
     with (
         patch.object(parallel_state, "_TP", diffusion_tp_group),
         patch.object(srt_parallel_state, "_TP", srt_tp_group),
         patch.object(srt_parallel_state, "_ATTN_TP", srt_attention_tp_group),
+        patch.object(srt_parallel_state, "_PP", srt_pp_group),
     ):
         parallel_state._sync_srt_tp_group()
         parallel_state._clear_srt_tp_group()
 
         assert srt_parallel_state._TP is srt_tp_group
         assert srt_parallel_state._ATTN_TP is srt_attention_tp_group
+        assert srt_parallel_state._PP is srt_pp_group
 
 
 @pytest.mark.parametrize("rank", [0, 1])

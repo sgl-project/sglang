@@ -1606,16 +1606,9 @@ class ServerArgs(DisaggServerArgsMixin):
             return False
         default_params = model_info.sampling_param_cls()
 
-        # guidance_scale may be a None sentinel on models that resolve their
-        # recipe per served variant in _adjust (e.g. HiDream); a bare class
-        # instance has no variant context, so treat None as CFG-off.
-        guidance_scale = getattr(default_params, "guidance_scale", 0)
-        if guidance_scale is None:
-            guidance_scale = 0
-
         return (
             getattr(default_params, "negative_prompt", None) is not None
-            and guidance_scale > 1.0
+            and (getattr(default_params, "guidance_scale", 0) or 0) > 1.0
         )
 
     @staticmethod

@@ -7,19 +7,26 @@ No separate text encoder, VAE, or scheduler modules are needed.
 
 from __future__ import annotations
 
+import json
 import math
+import os
+from glob import glob
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
+from safetensors.torch import load_file
+from transformers import AutoProcessor
 
+from sglang.multimodal_gen.configs.models.dits.hidream import HiDreamDitConfig
 from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
     HiDreamPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.hidream import HiDreamSamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.dits.hidream import HiDreamForCausalLM
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -56,24 +63,12 @@ class HiDreamPipeline(ComposedPipelineBase):
         if loaded_modules is not None and {"model", "processor"} <= set(loaded_modules):
             return loaded_modules
 
-        from transformers import AutoProcessor
-
-        from sglang.multimodal_gen.runtime.models.dits.hidream import (
-            HiDreamForCausalLM,
-        )
-
         model_path = self.model_path
         logger.info("Loading HiDream model from %s", model_path)
 
         processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=True
         )
-
-        from sglang.multimodal_gen.configs.models.dits.hidream import (
-            HiDreamDitConfig,
-        )
-        import json
-        import os
 
         config_path = os.path.join(model_path, "config.json")
         with open(config_path, "r") as f:
@@ -83,29 +78,46 @@ class HiDreamPipeline(ComposedPipelineBase):
         model = HiDreamForCausalLM(dit_config, hf_config)
 
         # TP linears shard via param.weight_loader, not load_state_dict
-        from safetensors.torch import load_file
-
         index_path = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.exists(index_path):
             with open(index_path, "r") as f:
                 index = json.load(f)
             weight_files = sorted(set(index["weight_map"].values()))
         else:
-            from glob import glob
             weight_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
 
         params_dict = dict(model.named_parameters())
         loaded_keys = set()
+        # SRT fused layers: (checkpoint suffix, target suffix, shard_id)
+        stacked_mapping = {
+            "self_attn.q_proj.": ("self_attn.qkv_proj.", "q"),
+            "self_attn.k_proj.": ("self_attn.qkv_proj.", "k"),
+            "self_attn.v_proj.": ("self_attn.qkv_proj.", "v"),
+            "mlp.gate_proj.": ("mlp.gate_up_proj.", 0),
+            "mlp.up_proj.": ("mlp.gate_up_proj.", 1),
+        }
         for wf in weight_files:
             shard = load_file(os.path.join(model_path, wf))
             for key, value in shard.items():
                 model_key = key[6:] if key.startswith("model.") else key
+                # reused SRT VisionAttention names the fused layer qkv_proj
+                if ".attn.qkv." in model_key:
+                    model_key = model_key.replace(".attn.qkv.", ".attn.qkv_proj.")
+                shard_id = None
+                for src_suffix, (dst_suffix, sid) in stacked_mapping.items():
+                    if src_suffix in model_key:
+                        model_key = model_key.replace(src_suffix, dst_suffix)
+                        shard_id = sid
+                        break
                 if model_key not in params_dict:
                     continue
                 param = params_dict[model_key]
                 weight_loader = getattr(param, "weight_loader", None)
                 if weight_loader is not None:
-                    weight_loader(param, value)
+                    if shard_id is not None:
+                        weight_loader(param, value, shard_id)
+                    else:
+                        weight_loader(param, value)
                 else:
                     param.data.copy_(value)
                 loaded_keys.add(model_key)

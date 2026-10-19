@@ -14,319 +14,18 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.hidream import HiDreamDitConfig
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum, current_platform
+from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.models.qwen2 import Qwen2MLP
+from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor,
-    cos: torch.Tensor, sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embedding to query and key tensors."""
-    # cos/sin cast to q dtype (official)
-    cos = cos.unsqueeze(unsqueeze_dim).to(q.dtype)
-    sin = sin.unsqueeze(unsqueeze_dim).to(q.dtype)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor,
-    cos: torch.Tensor, sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Vision-specific rotary embedding (float32 precision)."""
-    orig_q_dtype, orig_k_dtype = q.dtype, k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = ((q * cos) + (rotate_half(q) * sin)).to(orig_q_dtype)
-    k_embed = ((k * cos) + (rotate_half(k) * sin)).to(orig_k_dtype)
-    return q_embed, k_embed
-
-
-class HiDreamVisionMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.linear_fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(intermediate_size, hidden_size, bias=True)
-        self.act_fn = nn.GELU("tanh")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
-class HiDreamVisionPatchEmbed(nn.Module):
-    def __init__(self, patch_size: int, temporal_patch_size: int,
-                 in_channels: int, embed_dim: int):
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        kernel_size = [temporal_patch_size, patch_size, patch_size]
-        self.proj = nn.Conv3d(in_channels, embed_dim,
-                              kernel_size=kernel_size, stride=kernel_size, bias=True)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size,
-            self.patch_size, self.patch_size
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
-        return hidden_states
-
-
-class HiDreamVisionRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        return torch.outer(seq, self.inv_freq)
-
-
-class HiDreamVisionPatchMerger(nn.Module):
-    def __init__(self, hidden_size: int, out_hidden_size: int,
-                 spatial_merge_size: int, use_postshuffle_norm: bool = False):
-        super().__init__()
-        self.hidden_size = hidden_size * (spatial_merge_size ** 2)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        self.norm = nn.LayerNorm(
-            self.hidden_size if use_postshuffle_norm else hidden_size, eps=1e-6
-        )
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, out_hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x)
-        x = x.view(-1, self.hidden_size)
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
-class HiDreamVisionAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int):
-        super().__init__()
-        self.dim = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-        self.proj = nn.Linear(hidden_size, hidden_size)
-        self.scaling = self.head_dim ** -0.5
-
-    def forward(
-        self, hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        seq_length = hidden_states.shape[0]
-        q, k, v = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-        q = q.transpose(0, 1).unsqueeze(0)  # [1, seq, heads, head_dim] -> [1, heads, seq, head_dim]
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
-
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        q_splits = q.split(lengths, dim=2)
-        k_splits = k.split(lengths, dim=2)
-        v_splits = v.split(lengths, dim=2)
-
-        attn_outputs = []
-        for q_c, k_c, v_c in zip(q_splits, k_splits, v_splits):
-            out = F.scaled_dot_product_attention(
-                q_c, k_c, v_c, is_causal=False, scale=self.scaling
-            )
-            attn_outputs.append(out)
-        attn_output = torch.cat(attn_outputs, dim=1)
-
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        return self.proj(attn_output)
-
-
-class HiDreamVisionBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, intermediate_size: int):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.attn = HiDreamVisionAttention(hidden_size, num_heads)
-        self.mlp = HiDreamVisionMLP(hidden_size, intermediate_size)
-
-    def forward(
-        self, hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
-
-
-class HiDreamVisionModel(nn.Module):
-    """Full vision encoder with deepstack feature extraction."""
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.spatial_merge_size = cfg.vision_spatial_merge_size
-        self.patch_size = cfg.vision_patch_size
-        self.spatial_merge_unit = self.spatial_merge_size ** 2
-
-        self.patch_embed = HiDreamVisionPatchEmbed(
-            cfg.vision_patch_size, cfg.vision_temporal_patch_size,
-            cfg.vision_in_channels, cfg.vision_hidden_size,
-        )
-        self.pos_embed = nn.Embedding(
-            cfg.vision_num_position_embeddings, cfg.vision_hidden_size
-        )
-        self.num_grid_per_side = int(cfg.vision_num_position_embeddings ** 0.5)
-
-        head_dim = cfg.vision_hidden_size // cfg.vision_num_heads
-        self.rotary_pos_emb = HiDreamVisionRotaryEmbedding(head_dim // 2)
-
-        self.blocks = nn.ModuleList([
-            HiDreamVisionBlock(cfg.vision_hidden_size, cfg.vision_num_heads,
-                               cfg.vision_intermediate_size)
-            for _ in range(cfg.vision_depth)
-        ])
-        self.merger = HiDreamVisionPatchMerger(
-            cfg.vision_hidden_size, cfg.vision_out_hidden_size,
-            cfg.vision_spatial_merge_size, use_postshuffle_norm=False,
-        )
-        self.deepstack_visual_indexes = list(cfg.deepstack_visual_indexes)
-        self.deepstack_merger_list = nn.ModuleList([
-            HiDreamVisionPatchMerger(
-                cfg.vision_hidden_size, cfg.vision_out_hidden_size,
-                cfg.vision_spatial_merge_size, use_postshuffle_norm=True,
-            )
-            for _ in range(len(self.deepstack_visual_indexes))
-        ])
-
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        merge_size = self.spatial_merge_size
-        max_hw = int(grid_thw[:, 1:].max().item())
-        freq_table = self.rotary_pos_emb(max_hw)
-        device = freq_table.device
-        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
-        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
-        offset = 0
-        for num_frames, height, width in grid_thw:
-            merged_h, merged_w = height // merge_size, width // merge_size
-            block_rows = torch.arange(merged_h, device=device)
-            block_cols = torch.arange(merged_w, device=device)
-            intra_row = torch.arange(merge_size, device=device)
-            intra_col = torch.arange(merge_size, device=device)
-            row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
-            col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
-            row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-            col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-            coords = torch.stack((row_idx, col_idx), dim=-1)
-            if num_frames > 1:
-                coords = coords.repeat(num_frames, 1)
-            num_tokens = coords.shape[0]
-            pos_ids[offset: offset + num_tokens] = coords
-            offset += num_tokens
-        embeddings = freq_table[pos_ids]
-        return embeddings.flatten(1)
-
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
-            h_floor, w_floor = h_idxs.int(), w_idxs.int()
-            h_ceil = (h_floor + 1).clip(max=self.num_grid_per_side - 1)
-            w_ceil = (w_floor + 1).clip(max=self.num_grid_per_side - 1)
-            dh, dw = h_idxs - h_floor, w_idxs - w_floor
-            base_h, base_h_c = h_floor * self.num_grid_per_side, h_ceil * self.num_grid_per_side
-            indices = [
-                (base_h[None].T + w_floor[None]).flatten(),
-                (base_h[None].T + w_ceil[None]).flatten(),
-                (base_h_c[None].T + w_floor[None]).flatten(),
-                (base_h_c[None].T + w_ceil[None]).flatten(),
-            ]
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device
-        )
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
-        result = []
-        merge_size = self.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-            result.append(pos_embed)
-        return torch.cat(result)
-
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        hidden_states = self.patch_embed(hidden_states)
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        seq_len = hidden_states.size(0)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        deepstack_feature_lists = []
-        for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens,
-                                position_embeddings=position_embeddings)
-            if layer_num in self.deepstack_visual_indexes:
-                idx = self.deepstack_visual_indexes.index(layer_num)
-                deepstack_feature_lists.append(
-                    self.deepstack_merger_list[idx](hidden_states)
-                )
-        hidden_states = self.merger(hidden_states)
-        return hidden_states, deepstack_feature_lists
 
 
 class HiDreamTextRotaryEmbedding(nn.Module):
@@ -382,18 +81,13 @@ class HiDreamTextAttention(nn.Module):
         self.num_kv_heads = cfg.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
 
-        self.q_proj = ColumnParallelLinear(
-            cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim,
-            bias=cfg.attention_bias, prefix=f"{prefix}.q_proj",
+        self.qkv_proj = QKVParallelLinear(
+            cfg.hidden_size, cfg.head_dim,
+            cfg.num_attention_heads, cfg.num_key_value_heads,
+            bias=cfg.attention_bias, prefix=f"{prefix}.qkv_proj",
         )
-        self.k_proj = ColumnParallelLinear(
-            cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim,
-            bias=cfg.attention_bias, prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj = ColumnParallelLinear(
-            cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim,
-            bias=cfg.attention_bias, prefix=f"{prefix}.v_proj",
-        )
+        self.q_size = cfg.num_attention_heads * cfg.head_dim
+        self.kv_size = cfg.num_key_value_heads * cfg.head_dim
         self.o_proj = RowParallelLinear(
             cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size,
             bias=cfg.attention_bias, prefix=f"{prefix}.o_proj",
@@ -409,11 +103,10 @@ class HiDreamTextAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        q, _ = self.q_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(hidden_shape)).transpose(1, 2)
-        k, _ = self.k_proj(hidden_states)
         k = self.k_norm(k.view(hidden_shape)).transpose(1, 2)
-        v, _ = self.v_proj(hidden_states)
         v = v.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -421,37 +114,14 @@ class HiDreamTextAttention(nn.Module):
         return q, k, v
 
 
-class HiDreamTextMLP(nn.Module):
-    """SiLU gated MLP with TP-optimized projections."""
-
-    def __init__(self, cfg, prefix: str = ""):
-        super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            cfg.hidden_size, cfg.intermediate_size,
-            bias=False, prefix=f"{prefix}.gate_proj",
-        )
-        self.up_proj = ColumnParallelLinear(
-            cfg.hidden_size, cfg.intermediate_size,
-            bias=False, prefix=f"{prefix}.up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            cfg.intermediate_size, cfg.hidden_size,
-            bias=False, prefix=f"{prefix}.down_proj",
-        )
-        self.act_fn = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
-        out, _ = self.down_proj(self.act_fn(gate) * up)
-        return out
-
-
 class HiDreamTextDecoderLayer(nn.Module):
     def __init__(self, cfg, layer_idx: int, prefix: str = ""):
         super().__init__()
         self.self_attn = HiDreamTextAttention(cfg, layer_idx, prefix=f"{prefix}.self_attn")
-        self.mlp = HiDreamTextMLP(cfg, prefix=f"{prefix}.mlp")
+        self.mlp = Qwen2MLP(
+            cfg.hidden_size, cfg.intermediate_size, "silu",
+            prefix=f"{prefix}.mlp",
+        )
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
@@ -624,7 +294,10 @@ class HiDreamForCausalLM(BaseDiT):
         self.num_attention_heads = ac.num_attention_heads
         self.num_channels_latents = ac.num_channels_latents
 
-        self.visual = HiDreamVisionModel(ac)
+        self.visual = Qwen3VLMoeVisionModel(
+            Qwen3VLVisionConfig(**hf_config["vision_config"]),
+            prefix="visual",
+        )
 
         self.language_model = HiDreamTextModel(ac, prefix="language_model")
 
@@ -648,9 +321,12 @@ class HiDreamForCausalLM(BaseDiT):
         self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         pixel_values = pixel_values.to(self.visual.patch_embed.proj.weight.dtype)
-        image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        visual_out = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size ** 2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
+        image_embeds = torch.split(visual_out[..., : self.hidden_size], split_sizes)
+        deepstack_image_embeds = list(visual_out[..., self.hidden_size :].chunk(
+            len(self.visual.deepstack_visual_indexes), dim=-1
+        ))
         return image_embeds, deepstack_image_embeds
 
     def get_placeholder_mask(
@@ -701,9 +377,11 @@ class HiDreamForCausalLM(BaseDiT):
             hidden_shape = (*input_shape, -1, head_dim)
             attn = decoder_layer.self_attn
 
-            q = attn.q_norm(attn.q_proj(normed)[0].view(hidden_shape)).transpose(1, 2)
-            k = attn.k_norm(attn.k_proj(normed)[0].view(hidden_shape)).transpose(1, 2)
-            v = attn.v_proj(normed)[0].view(hidden_shape).transpose(1, 2)
+            qkv, _ = attn.qkv_proj(normed)
+            q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+            q = attn.q_norm(q.view(hidden_shape)).transpose(1, 2)
+            k = attn.k_norm(k.view(hidden_shape)).transpose(1, 2)
+            v = v.view(hidden_shape).transpose(1, 2)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
             num_heads = q.shape[1]

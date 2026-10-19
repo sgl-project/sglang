@@ -2722,10 +2722,6 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        # Mirror the eager-path condition below: only take the sinks/FIA branch
-        # when sinks are provided, or FIA can handle a sink-less SWA layer.
-        # Otherwise a sink-less SWA layer would reach attention_sinks_triton
-        # with sinks=None and crash inside the Triton kernel.
         if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):

@@ -7,7 +7,6 @@ import os
 from typing import cast
 
 from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
@@ -25,12 +24,7 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
         required=False,
         help="Read CLI options from a config JSON or YAML file.",
     )
-    parser = ServerArgs.add_cli_args(parser)
-    # Sampling CLI args (e.g. --num-inference-steps) are accepted on serve so
-    # a server-side default can be set for requests, matching the generate
-    # and webui commands that stack the same two arg sets.
-    parser = SamplingParams.add_cli_args(parser)
-    return parser
+    return ServerArgs.add_cli_args(parser)
 
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
