@@ -4,7 +4,6 @@
 from .attn import (
     fused_store_cache,
     get_paged_mqa_logits_metadata,
-    triton_create_paged_compress_data,
 )
 from .compress import (
     CompressorDecodePlan,
@@ -44,7 +43,6 @@ __all__ = [
     "fused_k_norm_rope_flashmla",
     "make_name",
     "get_paged_mqa_logits_metadata",
-    "triton_create_paged_compress_data",
     "topk_transform_paged",
     "topk_transform_kpool_v2",
     "topk_transform_kpool_ragged_v2",
