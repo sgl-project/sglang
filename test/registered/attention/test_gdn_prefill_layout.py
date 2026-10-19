@@ -11,9 +11,10 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=6, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

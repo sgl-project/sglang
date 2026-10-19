@@ -169,7 +169,8 @@ _is_xpu = is_xpu()
 # plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
 # layout is handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
-# tuple so their control flow is unchanged.
+# tuple so their control flow is unchanged. Plain extend batches skip the fused
+# kernel on both CUDA and HIP and use qwen3_5_gdn_prefill_projection_views.
 _GDN_FUSED_QKVZBA_RATIOS = (
     (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
 )
