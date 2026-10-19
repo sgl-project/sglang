@@ -256,15 +256,16 @@ class PageInterleaveKVPoolMixin:
         # Per-request page samples. One logical page per position-page
         # (whole-page draws + ps-aligned chunk starts), so stride-ps sampling
         # enumerates each request's pages in position order — no run
-        # collapsing. block_pages (the padded allgather block) is the
-        # sync-free host bound sum_i ceil(K_i / N): each request's prefix is
+        # collapsing. Initially bound the padded allgather block by the
+        # sync-free host sum_i ceil(K_i / N): each request's prefix is
         # ONE cyclic rotation run (graft-declined inserts + per-request
         # bases), so a rank owns at most ceil(K_i / N) of its pages, and the
-        # cross-request dedup below only shrinks per-rank counts.
+        # cross-request dedup below can tighten this bound further.
         empty = torch.empty((0,), dtype=torch.int64, device=self.device)
         prefix_parts = []
         chunk_parts = []
         block_pages = 0
+        longest_prefix_pages = 0
         for i in range(len(prefix_lens_cpu)):
             prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
             assert prefix_len % ps == 0, (
@@ -277,6 +278,7 @@ class PageInterleaveKVPoolMixin:
                 pages_i = row[:prefix_len:ps].long() // ps
                 prefix_parts.append(pages_i)
                 block_pages += ceil_div(prefix_len // ps, shard_size)
+                longest_prefix_pages = max(longest_prefix_pages, prefix_len // ps)
                 if self._debug_plan_checks:
                     # Owner-congruence: each request's prefix owners must be
                     # exactly cyclic — the block bound above relies on it. A
@@ -305,6 +307,18 @@ class PageInterleaveKVPoolMixin:
         chunk_pages = torch.cat(chunk_parts) if chunk_parts else empty
         n_prefix = prefix_pages.numel()
         n_chunk = chunk_pages.numel()
+        # The longest cyclic prefix contributes at most ceil(K / N) pages
+        # to any owner. Even if every remaining unique page belongs to that
+        # owner, its count cannot exceed ceil(K / N) + (U - K). For nested
+        # prefixes U == K, so sharing no longer multiplies the padded gather.
+        # Both bounds are rank-independent; U is already available from the
+        # existing unique operation, with no additional device-to-host read.
+        block_pages = min(
+            block_pages,
+            ceil_div(longest_prefix_pages, shard_size)
+            + n_prefix
+            - longest_prefix_pages,
+        )
         n_prefix_slots = shard_size * block_pages
         assert n_prefix_slots * ps <= spec.max_prefix_tokens, (
             f"prefix ({n_prefix} pages, padded gather span "

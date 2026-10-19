@@ -1034,6 +1034,101 @@ def _reference_prefix_slots(per_request_prefix_pages):
 
 
 class TestBeginShardExtendPlan(CustomTestCase):
+    def test_random_shared_branches_fit_every_owner(self):
+        import random
+
+        rng = random.Random(43098)
+        for case in range(100):
+            base = rng.randrange(N)
+            shared = _chain_pages(base=base, n_pages=rng.randrange(1, 33))
+            chains = []
+            for request in range(rng.randrange(1, 9)):
+                if rng.randrange(2):
+                    chains.append(shared[: rng.randrange(1, len(shared) + 1)])
+                else:
+                    tail = _chain_pages(
+                        base=(base + len(shared)) % N,
+                        n_pages=rng.randrange(1, 10),
+                        local_start=100 + request * 16,
+                    )
+                    chains.append(shared + tail)
+            rows = [_chain_row(pages, len(pages) * PS) for pages in chains]
+            unique = set(sum(chains, []))
+            old_bound = sum(ceil_div(len(pages), N) for pages in chains)
+            blocks = []
+            for rank in range(N):
+                with self.subTest(case=case, rank=rank):
+                    stub = _run_begin(
+                        _make_pool_stub(_make_spec(), rank),
+                        [len(pages) * PS for pages in chains],
+                        [len(pages) * PS for pages in chains],
+                        rows,
+                    )
+                    blocks.append(stub._block_pages)
+                    own = sorted(page // N for page in unique if page % N == rank)
+                    self.assertLessEqual(len(own), stub._block_pages)
+                    self.assertLessEqual(stub._block_pages, old_bound)
+                    self.assertEqual(stub._send_pages[: len(own)].tolist(), own)
+                    self.assertTrue(torch.all(stub._send_pages[len(own) :] == 0))
+            self.assertEqual(len(set(blocks)), 1)
+
+    def test_nested_prefixes_do_not_multiply_gather(self):
+        # Different request lengths still reference one physical prefix.
+        # The longest prefix has an uneven owner distribution, including
+        # a nonzero rotation base; all ranks must choose the same block.
+        pages = _chain_pages(base=2, n_pages=31)
+        lengths = [31, 3, 17, 31, 9, 30, 31, 1]
+        rows = [_chain_row(pages[:length], length * PS) for length in lengths]
+        for rank in range(N):
+            with self.subTest(rank=rank):
+                stub = _run_begin(
+                    _make_pool_stub(_make_spec(), rank),
+                    [length * PS for length in lengths],
+                    [length * PS for length in lengths],
+                    rows,
+                )
+                self.assertEqual(stub._block_pages, 8)
+                self.assertEqual(stub._send_rows.numel(), 8 * PS)
+                own = sorted(p // N for p in pages if p % N == rank)
+                self.assertEqual(stub._send_pages[: len(own)].tolist(), own)
+                self.assertTrue(torch.all(stub._send_pages[len(own) :] == 0))
+                for owner in range(N):
+                    owned = sorted(p for p in pages if p % N == owner)
+                    for offset, page in enumerate(owned):
+                        self.assertEqual(int(stub._page_pos[page]), owner * 8 + offset)
+
+    def test_unique_pages_cannot_be_evenly_divided_between_owners(self):
+        # Three unrelated one-page branches all belong to rank 0. Dividing
+        # the unique-page count by N would underallocate its send block.
+        chains = [[4, 5, 6, 7], [8], [12], [16]]
+        rows = [_chain_row(pages, len(pages) * PS) for pages in chains]
+        for rank in range(N):
+            stub = _run_begin(
+                _make_pool_stub(_make_spec(), rank),
+                [len(pages) * PS for pages in chains],
+                [len(pages) * PS for pages in chains],
+                rows,
+            )
+            self.assertEqual(stub._block_pages, 4)
+            if rank == 0:
+                self.assertEqual(stub._send_pages.tolist(), [1, 2, 3, 4])
+
+    def test_shared_prefix_with_private_tail_keeps_every_page(self):
+        prefix = _chain_pages(base=1, n_pages=16)
+        chains = [prefix, prefix, prefix + [81], prefix + [85]]
+        rows = [_chain_row(pages, len(pages) * PS) for pages in chains]
+        for rank in range(N):
+            stub = _run_begin(
+                _make_pool_stub(_make_spec(), rank),
+                [len(pages) * PS for pages in chains],
+                [len(pages) * PS for pages in chains],
+                rows,
+            )
+            self.assertEqual(stub._block_pages, 6)
+            own = sorted(p // N for p in set(sum(chains, [])) if p % N == rank)
+            self.assertEqual(stub._send_pages[: len(own)].tolist(), own)
+            self.assertTrue(torch.all(stub._send_pages[len(own) :] == 0))
+
     def test_plan_with_rotated_prefix(self):
         """7 prefix pages of a base-2 chain + 9 chunk pages (last partial):
         owner-major slots, send rows owner-filtered in the same order and
@@ -1562,6 +1657,28 @@ def _run_mla(rank, world, port):
                 all_locs + layer_id * 1000, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE
             ),
         )
+
+    # Rebuild the plan across epochs with eight requests sharing the same
+    # stored prefix. Exercise both identical and nested prefixes over real
+    # NCCL, after the preceding epoch has used the same two scratch slots.
+    for lengths in ([prefix_len] * 8, [prefix_len, _GATHER_GRANULE] * 4):
+        table = req_to_token[:, :prefix_len].repeat(8, 1)
+        pool.begin_shard_extend(table, torch.arange(8), lengths, lengths)
+        assert pool._block_pages == prefix_len // _GATHER_GRANULE
+        for layer_id in range(_GATHER_LAYER_NUM):
+            scratch = pool.get_key_buffer(layer_id)
+            for row, length in zip(table, lengths):
+                locs = row[:length].long()
+                translated = pool.translate_loc_to_scratch(locs)
+                _check(
+                    rank,
+                    f"mla shared prefix epoch={pool._epoch} layer={layer_id}",
+                    scratch[translated, 0, :],
+                    _mla_value(
+                        locs + layer_id * 1000,
+                        _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE,
+                    ),
+                )
 
     torch.distributed.barrier()
     if rank == 0:
