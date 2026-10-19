@@ -28,6 +28,12 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def resets_swa_window(req) -> bool:
+    """Whether this step starts the request's SWA window: a new request slot or a
+    retraction. The prefill budget and `encoder_swa_reset` both read this."""
+    return req.kv.req_pool_idx is None or req.is_retracted
+
+
 def replay_len(prefix_len: int) -> int:
     """Cached tokens replayed in front of a hit's extend: the last SWA window.
     The prefill budget, the MLP-sync row count and the fold all read this."""
