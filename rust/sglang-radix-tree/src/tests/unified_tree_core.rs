@@ -3107,38 +3107,46 @@ fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
 }
 
 #[test]
-fn split_of_a_pending_node_transfers_the_ack_and_emits_the_replace_action() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
-    let node = tc
-        .match_prefix(&match_params(&vec![1, 2, 3]))
-        .best_match_node_id;
-    tc.mark_write_through_pending(vec![node], /* ack_id = */ node)
-        .expect("live test node");
-    let (new_node, action) = tc.split_node_(
-        tc.arena.resolve(node).expect("live test node"),
-        /* split_len = */ 1,
-    );
-    assert_eq!(tc.arena.node(new_node).write_through_pending_id, Some(node));
-    assert_eq!(
-        tc.arena
-            .node(tc.arena.resolve(node).expect("live test node"))
-            .write_through_pending_id,
-        Some(node)
-    );
-    match action {
-        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
-            ack_id,
-            old_node_id,
-            new_node_id,
-            new_child_node_id,
-        }) => {
-            assert_eq!(ack_id, node);
-            assert_eq!(old_node_id, node);
-            assert_eq!(new_node_id, tc.arena.node(new_node).id);
-            assert_eq!(new_child_node_id, node);
+fn split_updates_pending_backup_with_or_without_a_tree_ack() {
+    for buffer_only in [false, true] {
+        for pending in [false, true] {
+            let mut tc = core();
+            if buffer_only {
+                tc.set_host_memory_buffer_only();
+            }
+            tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+            let tail_id = tc
+                .match_prefix(&match_params(&vec![1, 2, 3]))
+                .best_match_node_id;
+            if pending {
+                tc.mark_write_through_pending(vec![tail_id], tail_id)
+                    .unwrap();
+            }
+            let result = tc.match_prefix(&match_params(&vec![1]));
+            let prefix_id = result.best_match_node_id;
+            assert_ne!(prefix_id, tail_id);
+            if pending || buffer_only {
+                assert!(matches!(
+                    result.cache_actions.as_slice(),
+                    [CacheAction::UpdatePendingBackupOnNodeSplit {
+                        ack_id,
+                        old_node_id,
+                        new_node_id,
+                        new_child_node_id,
+                    }] if *ack_id == pending.then_some(tail_id) && *old_node_id == tail_id
+                        && *new_node_id == prefix_id && *new_child_node_id == tail_id
+                ));
+            } else {
+                assert!(result.cache_actions.is_empty());
+            }
+            for node_id in [prefix_id, tail_id] {
+                let node = tc.arena.node(tc.arena.resolve(node_id).unwrap());
+                assert_eq!(node.write_through_pending_id, pending.then_some(tail_id));
+            }
+            if !pending {
+                tc.sanity_check(&[], &[]);
+            }
         }
-        other => panic!("expected the replace action, got {:?}", other.is_some()),
     }
 }
 
@@ -4014,12 +4022,12 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
         .cache_actions
         .iter()
         .find_map(|action| match action {
-            CacheAction::ReplaceWriteThroughOnNodeSplit {
+            CacheAction::UpdatePendingBackupOnNodeSplit {
                 ack_id,
                 new_node_id,
                 ..
             } => {
-                assert_eq!(*ack_id, leaf);
+                assert_eq!(*ack_id, Some(leaf));
                 Some(*new_node_id)
             }
             _ => None,
@@ -4483,7 +4491,7 @@ fn insert_host_refill_preserves_split_actions_and_lengths() {
     assert!(!result.host_insert_dropped);
     assert!(matches!(
         result.cache_actions.as_slice(),
-        [CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id, .. }] if *ack_id == leaf
+        [CacheAction::UpdatePendingBackupOnNodeSplit { ack_id, .. }] if *ack_id == Some(leaf)
     ));
 }
 

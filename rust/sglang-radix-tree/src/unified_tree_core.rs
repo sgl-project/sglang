@@ -307,13 +307,14 @@ pub enum CacheAction {
     FreeDeviceKVFullOnly(Vec<Tensor>),
     /// A device->host backup work item (the write-through threshold fired).
     BackupKV(BackupKV),
-    /// Replace the pending write-through node on a node split:
+    /// Update cache-side write bookkeeping after a node split:
     ///
     ///     parent -> node    =>    parent -> new_node -> new_child
     ///
     /// old_node_id (the pre-split node) is replaced by new_node_id + new_child_node_id.
-    ReplaceWriteThroughOnNodeSplit {
-        ack_id: usize,
+    UpdatePendingBackupOnNodeSplit {
+        /// None when buffer-only bookkeeping has no tree-tracked write.
+        ack_id: Option<usize>,
         old_node_id: NodeId,
         new_node_id: NodeId,
         new_child_node_id: NodeId,
@@ -1847,7 +1848,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             action,
             CacheAction::FreeDeviceKV(_)
                 | CacheAction::FreeDeviceKVFullOnly(_)
-                | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
+                | CacheAction::UpdatePendingBackupOnNodeSplit { .. }
         )
     }
 
@@ -2210,10 +2211,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.arena.node_mut(new_node_id).load_back_pending_id =
             self.arena.node(child_id).load_back_pending_id;
 
-        // A split of a backuped node tells the cache to fix its publish list.
-        let action = if let Some(ack_id) = self.arena.node(child_id).write_through_pending_id {
+        let ack_id = self.arena.node(child_id).write_through_pending_id;
+        if let Some(ack_id) = ack_id {
             self.arena.node_mut(new_node_id).write_through_pending_id = Some(ack_id);
-            Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
+        }
+        // Buffer-only writes are tracked by the cache rather than a node ack.
+        let action = if ack_id.is_some() || self.is_host_memory_buffer_only {
+            Some(CacheAction::UpdatePendingBackupOnNodeSplit {
                 ack_id,
                 old_node_id: self.arena.node(child_id).id,
                 new_node_id: self.arena.node(new_node_id).id,

@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
@@ -1269,7 +1269,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Fire-and-forget actions safe to batch until the next barrier."""
         return isinstance(
             action,
-            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+            (FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit),
         )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
@@ -1478,12 +1478,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        # A split of a backuped node tells the cache to fix its publish list.
+        # Buffer-mode dependencies are tracked by the cache, without an ack here.
         action: Optional[CacheAction | ComponentAction] = None
-        if child.write_through_pending_id is not None:
-            ack_id = child.write_through_pending_id
+        ack_id = child.write_through_pending_id
+        if ack_id is not None:
             new_node.write_through_pending_id = ack_id
-            action = ReplaceWriteThroughOnNodeSplit(
+        if ack_id is not None or self.is_host_memory_buffer_only:
+            action = UpdatePendingBackupOnNodeSplit(
                 ack_id=ack_id,
                 old_node_id=child.id,
                 new_node_id=new_node.id,

@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
@@ -2078,10 +2078,10 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
 
     def test_apply_cache_actions_applies_each_in_order(self):
         cache = mock.MagicMock()
-        first = ReplaceWriteThroughOnNodeSplit(
+        first = UpdatePendingBackupOnNodeSplit(
             ack_id=1, old_node_id=1, new_node_id=2, new_child_node_id=1
         )
-        second = ReplaceWriteThroughOnNodeSplit(
+        second = UpdatePendingBackupOnNodeSplit(
             ack_id=2, old_node_id=3, new_node_id=4, new_child_node_id=3
         )
         UnifiedRadixCache._apply_cache_actions(cache, [first, second])
@@ -2096,21 +2096,20 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         def make_cache():
             cache = mock.MagicMock()
             cache.ongoing_write_through = {7: _OngoingWriteThrough(10, None, [5, 10])}
+            cache._replace_pending_write_through_node = lambda *args: (
+                UnifiedRadixCache._replace_pending_write_through_node(cache, *args)
+            )
+            cache.components = {ComponentType.FULL: mock.Mock()}
             return cache
 
         def apply(cache, action):
-            UnifiedRadixCache._replace_pending_write_through_node(
-                cache,
-                action.ack_id,
-                action.old_node_id,
-                [action.new_node_id, action.new_child_node_id],
-            )
+            UnifiedRadixCache._apply_cache_action(cache, action)
 
         # split X(10) -> [A(11), X(10)], then fragment A(11) -> [B(12), A(11)]
-        first = ReplaceWriteThroughOnNodeSplit(
+        first = UpdatePendingBackupOnNodeSplit(
             ack_id=7, old_node_id=10, new_node_id=11, new_child_node_id=10
         )
-        second = ReplaceWriteThroughOnNodeSplit(
+        second = UpdatePendingBackupOnNodeSplit(
             ack_id=7, old_node_id=11, new_node_id=12, new_child_node_id=11
         )
 
@@ -2121,6 +2120,12 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         self.assertEqual(
             cache.ongoing_write_through[7].publish_node_ids, [5, 12, 11, 10]
         )
+        cache.linker.replace_pending_offload_node.assert_has_calls(
+            [mock.call(7, 10, [11, 10]), mock.call(7, 11, [12, 11])]
+        )
+        receiver = cache.components[ComponentType.FULL].apply_component_action
+        self.assertEqual(receiver.call_args_list, [mock.call(first), mock.call(second)])
+        self.assertEqual(cache.linker.replace_pending_offload_node.call_count, 2)
 
         # reversed order silently drops the second fragment - documents why
         # emission order must be preserved end to end
@@ -2128,6 +2133,21 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         apply(cache, second)
         apply(cache, first)
         self.assertEqual(cache.ongoing_write_through[7].publish_node_ids, [5, 11, 10])
+
+    def test_split_action_without_ack_still_reaches_full(self):
+        cache = mock.MagicMock()
+        component = _component_with_cache(ComponentType.FULL, cache)
+        component.apply_component_action = mock.Mock(
+            wraps=component.apply_component_action
+        )
+        cache.components = {ComponentType.FULL: component}
+        action = UpdatePendingBackupOnNodeSplit(
+            ack_id=None, old_node_id=10, new_node_id=11, new_child_node_id=10
+        )
+        UnifiedRadixCache._apply_cache_action(cache, action)
+        component.apply_component_action.assert_called_once_with(action)
+        cache._replace_pending_write_through_node.assert_not_called()
+        cache.linker.replace_pending_offload_node.assert_not_called()
 
 
 class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):

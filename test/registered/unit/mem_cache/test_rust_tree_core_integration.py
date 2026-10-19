@@ -61,12 +61,13 @@ from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
+    ComponentAction,
     FreeComponentHostSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     RecoverSWAWithLockedFull,
-    ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
@@ -4146,7 +4147,7 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
     actions = core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
     assert len(actions) == 2
     for action in actions:
-        assert isinstance(action, ReplaceWriteThroughOnNodeSplit)
+        assert isinstance(action, UpdatePendingBackupOnNodeSplit)
         assert action.ack_id == leaf
         assert action.old_node_id == leaf
         assert action.new_child_node_id == leaf
@@ -4651,23 +4652,104 @@ def root_child(core):
     return core.match_prefix(MatchPrefixParams(key=_key([1]))).last_host_node
 
 
-def test_split_of_a_write_through_pending_node_crosses_the_replace_action():
-    core = _tree_core()
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("mode", ["pending", "buffer", "both", "ordinary"])
+@pytest.mark.parametrize("split_by", ["insert", "match"])
+def test_split_pending_backup_action(backend, mode, split_by):
+    core = _tree_core(backend)
     core.set_hicache_enabled()
+    has_ack = mode in ("pending", "both")
+    has_buffer = mode in ("buffer", "both")
+    if has_buffer:
+        core.set_host_memory_buffer_only()
     _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
     leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4]))).best_match_node
-    core.mark_write_through_pending([leaf], ack_id=leaf)
-    # A divergent prefix splits the pending node; the publish list must follow.
-    result = _insert(core, [1, 2], [10, 11])
-    (replace,) = [
+    if has_ack:
+        core.mark_write_through_pending([leaf], ack_id=leaf)
+    # Both insertion and matching can split the existing node.
+    if split_by == "insert":
+        result = _insert(core, [1, 2], [10, 11])
+    else:
+        result = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    split_actions = [
         action
         for action in result.cache_actions
-        if isinstance(action, ReplaceWriteThroughOnNodeSplit)
+        if isinstance(action, UpdatePendingBackupOnNodeSplit)
     ]
-    assert replace.ack_id == leaf
-    assert replace.old_node_id == leaf
-    assert replace.new_child_node_id == leaf
-    assert replace.new_node_id != leaf
+    assert len(split_actions) == int(has_ack or has_buffer)
+    (path,) = core.collect_path_info([leaf])
+    prefix, suffix = [node.node_id for node in path]
+    assert suffix == leaf and prefix != leaf
+    if split_actions:
+        (split_action,) = split_actions
+        assert split_action.ack_id == (leaf if has_ack else None)
+        assert split_action.old_node_id == leaf
+        assert split_action.new_node_id == prefix
+        assert split_action.new_child_node_id == leaf
+        assert isinstance(split_action, ComponentAction)
+        assert split_action.component_type == ComponentType.FULL
+    if backend == "python":
+        assert [
+            core.node_by_id(node_id).write_through_pending_id
+            for node_id in (prefix, leaf)
+        ] == [leaf if has_ack else None] * 2
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("window", [1, 8])
+def test_fresh_swa_leaf_forwards_buffer_split_action(backend, window):
+    core, _ = _swa_transfer_core(backend, window=window)
+    core.set_host_memory_buffer_only()
+    result = _pump_insert(
+        core,
+        InsertParams(
+            key=_key([1, 2, 3, 4]),
+            value=torch.tensor([10, 11, 12, 13]),
+            component_evicted_seqlens={ComponentType.SWA: 2},
+        ),
+    )
+    splits = [
+        action
+        for action in result.cache_actions
+        if isinstance(action, UpdatePendingBackupOnNodeSplit)
+    ]
+    assert len(splits) == (2 if window == 1 else 1)
+    for split in splits:
+        assert split.ack_id is None
+        assert split.old_node_id == split.new_child_node_id == result.last_device_node
+    (path,) = core.collect_path_info([result.last_device_node])
+    assert [node.node_id for node in path] == [
+        *[split.new_node_id for split in splits],
+        result.last_device_node,
+    ]
+    assert [(node.path_start, node.path_end) for node in path] == (
+        [(0, 2), (2, 3), (3, 4)] if window == 1 else [(0, 2), (2, 4)]
+    )
+    rebuilds = [a for a in result.cache_actions if isinstance(a, SWARebuild)]
+    assert [rebuild.node_id for rebuild in rebuilds] == [
+        part.node_id for part in path[1:]
+    ]
+    assert torch.cat([rebuild.source_value for rebuild in rebuilds]).tolist() == [
+        12,
+        13,
+    ]
+    assert result.cache_actions.index(splits[-1]) < result.cache_actions.index(
+        rebuilds[0]
+    )
+
+
+def test_python_fresh_swa_leaf_cap_rejects_write_through_ack():
+    core, _ = _swa_transfer_core("python", window=2)
+    core.set_host_memory_buffer_only()
+    leaf = core._add_new_node(
+        core.root_node, _key([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13])
+    )
+    core.mark_write_through_pending([leaf.id], ack_id=leaf.id)
+    swa = core.components_by_type[ComponentType.SWA]
+    with pytest.raises(
+        AssertionError, match="fresh SWA leaf cannot be write-through-pending"
+    ):
+        swa._maybe_split_leaf_for_swa_lock(leaf, [])
 
 
 def test_write_through_threshold_assignment_reaches_the_core():

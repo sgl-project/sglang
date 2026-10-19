@@ -525,7 +525,11 @@ class SWAComponent(TreeComponent):
             )
             if live_start is None:
                 continue
-            parent = self._maybe_split_leaf_for_swa_lock(fragment) if cap_leaf else None
+            parent = (
+                self._maybe_split_leaf_for_swa_lock(fragment, cache_actions)
+                if cap_leaf
+                else None
+            )
             # Older fragments publish first so the tail remains more-MRU.
             if parent is not None:
                 self._publish_window(node=parent, cache_actions=cache_actions)
@@ -587,7 +591,9 @@ class SWAComponent(TreeComponent):
         )
 
     def _maybe_split_leaf_for_swa_lock(
-        self, leaf: UnifiedTreeNode
+        self,
+        leaf: UnifiedTreeNode,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> Optional[UnifiedTreeNode]:
         """Cap a fresh in-window SWA leaf at one page-aligned window so locking it pins
         only one window of SWA pool, not the whole (long chunked-prefill) leaf; return
@@ -610,7 +616,11 @@ class SWAComponent(TreeComponent):
             return None
 
         new_parent, action = self.tree_core._split_node(leaf.key, leaf, split_at)
-        assert action is None, "fresh SWA leaf cannot be write-through-pending"
+        assert action is None or action.ack_id is None, (
+            "fresh SWA leaf cannot be write-through-pending"
+        )
+        if action is not None:
+            cache_actions.append(action)
         return new_parent
 
     def redistribute_on_node_split(
