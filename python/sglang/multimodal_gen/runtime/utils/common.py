@@ -246,7 +246,7 @@ def get_zmq_socket(
                         # Last attempt failed
                         logger.error(
                             f"Failed to bind ZMQ socket after {max_bind_retries} attempts. "
-                            f"Original endpoint: {endpoint}, Last tried port: {original_port + attempt * 42}"
+                            f"Original endpoint: {endpoint}, last tried: {current_endpoint}"
                         )
                         raise
                     else:
