@@ -1018,6 +1018,12 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
+# DeepSeek-V4.1's prefill graph captures the ratio-1/2 indexer at this context width
+# unless any context replays: the candidate window (2,048 blocks of 8 tokens), inside
+# which the captured full top-k equals the two-level selection.
+_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
+
+
 def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
@@ -1620,7 +1626,7 @@ class DeepseekV4AttnBackend(
         self, core: DSV4AttnMetadata, compress_ratio: int
     ) -> PagedIndexerMetadata:
         num_pages = core.page_table.shape[1]
-        max_seq_len = _prefill_graph_max_seq_len()
+        max_seq_len = self._prefill_graph_seq_limit()
         if max_seq_len is not None:
             num_pages = min(max_seq_len // self.page_size, num_pages)
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(compress_ratio)
@@ -1655,14 +1661,11 @@ class DeepseekV4AttnBackend(
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
-        max_seq_len = _prefill_graph_max_seq_len()
+        max_seq_len = self._prefill_graph_seq_limit()
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+        if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
-        if (
-            int(seq_lens_cpu.max().item()) > max_seq_len
-            and not self.prefill_cuda_graph_context_unbounded
-        ):
+        if max_seq_len is not None and int(seq_lens_cpu.max().item()) > max_seq_len:
             return False
         if self.enable_decoder_swa_bounded_replay:
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -3002,13 +3005,13 @@ class DeepseekV4AttnBackend(
         """The context width of the prefill graph's metadata, for the full rows and
         the late-layer tail alike: the live context when any context replays, else
         the captured width bounded by the graph's context limit."""
-        if self.prefill_cuda_graph_context_unbounded:
+        if self._prefill_graph_replays_any_context():
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         if self.low_ratios == (1, 2):
-            graph_context_limit = _prefill_graph_max_seq_len()
+            graph_context_limit = self._prefill_graph_seq_limit()
             if graph_context_limit is not None:
                 max_seq_len = min(max_seq_len, graph_context_limit)
         return max_seq_len
@@ -3816,8 +3819,7 @@ class DeepseekV4AttnBackend(
         indexer metadata by address."""
         return isinstance(self.prefill_candidates, SparseTableBackend)
 
-    @property
-    def prefill_cuda_graph_context_unbounded(self) -> bool:
+    def _prefill_graph_replays_any_context(self) -> bool:
         """Whether a prefill graph replay admits any context length: with two-level
         candidates only c4/c128 compress metadata would be captured at a width."""
         return (
@@ -3826,6 +3828,27 @@ class DeepseekV4AttnBackend(
             and not self.has_c4
             and not self.has_c128
         )
+
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        """DeepSeek-V4.1 bounds the replayed context by the captured indexer width
+        unless any context replays; prefill context parallelism builds its own
+        metadata and needs no bound."""
+        if (
+            self.low_ratios != (1, 2)
+            or get_parallel().attn_cp_size > 1
+            or self._prefill_graph_replays_any_context()
+        ):
+            return None
+        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
+
+    def _prefill_graph_seq_limit(self) -> Optional[int]:
+        """The replayed context limit: cuda_graph_config[prefill].max_seq_len when
+        the user sets it, else this backend's default."""
+        max_seq_len = _prefill_graph_max_seq_len()
+        if max_seq_len is not None:
+            return max_seq_len
+        return self.prefill_cuda_graph_default_max_seq_len
 
     def _prefill_graph_full_topk_break(self, layer, x, q_lora, pos, forward_batch):
         """Eager break of the prefill CUDA graph: one full top-k layer's dense

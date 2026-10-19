@@ -171,9 +171,10 @@ class AttentionBackend(ABC):
 
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
-    # True when a prefill graph replays any context length; the backend's
-    # can_run_prefill_cuda_graph then judges the context instead of the runner.
-    prefill_cuda_graph_context_unbounded: bool = False
+    # Longest context a prefill graph replay serves when the user sets no
+    # cuda_graph_config[prefill].max_seq_len; None when nothing the backend
+    # captures depends on the context length.
+    prefill_cuda_graph_default_max_seq_len: Optional[int] = None
     dllm_attention = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:

@@ -375,15 +375,16 @@ def _prefill_graph_replay_widths(*, unbounded):
     backend._activate_request_window = lambda: None
     capture = object.__new__(DSV4Metadata)
     capture.prefill_graph_tail = True
+    backend._prefill_graph_replays_any_context = lambda: unbounded
     with (
         patch.object(
             DeepseekV4AttnBackend,
-            "prefill_cuda_graph_context_unbounded",
+            "prefill_cuda_graph_default_max_seq_len",
             new_callable=PropertyMock,
-            return_value=unbounded,
+            return_value=None if unbounded else 16384,
         ),
         patch.object(
-            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=16384
+            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=None
         ),
         patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"),
     ):
@@ -412,6 +413,51 @@ class TestPrefillGraphReplayWidth(CustomTestCase):
             _prefill_graph_replay_widths(unbounded=False),
             {"full": 16384, "tail": 16384},
         )
+
+
+def _prefill_graph_limits(
+    *, low_ratios=(1, 2), any_context=False, cp_size=1, user=None
+):
+    """The backend's default replayed-context limit and the effective one, for a
+    DeepSeek-V4 backend in the given layout."""
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.low_ratios = low_ratios
+    backend._prefill_graph_replays_any_context = lambda: any_context
+    with (
+        patch.object(
+            deepseek_v4_backend,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=cp_size),
+        ),
+        patch.object(
+            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=user
+        ),
+    ):
+        return (
+            backend.prefill_cuda_graph_default_max_seq_len,
+            backend._prefill_graph_seq_limit(),
+        )
+
+
+class TestPrefillGraphReplayLimit(CustomTestCase):
+    """DeepSeek-V4.1 bounds the replayed context by its captured indexer width only
+    while something captured depends on it; a user limit always applies."""
+
+    def test_captured_indexer_bounds_the_context(self):
+        self.assertEqual(_prefill_graph_limits(), (16384, 16384))
+
+    def test_any_context_replay_has_no_default(self):
+        self.assertEqual(_prefill_graph_limits(any_context=True), (None, None))
+
+    def test_user_limit_replaces_the_default(self):
+        self.assertEqual(_prefill_graph_limits(user=32768), (16384, 32768))
+        self.assertEqual(
+            _prefill_graph_limits(any_context=True, user=32768), (None, 32768)
+        )
+
+    def test_no_default_without_the_low_ratio_layout_or_with_prefill_cp(self):
+        self.assertEqual(_prefill_graph_limits(low_ratios=()), (None, None))
+        self.assertEqual(_prefill_graph_limits(cp_size=2), (None, None))
 
 
 if __name__ == "__main__":
