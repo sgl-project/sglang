@@ -85,7 +85,7 @@ fn sampling_denies_unknown_keys() {
 #[test]
 fn generate_request_ignores_unknown_keys() {
     let req: GenerateRequest = serde_json::from_str(
-        r#"{"text": "hi", "priority": 3, "session_id": "s", "custom_logit_processor": "x"}"#,
+        r#"{"text": "hi", "priority": 3, "conversation_id": "ignored"}"#,
     )
     .unwrap();
     assert!(matches!(

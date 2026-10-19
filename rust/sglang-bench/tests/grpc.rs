@@ -63,6 +63,7 @@ impl SglangService for Mock {
                         }),
                         output_ids: Some(api::TokenIds { ids: ids.clone() }),
                         index: None,
+                        prompt_token_ids: None,
                     },
                 )),
             }));
