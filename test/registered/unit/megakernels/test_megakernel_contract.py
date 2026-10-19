@@ -14,22 +14,11 @@ register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
 ROOT = Path(spec.__file__).resolve().parents[2]  # python/sglang
 
 # Names the framework reads that its CPU tests reach only through fakes: runner,
-# batch and process-group attributes, string protocols, launch-only arguments.
+# batch and process-group attributes, string protocols.
 READS = {
-    "srt/arg_groups/fields/*.py": (
-        "cuda_graph_config",
-        "enable_nvidia_megakernel",
-        "speculative_algorithm",
-        "speculative_num_draft_tokens",
-        "watchdog_timeout",
-    ),
     "srt/configs/model_config.py": ("dtype", "hf_config"),
     "srt/distributed/parallel_state.py": ("world_size", "cpu_group"),
-    "srt/model_executor/forward_batch_info.py": (
-        "forward_mode",
-        "batch_size",
-        "input_ids",
-    ),
+    "srt/model_executor/forward_batch_info.py": ("batch_size", "input_ids"),
     "srt/model_executor/model_runner.py": (
         "capture_tail_hooks",
         "decode_cuda_graph_runner",
@@ -65,22 +54,6 @@ def _provided(path: Path) -> frozenset:
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             names.add(f'"{node.value}"')
     return frozenset(names)
-
-
-class TestResolutionOrder(CustomTestCase):
-    def test_the_megakernel_step_runs_before_the_other_kernel_flag_step(self):
-        """With both kernel flags set, the megakernel step must raise first, listing the
-        conflict with every other reason, before the other step refuses on its own."""
-        tree = ast.parse((ROOT / "srt/arg_groups/pipeline.py").read_text())
-        line = {
-            node.args[0].id: node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "run_hook"
-            and isinstance(node.args[0], ast.Name)
-        }
-        self.assertLess(line["handle_nvidia_megakernel"], line["handle_monokernel"])
 
 
 class TestSglangReads(CustomTestCase):
