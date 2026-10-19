@@ -2149,6 +2149,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("kv_b_proj", prefix),
             parallel_group="attn_tp",
         )
+        # The ROCm FP8 prefill path feeds kv_b_proj the fused split + cat tuple,
+        # which only the Triton MXFP4 GEMM implements.
+        self.kv_b_proj.requires_triton_mxfp4_gemm = True
         # O projection.
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
