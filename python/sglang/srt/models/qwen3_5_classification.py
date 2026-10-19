@@ -89,9 +89,26 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
         return score_and_pool(self.score, self.pooler, hidden_states, forward_batch, input_ids)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Drop lm_head shards — this checkpoint has none; score.* loads via parent's fallback path.
-        filtered = [(n, w) for n, w in weights if not n.startswith("lm_head")]
-        return super().load_weights(filtered)
+        # Materialize once so we can handle score.* before delegating to parent.
+        weights = list(weights)
+        params_dict = dict(self.named_parameters())
+
+        remaining = []
+        for name, loaded_weight in weights:
+            if name.startswith("lm_head"):
+                # No lm_head in this checkpoint; skip silently.
+                continue
+            if name.startswith("score."):
+                if name in params_dict:
+                    from sglang.srt.model_loader.weight_utils import default_weight_loader
+                    weight_loader = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                    weight_loader(params_dict[name], loaded_weight)
+                else:
+                    logger.warning(f"score weight {name} not found in params_dict")
+                continue
+            remaining.append((name, loaded_weight))
+
+        return super().load_weights(remaining)
 
 
 EntryClass = [Qwen3_5VLForSequenceClassification]
