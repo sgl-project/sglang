@@ -13,6 +13,9 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    refresh_shared_read_done_event,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -529,6 +532,10 @@ class NGRAMWorker(BaseSpecWorker):
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
+
+            # Refresh shared_read_done_event after post-replay KV compaction so the
+            # overlap WAR barrier waits before releasing or overwriting req_to_token.
+            refresh_shared_read_done_event(self.model_runner)
 
             self._update_ngram_corpus(batch)
             # Erase match state of requests that left the decode batch.
