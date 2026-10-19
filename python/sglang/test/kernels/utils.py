@@ -2,8 +2,9 @@ import sys
 from typing import Callable, List, Optional, Sequence
 
 import pytest
+import torch
 
-from sglang.kernels.ops.communication.mp import multigpu_launch
+from sglang.test.kernels.multigpu import multigpu_launch
 
 
 def multigpu_pytest_main(
@@ -62,3 +63,23 @@ def multigpu_pytest_main(
         pre_launch_fn=pre_launch_fn,
         timeout=timeout,
     )
+
+
+def cuda_event_us(fn, warmups: int, repeats: int, rounds: int) -> float:
+    """Median over ``rounds`` of CUDA-event microseconds per call of ``fn``."""
+    for _ in range(warmups):
+        fn()
+    torch.cuda.synchronize()
+
+    samples = []
+    for _ in range(rounds):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(repeats):
+            fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) * 1000.0 / repeats)
+    samples.sort()
+    return samples[len(samples) // 2]

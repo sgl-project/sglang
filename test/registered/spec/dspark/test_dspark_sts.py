@@ -9,7 +9,7 @@ from sglang.benchmark.dspark_sts_fit import (
     expected_calibration_error,
     fit_sts_temperatures,
 )
-from sglang.srt.models.dspark import DSparkConfidenceHead
+from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     DSparkStsCalibration,
     StsDataRecorder,
@@ -40,11 +40,38 @@ class TestApplySts(CustomTestCase):
             for got, want in zip(row, expected_row):
                 self.assertAlmostEqual(got, want, places=6)
 
-    def test_apply_sts_stashes_raw_logit(self):
+
+class TestConfidencePredict(CustomTestCase):
+    def test_predict_applies_sts_to_the_raw_logit(self):
+        torch.manual_seed(0)
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
-        confidence_raw = torch.randn(2, 5)
-        head.apply_sts(confidence_raw)
-        self.assertIs(head._last_confidence_raw, confidence_raw)
+        head.sts_temperatures = torch.tensor([0.5, 1.0, 2.0])
+        confidence, confidence_raw = head.predict(
+            torch.randn(2 * 3, 8),
+            anchor_tokens=torch.tensor([1, 2]),
+            draft_tokens=torch.tensor([[3, 4, 5], [6, 7, 8]]),
+            markov_head=None,
+        )
+        self.assertEqual(confidence_raw.shape, (2, 3))
+        self.assertTrue(torch.equal(confidence, head.apply_sts(confidence_raw)))
+
+    def test_markov_features_are_the_previous_tokens(self):
+        # Step i reads the embedding of the token before it: the anchor, then drafts.
+        torch.manual_seed(0)
+        head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=True)
+        markov_head = VanillaMarkov(vocab_size=16, markov_rank=4)
+        features = torch.randn(2, 3, 8)
+        anchor_tokens = torch.tensor([1, 2])
+        draft_tokens = torch.tensor([[3, 4, 5], [6, 7, 8]])
+        _, confidence_raw = head.predict(
+            features.view(6, 8),
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=markov_head,
+        )
+        prev_tokens = torch.tensor([[1, 3, 4], [2, 6, 7]])
+        expected = head(features, markov_head.get_prev_embeddings(prev_tokens))
+        self.assertTrue(torch.equal(confidence_raw, expected))
 
 
 class TestDSparkStsCalibration(CustomTestCase):

@@ -25,7 +25,7 @@ tracing = { workspace = true }
 
 dynamo-parsers = { version = "=9.2.8", optional = true }
 dynamo-protocols = { version = "7.0.0", optional = true }
-dynamo-renderer = { version = "7.0.1", optional = true }
+dynamo-renderer = { version = "7.1.1", optional = true }
 hf-hub = { version = "0.4", default-features = false }
 regex = { version = "1", optional = true }
 uuid = { workspace = true, optional = true }

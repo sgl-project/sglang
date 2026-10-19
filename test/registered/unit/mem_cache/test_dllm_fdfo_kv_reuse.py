@@ -27,6 +27,16 @@ class _FakeAllocator:
     def available_size(self):
         return 1 << 30
 
+    def get_extend_allocation_demand(
+        self,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        *,
+        conservative_num_tokens,
+        shard_size,
+    ):
+        return conservative_num_tokens
+
     def alloc(self, need_size):
         self.alloc_calls.append(need_size)
         return torch.arange(self.base, self.base + need_size, dtype=torch.int64)
@@ -99,6 +109,7 @@ def _make_batch(pool, allocator, reqs, extend_lens):
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         tree_cache=_FakeTreeCache(allocator),
+        hisparse_coordinator=None,
         prefix_lens=[req.prefix_len for req in reqs],
         extend_lens=extend_lens,
         seq_lens=seq_lens_cpu,
