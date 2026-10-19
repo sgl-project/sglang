@@ -195,7 +195,7 @@ class CoverageSelector:
     def normalize_test_name(test_name: str) -> str:
         """
         Convert test case directory name to standard script name format.
-        sglang (encoded dir name: <encoded workspace root><test or python path>):
+        sglang (encoded dir name: <encoded workspace root><test path>):
         - k8s pool: /__w/sglang/sglang/... -> ____w__sglang__sglang__...
         - hosted runners: /home/runner/work/sglang/sglang/... -> __home__runner__work__sglang__sglang__...
         - ...test__registered__npu__xxx__test_foo
