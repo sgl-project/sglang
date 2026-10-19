@@ -68,14 +68,12 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
         fb.num_token_non_padded,
     )
     fb.global_num_tokens_cpu = counts
+    # Device ops only: this runs inside prefill graph capture, where a host copy
+    # would be recorded against pageable memory.
     gpu = fb.global_num_tokens_gpu
     if len(set(counts)) == 1:
-        # Device ops only: this runs inside prefill graph capture, where a host
-        # copy would be recorded against pageable memory.
         fb.global_num_tokens_gpu = torch.full_like(gpu, counts[0])
     else:
-        # Captures bake rank-uniform counts, so this host copy never runs in one.
-        # A pageable copy would stall the host until the early layers finish.
         fb.global_num_tokens_gpu = async_h2d(counts, dtype=gpu.dtype, device=gpu.device)
     fb.global_num_tokens_padded_cpu = counts
     # The MoE gatherv reads its sizes from the logprob counts when present.
