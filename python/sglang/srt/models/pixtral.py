@@ -38,8 +38,8 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -136,8 +136,7 @@ class PixtralForConditionalGeneration(nn.Module):
         )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
@@ -857,7 +856,7 @@ class PixtralHFVisionModel(nn.Module):
     DEFAULT_IMAGE_TOKEN_ID = 10
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def __init__(
         self,
@@ -902,7 +901,6 @@ class PixtralHFVisionModel(nn.Module):
 
         # Initialize patch position embedding
         self.patch_positional_embedding = PixtralVisionRotaryEmbedding(config)
-        self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
     def dtype(self):

@@ -23,7 +23,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{WireProtocol, WorkerRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -148,14 +148,15 @@ fn hanging_ctx(urls: &[&str], max_attempts: u32) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for (i, url) in urls.iter().enumerate() {
+        let spec = WorkerSpec {
+            id: WorkerId(format!("w{i}")),
+            url: (*url).into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            ..Default::default()
+        };
         registry
-            .add(WorkerSpec {
-                id: WorkerId(format!("w{i}")),
-                url: (*url).into(),
-                mode: WorkerMode::Plain,
-                model_ids: vec![ModelId("tiny".into())],
-                ..Default::default()
-            })
+            .add_with_cb(spec, Some(Default::default()), WireProtocol::default())
             .unwrap();
     }
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());

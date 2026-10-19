@@ -22,8 +22,16 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_strided_gather_zero_fills_tail(dtype):
+# FP8 packed scratch is used only with an FP8 KV pool.
+@pytest.mark.parametrize(
+    "dtype,packed_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+    ],
+)
+def test_strided_gather_zero_fills_tail(dtype, packed_dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.manual_seed(0)
@@ -51,9 +59,8 @@ def test_strided_gather_zero_fills_tail(dtype):
         n = min(int(seq_lens[b]), topk)
         indices[b, :n] = torch.arange(n, device=device, dtype=torch.int32)
     cu_strided = torch.arange(batch + 1, device=device, dtype=torch.int32) * stride
-    # the scratch is always in the compute dtype (bf16); an FP8 pool is dequantized on the way in
     packed_k = torch.full(
-        (batch * stride, heads, dim), float("nan"), device=device, dtype=torch.bfloat16
+        (batch * stride, heads, dim), float("nan"), device=device, dtype=packed_dtype
     )
     packed_v = packed_k.clone()
 
@@ -79,8 +86,8 @@ def test_strided_gather_zero_fills_tail(dtype):
     for b in range(batch):
         n = min(int(seq_lens[b]), topk)
         slots = req_to_token[b, :n].long()
-        torch.testing.assert_close(pk[b, :n], k_pool[slots].to(torch.bfloat16).float())
-        torch.testing.assert_close(pv[b, :n], v_pool[slots].to(torch.bfloat16).float())
+        torch.testing.assert_close(pk[b, :n], k_pool[slots].to(packed_dtype).float())
+        torch.testing.assert_close(pv[b, :n], v_pool[slots].to(packed_dtype).float())
         assert (pk[b, n:] == 0).all() and (pv[b, n:] == 0).all()
 
 

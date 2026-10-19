@@ -26,11 +26,20 @@ def late_layer_dp_counts(
         # Local-only counts (MegaMoE with a DP LM head): no peer geometry to share.
         counts = [local_late_rows]
     elif in_graph:
-        # Prefill graphs pad every DP rank to one shape, so the tail block is
-        # rank-uniform and the capture bakes it in; replays never run this code.
+        # The capture bakes the tail block and replays never run this code. Every
+        # rank shares one bucket whenever the graph holds a DP gather.
         counts = [local_late_rows] * len(early)
+    elif forward_batch.global_late_layer_num_tokens_cpu is not None:
+        # Exchanged in ForwardBatch.prepare_mlp_sync_batch, which a peer replaying
+        # the prefill graph reaches too; a gather here would wait for it forever.
+        counts = forward_batch.global_late_layer_num_tokens_cpu
+        assert counts[get_parallel().attn_dp_rank] == local_late_rows, (
+            counts,
+            local_late_rows,
+        )
     else:
-        # Tail row counts are host-known; the CPU group avoids a device sync.
+        # Without the exchange (no extend in the batch) every rank takes this
+        # path; the CPU group avoids a device sync.
         counts = torch.empty(len(early), dtype=torch.int64)
         all_gather_single(
             counts,
