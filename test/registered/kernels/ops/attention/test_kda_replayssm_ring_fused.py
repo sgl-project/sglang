@@ -137,6 +137,9 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         fold = ckpt[slots[j]]
         rel = ((fold - base).abs().max() / base.abs().max().clamp_min(1e-6)).item()
         assert rel < 1e-3, f"row={j}: rel={rel:.3e}"
+        # Production head dim; K=64 rounds slightly differently on main too.
+        if K == 128:
+            assert torch.equal(fold, base), f"row={j}: K=128 fold not bit-identical"
 
 
 if __name__ == "__main__":
