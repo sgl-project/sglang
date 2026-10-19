@@ -30,6 +30,8 @@ dependencies = [
   "build",
   "compressed-tensors==0.18.0",
   "cuda-python>=13.0",
+  # Match the JIT compiler/headers to torch's CUDA 13.0 runtime.
+  "cuda-toolkit[nvcc,nvvm,cccl]==13.0.3",
   # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
   "cuda-tile==1.6.0rc5",
   "datasets",
