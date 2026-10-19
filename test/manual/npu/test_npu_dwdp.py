@@ -283,11 +283,6 @@ def test_npu_dwdp(dtype, large):
         ({"nnodes": 2}, "single host"),
         ({"enable_lora": True}, "LoRA"),
         ({"enable_pdmux": True}, "layer-split"),
-        ({"cuda_graph_backend_decode": "full"}, "explicit graph capture"),
-        (
-            {"cuda_graph_config": {"prefill": {"backend": "full"}}},
-            "explicit graph capture",
-        ),
     ],
 )
 def test_invalid_npu_dwdp_args(kwargs, message):
@@ -322,6 +317,63 @@ def test_dwdp_preserves_offload_and_memory_saver_settings(device, kwargs):
     cfg = resolving_view(args)
     for name, value in kwargs.items():
         assert getattr(cfg, name) == value
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, ("disabled", "disabled")),
+        ({"disable_cuda_graph": False}, ("disabled", "disabled")),
+        ({"cuda_graph_backend_decode": "full"}, ("full", "disabled")),
+        ({"cuda_graph_backend_prefill": "full"}, ("disabled", "full")),
+        (
+            {
+                "cuda_graph_config": {
+                    "decode": {"backend": "full"},
+                    "prefill": {"backend": "full"},
+                }
+            },
+            ("full", "full"),
+        ),
+        (
+            {
+                "cuda_graph_backend_decode": "full",
+                "cuda_graph_config": {
+                    "decode": {"backend": "disabled"},
+                    "prefill": {"backend": "full"},
+                },
+            },
+            ("disabled", "full"),
+        ),
+        (
+            {
+                "cuda_graph_config": {
+                    "decode": {"backend": "breakable"},
+                    "prefill": {"backend": "breakable"},
+                }
+            },
+            ("breakable", "breakable"),
+        ),
+    ],
+)
+def test_dwdp_graph_config_matches_cuda(device, kwargs, expected):
+    from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.parallel_hook import handle_dwdp
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(
+        model_path="dummy", device=device, tp_size=2, dwdp_size=2, **kwargs
+    )
+    handle_dwdp(args)
+    parse_cuda_graph_config(args)
+    cfg = resolving_view(args)
+    assert cfg.disable_cuda_graph
+    assert (
+        cfg.cuda_graph_config.decode.backend,
+        cfg.cuda_graph_config.prefill.backend,
+    ) == expected
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])
