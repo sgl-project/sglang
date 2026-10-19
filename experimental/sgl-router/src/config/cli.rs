@@ -170,6 +170,12 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
 
+    /// PD: at most N requests per prefill DP rank go to decode before their
+    /// first token; the rest wait and get their decode DP rank when sent.
+    /// Needs prefill engines with --optimistic-prefill-attempts above 0.
+    #[arg(long)]
+    pub decode_dispatch_limit: Option<NonZeroU32>,
+
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
     /// after streaming starts, it aborts the body without changing the HTTP status.
@@ -652,6 +658,7 @@ impl Cli {
                 max_attempts: self.server.retry_max_attempts,
                 initial_backoff_ms: self.server.retry_initial_backoff_ms,
                 max_backoff_ms: self.server.retry_max_backoff_ms,
+                decode_dispatch_limit: self.server.decode_dispatch_limit,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,

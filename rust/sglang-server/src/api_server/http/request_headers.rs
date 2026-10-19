@@ -57,7 +57,7 @@ pub(super) fn apply_header_overrides(body: &mut Value, headers: &HeaderMap) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::request::into_requests;
+    use crate::message::request::{GenerationPolicy, into_requests};
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         pairs
@@ -95,7 +95,11 @@ mod tests {
                 "disagg_prefill_dp_rank": 1, "priority": -2,
             })
         );
-        let (requests, _) = into_requests(serde_json::from_value(body.clone()).unwrap()).unwrap();
+        let (requests, _) = into_requests(
+            serde_json::from_value(body.clone()).unwrap(),
+            &GenerationPolicy::default(),
+        )
+        .unwrap();
         let req = &requests[0];
         assert_eq!(req.rid.client_facing(), "router");
         assert_eq!(req.bootstrap_host.as_deref(), Some("10.0.0.1"));
