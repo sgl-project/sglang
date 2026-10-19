@@ -19,8 +19,8 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
-from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
@@ -61,9 +61,7 @@ def rebuild_cp_kv_cache(
     """
     kv_lora_rank = m.kv_lora_rank
     qk_rope_head_dim = m.qk_rope_head_dim
-    packed = torch.cat((k_nope, k_pe), dim=-1).view(
-        -1, kv_lora_rank + qk_rope_head_dim
-    )
+    packed = torch.cat((k_nope, k_pe), dim=-1).view(-1, kv_lora_rank + qk_rope_head_dim)
     full_latent = cp_gather_full_sequence_states(
         packed.contiguous(), forward_batch, torch.npu.current_stream()
     )

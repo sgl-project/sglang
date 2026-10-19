@@ -398,8 +398,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # layer inherits the same all-CP-rank send path).
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend
-                not in ("mooncake", "ascend")
+                and cfg.disaggregation_transfer_backend not in ("mooncake", "ascend")
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "

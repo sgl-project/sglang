@@ -311,8 +311,7 @@ class AscendKVManager(MooncakeKVManager):
         )
 
         if self.pp_size > 1 or (
-            self.is_mla_backend
-            and len(self.kv_args.kv_data_ptrs) != len(dst_kv_ptrs)
+            self.is_mla_backend and len(self.kv_args.kv_data_ptrs) != len(dst_kv_ptrs)
         ):
             # The second condition covers layer-split prefill on PP=1: the
             # sender reports owned-only entries while the decode peer

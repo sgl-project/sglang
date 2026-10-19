@@ -276,9 +276,7 @@ class PrefillBootstrapQueue:
             # layer span instead of assuming entries == layers.
             span = getattr(self.token_to_kv_pool, "get_kv_transfer_layer_span", None)
             kv_args.prefill_end_layer = kv_args.prefill_start_layer + (
-                span(len(kv_data_ptrs))
-                if span is not None
-                else len(kv_data_ptrs)
+                span(len(kv_data_ptrs)) if span is not None else len(kv_data_ptrs)
             )
         else:
             kv_args.prefill_end_layer = getattr(
