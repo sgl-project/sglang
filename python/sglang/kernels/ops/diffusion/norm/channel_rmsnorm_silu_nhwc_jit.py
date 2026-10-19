@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -47,6 +48,7 @@ def _specialization(channels: int) -> tuple[int, int, int]:
 
 @cache_once
 def _jit_module(vec: int, lanes: int, units: int, has_bias: bool) -> Module:
+    require_sm80()
     args = make_cpp_args(vec, lanes, units, has_bias)
     return load_jit(
         "channel_rmsnorm_silu_nhwc",

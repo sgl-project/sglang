@@ -9,11 +9,13 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 
 @cache_once
 def _module():
+    require_sm80()
     args = make_cpp_args(torch.bfloat16)
     return load_jit(
         "gelu_tanh_cat",

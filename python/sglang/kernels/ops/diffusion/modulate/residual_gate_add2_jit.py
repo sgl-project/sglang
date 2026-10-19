@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 @cache_once
 def _jit_residual_gate_add2_module(dtype: torch.dtype) -> Module:
+    require_sm80()
     if dtype not in _SUPPORTED_DTYPES:
         raise RuntimeError(f"Unsupported residual_gate_add2 dtype: {dtype}")
     args = make_cpp_args(dtype)

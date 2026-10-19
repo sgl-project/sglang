@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ def _jit_qknorm_rope_module(
 ) -> Module:
     """``half_warp=False`` keeps the one-row-per-warp kernel where the two-rows
     variant would apply; tests use it as the bit-exactness oracle."""
+    require_sm80()
     template_args = [
         head_dim,
         rope_dim,
