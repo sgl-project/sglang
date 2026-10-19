@@ -421,3 +421,118 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+for _mod, _fn in [
+    ("mla_qk_prep", "concat_and_cast_q_fp8_pad"),
+    ("mla_qk_prep", "absorbed_bmm_concat_cast_q_fp8"),
+    ("metadata", "q8kv8_topk_length_from_indices"),
+    ("minimax_sparse.decode.topk_sparse", "flash_decode_with_gqa_share_sparse"),
+    ("minimax_sparse.prefill.topk_sparse", "flash_prefill_with_gqa_share_sparse"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+register_kernel(
+    KernelSpec(
+        op="attention.absorbed_bmm_concat_cast_q_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.qprep_bf16_fp8_sm90:q8kv8_qprep_fwd",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.topk_index_reduce",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.attention.minimax_sparse.common.index:topk_index_reduce",
+    )
+)
+# The context-parallel indexer serves only the gfx950 ROCm top-k contract.
+for _fn in ("score_local_blocks", "select_local_candidates", "merge_candidates"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.minimax_sparse.decode.indexer_cp:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _fn
+register_kernel(
+    KernelSpec(
+        op="attention.gluon_sparse_prefill",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.attention.minimax_sparse.prefill.gluon_prefill:gluon_sparse_prefill",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.mtp_verify_attn_fwd_asm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.vattn_asm_gfx950:mtp_verify_attn_fwd_asm",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+for _mod, _fn in [
+    ("helion.kda_decode", "helion_fused_recurrent_kda_packed_decode"),
+    ("helion.kda_replayssm", "helion_fused_recurrent_kda_replayssm_decode"),
+    ("helion.kda_prefill", "chunk_kda"),
+    ("helion.kda_verify", "helion_kda_verify"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.HELION,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _mod, _fn
+# tcgen05 + TMEM: datacenter Blackwell only (SM100 / SM103), not SM120.
+for _mod, _fn in [
+    ("linear.gdn_blackwell", "chunk_gated_delta_rule_cutedsl"),
+    ("linear.kda_blackwell", "chunk_kda_cutedsl"),
+    ("linear.kda_nvidia_prefill", "chunk_kda_fwd"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.CUTE_DSL,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+            ),
+        )
+    )
+del _mod, _fn
+register_kernel(
+    KernelSpec(
+        op="attention.chunk_kda_fwd",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.linear.kda_ptx_prefill:chunk_kda_fwd",
+        # Exactly the kda_ptx_prefill.SM_ARCHS build targets (sm_100a, sm_103a).
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((10, 0), (10, 3))
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp8_attention",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.fp8_fa_sm120:fp8_attention",
+        # MmaMXF8Op assembles only for SM120 / SM121.
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 1))}
+        ),
+    )
+)

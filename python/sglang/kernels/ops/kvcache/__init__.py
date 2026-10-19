@@ -56,6 +56,7 @@ __all__ = ["reshape_and_cache_flash"]
 _TRITON_KERNELS = [
     ("cache_ops", "launch_reshape_and_cache_flash"),
     ("shuffle_5d_cache", "launch_reshape_and_cache_shuffle_5d"),
+    ("shuffle_5d_cache", "launch_gather_shuffle_5d_to_linear"),
     ("pd_dcp_gather", "copy_mla_rows_into_pack"),
     ("kv_read_table", "build_kv_read_table"),
     ("kv_read_table", "build_kv_read_table_packed"),
