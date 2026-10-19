@@ -1636,10 +1636,10 @@ class TestSWAPoolFloor(CustomTestCase):
         paged = self._dspark_replay_planner(draft_ring=False)
         self.assertEqual(planner.bytes_per_swa_token, 0)
         self.assertEqual(planner.swa_cap_tokens, 0)
-        # Three draft stages of one (128 + 6)-row ring per request slot.
+        # Three draft stages of one ring per request slot: 128 + 6 rows in a page.
         self.assertEqual(
             planner.request_window_bytes - paged.request_window_bytes,
-            (3 * (128 + 6) + 256) * 3 * 584,
+            (3 * 256 + 256) * 3 * 584,
         )
         sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
         self.assertEqual(sizes.swa_max_total_num_tokens, 0)
@@ -1851,6 +1851,27 @@ class TestFusedDraftPricing(unittest.TestCase):
         self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
         config = cfg.calculate_pool_sizes(available, 1)
         self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_fused_swa_entry_replaces_the_swa_terms(self):
+        """A draft placed in the swa sub-pool is priced through the fused swa
+        entry: the separate per-layer swa draft term must go, or the draft is
+        charged twice (once inside the entry, once as a private pool)."""
+        mr, cfg = self._make(fused_entry=None, draft_layers=2)
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 2
+        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            fused = HybridSWAPoolConfigurator(mr)
+        self.assertEqual(fused._draft_swa_layers_num, 0)
+        self.assertEqual(fused._draft_full_layers_num, 0)
+        self.assertEqual(
+            fused._cell_size,
+            fused._full_per_token * fused._full_layers_num
+            + fused._swa_full_tokens_ratio * 4_321,
+        )
 
 
 if __name__ == "__main__":

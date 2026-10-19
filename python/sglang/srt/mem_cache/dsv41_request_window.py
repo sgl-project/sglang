@@ -213,6 +213,16 @@ class RequestWindow:
         size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
         self.workspace = self.pool_factory(size, 1)
 
+    def row_loc(self, slots, positions):
+        return slots * self.capacity + positions % self.capacity
+
+    def page_indices(self, slot: int, start: int, end: int):
+        assert start % self.page_size == 0, (start, self.page_size)
+        positions = torch.arange(start, end, self.page_size)
+        # capacity is whole pages, so a page's rows keep a paged pool's offsets
+        # and pair with decode's paged SWA pages one for one.
+        return (self.row_loc(slot, positions) // self.page_size).to(torch.int32).numpy()
+
     def reset(self, slots):
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
@@ -237,7 +247,7 @@ class RequestWindow:
     def initialize_dummy_history(self):
         layout = self.layout
         self.tags.fill_(-1)
-        loc = layout.history_req * self.capacity + layout.history_pos % self.capacity
+        loc = self.row_loc(layout.history_req, layout.history_pos)
         for buf in self.state.kv_buffer:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
@@ -246,7 +256,7 @@ class RequestWindow:
     def _history_src(self, layout):
         return torch.where(
             layout.history_valid,
-            layout.history_req * self.capacity + layout.history_pos % self.capacity,
+            self.row_loc(layout.history_req, layout.history_pos),
             self.zero_row,
         )
 

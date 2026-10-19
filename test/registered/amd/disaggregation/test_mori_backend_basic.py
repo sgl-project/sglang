@@ -2,7 +2,7 @@ import struct
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 
@@ -137,6 +137,51 @@ class TestMoriDCP(unittest.TestCase):
         manager._add_remote_peer(info)
         self.assertTrue(info.requires_dcp_relayout)
         self.assertEqual(info.dcp_token_item_lens, [64])
+
+
+class TestMoriDsaStateElision(unittest.TestCase):
+    """_send_swa_dsa_state must read the dst length of the paired dst entry.
+
+    A prefill PP stage holds a slice of the layers while decode holds all of
+    them, so src entry i pairs with dst entry j != i.
+    """
+
+    def _send(self, src_layers, dst_layers, src_lens, dst_lens):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.pp_size = 2
+        manager.is_mla_backend = True
+        manager.attn_tp_size = 1
+        manager._build_contiguous_transfer_plan = Mock(return_value="plan")
+        manager._submit_batch_transfer_plan = Mock(return_value=[])
+        indices = np.array([1, 2], dtype=np.int32)
+
+        manager._send_swa_dsa_state(
+            SimpleNamespace(decode_tp_size=1),
+            indices,
+            indices,
+            [f"s{layer}" for layer in src_layers],
+            src_lens,
+            [
+                None if length == 0 else f"d{layer}"
+                for layer, length in zip(dst_layers, dst_lens)
+            ],
+            dst_lens,
+            "dsa",
+            src_layers,
+            dst_layers,
+        )
+        return manager._submit_batch_transfer_plan.call_args_list
+
+    def test_dst_elision_is_read_at_the_paired_entry(self):
+        # Decode elided layer 2 only. Both prefill layers must still be sent;
+        # reading dst_lens[i] instead of dst_lens[j] drops layer 3.
+        calls = self._send([3, 4], [2, 3, 4], [132, 132], [0, 132, 132])
+        self.assertEqual(calls, [call("s3", "d3", "plan"), call("s4", "d4", "plan")])
+
+    def test_elided_dst_entry_is_never_written(self):
+        # Decode elided layer 4. Writing to it would use a None descriptor.
+        calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
+        self.assertEqual(calls, [call("s5", "d5", "plan")])
 
 
 if __name__ == "__main__":

@@ -218,6 +218,22 @@ doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
 Set the initial backoff to 0 to retry immediately. A backoff never waits past
 the request's stale deadline.
 
+Separately, a send whose pooled HTTP/1.1 connection the worker closed before
+answering (reset, broken pipe or EOF) is repeated once, immediately, on the same
+worker: an engine closing an idle connection never read the request. Idle
+connections leave the pool after 3 s, under SGLang's default 5 s keep-alive.
+
+### Circuit breaker
+
+Each worker has a circuit breaker: after `--cb-threshold` (default 3)
+consecutive failures the worker is taken out of routing until a request already
+sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
+probe request does. Under `--worker-urls` it is the only thing that takes a
+dead or hung worker out of routing, since there is no active health check.
+`--disable-circuit-breaker` turns it off, for example when one worker serves a
+role and an open breaker would reject all of that role's requests; a worker
+that stops answering then keeps its share of traffic.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
