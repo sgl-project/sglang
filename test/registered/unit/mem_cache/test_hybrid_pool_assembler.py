@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
     MambaPool,
+    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
@@ -977,6 +978,71 @@ class TestKvHostPoolRow(CustomTestCase):
             )
         return seen
 
+    def test_non_owner_uses_allocator_only_mla_geometry(self):
+        for pool_cls in (MLATokenToKVPool, DSATokenToKVPool):
+            for draft_count in (0, 1):
+                with self.subTest(pool=pool_cls.__name__, drafts=draft_count):
+                    fields = dict(
+                        size=128,
+                        page_size=64,
+                        dtype=torch.bfloat16,
+                        kv_lora_rank=128,
+                        qk_rope_head_dim=0,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    if pool_cls is DSATokenToKVPool:
+                        fields.update(
+                            index_head_dim=128, kv_cache_dim=128, index_buf_size=128
+                        )
+                    pool = pool_cls(**fields, layer_num=2)
+                    drafts = tuple(
+                        pool_cls(**fields, layer_num=1) for _ in range(draft_count)
+                    )
+                    with (
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_parallel",
+                            return_value=SimpleNamespace(dcp_enabled=False),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_memory",
+                            return_value=SimpleNamespace(
+                                hicache_ratio=2,
+                                hicache_size=0,
+                                hicache_mem_layout="page_first_direct",
+                            ),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "_get_allocator_type",
+                            return_value="default",
+                        ),
+                    ):
+                        host = hybrid_pool_assembler.build_kv_host_pool(
+                            kv_pool=pool,
+                            page_size=64,
+                            mtp_draft_device_pools=drafts,
+                            is_dummy=True,
+                        )
+                    self.addCleanup(host.destroy)
+                    self.assertTrue(host._is_dummy)
+                    self.assertIsNone(host.kv_buffer)
+                    self.assertEqual(host.layer_num, 2 + draft_count)
+                    self.assertEqual(host.device_capacity_tokens, pool.size)
+                    self.assertEqual(
+                        host.size_per_token,
+                        pool.kv_cache_dim
+                        * pool.store_dtype.itemsize
+                        * (2 + draft_count),
+                    )
+                    rows = host.alloc(64)
+                    self.assertEqual(len(rows), 64)
+                    self.assertEqual(host.available_size(), host.size - 64)
+                    host.free(rows)
+                    self.assertEqual(host.available_size(), host.size)
+
     def test_mla_row_width_comes_from_the_device_pool(self):
         pool = _dsa_pool_stub(layer_num=2)
         pool.kv_cache_dim = 656  # fp8 DSA store: 576 + fp32 scales
@@ -1459,6 +1525,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
             role="tokenizer",
         )
         cc = HybridCacheController.__new__(HybridCacheController)
+        cc.mem_pool_host = SimpleNamespace(entry_map={})
         cc.storage_backend = FailingStorage()
         cc.prefetch_sync_queue = Queue()
         operation = PrefetchOperation(

@@ -263,6 +263,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
+        controller.mla_dedup_enabled = False
+        controller.mla_shared_enabled = False
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
@@ -321,6 +323,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             with self.subTest(broadcast_fails=fails):
                 controller = mock.Mock(spec=HiCacheController)
                 controller.mla_dedup_enabled = True
+                controller.mla_shared_enabled = False
+                controller.mla_dedup = SimpleNamespace(layerwise_overlap=False)
                 controller.load_queue = []
                 controller.ack_load_queue = []
                 controller.load_fence_stream = None
