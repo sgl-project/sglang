@@ -248,8 +248,11 @@ jobs:
           if-no-files-found: warn
 
   base-b-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_1_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-1-npu-a3
@@ -257,13 +260,17 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_1_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-2-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_2_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-2-npu-a3
@@ -271,13 +278,17 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_2_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_4_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-4-npu-a3
@@ -286,13 +297,17 @@ jobs:
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0, 1]}'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_4_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-8-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_8_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-8-npu-a3
@@ -300,13 +315,17 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_8_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, recommend-tests-from-coverage]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_16_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-16-npu-a3
@@ -314,6 +333,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_16_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
@@ -465,8 +485,11 @@ jobs:
 
   base-c-test-acc-2-npu-a3:
     name: base-c-test-acc-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_2_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
@@ -476,13 +499,17 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       partitions: '{"size":2,"arr":[0,1]}'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_c_test_acc_2_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, recommend-tests-from-coverage ]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_16_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
@@ -491,13 +518,17 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_c_test_acc_16_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_2_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
@@ -506,13 +537,17 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_c_test_perf_2_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3, recommend-tests-from-coverage ]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_16_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
@@ -522,6 +557,7 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       test_timeout_minutes: '180'
+      only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_c_test_perf_16_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
       upload_test_logs: ${{ inputs.coverage_mode != true }}
 
@@ -536,6 +572,24 @@ jobs:
     if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
     outputs:
       coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
+      should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
+      only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
+      should_run_base_b_test_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_2_npu_a3 }}
+      only_tests_base_b_test_2_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_2_npu_a3 }}
+      should_run_base_b_test_4_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_4_npu_a3 }}
+      only_tests_base_b_test_4_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_4_npu_a3 }}
+      should_run_base_b_test_8_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_8_npu_a3 }}
+      only_tests_base_b_test_8_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_8_npu_a3 }}
+      should_run_base_b_test_16_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_16_npu_a3 }}
+      only_tests_base_b_test_16_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_16_npu_a3 }}
+      should_run_base_c_test_acc_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_acc_2_npu_a3 }}
+      only_tests_base_c_test_acc_2_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_acc_2_npu_a3 }}
+      should_run_base_c_test_acc_16_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_acc_16_npu_a3 }}
+      only_tests_base_c_test_acc_16_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_acc_16_npu_a3 }}
+      should_run_base_c_test_perf_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_perf_2_npu_a3 }}
+      only_tests_base_c_test_perf_2_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_perf_2_npu_a3 }}
+      should_run_base_c_test_perf_16_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_c_test_perf_16_npu_a3 }}
+      only_tests_base_c_test_perf_16_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_c_test_perf_16_npu_a3 }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -549,8 +603,12 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
+          # test/registered + python/sglang/test/ci are needed by
+          # list_tests.py to enumerate each suite's test files for bucketing.
           sparse-checkout: |
             scripts
+            test/registered
+            python/sglang/test/ci
           sparse-checkout-cone-mode: false
 
       - name: Download test case map
@@ -604,6 +662,29 @@ jobs:
             --github-pr "${PR_SPEC}" \
             --source-dir "$PWD/outputs/covstub" \
             --map-file "$PWD/test_case_map.json"
+
+      # Bucket the recommended tests per suite. Downstream test jobs consume
+      # two outputs per suite: should_run_<suite> ('false' -> skip the whole
+      # job, e.g. precision mode active with an empty bucket) and
+      # only_tests_<suite> (the bucketed file list, exported non-empty ONLY in
+      # precision mode). Bucket contents are gated on PRECISION_MODE inside
+      # the script, so callers need no guard expressions.
+      # Any failure here leaves the outputs empty -> callers run full suites.
+      - name: Bucket recommended tests per suite
+        id: bucket-tests
+        continue-on-error: true
+        if: always()
+        env:
+          # Precision-test switch: 'true' = the a3 suites run only the
+          # recommended subset, 'false' = full suites.
+          PRECISION_MODE: 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
+            --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
+            --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
+            --precision-mode "${PRECISION_MODE}" \
+            --github-output "${GITHUB_OUTPUT}"
 
       - name: Export coverage paths output
         id: export-paths
