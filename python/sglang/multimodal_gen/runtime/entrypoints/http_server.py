@@ -50,6 +50,7 @@ from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.utils.common import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    init_http_request_metrics,
 )
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -436,6 +437,7 @@ def create_app(server_args: ServerArgs):
         configure_metrics()
         add_prometheus_middleware(app)
         add_prometheus_track_response_middleware(app)
+        init_http_request_metrics()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

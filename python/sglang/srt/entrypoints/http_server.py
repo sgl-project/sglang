@@ -504,10 +504,7 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
-# Registered while this module is imported, so that every tokenizer worker
-# process gets it. With --tokenizer-worker-num > 1 uvicorn spawns workers that
-# re-import this module; a middleware added afterwards in the parent process
-# never reaches the app those workers actually serve.
+# Registered at import so that tokenizer workers, which re-import this module, get it too.
 add_prometheus_track_response_middleware(app)
 
 # Include routers
