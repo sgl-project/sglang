@@ -117,27 +117,6 @@ def assert_fits(nc: int, nv: int, gpu: str = "h100") -> None:
         )
 
 
-def max_nc_for_nv(nv: int, gpu: str = "h100") -> int:
-    """Largest NC that fits for a given NV. Solves
-        4 * (NC^2 + (NV+1)*NC + 3*NV) + pad <= cap
-    via the quadratic formula (monotone in NC). Returns 0 if even NC=1 overflows.
-    """
-    cap = gpu_budget_bytes(gpu)
-    b = _BYTES_PER_ELEM
-    # cap - pad >= b * (NC^2 + (NV+1)*NC + 3*NV)
-    rhs = (cap - _RUNTIME_PAD_BYTES) / b - 3 * nv
-    if rhs <= 0:
-        return 0
-    # NC^2 + (NV+1)*NC - rhs <= 0
-    import math
-
-    disc = (nv + 1) ** 2 + 4 * rhs
-    nc_max = int((-(nv + 1) + math.sqrt(disc)) / 2.0)
-    while nc_max > 0 and shmem_bytes(nc_max, nv) > cap:
-        nc_max -= 1
-    return max(nc_max, 0)
-
-
 def report(nc: int, nv: int, gpu: str = "h100") -> str:
     """Human-readable summary — used by kernels on init for logging."""
     bd = breakdown(nc, nv)

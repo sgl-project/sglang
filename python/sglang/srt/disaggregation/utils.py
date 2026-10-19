@@ -1780,6 +1780,13 @@ def setup_state_kv_args(
                 draft_lens,
                 draft_item_lens,
             )
+        row_ptrs, row_lens, row_item_lens = (
+            draft_token_to_kv_pool.get_swa_valid_from_buf_infos()
+        )
+        if row_ptrs:
+            append_state_component(
+                kv_args, StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens
+            )
 
     if (
         StateType.MAMBA not in kv_args.state_types
