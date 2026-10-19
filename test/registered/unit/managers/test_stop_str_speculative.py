@@ -7,9 +7,7 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 
 import unittest
 from array import array
-from unittest import mock
 
-from sglang.srt.managers import schedule_batch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -138,23 +136,14 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_reason.matched, r"\.$")
         self.assertEqual(req.finished_len, 2)
 
-    @mock.patch.object(schedule_batch, "_is_xpu", True)
     def test_stop_regex_end_anchored_midchunk(self):
-        """On XPU, an end-anchored stop_regex that matches only after a token
-        accepted mid-step ("a." in "a.b") must still finish the request."""
+        """An end-anchored stop_regex that matches only after a token accepted
+        mid-step ("a." in "a.b") must still finish the request."""
         req = _make_req([60, 61, 62], stop_regex=[r"[.!?]\s*$"])
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
         self.assertEqual(req.finished_len, 2)
-
-    @mock.patch.object(schedule_batch, "_is_xpu", False)
-    def test_stop_regex_end_anchored_midchunk_non_xpu_unchanged(self):
-        """Off XPU the mid-step prefix scan is not run: the same step leaves the
-        request unfinished, as before the XPU-only fix."""
-        req = _make_req([60, 61, 62], stop_regex=[r"[.!?]\s*$"])
-        req.update_finish_state(new_accepted_len=3)
-        self.assertFalse(req.finished())
 
     # --- decoded_text-only branch ---
     def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):
