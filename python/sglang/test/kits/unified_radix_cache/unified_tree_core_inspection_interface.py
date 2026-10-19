@@ -30,9 +30,7 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     # ==== Read-only inspection ====
 
     @abstractmethod
-    def contains_node(self, node_id: NodeId) -> bool:
-        """Whether the node id is live in the tree."""
-        ...
+    def contains_node(self, node_id: NodeId) -> bool: ...
 
     @abstractmethod
     def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
@@ -40,14 +38,10 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
-    def get_child_node_ids(self, node_id: NodeId) -> list[NodeId]:
-        """The node's child ids."""
-        ...
+    def get_child_node_ids(self, node_id: NodeId) -> list[NodeId]: ...
 
     @abstractmethod
-    def get_node_key_length(self, node_id: NodeId) -> int:
-        """The node's logical radix-key length."""
-        ...
+    def get_node_key_length(self, node_id: NodeId) -> int: ...
 
     @abstractmethod
     def get_node_token_ids(self, node_id: NodeId) -> list[int]:
@@ -81,14 +75,10 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
-    def get_node_hit_count(self, node_id: NodeId) -> int:
-        """The node's accumulated match count."""
-        ...
+    def get_node_hit_count(self, node_id: NodeId) -> int: ...
 
     @abstractmethod
-    def get_write_through_pending_id(self, node_id: NodeId) -> Optional[int]:
-        """The node's pending write-through id, if any."""
-        ...
+    def get_write_through_pending_id(self, node_id: NodeId) -> Optional[int]: ...
 
     @abstractmethod
     def is_external_cache_stored(self, node_id: NodeId) -> bool:
@@ -117,14 +107,10 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
-    def is_device_evictable_leaf(self, node_id: NodeId) -> bool:
-        """Whether the node belongs to the device-evictable leaf set."""
-        ...
+    def is_device_evictable_leaf(self, node_id: NodeId) -> bool: ...
 
     @abstractmethod
-    def is_host_evictable_leaf(self, node_id: NodeId) -> bool:
-        """Whether the node belongs to the host-evictable leaf set."""
-        ...
+    def is_host_evictable_leaf(self, node_id: NodeId) -> bool: ...
 
     @abstractmethod
     def is_device_leaf(self, node_id: NodeId) -> bool:
@@ -132,9 +118,7 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
-    def get_all_node_ids(self) -> list[NodeId]:
-        """All live tree node ids."""
-        ...
+    def get_all_node_ids(self) -> list[NodeId]: ...
 
     @abstractmethod
     def component_protected_size(self, component_type: ComponentType) -> int:

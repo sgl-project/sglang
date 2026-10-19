@@ -225,7 +225,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
         for session in session_radix_cache_test_values():
             for pinned in (False, True):
                 with self.subTest(session=session, pinned=pinned):
-                    # Rust independently of the shared suite's default backend;
+                    # Rust independently of the fixtures' default backend;
                     # session caches fall back to the Python TreeCore.
                     with mock.patch(
                         "sglang.test.kits.unified_radix_cache.fixtures.TREE_CORE_TEST_BACKEND",
@@ -421,7 +421,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     def test_evict_respects_lock_ref(self):
-        """Lock protects from eviction; unlock allows re-eviction."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq_a = self._make_seq(1, 2)
         seq_b = self._make_seq(500, 2)
@@ -437,7 +436,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         m = match_prefix(cache, seq_a)
         self.assertEqual(m.device_prefix_len, len(seq_a))
 
-        # Unlock -> should now be evictable
         cache.dec_lock_ref(
             m.last_device_node,
             lock_result.to_dec_params(),
@@ -447,7 +445,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     def test_prev_prefix_len(self):
-        """Three-step test: free overlap, free partial, no free."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         initial_avail = allocator.available_size()
 
@@ -455,11 +452,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         seq_2p = self._make_seq(1, 2)  # 2 pages (extends seq_1p)
         seq_3p = self._make_seq(1, 3)  # 3 pages (extends seq_2p)
 
-        # Step 1: insert 1 page
         self._insert(cache, allocator, req_to_token_pool, seq_1p)
         self.assertEqual(allocator.available_size(), initial_avail - len(seq_1p))
 
-        # Step 2: insert 2 pages with prev_prefix_len=0 → frees overlap of 1 page
+        # Frees the 1-page overlap.
         key_2p = RadixKey(array("q", seq_2p))
         value_2p = self._alloc(allocator, len(seq_2p))
         params = InsertParams(
@@ -482,7 +478,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             initial_avail - len(seq_1p) - (len(seq_2p) - len(seq_1p)),
         )
 
-        # Step 3: insert 3 pages with prev_prefix_len=len(seq_2p) → nothing freed
+        # prev_prefix_len covers the whole overlap: nothing freed.
         avail_before = allocator.available_size()
         key_3p = RadixKey(array("q", seq_3p))
         value_3p = self._alloc(allocator, len(seq_3p))
@@ -501,7 +497,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             result.adopted_ranges[ComponentType.FULL],
             [(len(seq_2p), len(seq_3p))],
         )
-        # alloc(3p), freed 0 (prev_prefix_len covers entire overlap), stored 1p new → net -3p
+        # alloc(3p), freed 0, stored 1p new -> net -3p.
         self.assertEqual(allocator.available_size(), avail_before - len(seq_3p))
         cache.sanity_check()
 
@@ -726,7 +722,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
     @requires_paged
     def test_paged_match_truncates_unaligned_key(self):
-        """match_prefix internally aligns keys to page boundary."""
         ps = self.cfg.page_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
@@ -1136,7 +1131,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
                 node_a, ComponentType.SWA, EvictLayer.DEVICE
             )
 
-        # Clean up the forced lock so teardown/sanity is consistent.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 0)
 
     @requires_swa_and_mamba
@@ -1154,7 +1148,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             "A must hold a Mamba checkpoint",
         )
 
-        # Lock ONLY Mamba (Full stays unlocked) — a stranded lower-tier lock.
+        # Same stranded-Mamba-lock setup as above.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 1)
         self.assertGreaterEqual(
             node_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1, "Mamba locked"
@@ -1167,14 +1161,11 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             node_a, ComponentType.SWA, EvictLayer.DEVICE
         )
         cache._free_values(result.device_frees, result.host_frees)
-        # No higher-or-equal tier pins the node, so even with early-release on
-        # the stranded Mamba lock must trip the hard-invariant assert.
         with self.assertRaises(AssertionError):
             cache.tree_core.validate_cascade_evict(
                 node_a, ComponentType.SWA, EvictLayer.DEVICE
             )
 
-        # Clean up the forced lock so teardown/sanity is consistent.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 0)
 
     @requires_swa
@@ -1300,8 +1291,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._insert(cache, allocator, req_to_token_pool, seq_side)
 
         pre = self._swa_lru_order(cache)
-        # Each 8-page segment is cap-split into [prefix, tail]; tails lead in
-        # MRU order, so segment tails sit at even indices.
+        # Same segment layout as above.
         self.assertEqual(len(pre), 8)
         side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
 
@@ -1467,10 +1457,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIn(parent, node_children(cache, cache.root_node_handle()))
         self.assertTrue(all(evicted == 0 for evicted in result.tracker.values()))
 
-    # ================================================================
-    # Evict chain tests covering demotion, cascade, and tombstone cleanup.
-    # ================================================================
-
     def test_aux_evict_full_locked_leaf_tombstones_aux_only(self):
         aux_types = [
             ct
@@ -1537,7 +1523,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     def test_evict_leaf_frees_all_components(self):
-        """Evicting a device leaf frees Full and all aux components atomically."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 3)
         self._insert(cache, allocator, req_to_token_pool, seq)
@@ -1557,18 +1542,15 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     def test_evict_cascade_parent_becomes_d_leaf(self):
-        """After evicting a D-leaf child, parent may become a new D-leaf."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         base = self._make_seq(1, 2)
         leaf = base + self._make_seq(500, 2)
         self._insert(cache, allocator, req_to_token_pool, base)
         self._insert(cache, allocator, req_to_token_pool, leaf)
 
-        # Lock the base node to prevent it from being evicted
         m_base = match_prefix(cache, base)
         lock_result = cache.inc_lock_ref(m_base.last_device_node)
 
-        # Evict the leaf — parent (base) should become D-leaf after unlock
         result = cache.evict(EvictParams(num_tokens=len(leaf)))
         cache.sanity_check()
 
@@ -1576,16 +1558,13 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             m_base.last_device_node,
             lock_result.to_dec_params(),
         )
-        # After unlock, base should be in evictable_device_leaves
         self.assertTrue(
             cache.tree_core.is_device_evictable_leaf(m_base.last_device_node)
         )
         cache.sanity_check()
 
     def test_evict_iterative_tombstone_cleanup(self):
-        """Tombstone cascade: evicting a leaf triggers cleanup up the tree."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        # Create a chain: root -> A -> B -> C (3 levels)
         ps = self.cfg.page_size
         chain = self._make_seq(1, 6)
         self._insert(cache, allocator, req_to_token_pool, chain[: 2 * ps])
@@ -1595,16 +1574,13 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         initial_evictable = cache.full_evictable_size()
         self.assertGreater(initial_evictable, 0)
 
-        # Evict everything — tombstone cascade should clean up all
         result = cache.evict(EvictParams(num_tokens=initial_evictable * 2))
         self.assertGreaterEqual(result.num_tokens_evicted, initial_evictable)
         self.assertEqual(cache.full_evictable_size(), 0)
-        # Only root should remain
         self.assertEqual(len(node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
     def test_evict_respects_lru_order(self):
-        """Older (less recently accessed) nodes are evicted first."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
         seq_old = self._make_seq(1, 2)
@@ -1613,13 +1589,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._insert(cache, allocator, req_to_token_pool, seq_old)
         self._insert(cache, allocator, req_to_token_pool, seq_new)
 
-        # Touch seq_new to make it MRU
         match_prefix(cache, seq_new)
 
-        # Evict just enough for one sequence
         cache.evict(EvictParams(num_tokens=len(seq_old)))
 
-        # seq_old should be gone (LRU), seq_new should remain
         m_old = match_prefix(cache, seq_old)
         m_new = match_prefix(cache, seq_new)
         self.assertEqual(m_old.device_prefix_len, 0)
@@ -1648,7 +1621,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     def test_evict_multiple_independent_leaves(self):
-        """Evicting multiple independent leaves works correctly."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seqs = [self._make_seq(i * 100, 2) for i in range(4)]
         for s in seqs:
@@ -1657,14 +1629,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         total = sum(len(s) for s in seqs)
         self.assertEqual(cache.full_evictable_size(), total)
 
-        # Evict half
         half = total // 2
         result = cache.evict(EvictParams(num_tokens=half))
         self.assertGreaterEqual(result.num_tokens_evicted, half)
         self.assertLessEqual(cache.full_evictable_size(), total - half)
         cache.sanity_check()
 
-        # Evict remainder
         remaining = cache.full_evictable_size()
         result = cache.evict(EvictParams(num_tokens=remaining * 2))
         self.assertGreaterEqual(result.num_tokens_evicted, remaining)
@@ -1672,7 +1642,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     def test_evict_result_accounting_matches_actual(self):
-        """EvictResult.num_tokens_evicted matches actual size change."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seqs = [self._make_seq(i * 100, 2) for i in range(5)]
         for s in seqs:
@@ -1686,7 +1655,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
     @requires_swa
     def test_swa_evict_internal_tombstone(self):
-        """SWA eviction on internal node cascades to lower-priority components."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         base = self._make_seq(1, 3)
         leaf = base + self._make_seq(500, 3)
@@ -2165,7 +2133,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
 class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):
     """A widened draft needs SWA history before the target window. A running
     checkpoint must lock that history, and an incomplete cached window must
-    not be reused even when the target alone could read it. The shared suite
+    not be reused even when the target alone could read it. The Rust rerun module
     runs these contracts against both Python and Rust TreeCore.
     """
 

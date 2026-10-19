@@ -1,5 +1,3 @@
-"""Fixtures for the UnifiedRadixCache insert walk unit tests."""
-
 from array import array
 from types import SimpleNamespace
 
@@ -166,7 +164,6 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
             op = rng.random()
             try:
                 if op < 0.35 or not chains:
-                    # Insert: fresh chain or extend/diverge an existing one.
                     if chains and rng.random() < 0.6:
                         base = rng.choice(chains)
                         cut = rng.randrange(1, len(base) + 1)
@@ -195,7 +192,6 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                     cache.insert(params)
                     chains.append(seq)
                 elif op < 0.6:
-                    # Lock a random chain's current deepest device node.
                     seq = rng.choice(chains)
                     m = match_prefix(cache, seq)
                     node_id = m.last_device_node
@@ -206,14 +202,12 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                     )
                     held.append([node_id, receipt, False])
                 elif op < 0.8 and held:
-                    # Full release of a random held lock.
                     idx = rng.randrange(len(held))
                     node_id, receipt, released = held.pop(idx)
                     cache.dec_lock_ref(
                         node_id, receipt.to_dec_params(), skip_swa=released
                     )
                 elif op < 0.9 and held:
-                    # Early SWA release of a random not-yet-released lock.
                     idx = rng.randrange(len(held))
                     node_id, receipt, released = held[idx]
                     if (

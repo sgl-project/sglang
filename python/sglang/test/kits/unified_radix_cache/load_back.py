@@ -1,5 +1,3 @@
-"""Fixtures for the UnifiedRadixCache load back unit tests."""
-
 from unittest import mock
 
 import torch

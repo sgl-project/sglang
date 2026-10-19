@@ -1,5 +1,3 @@
-"""Fixtures for the UnifiedRadixCache core unit tests."""
-
 from array import array
 from unittest import mock
 

@@ -191,7 +191,10 @@ CONFIGS: list[CacheConfig] = [
 
 
 def requires(predicate, reason):
-    """Run a suite test only under the configs that satisfy ``predicate``.
+    """Keep a test only under the configs where ``predicate`` holds.
+
+    Under any other config the test is removed from the bound class, not
+    skipped. ``reason`` documents the requirement and is not read at runtime.
 
     Stacked requirements are checked top to bottom and stop at the first that
     fails, so a lower one may assume the ones above it hold.
@@ -263,7 +266,7 @@ requires_full_mamba_ps1 = requires(
 
 
 def config_attrs(suite, cfg):
-    """Bind ``suite`` to ``cfg``, hiding the tests whose requirements it fails."""
+    """Bind the test mixin ``suite`` to ``cfg``, hiding the tests whose requirements it fails."""
     attrs = {"cfg": cfg}
     for name, test in vars(suite).items():
         requirements = getattr(test, "_cfg_requirements", ())
@@ -273,7 +276,7 @@ def config_attrs(suite, cfg):
 
 
 def define_config_test_classes(suite, namespace):
-    """Define ``Test_<label>`` in ``namespace`` for each config, binding ``suite``."""
+    """Define ``Test_<label>`` in ``namespace`` for each config, binding the test mixin ``suite``."""
     for cfg in CONFIGS:
         name = f"Test_{cfg.label}"
         test_class = type(name, (suite, CustomTestCase), config_attrs(suite, cfg))

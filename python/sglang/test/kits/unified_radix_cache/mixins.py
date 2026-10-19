@@ -139,7 +139,7 @@ class UnifiedRadixCacheFixtures:
         return cache.insert(params)
 
     def _path_chain(self, cache, node):
-        """Return root->node node chain (excluding root)."""
+        """Nodes from root to node, excluding root."""
         chain = []
         cur = node
         while cur != cache.root_node_handle():
@@ -149,6 +149,7 @@ class UnifiedRadixCacheFixtures:
         return chain
 
     def _skip_unsupported_hicache_test(self):
+        """Runtime skip for tests that call hicache helpers without ``requires_hicache``."""
         if not supports_hicache(self.cfg):
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False

@@ -1,5 +1,3 @@
-"""Fixtures for the UnifiedRadixCache storage unit tests."""
-
 import shutil
 import tempfile
 import time
@@ -105,8 +103,6 @@ class ExtraPoolFullComponent(FullComponent):
 
 
 class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
-    # ---------- L3 storage (file backend) helpers ----------
-
     def _make_storage_dir(self):
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)

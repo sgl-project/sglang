@@ -1,5 +1,3 @@
-"""Fixtures for the UnifiedRadixCache kv events unit tests."""
-
 from array import array
 
 from sglang.srt.disaggregation.kv_events import (

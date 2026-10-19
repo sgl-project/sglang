@@ -371,7 +371,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_evict_to_host(self):
-        """Evicting a backed-up device leaf demotes it to host-only state."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
@@ -382,17 +381,14 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self._backup_node(cache, node)
         self.assertTrue(cache.tree_core.is_backuped(node))
 
-        # Evict -> should demote to host (S3)
         result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
 
-        # Node should now be evicted (S3)
         self.assertTrue(cache.tree_core.is_full_device_evicted(node))
         self.assertTrue(cache.tree_core.is_backuped(node))
         self.assertIsNone(node_device_value(cache, node, ComponentType.FULL))
         self.assertIsNotNone(node_host_value(cache, node, ComponentType.FULL))
 
-        # Should be in host_leaves, not device_leaves
         self.assertFalse(cache.tree_core.is_device_evictable_leaf(node))
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(node))
         cache.sanity_check()
@@ -456,7 +452,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_host_leaf_eviction(self):
-        """Evicting a host leaf removes the node from the tree entirely."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
@@ -470,17 +465,14 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertTrue(cache.tree_core.is_full_device_evicted(node))
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(node))
 
-        # Now evict host
         cache.evict_host(len(seq))
 
-        # Node should be removed from tree
         self.assertFalse(cache.tree_core.is_host_evictable_leaf(node))
         self.assertEqual(len(node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
     @requires_hicache
     def test_hicache_evict_drops_unlocked_node_when_backup_fails(self):
-        """A failed write-back backup drops an unlocked subtree."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
         seq = self._make_seq(1, 2)
@@ -505,7 +497,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         lambda cfg: not cfg.has_mamba, "SWA-only path keeps the split setup simple"
     )
     def test_hicache_write_through_offloads_swa_split_leaf(self):
-        """A SWA boundary-split leaf should offload normally under write-through."""
 
         ps = self.cfg.page_size
         cache, allocator, _ = build_fixture(self.cfg)
@@ -1237,7 +1228,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_hicache
     def test_hicache_write_back_leaf_backup(self):
-        """write_back: evicting a device leaf backs it up to host"""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
 

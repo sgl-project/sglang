@@ -207,7 +207,6 @@ class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
 class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
     @requires_hicache
     def test_hicache_load_back_restores_data(self):
-        """Loading back an evicted node restores the backed-up cache data."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         base = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, base)
@@ -972,7 +971,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         "SWA-only path keeps the chain construction simple",
     )
     def test_hicache_swa_load_back_min_suffix(self):
-        """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""
         ps = self.cfg.page_size
         sw = self.cfg.sliding_window_size
         expected_pages = (sw + ps - 1) // ps
@@ -1170,7 +1168,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         "page_size==1 for direct swa_attn_allocator access",
     )
     def test_hicache_swa_load_back_uses_full_pool_capacity(self):
-        """load_back should gate Full KV load on Full pool capacity only."""
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
 

@@ -2261,7 +2261,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(self._host_avail_sizes(cons3), avail3)
         cons3.sanity_check()
 
-    # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
+    # TP consistency for SWA prefetch
 
     def test_tp_swa_prefetch_dropped_when_peer_misses(self):
         """A peer rank missing the SWA window drops the whole prefetch result
@@ -2560,7 +2560,6 @@ class TestUnifiedRadixPrefetchCorruption(
     )
 
     def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
-        """Write-through: a refill under an un-backed-up parent is dropped."""
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
 

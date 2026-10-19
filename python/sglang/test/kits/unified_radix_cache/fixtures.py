@@ -65,7 +65,7 @@ def selected_tree_core_test_backend() -> str:
 def drop_hicache_atexit_pin(cache):
     """init_hicache registers ``cache.shutdown`` with atexit, which pins the
     fixture's device and host pools until process exit; hundreds of HiCache
-    fixtures in this suite would otherwise accumulate on the GPU."""
+    fixtures in one test process would otherwise accumulate on the GPU."""
     atexit.unregister(cache.shutdown)
 
 
