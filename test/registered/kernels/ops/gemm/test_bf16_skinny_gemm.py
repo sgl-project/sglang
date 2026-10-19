@@ -46,7 +46,9 @@ def _error_bound(x, w):
     return ref, gamma * (x.double().abs() @ w.double().abs().T) + ulp
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "CUDA required"
+)
 class TestBf16SkinnyGemm(CustomTestCase):
     def test_within_fp32_accumulation_bound(self):
         for n, k in SHAPES:
