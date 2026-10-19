@@ -971,6 +971,39 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
         self.assertTrue(any("omitted" in r for r in log.output))
 
+    def test_request_claude_code_display_updates_is_accepted(self):
+        """Claude Code's opening request (beta ``display="updates"`` with
+        ``output_config`` and ``context_management``) must not 400."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "updates"},
+            output_config={"effort": "high"},
+            context_management={
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            },
+            metadata={"user_id": "session"},
+            stream=False,
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertEqual(chat_request.reasoning_effort, "high")
+        self.assertTrue(any("updates" in r for r in log.output))
+
+    def test_request_thinking_unknown_display_is_rejected(self):
+        """Only the SDK's display values pass; anything else is a 400."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "adaptive", "display": "streaming"}, stream=False
+            )
+        self.assertIn("display", str(ctx.exception))
+
     def test_request_output_config_effort_maps_to_reasoning_effort(self):
         """``output_config.effort`` rows map onto ``reasoning_effort``."""
         for anthropic_effort, openai_effort in [
