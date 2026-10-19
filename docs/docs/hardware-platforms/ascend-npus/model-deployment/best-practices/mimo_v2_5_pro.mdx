@@ -81,7 +81,7 @@ python3 -m sglang.launch_server \
     --swa-full-tokens-ratio 0.3 \
     --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
-    --disable-piecewise-cuda-graph \
+    --cuda-graph-backend-prefill disabled \
     --attn-dp-size 2 --enable-dp-lm-head \
     --moe-a2a-backend deepep --deepep-mode normal
 ```

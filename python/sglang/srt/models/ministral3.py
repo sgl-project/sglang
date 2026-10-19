@@ -155,6 +155,7 @@ class Ministral3Model(LlamaModel):
                 prefix=prefix,
             ),
             prefix="model.layers",
+            stage_facts=lambda idx: Ministral3DecoderLayer.stage_facts(config, idx),
         )
 
 

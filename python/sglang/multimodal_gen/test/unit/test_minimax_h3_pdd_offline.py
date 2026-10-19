@@ -113,7 +113,8 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
         apply_schedule(batch)
         self.assertEqual(
             batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY],
-            {name: values[:3] for name, values in sigmas.items()},
+            # Three warmup updates need four sigma boundaries on the serving grid.
+            {name: values[:4] for name, values in sigmas.items()},
         )
 
     def test_conversion_keeps_heads_outside_transformer(self):

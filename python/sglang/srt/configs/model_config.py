@@ -291,6 +291,23 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
     return config
 
 
+@lru_cache
+def load_joint_head_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """joint_head_config.json of a Clef checkpoint, whose joint schema head
+    answers /v1/systemone decisions from the backbone's hidden states."""
+    path = cached_file(
+        model_path,
+        "joint_head_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if path is None:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
@@ -544,6 +561,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        self.joint_head_config = None
+        if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+            self.joint_head_config = load_joint_head_config(self.model_path, revision)
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
@@ -978,6 +998,12 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+            if self.hf_text_config.mtp_local_layer_ids:
+                # A local MTP depth keeps the trunk's window unless it declares
+                # its own: the draft backend builds its window rail only if set.
+                self.sliding_window_size = (
+                    self.hf_text_config.mtp_local_extent or self.sliding_window_size
+                )
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
@@ -2297,6 +2323,7 @@ multimodal_model_archs = [
     "NemotronH_Nano_Omni_Reasoning_V3",
     "NemotronH_Omni_Reasoning_V3",
     "MuseGlimmerForConditionalGeneration",
+    "MuseSparkForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -2374,8 +2401,11 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
+    "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -2626,21 +2656,15 @@ def get_hybrid_layer_ids(
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
     elif "InklingForConditionalGenerationMTP" in model_architectures:
-        # One block per MTP depth; a banded head marks its sliding-window depths
-        # in mtp_local_layer_ids. The per-depth pool routing in the KV-cache
-        # mixin is authoritative; this keeps model_config's swa/full lists
-        # self-consistent for other consumers.
-        mtp_local_layer_ids = hf_text_config.mtp_local_layer_ids
-        if mtp_local_layer_ids:
-            num_depths = hf_text_config.num_nextn_predict_layers
-            local_set = set(mtp_local_layer_ids)
-            swa_attention_layer_ids = sorted(local_set)
-            full_attention_layer_ids = [
-                i for i in range(num_depths) if i not in local_set
-            ]
-        else:
-            swa_attention_layer_ids = []
-            full_attention_layer_ids = [0]
+        # Runner-local layer setup selects one depth from these shared lists,
+        # including when every draft depth uses full attention.
+        local_set = set(hf_text_config.mtp_local_layer_ids)
+        swa_attention_layer_ids = sorted(local_set)
+        full_attention_layer_ids = [
+            i
+            for i in range(hf_text_config.num_nextn_predict_layers)
+            if i not in local_set
+        ]
     elif "InklingForConditionalGeneration" in model_architectures:
         local_layer_ids = hf_text_config.local_layer_ids
         local_layer_id_set = set(local_layer_ids)
@@ -2661,6 +2685,17 @@ def get_hybrid_layer_ids(
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))
         full_attention_layer_ids = []
+    elif "MuseSparkForConditionalGeneration" in model_architectures:
+        swa_attention_layer_ids = [
+            i
+            for i, kind in enumerate(hf_text_config.layer_types)
+            if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i
+            for i, kind in enumerate(hf_text_config.layer_types)
+            if kind == "full_attention"
+        ]
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern

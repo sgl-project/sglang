@@ -1,11 +1,7 @@
 """Adler-32 checksum for GPU tensors.
 
-Three entry points:
-  - adler32_checksum(tensor) -> int : checksum all bytes of a contiguous tensor
-  - adler32_regions_checksum(data_ptrs, lengths, device) -> int : checksum
-    multiple raw GPU regions in order
-  - adler32_strided_checksum(data_ptrs, strides, indices) -> int : checksum
-    selected items across multiple tensors in a single kernel launch
+adler32_strided_checksum(data_ptrs, strides, indices) -> int checksums selected
+items across multiple tensors in a single kernel launch.
 """
 
 from __future__ import annotations
@@ -26,7 +22,6 @@ def _jit_adler32_module() -> Module:
         "adler32_checksum",
         cuda_files=["elementwise/adler32_checksum.cuh"],
         cuda_wrappers=[
-            ("adler32_whole", "Adler32WholeKernel::run"),
             ("adler32_strided", "Adler32StridedKernel::run"),
             ("adler32_reduce", "Adler32ReduceKernel::run"),
         ],
@@ -34,8 +29,6 @@ def _jit_adler32_module() -> Module:
 
 
 _BLOCK_SIZE = 256
-_MAX_BLOCKS = 1024
-_REGION_CHUNK_SIZE = 512 * 1024
 
 
 def _alloc_states(num_blocks: int, device: torch.device) -> torch.Tensor:
@@ -47,51 +40,6 @@ def _reduce_states(module: Module, states: torch.Tensor, num_blocks: int) -> int
     result = torch.empty(1, dtype=torch.int64, device=states.device)
     module.adler32_reduce(states, result, num_blocks)
     return result.item()
-
-
-def adler32_checksum(tensor: torch.Tensor) -> int:
-    """Compute Adler-32 checksum of entire tensor (all bytes)."""
-    assert tensor.is_contiguous(), "tensor must be contiguous"
-
-    module = _jit_adler32_module()
-    num_bytes = tensor.numel() * tensor.element_size()
-    if num_bytes == 0:
-        return 1
-
-    total_threads = min(num_bytes, _BLOCK_SIZE * _MAX_BLOCKS)
-    chunk_size = max(1, (num_bytes + total_threads - 1) // total_threads)
-    num_threads_needed = (num_bytes + chunk_size - 1) // chunk_size
-    num_blocks = (num_threads_needed + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-
-    states = _alloc_states(num_blocks, tensor.device)
-    data_view = tensor.view(torch.uint8)
-    module.adler32_whole(data_view, states, num_bytes, chunk_size)
-    return _reduce_states(module, states, num_blocks)
-
-
-def adler32_regions_checksum(
-    data_ptrs: list[int], lengths: list[int], device: torch.device
-) -> int:
-    assert len(data_ptrs) == len(lengths)
-    module = _jit_adler32_module()
-    chunk_ptrs = []
-    chunk_lengths = []
-    for data_ptr, length in zip(data_ptrs, lengths):
-        assert data_ptr > 0 and length >= 0
-        offset = 0
-        while offset < length:
-            chunk_length = min(_REGION_CHUNK_SIZE, length - offset)
-            chunk_ptrs.append(data_ptr + offset)
-            chunk_lengths.append(chunk_length)
-            offset += chunk_length
-    if not chunk_ptrs:
-        return 1
-    ptrs = torch.tensor(chunk_ptrs, dtype=torch.int64, device=device)
-    lens = torch.tensor(chunk_lengths, dtype=torch.int32, device=device)
-    num_blocks = (len(chunk_ptrs) + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-    states = _alloc_states(num_blocks, torch.device(device))
-    module.adler32_strided(ptrs, lens, states, len(chunk_ptrs))
-    return _reduce_states(module, states, num_blocks)
 
 
 def adler32_strided_checksum(

@@ -372,6 +372,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer()
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
+                        or get_moe_a2a_backend().is_ascend_fuseep()
                     )
                     else {}
                 ),
@@ -393,6 +394,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             self.num_experts = (
                 config.num_experts + get_exec().moe.ep_num_redundant_experts
@@ -827,6 +829,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()
             or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self._forward_deepep(hidden_states, forward_batch)
 
@@ -1026,9 +1029,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # Qwen2MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_next_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Qwen2MoeSparseMoeBlock(
@@ -1053,13 +1055,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages a Qwen2-MoE layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers)."""
+        # Qwen2MoE all layers are sparse and have no nextn now
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -1138,6 +1150,7 @@ class Qwen2MoeModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

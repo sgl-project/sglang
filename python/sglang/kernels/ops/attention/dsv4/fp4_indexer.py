@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.jit.utils import aligned_new_empty
+from sglang.kernels.ops.attention.deep_select import get_input_stride_alignment_bytes
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
 from sglang.srt.runtime_context import get_platform
 
@@ -910,12 +912,15 @@ def fp4_index_logits_paged(
     weights = weights.to(torch.bfloat16).contiguous()
     req = req.contiguous()
     lens = lens.contiguous()
-    # Existing candidate-amax needs rows aligned to eight floats.
-    out = torch.empty(
-        (batch, triton.cdiv(max_len, 8) * 8), device=q.device, dtype=torch.float32
+    # Rows aligned for DeepSelect top-k (128B) also suit candidate-amax (8 floats).
+    out = aligned_new_empty(
+        shape=(batch, max_len),
+        dtype=torch.float32,
+        device=q.device,
+        alignment_bytes=get_input_stride_alignment_bytes(),
     )
     if not batch or not max_len:
-        return out[:, :max_len]
+        return out
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     workers = min(triton.cdiv(max_len, 64), triton.cdiv(num_sms * 4, batch))
     _fp4_index_logits_paged_kernel[(batch, workers)](
@@ -943,4 +948,4 @@ def fp4_index_logits_paged(
         BLOCK_L=64,
         num_warps=4,
     )
-    return out[:, :max_len]
+    return out
