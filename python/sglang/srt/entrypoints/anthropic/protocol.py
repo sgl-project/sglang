@@ -257,24 +257,9 @@ class AnthropicToolChoice(BaseModel):
 class AnthropicThinkingParam(BaseModel):
     """Anthropic extended-thinking control on the request.
 
-    Mirrors the Anthropic SDK's ``ThinkingConfigParam`` discriminated
-    union of three variants — see ``anthropic-sdk-python``'s
-    ``thinking_config_{enabled,disabled,adaptive}_param.py``:
-
-    * ``enabled`` requires ``budget_tokens`` (≥1024) and accepts
-      ``display``.
-    * ``disabled`` accepts no other fields.
-    * ``adaptive`` (Claude 4.7) accepts ``display`` but not
-      ``budget_tokens``.
-
-    The serving layer treats ``adaptive`` identically to ``enabled``
-    because the local OpenAI-compatible backend has no auto-throttle
-    equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
-    compatibility but the backend has no hard-cap knob to honor it; the
-    serving layer logs a WARNING so operators see that the requested
-    budget is not enforced. ``display="omitted"`` and the beta
-    ``display="updates"`` are accepted but similarly cannot suppress
-    reasoning mid-stream and are logged.
+    Mirrors the SDK's ``thinking_config_{enabled,disabled,adaptive}_param.py``
+    variants. ``budget_tokens`` and ``display="omitted"``/``"updates"`` are
+    accepted for SDK compatibility but not enforced; the serving layer logs them.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
