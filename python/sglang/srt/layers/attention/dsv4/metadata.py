@@ -188,9 +188,6 @@ class PagedIndexerMetadata:
     # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
     # all rows at once.
     row_chunk: int = 0
-    # Consecutive query rows of one request (target verify: the draft tokens).
-    # Above 1 the paged logits kernel scores them as one request, reading the
-    # request's index-K cache once per block of rows instead of once per row.
     rows_per_request: int = 1
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
@@ -215,7 +212,6 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            # The JIT planner flattens the lengths, so grouped rows take DeepGEMM's.
             use_jit_indexer = (
                 not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
@@ -393,6 +389,7 @@ class PagedIndexerMetadata:
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
+                "rows_per_request",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
