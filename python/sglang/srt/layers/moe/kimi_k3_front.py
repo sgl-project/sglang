@@ -88,17 +88,15 @@ class KimiK3FrontWorkspace:
         self.q_mc = mc_base
         self.scale_mc = mc_base + scale_start
 
-        self._allocate_routing = getattr(
-            core, "trtllm_moe_allocate_routing_metadata", None
-        )
+        self._routing_slot_type = getattr(core, "TrtllmMoERoutingMetadataSlot", None)
         self.routing = None
 
     def route(self, layer_id, scores, bias, local_x, config):
         rows = scores.shape[0]
         assert rows <= self.max_tokens
-        if rows == 1 and self.routing is None and self._allocate_routing is not None:
+        if rows == 1 and self.routing is None and self._routing_slot_type is not None:
             self.routing = SingleTokenRouting(
-                scores.device, scores.shape[1], config.top_k, self._allocate_routing
+                scores.device, scores.shape[1], config.top_k, self._routing_slot_type
             )
         routing = self.routing if rows == 1 else None
         # Finalize/AllReduce fences the consumer before this layer reuses its slot.
@@ -132,32 +130,34 @@ class SingleTokenRouting:
     """Reuse native MoE metadata when one row selects distinct, sorted experts.
 
     Only tile-N=8 uses the prepared layout; other autotuner choices retain the
-    native preparation. Buffer capacities come from FlashInfer's allocator.
+    native preparation. Capacities follow the native one-row routing layout.
     """
 
-    def __init__(self, device, num_experts, top_k, allocate):
-        from flashinfer.fused_moe.core import RoutingInputMode
+    def __init__(self, device, num_experts, top_k, slot_type):
+        def ints(n):
+            return torch.empty(n, dtype=torch.int32, device=device)
 
         tile_n = 8
-        packed = torch.empty((1, top_k), dtype=torch.int32, device=device)
-        self.slot = allocate(
-            packed,
-            num_experts=num_experts,
-            top_k=top_k,
-            local_expert_offset=0,
-            num_local_experts=num_experts,
-            tile_n=tile_n,
-            routing_input_mode=RoutingInputMode.PackedPrecomputed,
-        )
-        expanded = torch.arange(top_k, dtype=torch.int32, device=device) * tile_n
         padded = top_k * tile_n
-        self.slot.total_num_padded_tokens.fill_(padded)
-        self.slot.expanded_idx_to_permuted_idx.copy_(expanded)
-        self.slot.permuted_idx_to_token_idx.fill_(-1)
-        self.slot.permuted_idx_to_token_idx[:padded:tile_n] = 0
-        self.batch = self.slot.cta_idx_xy_to_batch_idx[:top_k]
-        self.slot.cta_idx_xy_to_mn_limit[:top_k].copy_(expanded + 1)
-        self.slot.num_non_exiting_ctas.fill_(top_k)
+        expanded = torch.arange(top_k, dtype=torch.int32, device=device) * tile_n
+        permuted = torch.full((padded + 1,), -1, dtype=torch.int32, device=device)
+        permuted[:padded:tile_n] = 0
+        # FlashInfer's multi-tile allocator only accepts top_k <= 8. Its body
+        # also accepts this one-row layout, with one tile per distinct expert.
+        self.slot = slot_type(
+            tile_n=tile_n,
+            total_num_padded_tokens=ints(1).fill_(padded),
+            expanded_idx_to_permuted_idx=expanded,
+            permuted_idx_to_token_idx=permuted,
+            expert_weights=torch.empty((1, top_k), dtype=torch.bfloat16, device=device),
+            # Native routing ABI reserves at least 512 histogram entries.
+            expert_count_histogram=ints(max(2 * num_experts, 512)),
+            num_tokens_per_expert=ints(num_experts),
+            cta_idx_xy_to_batch_idx=ints(top_k),
+            cta_idx_xy_to_mn_limit=expanded + 1,
+            num_non_exiting_ctas=ints(1).fill_(top_k),
+        )
+        self.batch = self.slot.cta_idx_xy_to_batch_idx
         self.workspaces = {}
 
     def __call__(self, **kwargs):
