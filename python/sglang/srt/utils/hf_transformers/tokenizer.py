@@ -19,6 +19,7 @@ import warnings
 from pathlib import Path
 from typing import Optional, Union
 
+import msgspec
 from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
@@ -263,6 +264,38 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 # ---------------------------------------------------------------------------
 
 
+class _TokenizerComponents(msgspec.Struct):
+    pre_tokenizer: msgspec.Raw = msgspec.Raw(b"null")
+    decoder: msgspec.Raw = msgspec.Raw(b"null")
+
+
+def _load_tokenizer_components(tokenizer_file):
+    from tokenizers import Tokenizer as RawTokenizer
+
+    # Skip the vocabulary and merges: only these two components are needed by
+    # the v5 compatibility fix. Let tokenizers deserialize its own component
+    # formats, including nested sequences, using a tiny placeholder model.
+    components = msgspec.json.decode(
+        Path(tokenizer_file).read_bytes(), type=_TokenizerComponents
+    )
+    state = msgspec.json.encode(
+        {
+            "version": "1.0",
+            "pre_tokenizer": components.pre_tokenizer,
+            "decoder": components.decoder,
+            "model": {"type": "WordLevel", "vocab": {}, "unk_token": "[UNK]"},
+        }
+    ).decode()
+    try:
+        return RawTokenizer.from_str(state)
+    except Exception as exc:
+        # The Rust binding reports malformed component state as a plain Python
+        # Exception. Normalize it for the best-effort compatibility fix below.
+        raise ValueError(
+            f"Invalid tokenizer components in {tokenizer_file}: {exc}"
+        ) from exc
+
+
 def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
     """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
 
@@ -280,12 +313,10 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         return
 
     try:
-        from tokenizers import Tokenizer as RawTokenizer
-
         tok_file = _resolve_local_or_cached_file(
             model_name_or_path, "tokenizer.json", revision
         )
-        raw = RawTokenizer.from_file(tok_file)
+        raw = _load_tokenizer_components(tok_file)
     except FileNotFoundError:
         return
     except (OSError, ValueError, RuntimeError) as e:

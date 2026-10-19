@@ -1019,6 +1019,16 @@ class Scheduler(
         else:
             from sglang.srt.managers.tp_worker import TpModelWorker
 
+            if (
+                not self.model_config.is_multimodal
+                and not get_model().trust_remote_code
+                and get_serving().tokenizer_backend == "huggingface"
+                and get_serving().tokenizer_mode == "auto"
+            ):
+                # Same process and loading options. The target worker only
+                # needs this tokenizer for speculative initialization; keep
+                # the scheduler's object instead of rebuilding its vocabulary.
+                worker_kwargs["tokenizer"] = self.tokenizer
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):

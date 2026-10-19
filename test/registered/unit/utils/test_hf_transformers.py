@@ -6,14 +6,17 @@ context length, GGUF detection, etc.) that don't require actual model files.
 
 import inspect
 import io
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 from PIL import Image
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PretrainedConfig
 from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
@@ -33,12 +36,87 @@ from sglang.srt.utils.hf_transformers.common import (
     resolve_hf_gguf_reference,
 )
 from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.utils.hf_transformers.tokenizer import (
+    _fix_special_tokens_pattern,
+    _fix_v5_tokenizer_components,
+    _load_tokenizer_components,
+)
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+
+
+class TestTokenizerComponents(CustomTestCase):
+    def test_component_fix_preserves_model_and_restores_nested_components(self):
+        """Repair v5's replacement components without rebuilding the vocabulary."""
+        original = Tokenizer(
+            models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        )
+        original.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.WhitespaceSplit(),
+                pre_tokenizers.ByteLevel(add_prefix_space=False),
+            ]
+        )
+        original.decoder = decoders.Sequence([decoders.ByteLevel()])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tokenizer.json"
+            original.save(str(path))
+            loaded = Tokenizer.from_file(str(path))
+            loaded.pre_tokenizer = pre_tokenizers.Whitespace()
+            loaded.decoder = decoders.WordPiece()
+            wrapper = SimpleNamespace(_tokenizer=loaded)
+            _fix_v5_tokenizer_components(wrapper, directory)
+            self.assertEqual(loaded.get_vocab(), original.get_vocab())
+            self.assertEqual(
+                loaded.encode("hello hello").ids, original.encode("hello hello").ids
+            )
+            self.assertEqual(loaded.decode([1, 1]), original.decode([1, 1]))
+            self.assertEqual(
+                loaded.pre_tokenizer.__getstate__(),
+                original.pre_tokenizer.__getstate__(),
+            )
+            self.assertEqual(
+                loaded.decoder.__getstate__(), original.decoder.__getstate__()
+            )
+
+            # Same-class components intentionally keep the loader's settings,
+            # matching the existing compatibility policy.
+            loaded.decoder = decoders.WordPiece(prefix="##")
+            before = loaded.decoder.__getstate__()
+            _fix_v5_tokenizer_components(wrapper, directory)
+            self.assertEqual(loaded.decoder.__getstate__(), before)
+
+            data = json.loads(path.read_text())
+            data["model"] = {"type": "ModelNotNeededForComponentLoading"}
+            path.write_text(json.dumps(data))
+            components = _load_tokenizer_components(path)
+            self.assertEqual(
+                components.pre_tokenizer.__getstate__(),
+                original.pre_tokenizer.__getstate__(),
+            )
+
+    def test_absent_and_invalid_components_leave_loaded_tokenizer_usable(self):
+        backend = Tokenizer(
+            models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tokenizer.json"
+            for contents in (
+                "{}",
+                '{"pre_tokenizer": null}',
+                '{"pre_tokenizer": {"type": "invalid"}}',
+                '{"pre_tokenizer":',
+            ):
+                with self.subTest(contents=contents):
+                    path.write_text(contents)
+                    _fix_v5_tokenizer_components(
+                        SimpleNamespace(_tokenizer=backend), directory
+                    )
+                    self.assertEqual(backend.encode("hello hello").ids, [1, 1])
 
 
 # ---------------------------------------------------------------------------

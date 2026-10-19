@@ -293,6 +293,7 @@ class TpModelWorker(BaseTpWorker):
         draft_attention_backend: Optional[str] = None,
         random_seed: Optional[int] = None,
         load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+        tokenizer=None,
     ):
         # Parse args
         self.server_args = server_args
@@ -326,6 +327,9 @@ class TpModelWorker(BaseTpWorker):
             # A draft worker's tokenizer would only duplicate the target's:
             # tokenizer_path always points at the target model.
             self.tokenizer = self.processor = None
+        elif tokenizer is not None:
+            self.tokenizer = tokenizer
+            self.processor = None
         else:
             if self.model_config.is_multimodal:
                 self.processor = get_processor(
