@@ -998,10 +998,11 @@ def engram_gate(
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy."""
+    # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
+    # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
         _cuda_kernels(x)
         and x.ndim == 3
-        and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype
         and x.dtype in (torch.bfloat16, torch.float32)
         and q_weight.dtype in (torch.bfloat16, torch.float32)

@@ -389,6 +389,7 @@ class TestPrefillAdder(CustomTestCase):
             (0, 1024, 1024),
             (64, 1024, 960),
             (4096, 1024, 896),
+            (4096, 192, 64),  # the startup floor: replay rows plus one page
             (4096, 128, None),
         ):
             with self.subTest(prefix_len=prefix_len, rem_chunk=rem_chunk):
