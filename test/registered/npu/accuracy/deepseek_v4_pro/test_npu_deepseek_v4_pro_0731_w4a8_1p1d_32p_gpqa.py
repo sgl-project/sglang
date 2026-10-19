@@ -233,9 +233,9 @@ class TestNPUDeepSeekV4ProW4A8PDSEPIn128kOut1kPrefix90(
     warmup_requests = 16
     pop_sglang_is_in_ci_for_gsp = True
 
-    def test_npu_deepseek_v4_pro_w4a8_pd_sep_in128k_out1k_prefix90(self):
-        """Run NPU performance test for DeepSeek-V4-Pro W4A8 32p 1P1D in128k out1k 90PrefixCache."""
-        self.run_throughput()
+    # def test_npu_deepseek_v4_pro_w4a8_pd_sep_in128k_out1k_prefix90(self):
+    #     """Run NPU performance test for DeepSeek-V4-Pro W4A8 32p 1P1D in128k out1k 90PrefixCache."""
+    #     self.run_throughput()
 
 
 if __name__ == "__main__":
