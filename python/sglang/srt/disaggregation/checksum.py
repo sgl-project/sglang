@@ -102,11 +102,10 @@ class KvChecksumComputer:
         state_indices_gpu: Optional[torch.Tensor] = None,
     ) -> int:
         expected_device = self._device.type
-        assert expected_device in ("cuda", "npu")
-        assert kv_page_indices_gpu.device.type == expected_device
-        if self._device.index is not None:
-            assert kv_page_indices_gpu.device == self._device
-        assert kv_page_indices_gpu.is_contiguous()
+        assert (
+            kv_page_indices_gpu.device.type == expected_device
+            and kv_page_indices_gpu.is_contiguous()
+        )
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
         all_indices: List[torch.Tensor] = [kv_page_indices_gpu] * len(
@@ -114,8 +113,10 @@ class KvChecksumComputer:
         )
         if self._state_data_ptrs:
             assert state_indices_gpu is not None
-            assert state_indices_gpu.device == kv_page_indices_gpu.device
-            assert state_indices_gpu.is_contiguous()
+            assert (
+                state_indices_gpu.device.type == expected_device
+                and state_indices_gpu.is_contiguous()
+            )
             all_ptrs += self._state_data_ptrs
             all_lens += self._state_item_lens
             all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
