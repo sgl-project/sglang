@@ -24,9 +24,9 @@ INDEX_HEAD_DIM = 128
 PAYLOAD_BYTES = INDEX_HEAD_DIM + 4
 
 
-def _logical_offsets(loc: int) -> torch.Tensor:
-    page, token = divmod(loc, PAGE_SIZE)
-    page_base = page * PAGE_SIZE * PAYLOAD_BYTES
+def _logical_offsets(loc: int, page_size: int = PAGE_SIZE) -> torch.Tensor:
+    page, token = divmod(loc, page_size)
+    page_base = page * page_size * PAYLOAD_BYTES
     cols = torch.arange(INDEX_HEAD_DIM, dtype=torch.int64)
     if index_buf_accessor._use_aiter_preshuffle:
         tile = 16
@@ -41,7 +41,7 @@ def _logical_offsets(loc: int) -> torch.Tensor:
         k_offsets = page_base + token * INDEX_HEAD_DIM + cols
     scale_offsets = (
         page_base
-        + PAGE_SIZE * INDEX_HEAD_DIM
+        + page_size * INDEX_HEAD_DIM
         + token * 4
         + torch.arange(4, dtype=torch.int64)
     )
@@ -49,20 +49,33 @@ def _logical_offsets(loc: int) -> torch.Tensor:
 
 
 def _expected_index_move(
-    before: torch.Tensor, tgt_loc: torch.Tensor, src_loc: torch.Tensor
+    before: torch.Tensor,
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+    page_size: int = PAGE_SIZE,
 ) -> torch.Tensor:
     expected = before.clone()
     before_flat = before.flatten()
     expected_flat = expected.flatten()
     for tgt, src in zip(tgt_loc.cpu().tolist(), src_loc.cpu().tolist()):
-        expected_flat[_logical_offsets(tgt)] = before_flat[_logical_offsets(src)]
+        expected_flat[_logical_offsets(tgt, page_size)] = before_flat[
+            _logical_offsets(src, page_size)
+        ]
     return expected
 
 
-def _make_pool(pool_cls=DSATokenToKVPool, *, size=PAGE_SIZE * 7, layers=2):
+def _make_pool(
+    pool_cls=DSATokenToKVPool,
+    *,
+    size=PAGE_SIZE * 7,
+    layers=2,
+    index_page_size=PAGE_SIZE,
+):
     pool = object.__new__(pool_cls)
     pool.size = size
     pool.page_size = PAGE_SIZE
+    pool.index_kpool = 1
+    pool.index_page_size = index_page_size
     pool.index_head_dim = INDEX_HEAD_DIM
     pool.layer_num = layers
     num_pages = (size + PAGE_SIZE + 1) // PAGE_SIZE
@@ -119,9 +132,9 @@ class TestDSAIndexCacheMove(CustomTestCase):
             if got.shape[0] == 0:
                 torch.testing.assert_close(got, before, rtol=0, atol=0)
                 continue
-            expected = _expected_index_move(before.cpu(), tgt_loc, src_loc).to(
-                got.device
-            )
+            expected = _expected_index_move(
+                before.cpu(), tgt_loc, src_loc, pool.index_page_size
+            ).to(got.device)
             torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
     def test_cross_page_overlap_and_identity(self):
@@ -143,6 +156,12 @@ class TestDSAIndexCacheMove(CustomTestCase):
             torch.testing.assert_close(got, before, rtol=0, atol=0)
         for got, before in zip(pool.index_k_with_scale_buffer, index_before):
             torch.testing.assert_close(got, before, rtol=0, atol=0)
+
+    def test_smaller_physical_index_pages(self):
+        pool = _make_pool(index_page_size=PAGE_SIZE // 2)
+        src_loc = torch.tensor([31, 32, 95, 160], device="cuda")
+        tgt_loc = torch.tensor([64, 95, 160, 31], device="cuda")
+        self._assert_pool_move(pool, tgt_loc, src_loc)
 
     def test_page64_tree_prefix_tail_duplication(self):
         pool = _make_pool(size=PAGE_SIZE * 5, layers=1)

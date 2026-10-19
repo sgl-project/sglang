@@ -20,6 +20,7 @@ from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.utils import LazyImport
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -44,6 +45,11 @@ if is_cuda():
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
     )
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
+    top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
 
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 elif is_hip():

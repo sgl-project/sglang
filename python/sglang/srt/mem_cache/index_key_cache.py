@@ -59,6 +59,9 @@ class IndexKeyCache:
         buffers = [buf for buf in self.buffer if buf.shape[0] > 0]
         if not buffers or tgt_loc.numel() == 0:
             return
+        assert self.pool.index_kpool == 1, (
+            "Moving pooled index keys requires regrouping tokens"
+        )
         scratch = torch.empty(
             (tgt_loc.numel(), self.pool.index_head_dim + 4),
             dtype=torch.uint8,
@@ -67,7 +70,7 @@ class IndexKeyCache:
         for index_k in buffers:
             index_buf_accessor.MoveKAndS.execute(
                 self.pool,
-                index_k,
+                self._kernel_view(index_k),
                 tgt_loc=tgt_loc,
                 src_loc=src_loc,
                 scratch=scratch,

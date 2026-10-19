@@ -94,6 +94,11 @@ _TACTICS = {
 }
 
 
+def delta_kwargs(delta: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    # FlashInfer releases without the PrimsTS delta input reject the keyword.
+    return {} if delta is None else {"delta": delta}
+
+
 @functools.cache
 def _tmem_overlap_epilogues() -> frozenset[str]:
     # FlashInfer PR 6255 (SwiGLU) and 6286 (QKV) add tmem_overlap to these prepare
