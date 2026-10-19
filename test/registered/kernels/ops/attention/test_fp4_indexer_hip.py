@@ -35,10 +35,6 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     with_candidate_page8_table,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-    _fp4_e2m1_code_rne,
-    quantize_fp4_indexer_tensor,
-)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4KWriteMetadata,
@@ -81,6 +77,10 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    _fp4_e2m1_code_rne,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.deepseek_v4.common import (

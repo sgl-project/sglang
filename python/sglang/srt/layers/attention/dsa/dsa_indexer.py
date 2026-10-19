@@ -1914,9 +1914,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if _is_hip and not _is_gfx1250_supported:
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not _is_npu:
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

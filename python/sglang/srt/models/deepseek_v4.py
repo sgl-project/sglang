@@ -29,7 +29,6 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
-    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
@@ -38,6 +37,9 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
+)
+from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,

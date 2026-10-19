@@ -187,7 +187,7 @@ def _reference_quantize_and_store(
 
 def _import_act_quant():
     try:
-        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+        from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         return act_quant
     except Exception:

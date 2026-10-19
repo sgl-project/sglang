@@ -9,8 +9,10 @@ import unittest
 
 import torch
 
-import sglang.kernels.ops.attention.dsv4.fp8_wo_a as fp8_wo_a_module
-from sglang.kernels.ops.attention.dsv4 import sglang_per_token_group_quant_fp8_dsv4_wo_a
+import sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 as fp8_wo_a_module
+from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     sglang_per_token_group_quant_fp8,

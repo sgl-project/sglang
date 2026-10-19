@@ -11,16 +11,16 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-    _ceil_ue8m0_exp,
-    quantize_fp4_indexer_row,
-    quantize_fp4_indexer_tensor,
-)
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    _ceil_ue8m0_exp,
+    quantize_fp4_indexer_row,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

@@ -13,7 +13,6 @@ from .compress import (
     compress_forward,
     compress_norm_rope_store,
 )
-from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .norm_rope import (
     fused_k_norm_rope_flashmla,
     fused_norm_rope_inplace,
@@ -47,7 +46,6 @@ __all__ = [
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
-    "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     "make_name",
     "get_paged_mqa_logits_metadata",
     "triton_create_paged_compress_data",

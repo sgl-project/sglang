@@ -145,3 +145,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="quantization.quantize_fp4_indexer_tensor",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.quantization.fp4_indexer_quant"
+            ":quantize_fp4_indexer_tensor"
+        ),
+    )
+)

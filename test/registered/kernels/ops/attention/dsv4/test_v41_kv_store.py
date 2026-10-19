@@ -24,7 +24,7 @@ from sglang.kernels.ops.attention.dsv4.norm_rope import (
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
-from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
+from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed_kv
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
