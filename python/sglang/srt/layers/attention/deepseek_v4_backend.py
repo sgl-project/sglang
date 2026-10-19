@@ -1143,6 +1143,19 @@ def late_layer_whole_extend(
     )
 
 
+def late_layer_num_tokens(forward_batch: ForwardBatch, *, dspark: bool) -> int:
+    """Rows a rank runs from late_layer_start on: an extend's tail rows, as
+    late_layer_tail_layout picks them, and every row otherwise."""
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return forward_batch.input_ids.shape[0]
+    whole_extend = late_layer_whole_extend(forward_batch, dspark=dspark)
+    return sum(
+        late_layer_tail_lens(
+            forward_batch.extend_seq_lens_cpu, SWA_WINDOW, whole_extend
+        )
+    )
+
+
 def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
     if t.shape[0] == num_rows:
@@ -1802,6 +1815,13 @@ class DeepseekV4AttnBackend(
             ):
                 return False
         return True
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay:
+            return None
+        return late_layer_num_tokens(
+            forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
+        )
 
     def vote_prefill_cuda_graph(self, batch: ScheduleBatch) -> bool:
         """`can_run_prefill_cuda_graph`'s late-layer tail check judged from the
@@ -3099,7 +3119,7 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        if self.token_to_kv_pool.request_window is None and self.low_ratios == (1, 2):
+        if self.low_ratios == (1, 2):
             graph_context_limit = _prefill_graph_max_seq_len()
             if graph_context_limit is not None:
                 max_seq_len = min(max_seq_len, graph_context_limit)
@@ -3113,7 +3133,7 @@ class DeepseekV4AttnBackend(
             self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
-        if self.token_to_kv_pool.request_window is None and self.low_ratios == (1, 2):
+        if self.low_ratios == (1, 2):
             self._share_bcg_low_ratio_index_buffers(self.forward_metadata.core_metadata)
         self.forward_metadata.prefill_graph_tail = with_tail
         self.tail_forward_metadata = (
@@ -3189,7 +3209,7 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
-        if self.token_to_kv_pool.request_window is None and self.low_ratios == (1, 2):
+        if self.low_ratios == (1, 2):
             graph_context_limit = _prefill_graph_max_seq_len()
             if graph_context_limit is not None:
                 max_seq_len = min(max_seq_len, graph_context_limit)
@@ -4733,7 +4753,7 @@ class DeepseekV4AttnBackend(
             return BuildDsparkSwaRingIndices.execute(
                 seq_lens_casual=seq_lens_casual,
                 req_pool_indices_repeated=req_pool_indices_repeated,
-                valid_from=pool.swa_req_ring_valid_from,
+                valid_from=pool.swa_valid_from,
                 ring_size=pool.swa_req_ring_size,
                 block_size=block_size,
                 swa_window=SWA_WINDOW,
@@ -4744,6 +4764,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices_repeated=req_pool_indices_repeated,
             block_size=block_size,
             swa_window=SWA_WINDOW,
+            valid_from=pool.swa_valid_from,
         )
 
         swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
