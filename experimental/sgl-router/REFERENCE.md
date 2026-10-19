@@ -195,6 +195,17 @@ In PD mode, decode is ranked by step 3 only. The decode request names the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 
+A decode rank picked on arrival only starts decoding once prefill has queued,
+computed and sent the KV, so when prefill queues are long, even ranks with
+equal requests in flight run unequal batches. `--decode-dispatch-limit N` still
+sends every request to prefill on arrival, but sends at most N per prefill DP
+rank on to decode before decode streams their first token; the rest wait at
+the router in arrival order and get their decode rank when they are sent.
+Prefill must start a request before decode connects, so prefill engines need
+`--optimistic-prefill-attempts` above 0. A request that expires or loses its
+client while waiting has its prefill aborted; requests with a caller-set `rid`
+and fan-out requests go to decode at once.
+
 ### Retries
 
 `--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets
