@@ -1,21 +1,18 @@
-"""Triton sparse MLA decode kernel with FP8 and BF16 KV cache support.
+"""Triton sparse MLA decode with FP8 and BF16 KV cache support.
 
-Adapted from aiter's unified_attention_sparse_mla kernel for DSA shapes:
+Decode-tuned launcher for the fused / split-K kernels of ``triton_sparse_mla``
+on DSA shapes:
   q:       [bs, H, DIM]     fp8/bf16 (DIM=576 = D_V+D_TAIL)
   kv:      [num_pages, 1, DIM]  fp8/bf16
   indices: [bs, 1, topk]    int32
   output:  [1, bs, H, D_V]  bf16
-
-Two variants:
-  1. Base: single-pass per-token kernel (adapted from aiter)
-  2. Split-K: adaptive split-K with fused fast path (adapted from DSv4)
 """
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+    _FP8_MAX,
+    _LOG2E,
     _PREFERRED_BLOCK_K,
     _cu_count,
     _gfx950_sparse_mla_kv_splits,
@@ -28,14 +25,11 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _reduce_d_chunk,
     _row_strides,
     _sparse_mla_block_k,
+    _sparse_mla_fused_kernel,
     _sparse_mla_reduce_kernel,
+    _sparse_mla_split_k_kernel,
     _validate_input_dtypes,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-
-_IS_FNUZ = is_fp8_fnuz()
-_FP8_MAX = 240.0 if _IS_FNUZ else 448.0
-_G = tl.constexpr(128)
 
 _SplitKWorkspace = list[tuple[torch.Tensor, torch.Tensor]]
 _splitk_bufs: dict[tuple[torch.device, int], _SplitKWorkspace] = {}
@@ -80,420 +74,6 @@ def _get_splitk_bufs(
     lse = lse_buf[:needed_lse].view(bs, kv_splits, h_padded)
     acc = acc_buf[:needed_acc].view(bs, kv_splits, h_padded, d_v)
     return lse, acc
-
-
-# ---------------------------------------------------------------------------
-# Split-K kernel (adapted from DSv4 paged_decode.py)
-# ---------------------------------------------------------------------------
-
-LOG2E = 1.4426950408889634
-
-
-@triton.jit
-def _sparse_mla_decode_fused_kernel(
-    q_nope_ptr,  # [N, H, D_V]
-    q_rope_ptr,  # [N, H, D_TAIL]
-    kv_ptr,  # [num_pages, 1, KV_DIM]
-    idx_ptr,  # [N, topk]
-    out_ptr,  # [N, H, D_V]
-    qk_scale,
-    fp8_max,
-    topk: tl.constexpr,
-    H: tl.constexpr,
-    KV_DIM: tl.constexpr,
-    D_V: tl.constexpr,
-    D_TAIL: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
-    USE_FP8_DOT: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    USE_I64_PAGE: tl.constexpr = True,
-):
-    t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
-    g = tl.arange(0, _G)
-
-    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
-    if USE_FP8_DOT:
-        p_dot_scale = 1.0 / fp8_max
-    else:
-        p_dot_scale = 1.0
-
-    qn_base = q_nope_ptr + t * STRIDE_QN_T
-    qn_row = qn_base + h_offs[:, None] * STRIDE_QN_H
-    q0 = tl.load(
-        qn_row + g[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
-    if NUM_GROUPS >= 2:
-        q1 = tl.load(
-            qn_row + (_G + g)[None, :],
-            mask=h_mask[:, None],
-            other=0.0,
-        ).to(input_type)
-    if NUM_GROUPS >= 3:
-        q2 = tl.load(
-            qn_row + (2 * _G + g)[None, :],
-            mask=h_mask[:, None],
-            other=0.0,
-        ).to(input_type)
-    if NUM_GROUPS >= 4:
-        q3 = tl.load(
-            qn_row + (3 * _G + g)[None, :],
-            mask=h_mask[:, None],
-            other=0.0,
-        ).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
-
-    neg_large = -3.4028234663852886e38
-    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc0 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-    if NUM_GROUPS >= 2:
-        acc1 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-    if NUM_GROUPS >= 3:
-        acc2 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-    if NUM_GROUPS >= 4:
-        acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-
-    k_offs = tl.arange(0, BLOCK_K)
-    num_tiles = tl.cdiv(topk, BLOCK_K)
-
-    for j in tl.range(0, num_tiles, num_stages=3):
-        k_start = j * BLOCK_K
-        k_pos = k_start + k_offs
-        valid = k_pos < topk
-
-        slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
-        valid = valid & (slot >= 0)
-        page = tl.where(valid, slot, 0)
-        if USE_I64_PAGE:
-            page = page.to(tl.int64)
-
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = tl.load(
-            kv_base + g[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(input_type)
-        if NUM_GROUPS >= 2:
-            kv1 = tl.load(
-                kv_base + (_G + g)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(input_type)
-        if NUM_GROUPS >= 3:
-            kv2 = tl.load(
-                kv_base + (2 * _G + g)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(input_type)
-        if NUM_GROUPS >= 4:
-            kv3 = tl.load(
-                kv_base + (3 * _G + g)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(input_type)
-        kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(input_type)
-
-        scores = tl.dot(q0, tl.trans(kv0))
-        if NUM_GROUPS >= 2:
-            scores += tl.dot(q1, tl.trans(kv1))
-        if NUM_GROUPS >= 3:
-            scores += tl.dot(q2, tl.trans(kv2))
-        if NUM_GROUPS >= 4:
-            scores += tl.dot(q3, tl.trans(kv3))
-        scores += tl.dot(q_tail, tl.trans(kv_tail))
-        scores = scores * qk_scale
-        scores = tl.where(valid[None, :], scores, neg_large)
-
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(scores - m_new[:, None])
-        l_new = l_i * alpha + tl.sum(p, axis=1)
-
-        if USE_FP8_DOT:
-            p_dot = (p * fp8_max).to(input_type)
-        else:
-            p_dot = p.to(input_type)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
-        if NUM_GROUPS >= 2:
-            acc1 = (
-                acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
-            )
-        if NUM_GROUPS >= 3:
-            acc2 = (
-                acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
-            )
-        if NUM_GROUPS >= 4:
-            acc3 = (
-                acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
-            )
-        m_i = m_new
-        l_i = l_new
-
-    denom = tl.maximum(l_i, 1.0e-30)
-    inv_denom = 1.0 / denom
-    acc0 = tl.where(l_i[:, None] > 0.0, acc0 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 2:
-        acc1 = tl.where(l_i[:, None] > 0.0, acc1 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 3:
-        acc2 = tl.where(l_i[:, None] > 0.0, acc2 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 4:
-        acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
-
-    o_base = out_ptr + t * H * D_V
-    tl.store(
-        o_base + h_offs[:, None] * D_V + g[None, :],
-        acc0.to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    if NUM_GROUPS >= 2:
-        tl.store(
-            o_base + h_offs[:, None] * D_V + (_G + g)[None, :],
-            acc1.to(tl.bfloat16),
-            mask=h_mask[:, None],
-        )
-    if NUM_GROUPS >= 3:
-        tl.store(
-            o_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
-            acc2.to(tl.bfloat16),
-            mask=h_mask[:, None],
-        )
-    if NUM_GROUPS >= 4:
-        tl.store(
-            o_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
-            acc3.to(tl.bfloat16),
-            mask=h_mask[:, None],
-        )
-
-
-@triton.jit
-def _sparse_mla_decode_split_kernel(
-    q_nope_ptr,  # [N, H, D_V]
-    q_rope_ptr,  # [N, H, D_TAIL]
-    kv_ptr,  # [num_pages, 1, KV_DIM]
-    idx_ptr,  # [N, topk]
-    lse_partial_ptr,  # [N, KV_SPLITS, H_padded]  fp32
-    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D_V]  bf16
-    qk_scale,
-    fp8_max,
-    topk: tl.constexpr,
-    H: tl.constexpr,
-    KV_DIM: tl.constexpr,
-    D_V: tl.constexpr,
-    D_TAIL: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
-    USE_FP8_DOT: tl.constexpr,
-    KV_SPLITS: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    t = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_k = tl.program_id(2)
-
-    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    h_mask = h_offs < H
-    dt = tl.arange(0, D_TAIL)
-    g = tl.arange(0, _G)
-
-    input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
-    if USE_FP8_DOT:
-        p_dot_scale = 1.0 / fp8_max
-    else:
-        p_dot_scale = 1.0
-
-    qn_base = q_nope_ptr + t * STRIDE_QN_T
-    qn_row = qn_base + h_offs[:, None] * STRIDE_QN_H
-    q0 = tl.load(
-        qn_row + g[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
-    if NUM_GROUPS >= 2:
-        q1 = tl.load(
-            qn_row + (_G + g)[None, :],
-            mask=h_mask[:, None],
-            other=0.0,
-        ).to(input_type)
-    if NUM_GROUPS >= 3:
-        q2 = tl.load(
-            qn_row + (2 * _G + g)[None, :],
-            mask=h_mask[:, None],
-            other=0.0,
-        ).to(input_type)
-    if NUM_GROUPS >= 4:
-        q3 = tl.load(
-            qn_row + (3 * _G + g)[None, :],
-            mask=h_mask[:, None],
-            other=0.0,
-        ).to(input_type)
-    q_tail = tl.load(
-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(input_type)
-
-    tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= topk:
-        return
-    num_tiles = tl.cdiv(topk, BLOCK_K)
-    tile_start = pid_k * tiles_per_segment
-    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
-
-    neg_large = -3.4028234663852886e38
-    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc0 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-    if NUM_GROUPS >= 2:
-        acc1 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-    if NUM_GROUPS >= 3:
-        acc2 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-    if NUM_GROUPS >= 4:
-        acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
-
-    k_offs = tl.arange(0, BLOCK_K)
-    for j in tl.range(tile_start, tile_end, num_stages=3):
-        k_start = j * BLOCK_K
-        k_pos = k_start + k_offs
-        valid = k_pos < topk
-
-        slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
-        valid = valid & (slot >= 0)
-        page = tl.where(valid, slot, 0).to(tl.int64)
-
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = tl.load(
-            kv_base + g[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(input_type)
-        if NUM_GROUPS >= 2:
-            kv1 = tl.load(
-                kv_base + (_G + g)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(input_type)
-        if NUM_GROUPS >= 3:
-            kv2 = tl.load(
-                kv_base + (2 * _G + g)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(input_type)
-        if NUM_GROUPS >= 4:
-            kv3 = tl.load(
-                kv_base + (3 * _G + g)[None, :],
-                mask=valid[:, None],
-                other=0.0,
-            ).to(input_type)
-        kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(input_type)
-
-        scores = tl.dot(q0, tl.trans(kv0))
-        if NUM_GROUPS >= 2:
-            scores += tl.dot(q1, tl.trans(kv1))
-        if NUM_GROUPS >= 3:
-            scores += tl.dot(q2, tl.trans(kv2))
-        if NUM_GROUPS >= 4:
-            scores += tl.dot(q3, tl.trans(kv3))
-        scores += tl.dot(q_tail, tl.trans(kv_tail))
-        scores = scores * qk_scale
-        scores = tl.where(valid[None, :], scores, neg_large)
-
-        m_block = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(scores - m_new[:, None])
-        l_new = l_i * alpha + tl.sum(p, axis=1)
-
-        if USE_FP8_DOT:
-            p_dot = (p * fp8_max).to(input_type)
-        else:
-            p_dot = p.to(input_type)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
-        if NUM_GROUPS >= 2:
-            acc1 = (
-                acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
-            )
-        if NUM_GROUPS >= 3:
-            acc2 = (
-                acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
-            )
-        if NUM_GROUPS >= 4:
-            acc3 = (
-                acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
-            )
-        m_i = m_new
-        l_i = l_new
-
-    neg_large = -1073741824.0
-    denom = tl.maximum(l_i, 1.0e-30)
-    inv_denom = 1.0 / denom
-    has_data = l_i > 0.0
-    acc0 = tl.where(has_data[:, None], acc0 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 2:
-        acc1 = tl.where(has_data[:, None], acc1 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 3:
-        acc2 = tl.where(has_data[:, None], acc2 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 4:
-        acc3 = tl.where(has_data[:, None], acc3 * inv_denom[:, None], 0.0)
-
-    lse = tl.where(has_data, tl.log2(l_i) + m_i, neg_large)
-
-    H_padded = tl.cdiv(H, BLOCK_H) * BLOCK_H
-    lse_base = t * KV_SPLITS * H_padded + pid_k * H_padded
-    tl.store(lse_partial_ptr + lse_base + h_offs, lse, mask=h_mask)
-
-    ap_base = t * KV_SPLITS * H_padded * D_V + pid_k * H_padded * D_V
-    tl.store(
-        acc_partial_ptr + ap_base + h_offs[:, None] * D_V + g[None, :],
-        acc0.to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    if NUM_GROUPS >= 2:
-        tl.store(
-            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (_G + g)[None, :],
-            acc1.to(tl.bfloat16),
-            mask=h_mask[:, None],
-        )
-    if NUM_GROUPS >= 3:
-        tl.store(
-            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
-            acc2.to(tl.bfloat16),
-            mask=h_mask[:, None],
-        )
-    if NUM_GROUPS >= 4:
-        tl.store(
-            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
-            acc3.to(tl.bfloat16),
-            mask=h_mask[:, None],
-        )
 
 
 def triton_sparse_mla_decode_splitk(
@@ -581,7 +161,7 @@ def triton_sparse_mla_decode_splitk(
     else:
         kv_splits = min(kv_splits, max_kv_splits)
 
-    qk_scale = float(sm_scale) * LOG2E
+    qk_scale = float(sm_scale) * _LOG2E
 
     if kv_splits == 1:
         fused_num_warps = 4
@@ -589,10 +169,11 @@ def triton_sparse_mla_decode_splitk(
             fused_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, 1, num_cu)
         out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
         with _no_async_copy():
-            _sparse_mla_decode_fused_kernel[(bs, n_head_blocks)](
+            _sparse_mla_fused_kernel[(bs, n_head_blocks)](
                 q_nope,
                 q_rope,
                 kv,
+                idx_flat,
                 idx_flat,
                 out,
                 qk_scale,
@@ -608,6 +189,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
+                USE_TOPK_LENGTH=False,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -637,7 +219,7 @@ def triton_sparse_mla_decode_splitk(
 
     grid_split = (bs, n_head_blocks, kv_splits)
     with _no_async_copy():
-        _sparse_mla_decode_split_kernel[grid_split](
+        _sparse_mla_split_k_kernel[grid_split](
             q_nope,
             q_rope,
             kv,
