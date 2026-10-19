@@ -825,7 +825,17 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     )
 
 
-bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_sources)
+def _low_ratio_sources_capture_stub(layer, x, q_lora, positions) -> None:
+    # A decoder tail graph's capture pass hands the break activations its
+    # segments never computed; the indexer would select candidate blocks from
+    # them and index pages past the live context. Its replay runs the body.
+    if not in_replay_tail_graph():
+        deepseek_v4_low_ratio_sources(layer, x, q_lora, positions)
+
+
+bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
+    deepseek_v4_low_ratio_sources, capture_stub=_low_ratio_sources_capture_stub
+)
 
 
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
