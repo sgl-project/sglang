@@ -47,7 +47,7 @@ limitations under the License.
 
 namespace sglang {
 
-namespace fp8_block32_sm90_m1_impl {
+namespace fp8_block32_sm90_impl {
 
 using namespace cute;
 
@@ -201,7 +201,7 @@ __device__ __forceinline__ void mma_scaled(
   run[3] = fmaf(acc(3), s1, run[3]);
 }
 
-__global__ void __launch_bounds__(kThreads) fp8_block32_sm90_m1_kernel(Params p) {
+__global__ void __launch_bounds__(kThreads) fp8_block32_sm90_kernel(Params p) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
   const int tid = threadIdx.x;
   const int32_t n0 = static_cast<int32_t>(blockIdx.x) * kRows;
@@ -293,7 +293,7 @@ __global__ void __launch_bounds__(kThreads) fp8_block32_sm90_m1_kernel(Params p)
   store_one(tok1, g0 + 8, run[3]);
 #else
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("fp8_block32_sm90_m1 requires sm90\n");
+    printf("fp8_block32_sm90 requires sm90\n");
   }
 #endif
 }
@@ -529,7 +529,7 @@ __global__ void __launch_bounds__(LargeTile<kBM, kStages, kGroup>::kThreads)
 #endif
 }
 
-__global__ void fp8_block32_sm90_m1_reduce(
+__global__ void fp8_block32_sm90_reduce(
     bf16_t* __restrict__ out, const float* __restrict__ partial, int32_t m, int32_t n, int32_t split_k) {
   const int64_t mn = static_cast<int64_t>(m) * n;
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -543,7 +543,7 @@ __global__ void fp8_block32_sm90_m1_reduce(
   out[i] = __float2bfloat16(sum);
 }
 
-}  // namespace fp8_block32_sm90_m1_impl
+}  // namespace fp8_block32_sm90_impl
 
 /// \brief Block-[32, 32] FP8 GEMM on SM90. Each CTA consumes 8 tokens.
 ///
@@ -554,7 +554,7 @@ __global__ void fp8_block32_sm90_m1_reduce(
 /// \param partial `[split_k, M, N]` fp32 scratch, written by the mainloop.
 /// \param out `[M, N]` bf16.
 /// \param split_k K-split. `K % split_k == 0` and `(K / split_k) % 32 == 0`.
-void fp8_block32_sm90_m1(
+void fp8_block32_sm90(
     tvm::ffi::TensorView act,
     tvm::ffi::TensorView weight,
     tvm::ffi::TensorView act_scale,
@@ -563,7 +563,7 @@ void fp8_block32_sm90_m1(
     tvm::ffi::TensorView out,
     int64_t split_k) {
   using namespace host;
-  using namespace fp8_block32_sm90_m1_impl;
+  using namespace fp8_block32_sm90_impl;
 
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
@@ -617,18 +617,18 @@ void fp8_block32_sm90_m1(
   };
 
   constexpr size_t kSmem = sizeof(SharedStorage);
-  static_assert(kSmem <= 48 * 1024, "fp8_block32_sm90_m1 smem must fit the default 48KB limit");
+  static_assert(kSmem <= 48 * 1024, "fp8_block32_sm90 smem must fit the default 48KB limit");
   const uint32_t tiles_n = static_cast<uint32_t>(div_ceil(static_cast<uint64_t>(n), kRows));
   const uint32_t tiles_m = static_cast<uint32_t>(div_ceil(static_cast<uint64_t>(m), kAtomN));
   LaunchKernel(dim3(tiles_n, static_cast<uint32_t>(split_k), tiles_m), dim3(kThreads), device.unwrap(), kSmem)(
-      fp8_block32_sm90_m1_kernel, params);
+      fp8_block32_sm90_kernel, params);
 
   if (split_k > 1) {
     const uint32_t reduce_threads = 256;
     const int64_t mn = static_cast<int64_t>(m) * n;
     const uint32_t reduce_blocks = static_cast<uint32_t>(div_ceil(static_cast<uint64_t>(mn), reduce_threads));
     LaunchKernel(reduce_blocks, reduce_threads, device.unwrap())(
-        fp8_block32_sm90_m1_reduce,
+        fp8_block32_sm90_reduce,
         static_cast<bf16_t*>(out.data_ptr()),
         static_cast<const float*>(partial.data_ptr()),
         m,
@@ -646,7 +646,7 @@ void fp8_block32_sm90_large(
     tvm::ffi::TensorView weight_scale,
     tvm::ffi::TensorView out) {
   using namespace host;
-  using namespace fp8_block32_sm90_m1_impl;
+  using namespace fp8_block32_sm90_impl;
 
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();

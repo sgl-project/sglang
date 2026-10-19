@@ -68,7 +68,7 @@ class TestFp8Block32H20Gate(CustomTestCase):
     def test_predicate_rejects_other_gpus(self):
         from sglang.kernels.ops.gemm.fp8_block32_sm90 import (
             _is_h20_3e,
-            use_fp8_block32_gemm_m1,
+            use_fp8_block32_gemm,
         )
 
         if torch.cuda.get_device_capability()[0] != 9:
@@ -79,14 +79,14 @@ class TestFp8Block32H20Gate(CustomTestCase):
             "sglang.kernels.ops.gemm.fp8_block32_sm90._is_h20_3e", return_value=False
         ):
             self.assertFalse(
-                use_fp8_block32_gemm_m1(
+                use_fp8_block32_gemm(
                     act, weight, act_scale, weight_scale, [32, 32], torch.bfloat16
                 )
             )
         _is_h20_3e.cache_clear()
         if _is_h20_3e(0):
             self.assertTrue(
-                use_fp8_block32_gemm_m1(
+                use_fp8_block32_gemm(
                     act, weight, act_scale, weight_scale, [32, 32], torch.bfloat16
                 )
             )
@@ -95,12 +95,12 @@ class TestFp8Block32H20Gate(CustomTestCase):
 @unittest.skipIf(
     not _is_h20_3e(), "block-32 WGMMA GEMM is enabled only on NVIDIA H20-3e"
 )
-class TestFp8Block32Sm90M1(CustomTestCase):
+class TestFp8Block32Sm90(CustomTestCase):
     def _check(self, n, k, split_k=None, m=1):
-        from sglang.kernels.ops.gemm.fp8_block32_sm90 import fp8_block32_gemm_m1
+        from sglang.kernels.ops.gemm.fp8_block32_sm90 import fp8_block32_gemm
 
         act, weight, act_scale, weight_scale = _inputs(n, k, m=m)
-        out = fp8_block32_gemm_m1(act, weight, act_scale, weight_scale, split_k=split_k)
+        out = fp8_block32_gemm(act, weight, act_scale, weight_scale, split_k=split_k)
         ref = _dequant_ref(act, weight, act_scale, weight_scale)
         err = (out.float() - ref.float()).abs().max().item()
         self.assertEqual(tuple(out.shape), (m, n))
@@ -143,7 +143,7 @@ class TestFp8Block32Sm90M1(CustomTestCase):
         self.assertTrue(use_fp8_block32_large_tile(4096, 5120, 5120))
 
     def test_linear_uses_kernel_for_m_gt1(self):
-        from sglang.kernels.ops.gemm.fp8_block32_sm90 import use_fp8_block32_gemm_m1
+        from sglang.kernels.ops.gemm.fp8_block32_sm90 import use_fp8_block32_gemm
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
@@ -156,7 +156,7 @@ class TestFp8Block32Sm90M1(CustomTestCase):
         x = torch.randn(1, k, device="cuda", dtype=torch.bfloat16)
         q, scale = sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
         self.assertTrue(
-            use_fp8_block32_gemm_m1(
+            use_fp8_block32_gemm(
                 q, weight, scale, weight_scale, [32, 32], torch.bfloat16
             )
         )
@@ -170,7 +170,7 @@ class TestFp8Block32Sm90M1(CustomTestCase):
         x4 = torch.randn(4, k, device="cuda", dtype=torch.bfloat16)
         q4, scale4 = sglang_per_token_group_quant_fp8(x4, 32, scale_ue8m0=True)
         self.assertTrue(
-            use_fp8_block32_gemm_m1(
+            use_fp8_block32_gemm(
                 q4, weight, scale4, weight_scale, [32, 32], torch.bfloat16
             )
         )
