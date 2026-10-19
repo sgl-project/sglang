@@ -236,6 +236,23 @@ class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
 
 
 class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
+    def _fill_mamba_state(self, req_to_token_pool, indices, marker):
+        if not self.cfg.has_mamba:
+            return
+        mamba_indices = indices.reshape(-1)
+        mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
+        mamba_cache.temporal[:, mamba_indices] = marker
+        for offset, conv_buf in enumerate(mamba_cache.conv, start=1):
+            conv_buf[:, mamba_indices] = marker + offset
+
+    def _snapshot_mamba_state(self, req_to_token_pool, indices):
+        mamba_indices = indices.reshape(-1)
+        mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
+        return (
+            mamba_cache.temporal[:, mamba_indices].float().cpu().clone(),
+            [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
+        )
+
     @_requires_hicache
     def test_hicache_load_back_restores_data(self):
         """Loading back an evicted node restores the backed-up cache data."""
