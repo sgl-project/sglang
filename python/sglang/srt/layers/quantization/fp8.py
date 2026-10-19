@@ -1109,7 +1109,6 @@ class Fp8LinearMethod(LinearMethodBase):
             torch.bfloat16,
             torch.float16,
         ):
-            # The activation dtypes the FlashInfer MXFP8 path accepts.
             data, a_sf = x, None
         else:
             return None

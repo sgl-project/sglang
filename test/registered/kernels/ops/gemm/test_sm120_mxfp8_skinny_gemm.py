@@ -128,7 +128,7 @@ def _cute_dsl_available():
 
 
 @pytest.mark.parametrize("backend", ["cute-dsl", "cuda"])
-@pytest.mark.parametrize("m", [1, 6, 16, 48, 128])
+@pytest.mark.parametrize("m", [1, 6, 16, 32, 48, 128])
 def test_fused_quant_matches_flashinfer(m, backend):
     flashinfer = pytest.importorskip("flashinfer")
     if backend == "cute-dsl" and not _cute_dsl_available():
@@ -285,7 +285,8 @@ def test_linear_apply(build_linear, skinny_rows, n, k, dtype):
     if dtype != torch.bfloat16:
         assert skinny_rows == [1, 6, MAX_M, 6, 6]
         return
-    q, sf = flashinfer.mxfp8_quantize(x[:6], True, 32)
+    backend = "cute-dsl" if _cute_dsl_available() else "cuda"
+    q, sf = flashinfer.mxfp8_quantize(x[:6], True, 32, backend=backend)
     out_q = layer.quant_method.apply(layer, Mxfp8SwizzledInput(q, sf))
     assert torch.equal(out_q, layer(x[:6])[0])
     assert skinny_rows == [1, 6, MAX_M, 6, 6, 6, 6]
@@ -304,8 +305,6 @@ def test_linear_bias_and_fp32_keep_existing_path(build_linear, skinny_rows):
     ref = no_bias + layer.bias.float()
     err = (out.float() - ref).abs().max() / ref.abs().max()
     assert err < 1e-2, err
-    # FP32 activations stay off the kernel, as FlashInfer's MXFP8 path takes
-    # only BF16 and FP16.
     assert layer.quant_method._apply_mxfp8_skinny(layer, x.float()) is None
     assert skinny_rows == []
 
