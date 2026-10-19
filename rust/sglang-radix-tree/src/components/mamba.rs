@@ -133,7 +133,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         _value_chunks: &[Tensor],
         _best_value_len: usize,
     ) -> MatchResult {
-        let mamba_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+        let mamba_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Full KV may extend beyond the latest reusable Mamba state. The branching
         // point is the last checkpoint-grid-aligned position within the Full-KV hit
@@ -594,6 +594,24 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     ..Default::default()
                 }])
             }
+        })
+    }
+
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let hash_value = node.hash_value.as_ref().filter(|h| !h.is_empty())?;
+        let device_indices = node.try_device_value(MAMBA)?;
+        // One state per node, valid only at the node's end boundary.
+        Some(PoolTransfer {
+            name: PoolName::Mamba,
+            device_indices: Some(device_indices.shallow_clone()),
+            keys: Some(vec![hash_value[hash_value.len() - 1].clone()]),
+            hit_policy: PoolHitPolicy::TrailingPages,
+            ..Default::default()
         })
     }
 

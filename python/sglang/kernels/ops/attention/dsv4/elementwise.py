@@ -33,6 +33,23 @@ def _jit_fused_rope_module():
 
 
 @cache_once
+def _jit_fused_norm_rope_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+):
+    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    return load_jit(
+        make_name("fused_norm_rope"),
+        *args,
+        cuda_files=["deepseek_v4/fused_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedNormRopeKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -168,6 +185,26 @@ def fused_rope_inplace(
     module.forward(q, k, freqs_real, positions, inverse)
 
 
+def fused_norm_rope_inplace(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_fused_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module.forward(
+        kv,
+        weight,
+        positions,
+        freq_cis,
+        2,
+        eps,
+        0,
+    )
+
+
 def fused_q_norm_rope(
     q_input: torch.Tensor,
     q_output: torch.Tensor,
@@ -175,6 +212,14 @@ def fused_q_norm_rope(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
+    # Reuse the BF16 kernel and preserve its rounding before FP8 conversion.
+    # Keep the temporary separate from q_input: callers may reuse the input.
+    fp8_output = q_output if q_output.dtype == torch.float8_e4m3fn else None
+    if fp8_output is not None:
+        assert q_input.dtype == torch.bfloat16
+        assert q_output.shape == q_input.shape
+        assert q_output.device == q_input.device
+        q_output = torch.empty_like(q_input)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
@@ -186,6 +231,8 @@ def fused_q_norm_rope(
             q_input.dtype, head_dim, rope_dim, eps is not None
         )
         module.forward(q_input, q_output, freqs_real, positions, eps or 0.0)
+    if fp8_output is not None:
+        fp8_output.copy_(q_output)
 
 
 def fused_q_indexer_rope_hadamard_quant(

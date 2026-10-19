@@ -209,6 +209,8 @@ class TestServerArgsHook(_RegistryIsolated):
             return MagicMock
 
         server_args = SimpleNamespace(
+            disaggregation_mode="null",
+            disaggregation_decode_enable_radix_cache=False,
             speculative_draft_model_path=None,
             speculative_draft_model_revision=None,
             speculative_moe_runner_backend=None,
@@ -219,7 +221,6 @@ class TestServerArgsHook(_RegistryIsolated):
             trust_remote_code=False,
             speculative_draft_window_size=None,
             speculative_draft_sink_size=None,
-            speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
         )
 

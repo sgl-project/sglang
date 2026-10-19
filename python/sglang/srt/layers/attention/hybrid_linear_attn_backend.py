@@ -35,6 +35,11 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
@@ -67,6 +72,10 @@ class MambaAttnBackendBase(AttentionBackend):
     # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
+
+    # Most sequences the prefill graph tables hold (larger batches replay no
+    # graph); set at init by backends whose supports_prefill_graph_extend holds.
+    prefill_graph_max_seqs: int
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -109,6 +118,21 @@ class MambaAttnBackendBase(AttentionBackend):
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
 
+    def supports_prefill_graph_extend(self) -> bool:
+        """Whether breakable prefill CUDA graphs can capture this backend's
+        extend on static per-bucket tables instead of breaking at each layer."""
+        return False
+
+    def prefill_graph_extend_active(self) -> bool:
+        """Whether the extend being captured or replayed runs on those tables."""
+        return False
+
+    def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
+        raise NotImplementedError()
+
+    def refresh_prefill_graph_metadata(self, meta, forward_batch: ForwardBatch):
+        raise NotImplementedError()
+
     @property
     def mamba_chunk_size(self) -> int:
         if self._mamba_chunk_size is None:
@@ -141,6 +165,8 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
+
+        logical_mode = forward_batch.logical_forward_mode
 
         retrieve_next_token = None
         retrieve_next_sibling = None
@@ -185,7 +211,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         replayssm_write_pos = None
         replayssm_force_flush = None
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if logical_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
@@ -246,7 +272,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        elif logical_mode.is_extend(include_draft_extend_v2=True):
             has_extend_meta = (
                 forward_batch.extend_start_loc is not None
                 and forward_batch.extend_seq_lens is not None
@@ -541,6 +567,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -1002,8 +1029,9 @@ class MambaAttnBackendBase(AttentionBackend):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`).
 
-        Unaligned rows read the fp32 ``h_track_buf`` snapshot written in-kernel
-        when given (its rows follow the batch, selected by the integer index
+        Unaligned rows read the ``h_track_buf`` snapshot written in-kernel
+        when given (in the kernel's native state dtype; its rows follow the batch,
+        selected by the integer index
         ``track_ssm_h_batch_src`` — a boolean mask would nonzero() and sync the
         stream once per layer); otherwise they fall back to the per-chunk
         states ``h`` (already rounded to the activation dtype)."""
@@ -1177,6 +1205,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        # Breakable prefill CUDA graphs capture the linear extend when the linear
+        # backend can run it on static tables (linear/kda_prefill_graph.py);
+        # those tables follow the runner's captured-metadata contract.
+        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
+            check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            and linear_attn_backend.supports_prefill_graph_extend()
+            and not full_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        if self.use_captured_forward_metadata_for_breakable_cuda_graph:
+            self.prefill_cuda_graph_max_batch_size = (
+                linear_attn_backend.prefill_graph_max_seqs
+            )
+            logger.info(
+                "Breakable prefill CUDA graphs capture the %s extend.",
+                type(linear_attn_backend).__name__,
+            )
 
     @property
     def data_type(self):
@@ -1228,6 +1272,49 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    @staticmethod
+    def _is_plain_extend(forward_batch: ForwardBatch) -> bool:
+        mode = forward_batch.forward_mode
+        return (
+            mode.is_extend()
+            and not mode.is_target_verify()
+            and not mode.is_draft_extend_v2()
+        )
+
+    def linear_extend_in_graph(self) -> bool:
+        """Whether the linear layers of the prefill being captured run inside
+        the graph (no eager break)."""
+        return self.linear_attn_backend.prefill_graph_extend_active()
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        self.full_attn_backend.init_forward_metadata(forward_batch)
+        if not self._is_plain_extend(forward_batch):
+            if not forward_batch.forward_mode.is_draft_extend_v2():
+                self.linear_attn_backend.init_forward_metadata(forward_batch)
+            return None
+        return self.linear_attn_backend.init_prefill_graph_metadata(forward_batch)
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        self.full_attn_backend.init_forward_metadata(forward_batch)
+        if capture_metadata is not None:
+            self.linear_attn_backend.refresh_prefill_graph_metadata(
+                capture_metadata, forward_batch
+            )
+        elif not forward_batch.forward_mode.is_draft_extend_v2():
+            self.linear_attn_backend.init_forward_metadata(forward_batch)
+        if static_forward_batch is not None:
+            self.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=static_forward_batch.positions.shape[0]
+            )
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
@@ -1289,6 +1376,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -1299,6 +1387,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 num_tokens,
                 req_pool_indices,
                 seq_lens,
+                out_cache_loc,
                 encoder_lens,
                 forward_mode,
                 spec_info,
@@ -1385,13 +1474,21 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
+        # For linear attention, dispatch on the logical mode to match the
+        # built metadata.
+        dispatch_mode = (
+            forward_batch.logical_forward_mode
+            if is_linear_attn
+            else forward_batch.forward_mode
+        )
+
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
+        elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,
                 forward_batch,

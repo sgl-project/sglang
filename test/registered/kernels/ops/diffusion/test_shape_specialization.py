@@ -6,9 +6,11 @@ with the resolution, the prompt and the input image, so a class the server's
 warmup did not hit compiles on the first request that does: 0.3-0.5 s per
 kernel on a cold cache. These kernels use such sizes only for row indices and
 row masks, so they take them unspecialized, at no cost to vectorization.
-The Wan VAE layout kernels keep their channel count, element total and
-strides specialized; with channels a multiple of 16 those stay in one class
-at every resolution.
+The Wan VAE layout kernels keep their channel count and element total
+specialized, which stay in one class at every resolution with channels a
+multiple of 16. The strides of a channels-last tensor are multiples of the
+channels too; those of a channels-first one change with the resolution, so
+they go unspecialized, with the vector width passed as a layout constexpr.
 """
 
 import sys
@@ -130,6 +132,11 @@ def _cl3d(*shape):
     return _bf16(*shape).contiguous(memory_format=torch.channels_last_3d)
 
 
+def _cf3d(b, c, t, h, w):
+    # the frames-major view WanResample hands the next block
+    return _bf16(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+
+
 # One-frame chunks are real (the Wan VAE decodes frame by frame), one-pixel
 # frames are not: their size-1 dims get unit strides, and the strides stay
 # specialized on purpose.
@@ -147,6 +154,22 @@ def _wan_dup_up3d(n):
     dup_up3d_add(main, src, 2, 2, 4, False)
 
 
+def _wan_cat_pad_channels_first(n):
+    # a first-chunk conv input behind a channels-first upsample
+    hw = max(n, 2)
+    cat_pad_channels_last_3d(_cf3d(1, 96, 1, hw, hw), None, (1, 1, 1, 1, 2, 0))
+
+
+def _wan_dup_up3d_layouts(n, main_layout, src_layout):
+    # even source widths keep the upsampled rows a multiple of 4 wide, as
+    # they are at every Wan2.2 resolution
+    hw = n + n % 2
+    make = {"cl": _cl3d, "cf": _cf3d}
+    src = make[src_layout](1, 128, 1, hw, hw)
+    main = make[main_layout](1, 128, 2, 2 * hw, 2 * hw)
+    dup_up3d_add(main, src, 2, 2, 8, False)
+
+
 LAUNCHES = {
     "select01": lambda n: _select01(n, residual=False),
     "residual_select01": lambda n: _select01(n, residual=True),
@@ -157,7 +180,11 @@ LAUNCHES = {
     "temb_table_slices": _temb_table_slices,
     "pack_qkv": _pack_qkv,
     "wan_cat_pad": _wan_cat_pad,
+    "wan_cat_pad_channels_first": _wan_cat_pad_channels_first,
     "wan_dup_up3d": _wan_dup_up3d,
+    "wan_dup_up3d_cf_cf": lambda n: _wan_dup_up3d_layouts(n, "cf", "cf"),
+    "wan_dup_up3d_cf_cl": lambda n: _wan_dup_up3d_layouts(n, "cf", "cl"),
+    "wan_dup_up3d_cl_cf": lambda n: _wan_dup_up3d_layouts(n, "cl", "cf"),
 }
 
 

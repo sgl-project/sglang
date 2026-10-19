@@ -130,16 +130,22 @@ class EVS(torch.nn.Module, ABC):
                 f"[EVS] requested on model {model_name} but is disabled for pruning_rate == 0.0."
             )
 
-    def evs_video(self, items: list[MultimodalDataItem]) -> EVSEmbeddingResult:
+    def evs_video(
+        self, items: list[MultimodalDataItem]
+    ) -> EVSEmbeddingResult | torch.Tensor:
         """
         Apply EVS pruning to video embeddings.
 
         Args:
-            items: List containing a single EVS video item with video features.
+            items: EVS video items; more than one only when every video is a single frame.
 
         Returns:
-            EVSEmbeddingResult with pruned embeddings and actual token counts per frame.
+            EVSEmbeddingResult with pruned embeddings and actual token counts per frame,
+            or the unpruned features when every video is a single frame.
         """
+        if all(t == 1 for item in items for t, _, _ in item.thw_grids):
+            # The first frame is never pruned, so single-frame videos have nothing to prune.
+            return self.original_get_video_feature(items)
         logger.debug(
             f"[EVS] beginning for model {self.__class__.__name__} [evs_config={self.evs_config=}]"
         )
