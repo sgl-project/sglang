@@ -427,7 +427,37 @@ update whose target directory carries native `adaln_proj` safetensors, and
 rejects everything else (tensor updates, and directories without those
 tensors) before a single weight is written. A sidecar is built offline and
 cannot be regenerated in the server, so weight updates are rejected outright;
-rebuild the sidecar against the new weights and restart.
+rebuild the sidecar against the new weights and restart. The online FP8 video
+VAE decoder adds a constraint of its own; see "Advanced: online FP8 video VAE decoder" below.
+
+### Advanced: online FP8 video VAE decoder (deployment-level, lossy)
+
+`--component-quantizations.video_vae fp8` converts the 144 linears of the 36
+ViT decoder blocks to FP8 once at load. The encoder, patch embedding, norms,
+attention core and decoder output projection `proj_out` keep their precision.
+The scope is fixed: `--component-quantization-ignored-layers.video_vae` is not
+supported.
+
+Use CUDA SM100 or newer, keep the default fp16 decode autocast (no
+`--component-precisions.video_vae` or `--disable-autocast`) and keep the video
+VAE resident. Pass `--component-residency video_vae=resident` when a performance
+mode would offload it. Startup rejects unsupported configurations, and a
+conversion failure aborts the load. Attention uses the video VAE's configured
+backend (`torch_sdpa` by default); pass
+`--component-attention-backends video_vae=torch_cudnn_sdpa` to select cuDNN SDPA.
+
+Runtime weight updates through `/update_weights_from_disk` or
+`/update_weights_from_tensor` are rejected before any write when they include
+`video_vae`: copying new weights cannot refresh the FP8 scales. Restart on the
+new checkpoint, or pass a `target_modules` list that leaves `video_vae` out.
+Omitting `target_modules` updates every component, including `video_vae`.
+
+This is a deployment-level precision change outside the quality contract:
+FP8 and its fused decoder kernels apply at every accepted quality level.
+`"exact"` no longer reproduces the reference decoder bit-for-bit, and
+`"quality": "high"` requests are rejected because the audited 4xH200 deployment
+requires FP8 to be off. Measure against an `exact` server without FP8 on the
+target GPU before serving it.
 
 ### Serve MiniMax-H3 on Ascend NPUs
 
@@ -1097,6 +1127,11 @@ done
 
 ### Choose the quality level
 
+The behavior below assumes the reference weights and default component
+precisions. With the [online FP8 video VAE decoder](#advanced-online-fp8-video-vae-decoder-deployment-level-lossy),
+`exact` remains lossy, `high` is rejected, and VAE attention uses the configured
+backend at every accepted quality level.
+
 `quality` is a cumulative request-scoped optimization parameter with three
 levels:
 
@@ -1562,6 +1597,7 @@ fold decision is not node-boundary aware:
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
 - On CUDA, `quality: "lossless"` (the default) decodes up to `vae_config.decoder_tile_batch` (64) spatial tiles and `vae_config.window_batch` (1) temporal windows per video VAE decoder forward, next to the fused Q/K norm+RoPE and cuDNN SDPA; `exact` decodes one tile and one window at a time, `--performance-mode memory` does so at every level, and other platforms keep one tile per forward. On SM100+ the temporal blend and output denormalization run as bit-exact kernels at every quality level.
+- `--component-quantizations.video_vae fp8` (online FP8 decoder, SM100+, resident fp16-autocast video VAE only) is a deployment-level precision change applied at load and outside the quality contract: it changes the output at every quality level, including `exact`, and the `quality: "high"` fingerprint requires it to be off. See "Advanced: online FP8 video VAE decoder" under Deployment details.
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
 - Single-node Ulysses recipes pipeline each block's all-to-all against dense attention (FlashAttention on Hopper, cuDNN SDPA on Blackwell) over the copy engine: one head group's q/k/v moves while the previous group attends, every copy (the merge into the output included) runs on the copy engine, and the output is bit-identical to the sequential exchange. It needs peer-to-peer access and stream memory operations on every rank and about 6 × (rows per rank) × heads × head_dim extra activations per rank (2.1 GB for Ref2VA at Ulysses 2), one set shared by every resolution; when that does not fit on some rank, every rank keeps the sequential exchange. `SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0` restores the sequential exchange.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1. Encoder DP stays inside each DiT replica and composes with encoder TP: the H100 TP2 + Ulysses2 recipe has two TP-sharded encoder copies that can split a batch, while the RTX 5090 pure-TP2 recipe has one encoder copy and therefore no additional batch-DP degree. It provides no benefit for a batch of one and is not bitwise-identical to the unsplit deployment.

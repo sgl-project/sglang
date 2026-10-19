@@ -232,6 +232,24 @@ first sight (`sites/bitexact_gate.py`) and falls back for good on a
 mismatch; both run at every level. `minimax_h3_vae_denorm_clamp` also takes
 `out=value` to rewrite a contiguous input in place.
 
+### MiniMax-H3 online FP8 decoder
+
+Row producers for the online-FP8 ViT decoder: they feed the shared
+`apply_fp8_linear` dispatch through `OnlineFP8Linear` and run whenever the
+MiniMax-H3 FP8 decoder option is installed (the request `quality` tier neither
+selects nor disables them). All four are close-contract
+and gated to SM100+. FP8 epilogues follow `per_token_quant_fp8` (scale = amax /
+448, clamp to +-448, an all-zero row gives scale 0); the fp32 reduction tree
+differs from eager, so the tests assert >= 99.9% identical E4M3 bins plus a
+half-ulp bound on the dequantized values rather than `torch.equal`.
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `minimax_h3_vae_rmsnorm_fp8` | JIT CUDA | `fp8(RMSNorm(x) * weight)`; fp32/fp16 rows, fp32 weight; width from `x.shape[-1]` (2048), contiguous and 16-byte aligned |
+| `minimax_h3_vae_residual_rmsnorm_fp8` | JIT CUDA | `residual = fma(projected, layer_scale, x)` kept in fp32 and returned, then the RMSNorm + FP8 epilogue above |
+| `minimax_h3_vae_residual_layernorm` | JIT CUDA | fp32 residual update + LayerNorm(gamma, beta), fp32 output; the decoder's final norm |
+| `silu_mul_quant_fp8` | JIT CUDA | `fp8(silu(gate) * up)` from a fp16/bf16 `[gate \| up]` row, product never rounded to 16 bits; output width `x.shape[-1] // 2` (8192) |
+
 ### Rowwise E4M3 producers (SM89+)
 
 | Entry point | Backend | Contract |

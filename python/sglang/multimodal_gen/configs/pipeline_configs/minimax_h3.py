@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -23,12 +24,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_decode_precision
 
 logger = init_logger(__name__)
 
@@ -169,6 +172,9 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "quantization": server_args.quantization,
             "transformer_weights_path": server_args.transformer_weights_path,
             "text_encoder_quantization": text_encoder_quantization,
+            "video_vae_quantization": server_args.component_quantizations.get(
+                "video_vae"
+            ),
             "regional_compile": server_args.regional_compile,
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
@@ -194,6 +200,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "quantization": None,
             "transformer_weights_path": None,
             "text_encoder_quantization": None,
+            "video_vae_quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
             "sp_degree": 4,
@@ -234,6 +241,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             # decoder; memory mode keeps the one-tile recipe at every tier.
             self.vae_config.decoder_tile_batch = 1
             self.vae_config.window_batch = 1
+        self._validate_video_vae_quantization(server_args)
         if current_platform.is_mps():
             required_components = (
                 "transformer",
@@ -329,6 +337,43 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+
+    @staticmethod
+    def _validate_video_vae_quantization(server_args) -> None:
+        quantization = server_args.component_quantizations.get("video_vae")
+        if quantization is None:
+            return
+        if quantization != "fp8":
+            raise ValueError(
+                "MiniMax-H3 video_vae supports only "
+                f"--component-quantizations.video_vae fp8, got {quantization!r}"
+            )
+        if server_args.component_quantization_ignored_layers.get("video_vae"):
+            raise ValueError(
+                "--component-quantization-ignored-layers.video_vae is not "
+                "supported: the online FP8 decoder quantizes exactly the 144 ViT "
+                "block linears"
+            )
+        if not (current_platform.is_cuda() and is_cuda_sm_at_least((10, 0))):
+            raise ValueError(
+                "The MiniMax-H3 online FP8 video VAE decoder requires CUDA "
+                "compute capability 10.0 or newer"
+            )
+        if (
+            "video_vae" in server_args.component_precisions
+            or resolve_decode_precision(server_args, "video_vae") != torch.float16
+            or server_args.disable_autocast
+        ):
+            raise ValueError(
+                "The MiniMax-H3 online FP8 video VAE decoder requires the fp16 "
+                "decode autocast recipe; drop --component-precisions.video_vae "
+                "and --disable-autocast"
+            )
+        if server_args.residency_mode("video_vae") != RESIDENT:
+            raise ValueError(
+                "The MiniMax-H3 online FP8 video VAE decoder requires a resident "
+                "decoder; pass --component-residency video_vae=resident"
+            )
 
     def select_vae_weight_files(
         self,
