@@ -1,6 +1,6 @@
 """FlashInfer KDA decode/verify wrapper.
 
-Wraps ``flashinfer.kda_decode.recurrent_kda`` (SM100 / Blackwell). KDA prefill
+Wraps ``flashinfer.recurrent_kda`` (SM100 / Blackwell). KDA prefill
 uses a separate adapter in ``kda_flashinfer_prefill``.
 
 Contract with the Triton KDA reference:
@@ -41,7 +41,7 @@ def _get_flashinfer_kda_kernel():
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
-            from flashinfer.kda_decode import recurrent_kda
+            from flashinfer import recurrent_kda
 
             _flashinfer_recurrent_kda = recurrent_kda
             # recurrent_kda is SM100-only (CuTe DSL, Blackwell).
