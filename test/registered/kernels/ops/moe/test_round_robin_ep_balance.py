@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
@@ -227,7 +228,9 @@ def _select(
             router_logits=torch.zeros((num_tokens, NUM_EXPERTS), device="cuda"),
             topk_config=TopKConfig(
                 top_k=top_k,
-                num_shared_topk_slots=num_fused_shared_experts,
+                shared_experts=SharedExpertsConfig(
+                    num_fused_shared_experts=num_fused_shared_experts
+                ),
                 custom_routing_function=_fixed_router,
             ),
             layer_id=0,

@@ -1,5 +1,7 @@
 """Routed and shared contributions must each receive their scale exactly once."""
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.runtime_context import get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -13,7 +15,6 @@ import torch
 
 from sglang.srt.batch_overlap.operations import _StateDict
 from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.topk import TopK, TopKConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.model_runner_components import moe_ep_setup
@@ -42,7 +43,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
 
         topk_config = TopKConfig(
             top_k=4,
-            num_shared_topk_slots=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
             apply_routed_scaling_factor_on_output=folded_in_topk,
             **self.ROUTING,
@@ -204,6 +205,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         )
         module = deepseek_v2_module
         with (
+            get_context().override_server_args(),
             patch.object(module, "_use_aiter", use_aiter),
             patch.object(topk_module, "_use_aiter", use_aiter),
             patch.object(
@@ -213,12 +215,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             ),
             patch.object(module, "get_exec", return_value=exec_config),
             patch.object(topk_module, "get_exec", return_value=exec_config),
-            # TopK and HashTopK ask layers/moe/utils.py whether Waterfill is on.
-            patch.object(moe_utils, "get_exec", return_value=exec_config),
-            patch.object(
-                module,
-                "is_shared_experts_fusion_disabled",
-                return_value=not fused_shared,
+            get_model().override(
+                shared_experts=SharedExpertsConfig(
+                    num_fused_shared_experts=fused_shared
+                )
             ),
             patch.object(module, "MoEGate", return_value=gate),
             patch.object(
@@ -399,7 +399,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         topk_weights = torch.tensor([[1.0, 0.5, 0.25, 1.0]], dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_shared_topk_slots=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             fused_shared_experts_scaling_factor=scaling_factor,
             allow_routed_experts_capture=False,
         )
@@ -444,7 +444,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         topk_weights = torch.tensor([[1.0, 0.5, 0.25]], dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_shared_topk_slots=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
         )
         with (
@@ -472,7 +472,9 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     def _route_with_per_rank_slots(self, *, num_fused_shared_experts, logits, bias):
         topk_config = TopKConfig(
             top_k=8 + num_fused_shared_experts,
-            num_shared_topk_slots=num_fused_shared_experts,
+            shared_experts=SharedExpertsConfig(
+                num_fused_shared_experts=num_fused_shared_experts
+            ),
             renormalize=True,
             correction_bias=bias,
             torch_native=True,
@@ -529,7 +531,9 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         here would make the AITER postprocessor append shared ID 288 twice."""
         topk = TopK.__new__(TopK)
         torch.nn.Module.__init__(topk)
-        topk.topk_config = TopKConfig(top_k=9, num_shared_topk_slots=1)
+        topk.topk_config = TopKConfig(
+            top_k=9, shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+        )
         topk.enable_waterfill = False
         topk.waterfill_balancer = None
 
