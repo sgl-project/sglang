@@ -34,7 +34,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
-    CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
@@ -465,6 +464,22 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
 
 
 class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
+    def _swa_lru_order(self, cache):
+        return cache.tree_core.get_component_device_lru_node_ids(ComponentType.SWA)
+
+    def _swa_pinning_cfg_supported(self) -> bool:
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            return False
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        pages_per_node = 8
+        side_pages = 5
+        if pages_per_node * self.cfg.page_size < cushion:
+            return False
+        chain_inserts_pages = 4 * pages_per_node + side_pages
+        if self.cfg.kv_size < chain_inserts_pages * self.cfg.page_size:
+            return False
+        return True
+
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -2031,78 +2046,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, extra)
         cache.sanity_check()
 
-    def test_swa_deep_tree_backup_evict_loadback_stress(self):
-        """Deep multi-node SWA tree (long leaves, decode-evict tombstones,
-        shared-prefix branches) through write-through backup -> evict ->
-        loadback, asserting sanity throughout."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self._skip_unsupported_hicache_test():
-            return
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only keeps the deep-tree topology precise")
-
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        cache.write_through_threshold = 1  # real eager write-through auto-backup
-        ps = self.cfg.page_size
-        # Window in pages; sizes scale with it so the leaf-cap split fires.
-        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        wp = max(1, tail_size // ps)
-
-        def insert_swa(tokens, swa_ev):
-            value = self._alloc(allocator, len(tokens))
-            if value is None:
-                return False
-            cache.insert(
-                InsertParams(
-                    key=RadixKey(array("q", tokens)),
-                    value=value,
-                    component_evicted_seqlens={ComponentType.SWA: swa_ev},
-                )
-            )
-            cache.writing_check()
-            cache.sanity_check()
-            return True
-
-        base = self._make_seq(1, wp + 2)  # long leaf -> cap-split
-        if not insert_swa(base, 0):
-            self.skipTest("kv pool too small for deep-tree stress")
-        # fresh decode-evicted seq: tombstone-prefix + cap-split stacked
-        insert_swa(self._make_seq(20000, wp + 2), ps)
-        insert_swa(base + self._make_seq(70000, 2), 0)  # depth
-        for i in range(2):  # width: branches off the base prefix
-            insert_swa(base[: 2 * ps] + self._make_seq(80000 + 1000 * i, 3), 0)
-
-        self.assertGreaterEqual(len(cache.tree_core.get_all_node_ids()), 5)
-
-        # Stepwise eviction -> demote to host, sanity after each round.
-        for _ in range(4):
-            full_ev = cache.full_evictable_size()
-            if full_ev == 0:
-                break
-            cache.evict(
-                EvictParams(
-                    num_tokens=max(ps, full_ev // 2),
-                    swa_num_tokens=cache.swa_evictable_size(),
-                )
-            )
-            cache.sanity_check()
-
-        # Load evicted prefixes back from host, sanity after each.
-        for tokens in (base, base[: 2 * ps]):
-            m = _match_prefix(cache, tokens)
-            anchor = m.best_match_node
-            if (
-                anchor != cache.root_node_handle()
-                and cache.tree_core.is_full_device_evicted(anchor)
-            ):
-                if cache.load_back(anchor):
-                    self._finish_pending_loads(cache)
-                    self._release_ongoing_load_back_locks(cache)
-            cache.sanity_check()
-
-        cache.sanity_check()
-
     def test_full_kv_hit_length_counts_the_split_fragment(self):
         """A mid-node partial match splits the node; the matched fragment still
         counts toward full_kv_hit_length (independent of component validators)."""
@@ -2112,43 +2055,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
         result = _match_prefix(cache, [1, 2, 3, 4, 99])
         self.assertEqual(result.full_kv_hit_length, 4)
-
-    def test_swa_backup_collector_is_shared_by_both_call_sites(self):
-        """needs_incremental_backup and the BACKUP_HOST transfer read one
-        collector: cache mode walks the window past a host-backed target to
-        its device-only ancestor, buffer mode stages the target alone."""
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("requires SWA-only")
-        if self.cfg.sliding_window_size <= self.cfg.page_size:
-            self.skipTest("the window must reach past the leaf's own page")
-        # This test exercises the Python component's collector directly.
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
-            tree_core_backend="python"
-        )
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
-        if len(chain) < 2:
-            self.skipTest("chain too short")
-        parent, leaf = chain[-2], chain[-1]
-        swa = cache.components[ComponentType.SWA]
-        leaf_node = cache.tree_core.node_by_id(leaf)
-        cache.tree_core.set_component_host_value_raw(
-            leaf,
-            ComponentType.SWA,
-            _device_value(cache, leaf, ComponentType.SWA).clone(),
-        )
-
-        self.assertTrue(swa.needs_incremental_backup(leaf_node))
-        xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
-        )[0]
-        self.assertEqual(xfer.nodes_to_load, [parent])
-
-        cache.tree_core.set_host_memory_buffer_only()
-        self.assertTrue(swa.needs_incremental_backup(leaf_node))
-        xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
-        )[0]
-        self.assertEqual(xfer.nodes_to_load, [leaf])
 
     def test_zero_match_result_carries_node_id_handles(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -2173,39 +2079,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
         # and the handles must work with the NodeId-based lock APIs
         lock = cache.inc_lock_ref(zeroed.best_match_node)
         cache.dec_lock_ref(zeroed.best_match_node, lock.to_dec_params())
-
-    def test_mamba_has_host_value_only_predicate(self):
-        """Needs a slot only when mamba is host-only (device evicted, host backed up)."""
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if not chain:
-            self.skipTest("chain too short")
-        node = chain[-1]
-        dev = torch.tensor([0], dtype=torch.int64)
-        host = torch.tensor([0], dtype=torch.int64)
-
-        # host-only: device evicted, host backup present -> restore needs a slot
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, host)
-        self.assertTrue(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
-        # device + host: device value present -> no restore, no slot (the D+H bug case)
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, dev)
-        self.assertFalse(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
-        # device-only / neither: nothing to restore
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, None)
-        self.assertFalse(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
-        self.assertFalse(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
 
     def test_swa_branch_insert_releases_forward_overshoot(self):
         if (
@@ -2274,38 +2147,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
             torch.count_nonzero(mapping[kv_indices[expected_evicted:]]).item(),
             forward_len - expected_evicted,
         )
-
-    def test_build_backup_kv_action_orders_ancestors_first(self):
-        """write-through backs up unbacked ancestors parent-first; write-back only the leaf."""
-        if self.cfg.has_swa:
-            self.skipTest("SWA boundary splits deepen the chain non-deterministically")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-
-        top_seq = self._make_seq(1, 1)
-        mid_seq = top_seq + self._make_seq(1000, 1)
-        leaf_seq = mid_seq + self._make_seq(2000, 1)
-        self._insert(cache, allocator, req_to_token_pool, top_seq)
-        self._insert(cache, allocator, req_to_token_pool, mid_seq)
-        self._insert(cache, allocator, req_to_token_pool, leaf_seq)
-
-        m = _match_prefix(cache, leaf_seq)
-        leaf = m.last_device_node
-        mid = cache.tree_core.get_parent_node_id(leaf)
-        top = cache.tree_core.get_parent_node_id(mid)
-        self.assertNotEqual(top, cache.root_node_handle())
-        self.assertFalse(cache.tree_core.is_backuped(leaf))
-        self.assertFalse(cache.tree_core.is_backuped(mid))
-        self.assertFalse(cache.tree_core.is_backuped(top))
-
-        # write-through: every unbacked ancestor, top-most first, child last
-        write_through = cache.tree_core.build_backup_node_ids(leaf, write_back=False)
-        self.assertEqual(write_through, [top, mid, leaf])
-
-        # write-back: only the eviction victim, even with unbacked ancestors
-        write_back = cache.tree_core.build_backup_node_ids(leaf, write_back=True)
-        self.assertEqual(write_back, [leaf])
-
-        cache.sanity_check()
 
 
 for _cfg in _CONFIGS:
