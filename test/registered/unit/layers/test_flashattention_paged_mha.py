@@ -18,8 +18,10 @@ with patch.dict(
         )
     },
 ):
+    from sglang.srt.layers.attention import flashattention_backend
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
+        FlashAttentionMetadata,
     )
     from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
         UnquantizedKVCacheMethod,
@@ -161,11 +163,113 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
             logical_batch_size=2,
             kv_head_num=1,
             is_prefill=True,
+            ver=3,
         )
 
         self.assertEqual(q.dtype, torch.float16)
         self.assertEqual(k_descale.shape, (2, 1))
         self.assertEqual(v_descale.shape, (2, 1))
+
+
+def _fa3_backend():
+    backend = _backend()
+    backend.fa_impl_ver = 3
+    backend.use_mla = False
+    return backend
+
+
+def _gemma4_layer(*, head_dim, sliding_window_size):
+    return SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=4,
+        tp_k_head_num=2,
+        tp_v_head_num=2,
+        head_dim=head_dim,
+        v_head_dim=head_dim,
+        sliding_window_size=sliding_window_size,
+        is_cross_attention=False,
+        attn_type=None,
+        scaling=1.0,
+        logit_cap=0.0,
+        k_scale=None,
+        v_scale=None,
+    )
+
+
+class TestFlashAttentionFa3UpgradesToFa4(unittest.TestCase):
+    def test_ver_for_upgrades_fa3_above_the_fa3_head_dim_limit(self):
+        # FA3 kernels stop at head_dim 256; the wider of K and V decides.
+        backend = _fa3_backend()
+        cases = [((256, 256), 3), ((257, 257), 4), ((512, 512), 4), ((128, 512), 4)]
+        for (head_dim, v_head_dim), expected in cases:
+            layer = SimpleNamespace(head_dim=head_dim, v_head_dim=v_head_dim)
+            self.assertEqual(backend._ver_for(layer), expected, (head_dim, v_head_dim))
+
+    def test_ver_for_sends_image_masks_to_fa4(self):
+        # Image masks exist only in FA4, so a layer FA3 could run still goes
+        # to FA4 when the batch carries them.
+        layer = SimpleNamespace(head_dim=256, v_head_dim=256)
+        self.assertEqual(_fa3_backend()._ver_for(layer, needs_fa4=True), 4)
+
+    def test_ver_for_keeps_absorbed_mla_on_fa3(self):
+        # Absorbed MLA reports head_dim 576 / v_head_dim 512, but FA3 runs it
+        # natively as hdim 64 + qv 512; FA4's qv path is SM100-only.
+        backend = _fa3_backend()
+        backend.use_mla = True
+        layer = SimpleNamespace(head_dim=576, v_head_dim=512)
+        self.assertEqual(backend._ver_for(layer), 3)
+
+    def test_ver_for_never_downgrades_fa4(self):
+        backend = _backend()
+        backend.fa_impl_ver = 4
+        layer = SimpleNamespace(head_dim=128, v_head_dim=128)
+        self.assertEqual(backend._ver_for(layer), 4)
+
+    def test_forward_decode_dispatches_each_layer_to_its_version(self):
+        # Gemma-4 on fa3: 256-dim sliding-window layers stay on FA3, 512-dim
+        # full layers run FA4.
+        backend = _fa3_backend()
+        backend.kv_cache_dtype = torch.bfloat16
+        backend.kv_cache_dtype_str = "auto"
+        backend.use_mla = False
+        backend.topk = 0
+        backend.local_attn_builder = None
+        backend.use_sliding_window_kv_pool = False
+        backend.is_prefill_aware_swa = False
+        backend._decode_uses_static_max_seqlen_k = False
+        backend.decode_num_splits = 0
+        backend.num_splits = 0
+        backend.full_cg_prefill_metadata = None
+        backend.forward_metadata = FlashAttentionMetadata(
+            cache_seqlens_int32=torch.ones(1, dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            page_table=torch.zeros(1, 1, dtype=torch.int32),
+        )
+        forward_batch = SimpleNamespace(batch_size=1, spec_info=None)
+
+        for head_dim, window, expected_ver in ((256, 1023, 3), (512, -1, 4)):
+            layer = _gemma4_layer(head_dim=head_dim, sliding_window_size=window)
+            backend.token_to_kv_pool = SimpleNamespace(
+                get_kv_buffer=Mock(
+                    return_value=(
+                        torch.empty(1, 2, head_dim, dtype=torch.bfloat16),
+                        torch.empty(1, 2, head_dim, dtype=torch.bfloat16),
+                    )
+                )
+            )
+            kernel = Mock(return_value=torch.zeros(1, 4, head_dim))
+            with patch.object(
+                flashattention_backend, "flash_attn_with_kvcache", kernel
+            ):
+                backend.forward_decode(
+                    torch.zeros(1, 4 * head_dim, dtype=torch.bfloat16),
+                    None,
+                    None,
+                    layer,
+                    forward_batch,
+                    save_kv_cache=False,
+                )
+            self.assertEqual(kernel.call_args.kwargs["ver"], expected_ver, head_dim)
 
 
 if __name__ == "__main__":
