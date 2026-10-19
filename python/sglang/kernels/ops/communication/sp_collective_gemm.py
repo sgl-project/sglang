@@ -3,12 +3,24 @@
 Torch symmetric memory is used only to allocate/register NVLink-accessible
 buffers. AG dispatches between a tile-gated CUTLASS GEMM and per-shard cuBLAS
 GEMMs; RS uses a fused CUTLASS kernel.
+
+The symmetric-memory workspaces are owned by
+``sglang.srt.layers.communication.sp_collective_gemm_workspace``: each entry
+point takes its getter as ``workspace`` and calls it with the tile-padded shape
+``(kind, group, rows, width, x, row_align, flag_tile_mn)``.
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Callable
+
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+        SPCollectiveGemmWorkspace,
+    )
 
 _TILE_M = 64
 _TILE_N = 128
@@ -18,7 +30,6 @@ _AG_TILES = (
     (64, 128, False, (1, 1)),
 )
 _RS_TILES = ((128, 256, False, (1, 1)), (64, 128, False, (1, 1)))
-_workspaces = {}
 _compiled = {}
 
 
@@ -93,86 +104,10 @@ def _check_inputs(x, weight, group):
     return world, dist.get_rank(group)
 
 
-class _Workspace:
-    def __init__(
-        self,
-        kind,
-        group,
-        rows,
-        width,
-        dtype,
-        device,
-        row_align=_TILE_M,
-        flag_tile_mn=(_TILE_M, _TILE_N),
-    ):
-        import cutlass.torch as cutlass_torch
-        import torch.distributed._symmetric_memory as symm_mem
-
-        # Power of two >= row_align, so capacity stays a whole number of M tiles.
-        self.capacity = max(row_align, 1 << (rows - 1).bit_length())
-        self.world = dist.get_world_size(group)
-        self.sms = torch.cuda.get_device_properties(device).multi_processor_count
-        self.storage = symm_mem.empty(
-            (self.capacity, width), dtype=dtype, device=device
-        )
-        self.handle = symm_mem.rendezvous(self.storage, group)
-        if kind == "ag":
-            self.gathered = torch.empty(
-                (self.capacity * self.world, width), dtype=dtype, device=device
-            )
-            self.flags = torch.zeros(self.world, dtype=torch.int32, device=device)
-            self.copy_stream = torch.cuda.Stream(device=device)
-        else:
-            if not self.handle.multicast_ptr:
-                raise RuntimeError(
-                    "CUTLASS GEMM-RS requires NVSwitch multicast mapping"
-                )
-            self.multicast = cutlass_torch.as_tensor(
-                self.handle.multicast_ptr, self.storage.shape, dtype
-            )
-            num_flags = (
-                self.capacity // flag_tile_mn[0] * (width // flag_tile_mn[1])
-                + self.sms
-                + 8
-            )
-            self.flags = symm_mem.empty((num_flags,), dtype=torch.int32, device=device)
-            self.flags.zero_()
-            self.flag_handle = symm_mem.rendezvous(self.flags, group)
-            if not self.flag_handle.multicast_ptr:
-                raise RuntimeError("CUTLASS GEMM-RS requires multicast flag storage")
-            self.flag_multicast = cutlass_torch.as_tensor(
-                self.flag_handle.multicast_ptr, self.flags.shape, self.flags.dtype
-            )
-            self.peer_flags = tuple(
-                self.flag_handle.get_buffer(r, self.flags.shape, self.flags.dtype)
-                for r in range(self.world)
-            )
-        self.handle.barrier(channel=0)
-
-
-def _workspace(
-    kind, group, rows, width, x, row_align=_TILE_M, flag_tile_mn=(_TILE_M, _TILE_N)
-):
-    key = (kind, group, width, x.dtype, x.device)
-    ws = _workspaces.get(key)
-    if ws is None or rows > ws.capacity:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Warm up CUTLASS SP workspace before CUDA graph capture")
-        if ws is not None:
-            # Peer mappings must stay alive until all ranks stop reading them.
-            ws.handle.barrier(channel=0)
-            torch.cuda.current_stream().synchronize()
-        ws = _Workspace(
-            kind, group, rows, width, x.dtype, x.device, row_align, flag_tile_mn
-        )
-        _workspaces[key] = ws
-    return ws
-
-
 def _all_gather_matmul_cublas(
     local: torch.Tensor,
     weight: torch.Tensor,
-    ws: _Workspace,
+    ws: SPCollectiveGemmWorkspace,
     rank: int,
     rows: int,
     out: torch.Tensor,
@@ -236,7 +171,14 @@ def _all_gather_matmul_cublas(
     main.wait_stream(ws.copy_stream)
 
 
-def all_gather_matmul(x, weight, group, *, backend: str = "auto"):
+def all_gather_matmul(
+    x,
+    weight,
+    group,
+    *,
+    workspace: Callable[..., SPCollectiveGemmWorkspace],
+    backend: str = "auto",
+):
     """all_gather(x, dim=0) @ weight.T, with shape-based backend selection.
 
     Backend overrides must agree across ranks and are fixed at graph capture.
@@ -262,7 +204,7 @@ def all_gather_matmul(x, weight, group, *, backend: str = "auto"):
     mma_m, mma_n, use_2cta, cluster = _ag_tile(n)
     local = _pad_shards(x.contiguous(), 1, mma_m)
     padded = local.shape[0]
-    ws = _workspace("ag", group, padded, k, x, mma_m)
+    ws = workspace("ag", group, padded, k, x, mma_m)
     gathered = ws.gathered[: padded * world]
     if backend == "cublas":
         out = x.new_empty((rows * world, n))
@@ -328,7 +270,9 @@ def all_gather_matmul(x, weight, group, *, backend: str = "auto"):
     return _unpad_shards(out, rows, world)
 
 
-def matmul_reduce_scatter(x, weight, group):
+def matmul_reduce_scatter(
+    x, weight, group, *, workspace: Callable[..., SPCollectiveGemmWorkspace]
+):
     """reduce_scatter(x @ weight.T, SUM, dim=0), one fused GEMM-RS kernel."""
     import cuda.bindings.driver as cuda
     import cutlass
@@ -349,7 +293,7 @@ def matmul_reduce_scatter(x, weight, group):
     cta_m = mma_m // (2 if use_2cta else 1)
     padded_input = _pad_shards(x.contiguous(), world, cta_m)
     m = padded_input.shape[0]
-    ws = _workspace("rs", group, m, n, x, cta_m, (cta_m, mma_n))
+    ws = workspace("rs", group, m, n, x, cta_m, (cta_m, mma_n))
     out = x.new_empty((m // world, n))
     args = dict(
         a=_tensor(padded_input),

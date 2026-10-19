@@ -81,9 +81,10 @@ that first used it, and keep a fused operation intact:
   data) is `gemm`, normalization is `layernorm`.
 
 Runtime integration that owns process groups, symmetric buffers, workspace
-classes, or model dispatch stays in `srt`: the K3 and Muse Spark communication
-adapters live in `srt/layers/communication/`, while their callable kernels live
-in `kernels/ops/communication/`. Reference/test oracles belong in
+classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
+collective-GEMM communication adapters and workspaces live in
+`srt/layers/communication/`, while their callable kernels live in
+`kernels/ops/communication/` and take that state as arguments. Reference/test oracles belong in
 `sglang.test.kernels`, not in an operator module. Tests of runtime state belong
 with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
 tests belong in `test/registered/unit/kernels/`.
