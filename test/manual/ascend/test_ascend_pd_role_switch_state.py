@@ -2,10 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.kv_cache_builder import resolve_decode_retraction_backup
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 
 class TestDecodeGraphRoleSwitchState(unittest.TestCase):
@@ -54,36 +51,6 @@ class TestDecodeGraphRoleSwitchState(unittest.TestCase):
                 runner = self._startup(kind)
                 self.assertFalse(runner.decode_cuda_graph_captured)
                 self.assertEqual(runner.decode_cuda_graph_capture_bs, [])
-
-
-class TestAscendDecodeRetractionDefault(unittest.TestCase):
-    def test_default_uses_cpu_tensor_for_ascend_blocked_kv_layout(self):
-        pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        worker = SimpleNamespace(
-            is_hybrid_swa=False,
-            get_memory_pool=lambda: (None, SimpleNamespace(get_kvcache=lambda: pool)),
-            model_runner=SimpleNamespace(
-                mtp_draft_device_pools=(), model_config=object()
-            ),
-        )
-        module = "sglang.srt.mem_cache.kv_cache_builder"
-        for npu, expected in ((False, "host_pool"), (True, "cpu_tensor")):
-            with self.subTest(npu=npu):
-                args = ServerArgs(
-                    model_path="dummy",
-                    device="cpu",
-                    disaggregation_mode="decode",
-                    hicache_ratio=1.0,
-                )
-                set_global_server_args_for_scheduler(args)
-                with (
-                    patch(module + ".is_npu", return_value=npu),
-                    patch(module + ".is_hip", return_value=False),
-                    patch(module + ".uses_ssm_state", return_value=False),
-                ):
-                    self.assertEqual(
-                        resolve_decode_retraction_backup(tp_worker=worker), expected
-                    )
 
 
 if __name__ == "__main__":

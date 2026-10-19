@@ -159,7 +159,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             for pool in (self.device_pool, *self.mtp_draft_device_pools)
             if pool is not None
             for side in ("k_buffer", "v_buffer")
-            for buf in getattr(pool, side, None) or ()
+            for buffers in (getattr(pool, side, None),)
+            if buffers is not None
+            for buf in buffers
         )
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
