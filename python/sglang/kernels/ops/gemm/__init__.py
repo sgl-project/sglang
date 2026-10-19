@@ -179,7 +179,7 @@ register_kernel(
     KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
-        target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
+        target="sglang.kernels.ops.gemm.flashinfer_bmm_fp8:bmm_fp8",
         capabilities=CUDA_ONLY,
     )
 )
