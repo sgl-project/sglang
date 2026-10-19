@@ -15,6 +15,27 @@ class HiSparseV2Config(msgspec.Struct, frozen=True, kw_only=True):
     block_size: int
 
 
+def resolve_hisparse_v2_query_steps(
+    *,
+    algorithm: str | None,
+    num_draft_tokens: int | None,
+    eagle_topk: int | None,
+    adaptive: bool,
+    multi_layer: bool,
+) -> int:
+    if algorithm is None or algorithm.upper() == "NONE":
+        return 1
+    if algorithm.upper() != "EAGLE" or multi_layer:
+        raise ValueError("HiSparse V2 MTP requires a single EAGLE draft model")
+    if (eagle_topk or 1) != 1:
+        raise ValueError("HiSparse V2 MTP requires --speculative-eagle-topk 1")
+    if adaptive:
+        raise ValueError("HiSparse V2 MTP does not support speculative-adaptive")
+    if type(num_draft_tokens) is not int or not 2 <= num_draft_tokens <= 4:
+        raise ValueError("HiSparse V2 MTP requires 2-4 speculative draft tokens")
+    return num_draft_tokens
+
+
 def parse_hisparse_v2_config(*, model_top_k: int = 2048) -> HiSparseV2Config:
     memory = get_memory()
     return resolve_hisparse_v2_config(

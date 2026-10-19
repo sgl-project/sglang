@@ -118,7 +118,6 @@ def validate_hisparse_v2(server_args: ServerArgs) -> None:
             raise ValueError(f"--enable-hisparse-v2 requires {requirement}")
     unsupported = (
         (get_platform().is_hip or cfg.device != "cuda", "non-CUDA devices"),
-        (cfg.speculative_algorithm is not None, "speculative decoding"),
         (cfg.enable_mixed_chunk, "mixed prefill/decode batches"),
         (cfg.enable_session_radix_cache or cfg.enable_streaming_session, "sessions"),
         (cfg.disaggregation_mode != "null", "PD disaggregation"),
@@ -135,8 +134,16 @@ def validate_hisparse_v2(server_args: ServerArgs) -> None:
     from sglang.srt.configs.model_config import get_dsa_index_topk
     from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
         resolve_hisparse_v2_config,
+        resolve_hisparse_v2_query_steps,
     )
 
+    resolve_hisparse_v2_query_steps(
+        algorithm=cfg.speculative_algorithm,
+        num_draft_tokens=cfg.speculative_num_draft_tokens,
+        eagle_topk=cfg.speculative_eagle_topk,
+        adaptive=cfg.speculative_adaptive,
+        multi_layer=cfg.enable_multi_layer_eagle,
+    )
     resolve_hisparse_v2_config(
         config=cfg.hisparse_config,
         model_top_k=get_dsa_index_topk(hf_config),

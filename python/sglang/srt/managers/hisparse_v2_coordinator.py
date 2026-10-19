@@ -34,6 +34,7 @@ class _PrefillReservation(msgspec.Struct, frozen=True):
 class HiSparseV2Coordinator:
     def __init__(self, *, cache: HiSparseV2Cache, allocator):
         self.cache = cache
+        self.caches = (cache,)
         self.allocator = allocator
         self.tree_cache = None
         self.forward_stream = None
@@ -41,20 +42,40 @@ class HiSparseV2Coordinator:
         self.pending: dict[str, _PrefillReservation] = {}
         self._admit_count = 0
 
-    def attach_tree(self, tree_cache) -> None:
+    def attach_tree(self, tree_cache, *, draft_caches=()) -> None:
         from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
         if not isinstance(tree_cache.tree_core, UnifiedTreeCore):
             raise ValueError("HiSparse V2 requires the Python unified tree core")
+        if len(draft_caches) > 1:
+            raise ValueError("HiSparse V2 supports one MTP draft cache")
         self.tree_cache = tree_cache
-        self.cache.attach_host_pool(tree_cache.host_pool_group.get_pool(PoolName.KV))
+        host_pool = tree_cache.host_pool_group.get_pool(PoolName.KV)
+        self.cache.attach_host_pool(host_pool)
+        for draft_cache in draft_caches:
+            if draft_cache is None or (
+                draft_cache.pool.size < self.cache.pool.size
+                or draft_cache.page_size != self.cache.page_size
+                or draft_cache.reserved_buffer_tokens
+                != self.cache.reserved_buffer_tokens
+                or draft_cache.top_k != self.cache.top_k
+            ):
+                raise ValueError("HiSparse V2 MTP requires compatible DSA cache pools")
+            if host_pool.mtp_draft_device_pools:
+                if host_pool.mtp_draft_device_pools != (draft_cache.pool,):
+                    raise ValueError(
+                        "HiSparse V2 draft does not match HiCache's packed pool"
+                    )
+                draft_cache.attach_host_pool(
+                    host_pool, layer_offset=host_pool.target_layer_num
+                )
+            else:
+                draft_cache.attach_host_pool(
+                    tree_cache.host_pool_group.get_pool(PoolName.DRAFT)
+                )
+        self.caches = (self.cache, *draft_caches)
         tree_cache.hisparse_v2_coordinator = self
         tree_cache.tree_core.hisparse_v2_coordinator = self
-
-    def prepare_forward(self, forward_batch) -> None:
-        self.cache.num_real_reqs.fill_(
-            0 if forward_batch.forward_mode.is_idle() else forward_batch.batch_size
-        )
 
     def _wait_for_forward(self) -> None:
         if self.forward_stream is not None:
@@ -72,15 +93,15 @@ class HiSparseV2Coordinator:
         if req.rid in self.pending:
             return 0
         prefix_len = len(req.full_untruncated_fill_ids)
-        if prefix_len < self.cache.buffer_tokens or (
+        if prefix_len < self.cache.reserved_buffer_tokens or (
             prefix_len
-            + self.cache.buffer_tokens
+            + self.cache.reserved_buffer_tokens
             + max_new_tokens
             + self.cache.page_size
             >= self.cache.pool.size
         ):
             return 0
-        return self.cache.buffer_tokens
+        return self.cache.reserved_buffer_tokens
 
     def reserve_prefill(self, req, *, max_new_tokens: int) -> bool:
         needed = self.temp_tokens_required(req, max_new_tokens=max_new_tokens)
@@ -93,7 +114,7 @@ class HiSparseV2Coordinator:
         )
         pending_tokens = sum(p.prefix_len for p in self.pending.values())
         pages_left = (
-            self.cache.index_allocator.available()
+            min(cache.index_allocator.available() for cache in self.caches)
             - pending_tokens // self.cache.page_size
         )
         claimed = {
@@ -125,7 +146,7 @@ class HiSparseV2Coordinator:
             raise RuntimeError("HiSparse V2 request admitted twice")
         prefix_len = req.kv.cache_protected_len
         reservation = self.pending.pop(req.rid, None)
-        if prefix_len < self.cache.buffer_tokens:
+        if prefix_len < self.cache.reserved_buffer_tokens:
             if reservation is not None:
                 self.allocator.free(reservation.temp)
             return False
@@ -135,28 +156,37 @@ class HiSparseV2Coordinator:
         temp = (
             reservation.temp
             if reservation is not None
-            else self.allocator.alloc(self.cache.buffer_tokens)
+            else self.allocator.alloc(self.cache.reserved_buffer_tokens)
         )
         if temp is None:
             logger.debug(
                 "HiSparse V2 keeps request %s resident: no swap slots", req.rid
             )
             return False
+        copied_caches = []
         try:
             tokens = self.cache.req_to_token[req_id, :prefix_len]
-            copied = self.cache.copy_index(req_id, tokens)
+            for cache in self.caches:
+                if not cache.copy_index(req_id, tokens):
+                    break
+                copied_caches.append(cache)
         except Exception:
+            for cache in copied_caches:
+                cache.release(req_id)
             self.allocator.free(temp)
             raise
-        if not copied:
+        if len(copied_caches) != len(self.caches):
+            for cache in copied_caches:
+                cache.release(req_id)
             self.allocator.free(temp)
             logger.debug(
                 "HiSparse V2 keeps request %s resident: index pool full", req.rid
             )
             return False
 
-        self.cache.temp_locs[req_id, : self.cache.buffer_tokens] = temp.to(torch.int32)
-        self.cache.protected_lens[req_id] = prefix_len
+        for cache in self.caches:
+            cache.assign_temp_locations(req_id, temp)
+            cache.protected_lens[req_id] = prefix_len
         self.requests[req_id] = _RequestState(
             prefix_len=prefix_len, temp=temp, nodes=self._prefix_nodes(req)
         )
@@ -219,7 +249,8 @@ class HiSparseV2Coordinator:
                     node.id
                 ).to_dec_params()
             # Publish both maps before the allocator can hand these rows to another request.
-            self.cache.host_locs[req_id, positions] = host_rows[lookup[positions]]
+            for cache in self.caches:
+                cache.host_locs[req_id, positions] = host_rows[lookup[positions]]
             row[positions] = -1
 
     def request_finished(self, req) -> None:
@@ -232,12 +263,15 @@ class HiSparseV2Coordinator:
         self._wait_for_forward()
         for node_id, receipt in state.host_locks.items():
             self.tree_cache.dec_host_lock_ref(node_id, receipt)
-        self.cache.release(req.kv.req_pool_idx)
+        for cache in self.caches:
+            cache.release(req.kv.req_pool_idx)
         self.allocator.free(state.temp)
         req.hisparse_v2_active = False
 
     def reserved_temp_tokens(self) -> int:
-        return (len(self.requests) + len(self.pending)) * self.cache.buffer_tokens
+        return (
+            len(self.requests) + len(self.pending)
+        ) * self.cache.reserved_buffer_tokens
 
     def reset(self) -> None:
         if self.requests or self.pending:
@@ -247,28 +281,44 @@ class HiSparseV2Coordinator:
 
     def destroy(self) -> None:
         self._wait_for_forward()
-        self.cache.host_bindings.zero_()
+        for cache in self.caches:
+            cache.host_bindings.zero_()
         torch.cuda.current_stream().synchronize()
 
 
-def build_hisparse_v2_coordinator(
-    *, req_to_token_pool, token_to_kv_pool, allocator, model_config, device
+def build_hisparse_v2_cache(
+    *, req_to_token_pool, token_to_kv_pool, model_config, device
 ):
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
     from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
         parse_hisparse_v2_config,
+        resolve_hisparse_v2_query_steps,
     )
+    from sglang.srt.runtime_context import get_spec
 
+    if (
+        not isinstance(token_to_kv_pool, DSATokenToKVPool)
+        or get_dsa_index_kpool(model_config.hf_text_config) != 1
+    ):
+        raise ValueError("HiSparse V2 requires unpooled DSA target and draft KV pools")
     config = parse_hisparse_v2_config(
         model_top_k=model_config.hf_text_config.index_topk
     )
-    return HiSparseV2Coordinator(
-        cache=HiSparseV2Cache(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=token_to_kv_pool,
-            top_k=config.top_k,
-            buffer_tokens=config.buffer_tokens,
-            block_size=config.block_size,
-            device=device,
-        ),
-        allocator=allocator,
+    spec = get_spec()
+    num_query_steps = resolve_hisparse_v2_query_steps(
+        algorithm=spec.speculative_algorithm,
+        num_draft_tokens=spec.speculative_num_draft_tokens,
+        eagle_topk=spec.speculative_eagle_topk,
+        adaptive=spec.speculative_adaptive,
+        multi_layer=spec.enable_multi_layer_eagle,
+    )
+    return HiSparseV2Cache(
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool=token_to_kv_pool,
+        top_k=config.top_k,
+        buffer_tokens=config.buffer_tokens,
+        block_size=config.block_size,
+        device=device,
+        num_query_steps=num_query_steps,
     )
