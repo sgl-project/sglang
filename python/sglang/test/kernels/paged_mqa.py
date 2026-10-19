@@ -126,8 +126,18 @@ def generate_paged_mqa_test_data(
 
 
 def assert_paged_mqa_matches_ref(
-    logits, ref_logits, context_lens, B, next_n, max_model_len
+    logits,
+    ref_logits,
+    context_lens,
+    B,
+    next_n,
+    max_model_len,
+    atol=5e-5,
+    rtol=1e-5,
+    max_calc_diff=None,
 ):
+    """Elementwise ``atol``/``rtol``, or with ``max_calc_diff`` DeepGEMM's
+    ``1 - 2<x, y> / (|x|^2 + |y|^2)`` over the causal positions."""
     device = logits.device
     positions = torch.arange(max_model_len, device=device).unsqueeze(0)
     row_indices = torch.arange(B * next_n, device=device) // next_n
@@ -137,4 +147,9 @@ def assert_paged_mqa_matches_ref(
 
     logits_masked = logits.float().masked_fill(~mask, 0)
     ref_masked = ref_logits.float().masked_fill(~mask, 0)
-    torch.testing.assert_close(logits_masked, ref_masked, atol=5e-5, rtol=1e-5)
+    if max_calc_diff is None:
+        torch.testing.assert_close(logits_masked, ref_masked, atol=atol, rtol=rtol)
+        return
+    x, y = logits_masked.double(), ref_masked.double()
+    diff = (1 - 2 * (x * y).sum() / (x * x + y * y).sum()).item()
+    assert diff < max_calc_diff, f"calc_diff {diff:.3g} >= {max_calc_diff}"

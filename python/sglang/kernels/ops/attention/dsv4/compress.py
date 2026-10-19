@@ -52,6 +52,8 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool,
     layout: KVLayout,
     fp8_2buff: bool = False,
+    round_scale: bool = False,
+    ue8m0_scale: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -62,6 +64,8 @@ def _jit_compress_norm_rope_module(
         bf16_store,
         layout.cpp_name,
         is_arch_support_pdl(),
+        round_scale,
+        ue8m0_scale,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -461,8 +465,12 @@ def compress_norm_rope_store(
     layout: Union[KVLayout, str] = KVLayout.V4,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
+    # FP8 indexer only: power-of-two scale, and packed UE8M0 storage (MXFP8)
+    round_scale: bool = False,
+    ue8m0_scale: bool = False,
 ) -> None:
     layout = KVLayout.parse(layout)
+    assert not (round_scale or ue8m0_scale) or (kv.shape[-1] == 128 and not use_fp4)
     if layout is not KVLayout.V4:
         assert kv.shape[-1] == 512 and not use_fp4 and not bf16_store, (
             "the V4.1 layouts are paged FlashMLA main-KV caches"
@@ -523,6 +531,8 @@ def compress_norm_rope_store(
             bf16_store,
             layout,
             fp8_2buff,
+            round_scale,
+            ue8m0_scale,
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()

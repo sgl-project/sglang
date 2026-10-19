@@ -85,6 +85,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    has_deep_gemm_index_logits,
     has_dense_fp4_indexer,
     is_sm100_or_newer,
     make_candidate_indexer,
@@ -1655,7 +1656,7 @@ class DeepseekV4AttnBackend(
         return (
             bool(self.low_ratios)
             and has_dense_fp4_indexer()
-            and is_sm100_or_newer()
+            and has_deep_gemm_index_logits()
             and get_parallel().attn_cp_size == 1
         )
 
@@ -2494,6 +2495,22 @@ class DeepseekV4AttnBackend(
                     )
                 if self.trtllm_attn:
                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
+
+        litetopk = self.full_topk_indexer.litetopk
+        mode = forward_batch.forward_mode
+        if (
+            litetopk is not None
+            and isinstance(metadata, DSV4Metadata)
+            and (mode.is_decode() or mode.is_target_verify())
+        ):
+            tokens_per_request = (
+                int(forward_batch.spec_info.draft_token_num)
+                if mode.is_target_verify()
+                else 1
+            )
+            for paged in (metadata.c1_indexer_metadata, metadata.c2_indexer_metadata):
+                if paged is not None:
+                    litetopk.prepare_metadata(paged, tokens_per_request)
 
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
