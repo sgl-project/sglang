@@ -768,6 +768,15 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
 
+        full_target = available_size_targets.get(ComponentType.FULL)
+        if full_target is not None:
+            # Classed pools can free the requested count without raising their
+            # min-class capacity floor to the original allocation target.
+            retry_result = _evict_until_allocatable(self, allocator, full_target[1])
+            result.num_tokens_evicted += retry_result.num_tokens_evicted
+            result.swa_num_tokens_evicted += retry_result.swa_num_tokens_evicted
+            result.mamba_num_evicted += retry_result.mamba_num_evicted
+
         return result
 
     @staticmethod
@@ -1893,8 +1902,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if avail < kv_tokens:
             needed = kv_tokens - avail
             self.evict_for_alloc(EvictParams(num_tokens=needed))
-            # No-op unless KV sharding's min-class floor needs more passes.
-            _evict_until_allocatable(self, self.token_to_kv_pool_allocator, kv_tokens)
             if self._component_available_size(ComponentType.FULL) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
