@@ -9,15 +9,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-import unified_radix_cache_fixtures as shared_cache_suite
-from unified_radix_cache_fixtures import (
-    CacheConfig,
-    _device_lock_ref,
-    _device_value,
-    _InsertWalkSuite,
-    _node_children,
-    build_fixture,
-)
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -50,6 +41,15 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.kits.unified_radix_cache_unittest import fixtures as shared_cache_suite
+from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+    CacheConfig,
+    _device_lock_ref,
+    _device_value,
+    _InsertWalkSuite,
+    _node_children,
+    build_fixture,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

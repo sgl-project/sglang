@@ -5,15 +5,15 @@ from array import array
 from unittest.mock import patch
 
 import torch
-from unified_radix_cache_fixtures import (
-    CacheConfig,
-    UnifiedRadixCacheFixtures,
-    build_fixture,
-)
 
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, EvictParams
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+    CacheConfig,
+    UnifiedRadixCacheFixtures,
+    build_fixture,
+)
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 

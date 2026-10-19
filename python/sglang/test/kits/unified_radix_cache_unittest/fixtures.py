@@ -12,8 +12,6 @@ from typing import Optional
 from unittest import mock
 
 import torch
-from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
-from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -64,10 +62,11 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(
-    est_time=0, suite="base-a-test-cpu", disabled="UnifiedRadixCache unit test fixtures"
+from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspection_interface import (
+    UnifiedTreeCoreInspectionInterface,
+)
+from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspector import (
+    UnifiedTreeCoreInspector,
 )
 
 # A dedicated test entry point overrides this without changing the process-wide
@@ -368,7 +367,9 @@ def build_fixture(
         return UnifiedTreeCoreInspector(params, components)
 
     def rust_inspector_factory(params, _components):
-        from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+        from sglang.test.kits.unified_radix_cache_unittest.rust_unified_tree_core_inspector import (
+            RustUnifiedTreeCoreInspector,
+        )
 
         return RustUnifiedTreeCoreInspector(params)
 

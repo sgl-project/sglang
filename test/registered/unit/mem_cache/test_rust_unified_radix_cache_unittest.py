@@ -3,9 +3,9 @@
 import unittest
 
 import test_unified_radix_cache_unittest as shared_suite
-import unified_radix_cache_fixtures as fixtures
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.unified_radix_cache_unittest import fixtures
 
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 

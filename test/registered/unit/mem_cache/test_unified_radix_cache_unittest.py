@@ -14,25 +14,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from unified_radix_cache_fixtures import (
-    _CONFIGS,
-    CacheConfig,
-    UnifiedRadixCacheFixtures,
-    _aux_storage_key_transfers,
-    _device_lock_ref,
-    _device_value,
-    _drop_hicache_atexit_pin,
-    _host_lock_ref,
-    _host_value,
-    _InsertWalkSuite,
-    _node_children,
-    _node_key_length,
-    _node_parent,
-    _node_token_ids,
-    _selected_tree_core_test_backend,
-    _write_backup,
-    build_fixture,
-)
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.disaggregation.kv_events import (
@@ -122,6 +103,25 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+    _CONFIGS,
+    CacheConfig,
+    UnifiedRadixCacheFixtures,
+    _aux_storage_key_transfers,
+    _device_lock_ref,
+    _device_value,
+    _drop_hicache_atexit_pin,
+    _host_lock_ref,
+    _host_value,
+    _InsertWalkSuite,
+    _node_children,
+    _node_key_length,
+    _node_parent,
+    _node_token_ids,
+    _selected_tree_core_test_backend,
+    _write_backup,
+    build_fixture,
+)
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
@@ -603,7 +603,8 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     # Rust independently of the shared suite's default backend;
                     # session caches fall back to the Python TreeCore.
                     with mock.patch(
-                        "unified_radix_cache_fixtures._TREE_CORE_TEST_BACKEND", "rust"
+                        "sglang.test.kits.unified_radix_cache_unittest.fixtures._TREE_CORE_TEST_BACKEND",
+                        "rust",
                     ):
                         cache, first, second, leaf = self._build_internal_chain(
                             ct, session
