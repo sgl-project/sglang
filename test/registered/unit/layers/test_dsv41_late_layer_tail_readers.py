@@ -289,6 +289,13 @@ def _full_topk_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
 
     def make_inputs(layer, x, q_lora, req, pos, forward_batch, rows_per_request):
         seen.update(req=req.tolist(), pos=pos.tolist(), scored=x.shape[0])
+        return SimpleNamespace(layer_id=layer.layer_id)
+
+    def publish_prefill(self, inputs):
+        # The published table has one row per scored row.
+        published = object.__new__(_SparsePrefillTable)
+        published.blocks = torch.zeros(seen["scored"], 1, dtype=torch.int32)
+        return published
 
     def gather_rows(self, rows):
         seen["rows"] = rows.tolist()
@@ -297,11 +304,12 @@ def _full_topk_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
     backend = SimpleNamespace(
         forward_metadata=tail_meta if inside_tail else full_meta,
         _make_low_ratio_prefill_indexer_inputs=make_inputs,
-        prefill_candidates=SimpleNamespace(
-            publish_prefill=lambda inputs: object.__new__(_SparsePrefillTable)
-        ),
+        prefill_candidates=object.__new__(SparseTableBackend),
     )
-    with patch.object(_SparsePrefillTable, "gather_rows", gather_rows):
+    with (
+        patch.object(SparseTableBackend, "publish_prefill", publish_prefill),
+        patch.object(_SparsePrefillTable, "gather_rows", gather_rows),
+    ):
         DeepseekV4AttnBackend._prefill_graph_full_topk_break(
             backend,
             SimpleNamespace(

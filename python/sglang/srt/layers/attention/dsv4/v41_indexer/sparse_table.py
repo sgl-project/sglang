@@ -134,6 +134,8 @@ class SparseTableBackend:
         self._cached_row_ids: Optional[torch.Tensor] = None
         # captured graphs keep reading the buffers they saw
         self._retired_cached_row_ids: list = []
+        # per layer: the table tensors every captured prefill bucket reads
+        self._graph_table_bufs: dict = {}
 
     def publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
@@ -196,20 +198,13 @@ class SparseTableBackend:
         )
         indexer = inputs.indexer
         q_fp4, q_sf = quantize_index_q(inputs.q)
-        rows, heads = q_fp4.shape[0], q_fp4.shape[1]
+        rows = q_fp4.shape[0]
         k_cache = get_index_k_cache(
             token_to_kv_pool=self.token_to_kv_pool,
             layer_id=inputs.layer_id,
             page_size=inputs.paged_metadata.compressed_page_size,
         )
-        logits = sparse_logits(
-            q_fp4.view(rows, 1, heads, 64),
-            q_sf.view(rows, 1, heads),
-            k_cache,
-            inputs.weights.to(torch.bfloat16),
-            published.schedule,
-            published.blocks.shape[1],
-        )
+        logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
 
         def transform(blocks: torch.Tensor, out: torch.Tensor) -> None:
@@ -224,6 +219,49 @@ class SparseTableBackend:
         if inputs.out_page_indices is not None:
             transform(published.phys_blocks, inputs.out_page_indices)
         transform(published.blocks, inputs.out_raw_indices)
+
+    def publish_prefill_graph(
+        self, inputs: PrefillInputs, num_rows: int, *, shared: bool
+    ) -> tuple:
+        """The candidate source under the prefill CUDA graph: publish over the live
+        rows, then return the table of the graph's ``num_rows`` rows (live rows first,
+        padding rows repeat the last live row) as the tensors its consumers read.
+        With ``shared``, the tensors sit in this layer's buffers that every captured
+        bucket reads; a replay copies its live table there, one graph at a time."""
+        published = self.publish_prefill(inputs)
+        assert published is not None, "candidate source published no sparse table"
+        live = published.blocks.shape[0]
+        rows = torch.arange(num_rows, device=published.blocks.device).clamp_max(
+            live - 1
+        )
+        table = published.gather_rows(rows)
+        out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
+        return self._shared_graph_table(inputs.layer_id, out) if shared else out
+
+    def bind_prefill_graph_table(self, tensors: tuple) -> _SparseTable:
+        """Capture time: the table the captured consumers read, over the tensors the
+        candidate source's break refreshes at every replay."""
+        blocks, schedule, phys_blocks, valid_lens = tensors
+        ready = torch.cuda.Event()
+        ready.record()
+        return _SparseTable(
+            blocks=blocks,
+            schedule=schedule,
+            phys_blocks=phys_blocks,
+            valid_lens=valid_lens,
+            ready=ready,
+        )
+
+    def _shared_graph_table(self, layer_id: int, tensors: tuple) -> tuple:
+        bufs = self._graph_table_bufs.setdefault(layer_id, [None] * len(tensors))
+        views = []
+        for i, t in enumerate(tensors):
+            buf = bufs[i]
+            if buf is None or buf.dtype != t.dtype or buf.numel() < t.numel():
+                # Graphs captured on a smaller buffer keep it alive themselves.
+                buf = bufs[i] = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
+            views.append(buf[: t.numel()].view(t.shape).copy_(t))
+        return tuple(views)
 
     def publish_decode(self, inputs: DecodeInputs):
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
@@ -499,6 +537,25 @@ def publish_prefill_table(
     )
 
 
+def _prefill_table_logits(
+    table: _SparseTable,
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    weights: torch.Tensor,
+    k_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Sparse logits of prefill rows (one query row each) over a table's blocks."""
+    rows, heads = q_sf.shape[0], q_sf.shape[1]
+    return sparse_logits(
+        q_fp4.view(rows, 1, heads, 64),
+        q_sf.view(rows, 1, heads),
+        k_cache,
+        weights.to(torch.bfloat16),
+        table.schedule,
+        table.blocks.shape[1],
+    )
+
+
 def select_prefill_table(
     *,
     table: _SparsePrefillTable,
@@ -506,14 +563,6 @@ def select_prefill_table(
     k_cache: torch.Tensor,
     out_positions: torch.Tensor,
 ) -> None:
-    rows, heads = data.q_sf.shape
-    logits = sparse_logits(
-        data.q_fp4.view(rows, 1, heads, 64),
-        data.q_sf.view(rows, 1, heads),
-        k_cache,
-        data.weights.to(torch.bfloat16),
-        table.schedule,
-        table.blocks.shape[1],
-    )
+    logits = _prefill_table_logits(table, data.q_fp4, data.q_sf, data.weights, k_cache)
     # request-relative compressed positions, -1 padded
     topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)

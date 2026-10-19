@@ -92,8 +92,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
-    _SparsePrefillTable,
-    _SparseTable,
 )
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
@@ -1283,10 +1281,9 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
-        # Prefill CUDA graph buffers kept per ratio / layer; graphs captured on an
-        # older (smaller) allocation keep it alive themselves.
+        # Prefill CUDA graph source projection buffers per ratio; graphs captured on
+        # an older (smaller) allocation keep it alive themselves.
         self._source_proj_bufs: Dict[int, list] = {}
-        self._candidate_table_bufs: Dict[int, list] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -3272,7 +3269,9 @@ class DeepseekV4AttnBackend(
                     # candidate source hands its block table to the consumers.
                     out = _bcg_prefill_graph_full_topk(layer, x, q_lora, pos)
                     if layer.indexer.is_candidate_source:
-                        self._prefill_graph_set_candidate_table(out)
+                        self.forward_metadata.candidate_metadata = (
+                            self.prefill_candidates.bind_prefill_graph_table(out)
+                        )
             return
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
@@ -3864,46 +3863,9 @@ class DeepseekV4AttnBackend(
         if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)
             return ()
-        published = self.prefill_candidates.publish_prefill(inputs)
-        assert isinstance(published, _SparsePrefillTable), (
-            "candidate source published no sparse table"
+        return self.prefill_candidates.publish_prefill_graph(
+            inputs, x.shape[0], shared=is_capturing()
         )
-        # x holds the rows the consumers run on (the whole bucket, or the tail
-        # block): live rows first, padding rows read row 0
-        rows = torch.arange(x.shape[0], device=x.device).clamp_max(real - 1)
-        table = published.gather_rows(rows)
-        out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
-        if is_capturing():
-            # Every bucket's graph reads this layer's table at one address: a
-            # replay copies its live table there, and one graph replays at a time.
-            out = self._shared_candidate_table(layer.layer_id, out)
-        return out
-
-    def _shared_candidate_table(self, layer_id: int, tensors) -> tuple:
-        bufs = self._candidate_table_bufs.setdefault(layer_id, [None] * len(tensors))
-        views = []
-        for i, t in enumerate(tensors):
-            buf = bufs[i]
-            if buf is None or buf.dtype != t.dtype or buf.numel() < t.numel():
-                # Graphs captured on a smaller buffer keep it alive themselves.
-                buf = bufs[i] = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
-            views.append(buf[: t.numel()].view(t.shape).copy_(t))
-        return tuple(views)
-
-    def _prefill_graph_set_candidate_table(self, table_tensors) -> None:
-        """Capture time: bind the consumers' metadata to the bridge tensors the
-        full top-k break refreshes at every replay."""
-        blocks, schedule, phys_blocks, valid_lens = table_tensors
-        ready = torch.cuda.Event()
-        ready.record()
-        table = _SparseTable(
-            blocks=blocks,
-            schedule=schedule,
-            phys_blocks=phys_blocks,
-            valid_lens=valid_lens,
-            ready=ready,
-        )
-        self.forward_metadata.candidate_metadata = table
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
