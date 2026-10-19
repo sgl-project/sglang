@@ -825,7 +825,17 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     )
 
 
-bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_sources)
+def _low_ratio_sources_capture_stub(layer, x, q_lora, positions) -> None:
+    # A decoder tail graph's capture pass hands the break activations its
+    # segments never computed; the indexer would select candidate blocks from
+    # them and index pages past the live context. Its replay runs the body.
+    if not in_replay_tail_graph():
+        deepseek_v4_low_ratio_sources(layer, x, q_lora, positions)
+
+
+bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
+    deepseek_v4_low_ratio_sources, capture_stub=_low_ratio_sources_capture_stub
+)
 
 
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
@@ -3846,13 +3856,15 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
-        use_tail_graph = (
-            self.decoder_replay_tail is not None
-            and tail is not None
-            and self.decoder_replay_tail.plan(
-                tail, num_tokens=input_ids.shape[0], tail_in_graph=tail_in_graph
+        use_tail_graph, tail_graph_dp_rows = False, None
+        if self.decoder_replay_tail is not None:
+            use_tail_graph, tail_graph_dp_rows = self.decoder_replay_tail.plan(
+                tail,
+                forward_batch=forward_batch,
+                num_tokens=input_ids.shape[0],
+                tail_in_graph=tail_in_graph,
+                late_dp_counts=late_dp_counts,
             )
-        )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -3867,7 +3879,10 @@ class DeepseekV4Model(nn.Module):
             if _is_cuda:
                 layer = self.layers[i]
                 if (
-                    (tail is not None and i == self.late_layer_start)
+                    (
+                        (tail is not None or use_tail_graph)
+                        and i == self.late_layer_start
+                    )
                     or layer.engram is not None
                     or (capture_dspark and i in self.dspark_layers_to_capture)
                 ):
@@ -3899,6 +3914,31 @@ class DeepseekV4Model(nn.Module):
                     # against the persistent index buffers.
                     tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
                     saved_full = attn_backend.prefill_graph_late_layer_saved
+                    if (
+                        self.decoder_replay_tail is not None
+                        and self.decoder_replay_tail.breaks_out_of_prefill_graph(
+                            tail, num_tokens=input_ids.shape[0]
+                        )
+                    ):
+                        residual, pre, aux = (
+                            self.decoder_replay_tail.run_in_prefill_graph(
+                                state=state,
+                                positions=positions,
+                                input_ids=input_ids,
+                                input_ids_global=input_ids_global,
+                                capture_dspark=capture_dspark,
+                                block_rows=tail.token_indices.shape[0],
+                                source_kv_layer_id=(
+                                    self.late_layer_start
+                                    if self.tail_writes_source_kv
+                                    else None
+                                ),
+                            )
+                        )
+                        dspark_aux_hidden_states.extend(aux)
+                        residual_batch.clear(forward_batch)
+                        bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                        return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
@@ -3920,11 +3960,25 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                         forward_batch=forward_batch,
                         capture_dspark=capture_dspark,
+                        dp_rows=tail_graph_dp_rows,
                     )
                     dspark_aux_hidden_states.extend(aux)
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
+            if use_tail_graph and tail is None and i == self.late_layer_start:
+                residual, pre, aux = self.decoder_replay_tail.run_idle(
+                    state=state,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
+                    capture_dspark=capture_dspark,
+                    dp_rows=tail_graph_dp_rows,
+                )
+                dspark_aux_hidden_states.extend(aux)
+                residual_batch.clear(forward_batch)
+                return residual, pre, None
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():

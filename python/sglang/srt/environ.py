@@ -1633,6 +1633,9 @@ class Envs:
     # Decoder SWA bounded replay: eager prefill steps with up to this many tail rows
     # run the tail layers from CUDA graphs (buckets of 128 rows); 0 keeps them eager.
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = EnvInt(2048)
+    # Prefill-graph shapes of at least this many tokens run the tail from the tail
+    # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
+    SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
