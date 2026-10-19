@@ -177,14 +177,14 @@ def create_unified_radix_cache(
             and get_spec().speculative_algorithm is not None
         ):
             if (
-                get_spec().speculative_algorithm != "EAGLE"
+                get_spec().speculative_algorithm not in ("EAGLE", "DFLASH")
                 or get_spec().speculative_eagle_topk not in (None, 1)
                 or get_disagg().disaggregation_transfer_backend != "nixl"
                 or ctx.is_hybrid_swa
             ):
                 raise ValueError(
                     "PD decode KV-only hybrid radix cache with speculation "
-                    "currently requires linear EAGLE (topk=1), NIXL, and "
+                    "currently requires linear EAGLE or DFLASH (topk=1), NIXL, and "
                     "a model without sliding-window attention."
                 )
         if params.mamba_state_from_prefill and (
