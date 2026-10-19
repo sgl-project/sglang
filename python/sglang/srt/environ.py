@@ -1881,10 +1881,6 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
-    # NCCL's window registration has no timeout of its own, so a lost message in
-    # its fd-exchange rendezvous hangs every rank silently. Give up after this
-    # many seconds and report instead.
-    SGLANG_SYMM_MEM_REGISTRATION_TIMEOUT_S = EnvFloat(120.0)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

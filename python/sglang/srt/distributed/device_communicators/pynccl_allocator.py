@@ -1,15 +1,11 @@
 import ctypes
-import faulthandler
 import logging
 import os
-import signal
 import tempfile
-import threading
 import traceback
 from contextlib import nullcontext
 from typing import Optional
 
-import psutil
 import torch
 
 # The private _cuda_* pool APIs are absent before torch 2.8; the call sites below
@@ -239,50 +235,17 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     return _mem_pool
 
 
-# NCCL's window registration blocks in a Unix-domain-socket fd-exchange
-# rendezvous that has no timeout of its own. When that rendezvous loses a
-# message, every rank in the group sits in recvmsg with no error and no log
-# line: the engine stays up, `/health` keeps returning 200, and no batch can
-# make progress. Bound the wait (SGLANG_SYMM_MEM_REGISTRATION_TIMEOUT_S) so a
-# wedge is reported instead of hidden, and keep the in-progress state readable
-# so the scheduler watchdog can name it rather than reporting a bare stall.
-
-_registration_in_progress: Optional[str] = None
+# The context whose segments are being registered with NCCL right now. The
+# registration has no timeout of its own, so the scheduler watchdog reads this
+# to name a stall inside it.
+_registration_in_progress: Optional["SymmetricMemoryContext"] = None
 
 
 def describe_registration_in_progress() -> Optional[str]:
-    """What the symmetric-memory registration is doing, or ``None`` if idle.
-
-    The scheduler watchdog reads this for its dump, so a stall inside the
-    registration is named instead of showing up as a generic watchdog timeout.
-    """
-    return _registration_in_progress
-
-
-def _run_with_timeout(fn, timeout_s: float):
-    """Run ``fn()`` on a worker thread and return its result.
-
-    Raises ``TimeoutError`` if it has not returned within ``timeout_s``; any
-    other exception raised by ``fn`` is re-raised. The worker is a daemon, so a
-    call that never returns cannot keep the process alive by itself.
-    """
-
-    outcome: dict = {}
-
-    def _target():
-        try:
-            outcome["result"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised by the caller
-            outcome["exc"] = exc
-
-    worker = threading.Thread(target=_target, name="symm-mem-register", daemon=True)
-    worker.start()
-    worker.join(timeout_s)
-    if worker.is_alive():
-        raise TimeoutError(f"did not return within {timeout_s:.0f}s")
-    if "exc" in outcome:
-        raise outcome["exc"]
-    return outcome["result"]
+    ctx = _registration_in_progress
+    if ctx is None:
+        return None
+    return f"comm={ctx._comm_ptr} group={ctx.group_coordinator.unique_name}"
 
 
 class SymmetricMemoryContext:
@@ -368,63 +331,20 @@ class SymmetricMemoryContext:
         1. Tracking which segments have been registered with each comm
         2. Only registering new segments (avoiding re-registration)
         3. Thread-safe access to the segment registry
-
-        The call is bounded: see the module comment above.
         """
 
         global _registration_in_progress
 
-        group = self.group_coordinator.unique_name
-        timeout_s = envs.SGLANG_SYMM_MEM_REGISTRATION_TIMEOUT_S.get()
-
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        _registration_in_progress = f"comm={self._comm_ptr} group={group}"
-        logger.debug("Registering symmetric-memory segments with %s", group)
+        _registration_in_progress = self
         try:
-            result = _run_with_timeout(
-                lambda: _register_func(self._comm_ptr),
-                timeout_s,
-            )
-        except TimeoutError:
-            self._report_registration_timeout(group, timeout_s)
-            raise  # unreachable: the report exits the process
+            result = _register_func(self._comm_ptr)
         finally:
             _registration_in_progress = None
         assert result == 0, (
             f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
         )
-
-    def _report_registration_timeout(self, group: str, timeout_s: float) -> None:
-        """Give up loudly: the group is wedged and no batch can make progress.
-
-        NCCL's registration has no timeout of its own, so without this the
-        engine would sit here indefinitely with `/health` still answering 200.
-        Take the same exit path as any other scheduler failure: dump what a
-        maintainer needs, then SIGQUIT the parent so the normal crash handling
-        runs, and stop this process because the wedged thread still holds the
-        C++ segment mutex -- it could never register again.
-        """
-        logger.error(
-            "Symmetric-memory registration for comm %s (group %s) did not return "
-            "within %.0f s. Every rank in the group is wedged in NCCL's "
-            "fd-exchange rendezvous: the engine is up and /health answers 200, "
-            "but no batch can make progress. Dumping stacks and aborting.",
-            self._comm_ptr,
-            group,
-            timeout_s,
-        )
-        try:
-            from sglang.srt.utils.cudacore_pyspy_dump_utils import (
-                pyspy_dump_schedulers,
-            )
-
-            pyspy_dump_schedulers()
-        except Exception:
-            logger.exception("Failed to dump scheduler stacks")
-        faulthandler.dump_traceback()
-        psutil.Process().parent().send_signal(signal.SIGQUIT)
-        os._exit(1)
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
