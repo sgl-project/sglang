@@ -95,8 +95,8 @@ def create_llada2_cfg_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
+    _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
     if get_parallel().dcp_enabled and get_spec().speculative_algorithm is not None:
-        _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
         if decode_backend == "trtllm_mla":
             raise ValueError(
                 "trtllm_mla cannot serve decode context parallelism with speculative "
@@ -104,6 +104,14 @@ def create_trtllm_mla_backend(runner):
                 "kernel and returns no rank-local LSE for the cross-rank merge. "
                 "Select cutedsl_mla."
             )
+    import torch
+
+    if decode_backend == "cutedsl_mla" and runner.kv_cache_dtype == torch.float8_e4m3fn:
+        from sglang.srt.layers.attention.cutedsl_mla_backend import (
+            CuteDslMLAPrefillBackend,
+        )
+
+        return CuteDslMLAPrefillBackend(runner)
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
