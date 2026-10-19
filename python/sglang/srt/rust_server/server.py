@@ -12,17 +12,20 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from array import array
 from itertools import chain
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
+import psutil
 
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
@@ -67,6 +70,9 @@ class RustServer:
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
         self._max_per_poll = max_per_poll
+        # The engine-level startup timings `/server_info` reports, set once
+        # the scheduler finishes initializing (see `set_startup_time`).
+        self.startup_time: Optional[Dict[str, Any]] = None
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
@@ -235,6 +241,17 @@ class RustServer:
         because ``drain`` settles its ownership after the wrapper returns."""
         assert self.mm_spec is not None
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def set_startup_time(self, scheduler_startup_time: Dict[str, Any]) -> None:
+        """Record the startup timings in the shape of Python's
+        ``TokenizerManager.startup_time``. That frontend's end-to-end phase
+        (``tokenizer_e2e``) runs from launch until the schedulers are ready;
+        this one serves from inside the scheduler process, so it runs from
+        the process's spawn until its initialization ends, now."""
+        self.startup_time = build_engine_startup_time(
+            [scheduler_startup_time],
+            tokenizer_e2e=time.time() - psutil.Process().create_time(),
+        )
 
     def mm_transport_stats(self) -> Dict[str, int]:
         """Snapshot of the zero-copy accounting at the multimodal hand-off
