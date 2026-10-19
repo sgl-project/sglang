@@ -1689,6 +1689,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert is_valid_kv_layout_pair(self.kv_layout, layout)
         return layout
 
+    def pd_kv_layout(self) -> str:
+        """The main and compressed KV layouts, which PD peers must share."""
+        if self.uniform_fp8:
+            return KVLayout.UNIFORM_FP8.value
+        compressed = [
+            f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
+            for ratio in sorted(set(self.compression_ratios) - {0})
+        ]
+        return ",".join([self.kv_layout.value, *compressed])
+
     def _make_indexer_pool(
         self,
         size: int,
