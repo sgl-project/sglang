@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptSampling,
     FinalizeAcceptLens,
     SelectMixedAccept,
+    SoftmaxTemp,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -46,9 +47,14 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
 )
 from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+# Draft proposal probs feeding rejection sampling; the data layer is the
+# in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
+_VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -942,7 +948,6 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    draft_probs = None
     if draft_block.greedy_draft:
         # An argmax draft is one-hot: rejection accepts at the target probability.
         draft_tokens = draft_block.draft_tokens
@@ -952,15 +957,19 @@ def accept_draft_tokens(
             device=target_logits.device,
         )
         draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+    else:
+        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+        draft_probs = SoftmaxTemp.execute(
+            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+            temperatures=draft_block.temperatures,
+            rows_per_request=gamma_rows,
+        ).view(bs, gamma_rows, vocab)
+        expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
         return AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
-            draft_logits=draft_block.corrected_logits,
-            draft_temperatures=None
-            if draft_block.greedy_draft
-            else draft_block.temperatures,
             sampling_info=sampling_info,
             draft_input=draft_input,
             gamma=gamma,
@@ -979,10 +988,6 @@ def accept_draft_tokens(
         candidates=candidates,
         target_logits=target_logits,
         draft_probs=draft_probs,
-        draft_logits=draft_block.corrected_logits,
-        draft_temperatures=None
-        if draft_block.greedy_draft
-        else draft_block.temperatures,
         sampling_info=sampling_info,
         draft_input=draft_input,
         gamma=gamma,

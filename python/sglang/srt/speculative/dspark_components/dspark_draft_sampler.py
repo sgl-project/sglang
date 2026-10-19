@@ -5,10 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.models.dspark import VanillaMarkov
-from sglang.srt.speculative.dspark_components.dspark_config import (
-    resolve_markov_candidate_config,
-)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -20,115 +16,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 
 logger = logging.getLogger(__name__)
-
-
-def _target_vocab_size(model) -> int:
-    return int(getattr(model, "target_vocab_size", model.lm_head.org_vocab_size))
-
-
-def initialize_markov_candidate_sampler(
-    *,
-    model,
-    draft_hf_config,
-    gamma: int,
-    capacity: Optional[int],
-    tp_size: int,
-    markov_topk: Optional[int] = None,
-    markov_bias_topk: Optional[int] = None,
-):
-    """Resolve the path once after loading weights, before sizing the KV pool.
-
-    The proposal cache is owned by physical sampler slots and shared by eager
-    and all graph tiers. A verifier consumes it on the same stream before the
-    next proposal can clear it. Weight reloads rebuild the table in place;
-    configuration/layout changes require worker restart and graph recapture.
-    """
-    vocab = int(getattr(model, "draft_vocab_size", model.lm_head.org_vocab_size))
-    config = resolve_markov_candidate_config(
-        draft_hf_config,
-        markov_topk=markov_topk,
-        markov_bias_topk=markov_bias_topk,
-        draft_vocab_size=vocab,
-    )
-    model.markov_candidate_sampler = None
-    head = model.markov_head
-    reason = None
-    if config.effective_topk == 0:
-        reason = "K=0 selects the existing full-vocabulary path"
-    elif type(head) is not VanillaMarkov:
-        reason = "candidate walk requires an ordinary vanilla Markov head"
-    else:
-        from sglang.kernels.ops.speculative.dspark.dspark_markov_topk import (
-            MAX_STEPS,
-            CandidateCapacityError,
-            MarkovCandidateSampler,
-            candidate_support_reason,
-        )
-
-        w1 = getattr(head.markov_w1, "weight", None)
-        w2 = getattr(head.markov_w2, "weight", None)
-        if w1 is None or w2 is None:
-            reason = "Markov weights are not directly readable"
-        else:
-            reason = candidate_support_reason(
-                w1,
-                w2,
-                topk=config.effective_topk,
-                bias_topk=config.effective_bias_topk,
-                tp_size=tp_size,
-            )
-        if reason is None and not 0 < gamma <= MAX_STEPS:
-            reason = f"candidate gamma exceeds the bounded range 1..{MAX_STEPS}"
-        if reason is None and (capacity is None or capacity <= 0):
-            reason = (
-                "set --max-running-requests to bound FP32 proposal storage "
-                "before KV capacity planning"
-            )
-        if reason is None:
-            try:
-                model.markov_candidate_sampler = MarkovCandidateSampler(
-                    w1,
-                    w2,
-                    alpha=float(getattr(model, "logit_scale", 1.0)),
-                    topk=config.effective_topk,
-                    bias_topk=config.effective_bias_topk,
-                    target_vocab_size=_target_vocab_size(model),
-                    gamma=gamma,
-                    capacity=capacity,
-                    d2t_offset=getattr(model, "draft_id_to_target_id", None),
-                    logits_dtype=_base_logits_dtype(model),
-                )
-            except CandidateCapacityError as exc:
-                # Only a pre-allocation capability check may choose a memory
-                # fallback. Loading, mapping, OOM and compile errors propagate.
-                reason = str(exc)
-    enabled = model.markov_candidate_sampler is not None
-    logger.info(
-        "DSpark Markov requested K/M=%d/%d effective K/M=%d/%d "
-        "head=%s Vt=%d Vd=%d R=%s gamma=%d TP=%d path=%s reason=%s",
-        config.requested_topk,
-        config.requested_bias_topk,
-        config.effective_topk if enabled else 0,
-        config.effective_bias_topk if enabled else 0,
-        type(head).__name__,
-        _target_vocab_size(model),
-        vocab,
-        getattr(head, "markov_rank", "unknown"),
-        gamma,
-        tp_size,
-        "candidate-triton" if enabled else "full-vocabulary",
-        reason or "supported",
-    )
-    return model.markov_candidate_sampler
-
-
-def _base_logits_dtype(model) -> torch.dtype:
-    """Dtype of the block logits; a quantized head's packed `weight` carries no
-    logits dtype, its kernel emits the activation (draft param) dtype instead."""
-    weight = model.lm_head.weight
-    if weight.is_floating_point():
-        return weight.dtype
-    return next(model.markov_head.parameters()).dtype
 
 
 class DsparkDraftSampler:
@@ -186,16 +73,11 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
-        self.candidate_sampler = getattr(model, "markov_candidate_sampler", None)
         self.num_valid = None
-        if self.candidate_sampler is not None:
-            if self.max_bs > self.candidate_sampler.capacity:
-                raise ValueError("DSpark graph exceeds the candidate cache capacity")
+        if getattr(self.markov_head, "candidate_ids", None) is not None:
             self.num_valid = torch.full(
                 (), self.max_bs, dtype=torch.int32, device=device
             )
-            if not self.greedy_draft:
-                self.step_logits = self.candidate_sampler.corrected_logits
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -241,7 +123,6 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
-            candidate_sampler=self.candidate_sampler,
             num_valid=self.num_valid,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))

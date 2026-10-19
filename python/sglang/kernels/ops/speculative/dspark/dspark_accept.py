@@ -16,13 +16,8 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 _is_npu = is_npu()
-
-# The rejection kernel guards invalid q; these checks also report its source.
-_VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
-_VERIFY_DRAFT_STATS = Invariant("dspark.verify.draft_stats", Bucket.GUARD, NotNaN())
 
 if _is_npu:
     from sgl_kernel_npu.sample import chain_speculative_sampling_triton
@@ -47,14 +42,12 @@ class AcceptSampling:
         *,
         candidates: torch.Tensor,
         target_logits: torch.Tensor,
-        draft_probs: Optional[torch.Tensor],
+        draft_probs: torch.Tensor,
         sampling_info,
         draft_input: DFlashDraftInputV2,
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        draft_logits: Optional[torch.Tensor] = None,
-        draft_temperatures: Optional[torch.Tensor] = None,
         block_verification: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling(
@@ -66,8 +59,6 @@ class AcceptSampling:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
-            draft_logits=draft_logits,
-            draft_temperatures=draft_temperatures,
             block_verification=block_verification,
         )
 
@@ -77,14 +68,12 @@ class AcceptSampling:
         *,
         candidates: torch.Tensor,
         target_logits: torch.Tensor,
-        draft_probs: Optional[torch.Tensor],
+        draft_probs: torch.Tensor,
         sampling_info,
         draft_input: DFlashDraftInputV2,
         gamma: int,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        draft_logits: Optional[torch.Tensor] = None,
-        draft_temperatures: Optional[torch.Tensor] = None,
         block_verification: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_sampling_triton(
@@ -96,8 +85,6 @@ class AcceptSampling:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
-            draft_logits=draft_logits,
-            draft_temperatures=draft_temperatures,
             block_verification=block_verification,
         )
 
@@ -106,14 +93,12 @@ def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor,
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
-    draft_logits: Optional[torch.Tensor],
-    draft_temperatures: Optional[torch.Tensor],
     block_verification: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
@@ -152,30 +137,6 @@ def _accept_sampling_core(
         (bs, uniform_width), dtype=torch.float32, device=device
     )
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    draft_args = dict(draft_probs=draft_probs)
-    if draft_logits is not None:
-        assert draft_probs is None and draft_temperatures is not None
-        draft_rows = draft_logits.shape[1]
-        flat_logits = draft_logits.reshape(bs * draft_rows, -1)
-        if draft_logits.is_cuda:
-            stats = softmax_temp_stats_triton(
-                logits=flat_logits,
-                temperatures=draft_temperatures,
-                rows_per_request=draft_rows,
-            ).view(bs, draft_rows, 2)
-            expect(_VERIFY_DRAFT_STATS, stats)
-            draft_args.update(
-                draft_logits=draft_logits,
-                draft_softmax_stats=stats,
-                draft_temperatures=draft_temperatures.reshape(bs).contiguous(),
-            )
-        else:
-            draft_args["draft_probs"] = SoftmaxTemp.execute(
-                logits=flat_logits,
-                temperatures=draft_temperatures,
-                rows_per_request=draft_rows,
-            ).view_as(draft_logits)
-            expect(_VERIFY_DRAFT_PROBS, draft_args["draft_probs"])
     sampling_fn = chain_speculative_sampling_triton
     if block_verification:
         # Startup validation rejects NPU, whose sampler has no block mode.
@@ -191,10 +152,10 @@ def _accept_sampling_core(
         uniform_samples=uniform_samples,
         uniform_samples_for_final_sampling=uniform_samples_final,
         target_probs=target_probs,
+        draft_probs=draft_probs,
         threshold_single=1.0,
         threshold_acc=1.0,
         deterministic=True,
-        **draft_args,
     )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:
@@ -210,14 +171,12 @@ def accept_sampling(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor,
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-    draft_logits: Optional[torch.Tensor] = None,
-    draft_temperatures: Optional[torch.Tensor] = None,
     block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
@@ -231,8 +190,6 @@ def accept_sampling(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
-        draft_logits=draft_logits,
-        draft_temperatures=draft_temperatures,
         block_verification=block_verification,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
@@ -284,14 +241,12 @@ def accept_sampling_triton(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor,
     sampling_info,
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-    draft_logits: Optional[torch.Tensor] = None,
-    draft_temperatures: Optional[torch.Tensor] = None,
     block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     correct_len, cap_trim_lens, accept_index, predicts = _accept_sampling_core(
@@ -303,8 +258,6 @@ def accept_sampling_triton(
         gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
-        draft_logits=draft_logits,
-        draft_temperatures=draft_temperatures,
         block_verification=block_verification,
     )
     bonus = gather_two_level_bonus_triton(
@@ -398,7 +351,6 @@ def _softmax_temp_kernel(
     rows_per_request,
     logits_row_stride,
     BLOCK_V: tl.constexpr,
-    STORE_PROBS: tl.constexpr = True,
 ):
     row = tl.program_id(0)
     temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
@@ -423,46 +375,13 @@ def _softmax_temp_kernel(
         e = tl.where(vmask, e, 0.0)
         sum_exp += tl.sum(e, axis=0)
 
-    if STORE_PROBS:
-        for v0 in range(0, vocab, BLOCK_V):
-            offs = v0 + tl.arange(0, BLOCK_V)
-            vmask = offs < vocab
-            x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
-            x = x / temp
-            e = tl.exp(x - row_max)
-            tl.store(out_base + offs, e / sum_exp, mask=vmask)
-    else:
-        # Keep max and scale separate: max + log(sum_exp) can lose the
-        # normalizer to rounding when all logits share a large offset.
-        tl.store(out_ptr + row.to(tl.int64) * 2, row_max)
-        tl.store(out_ptr + row.to(tl.int64) * 2 + 1, 1.0 / sum_exp)
-
-
-def softmax_temp_stats_triton(
-    *,
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    rows_per_request: int,
-) -> torch.Tensor:
-    """Return scaled row maxima and inverse exponential sums without dense q."""
-    num_rows, vocab = logits.shape
-    bs = num_rows // rows_per_request
-    assert bs * rows_per_request == num_rows
-    assert logits.stride(-1) == 1
-    temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
-    out = torch.empty((num_rows, 2), dtype=torch.float32, device=logits.device)
-    _softmax_temp_kernel[(num_rows,)](
-        logits,
-        temperatures,
-        out,
-        vocab,
-        rows_per_request,
-        logits.stride(0),
-        BLOCK_V=4096,
-        STORE_PROBS=False,
-        enable_fp_fusion=False,
-    )
-    return out
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        e = tl.exp(x - row_max)
+        tl.store(out_base + offs, e / sum_exp, mask=vmask)
 
 
 def softmax_temp_triton(

@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
+from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -49,7 +50,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-    initialize_markov_candidate_sampler,
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -290,26 +290,24 @@ class DSparkWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
             )
 
-        if not self._is_pd_prefill:
-            # Allocate persistent tables and proposal storage before the target
-            # and draft KV pools probe free memory. Capacity includes the largest
-            # graph tier as well as the scheduler's per-worker request bound.
-            max_running = get_schedule().max_running_requests
-            capacity = None
-            if max_running is not None:
-                capacity = max(1, max_running // parallel.attn_dp_size)
-                if self._decode_graph_allowed:
-                    capacity = max(
-                        capacity, max(get_exec().graph.cuda_graph_config.decode.bs)
-                    )
-            initialize_markov_candidate_sampler(
-                model=self.draft_model,
-                draft_hf_config=self.draft_model_runner.model_config.hf_config,
-                gamma=self.gamma,
-                capacity=capacity,
-                tp_size=parallel.tp_size,
-                markov_topk=get_spec().speculative_dspark_markov_topk,
-                markov_bias_topk=get_spec().speculative_dspark_markov_bias_topk,
+        topk = get_spec().speculative_dspark_markov_topk
+        if not self._is_pd_prefill and topk > 0:
+            head = self.draft_model.markov_head
+            supported = (
+                type(head) is VanillaMarkov
+                and parallel.tp_size == 1
+                and is_cuda()
+                and head.markov_w1.weight.is_floating_point()
+                and head.markov_w2.weight.is_floating_point()
+            )
+            if supported:
+                # Build the persistent ID table before KV pools probe free memory.
+                head.configure_candidates(topk)
+            logger.info(
+                "DSpark Markov requested K=%d effective K=%d; candidates require "
+                "an unquantized VanillaMarkov head on NVIDIA CUDA with TP=1",
+                topk,
+                head.candidate_topk if supported else 0,
             )
         self._target_hidden_projection_enabled = False
 

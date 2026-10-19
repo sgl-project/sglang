@@ -103,8 +103,6 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
-    markov_head_type = "vanilla"
-
     def __init__(
         self,
         *,
@@ -126,6 +124,8 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         self.logit_scale = float(logit_scale)
         self.register_buffer("draft_id_to_target_id", None, persistent=False)
         self.register_buffer("_target_token_ids", None, persistent=False)
+        self.register_buffer("candidate_ids", None, persistent=False)
+        self.candidate_topk = 0
         self.markov_rank = int(markov_rank)
         if self.markov_rank <= 0:
             raise ValueError(
@@ -150,10 +150,80 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         out = logits.new_full((*logits.shape[:-1], self.target_vocab_size), -torch.inf)
         return out.index_copy_(-1, self._target_token_ids, logits)
 
-    def add_bias(self, logits: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        if self.logit_scale != 1.0:
-            bias = bias * self.logit_scale
-        return self.to_target_logits(logits + bias)
+    @torch.no_grad()
+    def configure_candidates(self, topk: int) -> None:
+        """Use one K for the base-logit and Markov-bias candidate sets."""
+        if topk < 0:
+            raise ValueError("DSpark candidate topk must be nonnegative.")
+        self.candidate_topk = topk if 0 < topk < self.draft_vocab_size else 0
+        if not self.candidate_topk:
+            self.candidate_ids = None
+            return
+        self.candidate_ids = torch.empty(
+            (self.markov_w1.num_embeddings, topk),
+            dtype=torch.int64,
+            device=self.markov_w1.weight.device,
+        )
+        self.refresh_candidates()
+
+    @torch.no_grad()
+    def refresh_candidates(self) -> None:
+        """Rebuild IDs in place so captured graphs retain the same table."""
+        if getattr(self, "candidate_ids", None) is None:
+            return
+        if self.logit_scale == 0:
+            self.candidate_ids.copy_(
+                torch.arange(self.candidate_topk, device=self.candidate_ids.device)
+            )
+            return
+        w2 = self.markov_w2.weight.float().T
+        # Bound the projection workspace; never materialize [Vprev, Vdraft].
+        chunk = max(1, min(128, (64 << 20) // (self.draft_vocab_size * 4)))
+        for start in range(0, self.markov_w1.num_embeddings, chunk):
+            stop = start + chunk
+            bias = self.markov_w1.weight[start:stop].float() @ w2
+            ids = bias.topk(
+                self.candidate_topk, dim=-1, largest=self.logit_scale > 0
+            ).indices
+            self.candidate_ids[start:stop].copy_(ids)
+
+    def candidate_logits(
+        self, prev_tokens: torch.Tensor, base_logits: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Return the candidate proposal in target vocabulary, before temperature."""
+        if getattr(self, "candidate_ids", None) is None:
+            return None
+        base_ids = base_logits.topk(self.candidate_topk, dim=-1, sorted=False).indices
+        static_ids = self.candidate_ids[prev_tokens]
+        ids = torch.cat((base_ids, static_ids), dim=-1)
+        scores = base_logits.gather(-1, ids).float()
+        if self.logit_scale != 0:
+            prev = self.get_prev_embeddings(prev_tokens).float()
+            weights = self.markov_w2.weight[ids].float()
+            bias = (weights * prev[:, None, :]).sum(dim=-1)
+            scores = scores + self.logit_scale * bias
+        target_ids = ids
+        if self.draft_id_to_target_id is not None:
+            target_ids = ids + self.draft_id_to_target_id[ids]
+        finite = torch.isfinite(scores).any(dim=-1, keepdim=True)
+        scores = torch.where(finite, scores, -torch.inf)
+        logits = torch.full(
+            (base_logits.shape[0], self.target_vocab_size),
+            -torch.inf,
+            dtype=torch.float32,
+            device=base_logits.device,
+        )
+        # Each set has unique IDs. Separate writes give their overlap one score,
+        # instead of treating a duplicated candidate as extra probability mass.
+        k = self.candidate_topk
+        logits.scatter_(-1, target_ids[:, :k], scores[:, :k])
+        logits.scatter_(-1, target_ids[:, k:], scores[:, k:])
+        # A row without finite candidates is a point mass at its lowest target ID.
+        fallback = target_ids.amin(dim=-1, keepdim=True)
+        logits.scatter_(
+            -1, fallback, torch.where(finite, logits.gather(-1, fallback), 0.0)
+        )
+        return logits
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -162,6 +232,8 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         return self.markov_w2(latent_states)
 
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        if getattr(self, "candidate_ids", None) is not None:
+            return torch.float32
         # The bias comes out in the embedding's dtype.
         return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
 
@@ -176,7 +248,11 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
     def greedy_w2_weight(self) -> Optional[torch.Tensor]:
-        if self.logit_scale != 1.0 or self.draft_id_to_target_id is not None:
+        if (
+            self.logit_scale != 1.0
+            or self.draft_id_to_target_id is not None
+            or getattr(self, "candidate_ids", None) is not None
+        ):
             return None
         return self.markov_w2.weight if self._bias_is_w2_gemv() else None
 
@@ -229,8 +305,6 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-    markov_head_type = "gated"
-
     def __init__(
         self,
         *,
@@ -274,8 +348,6 @@ class GatedMarkovHead(VanillaMarkov):
 
 
 class RNNHead(VanillaMarkov):
-    markov_head_type = "rnn"
-
     def __init__(
         self,
         *,
@@ -624,11 +696,6 @@ class DSparkDraftMixin:
             self.logit_scale,
         )
 
-    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
-        if self.draft_id_to_target_id is None:
-            return draft_ids
-        return draft_ids + self.draft_id_to_target_id[draft_ids.long()]
-
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
         # (the runner skips the eager input_embeds staging when the draft
@@ -924,16 +991,8 @@ class DSparkDraftMixin:
             self.post_weight_update()
 
     def post_weight_update(self) -> None:
-        candidate_sampler = getattr(self, "markov_candidate_sampler", None)
-        if candidate_sampler is not None:
-            # The model-loader caller must pause serving before replacing weights;
-            # refresh synchronizes and preserves captured table/weight addresses.
-            candidate_sampler.refresh_weights(
-                self.markov_head.markov_w1.weight,
-                self.markov_head.markov_w2.weight,
-                alpha=self.logit_scale,
-                d2t_offset=self.draft_id_to_target_id,
-            )
+        if isinstance(self.markov_head, VanillaMarkov):
+            self.markov_head.refresh_candidates()
 
     def _load_confidence_weights(
         self,

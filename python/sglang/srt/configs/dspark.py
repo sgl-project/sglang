@@ -62,7 +62,6 @@ def normalize_speculators_dspark_config(config: dict[str, Any]) -> dict[str, Any
             "Speculators DSpark block_size must provide at least one draft token."
         )
     normalized["block_size"] = gamma
-    normalized["speculators_block_size"] = int(block_size)
     # Speculators' confidence defaults differ from legacy SGLang DSpark.
     normalized.setdefault("enable_confidence_head", False)
     normalized.setdefault("confidence_head_with_markov", False)
@@ -73,9 +72,6 @@ def normalize_speculators_dspark_config(config: dict[str, Any]) -> dict[str, Any
         "mask_token_id",
         "markov_rank",
         "markov_head_type",
-        "markov_topk",
-        "dspark_draft_topk",
-        "markov_bias_topk",
         "logit_scale",
         "enable_confidence_head",
         "confidence_head_with_markov",

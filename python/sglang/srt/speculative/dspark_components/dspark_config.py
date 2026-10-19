@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from numbers import Integral
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -68,9 +67,6 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
-    markov_topk: Optional[int] = None
-    markov_bias_topk: Optional[int] = None
-    draft_vocab_size: Optional[int] = None
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -83,62 +79,6 @@ class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
     verify_num_draft_tokens: int
     mask_token_id: int
-
-
-class DSparkMarkovCandidateConfig(msgspec.Struct, frozen=True):
-    requested_topk: int
-    requested_bias_topk: int
-    effective_topk: int
-    effective_bias_topk: int
-
-
-def _candidate_budget(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
-        raise ValueError(
-            f"DSpark {name} must be a non-negative integer, got {value!r}."
-        )
-    return int(value)
-
-
-def resolve_markov_candidate_config(
-    draft_hf_config: Any,
-    *,
-    markov_topk: Optional[int] = None,
-    markov_bias_topk: Optional[int] = None,
-    draft_vocab_size: Optional[int] = None,
-) -> DSparkMarkovCandidateConfig:
-    """Resolve optional CLI overrides without treating explicit zero as unset."""
-    text_config = _get_text_config(draft_hf_config)
-    nested = _get_dspark_config(draft_hf_config)
-
-    def checkpoint_value(name):
-        value = nested.get(name, _cfg_get(text_config, name, None))
-        return value if value is not None else _cfg_get(draft_hf_config, name, None)
-
-    if markov_topk is None:
-        markov_topk = checkpoint_value("markov_topk")
-        if markov_topk is None:
-            markov_topk = checkpoint_value("dspark_draft_topk")
-    if markov_bias_topk is None:
-        markov_bias_topk = checkpoint_value("markov_bias_topk")
-    k = _candidate_budget(0 if markov_topk is None else markov_topk, "markov_topk")
-    m = _candidate_budget(
-        16 if markov_bias_topk is None else markov_bias_topk, "markov_bias_topk"
-    )
-    if draft_vocab_size is None:
-        draft_vocab_size = checkpoint_value("draft_vocab_size")
-        if draft_vocab_size is None:
-            draft_vocab_size = checkpoint_value("vocab_size")
-    if draft_vocab_size is not None:
-        vocab = int(draft_vocab_size)
-        if vocab <= 0:
-            raise ValueError(f"DSpark draft_vocab_size must be positive, got {vocab}.")
-        # A disabled default M does not constrain legacy tiny vocab checkpoints.
-        if k > vocab or ((k > 0 or markov_bias_topk is not None) and m > vocab):
-            raise ValueError(
-                f"DSpark candidate budgets K={k}, M={m} exceed draft vocab size {vocab}."
-            )
-    return DSparkMarkovCandidateConfig(k, m, k, m if k else 0)
 
 
 def resolve_runtime_config(
@@ -376,14 +316,6 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     else:
         target_layer_ids = base.target_layer_ids
 
-    markov_topk = dspark_cfg.get(
-        "markov_topk", _cfg_get(text_config, "markov_topk", None)
-    )
-    if markov_topk is None:
-        markov_topk = dspark_cfg.get(
-            "dspark_draft_topk", _cfg_get(text_config, "dspark_draft_topk", None)
-        )
-
     return DSparkDraftConfig(
         num_hidden_layers=base.num_hidden_layers,
         num_target_layers=base.num_target_layers,
@@ -393,11 +325,4 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
-        markov_topk=markov_topk,
-        markov_bias_topk=dspark_cfg.get(
-            "markov_bias_topk", _cfg_get(text_config, "markov_bias_topk", None)
-        ),
-        draft_vocab_size=_cfg_get(
-            text_config, "draft_vocab_size", _cfg_get(text_config, "vocab_size", None)
-        ),
     )

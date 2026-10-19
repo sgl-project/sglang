@@ -80,13 +80,9 @@ class Spec(msgspec.Struct):
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
     ] = None
     speculative_dspark_markov_topk: A[
-        Optional[int],
-        "DSPARK only. Per-position base-logit candidate budget. Explicit 0 disables pruning; omit to use checkpoint markov_topk (legacy dspark_draft_topk), otherwise 0.",
-    ] = None
-    speculative_dspark_markov_bias_topk: A[
-        Optional[int],
-        "DSPARK only. Static Markov successor budget. Omit to use checkpoint markov_bias_topk, otherwise 16. Effective budget is 0 when base candidate pruning is disabled.",
-    ] = None
+        int,
+        "DSPARK only. Top-K budget for both base-logit and static Markov candidates. Set to 0 to score the full vocabulary.",
+    ] = 0
     speculative_dspark_sps_table_path: A[
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "

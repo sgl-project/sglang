@@ -130,6 +130,59 @@ class TestFusedGreedyEligibility(CustomTestCase):
                 self.assertIs(head.greedy_w2_weight() is not None, fuses)
 
 
+class TestMarkovCandidates(CustomTestCase):
+    def test_union_preserves_scores_and_target_ids(self):
+        """Overlapping sets must not double bias or double the proposal mass."""
+        head = VanillaMarkov(vocab_size=8, draft_vocab_size=4, markov_rank=1).to(
+            torch.bfloat16
+        )
+        with torch.no_grad():
+            head.markov_w1.weight.fill_(1)
+            head.markov_w2.weight.copy_(torch.tensor([[1], [4], [3], [-2]]))
+        target_ids = torch.tensor([3, 6, 1, 7])
+        head.configure_target_vocab(8, target_ids - torch.arange(4))
+        prev = torch.tensor([2])
+        base = torch.tensor([[6, 5, 0, 1]], dtype=torch.bfloat16)
+        for scale, scores in (
+            (1.0, [7, 9, 3, -torch.inf]),
+            (-1.0, [5, 1, -torch.inf, 3]),
+        ):
+            with self.subTest(scale=scale):
+                head.logit_scale = scale
+                head.configure_candidates(2)
+                logits = head.candidate_logits(prev, base)
+                expected = torch.full((1, 8), -torch.inf)
+                expected[0, target_ids] = torch.tensor(scores)
+                self.assertEqual(logits.dtype, torch.float32)
+                torch.testing.assert_close(logits, expected)
+
+        head.logit_scale = 0
+        head.refresh_candidates()
+        logits = head.candidate_logits(prev, base)
+        finite = torch.isfinite(logits)
+        torch.testing.assert_close(
+            logits[finite], head.to_target_logits(base)[finite].float()
+        )
+        torch.testing.assert_close(logits[0, target_ids[:2]], base[0, :2].float())
+
+        head.logit_scale = 1
+        head.refresh_candidates()
+        logits = head.candidate_logits(prev, torch.full_like(base, -torch.inf))
+        expected = torch.full((1, 8), -torch.inf)
+        expected[0, 1] = 0  # Lowest target ID in the union, not target token zero.
+        torch.testing.assert_close(logits, expected)
+
+    def test_disabled_and_full_vocabulary_candidates_use_dense_path(self):
+        head = VanillaMarkov(vocab_size=4, markov_rank=1)
+        for topk in (0, 4, 5):
+            with self.subTest(topk=topk):
+                head.configure_candidates(topk)
+                self.assertIsNone(head.candidate_ids)
+                self.assertIsNone(
+                    head.candidate_logits(torch.tensor([0]), torch.zeros(1, 4))
+                )
+
+
 class TestDraftWeightUpdates(CustomTestCase):
     def test_checkpoint_can_be_updated_in_parameter_buckets(self):
         """Online updates may omit other weights and the unchanged vocab mapping."""
@@ -158,29 +211,27 @@ class TestDraftWeightUpdates(CustomTestCase):
         model.load_weights([*weights.items(), ("d2t", mapping)])
         model._vocab_attached = True
 
-        # Replace only the CUDA table builder; check its resulting derived values.
-        cache = SimpleNamespace(bias=None)
-
-        def refresh(w1, w2, **kwargs):
-            cache.bias = w1.detach() @ w2.detach().T
-
-        model.markov_candidate_sampler = SimpleNamespace(refresh_weights=refresh)
+        model.markov_head.configure_candidates(2)
+        candidate_ptr = model.markov_head.candidate_ids.data_ptr()
         for index, (name, param) in enumerate(model.named_parameters(), start=1):
             with self.subTest(weight=name):
                 weights[name] = torch.full_like(param, index)
+                if name == "markov_head.markov_w2.weight":
+                    weights[name] *= torch.arange(4)[:, None]
                 model.load_weights([(name, weights[name])])
                 for key, actual in model.named_parameters():
                     torch.testing.assert_close(actual, weights[key])
                 torch.testing.assert_close(model.draft_id_to_target_id, mapping)
-                torch.testing.assert_close(
-                    cache.bias,
-                    model.markov_head.markov_w1.weight
-                    @ model.markov_head.markov_w2.weight.T,
+                self.assertEqual(
+                    model.markov_head.candidate_ids.data_ptr(), candidate_ptr
                 )
+        torch.testing.assert_close(
+            model.markov_head.candidate_ids, torch.tensor([[3, 2]]).expand(4, -1)
+        )
 
         # Direct tensor copies bypass load_weights; session finalization refreshes.
         name = "markov_head.markov_w1.weight"
-        updated = torch.full_like(weights[name], 11)
+        updated = torch.full_like(weights[name], -11)
         _model_load_weights_direct(model, [(name, updated)])
         with patch(
             "sglang.srt.model_executor.model_runner_components.weight_updater."
@@ -191,8 +242,9 @@ class TestDraftWeightUpdates(CustomTestCase):
                 run_post_load=False,
             )
         torch.testing.assert_close(
-            cache.bias, updated @ model.markov_head.markov_w2.weight.T
+            model.markov_head.candidate_ids, torch.tensor([[0, 1]]).expand(4, -1)
         )
+        self.assertEqual(model.markov_head.candidate_ids.data_ptr(), candidate_ptr)
 
         with self.assertRaisesRegex(ValueError, "Changing DSpark d2t"):
             model.load_weights([("d2t", mapping + 1)])
