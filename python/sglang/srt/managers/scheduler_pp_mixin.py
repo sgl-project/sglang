@@ -570,8 +570,8 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
-        self.pp_poll_sync_work_list: List[torch.distributed.Work] = []
-        self.pp_poll_sync_work_list2: List[torch.distributed.Work] = []
+        self.pp_poll_sync_work_list_bootstrap: List[torch.distributed.Work] = []
+        self.pp_poll_sync_work_list_inflight: List[torch.distributed.Work] = []
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()

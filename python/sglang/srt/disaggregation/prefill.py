@@ -490,7 +490,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.pp_group,
                 self.pp_rank,
                 self.pp_size,
-                self.scheduler.pp_poll_sync_work_list,
+                self.scheduler.pp_poll_sync_work_list_bootstrap,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1125,7 +1125,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.pp_group,
                 parallel.pp_rank,
                 parallel.pp_size,
-                self.pp_poll_sync_work_list2,
+                self.pp_poll_sync_work_list_inflight,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
