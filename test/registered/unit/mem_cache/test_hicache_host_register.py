@@ -70,7 +70,7 @@ class _FakeCudart:
         return "injected error"
 
 
-class TestHiCacheHostRegister(unittest.TestCase):
+class TestHiCacheHostRegister(CustomTestCase):
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),
@@ -219,6 +219,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 pool.dtype = torch.float16
                 pool.token_stride_size = 2
                 pool.device_pool = SimpleNamespace(device="cpu")
+                pool._transfer_device = torch.device("cpu")
                 pool.device = "cpu"
                 pool.pin_memory = True
                 pool.allocator = object()

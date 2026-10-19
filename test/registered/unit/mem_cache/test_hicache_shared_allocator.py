@@ -60,7 +60,11 @@ def _expect_failure(function, message):
         raise AssertionError(f"expected rejection containing {message!r}")
 
 
-def _worker(rank, rendezvous, output, scenario):
+def _worker(rank, rendezvous, output, scenario, ready, start):
+    # Keep Python/Torch import time out of the bounded collective test.
+    ready.set()
+    if not start.wait(120):
+        raise RuntimeError("parent did not start the shared allocator operation")
     dist.init_process_group(
         "gloo",
         init_method=f"file://{rendezvous}",
@@ -180,6 +184,22 @@ def _worker(rank, rendezvous, output, scenario):
                     qk_rope_head_dim=2,
                     kv_buffer=[torch.empty(10, 1, 10) for _ in range(2)],
                 )
+                # These CPU tensors stand in for device buffers. CUDA driver
+                # registration and pointer tables are the external boundaries;
+                # shared allocation and rollback below remain real.
+                buffer_info = mock.Mock(
+                    dtype=device_pool.store_dtype,
+                    device=torch.device("cuda"),
+                    kv_lora_rank=device_pool.kv_lora_rank,
+                    qk_rope_head_dim=device_pool.qk_rope_head_dim,
+                    kv_cache_dim=10,
+                    packed_fp8=False,
+                    scales=None,
+                    buffers=tuple(device_pool.kv_buffer),
+                    data_ptrs=None,
+                    layer_indices=(0, 1),
+                    device_layer_num=2,
+                )
                 with (
                     mock.patch.object(torch.cuda, "cudart", return_value=runtime),
                     mock.patch.object(pool_base, "_is_cuda", True),
@@ -205,11 +225,15 @@ def _worker(rank, rendezvous, output, scenario):
                 ):
                     _expect_failure(
                         lambda: MLATokenToKVPoolHost(
-                            device_pool,
+                            buffer_info,
                             2,
                             0,
                             2,
                             "page_first_direct",
+                            device_capacity_tokens=device_pool.size,
+                            start_layer=device_pool.start_layer,
+                            end_layer=device_pool.end_layer,
+                            target_layer_num=device_pool.layer_num,
                             shared_memory_group=dist.group.WORLD,
                         ),
                         "peer GPU pointer metadata failed",
@@ -287,15 +311,25 @@ class TestHiCacheSharedAllocator(CustomTestCase):
         with tempfile.TemporaryDirectory(prefix="hicache-shared-test-") as output:
             rendezvous = os.path.join(output, "rendezvous")
             context = mp.get_context("spawn")
+            ready = [context.Event() for _ in range(2)]
+            start = context.Event()
             processes = [
                 context.Process(
-                    target=_worker, args=(rank, rendezvous, output, scenario)
+                    target=_worker,
+                    args=(rank, rendezvous, output, scenario, ready[rank], start),
                 )
                 for rank in range(2)
             ]
             try:
                 for process in processes:
                     process.start()
+                startup_deadline = time.monotonic() + 120
+                for rank, event in enumerate(ready):
+                    self.assertTrue(
+                        event.wait(max(0, startup_deadline - time.monotonic())),
+                        f"rank {rank} did not start",
+                    )
+                start.set()
                 deadline = time.monotonic() + 40
                 for process in processes:
                     process.join(max(0, deadline - time.monotonic()))
