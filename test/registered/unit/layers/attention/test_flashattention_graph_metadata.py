@@ -2,8 +2,10 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.swa_window_align import align_swa_cache_seqlens
+from sglang.srt.configs.step5 import Step5Config, uses_step5_swa_window_align
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
     FlashAttentionMetadata,
@@ -73,6 +75,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         )
         backend.is_prefill_aware_swa = False
         backend.has_swa = False
+        backend.swa_fa4_window_align = False
         backend.use_sliding_window_kv_pool = False
         backend.page_size = 1
         backend._compute_scheduler_metadata = lambda *_: None
@@ -171,6 +174,7 @@ class TestSwaWindowAlignGraphBuffers(CustomTestCase):
         )
         b.is_prefill_aware_swa = False
         b.use_sliding_window_kv_pool = False
+        b.swa_fa4_window_align = True
         b.page_size = 1
         b._compute_scheduler_metadata = lambda *_: None
         b._maybe_init_local_attn_metadata = lambda *_: None
@@ -221,6 +225,27 @@ class TestSwaWindowAlignGraphBuffers(CustomTestCase):
         graph_md.cache_seqlens_int32 = torch.ones(self.MAX_BS + 1, dtype=torch.int32)
         with self.assertRaisesRegex(AssertionError, "used 5 > capacity 4"):
             b._fill_swa_window_align(graph_md)
+
+
+class TestSwaWindowAlignScope(CustomTestCase):
+    """FA4 leftpad window alignment is Step5's decode layout. Other SWA models must
+    keep the stock KV split: FA4's dedicated head_dim-256 kernel rejects leftpad."""
+
+    def test_only_step5_aligns_its_swa_decode(self):
+        other = PretrainedConfig(sliding_window=127, head_dim=256)
+        self.assertTrue(uses_step5_swa_window_align(Step5Config()))
+        self.assertFalse(uses_step5_swa_window_align(other))
+
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.fa_impl_ver = 4
+        b.forward_metadata = None
+        b.swa_fa4_window_align = uses_step5_swa_window_align(other)
+        seqlens = torch.tensor([1000, 64], dtype=torch.int32)
+        aligned, leftpad = b._swa_window_aligned_kvcache(
+            True, seqlens, window_left=127, max_seqlen_q=1, extra_kwargs={}
+        )
+        self.assertIsNone(leftpad)
+        self.assertIs(aligned, seqlens)
 
 
 if __name__ == "__main__":

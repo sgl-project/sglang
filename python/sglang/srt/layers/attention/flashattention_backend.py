@@ -21,6 +21,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.step5 import uses_step5_swa_window_align
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -256,6 +257,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.sliding_window_size = model_runner.sliding_window_size
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
+        )
+        self.swa_fa4_window_align = uses_step5_swa_window_align(
+            model_runner.model_config.hf_text_config
         )
         # CUDA graph state for the SWA window align, set by init_cuda_graph_state.
         self._swa_align_seqlens: Optional[torch.Tensor] = None
@@ -555,10 +559,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         q_len = max(int(getattr(metadata, "max_seq_len_q", 1) or 1), 1)
-        # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FA4_WINDOW_ALIGN; prune dead paths.
-        if not step5_options.SWA_FA4_WINDOW_ALIGN or (
-            not swa_window_align_supported(q_len)
-        ):
+        if not self.swa_fa4_window_align or not swa_window_align_supported(q_len):
             metadata.swa_aligned_seqlens = None
             metadata.swa_cache_leftpad = None
             return
@@ -593,8 +594,7 @@ class FlashAttentionBackend(AttentionBackend):
         if (
             not is_swa_layer
             or self.fa_impl_ver != 4
-            # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FA4_WINDOW_ALIGN; prune dead paths.
-            or not step5_options.SWA_FA4_WINDOW_ALIGN
+            or not self.swa_fa4_window_align
             or not swa_window_align_supported(q_len)
             or extra_kwargs.get("tile_mn") is not None
             or window_left is None

@@ -634,6 +634,20 @@ def get_step5_position_padding() -> int:
     return get_req_to_token_extra_context_len() // 8 * 8
 
 
+def uses_step5_swa_window_align(config: PretrainedConfig) -> bool:
+    """Whether FA4 SWA decode shifts the paged KV origin to the window (cache_leftpad).
+
+    Tuned and validated on Step5's SWA geometry only; other SWA models keep the
+    stock FA4 KV split.
+    """
+    from sglang.kernels.ops.attention.step5 import options as step5_options
+
+    if get_step5_text_config(config) is None:
+        return False
+    # TODO(yhyang201): frozen SGLANG_OPT_STEP5_SWA_FA4_WINDOW_ALIGN; prune dead paths.
+    return step5_options.SWA_FA4_WINDOW_ALIGN
+
+
 class Step5VLConfig(PretrainedConfig):
     """Open-source Step5 VL checkpoint (model_type "step5_vl").
 
