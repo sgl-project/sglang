@@ -501,13 +501,29 @@ class C_SchedulerHook(BaseHook):
                         self, *args, **kwargs
                     ),
                 )
+            batch = get_obj_from_args(
+                "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
+            )
+            blocked_l2_wall_dur = 0.0
+            if (
+                C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING
+                and batch is not None
+                and batch.reqs
+            ):
+                # Native result processing sends responses. Pace cache loads
+                # before delivery so a dependent request cannot arrive early.
+                blocked_l2_wall_dur = block_on_l2_load(
+                    C_SchedulerHook.SIM_MODE,
+                    effective_l2_load_delay(
+                        StateManager.get_hicache_l2_load_dur(),
+                        StateManager.get_last_inference_dur(),
+                        C_SchedulerHook.OVERLAP_SCHEDULE,
+                    ),
+                )
             process_batch_result_start = time.perf_counter()
             ret = original_process_batch_result(self, *args, **kwargs)
             process_batch_result_end = time.perf_counter()
 
-            batch = get_obj_from_args(
-                "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
-            )
             if batch is not None:
                 if len(batch.reqs) == 0:
                     return ret
@@ -521,11 +537,6 @@ class C_SchedulerHook(BaseHook):
                     StateManager.get_last_inference_dur(),
                     C_SchedulerHook.OVERLAP_SCHEDULE,
                 )
-                blocked_l2_wall_dur = block_on_l2_load(
-                    C_SchedulerHook.SIM_MODE,
-                    visible_l2_load_dur,
-                )
-
                 StateManager.step_global_clock(visible_l2_load_dur)
                 StateManager.step_global_clock(current_inference_dur)
                 # Step CPU overhead BEFORE recording latencies,
