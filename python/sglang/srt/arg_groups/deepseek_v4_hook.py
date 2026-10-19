@@ -36,7 +36,6 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         or cfg.device != "cuda"
         or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
-        or cfg.disaggregation_mode != "null"
         or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
     ):
         return "flashmla"
@@ -101,15 +100,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
         )
-        # The trtllm backend stores KV in a 512-byte uniform-FP8 layout while
-        # FlashMLA uses the 584-byte packed layout; the PD handshake only
-        # compares kv_cache_dtype, so mismatched prefill/decode backends would
-        # pass the check and transfer garbage. Reject until the handshake
-        # carries a layout identifier and the path is tested (#37838).
+        # The PD handshake rejects peers whose KV layouts differ, but the
+        # uniform-FP8 layout has not been run under PD (#37838).
         assert cfg.disaggregation_mode == "null", (
             "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
-            "(uniform-FP8 KV layout is not part of the PD handshake; see "
-            "https://github.com/sgl-project/sglang/issues/37838)."
+            "(untested; see https://github.com/sgl-project/sglang/issues/37838)."
         )
         # The trtllm-gen semaphore buffer is sized from the prefill chunk
         # bound; with chunking disabled a single long request has no bound.
