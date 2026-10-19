@@ -1,9 +1,9 @@
 ---
 title: "Speculative Decoding"
 metatags:
-    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, draft model configuration, and overlap-scheduler guidance."
+    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, DLite, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, DLite, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -18,6 +18,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
+- [DLite Decoding](#dlite-decoding)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -34,6 +35,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a UNO adapter for the target model**: Use **UNO** with `--speculative-algorithm UNO` and `--uno-lora-path ...`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
+- **You have a Qwen3 DLite checkpoint**: Use **DLITE** with `--speculative-algorithm DLITE` and `--speculative-draft-model-path ...`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -102,6 +104,13 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No DP attention (<code>--attn-dp-size</code> &gt; 1); <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DLite</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Current Qwen3 target hidden states, without a draft KV cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DLITE</code> + <code>--speculative-draft-model-path ...</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3 and greedy decoding; CUDA; PP=1; no DP attention</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -653,6 +662,32 @@ Off by default; with it unset the captured body is `select` itself, so temperatu
 LiLiCorr composes with the grouped dynamic convolutions that wrap each DFlash sublayer, and serving one needs no extra flag: the convolution belongs to the DFlash backbone, so `LiLiCorrDraftModel` inherits the builder and picks it up from `conv_kernel_size` and `conv_group_size` in `dflash_config`.
 
 Both keys default to `0`, so a checkpoint whose config lost them builds no convolution modules and the backbone loader then drops every convolution tensor it cannot resolve. That is correct for rotary caches and the worst case here, because the draft would serve as its convolution-free parent at a lower but entirely believable acceptance length. The loader therefore refuses any checkpoint whose convolution tensors and built modules disagree, in either direction.
+
+---
+
+## DLite Decoding
+
+DLite predicts a linear block from the target model's current multi-layer hidden
+states. It does not retain a draft KV cache between decoding steps. SGLang
+supports the released `dlite_v1` Qwen3-4B and Qwen3-8B student checkpoints.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model Qwen/Qwen3-8B \
+    --speculative-algorithm DLITE \
+    --speculative-draft-model-path SJTU-DAI-Sys/Qwen3-8B-DLite
+```
+
+The verify width is read from the checkpoint's `block_size`. If
+`--speculative-num-draft-tokens` is set explicitly, it must match that value.
+The target and draft hidden size, vocabulary size, and target depth must also
+match.
+
+The initial implementation supports CUDA, greedy decoding, tensor parallelism,
+ordinary overlap scheduling, and Qwen3 targets. Pipeline parallelism, DP
+attention, context parallelism, disaggregated serving, two-batch overlap,
+stochastic sampling, adaptive draft lengths, and mixed chunked prefill are not
+supported.
 
 ---
 

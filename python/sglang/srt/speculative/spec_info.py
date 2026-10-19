@@ -37,6 +37,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DLITE = auto()
     UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
@@ -117,6 +118,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dlite(self) -> bool:
+        return self == SpeculativeAlgorithm.DLITE
+
     def is_uno(self) -> bool:
         return self == SpeculativeAlgorithm.UNO
 
@@ -124,7 +128,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark()
+        return self.is_dflash() or self.is_dlite() or self.is_dspark()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -174,7 +178,7 @@ class SpeculativeAlgorithm(Enum):
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
         per-topk page rounding; see get_alloc_len_per_decode."""
-        return not self.is_ngram()
+        return not (self.is_ngram() or self.is_dlite())
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
@@ -238,6 +242,7 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dlite,
             _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
@@ -253,6 +258,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_dlite():
+            _handle_dlite(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
         elif self.is_dspark():
@@ -314,6 +321,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_dlite():
+            from sglang.srt.speculative.dlite_worker_v2 import DLiteWorkerV2
+
+            return DLiteWorkerV2
 
         if self.is_uno():
             from sglang.srt.speculative.uno_worker_v2 import UnoWorkerV2

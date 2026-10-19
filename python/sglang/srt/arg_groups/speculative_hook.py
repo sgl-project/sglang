@@ -436,6 +436,95 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_dlite(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not current_platform.is_cuda() or not cfg.device.startswith("cuda"):
+        raise ValueError("DLite speculative decoding currently supports CUDA only.")
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError(
+            "DLite requires setting --speculative-draft-model-path to a "
+            "DLiteDraftModel checkpoint."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError("DLite currently requires --pp-size 1.")
+    if attn_dp_enabled_of(cfg):
+        raise ValueError("DLite currently does not support DP attention.")
+    if cfg.attn_cp_size != 1:
+        raise ValueError("DLite currently requires --attn-cp-size 1.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DLite currently does not support disaggregated serving.")
+    if cfg.enable_two_batch_overlap:
+        raise ValueError("DLite currently does not support two-batch overlap.")
+    if cfg.enable_mixed_chunk:
+        raise ValueError("DLite currently does not support mixed chunked prefill.")
+    if cfg.speculative_adaptive:
+        raise ValueError("DLite currently does not support adaptive draft lengths.")
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "DLite currently supports greedy verification only; "
+            "--speculative-use-rejection-sampling is not supported."
+        )
+    if cfg.speculative_use_block_verification:
+        raise ValueError(
+            "DLite currently uses greedy token-wise block verification; "
+            "--speculative-use-block-verification is not supported."
+        )
+    if cfg.speculative_draft_model_quantization not in (None, "unquant"):
+        raise ValueError(
+            "DLite draft checkpoints currently require unquantized BF16 weights. "
+            "Set --speculative-draft-model-quantization unquant when the target "
+            "model is quantized."
+        )
+
+    for field in ("speculative_num_steps", "speculative_eagle_topk"):
+        value = getattr(cfg, field)
+        if value not in (None, 1):
+            raise ValueError(f"DLite requires --{field.replace('_', '-')} 1.")
+        declare_resolution(server_args, "_handle_dlite", **{field: 1})
+
+    from sglang.srt.speculative.dlite_utils import (
+        validate_dlite_target_compatibility,
+    )
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    model_override_args = json.loads(cfg.json_model_override_args)
+    draft_hf_config = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=model_override_args,
+    )
+    target_hf_config = model_config_of(server_args).hf_text_config
+    draft_config = validate_dlite_target_compatibility(
+        target_hf_config=target_hf_config,
+        draft_hf_config=draft_hf_config,
+    )
+
+    if cfg.speculative_num_draft_tokens is None:
+        declare_resolution(
+            server_args,
+            "_handle_dlite",
+            speculative_num_draft_tokens=draft_config.block_size,
+        )
+    elif int(cfg.speculative_num_draft_tokens) != draft_config.block_size:
+        raise ValueError(
+            "DLite requires --speculative-num-draft-tokens to match the "
+            f"checkpoint block_size={draft_config.block_size}, got "
+            f"{cfg.speculative_num_draft_tokens}."
+        )
+
+    if cfg.max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "_handle_dlite",
+            max_running_requests=48,
+        )
+        logger.warning(
+            "Max running requests is reset to 48 for DLite speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 

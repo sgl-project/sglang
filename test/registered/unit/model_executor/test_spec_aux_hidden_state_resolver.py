@@ -136,5 +136,56 @@ class TestDSparkResolverStages(unittest.TestCase):
         self.assertIsNone(config.dspark_num_stages)
 
 
+class TestDLiteResolver(unittest.TestCase):
+    def test_captures_checkpoint_layers_without_allocating_draft_kv(self):
+        config = _mod.SpecAuxHiddenStateConfig()
+        draft_hf = SimpleNamespace(
+            architectures=["DLiteDraftModel"],
+            block_size=8,
+            dlite_config={
+                "architecture_version": "dlite_v1",
+                "chs_num_layers": 4,
+                "mask_token_id": 99,
+                "model_role": "pivot_q_student",
+                "sequential_head": "rnn",
+                "sequential_rank": 32,
+                "target_layer_ids": [0, 1, 6, 7],
+            },
+            hidden_size=64,
+            num_target_layers=8,
+            vocab_size=128,
+        )
+        draft = SimpleNamespace(hf_config=draft_hf)
+        target_hf = SimpleNamespace(
+            architectures=["Qwen3ForCausalLM"],
+            hidden_size=64,
+            model_type="qwen3",
+            num_hidden_layers=8,
+            vocab_size=128,
+        )
+        target = SimpleNamespace(hf_text_config=target_hf)
+        spec = SimpleNamespace(
+            speculative_draft_model_path="/draft",
+            speculative_draft_model_revision=None,
+        )
+
+        with (
+            patch.object(_mod, "get_spec", return_value=spec),
+            patch.object(_mod.ModelConfig, "from_server_args", return_value=draft),
+        ):
+            _mod._resolve_dlite_aux_hidden_state(
+                config=config,
+                server_args=None,
+                model_config=target,
+                spec_algorithm=SimpleNamespace(is_dlite=lambda: True),
+                is_draft_worker=False,
+            )
+
+        self.assertTrue(config.dlite_use_aux_hidden_state)
+        self.assertEqual(config.dlite_target_layer_ids, [0, 1, 6, 7])
+        self.assertIsNone(config.draft_kv_num_layers)
+        self.assertIsNone(config.draft_model_config)
+
+
 if __name__ == "__main__":
     unittest.main()
