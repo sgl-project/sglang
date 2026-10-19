@@ -99,6 +99,7 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_blocking_pacing.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinator.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_timing_metadata.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_token_events.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_bridge.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_fork_join_example.py

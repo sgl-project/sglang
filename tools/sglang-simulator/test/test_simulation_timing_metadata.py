@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +10,7 @@ from unittest.mock import Mock
 import msgspec
 import pytest
 from sglang_simulator.simulation.coordinator import (
+    Cancel,
     Coordinator,
     ProtocolError,
     Ready,
@@ -21,6 +23,7 @@ from sglang_simulator.simulation.sglang.timing_metadata import (
     C_TimingTokenizerHook,
     attach_timing_output,
 )
+from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder
 
 
 class Request:
@@ -43,10 +46,10 @@ def setup_requests(*rids, arrival_ns=0):
     return clock, [Request(rid) for rid in rids]
 
 
-def commit(clock, reqs, at_ns, commits, previous=None):
+def commit(clock, reqs, at_ns, commits, previous=None, token_events=None):
     clock.advance(at_ns)
     result = SimpleNamespace(auxiliary_host_output=previous)
-    attach_timing_output(result, clock)
+    attach_timing_output(result, clock, token_events)
     result.auxiliary_host_output.consume(SimpleNamespace(reqs=reqs), commits)
 
 
@@ -130,6 +133,109 @@ def test_noncontiguous_native_commits_fail_explicitly():
     clock, (req,) = setup_requests("request")
     with pytest.raises(ProtocolError, match="non-contiguous"):
         commit(clock, [req], 10, [tokens(1, 70)])
+
+
+def test_token_ledger_uses_visible_commits_and_keeps_partial_cancelled_output(tmp_path):
+    path = tmp_path / "tokens.jsonl"
+    recorder = TokenEventRecorder(path)
+    clock, (completed, cancelled) = setup_requests("completed", "cancelled")
+    commit(
+        clock,
+        [completed, cancelled],
+        10,
+        [tokens(0, 71), tokens(0, 72, 73)],
+        token_events=recorder,
+    )
+    completed.done = cancelled.done = True
+    commit(
+        clock,
+        [completed, cancelled],
+        20,
+        [tokens(1, 74), None],
+        token_events=recorder,
+    )
+    recorder.finish("test", 20)
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert events[1]["commits"] == [
+        {"rid": "completed", "output_index": 0, "token_count": 1},
+        {"rid": "cancelled", "output_index": 0, "token_count": 2},
+    ]
+    assert events[2]["commits"] == [
+        {"rid": "completed", "output_index": 1, "token_count": 1}
+    ]
+    assert events[-1]["total_output_tokens"] == 4
+    assert snapshot(cancelled)["completion_tokens"] == 2
+
+
+def test_native_cancel_cleanup_append_does_not_count_as_output(tmp_path):
+    root = Path(__file__).resolve().parents[3]
+    functions = {}
+    for filename, names in (
+        ("schedule_batch.py", {"update_finish_state"}),
+        (
+            "scheduler_components/batch_result_processor.py",
+            {"_visible_output_len", "_build_auxiliary_commits"},
+        ),
+    ):
+        path = root / "python/sglang/srt/managers" / filename
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        assert len(nodes) == len(names)
+        for node in nodes:
+            node.decorator_list = []
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        namespace = {"CommittedTokens": SimpleNamespace}
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)  # noqa: S102 - trusted native functions
+        functions.update({name: namespace[name] for name in names})
+
+    processor = SimpleNamespace(_visible_output_len=functions["_visible_output_len"])
+    build = functions["_build_auxiliary_commits"]
+    clock, (req,) = setup_requests("cancelled")
+    req.output_ids = [71]
+    req.finished_len = None
+    req.finished_reason = None
+    req.to_finish = None
+    req.finished = lambda: req.finished_reason is not None
+    batch = SimpleNamespace(reqs=[req])
+    path = tmp_path / "cancelled-tokens.jsonl"
+    recorder = TokenEventRecorder(path)
+    commit(clock, [req], 10, build(processor, batch, [0]), token_events=recorder)
+
+    clock.advance(12)
+    clock.grant()
+    clock.accept_ready(Ready("test", 1, [Cancel(req.rid)]))
+    clock.grant()
+    clock.accept_ready(Ready("test", 2, [], finished=True))
+    req.to_finish = SimpleNamespace(reason="aborted")
+    start = processor._visible_output_len(req)
+    # The native decode path extends output_ids before applying to_finish.
+    req.output_ids.extend([72])
+    functions["update_finish_state"](req, 1)
+    native_commits = build(processor, batch, [start])
+    assert native_commits[0].token_ids == (72,)
+    assert req.finished() and req.finished_len is None
+    commit(clock, [req], 20, native_commits, token_events=recorder)
+    recorder.finish("test", 20)
+
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [
+        event["at_ns"] for event in events if event["event"] == "output_commit"
+    ] == [10]
+    assert events[-1]["total_output_tokens"] == 1
+    assert snapshot(req)["completion_tokens"] == 1
+    assert snapshot(req)["last_token_ns"] == 10
 
 
 def _native_tokenizer_functions():

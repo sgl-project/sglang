@@ -1,5 +1,6 @@
 """Exercise the real coordination bridge with a small scheduler and loopback I/O."""
 
+import json
 import queue
 import socket
 import sys
@@ -235,6 +236,51 @@ class Harness:
 
     def close(self):
         self.bridge.close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_opt_in_token_ledger_only_finishes_after_native_cleanup(
+    monkeypatch, tmp_path, fail
+):
+    path = tmp_path / "tokens.jsonl"
+    monkeypatch.setenv("SGLANG_SIMULATOR_TOKEN_EVENTS", str(path))
+    instance = Harness()
+    instance.scheduler.running_batch.reqs.append(NativeRequest(rid(1)))
+
+    def driver(control):
+        control.send(encode_message(Ready("run", 0, [], finished=True)))
+        return decode_grant(control.recv())
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(instance.run_driver, driver)
+            assert instance.receive() == []
+            assert "FINISHED" not in path.read_text()
+            if fail:
+                with pytest.raises(
+                    ProtocolError, match="stalled during native cleanup"
+                ):
+                    instance.bridge.on_idle()
+            else:
+                instance.scheduler.running_batch.reqs.clear()
+                instance.bridge.on_idle()
+            grant = future.result(timeout=3)
+        assert grant.status == ("ERROR" if fail else "FINISHED")
+    finally:
+        instance.close()
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert (events[-1]["event"] == "finish") is not fail
+
+
+def test_token_ledger_disabled_does_not_open_a_file(monkeypatch):
+    monkeypatch.delenv("SGLANG_SIMULATOR_TOKEN_EVENTS", raising=False)
+
+    def unexpected_file(*args, **kwargs):
+        raise AssertionError("disabled ledger must not create a writer")
+
+    monkeypatch.setattr(coordinated, "TokenEventRecorder", unexpected_file)
+    instance = Harness()
+    instance.close()
 
 
 @pytest.fixture

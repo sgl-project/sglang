@@ -16,9 +16,10 @@ from sglang_simulator.simulation.coordinator import (
     decode_ready,
     encode_message,
 )
-from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.manager import Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.timing_metadata import attach_timing_output
+from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder
 
 
 class CoordinatedScheduler:
@@ -37,6 +38,7 @@ class CoordinatedScheduler:
         self.clock = Coordinator()
         self.timeout_s = timeout_s
         self._closed = False
+        self._token_events = None
         self._watchdogs = []
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REP)
@@ -44,6 +46,9 @@ class CoordinatedScheduler:
             self._socket.setsockopt(zmq.LINGER, 0)
             self._socket.setsockopt(zmq.IPV6, 1)
             self._socket.bind(endpoint)
+            token_events_path = Envs.token_events_path()
+            if token_events_path is not None:
+                self._token_events = TokenEventRecorder(token_events_path)
         except Exception:
             self.close()
             raise
@@ -77,6 +82,8 @@ class CoordinatedScheduler:
         for watchdog, active in self._watchdogs:
             watchdog.is_active = active
         self._watchdogs.clear()
+        if self._token_events is not None:
+            self._token_events.close()
         self._socket.close(linger=0)
         self._context.term()
 
@@ -297,7 +304,10 @@ class CoordinatedScheduler:
         StateManager.set_global_clock(now_ns / 1e9)
 
     def _grant(self, *, finished: bool = False) -> None:
-        self._socket.send(encode_message(self.clock.grant(finished=finished)))
+        grant = self.clock.grant(finished=finished)
+        if finished and self._token_events is not None:
+            self._token_events.finish(grant.run_id, grant.now_ns)
+        self._socket.send(encode_message(grant))
         self._reply_pending = False
         self._finished = finished
 
@@ -321,7 +331,7 @@ class CoordinatedScheduler:
                 self._settle()
             self._advance(finish_ns)
             self._cleanup_cancelled()
-            attach_timing_output(result, self.clock)
+            attach_timing_output(result, self.clock, self._token_events)
             ret = process()
             self.scheduler.process_pending_chunked_abort()
             for req in batch.reqs:

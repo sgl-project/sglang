@@ -6,6 +6,7 @@ from functools import wraps
 import msgspec
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.coordinator import Coordinator, ProtocolError
+from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder
 
 METADATA_KEY = "sglang_simulator"
 _REQUEST_ATTRIBUTE = "_simulator_timing"
@@ -18,20 +19,28 @@ class TimingMetadataOutput:
     clock: Coordinator
     commit_ns: int
     previous: object = None
+    token_events: TokenEventRecorder | None = None
 
     def consume(self, batch, commits) -> None:
         if self.previous is not None:
             self.previous.consume(batch, commits)
+        output_events = []
         for req, commit in zip(batch.reqs, commits, strict=True):
             prior = getattr(req, _REQUEST_ATTRIBUTE, None)
             count = prior["completion_tokens"] if prior is not None else 0
             first_ns = prior["first_token_ns"] if prior is not None else None
             last_ns = prior["last_token_ns"] if prior is not None else None
-            if commit is not None:
+            # Native abort cleanup can append a running batch's result after
+            # the protocol cancellation. That discarded tail is not output.
+            if commit is not None and not self.clock.is_cancelled(req.rid):
                 if commit.output_index != count:
                     raise ProtocolError(f"non-contiguous token commit for {req.rid}")
                 count += len(commit.token_ids)
                 if commit.token_ids:
+                    if self.token_events is not None:
+                        output_events.append(
+                            (req.rid, commit.output_index, len(commit.token_ids))
+                        )
                     if first_ns is None:
                         first_ns = self.commit_ns
                     last_ns = self.commit_ns
@@ -49,11 +58,15 @@ class TimingMetadataOutput:
             }
             # Replace instead of mutating: an earlier IPC output may still hold it.
             setattr(req, _REQUEST_ATTRIBUTE, snapshot)
+        if self.token_events is not None and output_events:
+            self.token_events.record(self.commit_ns, output_events)
 
 
-def attach_timing_output(result, clock: Coordinator) -> None:
+def attach_timing_output(
+    result, clock: Coordinator, token_events: TokenEventRecorder | None = None
+) -> None:
     result.auxiliary_host_output = TimingMetadataOutput(
-        clock, clock.now_ns, result.auxiliary_host_output
+        clock, clock.now_ns, result.auxiliary_host_output, token_events
     )
 
 

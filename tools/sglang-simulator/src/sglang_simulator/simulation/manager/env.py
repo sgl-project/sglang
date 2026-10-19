@@ -7,6 +7,10 @@ logger = get_logger("sgl_simulator")
 
 class Envs:
     @classmethod
+    def token_events_path(cls) -> str | None:
+        return os.getenv("SGLANG_SIMULATOR_TOKEN_EVENTS") or None
+
+    @classmethod
     def coordinator_endpoint(cls) -> str | None:
         return os.getenv("SGLANG_SIMULATOR_COORDINATOR") or None
 

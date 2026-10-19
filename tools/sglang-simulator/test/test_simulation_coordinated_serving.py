@@ -256,6 +256,61 @@ def test_cancelled_requests_drain_the_running_batch(
         runner.shutdown()
 
 
+def test_native_decode_cancel_keeps_only_pre_cancel_output_tokens(
+    tmp_path, monkeypatch
+):
+    ledger = tmp_path / "token_events.jsonl"
+    monkeypatch.setenv("SGLANG_SIMULATOR_TOKEN_EVENTS", str(ledger))
+    runner, endpoint = _start_server(tmp_path / "cancel-ledger", monkeypatch)
+
+    async def run():
+        async with (
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session,
+            AsyncCoordinatorClient(endpoint) as client,
+        ):
+            task = asyncio.create_task(
+                _generate(session, runner.base_url, "running0", 61, output_length=4)
+            )
+            try:
+                timer = await client.request(
+                    Ready("cancel-ledger", 0, [Submit("running0")], 12 * MILLISECOND)
+                )
+                assert timer.now_ns == 12 * MILLISECOND
+                assert not timer.terminals
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                cancelled = await client.request(
+                    Ready("cancel-ledger", 1, [Cancel("running0")], finished=True)
+                )
+                assert [(t.kind, t.at_ns) for t in cancelled.terminals] == [
+                    ("CANCELLED", 12 * MILLISECOND)
+                ]
+                final = await client.request(
+                    Ready("cancel-ledger", 2, [], finished=True)
+                )
+                assert final.status == "FINISHED"
+                assert final.now_ns == 20 * MILLISECOND
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(run())
+        events = [json.loads(line) for line in ledger.read_text().splitlines()]
+        commits = [event for event in events if event["event"] == "output_commit"]
+        assert commits == [
+            {
+                "event": "output_commit",
+                "at_ns": 10 * MILLISECOND,
+                "commits": [{"rid": "running0", "output_index": 0, "token_count": 1}],
+            }
+        ]
+        assert events[-1]["status"] == "FINISHED"
+        assert events[-1]["total_output_tokens"] == 1
+    finally:
+        runner.shutdown()
+
+
 async def _cancel_middle_chunk(base_url, endpoint):
     tasks = []
     connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)

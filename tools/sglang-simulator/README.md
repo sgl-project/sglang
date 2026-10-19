@@ -435,3 +435,42 @@ Runtime changes should also be validated in a matching official SGLang image
 with both `OFFLINE` and `BLOCKING` modes. Predictor changes should report
 step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
+
+## Optional committed-output ledger
+
+For coordinated OFFLINE runs, set
+`SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain
+native visible output-token commits. The parent directory must exist and the
+file must be new. With the variable unset, the recorder is disabled and does no
+file I/O. Recording does not change virtual batch costs or scheduling.
+
+The JSONL stream starts with
+`{"event":"start","version":1,"clock":"virtual_ns"}`. Each output-producing
+batch writes an `output_commit` containing integer `at_ns` and `commits` entries
+with `rid`, zero-based `output_index`, and positive incremental `token_count`.
+Counts come from native visible output progression, including the first prefill
+token and multi-token commits. Empty/chunk-only/aborted results add no tokens.
+Previously committed tokens remain in the stream when their request is later
+cancelled. This measures output, not speculative or cancelled computation whose
+tokens were discarded before becoming visible.
+
+Only successful coordinator completion writes a `finish` footer containing
+`run_id`, integer `at_ns`, `status: "FINISHED"`, and `total_output_tokens`.
+Interrupted or failed streams have no success footer and must not be treated as
+complete results. Writes are flushed per batch; a write failure aborts the
+coordinated run. Existing files are never overwritten.
+
+The ledger contains no workload phases. A caller supplies exact integer virtual
+phase boundaries and request ownership separately. For fixed-duration throughput,
+sum the selected profiling requests' commits in `[start_ns, start_ns + duration_ns)`
+and divide by that configured duration, retaining output from requests later
+cancelled. Exclude warmup by request ownership as well as time: warmup completion
+and profiling start can share a timestamp. Report grace-period output and successful
+request latency cohorts separately. An early-ended measurement is incomplete and
+must not be presented as a full-duration throughput point. Legacy request statistics'
+requested `output_length` are not a substitute for this ledger.
+
+The AgentX reference output-token throughput counts output from successful
+profiling requests over their observed earliest-start/latest-end span. It uses a
+different output cohort and denominator; report it separately from fixed-window
+committed throughput.
