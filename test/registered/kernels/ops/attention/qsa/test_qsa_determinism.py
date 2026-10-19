@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
 
@@ -105,3 +106,7 @@ def test_qsa_prefill_batch_invariance() -> None:
             dim**-0.5,
         )
         torch.testing.assert_close(actual[:seq], reference, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

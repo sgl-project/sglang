@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Iterator
 
 import pytest
@@ -52,3 +53,7 @@ def test_shared_expert_gate_batch_invariance(dtype: torch.dtype) -> None:
             hidden.repeat(copies, 1), weight, shared.repeat(copies, 1), output
         )
         torch.testing.assert_close(output[:256], reference, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
