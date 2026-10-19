@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import (
 _hip = None
 
 
-def _hip_lib():
+def hip_lib():
     global _hip
     if _hip is None:
         # Bind to the HIP runtime torch already mapped. ROCm 10 ships a second
@@ -39,18 +39,18 @@ def _hip_lib():
     return _hip
 
 
-def _check(rc, what):
+def check_hip(rc, what):
     if rc != 0:
         raise RuntimeError(
-            f"smallm_moe: {what} failed: {rc} ({_hip_lib().hipGetErrorString(rc).decode()})"
+            f"smallm_moe: {what} failed: {rc} ({hip_lib().hipGetErrorString(rc).decode()})"
         )
 
 
-class _Kernel:
+class HipKernel:
     def __init__(self, mod, name):
         self.fn = ctypes.c_void_p()
-        _check(
-            _hip_lib().hipModuleGetFunction(ctypes.byref(self.fn), mod, name.encode()),
+        check_hip(
+            hip_lib().hipModuleGetFunction(ctypes.byref(self.fn), mod, name.encode()),
             f"hipModuleGetFunction {name}",
         )
 
@@ -63,8 +63,8 @@ class _Kernel:
             ctypes.cast(ctypes.byref(size), ctypes.c_void_p).value,
             3,
         )
-        _check(
-            _hip_lib().hipModuleLaunchKernel(
+        check_hip(
+            hip_lib().hipModuleLaunchKernel(
                 self.fn,
                 grid,
                 1,
@@ -81,11 +81,11 @@ class _Kernel:
         )
 
 
-def _hipcc():
+def hipcc_path():
     return os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
 
 
-def _hip_version():
+def hip_version():
     if torch.version.hip:
         return tuple(int(x) for x in torch.version.hip.split("-")[0].split(".")[:3])
     return (0, 0, 0)

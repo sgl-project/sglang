@@ -24,11 +24,11 @@ import tempfile
 import torch
 
 from sglang.kernels.jit.utils.hipcc import (
-    _check,
-    _hip_lib,
-    _hip_version,
-    _hipcc,
-    _Kernel,
+    HipKernel,
+    check_hip,
+    hip_lib,
+    hip_version,
+    hipcc_path,
 )
 from sglang.srt.environ import envs
 
@@ -102,15 +102,15 @@ def smallm_moe_enabled() -> bool:
             arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         _available = (
             arch == "gfx950"
-            and _hip_version() >= (7, 2, 0)
-            and os.path.exists(_hipcc())
+            and hip_version() >= (7, 2, 0)
+            and os.path.exists(hipcc_path())
         )
         if not _available:
             logger.info(
                 "smallm_moe not enabled (arch=%r, hip=%s, hipcc=%s); aiter fused_moe stays in use",
                 arch,
-                _hip_version(),
-                os.path.exists(_hipcc()),
+                hip_version(),
+                os.path.exists(hipcc_path()),
             )
     return _available and _disabled_reason is None
 
@@ -135,7 +135,7 @@ def _get_kernels(inter: int, pre: str):
             try:
                 subprocess.run(
                     [
-                        _hipcc(),
+                        hipcc_path(),
                         "--genco",
                         "--offload-arch=gfx950",
                         "-O3",
@@ -152,8 +152,8 @@ def _get_kernels(inter: int, pre: str):
                 _disable(f"hipcc failed: {detail.strip()[-400:]}")
             mod = ctypes.c_void_p()
             try:
-                _check(
-                    _hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
+                check_hip(
+                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
                     "hipModuleLoad",
                 )
             except RuntimeError as e:
@@ -163,9 +163,9 @@ def _get_kernels(inter: int, pre: str):
         mod = _kernels["_mod"]
         try:
             kk = {
-                "p1": _Kernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
+                "p1": HipKernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
                 "p2": {
-                    sl: _Kernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
+                    sl: HipKernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
                     for sl in (10, 11)
                 },
             }
