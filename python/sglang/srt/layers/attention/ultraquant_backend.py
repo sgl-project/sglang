@@ -125,10 +125,6 @@ class UltraQuantAttnBackend(TritonAttnBackend):
             self.min_kv_splits = self.max_kv_splits
 
         self._verify_pool_recipe()
-        # These layers hold plain K/V, so the stock Triton path serves them.
-        self.full_precision_layers = (
-            self._ultraquant_pool().quant_method.full_precision_layers
-        )
 
         # E2M1 times a power of two dequantizes exactly into E4M3, so where
         # aiter's FP8 prefill kernel covers the shape the dense run is FP8.
@@ -380,10 +376,6 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         aux_tensors=None,
     ):
         self._reject_unsupported(layer, score_mod, aux_tensors, "decode")
-        if layer.layer_id in self.full_precision_layers:
-            return super().forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache, sinks
-            )
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         o = torch.empty_like(q)
@@ -485,10 +477,6 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         aux_tensors=None,
     ):
         self._reject_unsupported(layer, score_mod, aux_tensors, "extend")
-        if layer.layer_id in self.full_precision_layers:
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, sinks
-            )
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         o = torch.empty_like(q)
