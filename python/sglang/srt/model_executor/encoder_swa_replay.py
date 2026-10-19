@@ -214,9 +214,6 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         fold_off += r + n
 
     folded = copy(batch)
-    # Keep each request's multimodal inputs and absolute image offsets. The
-    # model embeds the expanded [prefix, prefix + extend) range, including
-    # replay rows that start inside a cached image span.
     folded.input_ids = torch.cat(ids)
     folded.out_cache_loc = torch.cat(locs)
     folded.prefill_input_ids_cpu = (
