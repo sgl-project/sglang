@@ -669,6 +669,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
+        enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=enable_metrics),
         metrics_collector=SimpleNamespace(
             observe_decode_deferred_kv_release=MagicMock()
@@ -974,6 +975,58 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
         self.assertEqual(released, [entry])
         self.assertEqual(q._deferred_releases, [])
+
+
+class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
+    """Under HiSparse the transfer writes into the coordinator's host pages."""
+
+    def _queue(self, mgr, log):
+        q = _make_pop_queue(mgr)
+        q.scheduler.enable_hisparse = True
+        q.scheduler.hisparse_coordinator = SimpleNamespace(
+            request_finished=lambda req: log.append(("hisparse", req.rid))
+        )
+        return q
+
+    def _pop_and_resolve(self, q, mgr, room, log):
+        release = lambda req, *args, **kwargs: log.append(("kv", req.rid))
+        with (
+            patch.object(decode_mod, "prepare_abort"),
+            patch.object(decode_mod, "release_kv_cache", side_effect=release),
+        ):
+            q.pop_transferred()
+            at_failure = list(log)
+            generation = mgr.register_deferred_abort_room(room)
+            for prefill_rank in (0, 1):
+                mgr.note_abort_ack(room, prefill_rank, generation)
+            q.resolve_deferred_releases()
+        return at_failure
+
+    def test_deferred_failure_keeps_the_destination_until_release(self):
+        mgr = _make_manager()
+        log = []
+        q = self._queue(mgr, log)
+        q.queue = [_make_failed_req(mgr, room=12, idx=6, abort_notified=False)]
+
+        at_failure = self._pop_and_resolve(q, mgr, 12, log)
+
+        self.assertEqual(at_failure, [])
+        self.assertEqual(log, [("hisparse", "r12"), ("kv", "r12")])
+
+    def test_immediate_failure_frees_the_destination_once(self):
+        mgr = _make_manager()
+        log = []
+        q = self._queue(mgr, log)
+        q.queue = [
+            _make_failed_req(
+                mgr, room=13, idx=7, abort_notified=False, notifiable=False
+            )
+        ]
+
+        at_failure = self._pop_and_resolve(q, mgr, 13, log)
+
+        self.assertEqual(at_failure, [("hisparse", "r13"), ("kv", "r13")])
+        self.assertEqual(log, at_failure)
 
 
 class TestBackendOptIn(CustomTestCase):
