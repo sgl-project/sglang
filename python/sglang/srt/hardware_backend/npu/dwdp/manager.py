@@ -76,23 +76,17 @@ class NPUDwdpManager(DwdpPrefetch):
         for li, layer in layers:
             if layer.moe_ep_size != self.dwdp_size or layer.moe_tp_size != 1:
                 raise ValueError("NPU DWDP requires EP=DWDP=TP and MoE TP=1")
-            if layer.num_global_routed_experts % self.dwdp_size:
-                raise ValueError("NPU DWDP expert count must be divisible by dwdp_size")
             for name in _WEIGHTS:
                 kernel = type(getattr(layer, name.replace("_weight", "_kernel"), None))
-                if kernel not in supported:
-                    raise ValueError(
-                        "NPU DWDP supports unquantized BF16/FP16 or W8A8 INT8 MoE only"
-                    )
                 weight = getattr(layer, name, None)
                 if (
                     not isinstance(weight, torch.Tensor)
                     or weight.device != self.device
-                    or weight.dtype not in supported[kernel]
+                    or weight.dtype not in supported.get(kernel, ())
                     or weight.ndim != 3
                 ):
                     raise ValueError(
-                        f"NPU DWDP layer {li}: incompatible device/dtype/shape for {name}"
+                        f"NPU DWDP layer {li}: incompatible kernel/device/dtype/shape for {name}"
                     )
                 if weight.shape[0] * self.dwdp_size != layer.num_global_routed_experts:
                     raise ValueError(
@@ -275,9 +269,7 @@ class NPUDwdpManager(DwdpPrefetch):
             self._specs,
             self._weights,
             self._exports,
-            self._peer_views,
             self._peer_ranges,
-            self._remote_slices,
         ):
             data.clear()
         self._state = "closed"

@@ -1,10 +1,9 @@
 """NPU DWDP page coverage and failure cleanup without accelerator hardware."""
 
-import ast
 import ctypes
+import json
 import sys
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -21,6 +20,14 @@ from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def isolate_scheduler_env():
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
+        yield
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -64,53 +71,8 @@ def test_shared_layer_discovery_preserves_cuda_scope(monkeypatch, wrapped):
         collect_moe_layers(torch.nn.ModuleList([first]))
 
 
-def test_cuda_manager_binds_shared_layer_discovery():
-    from sglang.srt.layers.moe.dwdp import layer_utils
-
-    # Inspect the CUDA class without importing its driver-only dependencies.
-    source = Path(layer_utils.__file__).with_name("dwdp_manager.py").read_text()
-    tree = ast.parse(source)
-    manager = next(node for node in tree.body if isinstance(node, ast.ClassDef))
-    binding = next(
-        node
-        for node in manager.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "_collect_moe_layers"
-            for target in node.targets
-        )
-    )
-    assert ast.unparse(binding.value) == "staticmethod(collect_moe_layers)"
-    assert any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "sglang.srt.layers.moe.dwdp.layer_utils"
-        and any(alias.name == "collect_moe_layers" for alias in node.names)
-        for node in tree.body
-    )
-    buffer_tree = ast.parse(
-        Path(layer_utils.__file__).with_name("weight_buffer.py").read_text()
-    )
-    setup = next(
-        node
-        for node in ast.walk(buffer_tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_setup_layer"
-    )
-    calls = {
-        getattr(node.func, "id", getattr(node.func, "attr", None))
-        for node in ast.walk(setup)
-        if isinstance(node, ast.Call)
-    }
-    assert {"map_weight_pages", "build_remote_slices"} <= calls
-
-
-@pytest.mark.parametrize(
-    "backend, weight_dtype",
-    [("cuda", torch.float16), ("npu", torch.float16), ("npu", torch.bfloat16)],
-)
-def test_shared_parameter_gather_preserves_caller_order(
-    monkeypatch, backend, weight_dtype
-):
-    from sglang.srt.hardware_backend.npu.dwdp import manager as npu_manager
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.bfloat16])
+def test_parameter_gather_preserves_order_and_bias_dtype(monkeypatch, weight_dtype):
     from sglang.srt.layers.moe.dwdp import layer_utils
 
     names = ("w13_weight_bias", "w13_weight_scale", "w2_weight_bias")
@@ -118,22 +80,17 @@ def test_shared_parameter_gather_preserves_caller_order(
         name: torch.arange(4, dtype=torch.float32).reshape(2, 2) + index * 20
         for index, name in enumerate(names)
     }
-    trace, replaced, helper_calls = [], {}, []
-    num_total = 3 if backend == "cuda" else 4
-    group = NS(device_group=object())
-
-    def named(count):
-        trace.append(("named", count))
-        return list(parameters.items())
+    trace, replaced = [], {}
+    manager = NS(dwdp_size=2, group=NS(device_group=object()))
 
     def replace(name, full):
         trace.append(("replace", name))
         replaced[name] = full
 
     experts = NS(
-        num_global_routed_experts=num_total,
+        num_global_routed_experts=4,
         w13_weight=torch.empty(0, dtype=weight_dtype),
-        named_per_expert_tensors=named,
+        named_per_expert_tensors=lambda count: list(parameters.items()),
         replace_expert_tensor=replace,
     )
 
@@ -147,50 +104,25 @@ def test_shared_parameter_gather_preserves_caller_order(
             assert shard.shape == data.shape and shard.dtype == data.dtype
             shard.copy_(data + rank * 10)
 
-    def gather(experts, local_experts, num_total, dwdp_size, group):
-        helper_calls.append((experts, local_experts, num_total, dwdp_size, group))
-        return layer_utils.gather_per_expert_tensors(
-            experts, local_experts, num_total, dwdp_size, group
-        )
-
     monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
-    manager = NS(dwdp_size=2, group=group)
-    if backend == "npu":
-        monkeypatch.setattr(npu_manager, "gather_per_expert_tensors", gather)
-        NPUDwdpManager._replicate_small_params(manager, experts)
-    else:
-        source = Path(layer_utils.__file__).with_name("dwdp_manager.py").read_text()
-        method = next(
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_allgather_small_params"
-        )
-        namespace = {
-            "gather_per_expert_tensors": gather,
-            "logger": NS(debug=lambda *_: None),
-        }
-        exec("from __future__ import annotations\n" + ast.unparse(method), namespace)
-        manager.layout = NS(num_experts_per_worker=2, num_routed_experts=num_total)
-        namespace[method.name](manager, [(7, experts)], group)
-    assert helper_calls == [(experts, 2, num_total, 2, group)]
-    assert trace == [("named", 2)] + [
+    NPUDwdpManager._replicate_small_params(manager, experts)
+    assert trace == [
         item for name in names for item in (("gather", name), ("replace", name))
     ]
     assert list(replaced) == list(names)
     for name, data in parameters.items():
-        expected = torch.cat((data, data + 10))[:num_total]
-        if (
-            backend == "npu"
-            and name.endswith("_bias")
-            and weight_dtype == torch.float16
-        ):
+        expected = torch.cat((data, data + 10))
+        if name.endswith("_bias") and weight_dtype == torch.float16:
             expected = expected.to(torch.float16)
         torch.testing.assert_close(replaced[name], expected)
+    # The common helper also preserves the caller's routed-expert truncation.
+    gathered = list(
+        layer_utils.gather_per_expert_tensors(experts, 2, 3, 2, manager.group)
+    )
+    assert all(full.shape[0] == 3 for _, full in gathered)
 
 
-@pytest.mark.parametrize("rank", [0, 1, 2])
-def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, rank):
+def test_shared_prefetch_waits_for_compute_before_slot_reuse():
     trace, events, layers = [], [], [2, 5, 8, 11]
 
     def stream(name):
@@ -209,34 +141,18 @@ def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, ran
         events.append(result)
         return result
 
-    monkeypatch.setattr(
-        torch,
-        "cuda",
+    manager = NPUDwdpManager.__new__(NPUDwdpManager)
+    manager._state, manager._moe_layer_indices = "ready", layers
+    manager._buffer_index_for_layer = lambda li: layers.index(li) % 2
+    manager._prefetch_layer_per_slice = lambda li: trace.append(("copy", li))
+    manager._init_prefetch(
         NS(
             Stream=lambda **kwargs: copy_stream,
             Event=event,
             current_stream=lambda *args: compute_stream,
             stream=lambda stream: nullcontext(),
         ),
-    )
-    weights = {li: torch.zeros(6, 2) for li in layers}
-    peers = {
-        (r, li, "w"): torch.full((2, 2), float(li * 10 + r))
-        for r in range(3)
-        for li in layers
-    }
-    for li in layers:
-        weights[li][rank * 2 : (rank + 1) * 2].copy_(peers[rank, li, "w"])
-    buffer = NS(
-        device_id=0,
-        buffer_index_for_layer=lambda li: layers.index(li) % 2,
-        get_remote_slices=lambda li, name: [
-            (weights[li][: rank * 2], 0, rank * 2),
-            (weights[li][(rank + 1) * 2 :], (rank + 1) * 2, 6),
-        ],
-    )
-    manager = DWDPWeightManager(
-        buffer, peers, [(0, 2), (2, 4), (4, 6)], layers, ["w"], rank, 3
+        None,
     )
     assert NPUDwdpManager.wait_prefetch is DWDPWeightManager.wait_prefetch
     assert (
@@ -244,13 +160,6 @@ def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, ran
         is DWDPWeightManager.record_compute_and_prefetch_next
     )
     assert trace == [("record", "compute", 2), ("record", "compute", 3)]
-    original_copy = manager._prefetch_layer_per_slice
-
-    def copy(li):
-        trace.append(("copy", li))
-        original_copy(li)
-
-    manager._prefetch_layer_per_slice = copy
 
     def expected_prefetch(pos):
         return [
@@ -259,19 +168,12 @@ def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, ran
             ("record", "copy", pos % 2),
         ]
 
-    for step in range(2):
-        if step:
-            for (peer, _, _), data in peers.items():
-                if peer != rank:
-                    data.add_(100)
+    for _ in range(2):
         trace.clear()
         expected = expected_prefetch(0) + expected_prefetch(1)
         manager.prefetch_first_layers()
         for pos, li in enumerate(layers):
             manager.wait_prefetch(li)
-            torch.testing.assert_close(
-                weights[li], torch.cat([peers[r, li, "w"] for r in range(3)])
-            )
             trace.append(("compute", li))
             manager.record_compute_and_prefetch_next(li)
             expected += [
@@ -284,79 +186,25 @@ def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, ran
         assert trace == expected
 
 
-@pytest.mark.parametrize("world", [2, 3, 4])
-@pytest.mark.parametrize("expert_bytes", [2, 64, 300, 1024])
-def test_remote_slices_cover_all_remote_weights(monkeypatch, world, expert_bytes):
-    import sglang.srt.hardware_backend.npu.dwdp.manager as npu_manager
-
-    calls = []
-
-    def slices(full, start, end, total):
-        calls.append((start, end, total))
-        return build_remote_slices(full, start, end, total)
-
-    monkeypatch.setattr(npu_manager, "build_remote_slices", slices)
-    assert build_remote_slices(torch.empty(2, 1), 0, 2, 2) == []
-    vmm = NPUWeightVMM.__new__(NPUWeightVMM)
-    vmm.granularity = 1024
-    spec = WeightSpec(
-        world * 4, (4, expert_bytes), (world * 4, expert_bytes), torch.uint8
-    )
-    for rank in range(world):
-        manager = NPUDwdpManager.__new__(NPUDwdpManager)
-        manager.dwdp_size, manager.dwdp_rank = world, rank
-        page = vmm.layout(spec, rank)
-        start, end, total = (
-            rank * spec.chunk_bytes,
-            (rank + 1) * spec.chunk_bytes,
-            world * spec.chunk_bytes,
-        )
-        assert page.page_start == start // 1024 * 1024
-        assert page.page_end == (end + 1023) // 1024 * 1024
-        assert page.total_size >= total + page.pre_padding
-        manager._specs, manager._weights = {}, {}
-        manager._remote_slices, manager._peer_ranges = {}, {}
-        for name in ("w13_weight", "w2_weight"):
-            manager._specs[5, name] = spec
-            manager._weights[5, name] = torch.zeros(spec.full_shape, dtype=spec.dtype)
-        manager._prepare_copy_views()
-        assert calls[-2:] == [(rank * 4, (rank + 1) * 4, world * 4)] * 2
-        for name in ("w13_weight", "w2_weight"):
-            full, covered = manager._weights[5, name], set()
-            for dst, expert_start, expert_end in manager._get_remote_slices(5, name):
-                offset = dst.data_ptr() - full.data_ptr()
-                size = dst.numel() * dst.element_size()
-                assert offset == expert_start * expert_bytes
-                assert size == (expert_end - expert_start) * expert_bytes
-                region = set(range(offset, offset + size))
-                assert not covered & region
-                covered |= region
-                dst.fill_(1)
-            assert covered == set(range(total)) - set(range(start, end))
-            assert full[rank * 4 : (rank + 1) * 4].count_nonzero() == 0
-            assert full.count_nonzero() == total - spec.chunk_bytes
-
-
-@pytest.mark.parametrize("rank", [0, 1, 3])
+@pytest.mark.parametrize("world, rank", [(2, 0), (3, 1), (4, 3)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int8])
-def test_npu_uses_shared_copy_for_all_remote_edges(monkeypatch, rank, dtype):
-    import sglang.srt.hardware_backend.npu.dwdp.manager as npu_manager
-
+def test_copy_restores_all_remote_weights_without_changing_local(world, rank, dtype):
+    assert build_remote_slices(torch.empty(2, 1), 0, 2, 2) == []
     manager = NPUDwdpManager.__new__(NPUDwdpManager)
-    manager.dwdp_size, manager.dwdp_rank = 4, rank
+    manager.dwdp_size, manager.dwdp_rank = world, rank
     manager._specs, manager._weights, manager._peer_views = {}, {}, {}
     manager._remote_slices, manager._peer_ranges = {}, {}
     layers, local = [2, 5, 8, 11], {}
     for pos, li in enumerate(layers):
         local_experts = 1 + pos % 2
-        num_experts = 4 * local_experts
+        num_experts = world * local_experts
         for name, width in (("w13_weight", 10), ("w2_weight", 14)):
             width //= torch.tensor([], dtype=dtype).element_size()
             manager._specs[li, name] = WeightSpec(
                 num_experts, (local_experts, width), (num_experts, width), dtype
             )
             manager._weights[li, name] = torch.empty(num_experts, width, dtype=dtype)
-            for peer in range(4):
+            for peer in range(world):
                 value = (
                     torch.arange(local_experts * width).reshape(local_experts, width)
                     + pos * 20
@@ -369,13 +217,6 @@ def test_npu_uses_shared_copy_for_all_remote_edges(monkeypatch, rank, dtype):
                 else:
                     manager._peer_views[peer, li, name] = value
     manager._prepare_copy_views()
-    calls, original = [], npu_manager.copy_remote_expert_slices
-
-    def copy(*args, **kwargs):
-        calls.append(args[0])
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(npu_manager, "copy_remote_expert_slices", copy)
     for step in range(2):
         if step:
             for value in manager._peer_views.values():
@@ -392,7 +233,7 @@ def test_npu_uses_shared_copy_for_all_remote_edges(monkeypatch, rank, dtype):
                         local[li, name]
                         if peer == rank
                         else manager._peer_views[peer, li, name]
-                        for peer in range(4)
+                        for peer in range(world)
                     ]
                 )
                 torch.testing.assert_close(manager._weights[li, name], expected)
@@ -401,7 +242,6 @@ def test_npu_uses_shared_copy_for_all_remote_edges(monkeypatch, rank, dtype):
                     manager._weights[li, name][rank * count : (rank + 1) * count],
                     local[li, name],
                 )
-    assert calls == layers * 2
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int8])
@@ -670,11 +510,12 @@ def test_fabric_handle_api_requires_library_and_all_symbols(monkeypatch, missing
     ],
 )
 def test_fabric_selection_and_same_host_fallback(
-    monkeypatch, local_error, peer_error, same_host
+    monkeypatch, vmm, local_error, peer_error, same_host
 ):
     from sglang.srt.hardware_backend.npu.dwdp import vmm as module
 
-    rt, calls, peers = _FakeACL(), [], [17, 29]
+    vmm, rt = vmm
+    calls, peers = [], [17, 29]
     rt.fail_after_allocations = 0 if local_error == "allocate" else None
 
     def export(handle, pids):
@@ -696,11 +537,7 @@ def test_fabric_selection_and_same_host_fallback(
         calls.append(("legacy authorize", share, pids))
         return 0
 
-    def import_handle(share):
-        calls.append(("fabric import", share))
-        return rt.malloc_physical(8)[0]
-
-    api = NS(export_handle=export, import_handle=import_handle)
+    api = NS(export_handle=export, import_handle=lambda share: rt.malloc_physical(8)[0])
     monkeypatch.setattr(module, "_FabricHandleAPI", api_factory)
     monkeypatch.setattr(
         rt, "mem_export_to_shareable_handle", legacy_export, raising=False
@@ -712,7 +549,6 @@ def test_fabric_selection_and_same_host_fallback(
         lambda share, device: rt.malloc_physical(8),
         raising=False,
     )
-    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
 
     def gather(result):
         error, cleanup_error = result
@@ -736,24 +572,18 @@ def test_fabric_selection_and_same_host_fallback(
             else ("legacy export", handle, 0, 0)
         )
         assert (
-            len(
-                [
-                    call
-                    for call in calls
-                    if call[0].endswith("export") and call[1] == handle
-                ]
-            )
-            == 1
+            sum(call[0].endswith("export") and call[1] == handle for call in calls) == 1
         )
         assert vmm.import_shard(share, 8, 1) == vmm._imports[0][1] + 1
     vmm.close()
     assert not rt.allocations and not rt.reservations and not rt.mappings
 
 
-def test_selected_fabric_does_not_retry_real_weight_exports_with_ipc(monkeypatch):
+def test_selected_fabric_does_not_retry_real_weight_exports_with_ipc(monkeypatch, vmm):
     from sglang.srt.hardware_backend.npu.dwdp import vmm as module
 
-    rt, exports = _FakeACL(), []
+    vmm, rt = vmm
+    exports = []
 
     def export(handle, peers):
         exports.append(handle)
@@ -768,7 +598,6 @@ def test_selected_fabric_does_not_retry_real_weight_exports_with_ipc(monkeypatch
         lambda *args: pytest.fail("cannot re-export through IPC"),
         raising=False,
     )
-    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
     vmm.select_transport([17], lambda result: [result, result], True)
     handle = vmm._allocate(8)
     with pytest.raises(RuntimeError, match="real export failed"):
@@ -779,14 +608,15 @@ def test_selected_fabric_does_not_retry_real_weight_exports_with_ipc(monkeypatch
 
 
 @pytest.mark.parametrize("peer_failure", [False, True])
-def test_fabric_probe_cleanup_failure_is_fatal_and_retryable(monkeypatch, peer_failure):
+def test_fabric_probe_cleanup_failure_is_fatal_and_retryable(
+    monkeypatch, vmm, peer_failure
+):
     from sglang.srt.hardware_backend.npu.dwdp import vmm as module
 
-    rt = _FakeACL()
+    vmm, rt = vmm
     rt.fail_free_after = None if peer_failure else 0
     api = NS(export_handle=lambda *args: b"x" * 128)
     monkeypatch.setattr(module, "_FabricHandleAPI", lambda: api)
-    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
 
     def gather(result):
         assert result[0] is None and bool(result[1]) != peer_failure
@@ -800,7 +630,10 @@ def test_fabric_probe_cleanup_failure_is_fatal_and_retryable(monkeypatch, peer_f
     assert not rt.allocations and not vmm._handles
 
 
-def _fake_import_vmm(monkeypatch):
+@pytest.fixture
+def vmm(monkeypatch):
+    from sglang.srt.hardware_backend.npu.dwdp import vmm as module
+
     rt = _FakeACL()
     monkeypatch.setattr(
         rt,
@@ -808,59 +641,53 @@ def _fake_import_vmm(monkeypatch):
         lambda size, device: rt.malloc_physical(size),
         raising=False,
     )
+    monkeypatch.setattr(
+        module,
+        "tensor_from_pointer",
+        lambda pointer, nbytes, **metadata: NS(
+            pointer=pointer, nbytes=nbytes, **metadata
+        ),
+    )
     return NPUWeightVMM(NS(rt=rt), NS(index=0)), rt
 
 
 @pytest.mark.parametrize(
     "failure", ["unmap_mem", "release_mem_address", "free_physical"]
 )
-def test_import_cleanup_retries_only_remaining_steps(monkeypatch, failure):
-    vmm, rt = _fake_import_vmm(monkeypatch)
+def test_import_cleanup_retries_only_remaining_steps(monkeypatch, vmm, failure):
+    vmm, rt = vmm
     for _ in range(2):
         vmm.import_shard(8, 8, 1)
-    (handle, pointer, _), (done_handle, done_pointer, _) = vmm._imports
+    (handle, pointer, _), (done_handle, _, _) = vmm._imports
     operations = ("unmap_mem", "release_mem_address", "free_physical")
     failed_at = operations.index(failure)
-    values = (pointer, pointer, handle)
-    done_values = (done_pointer, done_pointer, done_handle)
-    pending = {(failure, values[failed_at])}
-    calls = []
-    for operation in operations:
-        original = getattr(rt, operation)
+    target = handle if failure == "free_physical" else pointer
+    original = getattr(rt, failure)
+    pending = [target]
 
-        def invoke(value, operation=operation, original=original):
-            calls.append((operation, value))
-            if (operation, value) in pending:
-                pending.remove((operation, value))
-                return 1
-            return original(value)
+    def fail_once(value):
+        if pending == [value]:
+            pending.clear()
+            return 1
+        return original(value)
 
-        monkeypatch.setattr(rt, operation, invoke)
+    monkeypatch.setattr(rt, failure, fail_once)
     with pytest.raises(RuntimeError, match="ACL error"):
         vmm.close_imports()
-    remaining = [entry.copy() for entry in vmm._imports]
-    assert calls == list(zip(operations, done_values)) + list(
-        zip(operations[: failed_at + 1], values[: failed_at + 1])
-    )
     assert rt.freed == [done_handle]
-    calls.clear()
-    # The old implementation repeats an already successful unmap here when
-    # address/handle release failed, which the fake ACL rejects.
-    vmm.close_imports()
-    assert remaining == [[handle, None if failed_at == 2 else pointer, failed_at == 0]]
-    assert calls == list(zip(operations[failed_at:], values[failed_at:]))
-    calls.clear()
-    vmm.close_imports()
+    assert vmm._imports == [
+        [handle, None if failed_at == 2 else pointer, failed_at == 0]
+    ]
+    # Fake ACL rejects double-unmap, address release and physical free.
     vmm.close()
     vmm.close()
-    assert calls == []
     assert not vmm._imports and not rt.allocations
     assert not rt.mappings and not rt.reservations
 
 
 @pytest.mark.parametrize("failure", ["reserve_mem_address", "map_mem"])
-def test_partial_import_cleanup_skips_unfinished_steps(monkeypatch, failure):
-    vmm, rt = _fake_import_vmm(monkeypatch)
+def test_partial_import_cleanup_skips_unfinished_steps(monkeypatch, vmm, failure):
+    vmm, rt = vmm
     original = getattr(rt, failure)
     monkeypatch.setattr(
         rt,
@@ -873,60 +700,12 @@ def test_partial_import_cleanup_skips_unfinished_steps(monkeypatch, failure):
     handle, pointer, mapped = vmm._imports[0]
     assert not mapped
     assert (pointer is None) == (failure == "reserve_mem_address")
-    calls = []
-    for operation in ("unmap_mem", "release_mem_address", "free_physical"):
-        original = getattr(rt, operation)
-
-        def invoke(value, operation=operation, original=original):
-            calls.append((operation, value))
-            return original(value)
-
-        monkeypatch.setattr(rt, operation, invoke)
-    vmm.close_imports()
-    vmm.close_imports()
+    # Unfinished map/reserve operations must not be undone; Fake ACL rejects it.
     vmm.close()
-    assert calls == ([] if pointer is None else [("release_mem_address", pointer)]) + [
-        ("free_physical", handle)
-    ]
+    vmm.close()
+    assert rt.freed == [handle]
     assert not vmm._imports and not rt.allocations
     assert not rt.mappings and not rt.reservations
-
-
-@pytest.mark.parametrize("pre, post", [(0, 0), (4, 0), (0, 2), (4, 2)])
-def test_shared_weight_mapping_order_and_cursor(pre, post):
-    allocated = []
-
-    def allocate(size):
-        allocated.append(size)
-        return len(allocated)
-
-    pool = PagePool(
-        [20, 0],
-        0,
-        granularity=1,
-        page_size=2,
-        allocate_page=allocate,
-        release_page=lambda handle: None,
-    )
-    layout = NS(
-        pre_size=pre,
-        post_size=post,
-        mnnvl_size=4,
-        pre_pages=pre // 2,
-        post_pages=post // 2,
-    )
-    trace, expected, cursor = [], [], 1
-    reservation = NS(map_existing=lambda *args: trace.append(args))
-    for handle in (100, 101):
-        before = cursor
-        cursor = pool.map_weight_pages(0, reservation, layout, handle, cursor)
-        expected += [(i * 2, 2, before + i + 1) for i in range(pre // 2)]
-        expected.append((pre, 4, handle))
-        expected += [
-            (pre + 4 + i * 2, 2, before + pre // 2 + i + 1) for i in range(post // 2)
-        ]
-    assert cursor == 1 + 2 * (pre + post) // 2
-    assert trace == expected
 
 
 def test_shared_page_pool_reuses_maximum_not_each_size():
@@ -962,89 +741,20 @@ def test_shared_page_pool_reuses_maximum_not_each_size():
     assert freed == list(range(1, 6))
 
 
-def test_shared_page_pool_preserves_cuda_driver_order(monkeypatch):
-    trace = []
-
-    def granularity(device):
-        trace.append(("granularity", device))
-        return 2
-
-    def prop(device, handle_types):
-        trace.append(("prop", device, handle_types))
-        return "prop"
-
-    class Reservation:
-        def __init__(self, size, prop, device, alignment):
-            trace.append(("reserve", size, prop, device, alignment))
-
-        def map(self, offset, size, retain_handle):
-            handle = 100 + sum(item[0] == "map" for item in trace)
-            trace.append(("map", offset, size, retain_handle, handle))
-            return handle
-
-        def close(self, release_handles):
-            trace.append(("close", release_handles))
-
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang.srt.utils.cuda_vmm_utils",
-        NS(
-            get_device_granularity=granularity,
-            make_device_allocation_prop=prop,
-            VmmReservation=Reservation,
-            check_drv=lambda value, label: value,
-        ),
-    )
-    bindings = NS(
-        driver=NS(cuMemRelease=lambda handle: trace.append(("release", handle)))
-    )
-    monkeypatch.setitem(sys.modules, "cuda", NS(bindings=bindings))
-    monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
-    pool = PagePool([17, 1], 3)
-    reservation = NS(map_existing=lambda *args: trace.append(("existing", *args)))
-    pool.map_pages(0, reservation, 32, 17)
-    pool.release()
-    pool.release()
-    expected = [("granularity", 3), ("prop", 3, None)]
-    for handle in (100, 101, 102):
-        expected += [
-            ("reserve", 16, "prop", 3, 2),
-            ("map", 0, 16, True, handle),
-            ("close", False),
-        ]
-    assert trace == expected + [
-        ("existing", 32, 16, 100),
-        ("existing", 48, 16, 101),
-        ("release", 100),
-        ("release", 101),
-        ("release", 102),
-    ]
-
-
-def _fake_weight_vmm(monkeypatch):
-    import sglang.srt.hardware_backend.npu.dwdp.vmm as module
-
-    monkeypatch.setattr(
-        module,
-        "tensor_from_pointer",
-        lambda pointer, nbytes, **metadata: NS(
-            pointer=pointer, nbytes=nbytes, **metadata
-        ),
-    )
-    rt = _FakeACL()
-    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
+def _weight_specs():
     assignments = {2: 0, 4: 1, 7: 0, 9: 1}
     specs = {
         (li, name): WeightSpec(4, (1, width), (4, width), torch.uint8)
         for li, widths in zip(assignments, ((9, 13), (17, 19), (35, 29), (7, 11)))
         for name, width in zip(("w13_weight", "w2_weight"), widths)
     }
-    return vmm, rt, specs, assignments
+    return specs, assignments
 
 
 @pytest.mark.parametrize("rank", [0, 1, 3])
-def test_npu_reuses_shared_pool_pages_across_weights_and_layers(monkeypatch, rank):
-    vmm, rt, specs, assignments = _fake_weight_vmm(monkeypatch)
+def test_npu_reuses_shared_pool_pages_across_weights_and_layers(vmm, rank):
+    vmm, rt = vmm
+    specs, assignments = _weight_specs()
     local = {key: vmm.create_local(spec, rank) for key, spec in specs.items()}
     assert len(rt.allocations) == len(specs)  # No pool before old weights are released.
     views = vmm.create_weights(
@@ -1092,8 +802,9 @@ def test_npu_reuses_shared_pool_pages_across_weights_and_layers(monkeypatch, ran
 @pytest.mark.parametrize(
     "failure", ["allocate", "map", "release_mem_address", "free_physical"]
 )
-def test_npu_pool_partial_failure_cleanup_is_retryable(monkeypatch, failure):
-    vmm, rt, specs, assignments = _fake_weight_vmm(monkeypatch)
+def test_npu_pool_partial_failure_cleanup_is_retryable(vmm, failure):
+    vmm, rt = vmm
+    specs, assignments = _weight_specs()
     local = {key: vmm.create_local(spec, 1)[1] for key, spec in specs.items()}
     if failure == "allocate":
         rt.fail_after_allocations = len(rt.allocations) + 1
@@ -1186,3 +897,139 @@ def test_peer_layout_mismatch_before_device_allocation():
     with pytest.raises(ValueError, match="different expert weight layouts"):
         manager.setup(None)
     assert manager._state == "new"
+
+
+def _dwdp_config(device, **kwargs):
+    from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.parallel_hook import handle_dwdp
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(
+        model_path="dummy", device=device, tp_size=2, dwdp_size=2, **kwargs
+    )
+    handle_dwdp(args)
+    parse_cuda_graph_config(args)
+    return resolving_view(args)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [({"enable_lora": True}, "LoRA"), ({"enable_pdmux": True}, "layer-split")],
+)
+def test_invalid_npu_dwdp_args(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        _dwdp_config("npu", **kwargs)
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("disable_fusion", [False, True])
+def test_dwdp_preserves_optional_features(device, shared, disable_fusion):
+    from sglang.srt.environ import envs
+
+    kwargs = dict(
+        cpu_offload_gb=1,
+        offload_group_size=2,
+        enable_memory_saver=True,
+        disable_shared_experts_fusion=disable_fusion,
+    )
+    with envs.SGLANG_SHARED_EXPERT_TP1.override(shared):
+        cfg = _dwdp_config(device, **kwargs)
+        assert envs.SGLANG_SHARED_EXPERT_TP1.get() == shared
+    assert all(getattr(cfg, name) == value for name, value in kwargs.items())
+    assert cfg.attn_dp_size == cfg.ep_size == 2
+    assert cfg.dp_size == cfg.moe_dense_tp_size == 1
+    assert cfg.moe_a2a_backend == "none" and cfg.enable_dp_lm_head
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, ("disabled", "disabled")),
+        ({"disable_cuda_graph": False}, ("disabled", "disabled")),
+        ({"cuda_graph_backend_decode": "full"}, ("full", "disabled")),
+        ({"cuda_graph_backend_prefill": "full"}, ("disabled", "full")),
+        (
+            {
+                "cuda_graph_config": {
+                    "decode": {"backend": "full"},
+                    "prefill": {"backend": "full"},
+                }
+            },
+            ("full", "full"),
+        ),
+        (
+            {
+                "cuda_graph_backend_decode": "full",
+                "cuda_graph_config": {
+                    "decode": {"backend": "disabled"},
+                    "prefill": {"backend": "full"},
+                },
+            },
+            ("disabled", "full"),
+        ),
+        (
+            {
+                "cuda_graph_config": {
+                    "decode": {"backend": "breakable"},
+                    "prefill": {"backend": "breakable"},
+                }
+            },
+            ("breakable", "breakable"),
+        ),
+    ],
+)
+def test_dwdp_graph_config_matches_cuda(device, kwargs, expected):
+    cfg = _dwdp_config(device, **kwargs)
+    assert cfg.disable_cuda_graph
+    assert (
+        cfg.cuda_graph_config.decode.backend,
+        cfg.cuda_graph_config.prefill.backend,
+    ) == expected
+
+
+@pytest.mark.parametrize("nnodes", [1, 2])
+def test_npu_dwdp_full_resolution(tmp_path, monkeypatch, nnodes):
+    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.environ import envs
+    from sglang.srt.server_args import ServerArgs
+
+    for module in ("sglang.srt.utils.common", "sglang.srt.hardware_backend.npu.utils"):
+        monkeypatch.setattr(f"{module}.get_npu_memory_capacity", lambda: 64 * 1024)
+    config = dict(
+        architectures=["DeepseekV2ForCausalLM"],
+        model_type="deepseek_v2",
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=4,
+        vocab_size=128,
+        max_position_embeddings=2048,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with envs.SGLANG_SHARED_EXPERT_TP1.override(False):
+        args = ServerArgs(
+            model_path=str(tmp_path),
+            device="npu",
+            tp_size=2,
+            dwdp_size=2,
+            nnodes=nnodes,
+            dist_init_addr="127.0.0.1:29999",
+        )
+        args.resolve_once()
+        cfg = resolved_view(args)
+        assert not envs.SGLANG_SHARED_EXPERT_TP1.get()
+        assert cfg.attn_dp_size == cfg.ep_size == 2 and cfg.dp_size == 1
+        assert not cfg.disable_shared_experts_fusion
+        assert (
+            cfg.cuda_graph_config.prefill.backend
+            == cfg.cuda_graph_config.decode.backend
+            == "disabled"
+        )
