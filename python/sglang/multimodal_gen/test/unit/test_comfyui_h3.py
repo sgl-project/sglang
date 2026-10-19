@@ -951,11 +951,6 @@ def test_ref2va_image_forward_kwargs_are_supported():
     assert out_audio.shape == audio.shape
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="optional GPU smoke")
-def test_optional_gpu_step_output_shapes():
-    pytest.skip("no tiny H3 checkpoint on this machine; do not download weights")
-
-
 # --- profile ---
 
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (

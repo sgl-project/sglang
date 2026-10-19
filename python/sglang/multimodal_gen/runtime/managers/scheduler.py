@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
+    Pi05SegmentSchedulerMixin,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -104,7 +107,12 @@ class _SequentiallyReturnedOutputs:
     outputs: Iterator[OutputBatch]
 
 
-class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
+class Scheduler(
+    Pi05SegmentSchedulerMixin,
+    SchedulerWarmupMixin,
+    SchedulerPostTrainingMixin,
+    SchedulerDisaggMixin,
+):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -144,8 +152,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if gpu_id % gpus_per_replica == 0:
             endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
+            # Clients connect to the configured endpoint, so never move to another port.
             self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.ROUTER, endpoint, True
+                self.context, zmq.ROUTER, endpoint, True, same_port=True
             )
             logger.info(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
@@ -189,6 +198,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
+        self._pi05_arrivals: dict[int, tuple[float, int]] = {}
+        self._pi05_sequence = 0
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics
@@ -513,6 +524,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             for f in sp_fields
             if not f.metadata.get("batch_sig_exclude", False)
             and not (exclude_num_outputs and f.name == "num_outputs_per_prompt")
+            and not (
+                self._pi05_segments_enabled()
+                and self._is_pi05_segment_request(req)
+                and f.name == "num_inference_steps"
+            )
         ]
 
     def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
@@ -653,7 +669,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         pipeline cannot keep per-request inside a merged dynamic batch."""
         if self.server_args.pipeline_config.supports_batching_image_conditioning():
             return False
-        return base_req.image_path is not None or candidate_req.image_path is not None
+        return (
+            getattr(base_req, "image_path", None) is not None
+            or getattr(candidate_req, "image_path", None) is not None
+        )
 
     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
         pipeline_config = self.server_args.pipeline_config
@@ -1176,6 +1195,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         Returns None when the head request is waiting for more compatible
         requests within the configured batching delay.
         """
+        if self._pi05_segments_enabled():
+            return self._get_next_pi05_segment_batch()
         if not self.waiting_queue:
             return None
 
@@ -1469,6 +1490,19 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         and get_first_generation_req(req) is not None
                     ):
                         self.metrics.observe_batch(1, "request_group")
+            if self._pi05_segments_enabled() and all(
+                self._is_pi05_segment_request(req) for _, req in items
+            ):
+                completed = self._run_pi05_segment(items)
+                for item, output in completed:
+                    try:
+                        self._return_item_result(item, output)
+                    except zmq.ZMQError as exc:
+                        logger.error(
+                            "ZMQ error returning completed pi05 actions: %s", exc
+                        )
+                continue
+
             try:
                 with maybe_record_function(
                     f"REQ {self._req_label(items)} dispatch+forward"
