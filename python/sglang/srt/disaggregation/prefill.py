@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
+    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -1530,9 +1531,21 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                request_window = kvcache.request_window
+                # Under encoder replay the scheduler is not hybrid SWA and keeps no
+                # window size; the pool holds it.
+                window_size = (
+                    self.sliding_window_size
+                    if request_window is None
+                    else kvcache.sliding_window
+                )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
+                if request_window is not None:
+                    return request_window.page_indices(
+                        int(req.kv.req_pool_idx), window_start, seq_len
+                    )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -1548,6 +1561,19 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
+
+            def _dsa_pages_payload():
+                # Decode already holds the indexer rows of the prefix it cached
+                # (decode_prefix_len, page-aligned), and its rows for a prefix
+                # still being restored point at no page yet: send only the
+                # suffix, positionally matching decode's _dsa_pages_payload.
+                return suffix_page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    req.kv.req_pool_idx,
+                    req.disagg_decode_prefix_len,
+                    seq_len,
+                    page_size,
+                )
 
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
@@ -1580,6 +1606,9 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _request_row_payload():
+                return np.array([req.kv.req_pool_idx], dtype=np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1588,12 +1617,13 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
