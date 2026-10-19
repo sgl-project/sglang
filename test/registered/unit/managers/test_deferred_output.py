@@ -41,50 +41,31 @@ def _req(rid, return_logprob=False):
     return SimpleNamespace(rid=rid, defer_output=False, return_logprob=return_logprob)
 
 
-def _streamer(defer_outputs):
-    streamer = object.__new__(SchedulerOutputStreamer)
-    streamer.is_generation = True
-    streamer.defer_outputs = defer_outputs
-    return streamer
-
-
-def test_streamer_skips_held_requests():
-    held, free = _req("held"), _req("free")
-    held.defer_output = True
-
-    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
-        _streamer(defer_outputs=True).stream_output([held, free], False)
-
-    stream.assert_called_once_with([free], False, None)
-
-
-def test_streamer_is_unchanged_without_a_source():
-    reqs = [_req("a"), _req("b")]
-
-    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
-        _streamer(defer_outputs=False).stream_output(reqs, True)
-
-    stream.assert_called_once_with(reqs, True, None)
-
-
 def _scheduler():
     scheduler = object.__new__(Scheduler)
     scheduler.disaggregation_mode = DisaggregationMode.NULL
-    scheduler.output_streamer = SimpleNamespace(
-        defer_outputs=False, stream_output=Mock()
-    )
+    streamer = object.__new__(SchedulerOutputStreamer)
+    streamer.is_generation = True
+    streamer.defer_outputs = False
+    scheduler.output_streamer = streamer
     return scheduler
 
 
-def test_registering_a_source_enables_the_streamer_filter():
+@pytest.mark.parametrize("registered", [False, True])
+def test_streamer_filters_held_requests_only_with_a_source(registered):
     scheduler = _scheduler()
     source = Source()
-
-    scheduler.register_deferred_output_source(source)
-
-    assert scheduler.deferred_output_sources == (source,)
-    assert scheduler.output_streamer.defer_outputs is True
+    held, free = _req("held"), _req("free")
+    source.hold(held)
+    if registered:
+        scheduler.register_deferred_output_source(source)
+        assert scheduler.deferred_output_sources == (source,)
     assert Scheduler.deferred_output_sources == ()
+
+    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
+        scheduler.output_streamer.stream_output([held, free], True)
+
+    stream.assert_called_once_with([free] if registered else [held, free], True, None)
 
 
 @pytest.mark.parametrize(
@@ -109,26 +90,26 @@ def test_released_requests_stream_exactly_once():
     source.hold(first, second)
     source.ready = [first]
 
-    scheduler.stream_released_deferred_outputs()
+    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
+        scheduler.stream_released_deferred_outputs()
+        stream.assert_called_once_with([first], True, None)
+        assert first.defer_output is False
+        assert second.defer_output is True
+        assert scheduler.has_pending_deferred_outputs()
 
-    scheduler.output_streamer.stream_output.assert_called_once_with([first], True)
-    assert first.defer_output is False
-    assert second.defer_output is True
-    assert scheduler.has_pending_deferred_outputs()
-
-    scheduler.output_streamer.stream_output.reset_mock()
-    scheduler.stream_released_deferred_outputs()
-
-    scheduler.output_streamer.stream_output.assert_not_called()
+        stream.reset_mock()
+        scheduler.stream_released_deferred_outputs()
+        stream.assert_not_called()
 
 
-def _idle_scheduler():
-    scheduler = Scheduler.__new__(Scheduler)
+def test_held_responses_do_not_change_idle_state():
+    # Only the output rank holds responses under TP; idle-gated operations
+    # (cache flush, memory release) must agree across ranks.
+    scheduler = _scheduler()
     scheduler._engine_paused = False
     scheduler.enable_overlap = False
     scheduler.last_batch = None
     scheduler.chunked_req = None
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.running_batch = MagicMock()
     scheduler.running_batch.is_empty.return_value = True
     scheduler.result_queue = deque()
@@ -141,14 +122,6 @@ def _idle_scheduler():
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False
     scheduler.enable_hisparse = False
-    scheduler.output_streamer = SimpleNamespace(defer_outputs=False)
-    return scheduler
-
-
-def test_held_responses_do_not_change_idle_state():
-    # Only the output rank holds responses under TP; idle-gated operations
-    # (cache flush, memory release) must agree across ranks.
-    scheduler = _idle_scheduler()
     source = Source()
     scheduler.register_deferred_output_source(source)
 
@@ -179,28 +152,17 @@ def test_batch_results_release_held_responses_first():
     assert order.mock_calls[:2] == [call.release(), call.process(batch, ANY)]
 
 
-def test_idle_scheduler_releases_held_responses_and_yields():
+@pytest.mark.parametrize(
+    ("fully_idle", "pending"), [(False, True), (True, True), (True, False)]
+)
+def test_idle_scheduler_polls_and_only_sleeps_after_release(fully_idle, pending):
     scheduler = MagicMock()
     scheduler.deferred_output_sources = (Source(),)
-    scheduler.is_fully_idle.return_value = False
+    scheduler.is_fully_idle.return_value = fully_idle
+    scheduler.has_pending_deferred_outputs.return_value = pending
     scheduler._last_stall_publish_ts = float("inf")
     scheduler.enable_hicache_storage = False
     scheduler.enable_lmcache = False
-    scheduler.disaggregation_mode = DisaggregationMode.NULL
-
-    with patch("sglang.srt.managers.scheduler.time.sleep") as sleep:
-        Scheduler.on_idle.__wrapped__(scheduler)
-
-    scheduler.stream_released_deferred_outputs.assert_called_once_with()
-    sleep.assert_called_once_with(0)
-
-
-@pytest.mark.parametrize("pending", [True, False])
-def test_fully_idle_scheduler_polls_instead_of_sleeping_while_holding(pending):
-    scheduler = MagicMock()
-    scheduler.deferred_output_sources = (Source(),)
-    scheduler.has_pending_deferred_outputs.return_value = pending
-    scheduler.is_fully_idle.return_value = True
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.enable_hisparse = True  # skips the pool accounting checks
 
@@ -208,7 +170,7 @@ def test_fully_idle_scheduler_polls_instead_of_sleeping_while_holding(pending):
         Scheduler.on_idle.__wrapped__(scheduler)
 
     scheduler.stream_released_deferred_outputs.assert_called_once_with()
-    if pending:
+    if not fully_idle or pending:
         scheduler.maybe_sleep_on_idle.assert_not_called()
         sleep.assert_called_once_with(0)
     else:
