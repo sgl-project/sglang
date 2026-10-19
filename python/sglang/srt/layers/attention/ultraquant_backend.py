@@ -43,7 +43,6 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_gfx95_supported
 
 try:
     from aiter import flash_attn_varlen_fp8_pertensor_func, flash_attn_varlen_func
@@ -134,7 +133,7 @@ class UltraQuantAttnBackend(TritonAttnBackend):
         # E2M1 times a power of two dequantizes exactly into E4M3, so where
         # aiter's FP8 prefill kernel covers the shape the dense run is FP8.
         self._fp8_dense_prefill = False
-        if flash_attn_varlen_fp8_pertensor_func is not None and is_gfx95_supported():
+        if flash_attn_varlen_fp8_pertensor_func is not None:
             from sglang.srt.layers.attention.aiter_backend import (
                 _aiter_fp8_asm_supports_gqa,
             )

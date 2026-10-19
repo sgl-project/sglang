@@ -128,9 +128,10 @@ def _handle_ultraquant_compatibility(cfg: Any, server_args: Any) -> None:
             "Pass --kv-cache-dtype ultraquant_4bit, or choose another attention "
             f"backend. Got --kv-cache-dtype={cfg.kv_cache_dtype!r}."
         )
-    if uses_ultraquant_kv and not get_platform().is_hip:
+    if uses_ultraquant_kv and not get_platform().is_gfx95:
         raise ValueError(
-            "--kv-cache-dtype=ultraquant_4bit is currently validated only on ROCm."
+            "--kv-cache-dtype=ultraquant_4bit is currently validated only on "
+            "gfx950 (MI350/MI355)."
         )
     if not uses_ultraquant_kv:
         return

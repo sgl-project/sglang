@@ -1096,11 +1096,20 @@ class TestKV4Compatibility(unittest.TestCase):
         args._model_config = SimpleNamespace(dtype=dtype, is_hybrid_swa=is_hybrid_swa)
         return args
 
-    @override_platform(is_cuda=False, is_hip=True)
+    @override_platform(is_cuda=False, is_hip=True, is_gfx95=True)
     def test_ultraquant_allows_plain_serving(self):
         handle_kv4_compatibility(self._make_ultraquant_args())
 
-    @override_platform(is_cuda=False, is_hip=True)
+    def test_ultraquant_rejects_non_gfx95(self):
+        for platform in (
+            dict(is_cuda=True, is_hip=False, is_gfx95=False),
+            dict(is_cuda=False, is_hip=True, is_gfx95=False),
+        ):
+            with self.subTest(**platform), override_platform(**platform):
+                with self.assertRaisesRegex(ValueError, "gfx950"):
+                    handle_kv4_compatibility(self._make_ultraquant_args())
+
+    @override_platform(is_cuda=False, is_hip=True, is_gfx95=True)
     def test_ultraquant_rejects_unvalidated_kv_paths(self):
         for option, value, flag in (
             ("enable_unified_memory", True, "--enable-unified-memory"),
@@ -1116,7 +1125,7 @@ class TestKV4Compatibility(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, flag):
                     handle_kv4_compatibility(args)
 
-    @override_platform(is_cuda=False, is_hip=True)
+    @override_platform(is_cuda=False, is_hip=True, is_gfx95=True)
     def test_ultraquant_rejects_mla_models(self):
         args = self._make_ultraquant_args()
         with (
@@ -1128,13 +1137,13 @@ class TestKV4Compatibility(unittest.TestCase):
         ):
             handle_kv4_compatibility(args)
 
-    @override_platform(is_cuda=False, is_hip=True)
+    @override_platform(is_cuda=False, is_hip=True, is_gfx95=True)
     def test_ultraquant_rejects_hybrid_swa_models(self):
         args = self._make_ultraquant_args(is_hybrid_swa=True)
         with self.assertRaisesRegex(ValueError, "sliding-window"):
             handle_kv4_compatibility(args)
 
-    @override_platform(is_cuda=False, is_hip=True)
+    @override_platform(is_cuda=False, is_hip=True, is_gfx95=True)
     def test_ultraquant_rejects_non_bf16_models(self):
         args = self._make_ultraquant_args(dtype=torch.float16)
         with self.assertRaisesRegex(ValueError, "bfloat16 models only"):
