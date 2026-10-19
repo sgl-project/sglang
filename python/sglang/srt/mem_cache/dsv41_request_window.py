@@ -234,7 +234,8 @@ class RequestWindow:
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
         )
-        self.tags[:, loc.flatten()] = -1
+        # index_fill_ stays on the device; a scalar index_put waits for the stream.
+        self.tags.index_fill_(1, loc.flatten(), -1)
         self.prepared = None
 
     def activate(self, layout):
