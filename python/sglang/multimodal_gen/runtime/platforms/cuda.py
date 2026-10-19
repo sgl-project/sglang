@@ -848,11 +848,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
-        MiniMax-H3 VAE decoder fast paths.
+        MiniMax-H3 VAE fast paths.
 
         Requests with quality="lossless" or "high" run the fast paths; the
         "exact" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
