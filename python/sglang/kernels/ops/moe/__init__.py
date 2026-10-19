@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Optional
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
+    CUDA_ONLY,
     CapabilityRequirement,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
 )
@@ -16,19 +16,22 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = frozenset({CapabilityRequirement.CUDA})
 _HIP = frozenset({CapabilityRequirement.HIP})
+
+register_kernel(
+    KernelSpec(
+        op="moe.shared_expert_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shared_expert_gate:shared_expert_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
 
 register_kernel(
     KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
-        format_signature=FormatSignature(
-            in_place=True,
-            description="align/sort expert token ids into block-padded buffers",
-        ),
-        description="MoE align-block-size (sgl_kernel wheel).",
     )
 )
 register_kernel(
@@ -36,12 +39,7 @@ register_kernel(
         op="moe.moe_align_block_size",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.moe_align:moe_align_block_size",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True,
-            description="MoE align-block-size (JIT variant, AOT signature)",
-        ),
-        description="MoE align-block-size (sglang.kernels.jit).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -50,11 +48,6 @@ register_kernel(
         backend=KernelBackend.AOT,
         target="sgl_kernel:topk_softmax",
         capabilities=_HIP,
-        format_signature=FormatSignature(
-            in_place=True,
-            description="top-k softmax routing weights/ids",
-        ),
-        description="MoE top-k softmax (sgl_kernel ROCm wheel).",
     )
 )
 register_kernel(
@@ -62,12 +55,7 @@ register_kernel(
         op="moe.topk_softmax",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True,
-            description="top-k softmax routing weights/ids",
-        ),
-        description="MoE top-k softmax (sglang.kernels.jit).",
+        capabilities=CUDA_ONLY,
     )
 )
 
@@ -196,12 +184,7 @@ register_kernel(
         op="moe.moe_align_small_numel",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.moe_align_small_numel:moe_align_small_numel",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True,
-            description="align/sort expert token ids into block-padded buffers",
-        ),
-        description="MoE align-block-size, single-launch triton variant.",
+        capabilities=CUDA_ONLY,
     )
 )
 
@@ -213,8 +196,7 @@ register_kernel(
         op="moe.shuffle_rows_with_scales",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
-        capabilities=_CUDA,
-        description="Row gather of quantized values plus their scales, one launch.",
+        capabilities=CUDA_ONLY,
     )
 )
 
@@ -225,7 +207,7 @@ register_kernel(
         op="moe.situ_and_mul_masked_post_quant",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe._jit_situ_and_mul_quant:situ_and_mul_masked_post_quant",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 
@@ -236,7 +218,7 @@ register_kernel(
         op="moe.gemma_routing_post_topk",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.gemma4_routing:gemma_routing_post_topk",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(

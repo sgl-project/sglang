@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -171,10 +172,12 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         attn_backend,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=False,
             require_backend_selection=require_backend_selection,
         )
@@ -296,6 +299,14 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
+        override_cls_name = server_args.pipeline_config.transformer_class_override
+        if override_cls_name is not None and override_cls_name != cls_name:
+            logger.info(
+                "Overriding transformer class from %s to %s",
+                cls_name,
+                override_cls_name,
+            )
+            cls_name = override_cls_name
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:

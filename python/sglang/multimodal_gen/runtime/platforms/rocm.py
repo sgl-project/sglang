@@ -69,20 +69,6 @@ class RocmPlatform(Platform):
         return torch.cuda.get_device_properties(device_id).total_memory
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA graph. "
-                "Since enforce-eager is enabled, async output processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
-    def log_warnings(cls) -> None:
-        pass  # ROCm-specific warnings can be added here
-
-    @classmethod
     def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
         torch.cuda.reset_peak_memory_stats(device)
         return float(torch.cuda.max_memory_allocated(device))

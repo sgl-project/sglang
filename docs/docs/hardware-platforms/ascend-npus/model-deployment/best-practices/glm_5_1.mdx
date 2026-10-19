@@ -25,8 +25,6 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 | GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
 | GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
 | GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
-| GLM-5.1 | Ascend A3 Series Products | 48 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Ascend A3 Series Products | 48 | PD Disaggregation | 64k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -83,6 +81,7 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -105,7 +104,8 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 32 \
-        --attn-dp-size 16 \
+        --dp-size 16 \
+        --enable-dp-attention \
         --chunked-prefill-size 65536 \
         --max-prefill-tokens 280000 \
         --trust-remote-code \
@@ -218,18 +218,16 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1200
-        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=8
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
         export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24699
         export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
         export TASK_QUEUE_ENABLE=2
-        export ZBAL_ENABLE_GRAPH=1
+        export ZBAL_HCCL_OP=send,recv
+        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -239,7 +237,7 @@ do
         --dist-init-addr ${P_IP[0]}:5000 \
         --disaggregation-bootstrap-port 8998 \
         --node-rank $i \
-        --tp-size 4 \
+        --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
         --attention-backend ascend \
@@ -248,21 +246,25 @@ do
         --disaggregation-transfer-backend ascend \
         --max-running-requests 16 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 32768 \
+        --chunked-prefill-size 524288 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
+        --dp-size 1 \
+        --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
-        --attn-cp-size 4 \
+        --enable-prefill-cp \
+        --cp-strategy interleave \
+        --attn-cp-size 32 \
         --disable-radix-cache \
-        --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2 \
         --trust-remote-code
         break
     fi
@@ -275,10 +277,11 @@ do
     then
         echo "${D_IP[$i]}"
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=200
+        export HCCL_BUFFSIZE=600
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -293,10 +296,11 @@ do
         --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --attn-dp-size 32 \
+        --dp-size 32 \
         --ep-size 32 \
+        --enable-dp-attention \
         --mem-fraction-static 0.85 \
-        --max-running-requests 32 \
+        --max-running-requests 64 \
         --attention-backend ascend \
         --device npu \
         --quantization modelslim \
@@ -423,6 +427,8 @@ do
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -452,12 +458,11 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
-        --attn-dp-size 4 \
+        --dp-size 1 \
         --load-balance-method round_robin \
         --enable-prefill-cp \
-        --cp-strategy zigzag \
-        --attn-cp-size 8 \
-        --enable-dp-lm-head \
+        --cp-strategy interleave \
+        --attn-cp-size 32 \
         --moe-dense-tp 1 \
         --reasoning-parser glm45 \
         --tool-call-parser glm47 \
@@ -477,6 +482,7 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -489,8 +495,9 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --attn-dp-size 32 \
+        --dp-size 32 \
         --ep-size 32 \
+        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -623,18 +630,15 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1200
-        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
+        export HCCL_BUFFSIZE=8
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
         export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24699
         export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
         export TASK_QUEUE_ENABLE=2
-        export ZBAL_ENABLE_GRAPH=1
+        export ZBAL_HCCL_OP=send,recv
         export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
         python3 -m sglang.launch_server \
@@ -646,30 +650,34 @@ do
         --disaggregation-bootstrap-port 8998 \
         --node-rank $i \
         --trust-remote-code \
-        --tp-size 4 \
+        --tp-size 32 \
         --nnodes 2 \
         --mem-fraction-static 0.72 \
         --attention-backend ascend \
         --device npu \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --max-running-requests 16 \
+        --max-running-requests 32 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 32768 \
+        --chunked-prefill-size 524288 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
+        --dp-size 1 \
+        --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
-        --attn-cp-size 4 \
+        --enable-prefill-cp \
+        --cp-strategy interleave \
+        --attn-cp-size 32 \
         --disable-radix-cache \
-        --enable-dp-lm-head \
         --moe-dense-tp 1 \
-        --pp-size 8
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 1 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 2
         break
     fi
 done
@@ -681,10 +689,11 @@ do
     then
         echo "${D_IP[$i]}"
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=200
+        export HCCL_BUFFSIZE=600
         export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -696,12 +705,14 @@ do
         --port 8001 \
         --dist-init-addr ${D_IP[0]}:5000 \
         --node-rank $i \
+        --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --attn-dp-size 32 \
+        --dp-size 32 \
+        --enable-dp-attention \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
-        --max-running-requests 32 \
+        --max-running-requests 64 \
         --attention-backend ascend \
         --device npu \
         --quantization modelslim \
@@ -720,8 +731,7 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
-        --trust-remote-code
+        --speculative-num-draft-tokens 4
         break
     fi
 done
@@ -753,8 +763,8 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 32 \
-    --num-prompts 32 \
+    --max-concurrency 1 \
+    --num-prompts 1 \
     --random-input-len 65536 \
     --random-output-len 1024 \
     --random-range-ratio 1 \
@@ -854,7 +864,7 @@ do
         --disaggregation-transfer-backend ascend \
         --max-running-requests 16 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
+        --chunked-prefill-size 32768 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
@@ -862,8 +872,8 @@ do
         --disable-cuda-graph \
         --dtype bfloat16 \
         --speculative-draft-model-quantization unquant \
-        --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
         --attn-cp-size 4 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -898,7 +908,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --attn-dp-size 32 \
+        --dp-size 32 \
+        --enable-dp-attention \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 32 \
@@ -919,6 +930,10 @@ do
         --speculative-draft-model-quantization unquant \
         --reasoning-parser glm45 \
         --tool-call-parser glm47 \
+        --speculative-algorithm NEXTN \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
         --trust-remote-code
         break
     fi
@@ -951,8 +966,8 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 1 \
-    --num-prompts 1 \
+    --max-concurrency 32 \
+    --num-prompts 64 \
     --random-input-len 65536 \
     --random-output-len 1024 \
     --random-range-ratio 1 \
@@ -1027,6 +1042,8 @@ do
         echo "${P_IP[$i]}"
         export DEEPEP_HCCL_BUFFSIZE=1200
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_SOCKET_IFNAME=<network-interface>
@@ -1056,12 +1073,11 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
-        --attn-dp-size 4 \
+        --dp-size 1 \
         --load-balance-method round_robin \
         --enable-prefill-cp \
-        --cp-strategy zigzag \
-        --attn-cp-size 8 \
-        --enable-dp-lm-head \
+        --cp-strategy interleave \
+        --attn-cp-size 32 \
         --moe-dense-tp 1 \
         --reasoning-parser glm45 \
         --tool-call-parser glm47 \
@@ -1081,6 +1097,7 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1093,8 +1110,9 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --attn-dp-size 32 \
+        --dp-size 32 \
         --ep-size 32 \
+        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -1160,422 +1178,5 @@ python -m sglang.bench_serving \
     --gsp-output-len 1536 \
     --max-concurrency 100 \
     --num-prompts 480 \
-    --request-rate inf
-```
-
-### GLM-5.1 W4A8 2P1D 48P IN128K OUT1K PREFIX90 50ms
-
-**Model**: GLM-5.1
-
-**Hardware**: Ascend A3 Series Products
-
-**Cards**: 48
-
-**Deploy Mode**: PD Disaggregation
-
-**Quantization**: W4A8 INT8
-
-**Dataset**: 128k+1k (90% prefix cache hit rate)
-
-**TPOT**: 50ms
-
-#### Model Deployment
-
-```bash Command
-# ============================================================
-# Before running, update the following variables:
-#   P_IP: prefill node IP address
-#   D_IP: decode node IP address
-#   ASCEND_MF_STORE_URL: prefill node IP with port
-#   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
-# ============================================================
-
-
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
-export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
-export SGLANG_SET_CPU_AFFINITY=1
-export STREAMS_PER_DEVICE=32
-
-P_IP=('<your prefill ip1>' '<your prefill ip2>' '<your prefill ip3>' '<your prefill ip4>')
-D_IP=('<your decode ip1>' '<your decode ip2>')
-
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
-
-MODEL_PATH=/path/to/model-weights
-
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
-# prefill
-for i in "${!P_IP[@]}";
-do
-    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
-    then
-        echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1200
-        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_SOCKET_IFNAME=<network-interface>
-        export TASK_QUEUE_ENABLE=2
-
-        python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
-        --host ${P_IP[$i]} \
-        --port 8000 \
-        --dist-init-addr ${P_IP[$(( $i / 2 * 2 ))]}:5000 \
-        --disaggregation-bootstrap-port $((8998 + $i / 2)) \
-        --node-rank $(( $i % 2 )) \
-        --tp-size 4 \
-        --nnodes 2 \
-        --mem-fraction-static 0.72 \
-        --attention-backend ascend \
-        --device npu \
-        --quantization modelslim \
-        --disaggregation-transfer-backend ascend \
-        --max-running-requests 32 \
-        --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
-        --max-prefill-tokens 180000 \
-        --moe-a2a-backend deepep \
-        --deepep-mode normal \
-        --disable-shared-experts-fusion \
-        --disable-cuda-graph \
-        --dtype bfloat16 \
-        --speculative-draft-model-quantization unquant \
-        --enable-prefill-cp \
-        --cp-strategy zigzag \
-        --attn-cp-size 4 \
-        --enable-dp-lm-head \
-        --moe-dense-tp 1 \
-        --pp-size 8 \
-        --reasoning-parser glm45 \
-        --tool-call-parser glm47 \
-        --trust-remote-code
-        break
-    fi
-done
-
-# decode
-for i in "${!D_IP[@]}";
-do
-    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
-    then
-        echo "${D_IP[$i]}"
-        export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=200
-        export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
-        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
-        export TASK_QUEUE_ENABLE=0
-
-        python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
-        --host ${D_IP[$i]} \
-        --port 8001 \
-        --dist-init-addr ${D_IP[0]}:5000 \
-        --node-rank $i \
-        --tp-size 32 \
-        --nnodes 2 \
-        --attn-dp-size 32 \
-        --ep-size 32 \
-        --mem-fraction-static 0.865 \
-        --max-running-requests 96 \
-        --attention-backend ascend \
-        --device npu \
-        --quantization modelslim \
-        --served-model-name glm-5 \
-        --moe-a2a-backend deepep \
-        --deepep-mode low_latency \
-        --cuda-graph-bs-decode 1 2 3 4 5 6 \
-        --disaggregation-transfer-backend ascend \
-        --watchdog-timeout 9000 \
-        --context-length 180000 \
-        --tokenizer-worker-num 32 \
-        --disable-shared-experts-fusion \
-        --dtype bfloat16 \
-        --load-balance-method round_robin \
-        --speculative-draft-model-quantization unquant \
-        --speculative-algorithm NEXTN \
-        --speculative-num-steps 3 \
-        --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
-        --reasoning-parser glm45 \
-        --tool-call-parser glm47 \
-        --trust-remote-code
-        break
-    fi
-done
-```
-
-```bash Command
-# ============================================================
-# Before running, replace the following placeholders:
-#   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
-#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
-# ============================================================
-
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --policy round_robin
-```
-
-#### Benchmark
-
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 117965` = `round(131072 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 13107` = `round(131072 * (1 - 0.9))` is the unique per-request suffix.
-`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
-
-```bash Command
-python -m sglang.bench_serving \
-    --dataset-name generated-shared-prefix \
-    --backend sglang \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --gsp-num-groups 1 \
-    --gsp-prompts-per-group 576 \
-    --gsp-system-prompt-len 117965 \
-    --gsp-question-len 13107 \
-    --gsp-output-len 1024 \
-    --max-concurrency 144 \
-    --num-prompts 576 \
-    --request-rate inf
-```
-
-### GLM-5.1 W4A8 4P1D 48P IN64K OUT1K PREFIX90 50ms
-
-**Model**: GLM-5.1
-
-**Hardware**: Ascend A3 Series Products
-
-**Cards**: 48
-
-**Deploy Mode**: PD Disaggregation
-
-**Quantization**: W4A8 INT8
-
-**Dataset**: 64k+1k (90% prefix cache hit rate)
-
-**TPOT**: 50ms
-
-#### Model Deployment
-
-```bash Command
-# ============================================================
-# Before running, update the following variables:
-#   P_IP: prefill node IP address
-#   D_IP: decode node IP address
-#   ASCEND_MF_STORE_URL: prefill node IP with port
-#   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
-# ============================================================
-
-
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1200
-export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1200
-export SGLANG_SET_CPU_AFFINITY=1
-export STREAMS_PER_DEVICE=32
-
-P_IP=('<your prefill ip1>' '<your prefill ip2>' '<your prefill ip3>' '<your prefill ip4>')
-D_IP=('<your decode ip1>' '<your decode ip2>')
-
-export ASCEND_MF_STORE_URL="tcp://<your prefill ip1>:24670"
-
-MODEL_PATH=/path/to/model-weights
-
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
-# prefill
-for i in "${!P_IP[@]}";
-do
-    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
-    then
-        echo "${P_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=1200
-        export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_SOCKET_IFNAME=<network-interface>
-        export TASK_QUEUE_ENABLE=2
-
-        python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
-        --host ${P_IP[$i]} \
-        --port 8000 \
-        --disaggregation-bootstrap-port $((8998 + $i)) \
-        --node-rank 0 \
-        --tp-size 4 \
-        --nnodes 1 \
-        --mem-fraction-static 0.72 \
-        --attention-backend ascend \
-        --device npu \
-        --quantization modelslim \
-        --disaggregation-transfer-backend ascend \
-        --max-running-requests 16 \
-        --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
-        --max-prefill-tokens 180000 \
-        --moe-a2a-backend deepep \
-        --deepep-mode normal \
-        --disable-shared-experts-fusion \
-        --disable-cuda-graph \
-        --dtype bfloat16 \
-        --speculative-draft-model-quantization unquant \
-        --enable-prefill-cp \
-        --cp-strategy zigzag \
-        --attn-cp-size 4 \
-        --enable-dp-lm-head \
-        --moe-dense-tp 1 \
-        --pp-size 4 \
-        --reasoning-parser glm45 \
-        --tool-call-parser glm47 \
-        --trust-remote-code
-        break
-    fi
-done
-
-# decode
-for i in "${!D_IP[@]}";
-do
-    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
-    then
-        echo "${D_IP[$i]}"
-        export DEEPEP_HCCL_BUFFSIZE=300
-        export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40
-        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
-        export TASK_QUEUE_ENABLE=0
-
-        python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
-        --host ${D_IP[$i]} \
-        --port 8001 \
-        --dist-init-addr ${D_IP[0]}:5000 \
-        --node-rank $i \
-        --tp-size 32 \
-        --nnodes 2 \
-        --attn-dp-size 32 \
-        --ep-size 32 \
-        --mem-fraction-static 0.85 \
-        --max-running-requests 320 \
-        --attention-backend ascend \
-        --device npu \
-        --quantization modelslim \
-        --served-model-name glm-5 \
-        --moe-a2a-backend deepep \
-        --deepep-mode low_latency \
-        --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 \
-        --disaggregation-transfer-backend ascend \
-        --watchdog-timeout 9000 \
-        --context-length 180000 \
-        --tokenizer-worker-num 4 \
-        --disable-shared-experts-fusion \
-        --dtype bfloat16 \
-        --load-balance-method round_robin \
-        --speculative-draft-model-quantization unquant \
-        --speculative-algorithm NEXTN \
-        --speculative-num-steps 3 \
-        --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4 \
-        --reasoning-parser glm45 \
-        --tool-call-parser glm47 \
-        --trust-remote-code
-        break
-    fi
-done
-```
-
-```bash Command
-# ============================================================
-# Before running, replace the following placeholders:
-#   <your prefill ip1>, <your prefill ip2>, <your prefill ip3>, <your prefill ip4>: prefill node IP addresses
-#   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
-# ============================================================
-
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --prefill http://<your prefill ip3>:8000 9000 \
-    --prefill http://<your prefill ip4>:8000 9001 \
-    --decode http://<your decode ip1>:8001 \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --policy round_robin
-```
-
-#### Benchmark
-
-We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
-`--gsp-system-prompt-len 58982` = `round(65536 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6554` = `round(65536 * (1 - 0.9))` is the unique per-request suffix.
-`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
-
-```bash Command
-python -m sglang.bench_serving \
-    --dataset-name generated-shared-prefix \
-    --backend sglang \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --gsp-num-groups 1 \
-    --gsp-prompts-per-group 1280 \
-    --gsp-system-prompt-len 58982 \
-    --gsp-question-len 6554 \
-    --gsp-output-len 1024 \
-    --max-concurrency 320 \
-    --num-prompts 1280 \
     --request-rate inf
 ```

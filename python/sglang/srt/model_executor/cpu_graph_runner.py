@@ -22,7 +22,6 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-import psutil
 import torch
 import tqdm
 
@@ -48,6 +47,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     empty_context,
+    get_free_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -741,7 +741,7 @@ class CPUGraphRunner:
         )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
-                avail_mem = psutil.virtual_memory().available / (1 << 30)
+                avail_mem = get_free_cpu_memory() / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
@@ -814,7 +814,6 @@ class CPUGraphRunner:
 
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
-            out_cache_loc_is_physical=True,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -832,6 +831,7 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -849,6 +849,7 @@ class CPUGraphRunner:
                     num_tokens,
                     req_pool_indices,
                     seq_lens,
+                    out_cache_loc,
                     None,
                     forward_batch.forward_mode,
                     forward_batch.spec_info,

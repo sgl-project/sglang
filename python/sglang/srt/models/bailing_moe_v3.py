@@ -479,13 +479,13 @@ class BailingMoE(nn.Module):
             share_expert_swiglu_limit_list, layer_id
         )
 
-        # Run the MoE gate in bf16. ling-v3's config sets router_dtype="fp32",
-        # but on Hopper that fp32 gate GEMM falls back to a slow sm80 (Ampere)
-        # no-tensor-core path (~7% of decode GPU time). bf16 uses Hopper tensor
-        # cores; the top-k selection re-casts gating logits back to fp32
-        # (see layers/moe/topk.py), so routing stays fp32-stable. Validated on
-        # ling-v3 TP4: accuracy-neutral (greedy), ~17% bs=1 TPOT improvement.
-        self.router_dtype = torch.bfloat16
+        # bf16 here perturbs routing enough to cause output variance, so the
+        # gate dtype follows the checkpoint config; absent means fp32.
+        router_dtype = getattr(config, "router_dtype", None)
+        if router_dtype is None or router_dtype == "fp32":
+            self.router_dtype = torch.float32
+        else:
+            self.router_dtype = torch.bfloat16
 
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
@@ -1073,14 +1073,8 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.expert_num = config.num_experts
         self.hidden_size = config.hidden_size
-        is_moe_layer = is_nextn or (
-            not (self.expert_num == 1)
-            and (self.layer_id >= config.first_k_dense_replace)
-        )
-        self.is_layer_sparse = is_moe_layer
-        is_next_layer_sparse = not (self.expert_num == 1) and (
-            self.layer_id + 1 >= config.first_k_dense_replace
-        )
+        attn, ffn = self.stage_facts(config, self.layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
         mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
 
         if self.expert_num == 1:
@@ -1119,7 +1113,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(),
+                attn,
                 self.input_layernorm,
                 {
                     "qkv_latent_func": self.attention.prepare_qkv_latent
@@ -1127,12 +1121,24 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     else None
                 },
             ),
-            (
-                declare_ffn(
-                    sparse=is_moe_layer,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int, is_nextn: bool = False):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        is_moe_layer = is_nextn or (
+            not (config.num_experts == 1) and (layer_id >= config.first_k_dense_replace)
+        )
+        is_next_layer_sparse = not (config.num_experts == 1) and (
+            layer_id + 1 >= config.first_k_dense_replace
+        )
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_moe_layer,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -1265,6 +1271,9 @@ class BailingMoELinearModel(nn.Module):
             self.num_layers,
             layer_fn,
             prefix=f"{prefix}.layers",
+            stage_facts=lambda idx: BailingMoELinearDecoderLayer.stage_facts(
+                config, idx
+            ),
         )
 
         linear_layer_nums = sum(

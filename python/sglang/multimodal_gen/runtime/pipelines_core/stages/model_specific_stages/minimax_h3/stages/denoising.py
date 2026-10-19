@@ -443,12 +443,6 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        # one denoise per sigma interval: steps - 1
-        return max(1, num_inference_steps - 1)
-
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
@@ -560,7 +554,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # would send the next request down the refresh path with nothing
         # mounted.
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
@@ -749,7 +742,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=model,
                 packed=packed,
-                ctx=ctx,
+                is_ref2va=ctx.is_ref2va,
+                latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
                 server_args=server_args,
                 device=device,
             )
@@ -1051,7 +1045,8 @@ def _maybe_prepare_vsa_h3_step_metadata(
     *,
     model: Any,
     packed: Mapping[str, torch.Tensor],
-    ctx: _FullLoopContext,
+    is_ref2va: bool,
+    latent_shape: tuple[int, int, int],
     server_args: ServerArgs,
     device: torch.device,
 ) -> Callable[[int], Any] | None:
@@ -1063,7 +1058,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
         is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
     ):
         return None
-    if ctx.is_ref2va:
+    if is_ref2va:
         raise NotImplementedError(
             "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
             "reference-block layout is not tiled yet. Use --attention-backend "
@@ -1077,7 +1072,10 @@ def _maybe_prepare_vsa_h3_step_metadata(
             "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
             f"geometry; got vsa_tile_size={tile_size}."
         )
-    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    default_sparsity = server_args.pipeline_config.vsa_sparsity
+    sparsity = float(
+        config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
+    )
     if not 0.0 <= sparsity < 1.0:
         raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
     mode = str(config.get("vsa_mode", "exempt"))
@@ -1101,7 +1099,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
     def build(step_index: int):
         return builder.build(
             current_timestep=step_index,
-            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            raw_latent_shape=latent_shape,
             patch_size=patch_size,
             VSA_sparsity=sparsity,
             prefix_segments=(text_len, cond_rows, audio_rows),

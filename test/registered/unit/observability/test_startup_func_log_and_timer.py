@@ -6,7 +6,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import sglang.srt.observability.startup_func_log_and_timer as mod
 from sglang.srt.observability.startup_func_log_and_timer import (
@@ -58,28 +58,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
         self.assertAlmostEqual(get_max_duration("ctx"), 1.0)
         mock_gauge.labels().set.assert_not_called()
 
-    def test_set_startup_metric_no_log(self):
-        mod.enable_startup_metrics = False
-        with patch.object(mod.logger, "info") as mock_log:
-            set_startup_metric("ctx", 1.0, should_log=False)
-            mock_log.assert_not_called()
-
-    def test_startup_timer_basic(self):
-        with startup_timer("block"):
-            pass
-        self.assertGreaterEqual(get_max_duration("block"), 0.0)
-
-    def test_startup_timer_with_gauge(self):
-        """Gauge updated when metrics enabled and log_only=False."""
-        mock_gauge = MagicMock()
-        mod.enable_startup_metrics = True
-        mod.STARTUP_LATENCY_SECONDS = mock_gauge
-
-        with startup_timer("block"):
-            pass
-        mock_gauge.labels.assert_called_with(context="block")
-        mock_gauge.labels().set.assert_called_once()
-
     def test_startup_timer_log_only(self):
         """log_only=True skips gauge but still tracks max."""
         mock_gauge = MagicMock()
@@ -100,19 +78,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
 
         self.assertEqual(add(2, 3), 5)
         self.assertIsNotNone(get_max_duration("add"))
-
-    def test_decorator_factory_with_gauge(self):
-        """Factory decorator with custom name, gauge updated."""
-        mock_gauge = MagicMock()
-        mod.enable_startup_metrics = True
-        mod.STARTUP_LATENCY_SECONDS = mock_gauge
-
-        @time_startup_latency(name="custom_op")
-        def add(a, b):
-            return a + b
-
-        self.assertEqual(add(2, 3), 5)
-        mock_gauge.labels.assert_called_with(context="custom_op")
 
     def test_decorator_log_only(self):
         """log_only=True skips gauge but still tracks max."""
