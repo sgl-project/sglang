@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+from sglang.kernels.spec import KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -21,11 +21,6 @@ register_kernel(
         op="kvcache.reshape_and_cache_flash",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.kvcache.cache_ops:launch_reshape_and_cache_flash",
-        format_signature=FormatSignature(
-            in_place=True,
-            description="write token-major K/V into paged KV cache layout",
-        ),
-        description="Reshape-and-cache (Triton launcher).",
     )
 )
 
