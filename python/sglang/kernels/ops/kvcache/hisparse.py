@@ -45,6 +45,9 @@ def _jit_spec_module(
     hot_buffer_size: int,
     num_steps: int,
     record_miss_plan: bool,
+    pass_through_device_locs: bool = False,
+    late_bound_host_base: bool = False,
+    workspace_capacity: int | None = None,
 ) -> Module:
     template_args = make_cpp_args(
         block_size,
@@ -54,6 +57,9 @@ def _jit_spec_module(
         num_steps,
         record_miss_plan,
         is_arch_support_pdl(),
+        pass_through_device_locs,
+        late_bound_host_base,
+        workspace_capacity if workspace_capacity is not None else num_steps * num_top_k,
     )
     return load_jit(
         "hisparse_spec",
@@ -74,7 +80,7 @@ def load_cache_to_device_buffer_spec_mla(
     device_buffer_tokens: torch.Tensor,
     host_cache_locs: torch.Tensor,
     device_buffer_locs: torch.Tensor,
-    host_cache: torch.Tensor,
+    host_cache: torch.Tensor | None,
     device_buffer: torch.Tensor,
     top_k_device_locs: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -84,21 +90,56 @@ def load_cache_to_device_buffer_spec_mla(
     miss_src: torch.Tensor | None = None,
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
+    device_locs: torch.Tensor | None = None,
+    host_binding: torch.Tensor | None = None,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair.
 
     Optional miss-plan outputs use the same protocol as the single-step HiSparse
     kernel, so shared-index layers can replay only the Host-to-GPU copies with
     ``copy_cache_planned_mla``.
+
+    ``device_locs`` enables resident KV passthrough and single-step draft calls
+    using the same hot/scratch state. ``host_binding`` supplies the runtime
+    [host base address, row stride in bytes] for the shared HiCache host pool.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if not 2 <= num_steps <= 4:
+    if not 2 <= num_steps <= 4 and not (num_steps == 1 and device_locs is not None):
         raise ValueError(
-            f"HiSparse speculative swap requires 2-4 steps, got {num_steps}."
+            f"HiSparse speculative swap requires 2-4 steps, or one resident-device step; got {num_steps}."
         )
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
-    item_size_bytes = host_cache.stride(0) * host_cache.element_size()
+    item_size_bytes = device_buffer.stride(0) * device_buffer.element_size()
+    if host_cache is None and host_binding is None:
+        raise ValueError(
+            "HiSparse swap requires a host cache or a late-bound host address."
+        )
+    if (
+        req_pool_indices.numel() != top_k_tokens.shape[0]
+        or seq_lens.numel() != top_k_tokens.shape[0] * num_steps
+    ):
+        raise ValueError("HiSparse speculative request/query dimensions do not match.")
+    if device_locs is not None and (
+        device_locs.dtype != torch.int32
+        or device_locs.shape != host_cache_locs.shape
+        or device_locs.stride(1) != 1
+        or device_locs.device != device_buffer.device
+    ):
+        raise ValueError("device_locs must be a GPU int32 request-to-token table.")
+    if host_binding is not None and (
+        host_binding.dtype != torch.int64
+        or host_binding.shape != (2,)
+        or not host_binding.is_contiguous()
+        or host_binding.device != device_buffer.device
+    ):
+        raise ValueError("host_binding must be a contiguous GPU int64 pair.")
+    if host_binding is None and (
+        host_cache.stride(0) * host_cache.element_size() != item_size_bytes
+    ):
+        raise ValueError("Host and device KV row widths must match.")
+    if top_k_tokens.size(0) == 0:
+        return
     record_miss_plan = miss_src is not None
     if record_miss_plan:
         if miss_dst is None or miss_count is None:
@@ -142,14 +183,19 @@ def load_cache_to_device_buffer_spec_mla(
         hot_buffer_size,
         num_steps,
         record_miss_plan,
+        device_locs is not None,
+        host_binding is not None,
+        # Draft and verification reuse metadata without changing its hash layout.
+        min(8192, state.scratch_state.size(1) // 5),
     )
+    empty_device = torch.empty(0, device=device_buffer.device)
 
     module.load_cache_to_device_buffer_spec(
         top_k_tokens,
         device_buffer_tokens,
         host_cache_locs,
         device_buffer_locs,
-        host_cache,
+        host_cache if host_cache is not None else torch.empty(0),
         device_buffer,
         top_k_device_locs,
         req_pool_indices,
@@ -163,6 +209,8 @@ def load_cache_to_device_buffer_spec_mla(
         miss_src,
         miss_dst,
         miss_count,
+        device_locs if device_locs is not None else empty_device,
+        host_binding if host_binding is not None else empty_device,
     )
 
 

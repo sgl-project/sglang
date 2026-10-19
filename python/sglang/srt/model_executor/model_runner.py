@@ -487,6 +487,7 @@ class ModelRunner:
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
         self.hisparse_v2_coordinator = None
+        self.hisparse_v2_cache = None
 
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
@@ -1019,19 +1020,24 @@ class ModelRunner:
 
     def maybe_init_hisparse_v2_coordinator(self):
         """Build the DSA HiCache coordinator before graph capture."""
-        if not get_memory().enable_hisparse_v2 or self.is_draft_worker:
+        if not get_memory().enable_hisparse_v2:
             return
         from sglang.srt.managers.hisparse_v2_coordinator import (
-            build_hisparse_v2_coordinator,
+            HiSparseV2Coordinator,
+            build_hisparse_v2_cache,
         )
 
-        self.hisparse_v2_coordinator = build_hisparse_v2_coordinator(
+        self.hisparse_v2_cache = build_hisparse_v2_cache(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
-            allocator=self.token_to_kv_pool_allocator,
             model_config=self.model_config,
             device=self.device,
         )
+        if not self.is_draft_worker:
+            self.hisparse_v2_coordinator = HiSparseV2Coordinator(
+                cache=self.hisparse_v2_cache,
+                allocator=self.token_to_kv_pool_allocator,
+            )
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -1765,8 +1771,8 @@ class ModelRunner:
             )
 
         # Hisparse coordinator — backends now read it from self.model_runner.
-        if self.hisparse_v2_coordinator is not None:
-            self.hisparse_v2_coordinator.prepare_forward(forward_batch)
+        if self.hisparse_v2_cache is not None:
+            self.hisparse_v2_cache.prepare_forward(forward_batch)
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
@@ -2006,8 +2012,8 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
-            if self.hisparse_v2_coordinator is not None:
-                self.hisparse_v2_coordinator.prepare_forward(forward_batch)
+            if self.hisparse_v2_cache is not None:
+                self.hisparse_v2_cache.prepare_forward(forward_batch)
             if (
                 forward_batch.forward_mode.is_decode()
                 and self.hisparse_coordinator is not None

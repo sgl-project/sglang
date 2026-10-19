@@ -1295,7 +1295,15 @@ class Scheduler(
         self.hisparse_v2_coordinator = (
             self.tp_worker.model_runner.hisparse_v2_coordinator
         )
-        self.hisparse_v2_coordinator.attach_tree(self.tree_cache)
+        draft_runners = (
+            self.draft_worker._draft_model_runners()
+            if self.draft_worker is not None
+            else ()
+        )
+        self.hisparse_v2_coordinator.attach_tree(
+            self.tree_cache,
+            draft_caches=tuple(runner.hisparse_v2_cache for runner in draft_runners),
+        )
         self.hisparse_v2_coordinator.forward_stream = self.forward_stream
 
     def init_hisparse_coordinator(self) -> None:

@@ -1547,7 +1547,6 @@ class TestHiSparseV2Policy(CustomTestCase):
             {"hicache_write_policy": "write_through"},
             {"hicache_host_memory_mode": "buffer_only"},
             {"enable_streaming_session": True},
-            {"speculative_algorithm": "EAGLE"},
             {"disaggregation_mode": "decode"},
             {"attn_cp_size": 2},
         ):
@@ -1566,6 +1565,36 @@ class TestHiSparseV2Policy(CustomTestCase):
         ):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 validate_hisparse_v2(self._args(hisparse_config=json.dumps(config)))
+
+    @override_platform(is_hip=False)
+    def test_mtp_accepts_fixed_linear_queries_and_rejects_other_layouts(self):
+        for num_draft_tokens in (2, 3, 4):
+            with self.subTest(num_draft_tokens=num_draft_tokens):
+                validate_hisparse_v2(
+                    self._args(
+                        speculative_algorithm="EAGLE",
+                        speculative_eagle_topk=1,
+                        speculative_num_draft_tokens=num_draft_tokens,
+                    )
+                )
+        for overrides in (
+            {"speculative_algorithm": "EAGLE3"},
+            {"speculative_algorithm": "DFLASH"},
+            {"speculative_eagle_topk": 2},
+            {"speculative_adaptive": True},
+            {"enable_multi_layer_eagle": True},
+            {"speculative_num_draft_tokens": None},
+            {"speculative_num_draft_tokens": 1},
+            {"speculative_num_draft_tokens": 5},
+        ):
+            values = dict(
+                speculative_algorithm="EAGLE",
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+            )
+            values.update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                validate_hisparse_v2(self._args(**values))
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):

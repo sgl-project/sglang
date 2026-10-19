@@ -43,9 +43,11 @@ class TestHiSparseV2(CustomTestCase):
         self.live_reqs = []
         self.tree = None
 
-    def _build(self, dtype=torch.bfloat16):
+    def _build(self, dtype=torch.bfloat16, *, num_query_steps=1, with_draft=False):
+        size = 32768 if num_query_steps > 1 else 4096
+        top_k = 1024 if num_query_steps > 1 else 64
         self.pool = DSATokenToKVPool(
-            size=4096,
+            size=size,
             page_size=64,
             kv_lora_rank=512,
             dtype=dtype,
@@ -55,13 +57,30 @@ class TestHiSparseV2(CustomTestCase):
             index_head_dim=128,
             enable_memory_saver=False,
             kv_cache_dim=656 if dtype == torch.float8_e4m3fn else 576,
-            index_buf_size=16384,
+            index_buf_size=size * 4,
         )
         self.reqs = ReqToTokenPool(
-            size=4, max_context_len=8192, device="cuda", enable_memory_saver=False
+            size=4, max_context_len=65536, device="cuda", enable_memory_saver=False
+        )
+        draft_pool = (
+            DSATokenToKVPool(
+                size=size,
+                page_size=64,
+                kv_lora_rank=512,
+                dtype=dtype,
+                qk_rope_head_dim=64,
+                layer_num=1,
+                device="cuda",
+                index_head_dim=128,
+                enable_memory_saver=False,
+                kv_cache_dim=656 if dtype == torch.float8_e4m3fn else 576,
+                index_buf_size=size * 4,
+            )
+            if with_draft
+            else None
         )
         self.allocator = PagedTokenToKVPoolAllocator(
-            size=4096,
+            size=size,
             page_size=64,
             dtype=dtype,
             device="cuda",
@@ -75,21 +94,38 @@ class TestHiSparseV2(CustomTestCase):
             page_size=64,
             tree_components=(ComponentType.FULL,),
             tree_core_backend="python",
+            mtp_draft_device_pools=(draft_pool,) if with_draft else (),
         )
         self.tree = UnifiedRadixCache(params)
         self.tree.init_hicache(get_server_args(), params)
         self.cache = HiSparseV2Cache(
             req_to_token_pool=self.reqs,
             token_to_kv_pool=self.pool,
-            top_k=64,
-            buffer_tokens=64,
+            top_k=top_k,
+            buffer_tokens=top_k,
             block_size=256,
             device="cuda",
+            num_query_steps=num_query_steps,
+        )
+        self.draft_cache = (
+            HiSparseV2Cache(
+                req_to_token_pool=self.reqs,
+                token_to_kv_pool=draft_pool,
+                top_k=top_k,
+                buffer_tokens=top_k,
+                block_size=256,
+                device="cuda",
+                num_query_steps=num_query_steps,
+            )
+            if with_draft
+            else None
         )
         self.coordinator = HiSparseV2Coordinator(
             cache=self.cache, allocator=self.allocator
         )
-        self.coordinator.attach_tree(self.tree)
+        self.coordinator.attach_tree(
+            self.tree, draft_caches=(self.draft_cache,) if with_draft else ()
+        )
 
     def _prefill(self, rid="a", length=256):
         req = Req(
@@ -106,13 +142,14 @@ class TestHiSparseV2(CustomTestCase):
         req.last_node = self.tree.root_node
         indices = self.allocator.alloc(length)
         self.reqs.req_to_token[req.kv.req_pool_idx, :length] = indices.int()
-        for buffer in self.pool.kv_buffer:
-            view = buffer.view(torch.uint8)
-            view[indices] = torch.randint(
-                256, (length, *view.shape[1:]), dtype=torch.uint8, device="cuda"
-            )
-        for buffer in self.pool.index_k_with_scale_buffer:
-            buffer.random_(0, 255)
+        for cache in self.coordinator.caches:
+            for buffer in cache.pool.kv_buffer:
+                view = buffer.view(torch.uint8)
+                view[indices] = torch.randint(
+                    256, (length, *view.shape[1:]), dtype=torch.uint8, device="cuda"
+                )
+            for buffer in cache.pool.index_k_with_scale_buffer:
+                buffer.random_(0, 255)
         self.tree.checkpoint(req, up_to=length)
         self.live_reqs.append(req)
         return req
@@ -318,6 +355,97 @@ class TestHiSparseV2(CustomTestCase):
         self.assertFalse(self.coordinator.pending)
         self.tree.evict(EvictParams(num_tokens=256))
         self.assertEqual(self.allocator.available_size(), self.pool.size)
+
+    def _check_mtp_packed_host_eviction(self, dtype):
+        self._build(dtype, num_query_steps=4, with_draft=True)
+        req = self._prefill(length=8192)
+        rid = req.kv.req_pool_idx
+        indices = self.reqs.req_to_token[rid, :8192].long().clone()
+        expected = [
+            [b.view(torch.uint8)[indices].clone() for b in cache.pool.kv_buffer]
+            for cache in self.coordinator.caches
+        ]
+        expected_index = [
+            [
+                b[indices[::64] // 64].clone()
+                for b in cache.pool.index_k_with_scale_buffer
+            ]
+            for cache in self.coordinator.caches
+        ]
+        held = self.allocator.alloc(self.allocator.available_size())
+        self.assertIsNotNone(held)
+        self.assertEqual(self.allocator.available_size(), 0)
+        self.assertTrue(self.coordinator.admit_request(req))
+        self.assertEqual(self.allocator.available_size(), 0)
+        self.assertEqual(self.coordinator.reserved_temp_tokens(), 4096)
+        topk = torch.arange(4096, dtype=torch.int32, device="cuda").view(4, 1024)
+        reqs = torch.tensor([rid], device="cuda")
+        for cache in self.coordinator.caches:
+            cache.num_real_reqs.fill_(1)
+            for layer in range(cache.pool.layer_num):
+                locs = cache.swap_in_selected_pages(
+                    reqs, torch.full((4,), 8192, device="cuda"), topk, layer
+                )
+                torch.testing.assert_close(locs.long(), indices[:4096].view(4, 1024))
+            self.assertTrue((cache.residency[:, rid] == -1).all().item())
+            self.assertEqual(cache.spec_states[0].scratch_state[0, rid].item(), 0)
+        self.assertEqual(
+            self.tree.evict(EvictParams(num_tokens=8192)).num_tokens_evicted, 8192
+        )
+        reused = self.allocator.alloc(8192)
+        for cache in self.coordinator.caches:
+            for buffer in cache.pool.kv_buffer:
+                buffer.view(torch.uint8)[reused] = 0
+            for buffer in cache.pool.index_k_with_scale_buffer:
+                buffer[reused[::64] // 64] = 0
+        for cache, expected_layers, expected_index_layers in zip(
+            self.coordinator.caches, expected, expected_index
+        ):
+            pages = cache.indexer_page_table(req_pool_indices=reqs, num_pages=128)
+            for buffer, expected_values in zip(
+                cache.pool.index_k_with_scale_buffer, expected_index_layers
+            ):
+                torch.testing.assert_close(buffer[pages[0].long()], expected_values)
+            cache.num_real_reqs.fill_(1)
+            for layer, expected_values in enumerate(expected_layers):
+                locs = cache.swap_in_selected_pages(
+                    reqs, torch.full((4,), 8192, device="cuda"), topk, layer
+                )
+                torch.testing.assert_close(
+                    cache.pool.kv_buffer[layer].view(torch.uint8)[locs.long()],
+                    expected_values[:4096].view(4, 1024, *expected_values.shape[1:]),
+                )
+        self._finish(req)
+        self.allocator.free(reused)
+        self.allocator.free(held)
+        self.assertEqual(self.allocator.available_size(), self.pool.size)
+
+    def test_mtp_bf16_target_and_draft_survive_packed_host_eviction(self):
+        self._check_mtp_packed_host_eviction(torch.bfloat16)
+
+    def test_mtp_fp8_target_and_draft_survive_packed_host_eviction(self):
+        self._check_mtp_packed_host_eviction(torch.float8_e4m3fn)
+
+    def test_graph_does_not_capture_the_real_request_count(self):
+        self._build()
+        graph = torch.cuda.CUDAGraph()
+        output = torch.empty_like(self.cache.num_real_reqs)
+        captured = SimpleNamespace(forward_mode=ForwardMode.DECODE, batch_size=4)
+        self.cache.prepare_forward(captured)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            self.cache.prepare_forward(captured)
+            output.copy_(self.cache.num_real_reqs)
+        for mode, size, expected in (
+            (ForwardMode.DECODE, 2, 2),
+            (ForwardMode.IDLE, 4, 0),
+            (ForwardMode.DECODE, 1, 1),
+        ):
+            self.cache.prepare_forward(
+                SimpleNamespace(forward_mode=mode, batch_size=size)
+            )
+            graph.replay()
+            self.assertEqual(output.item(), expected)
 
 
 if __name__ == "__main__":

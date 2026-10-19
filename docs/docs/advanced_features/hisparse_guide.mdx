@@ -23,8 +23,18 @@ model's [cookbook deployment](/cookbook/intro):
 --page-size 64
 ```
 
-V2 supports chunked prefill and decode CUDA graphs. It cannot be combined with
-`--enable-hisparse`, speculative decoding, PD, PP/CP, hybrid SWA, mixed
+V2 supports chunked prefill, decode CUDA graphs, and linear EAGLE/MTP with one
+DSA draft model: use `--speculative-eagle-topk 1` and 2-4
+`--speculative-num-draft-tokens`. MTP shares one `device_buffer_size` hot buffer
+across queries and deduplicates their swap misses, using the same hot/scratch
+policy as V1. For `N` draft tokens, scratch holds
+`min(N * top_k, max(1024, N * top_k - device_buffer_size))` slots per request.
+Hot and scratch slots are reserved together before prefill and released when
+the request finishes. Resident KV is read directly from the GPU pool; hot slots
+are populated on demand after HiCache eviction. Target and draft KV share slot
+ownership and the HiCache lifecycle. Adaptive speculation and multi-layer drafts
+are unsupported.
+V2 cannot be combined with `--enable-hisparse`, PD, PP/CP, hybrid SWA, mixed
 prefill/decode batches, sessions, or routed-expert recording.
 
 The remaining sections describe `--enable-hisparse`.
