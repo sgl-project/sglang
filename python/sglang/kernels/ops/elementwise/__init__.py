@@ -57,6 +57,13 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="elementwise.apply_log_scaling_tau",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.elementwise.row_scale:apply_log_scaling_tau",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="elementwise.kimi_k3_mla_output_gate",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.elementwise.mla_output_gate:kimi_k3_mla_output_gate",
