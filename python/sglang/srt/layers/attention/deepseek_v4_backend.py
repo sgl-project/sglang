@@ -3337,16 +3337,21 @@ class DeepseekV4AttnBackend(
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)
-                if self._low_ratio_prefill_reads_page_indices(forward_batch)
+                if self._low_ratio_prefill_reads_page_indices(forward_batch, layer)
                 else None
             ),
         )
 
-    def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
-        # The negation of the sparse-prefill gate in forward(), which reads only
-        # raw_indices; the query-count clause is dropped, so this errs to True.
+    def _low_ratio_prefill_reads_page_indices(
+        self, forward_batch: ForwardBatch, layer
+    ):
+        # Every prefill consumer of sparse_page_indices needs a True clause here;
+        # packed Main KV always takes the mixed path instead of sparse prefill.
         return (
-            self.trtllm_attn
+            self.token_to_kv_pool.get_extra_key_layout(
+                layer.layer_id
+            ).is_packed_main_kv
+            or self.trtllm_attn
             or not forward_batch.forward_mode.is_extend_without_speculative()
             or get_platform().is_sm120
             or self.tail_forward_metadata is not None
