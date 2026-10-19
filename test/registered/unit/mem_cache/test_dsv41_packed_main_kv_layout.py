@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     make_dsv41_packed_main_kv_spec,
     resolve_dsv41_main_kv_layout_specs,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -131,6 +132,45 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
             self.assertRaisesRegex(ValueError, "requires SM90"),
         ):
             validate_deepseek_v41_features(object())
+
+    def test_prefill_page_indices_follow_packed_layout(self):
+        """Packed eager prefill must publish physical Main-KV page indices."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = SimpleNamespace(
+            trtllm_attn=False,
+            tail_forward_metadata=None,
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
+            token_to_kv_pool=SimpleNamespace(request_window=None),
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        layer = SimpleNamespace(layer_id=0)
+        cases = (
+            (DSV41_MAIN_KV_LAYOUT, True),
+            (KVLayout.V41_FP4, False),
+        )
+        for layout, expected in cases:
+            backend.token_to_kv_pool.get_extra_key_layout = lambda _: layout
+            with (
+                self.subTest(layout=layout),
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                    return_value=SimpleNamespace(is_sm120=False),
+                ),
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.envs."
+                    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get",
+                    return_value=True,
+                ),
+            ):
+                actual = (
+                    DeepseekV4AttnBackend._low_ratio_prefill_reads_page_indices(
+                        backend, forward_batch, layer
+                    )
+                )
+                self.assertIs(actual, expected)
 
     def test_views_share_storage(self):
         spec = make_dsv41_packed_main_kv_spec(128)
