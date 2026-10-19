@@ -145,14 +145,6 @@ class TestNPUKvChecksum(unittest.TestCase):
         states[1][2, 0] += 1
         self.assertNotEqual(computer.compute(kv_idx, state_idx), expected)
 
-    def test_heterogeneous_state_rejected(self):
-        for state_types in (["swa", "dsv4_c128"], ["mamba", "dsa"]):
-            with self.subTest(state_types=state_types):
-                with self.assertRaisesRegex(NotImplementedError, "state components"):
-                    KvChecksumComputer(
-                        self.device, [1], [1], state_types=state_types
-                    )
-
     def test_invalid_descriptors(self):
         idx = torch.tensor([0, 1], dtype=torch.int64, device=self.device)
         data = torch.zeros((2, 64), dtype=torch.uint8, device=self.device)

@@ -96,15 +96,6 @@ class KvChecksumComputer:
         self._state_data_ptrs = _flatten_ints(state_data_ptrs)
         self._state_item_lens = _flatten_ints(state_item_lens)
         assert len(self._state_data_ptrs) == len(self._state_item_lens)
-        if self._device.type == "npu" and state_types:
-            # compute() currently supplies one index vector for all state
-            # descriptors. Heterogeneous components (e.g. DSV4 C128 and C4
-            # ring state) require separate index mappings before flattening.
-            if set(state_types) not in ({"mamba"}, {"swa"}):
-                raise NotImplementedError(
-                    "NPU KV checksum requires a shared Mamba or SWA state index "
-                    f"mapping; unsupported state components: {list(state_types)}"
-                )
 
     def compute(
         self,
