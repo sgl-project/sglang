@@ -232,6 +232,15 @@ def alloc_paged_token_slots_extend(
             f"Try to allocate {extend_num_tokens} tokens.\n"
             f"{available_and_evictable_str(tree_cache)}"
         )
+        if is_dsv4:
+            # The summary above only covers full/swa; the failing dsv4 gate is
+            # often the C128 sidecar pool. Print need vs available in pages so
+            # the message is self-explanatory.
+            c128_alloc = allocator.c128_attn_allocator
+            error_msg += (
+                f"C128 need: {c128_num_pages} pages, C128 available: "
+                f"{c128_alloc.available_size() // c128_alloc.page_size} pages\n"
+            )
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()

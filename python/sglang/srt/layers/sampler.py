@@ -160,6 +160,12 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        # Temporary A5/CANN9.2 zero-output probe; no-op unless
+        # SGLANG_ZERO_PROBE=1. Remove after the incident closes.
+        from sglang.srt.utils import zero_probe
+
+        zero_probe.probe_sampler(logits_output)
+
         logits = logits_output.next_token_logits
         _trace_e2e_sampler(
             "forward_enter",

@@ -388,6 +388,44 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def csa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSV4 c4 layer reuses an upstream c4 layer's top-k.
+
+    The schedule is indexed by position among c4 layers (indexer_seq_idx), not
+    the raw layer_id. Gated by ``use_index_cache``; driven by
+    ``index_topk_pattern`` or ``index_topk_freq``.
+    """
+    assert is_deepseek_v4(config)
+
+    if not getattr(config, "use_index_cache", False):
+        return False
+
+    compress_ratios = getattr(config, "compress_ratios", None) or []
+    # Eligible only on c4 layers.
+    if layer_id >= len(compress_ratios) or compress_ratios[layer_id] != 4:
+        return False
+
+    # Position among c4 layers: count of c4 layers strictly before this one.
+    indexer_seq_idx = sum(1 for r in compress_ratios[:layer_id] if r == 4)
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None:
+        freq = getattr(config, "index_topk_freq", 1)
+        if freq is None:
+            freq = 1
+        assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+        # Group of `freq`: first c4 layer computes, the next freq-1 reuse it.
+        return indexer_seq_idx % freq != 0
+
+    assert isinstance(pattern, str) and pattern[:1] == "F", (
+        "index_topk_pattern must be a string starting with 'F' "
+        "(the first c4 layer must compute, not reuse)"
+    )
+    if 0 <= indexer_seq_idx < len(pattern):
+        return pattern[indexer_seq_idx] == "S"
+    return False
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads

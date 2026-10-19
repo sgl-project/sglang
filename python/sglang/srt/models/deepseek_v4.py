@@ -5083,6 +5083,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Temporary A5/CANN9.2 zero-output probe; no-op unless
+        # SGLANG_ZERO_PROBE=1. Remove after the incident closes.
+        from sglang.srt.utils import zero_probe
+
+        zero_probe.probe_forward(self, input_ids, positions, forward_batch)
+
         if (
             self.vision is not None
             and not forward_batch.forward_mode.is_decode()

@@ -343,6 +343,23 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         page_size = self.c128_attn_allocator.page_size
         return need <= self.c128_attn_allocator.available_size() // page_size
 
+    def c128_prefill_need_pages(self, prefix_len: int, seq_len: int) -> int:
+        """Per-request C128 page demand for the prefill adder's admission gate.
+
+        Same formula as the batch-level `c128_num_pages_needed` the real alloc
+        checks, so admission and alloc share one source of truth.
+        """
+        return int(
+            self.c128_num_pages_needed(
+                torch.tensor([prefix_len], dtype=torch.int64),
+                torch.tensor([seq_len], dtype=torch.int64),
+            )
+        )
+
+    def c128_available_pages(self) -> int:
+        """Currently free C128 pages (the unit `_has_c128_sidecar_capacity` judges in)."""
+        return self.c128_attn_allocator.available_size() // self.c128_attn_allocator.page_size
+
     def _alloc_compressed_kv(
         self,
         out_full_loc: torch.Tensor,

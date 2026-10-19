@@ -1201,6 +1201,13 @@ class C4Indexer(nn.Module):
 
         self.alt_streams = alt_streams
 
+        # IndexCache: reuse an upstream c4 layer's topk and skip the lightning
+        # indexer. MTP/NextN layers are excluded.
+        from sglang.srt.configs.model_config import csa_layer_skips_topk
+
+        _is_spec_layer = ("mtp" in prefix) or ("nextn" in prefix)
+        self.skip_topk = (not _is_spec_layer) and csa_layer_skips_topk(config, layer_id)
+
     def compute_q(
         self,
         q_lora: torch.Tensor,

@@ -4062,6 +4062,7 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        prev_chunked_req = self.chunked_req
         if adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
@@ -4094,7 +4095,37 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except RuntimeError as e:
+            # DSV4 NPU safety net. The adder's C128 gate already checks the
+            # batch-level demand sum at admission (see PrefillAdder._c128_gate);
+            # this catches residual drift that can still land between
+            # admission and the real alloc (allocator state changing across
+            # scheduler rounds). Requeue on the normal "not scheduled this
+            # round" path instead of crashing the scheduler; C128 holders free
+            # their pages as they finish or get retracted by the decode path.
+            # Scoped to the DSV4 NPU allocator (c128_attn_allocator
+            # attribute); every other model keeps the previous raise behavior.
+            if (
+                "out of memory" not in str(e).lower()
+                or getattr(
+                    self.token_to_kv_pool_allocator, "c128_attn_allocator", None
+                )
+                is None
+            ):
+                raise
+            for req in can_run_list:
+                self._add_request_to_queue(req)
+            if self.chunked_req is not None:
+                self.chunked_req.inflight_middle_chunks -= 1
+                if self.chunked_req is not prev_chunked_req:
+                    self.chunked_req = prev_chunked_req
+            logger.warning(
+                "Prefill alloc failed after admission; requeued %d request(s).",
+                len(can_run_list),
+            )
+            return None, running_batch
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
