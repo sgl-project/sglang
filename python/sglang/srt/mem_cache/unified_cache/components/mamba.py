@@ -43,9 +43,11 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_server_args,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
+from sglang.srt.system_prompt.radix_patch import cap_mamba_donate_len
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -605,6 +607,21 @@ class MambaComponent(TreeComponent):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
                     write_pos_buf[req.kv.mamba_pool_idx] = 0
+
+        # Fixed system prompt (--system-prompt): retain ONLY the shared system-
+        # prefix mamba state in the tree and free every per-request suffix
+        # state. Cap the donate length at the chunk-aligned system boundary so
+        # every request maps to the same shared boundary node; subsequent
+        # donates find mamba_exist=True (commit_insert_component_data) and the
+        # donated suffix state is freed in cleanup_after_caching_req, never
+        # stored. The boundary state itself is captured during prefill by
+        # req.mamba_branching_seqlen (seeded from system_prefix_boundary), so
+        # the shared node is created on the first request that crosses it.
+        # extra_buffer only (see cap_mamba_donate_len): no_buffer donates the
+        # live chunk-end state, so capping there would store a wrong state.
+        cache_len = cap_mamba_donate_len(
+            cache_len, req.system_prefix_boundary, self.cache.enable_mamba_extra_buffer
+        )
 
         if is_finished:
             if cache_len is None:
