@@ -248,6 +248,11 @@ def _can_batch_cross_request_image_misses(
         owner is not None
         and getattr(data_embedding_func, "__name__", None) == "get_image_feature"
         and owner.__class__.__name__ in _NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS
+        and envs.SGLANG_NPU_VIT_MAX_BATCH_PATCHES.get() > 0
+        and not envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        and not getattr(owner, "use_data_parallel", False)
+        and getattr(owner, "quant_config", None) is None
+        and get_parallel().tp_size == 1
     )
 
 
@@ -396,27 +401,35 @@ class PerImageRequestInfo:
     overlapping: List[Tuple[int, MultimodalDataItem, int]] = field(default_factory=list)
 
 
-def _chunk_misses_by_token_budget(
+def _chunk_misses_by_patch_budget(
     miss_items: List[MultimodalDataItem],
     token_counts: List[int],
     budget: int,
 ) -> List[Tuple[List[MultimodalDataItem], List[int]]]:
-    """Split cache-miss items into groups whose total ViT token count stays
-    within the per-call budget, bounding the batched ViT workspace. An item
-    larger than the budget forms its own group. budget <= 0 means no limit."""
+    """Bound input patches, retaining output token counts for embedding splits.
+
+    Oversized and unknown-size images run alone. A nonpositive budget leaves
+    non-NPU batching unchanged; NPU admission handles its disable switch.
+    """
     if budget <= 0:
         return [(miss_items, token_counts)]
     groups: List[Tuple[List[MultimodalDataItem], List[int]]] = []
     cur_items: List[MultimodalDataItem] = []
     cur_counts: List[int] = []
-    cur_tokens = 0
+    cur_patches = 0
     for item, count in zip(miss_items, token_counts):
-        if cur_items and cur_tokens + count > budget:
+        feature = item.feature
+        patches = (
+            feature.shape[0]
+            if isinstance(feature, torch.Tensor) and feature.ndim == 2
+            else budget + 1
+        )
+        if cur_items and cur_patches + patches > budget:
             groups.append((cur_items, cur_counts))
-            cur_items, cur_counts, cur_tokens = [], [], 0
+            cur_items, cur_counts, cur_patches = [], [], 0
         cur_items.append(item)
         cur_counts.append(count)
-        cur_tokens += count
+        cur_patches += patches
     if cur_items:
         groups.append((cur_items, cur_counts))
     return groups
@@ -476,18 +489,18 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    # Phase 1b: encode all unique cache misses, chunked by per-call ViT token budget
+    # Phase 1b: bound NPU input patches, not merged output visual tokens.
     if unique_misses:
         ordered_cache_keys = list(unique_misses.keys())
         miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
-        _move_items_to_device(miss_items, device, data_embedding_func)
-        budget = envs.SGLANG_MM_CROSS_REQUEST_BATCH_TOKEN_BUDGET.get()
+        budget = envs.SGLANG_NPU_VIT_MAX_BATCH_PATCHES.get() if _is_npu else 0
         split_embeddings: List[torch.Tensor] = []
-        for group_items, group_counts in _chunk_misses_by_token_budget(
+        for group_items, group_counts in _chunk_misses_by_patch_budget(
             miss_items, token_counts, budget
         ):
+            _move_items_to_device(group_items, device, data_embedding_func)
             group_embedding = data_embedding_func(group_items)
 
             if isinstance(group_embedding, list):
@@ -503,9 +516,7 @@ def _batch_encode_per_image_misses(
                     emb.reshape(-1, emb.shape[-1]) for emb in group_embedding
                 )
             else:
-                group_embedding = group_embedding.reshape(
-                    -1, group_embedding.shape[-1]
-                )
+                group_embedding = group_embedding.reshape(-1, group_embedding.shape[-1])
                 split_embeddings.extend(
                     torch.split(group_embedding, group_counts, dim=0)
                 )
