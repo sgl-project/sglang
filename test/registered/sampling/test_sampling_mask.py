@@ -599,50 +599,62 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
         self.assertEqual((capture.weights[0] > 0).nonzero().view(-1).tolist(), [0, 1])
         self.assertIn(int(sampled[0]), [0, 1])
 
-    def test_seeded_fused_export_keeps_float32_support(self):
-        """A seeded draw must export the same support the unseeded one does."""
+    def test_seeded_sampling_mask_does_not_change_draw(self):
         batch_size, vocab_size, top_k = 1, 12, 3
         torch.manual_seed(0)
         logits = torch.randn(batch_size, vocab_size)
         fused_logits = self._fused_op_output(logits, top_k)
-        sampling_info = self._sampling_info(
-            batch_size, top_k, top_p=1.0, seed=torch.tensor([1234]), npu_eligible=True
-        )
+        hashed = torch.full((batch_size, vocab_size), 2**31, dtype=torch.uint32)
 
-        with (
-            patch.object(
-                sampler_module,
-                "torch_npu",
-                SimpleNamespace(
-                    npu_top_k_top_p=MagicMock(return_value=fused_logits.clone())
-                ),
-                create=True,
-            ),
-            patch.object(
-                sampler_module,
-                "multinomial_with_seed",
-                return_value=torch.tensor([[0]]),
-            ),
-        ):
-            sampled, filtered_probs = (
-                sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
-                    logits.clone(),
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                    sampling_info.sampling_seed,
-                    torch.zeros(batch_size, dtype=torch.int64),
-                    npu_top_k_top_p_eligible=True,
-                    return_filtered_probs=True,
+        for npu_eligible in (False, True):
+            with self.subTest(npu_eligible=npu_eligible):
+                sampling_info = self._sampling_info(
+                    batch_size,
+                    top_k,
+                    top_p=1.0,
+                    seed=torch.tensor([1234]),
+                    npu_eligible=npu_eligible,
                 )
-            )
+                with (
+                    patch.object(
+                        sampler_module,
+                        "torch_npu",
+                        SimpleNamespace(
+                            npu_top_k_top_p=MagicMock(
+                                side_effect=lambda *_: fused_logits.clone()
+                            )
+                        ),
+                        create=True,
+                    ),
+                    patch.object(sampler_module, "murmur_hash32", return_value=hashed),
+                ):
 
-        self.assertEqual(filtered_probs.dtype, torch.float32)
-        self.assertTrue(
-            torch.equal(filtered_probs, torch.softmax(fused_logits, dim=-1))
-        )
-        self.assertEqual(int(sampled[0]), 0)
+                    def sample(return_filtered_probs):
+                        return sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+                            logits.clone(),
+                            sampling_info.top_ks.clone(),
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                            sampling_info.sampling_seed,
+                            torch.zeros(batch_size, dtype=torch.int64),
+                            npu_top_k_top_p_eligible=npu_eligible,
+                            return_filtered_probs=return_filtered_probs,
+                        )
+
+                    sampled, filtered_probs = sample(True)
+                    sampled_without_mask = sample(False)
+
+                self.assertEqual(sampled.tolist(), sampled_without_mask.tolist())
+                self.assertEqual(filtered_probs.dtype, torch.float32)
+                self.assertGreater(float(filtered_probs[0, sampled[0]]), 0)
+                self.assertEqual(
+                    (filtered_probs[0] > 0).nonzero().view(-1).numel(), top_k
+                )
+                if npu_eligible:
+                    self.assertTrue(
+                        torch.equal(filtered_probs, torch.softmax(fused_logits, dim=-1))
+                    )
 
     def test_seeded_torch_fallback_export_is_vocab_ordered(self):
         batch_size, vocab_size, top_k = 1, 12, 3
