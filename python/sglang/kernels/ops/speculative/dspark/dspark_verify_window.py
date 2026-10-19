@@ -25,11 +25,17 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     window_index: torch.Tensor
 
 
+""""
+build_ragged_verify_window是torch版本，用 PyTorch 张量操作， build_ragged_verify_window_triton使用 Triton kernel，两者算法是一样的。
+
+build_ragged_verify_window_triton:按 layout 把本轮要验证的 token、位置和 KV 槽位，组装成目标模型能直接使用的输入包。
+
+"""
 class BuildRaggedVerifyWindow:
     @classmethod
     def execute(cls, *args, **kwargs) -> RaggedVerifyWindow:
         if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
+            return cls.triton(*args, **kwargs) #
         return cls.torch(*args, **kwargs)
 
     @classmethod

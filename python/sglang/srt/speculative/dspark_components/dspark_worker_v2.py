@@ -325,6 +325,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             else None
         )
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+
+        # self.draft_model就是draft草稿模型，用来输出做第一步token的验证和删选
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -808,6 +810,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    # 每轮decode生成的主函数： 1调用草稿模型输出待验证的token和对应的condifence-》2规划（compact紧凑表示，分配内存地址等预算）-》3compact验证（第）-》4接受和提交
+    # 1alloc_verify_window + propose - ---> 2resovle_verify_token_budget + scheule_layout - ---> 3run_compact -----> 4accept_and_finalize + commithidden
     def _forward_decode(
         self,
         batch: ScheduleBatch,
@@ -864,6 +868,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
+
+        # alloc_verify_window： 为完整的窗口准备位置和KV访问计划，给dfaft模型等环节使用
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -894,7 +900,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             simulate_bonus_sampling_info = sampling_info
             sampling_info = None
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT): #这里就只是执行draft模型的token验证
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -906,11 +912,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
-        draft_tokens = draft_block.draft_tokens
+        draft_tokens = draft_block.draft_tokens #验证后的token
         if coordination_plan is not None:
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
-        confidence = proposal.confidence
+        confidence = proposal.confidence #获取置信度输出, draft模型预测的置信度，用这个来做第一遍筛选。
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
@@ -918,14 +924,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
-
+        """
+        00993641
+        resolve_verify_token_budget函数：这里面会调用compute_budget_sync用condfience和SPS计算筛选的token
+        例如 bs=3, 那最低的验证token_num=3, 假设根据confidence和SPS-table计算需要再额外再多分配6行位置。那最终验证的token_num=9
+        """
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=batch.req_pool_indices,
-        )
+        ) #
 
+        """
+        SparkVerifyPlanner.schedule_layout函数：
+        这里会调用 ScheduleVerifyLensTopk.execute，把计算得到额外6个名额按照surival的值，优先分配给更可能连续接受的位置，比如bs=3， 分配是【3,1,2】，再加上每个请求原本的1个anchor, 对应num_token=[4,2,3]
+        它把每请求的验证长度和本轮需要的执行容量，封装一下 layout 交给后端
+        """
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,

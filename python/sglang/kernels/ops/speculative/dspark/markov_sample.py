@@ -266,7 +266,7 @@ class MarkovSampleStep:
             )
             return sample_markov_step_npu(**kwargs)
         if inputs_on_cuda(**kwargs):
-            return cls.triton(**kwargs)
+            return cls.triton(**kwargs) ## l00993641
         return cls.torch(**kwargs)
 
 

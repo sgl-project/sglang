@@ -376,6 +376,9 @@ class DSparkVerifyPlanner:
 
         # No collective: the budget derives only from the broadcast draft tokens
         # (via confidence), replicated req_generation, and the static sps table.
+        """
+        #00993641 compute_budget_sync在这里会使用confidence还有sps_table来筛选token，并留出预算
+        """
         draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
@@ -386,7 +389,7 @@ class DSparkVerifyPlanner:
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
             return None
-        return self.prepare_verify_budget
+        return self.prepare_verify_budget #提前准备需要验证token的预算
 
     def _budget_from_resolved(
         self,
@@ -406,7 +409,7 @@ class DSparkVerifyPlanner:
                 generation=resolved.generation,
                 current_generation=current_generation,
                 req_pool_indices_cpu=req_pool_indices_cpu,
-            )
+            ) #00993641 使用condience和sps， 通过compute_verify_token_budget比较不同预算的效率。SPS table可以理解为不同图大概有多快的成本表。
         )
 
     def schedule_layout(
@@ -496,32 +499,8 @@ class DSparkVerifyPlanner:
             tier_num_tokens=tier_num_tokens,
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        #>>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        # logger.info(
-        #     "[DSPARK-TIER] "
-        #     "bs=%s global_num_reqs=%s budget=%s "
-        #     "dp_tier_num_tokens=%s tier_num_tokens=%s "
-        #     "graph_floor=%s capture_grid=%s",
-        #     bs,
-        #     global_num_reqs,
-        #     budget,
-        #     dp_tier_num_tokens,
-        #     tier_num_tokens,
-        #     graph_num_tokens_floor,
-        #     capture_num_tokens,
-        # )
-        #>>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
-
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        #     logger.info(
-        #         "[DSPARK-TIER] graph_num_tokens=%s",
-        #         graph_num_tokens,
-        #     )
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
             )
@@ -602,6 +581,10 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        """
+        ScheduleVerifyLensTopk.execute函数：把计算得到额外6个名额优先分配给更可能连续接受的位置。
+        返回的verify_lens：基础验证行数+额外验证数量【4,2,3】=9，在再按照上下裁剪后的结果
+        """
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
