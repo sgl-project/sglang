@@ -264,8 +264,8 @@ impl Worker {
     }
 
     /// Construct a worker with an explicit circuit-breaker configuration and
-    /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`
-    /// for the default breaker config (threshold = 3, cool_down = 30 s).
+    /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`,
+    /// as under `--disable-circuit-breaker`, for a breaker that never opens.
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
@@ -279,7 +279,7 @@ impl Worker {
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
-            None => Arc::new(CircuitBreaker::new()),
+            None => Arc::new(CircuitBreaker::disabled()),
         };
         let bootstrap_host = parse_bootstrap_host(&spec.url);
         let grpc = grpc_port.and_then(|port| grpc_client(&bootstrap_host, port));

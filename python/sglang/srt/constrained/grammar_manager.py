@@ -164,29 +164,41 @@ class GrammarManager:
             req.grammar.max_think_tokens = thinking_budget
 
     def _apply_constrained_reasoning_config(self, req: Req, key_type: str) -> None:
-        if not (
+        budget_enforced = (
             isinstance(req.grammar, ReasonerGrammarObject)
             and req.grammar.token_filter_fn is not None
+        )
+        if not budget_enforced and isinstance(
+            self.grammar_backend, ReasonerGrammarBackend
         ):
-            if self._get_request_thinking_budget(req) is not None:
+            budget_enforced = self.grammar_backend.framed_grammar_enforces_budget(
+                key_type
+            )
+        if not budget_enforced:
+            base_key_type = key_type.partition(":")[0]
+            thinking_budget = self._get_request_thinking_budget(req)
+            if thinking_budget is not None and thinking_budget >= 0:
                 req.set_finish_with_abort(
-                    f"thinking_budget cannot be enforced together with a {key_type} "
-                    f"constraint on this server; it requires --reasoning-parser, a "
-                    f"grammar backend that supports token filtering (e.g., xgrammar), "
-                    f"and a constraint that does not own the full assistant turn"
+                    f"thinking_budget cannot be enforced together with a "
+                    f"{base_key_type} constraint on this server; it requires "
+                    f"--reasoning-parser, a grammar backend that supports token "
+                    f"filtering (e.g., xgrammar), and a constraint that does not "
+                    f"own the full assistant turn"
                 )
                 return
             if self._env_thinking_budget_active():
                 req.set_finish_with_abort(
-                    f"SGLANG_MAX_THINK_TOKENS cannot be enforced on this {key_type} "
-                    f"constraint because it owns the full assistant turn; unset the "
-                    f"server-wide cap to use this constraint"
+                    f"SGLANG_MAX_THINK_TOKENS cannot be enforced on this "
+                    f"{base_key_type} constraint because it owns the full assistant "
+                    f"turn; unset the server-wide cap to use this constraint"
                 )
                 return
         self._apply_request_reasoning_config(req)
 
     def process_req_with_grammar(self, req: Req) -> bool:
-        if self.is_uno and self._get_request_thinking_budget(req) is not None:
+        thinking_budget = self._get_request_thinking_budget(req)
+        # A negative budget is an explicit "no cap" and needs no enforcement.
+        if self.is_uno and thinking_budget is not None and thinking_budget >= 0:
             req.set_finish_with_abort(
                 "thinking_budget is not supported with UNO speculative decoding "
                 "because it requires grammar decoding"
@@ -218,6 +230,11 @@ class GrammarManager:
                     key = (key_type, req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
+                key = self.grammar_backend.get_request_grammar_key(
+                    key,
+                    input_ids=req.origin_input_ids,
+                    thinking_budget=thinking_budget,
+                )
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning
@@ -238,7 +255,6 @@ class GrammarManager:
                     else:
                         self._apply_constrained_reasoning_config(req, key[0])
         else:
-            thinking_budget = self._get_request_thinking_budget(req)
             grammar_obj = (
                 self.grammar_backend.init_strict_reasoning_grammar(
                     req.require_reasoning,
@@ -250,7 +266,7 @@ class GrammarManager:
             if grammar_obj is not None:
                 req.grammar = grammar_obj
                 self._apply_request_reasoning_config(req)
-            elif thinking_budget is not None:
+            elif thinking_budget is not None and thinking_budget >= 0:
                 req.set_finish_with_abort(
                     "thinking_budget requires the server to be launched with "
                     "--reasoning-parser and a grammar backend that supports "

@@ -713,11 +713,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 output_size=num_tokens,
             )
         draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
-        if getattr(draft_pool, "swa_req_ring_valid_from", None) is not None:
+        if (
+            getattr(draft_pool, "swa_valid_from", None) is not None
+            and batch.encoder_swa_reset is not None
+        ):
             # A newly placed request's ring holds nothing below its cached prefix.
             placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
             if placed:
-                draft_pool.reset_swa_req_ring(
+                draft_pool.set_swa_valid_from(
                     batch.req_pool_indices[placed],
                     torch.tensor(
                         [batch.prefix_lens[i] for i in placed],
