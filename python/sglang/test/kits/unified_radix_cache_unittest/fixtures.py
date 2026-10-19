@@ -192,6 +192,10 @@ def _host_lock_ref(cache, node_id, component_type):
     return cache.tree_core.get_component_host_lock_ref(node_id, component_type)
 
 
+def _match_prefix(cache, tokens):
+    return cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+
 def _aux_storage_key_transfers(cache, node_id):
     transfers = []
     if ComponentType.SWA in cache.tree_components:
@@ -533,6 +537,11 @@ class UnifiedRadixCacheFixtures:
         """Page-aligned token sequence of num_pages pages."""
         page_size = self.cfg.page_size
         return list(range(start, start + num_pages * page_size))
+
+    def _make_storage_dir(self):
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        return storage_dir
 
     def _alloc(self, allocator, need_size):
         if not (self.cfg.has_swa and self.cfg.page_size > 1):
@@ -893,7 +902,7 @@ class UnifiedRadixCacheFixtures:
                 component_evicted_seqlens={ComponentType.SWA: live_from},
             )
         )
-        masked = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        masked = _match_prefix(cons, seq)
         self.assertEqual(masked.device_prefix_len, 0, "unified match not masked")
         self.assertEqual(masked.full_kv_hit_length, len(seq), "live FULL not resident")
         masked_full = value[: len(seq)].clone()
@@ -987,7 +996,7 @@ class UnifiedRadixCacheFixtures:
         self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         self.assertEqual(self._host_avail_sizes(cons), avail0)
-        after = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        after = _match_prefix(cons, seq)
         self.assertEqual(after.full_kv_hit_length, len(seq))
         self.assertEqual(after.device_prefix_len, len(seq))
         # Only the fetched SWA tail made the resident FULL reusable.
@@ -1021,7 +1030,7 @@ class UnifiedRadixCacheFixtures:
         # Sibling publishes the first page of the span while the hold parks.
         head = seq[: self.cfg.page_size]
         self._insert(cons, cons_alloc, cons_rtp, head)
-        sib = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", head))))
+        sib = _match_prefix(cons, head)
         self.assertEqual(sib.device_prefix_len, len(head))
         self._fill_full_kv(
             cons_alloc, cons.path_device_indices(sib.last_device_node), marker=3
@@ -1057,7 +1066,7 @@ class UnifiedRadixCacheFixtures:
         spliced = self._consume_staged_prefetch(cons, req_id, prefix_len=len(head))
         self.assertEqual(int(spliced.numel()), len(seq) - len(head))
 
-        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cons, seq)
         self.assertEqual(m.device_prefix_len, len(seq))
         self.assertTrue(
             torch.equal(
@@ -1105,7 +1114,7 @@ class UnifiedRadixCacheFixtures:
         self.addCleanup(p_dist.stop)
 
     def _swa_host_on_path(self, cache, seq):
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_host_node
         while node != cache.root_node_handle():
             if _host_value(cache, node, ComponentType.SWA) is not None:
@@ -1119,9 +1128,7 @@ class UnifiedRadixCacheFixtures:
             prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        leaf = prod.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
+        leaf = _match_prefix(prod, seq).last_device_node
         self._backup_node(prod, leaf)
         self._write_path_to_l3(prod, leaf)
         self._flush_l3_backups(prod)
@@ -1154,8 +1161,7 @@ class UnifiedRadixCacheFixtures:
         ) // self.cfg.page_size
         seq = self._make_seq(1, sw_pages + 1)
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         self._l3_produce(storage_dir, seq)
 
         # Baseline (single rank) must actually adopt SWA, else the TP assertions
@@ -1374,7 +1380,7 @@ class UnifiedRadixCacheFixtures:
         for i in range(num_pages):
             seq = seq + self._make_seq(1000 * (i + 1), 1)
             self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         chain: list = []
         cur = m.last_device_node
         while cur != cache.root_node_handle():
@@ -1496,19 +1502,3 @@ class UnifiedRadixCacheFixtures:
 
         tokens = self._swa_anchor_chain_tokens(len(chain))
         return cache, chain, n, y, x, tokens
-
-
-class _InsertWalkSuite:
-    """Fixture helpers from UnifiedRadixCacheSuite, without inheriting its tests."""
-
-    _rid = 0
-    _make_req = UnifiedRadixCacheFixtures._make_req
-    _apply_match_to_req = UnifiedRadixCacheFixtures._apply_match_to_req
-    _alloc = UnifiedRadixCacheFixtures._alloc
-    _insert = UnifiedRadixCacheFixtures._insert
-    _init_hicache = UnifiedRadixCacheFixtures._init_hicache
-    _build_hicache_fixture = UnifiedRadixCacheFixtures._build_hicache_fixture
-    _make_seq = UnifiedRadixCacheFixtures._make_seq
-    _skip_unsupported_hicache_test = (
-        UnifiedRadixCacheFixtures._skip_unsupported_hicache_test
-    )

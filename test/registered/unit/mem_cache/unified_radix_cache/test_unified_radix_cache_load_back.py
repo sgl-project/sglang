@@ -46,6 +46,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     UnifiedRadixCacheFixtures,
     _device_value,
     _host_value,
+    _match_prefix,
     _node_key_length,
     _node_parent,
     build_fixture,
@@ -240,7 +241,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         base = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, base)
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
+        m = _match_prefix(cache, base)
         node = m.last_device_node
         original_device_indices = cache.path_device_indices(m.last_device_node).clone()
         self._fill_full_kv(allocator, original_device_indices, marker=3)
@@ -271,9 +272,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertIsNotNone(_device_value(cache, node, ComponentType.FULL))
         # Gather the whole reloaded prefix via match (a leaf may be split).
         loaded_indices = cache.path_device_indices(
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", base)))
-            ).last_device_node
+            _match_prefix(cache, base).last_device_node
         )
         loaded_k, loaded_v = self._snapshot_full_kv(allocator, loaded_indices)
         self.assertTrue(torch.equal(loaded_k, expected_k))
@@ -305,15 +304,13 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = _match_prefix(cache, tokens).last_device_node
         evicted = cache.tree_core.evict_component(
             leaf, ComponentType.SWA, EvictLayer.DEVICE
         )
         cache._free_values(evicted.device_frees, evicted.host_frees)
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
@@ -327,9 +324,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             tokens[: result.swa_branching_seqlen],
         )
 
-        rematch = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
+        rematch = _match_prefix(cache, tokens)
         self.assertEqual(rematch.device_prefix_len, result.swa_branching_seqlen)
         self.assertIsNone(rematch.swa_branching_seqlen)
 
@@ -348,9 +343,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = _match_prefix(cache, tokens).last_device_node
         leaf_len = _node_key_length(cache, leaf)
         parent = _node_parent(cache, leaf)
         self._backup_node(cache, leaf)
@@ -368,7 +361,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         full_available_before = full_host_pool.available_size()
         swa_available_before = swa_host_pool.available_size()
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
@@ -387,9 +380,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             swa_available_before - leaf_len,
         )
 
-        rematch = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
+        rematch = _match_prefix(cache, tokens)
         self.assertEqual(rematch.device_prefix_len, result.swa_branching_seqlen)
         self.assertIsNone(rematch.swa_branching_seqlen)
 
@@ -441,28 +432,20 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         chunk_size = mamba_cache_chunk_size()
         tokens = self._make_seq(1, chunk_size + 1)
         self._insert(cache, allocator, req_to_token_pool, tokens)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = _match_prefix(cache, tokens).last_device_node
 
         cache.tree_core.set_component_device_value_raw(leaf, ComponentType.MAMBA, None)
-        no_hicache = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
+        no_hicache = _match_prefix(cache, tokens)
         self.assertEqual(no_hicache.best_match_node, cache.root_node_handle())
         self.assertEqual(no_hicache.last_device_node, cache.root_node_handle())
         self.assertEqual(no_hicache.mamba_branching_seqlen, chunk_size)
 
         tree_h, allocator_h, req_to_token_pool_h = self._build_hicache_fixture()
         self._insert(tree_h, allocator_h, req_to_token_pool_h, tokens)
-        leaf_h = tree_h.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf_h = _match_prefix(tree_h, tokens).last_device_node
         self._backup_node(tree_h, leaf_h)
         tree_h.evict(EvictParams(num_tokens=len(tokens)))
-        with_hicache = tree_h.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
+        with_hicache = _match_prefix(tree_h, tokens)
         self.assertEqual(with_hicache.best_match_node, leaf_h)
         self.assertEqual(with_hicache.last_device_node, tree_h.root_node_handle())
         self.assertIsNone(with_hicache.mamba_branching_seqlen)
@@ -477,13 +460,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = _match_prefix(cache, tokens).last_device_node
         parent = cache.tree_core.get_parent_node_id(leaf)
         cache.tree_core.set_component_device_value_raw(leaf, ComponentType.MAMBA, None)
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.best_match_node, parent)
         self.assertEqual(result.last_device_node, parent)
@@ -502,9 +483,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = _match_prefix(cache, tokens).last_device_node
         parent = cache.tree_core.get_parent_node_id(leaf)
         self.assertIsNotNone(parent)
         self._backup_node(cache, leaf)
@@ -527,7 +506,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         full_available_before = full_host_pool.available_size()
         mamba_available_before = mamba_host_pool.available_size()
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.best_match_node, parent)
         self.assertEqual(result.last_device_node, parent)
@@ -554,9 +533,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             mamba_available_before - 1,
         )
 
-        second_match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
+        second_match = _match_prefix(cache, tokens)
 
         self.assertEqual(second_match.device_prefix_len, branching_seqlen)
         self.assertIsNone(second_match.mamba_branching_seqlen)
@@ -907,9 +884,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._init_hicache(cache, write_policy="write_back")
         tokens = list(range(12))
         self._insert(cache, allocator, pool, tokens)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = _match_prefix(cache, tokens).last_device_node
         self._fill_mamba_state(
             pool, _device_value(cache, leaf, ComponentType.MAMBA), marker=11
         )

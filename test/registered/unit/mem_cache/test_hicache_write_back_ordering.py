@@ -19,11 +19,7 @@ register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestHiCacheWriteBackOrdering(unittest.TestCase):
-    _init_hicache = UnifiedRadixCacheFixtures._init_hicache
-    _make_req = UnifiedRadixCacheFixtures._make_req
-    _rid = 0
-
+class TestHiCacheWriteBackOrdering(UnifiedRadixCacheFixtures, unittest.TestCase):
     def _request(self, cache, allocator, req_pool, start, length=8):
         req = self._make_req(req_pool)
         req.origin_input_ids = array("q", range(start, start + 2 * length))

@@ -176,18 +176,11 @@ class TestMambaPathStateCap(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba pool fixtures need CUDA")
-class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
+class TestMambaPathCapWriteThroughOrdering(UnifiedRadixCacheFixtures, CustomTestCase):
     """CI-active write-through/path-cap ordering regressions (the unified radix
     cache unittest module is temporarily gated off on trunk)."""
 
     cfg = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
-    _rid = 0
-    # Borrow the fixture helpers without inheriting the full gated suite.
-    _make_req = UnifiedRadixCacheFixtures._make_req
-    _alloc = UnifiedRadixCacheFixtures._alloc
-    _insert = UnifiedRadixCacheFixtures._insert
-    _init_hicache = UnifiedRadixCacheFixtures._init_hicache
-    _build_hicache_fixture = UnifiedRadixCacheFixtures._build_hicache_fixture
 
     def test_write_through_backup_survives_mamba_path_cap(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()

@@ -31,6 +31,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _device_value,
     _host_lock_ref,
     _host_value,
+    _match_prefix,
     _node_children,
     _node_key_length,
     _node_parent,
@@ -57,9 +58,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, seq_a)
         self._insert(cache, allocator, req_to_token_pool, seq_ab)
 
-        node_a = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
-        ).last_device_node
+        node_a = _match_prefix(cache, seq_a).last_device_node
         self.assertGreater(
             len(_node_children(cache, node_a)), 0, "A must have children"
         )
@@ -165,7 +164,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
 
         # The chain is gone entirely: no device hit, no host hit.
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         self.assertEqual(m.device_prefix_len, 0)
         self.assertEqual(m.host_hit_length, 0)
         cache.sanity_check()
@@ -185,7 +184,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, parent_seq)
         child_seq = parent_seq + self._make_seq(1000, 1)
         self._insert(cache, allocator, req_to_token_pool, child_seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
+        m = _match_prefix(cache, child_seq)
         child = m.last_device_node
 
         # Evict only the child leaf -> real backup + demote, leaving it
@@ -213,9 +212,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
             child_lock_params = cache.inc_host_lock_ref(child).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
-            m = cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", parent_seq)))
-            )
+            m = _match_prefix(cache, parent_seq)
             self.assertEqual(m.device_prefix_len, len(parent_seq))
             cache.dec_host_lock_ref(child, child_lock_params)
 
@@ -223,7 +220,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(parent_seq))
         self.assertEqual(host_pool.available_size(), baseline_host)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
+        m = _match_prefix(cache, child_seq)
         self.assertEqual(m.device_prefix_len, 0)
         self.assertEqual(m.host_hit_length, 0)
         cache.sanity_check()
@@ -240,9 +237,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
+        leaf = _match_prefix(cache, seq).last_device_node
         self._backup_node(cache, leaf)
 
         lock_params = cache.inc_host_lock_ref(leaf).to_dec_params()
@@ -297,9 +292,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         seq = [1, 2, 3, 4, 5, 6, 7, 8]
         self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
+        leaf = _match_prefix(cache, seq).last_device_node
         parent_before_split = _node_parent(cache, leaf)
         self._backup_node(cache, leaf)
         available_after_backup = swa_host_pool.available_size()
@@ -340,7 +333,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
         self.assertNotEqual(node, cache.root_node_handle())
         self.assertFalse(cache.tree_core.is_backuped(node))
@@ -369,7 +362,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
 
         self._backup_node(cache, node)
@@ -402,7 +395,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         query = expected_prefix + self._make_seq(9000, 1)
 
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
         self._backup_node(cache, node)
 
@@ -410,7 +403,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self.assertTrue(cache.tree_core.is_full_device_evicted(node))
         self.assertTrue(cache.tree_core.is_backuped(node))
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", query))))
+        m = _match_prefix(cache, query)
 
         self.assertEqual(m.device_prefix_len, 0)
         self.assertEqual(m.last_device_node, cache.root_node_handle())
@@ -456,7 +449,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
 
         self._backup_node(cache, node)
@@ -481,7 +474,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._init_hicache(cache, write_policy="write_back")
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
         self.assertNotEqual(node, cache.root_node_handle())
         self.assertFalse(cache.tree_core.is_backuped(node))
@@ -543,7 +536,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
 
         for aux in aux_types:
@@ -572,7 +565,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         result = cache.evict(EvictParams(num_tokens=0, mamba_num=10))
         self.assertGreaterEqual(result.mamba_num_evicted, 1)
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        m = _match_prefix(cache, seq_a)
         node = m.best_match_node
         self.assertNotEqual(
             node,
@@ -675,7 +668,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         cache.evict(EvictParams(num_tokens=0, mamba_num=10))
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        m = _match_prefix(cache, seq_a)
         self.assertEqual(
             m.device_prefix_len,
             0,
@@ -697,7 +690,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
         self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        m = _match_prefix(cache, seq_a)
         node = m.best_match_node
         self.assertNotEqual(
             node,
@@ -750,7 +743,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        m = _match_prefix(cache, seq_a)
         if m.best_match_node != cache.root_node_handle():
             node = m.best_match_node
             self.assertIsNone(
@@ -768,7 +761,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         seq = self._make_seq(1, (min_tokens + ps - 1) // ps)
         self._insert(cache, allocator, req_to_token_pool, seq)
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        result = _match_prefix(cache, seq)
 
         self.assertEqual(result.device_prefix_len, len(seq))
         self.assertEqual(result.best_match_node, result.last_device_node)
@@ -817,7 +810,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.best_match_node, leaf)
         self.assertEqual(result.last_device_node, parent)
@@ -841,7 +834,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.best_match_node, leaf)
         self.assertEqual(result.last_device_node, parent)
@@ -861,7 +854,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         self._set_aux_host_tombstone(cache, leaf, ComponentType.SWA)
 
-        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        result = _match_prefix(cache, tokens)
 
         self.assertEqual(result.best_match_node, leaf)
         self.assertEqual(result.last_device_node, parent)
@@ -918,9 +911,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
 
         self._insert(cache, allocator, req_to_token_pool, next_tokens)
 
-        d = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", next_tokens)))
-        ).last_device_node
+        d = _match_prefix(cache, next_tokens).last_device_node
         self.assertEqual(cache.tree_core.get_write_through_pending_id(c), c)
         self.assertEqual(cache.tree_core.get_write_through_pending_id(d), d)
         self.assertIsNone(_host_value(cache, c, ComponentType.SWA))
@@ -1141,7 +1132,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
         old_mamba = _device_value(cache, node, ComponentType.MAMBA)
         self.assertIsNotNone(old_mamba)
@@ -1199,7 +1190,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         cache.sanity_check()
 
         for i in range(3):
-            m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seqs[i]))))
+            m = _match_prefix(cache, seqs[i])
             self._backup_node(cache, m.last_device_node)
 
         # Evict to free some tokens
@@ -1233,7 +1224,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, base)
         self._insert(cache, allocator, req_to_token_pool, leaf_seq)
 
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", leaf_seq))))
+        m = _match_prefix(cache, leaf_seq)
         leaf = m.last_device_node
         parent = cache.tree_core.get_parent_node_id(leaf)
         self.assertNotEqual(parent, cache.root_node_handle())
@@ -1289,9 +1280,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheFixtures):
             self._insert(cache, allocator, req_to_token_pool, seq)
 
         def leaf(seq):
-            return cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", seq)))
-            ).last_device_node
+            return _match_prefix(cache, seq).last_device_node
 
         c, b, t1 = self._path_chain(cache, leaf(t1_seq))
         _, d, t2 = self._path_chain(cache, leaf(t2_seq))

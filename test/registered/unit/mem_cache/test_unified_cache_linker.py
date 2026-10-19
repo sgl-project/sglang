@@ -44,9 +44,9 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_unittest import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     CacheConfig,
+    UnifiedRadixCacheFixtures,
     _device_lock_ref,
     _device_value,
-    _InsertWalkSuite,
     _node_children,
     build_fixture,
 )
@@ -322,7 +322,7 @@ class _TreeCoreBackendTestMixin:
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerPythonBackend(
-    _TreeCoreBackendTestMixin, _InsertWalkSuite, CustomTestCase
+    _TreeCoreBackendTestMixin, UnifiedRadixCacheFixtures, CustomTestCase
 ):
     def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
         """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
@@ -811,7 +811,9 @@ class TestUnifiedCacheLinkerPythonBackend(
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
-    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite, CustomTestCase
+    _TreeCoreBackendTestMixin,
+    shared_cache_suite.UnifiedRadixCacheFixtures,
+    CustomTestCase,
 ):
     """TreeCore linker contracts shared by the Python and Rust inspectors."""
 

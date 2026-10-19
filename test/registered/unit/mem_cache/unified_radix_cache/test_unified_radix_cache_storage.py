@@ -1,8 +1,6 @@
 """L3 storage, buffer-only host memory and prefetch tests for UnifiedRadixCache."""
 
 import os
-import shutil
-import tempfile
 import time
 import unittest
 from array import array
@@ -62,7 +60,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _device_lock_ref,
     _drop_hicache_atexit_pin,
     _host_value,
-    _InsertWalkSuite,
+    _match_prefix,
     _node_key_length,
     _node_parent,
     _node_token_ids,
@@ -386,8 +384,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         if self.cfg.has_mamba:
             self.skipTest("mamba L3 prefetch is out of scope for this unit fixture")
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         num_pages = 4
         if self.cfg.has_swa:
             # SWA L3 prefetch is all-or-nothing over one full sliding window.
@@ -408,7 +405,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        mp = _match_prefix(prod, seq)
         prod_leaf = mp.last_device_node
         self._fill_full_kv(
             prod_alloc, prod.path_device_indices(mp.last_device_node), marker=7
@@ -435,7 +432,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._run_prefetch_to_completion(cons, req_id)
 
         # The full prefix must now be a host hit (loaded from L3).
-        mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        mc = _match_prefix(cons, seq)
         self.assertEqual(mc.host_hit_length, len(seq))
         host_node = mc.last_host_node
         self.assertNotEqual(host_node, cons.root_node_handle())
@@ -444,9 +441,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # Load the reloaded host prefix back to device and verify KV bytes.
         self._load_back_node(cons, host_node)
         loaded_indices = cons.path_device_indices(
-            cons.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", seq)))
-            ).last_device_node
+            _match_prefix(cons, seq).last_device_node
         )
         self.assertEqual(len(loaded_indices), len(seq))
         loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, loaded_indices)
@@ -476,8 +471,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         num_pages = max(4, sw_pages + 1)
         seq = self._make_seq(1, num_pages)
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         # --- Producer tree: D->H backup, H->L3 offload, flush. ---
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
@@ -488,7 +482,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        mp = _match_prefix(prod, seq)
         prod_leaf = mp.last_device_node
         self._backup_node(prod, prod_leaf)
         self._write_path_to_l3(prod, prod_leaf)
@@ -631,8 +625,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         num_pages = max(4, sw_pages + 1)
         seq = self._make_seq(1, num_pages)
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         # --- Producer tree: D->H backup, H->L3 offload, flush. ---
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
@@ -643,7 +636,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        mp = _match_prefix(prod, seq)
         prod_leaf = mp.last_device_node
         self._backup_node(prod, prod_leaf)
         self._write_path_to_l3(prod, prod_leaf)
@@ -752,8 +745,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # resident prefix before the duplicate is released.
         if 2 * total_pages * page > self.cfg.kv_size:
             self.skipTest("chain does not fit the device pool")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         with envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True):
@@ -765,9 +757,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self._insert(cache, allocator, req_to_token_pool, seq[: end_pages * page])
 
         def chain_pages(key):
-            leaf = cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", key)))
-            ).last_device_node
+            leaf = _match_prefix(cache, key).last_device_node
             hashes: list[str] = []
             ends: list[int] = []
             for node in self._path_chain(cache, leaf):
@@ -855,9 +845,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self._run_prefetch_to_completion(cons, handle)
         self.assertEqual(
-            cons.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", seq)))
-            ).device_prefix_len,
+            _match_prefix(cons, seq).device_prefix_len,
             len(seq),
         )
 
@@ -893,8 +881,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         -> free. Staging and locks fully released, pages stored under every
         pool namespace, beliefs registered, re-hits skipped."""
         self._skip_unsupported_hicache_test()
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_buffer_hicache(cache, storage_dir)
@@ -904,9 +891,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         seq_ab = seq_a + self._make_seq(500, 2)
         self._insert(cache, allocator, req_to_token_pool, seq_a)
         self._insert(cache, allocator, req_to_token_pool, seq_ab)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq_ab)))
-        ).last_device_node
+        leaf = _match_prefix(cache, seq_ab).last_device_node
         chain = self._path_chain(cache, leaf)
 
         pipeline = cache.buffer_pipeline
@@ -1098,8 +1083,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
     def test_buffer_only_split_intent_writes_every_piece(self):
         """Repeated splits preserve every pool's write once, parents first."""
         self._skip_unsupported_hicache_test()
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_buffer_hicache(cache, storage_dir)
         pipeline = cache.buffer_pipeline
@@ -1107,9 +1091,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         seq = self._buffer_swa_seq(min_pages=4)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
+        leaf = _match_prefix(cache, seq).last_device_node
         chain = self._path_chain(cache, leaf)
         span_hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
         aux_keys = _aux_storage_key_transfers(cache, leaf)
@@ -1159,8 +1141,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         """The finish-path split preserves both prompt and output writes."""
         if self.cfg.components != (ComponentType.FULL,):
             self.skipTest("only FULL-only caches split the leaf at the prompt")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_buffer_hicache(cache, storage_dir)
         cache.tree_core.write_through_threshold = 1  # the write_through trigger
@@ -1183,9 +1164,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         req.extra_key = None
         finish_req(cache, req, kv_len)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", prompt + output)))
-        ).last_device_node
+        leaf = _match_prefix(cache, prompt + output).last_device_node
         chain = self._path_chain(cache, leaf)
         self.assertEqual(
             [_node_key_length(cache, n) for n in chain], [len(prompt), len(output)]
@@ -1200,8 +1179,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         BACKUP_HOST transfers) is written, believed and re-written
         independently of the KV pool."""
         self._skip_unsupported_hicache_test()
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
@@ -1217,9 +1195,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         seq = self._buffer_swa_seq()
         self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
+        leaf = _match_prefix(cache, seq).last_device_node
         chain = self._path_chain(cache, leaf)
         pipeline = cache.buffer_pipeline
         expected_intents = []
@@ -1345,8 +1321,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         Data bytes match the producer's; no CPU-tier KV events anywhere;
         declines feed the outcome counters."""
         self._skip_unsupported_hicache_test()
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         _, (expected_k, expected_v) = self._produce_buffer_l3(
@@ -1382,13 +1357,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertNotEqual(self._host_avail_sizes(cons), avail0)
         self.assertEqual(cons.token_to_kv_pool_allocator.available_size(), dev_avail0)
         self.assertEqual(
-            len(
-                cons.path_device_indices(
-                    cons.match_prefix(
-                        MatchPrefixParams(key=RadixKey(array("q", seq)))
-                    ).last_device_node
-                )
-            ),
+            len(cons.path_device_indices(_match_prefix(cons, seq).last_device_node)),
             0,
         )
         self.assertTrue(cons.check_prefetch_progress(req_id))
@@ -1430,7 +1399,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self.assertEqual(spliced_len, len(seq))
         cons.ready_to_load_host_cache()
-        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cons, seq)
         self.assertEqual(
             (m.device_prefix_len, m.last_device_node), (len(seq), spliced_node)
         )
@@ -1445,7 +1414,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             ),
             "load-back ack did not free the bounce",
         )
-        mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        mc = _match_prefix(cons, seq)
         self.assertEqual(mc.host_hit_length, 0)
         self.assertEqual(mc.device_prefix_len, len(seq))
         leaf = mc.last_device_node
@@ -1493,8 +1462,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         if self.cfg.components != (ComponentType.FULL,) or self.cfg.page_size != 4:
             self.skipTest("one FULL page_size=4 fixture covers namespace routing")
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         extra_key = "adapter-a"
         cache_salt = "tenant-a"
@@ -1632,8 +1600,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # config so the matrix does not exhaust a small CI GPU.
         if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
             self.skipTest("requires page_size=1, sliding_window_size=4")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
@@ -1719,8 +1686,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # the retained per-fixture device memory stays bounded.
         if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
             self.skipTest("requires page_size=1, sliding_window_size=4")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         cache, _alloc, _rtp = build_fixture(self.cfg)
@@ -1757,8 +1723,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         ps = self.cfg.page_size
         window = self.cfg.sliding_window_size
         seq = self._buffer_swa_seq()  # one full window + 1 page
@@ -1865,8 +1830,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         staging and consumption; the live pre-check must drop the hold before
         any device allocation or H2D exists."""
         self._skip_unsupported_hicache_test()
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -1893,7 +1857,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         # Sibling publishes the identical span (live FULL + SWA).
         self._insert(cons, cons_alloc, cons_rtp, seq)
-        sib = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        sib = _match_prefix(cons, seq)
         self.assertEqual(sib.device_prefix_len, len(seq))
         self._fill_full_kv(
             cons_alloc, cons.path_device_indices(sib.last_device_node), marker=3
@@ -1914,7 +1878,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         self.assertEqual(self._host_avail_sizes(cons), avail0)
-        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cons, seq)
         self.assertTrue(
             torch.equal(
                 cons.path_device_indices(m.last_device_node),
@@ -1936,8 +1900,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._skip_unsupported_hicache_test()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
 
@@ -1958,8 +1921,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
         page_size = self.cfg.page_size
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         _, expected_kv = self._produce_buffer_l3(storage_dir, seq, marker=3)
@@ -1978,7 +1940,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                 component_evicted_seqlens={ComponentType.SWA: len(sibling)},
             )
         )
-        live = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        live = _match_prefix(cons, seq)
         self.assertEqual(live.device_prefix_len, 0, "unified match not masked")
         self.assertEqual(live.full_kv_hit_length, split_at, "FULL run not partial")
         head_full = value[:split_at].clone()
@@ -2038,8 +2000,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
         page_size = self.cfg.page_size
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -2093,7 +2054,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         self.assertEqual(accounted0, full_accounted(), "a FULL page is free and owned")
         # The resident FULL head was reused rather than evicted for the tail.
-        live = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        live = _match_prefix(cons, seq)
         self.assertEqual(live.full_kv_hit_length, split_at)
         cons.sanity_check()
 
@@ -2102,8 +2063,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         via cc.load), consumption must fail-stop rather than hand out slots a
         queued H2D no longer owns."""
         self._skip_unsupported_hicache_test()
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -2168,8 +2128,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # one config so the matrix does not exhaust a small CI GPU.
         if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
             self.skipTest("requires page_size=1, sliding_window_size=4")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         with self.subTest(span="over-window"):
             self._assert_sibling_head_is_trimmed(
@@ -2192,8 +2151,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # one config so the matrix does not exhaust a small CI GPU.
         if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
             self.skipTest("requires page_size=1, sliding_window_size=4")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -2217,7 +2175,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.pop_prefetch_loaded_tokens(req_id)
         self._insert(cons, cons_alloc, cons_rtp, seq)
 
-        live = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        live = _match_prefix(cons, seq)
         req = mock.Mock(
             rid=req_id.rid,
             cache_request_handle=req_id,
@@ -2246,8 +2204,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # one config so the matrix does not exhaust a small CI GPU.
         if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
             self.skipTest("requires page_size=1, sliding_window_size=4")
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -2295,8 +2252,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         if window <= self.cfg.page_size:
             self.skipTest("window fits in one page")
         sw_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
 
         # 1. A root-anchored sub-window request is declined before querying.
         seq = self._make_seq(1, sw_pages - 1)
@@ -2330,7 +2286,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self._init_buffer_hicache(cons2, storage_dir)
             avail2 = self._host_avail_sizes(cons2)
             self._insert(cons2, cons2_alloc, cons2_rtp, seq_a)
-            m = cons2.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+            m = _match_prefix(cons2, seq_a)
             last_hash = cons2.get_last_hash_value(m.last_device_node)
             cons2.prefetch_from_storage(
                 CacheRequestHandle("subwin-req", 0),
@@ -2383,9 +2339,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self.assertEqual(
                 len(
                     cons2.path_device_indices(
-                        cons2.match_prefix(
-                            MatchPrefixParams(key=RadixKey(array("q", seq_ab)))
-                        ).last_device_node
+                        _match_prefix(cons2, seq_ab).last_device_node
                     )
                 ),
                 len(seq_ab),
@@ -2415,11 +2369,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(operation.storage_hit_count, len(stored))
         self.assertEqual(
             len(
-                cons3.path_device_indices(
-                    cons3.match_prefix(
-                        MatchPrefixParams(key=RadixKey(array("q", stored)))
-                    ).last_device_node
-                )
+                cons3.path_device_indices(_match_prefix(cons3, stored).last_device_node)
             ),
             0,
             "sub-window hit should not be loaded",
@@ -2447,7 +2397,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
-        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cons, seq)
         self.assertEqual(m.host_hit_length, 0)
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
@@ -2467,7 +2417,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._patch_tp_prefetch_sync(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, CacheRequestHandle("keep", 0))
 
-        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cons, seq)
         self.assertEqual(m.host_hit_length, len(seq))
         self.assertTrue(
             self._swa_host_on_path(cons, seq),
@@ -2490,9 +2440,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
         self.assertEqual(
-            cons.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", seq)))
-            ).host_hit_length,
+            _match_prefix(cons, seq).host_hit_length,
             0,
         )
         # Whole window dropped -> its host buffer is fully released back.
@@ -2577,8 +2525,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self.skipTest("SWA-only fixture required")
         if self._skip_unsupported_hicache_test():
             return
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        storage_dir = self._make_storage_dir()
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
         cons, _, _ = build_fixture(self.cfg)
@@ -2616,7 +2563,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self.assertEqual(pool.available_size(), avail)
         self._run_prefetch_to_completion(cons, CacheRequestHandle("r", 0))
         cons.drain_storage_control_queues()
-        m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cons, seq)
         self.assertEqual(m.device_prefix_len, len(seq))
         cons.sanity_check()
 
@@ -2631,7 +2578,7 @@ del _cfg, _name
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite, CustomTestCase):
+class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
     )
@@ -2640,9 +2587,7 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(_InsertWalkSuite, CustomTestCase):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         prefix = [1, 2]
         self._insert(cache, allocator, req_to_token_pool, prefix)
-        anchor = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", prefix)))
-        ).last_device_node
+        anchor = _match_prefix(cache, prefix).last_device_node
 
         cache.tree_core.is_write_back = True
         suffix = [3, 4]

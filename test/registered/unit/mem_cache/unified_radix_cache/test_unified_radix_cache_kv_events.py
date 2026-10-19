@@ -16,7 +16,6 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
-    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -28,6 +27,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     CacheConfig,
     _drop_hicache_atexit_pin,
+    _match_prefix,
     _node_children,
     _node_token_ids,
     _write_backup,
@@ -96,7 +96,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         return [block_hash for event in events for block_hash in event.block_hashes]
 
     def _leaf_for(self, cache, tokens):
-        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        match = _match_prefix(cache, tokens)
         leaf = match.last_device_node
         self.assertNotEqual(leaf, cache.root_node_handle())
         return leaf

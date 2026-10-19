@@ -47,7 +47,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _device_lock_ref,
     _device_value,
     _host_lock_ref,
-    _InsertWalkSuite,
+    _match_prefix,
     _node_children,
     _node_key_length,
     _node_parent,
@@ -62,7 +62,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestResumableInsertWalk(_InsertWalkSuite, CustomTestCase):
+class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig()
 
     def test_walk_backup_can_host_evict_on_path_h_leaf(self):
@@ -327,7 +327,7 @@ class TestResumableInsertWalk(_InsertWalkSuite, CustomTestCase):
             side_effect=RuntimeError("boom"),
         ):
             with self.assertRaises(RuntimeError):
-                cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+                _match_prefix(cache, [1, 2])
 
         # The relocation reached the pending record: the ack clears the
         # pending marker on both split halves, not just the stale node.
@@ -340,7 +340,7 @@ class TestResumableInsertWalk(_InsertWalkSuite, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestResumableInsertWalkSWA(_InsertWalkSuite, CustomTestCase):
+class TestResumableInsertWalkSWA(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
@@ -483,7 +483,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite, CustomTestCase):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, self.cfg.sliding_window_size + 4)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         node = m.last_device_node
 
         lock_result = cache.inc_lock_ref(node)
@@ -497,7 +497,7 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestResumableInsertWalkWriteBack(_InsertWalkSuite, CustomTestCase):
+class TestResumableInsertWalkWriteBack(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig()
 
     def test_drop_fallback_frees_host_for_later_backups_same_round(self):
@@ -518,7 +518,7 @@ class TestResumableInsertWalkWriteBack(_InsertWalkSuite, CustomTestCase):
         g1 = c1 + self._make_seq(2000, 2)
         self._insert(cache, allocator, req_to_token_pool, g1)
         cache.evict(EvictParams(num_tokens=4))
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", p1))))
+        m = _match_prefix(cache, p1)
         parent = m.last_device_node
         (child,) = _node_children(cache, parent)
         (grandchild,) = _node_children(cache, child)
@@ -563,7 +563,7 @@ class TestResumableInsertWalkWriteBack(_InsertWalkSuite, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestReturnedValuesDrain(_InsertWalkSuite, CustomTestCase):
+class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
     """Drain contract of the returned-values eviction API: every tree-core step
     result is drained exactly once, in per-component insertion order."""
 
@@ -760,7 +760,7 @@ class TestReturnedValuesDrain(_InsertWalkSuite, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestSegmentLockProtocol(_InsertWalkSuite, CustomTestCase):
+class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
     """Segment-lock protocol regressions, replaying the production lock-theft
     failure classes (F1/F2) and the split hazards.
 
@@ -775,8 +775,6 @@ class TestSegmentLockProtocol(_InsertWalkSuite, CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
-    _backup_node = UnifiedRadixCacheFixtures._backup_node
-    _path_chain = UnifiedRadixCacheFixtures._path_chain
 
     @staticmethod
     def _swa_ref(cache, node_id):
@@ -802,7 +800,7 @@ class TestSegmentLockProtocol(_InsertWalkSuite, CustomTestCase):
         return nodes
 
     def _match_leaf(self, cache, seq):
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        m = _match_prefix(cache, seq)
         return m.last_device_node
 
     @staticmethod
@@ -1151,7 +1149,7 @@ class TestSegmentLockProtocol(_InsertWalkSuite, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestSegmentLockFuzz(_InsertWalkSuite, CustomTestCase):
+class TestSegmentLockFuzz(UnifiedRadixCacheFixtures, CustomTestCase):
     """Random lock/insert/evict interleavings with the tree's own ledger
     recomputation (sanity_check) as the per-step oracle, on both cores."""
 
@@ -1211,9 +1209,7 @@ class TestSegmentLockFuzz(_InsertWalkSuite, CustomTestCase):
                 elif op < 0.6:
                     # Lock a random chain's current deepest device node.
                     seq = rng.choice(chains)
-                    m = cache.match_prefix(
-                        MatchPrefixParams(key=RadixKey(array("q", seq)))
-                    )
+                    m = _match_prefix(cache, seq)
                     node_id = m.last_device_node
                     if cache.tree_core.is_root(node_id):
                         continue
@@ -1336,7 +1332,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         slot = cache.session.slots["s"]
 
         cache.checkpoint(req, up_to=len(tokens))
-        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        match = _match_prefix(cache, tokens)
         self.assertEqual(slot.lock.node, match.last_device_node)
         self.assertIs(req.last_node, slot.virtual_node)
 
@@ -1349,9 +1345,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         release_kv_cache(req, cache, checkpoint=True)
 
         self.assertIs(cache.session.slots["s"], slot)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", range(1, 13))))
-        )
+        match = _match_prefix(cache, range(1, 13))
         self.assertEqual(match.device_prefix_len, len(tokens))
         cache.session.release_session("s")
         cache.sanity_check()
