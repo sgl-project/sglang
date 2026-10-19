@@ -1412,7 +1412,10 @@ class KimiK3MoE(nn.Module):
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 supports_weight_row_mapping,
             )
-            from sglang.srt.layers.moe.kimi_k3_front import FRONT_SHARD_ROWS
+            from sglang.srt.layers.moe.kimi_k3_front import (
+                FRONT_SHARD_ROWS,
+                sharded_front_available,
+            )
 
             sharded_front = (
                 num_tokens in FRONT_SHARD_ROWS
@@ -1421,6 +1424,9 @@ class KimiK3MoE(nn.Module):
                     hidden_size,
                     sum(self._front_sizes[:2]),
                     self.moe_hidden_size // self.tp_size,
+                )
+                and sharded_front_available(
+                    get_parallel().tp_group, self.moe_hidden_size
                 )
             )
         if sharded_front:
