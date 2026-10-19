@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.11", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -76,20 +76,36 @@ dependencies = [
   "xgrammar==0.2.1",
   "xxhash",
   "zstandard",
-  # ppu specific dependencies
-  "cuda-python>=13.0",
-  "tilelang==0.1.8",
-  "deep_gemm>=1.1.0",
-  "flash_attn_3",
-  "flash_mla",
-  "acext>=1.1.0",
-  "flashinfer_python[cu13]>=0.6.12,<=0.6.17", # keep it aligned with jit-cache version in Dockerfile
+  # PPU-specific dependencies. Public versions intentionally omit the local
+  # +v*.ppu2.2.0 suffix so package metadata remains portable; uv resolves each
+  # package from the flytiger index configured below. docker/ppu.Dockerfile
+  # fetches sglang-kernel from flytiger when available and otherwise builds it
+  # from the AOT sources in sglang/kernels/aot with setup_ppu.py.
+  "acext==1.1.0",
+  "cpm-kernels==1.0.11",
+  "cuda-bindings==13.0.0",
+  "cuda-python==13.0.0",
+  "deep_ep==2.2.0",
+  "deep_gemm==1.1.0",
+  "fast-hadamard-transform==1.0.4.post1",
+  "flash-attn==2.8.2",
+  "flash_attn_3==2.8.2",
+  "flash_mla==2.0.0",
+  "flashinfer_python[cu13]==0.6.17",
+  "mooncake-transfer-engine==0.3.12.post1",
+  "nvidia-dali-cuda130==1.53.0",
+  "pla==1.0.0",
+  "sglang-kernel==0.4.6.post1",
+  "sglang-router==0.3.2",
+  "tilelang==0.1.11",
   "torch>=2.11.0,<=2.13.0",
-  "torch_memory_saver>=0.0.9.post1",
+  "torch_memory_saver==0.0.9",
+  "torchao==0.17.0",
   "torchaudio==2.11.0",
-  "torchcodec>=0.10.0,<=0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
+  "torchcodec==0.15.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
   "torchvision",
-  "deep_ep",
+  "transformer-engine==2.5",
+  "triton==3.7.0",
 ]
 
 [[tool.uv.index]]
@@ -103,17 +119,31 @@ url = "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
 
 [tool.uv.sources]
 # PPU-specific packages resolved from the flytiger index
+acext = { index = "flytiger" }
+cpm-kernels = { index = "flytiger" }
+cuda-bindings = { index = "flytiger" }
 cuda-python = { index = "flytiger" }
-tilelang = { index = "flytiger" }
+deep_ep = { index = "flytiger" }
 deep_gemm = { index = "flytiger" }
+fast-hadamard-transform = { index = "flytiger" }
+flash-attn = { index = "flytiger" }
 flash_attn_3 = { index = "flytiger" }
 flash_mla = { index = "flytiger" }
-acext = { index = "flytiger" }
-deep_ep = { index = "flytiger" }
+flashinfer-python = { index = "flytiger" }
+mooncake-transfer-engine = { index = "flytiger" }
+nvidia-dali-cuda130 = { index = "flytiger" }
+pla = { index = "flytiger" }
+sglang-kernel = { index = "flytiger" }
+sglang-router = { index = "flytiger" }
+tilelang = { index = "flytiger" }
 torch = { index = "flytiger" }
 torch_memory_saver = { index = "flytiger" }
+torchao = { index = "flytiger" }
 torchaudio = { index = "flytiger" }
+torchcodec = { index = "flytiger" }
 torchvision = { index = "flytiger" }
+transformer-engine = { index = "flytiger" }
+triton = { index = "flytiger" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
@@ -182,11 +212,8 @@ test = [
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   # 4.9.3 is what sgl-eval's math_verify grader needs (latex2sympy2_extended
-  # raises ImportError on 4.7.x), so a `sglang[test]` environment is already
-  # compatible when sgl-eval is installed on top of it.
-  # Do NOT declare sgl-eval itself here: it is git-only, and PyPI rejects any
-  # uploaded distribution whose metadata carries a direct URL requirement.
-  # CUDA CI installs it in scripts/ci/cuda/ci_install_dependency.sh.
+  # raises ImportError on 4.7.x); pinned here so other test deps cannot pull
+  # it down.
   "antlr4-python3-runtime==4.9.3",
   "pandas",
   "parameterized",
@@ -213,6 +240,8 @@ vsa = ["setuptools", "torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
+"Documentation" = "https://docs.sglang.io"
+"Cookbook" = "https://docs.sglang.io/cookbook"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]
@@ -230,6 +259,7 @@ killall_sglang = "sglang.cli.killall:main"
 "sglang" = [
   "kernels/aot/*",
   "kernels/aot/**/*",
+  "srt/mem_cache/rust_tree_core/mem_cache_inspection*.so",
 ]
 
 [tool.setuptools.packages.find]
@@ -263,8 +293,9 @@ git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
-# Rust extension modules are auto-discovered by setup.py from the cargo
-# workspace in ../rust ([package.metadata.sglang] python-module in each crate).
+# Rust extension modules are auto-discovered by setup.py from the Cargo
+# workspace in ../rust and its declared extension manifests
+# ([package.metadata.sglang] python-module in each crate).
 # This CUDA pyproject builds all of them; platform variants restrict the set
 # via [tool.sglang] rust-extensions (see pyproject_other.toml).
 
