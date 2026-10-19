@@ -915,13 +915,7 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     tc_name = self.__class__.__name__
-    # getattr so accuracy-based cases (which set no perf baselines) can also
-    # route their metrics through this function.
-    tpot = getattr(self, "tpot", None)
-    output_token_throughput = getattr(self, "output_token_throughput", None)
-    ttft = getattr(self, "ttft", None)
-    mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
-    if tpot and metrics.get("mean_tpot"):
+    if self.tpot and metrics.get("mean_tpot"):
         dump_metric(
             "tpot",
             float(metrics["mean_tpot"]),
@@ -929,10 +923,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "tpot_baseline",
-            float(tpot),
+            float(self.tpot),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if output_token_throughput and metrics.get("total_tps"):
+    if self.output_token_throughput and metrics.get("total_tps"):
         dump_metric(
             "throughput",
             float(metrics["total_tps"]),
@@ -940,10 +934,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "throughput_baseline",
-            float(output_token_throughput),
+            float(self.output_token_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if ttft and metrics.get("mean_ttft"):
+    if self.ttft and metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
             float(metrics["mean_ttft"]),
@@ -951,10 +945,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "ttft_baseline",
-            float(ttft),
+            float(self.ttft),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if mean_e2e_latency and metrics.get("mean_e2e_latency"):
+    if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
             float(metrics["mean_e2e_latency"]),
@@ -962,7 +956,7 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "e2e_latency_baseline",
-            float(mean_e2e_latency),
+            float(self.mean_e2e_latency),
             labels={"test_case": tc_name, "type": "perf"},
         )
 

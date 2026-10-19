@@ -141,6 +141,11 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     }
     timeout = 10000
     seed = 42
+    # Perf baselines read by assert_metrics; this accuracy case sets none.
+    tpot = None
+    output_token_throughput = None
+    ttft = None
+    mean_e2e_latency = None
     # L2 (host) hit-rate threshold (%) checked by assert_metrics.
     host_hit_rate = 10
 
