@@ -135,7 +135,9 @@ def fused_recurrent_linear_replayssm_decode_kernel(
     #   g = -exp(A_log) * softplus(a + dt_bias);  alpha = exp(g);  beta = sigmoid(b)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     b_val = tl.load(b + i_n * stride_b_tok + i_hv).to(tl.float32)
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    # no round-trip through the activation dtype -- beta feeds the persistent
+    # state and the rounding accumulates over decode steps (cf. vllm#53877)
+    beta_val = tl.sigmoid(b_val).to(tl.float32)
     if not IS_KDA:
         a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
         dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
