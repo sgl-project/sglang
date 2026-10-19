@@ -97,7 +97,11 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -2025,6 +2029,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        self._mono = None  # Qwen4ExpMonoRunner (target verify) when SGLANG_ENABLE_QWEN4_MONOKERNEL is set
 
     def forward(
         self,
@@ -2034,6 +2039,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], PPProxyTensors]:
+        mono = self._mono
+        if mono is not None and mono.applicable(forward_batch, input_ids):
+            # Target verify through the FlyDSL monokernel: embedding, PLE, every layer and the final mixer
+            # (verify tokens are text: the in-kernel embedding of input_ids equals inputs_embeds).
+            return mono.forward(input_ids, forward_batch, self)
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -2650,7 +2660,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
+        from sglang.srt.models.qwen4_exp_monokernel import (
+            Qwen4ExpMonoRunner,
+            monokernel_enabled,
+        )
 
+        if monokernel_enabled() and get_spec().speculative_algorithm is not None:
+            # Built after loading: it reads the FusedMoE / FP8 params after their AITER shuffle.
+            self.model._mono = Qwen4ExpMonoRunner(
+                self.model, self.config, ntok=get_spec().speculative_num_draft_tokens
+            )
         if precompile_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
 
