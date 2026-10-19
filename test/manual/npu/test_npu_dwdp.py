@@ -182,19 +182,34 @@ def _worker(rank, devices, port, dtype, large):
         manager.setup(model)
         assert len(migrated) == len(model) * 2
         set_global_dwdp_manager(manager)
-        # Tiny weights share local boundary pages and need no runtime copies.
-        # Larger weights exercise both page-aligned and partial-page shards,
-        # remote slot reuse, and differently sized mappings in the same slot.
-        plans = [entry for plan in manager._plans.values() for entry in plan]
-        assert bool(plans) == large
-        assert all(peer != rank for peer, *_ in plans)
-        if large:
-            assert sum(n for _, _, _, n in plans) > 0
-        local_snapshots = [
-            layer.w13_weight[rank * 2 : (rank + 1) * 2].cpu().clone() for layer in model
-        ]
+        # Every size uses the same remote-expert copy path, including remote
+        # bytes inside local boundary pages. Large weights also reuse remote
+        # page slots across layers and exercise partial-page local shards.
+        assert len(manager._peer_views) == len(model) * 2
+        for (peer, li, name), view in manager._peer_views.items():
+            assert peer != rank
+            spec = manager._specs[li, name]
+            assert tuple(view.shape) == spec.chunk_shape
+            assert view.dtype == spec.dtype
+            assert view.is_contiguous()
+        local_snapshots = {
+            (layer.layer_id, name): getattr(layer, name)[rank * 2 : (rank + 1) * 2]
+            .cpu()
+            .clone()
+            for layer in model
+            for name in ("w13_weight", "w2_weight")
+        }
+        for li, name in local_snapshots:
+            remote = manager._get_remote_slices(li, name)
+            assert sum(dst.shape[0] for dst, *_ in remote) == 2
         # One rank stops executing MoE while the other continues reading it.
         for step in range(2 + 3 * rank):
+            # This also destroys resident remote edge bytes: every forward
+            # must restore them from peers, without changing any local source.
+            for li, name in local_snapshots:
+                for dst, *_ in manager._get_remote_slices(li, name):
+                    dst.fill_(-77)
+            torch.npu.synchronize()
             manager.prefetch_first_layers()
             for layer, reference in zip(model, refs):
                 tokens = 3 + step + rank
@@ -232,13 +247,15 @@ def _worker(rank, devices, port, dtype, large):
                         )
                         expected[token] += weights[token, k].float() * val
                 torch.testing.assert_close(out, expected, rtol=0.04, atol=5e-4)
-            for layer, saved in zip(model, local_snapshots):
-                torch.testing.assert_close(
-                    layer.w13_weight[rank * 2 : (rank + 1) * 2].cpu(),
-                    saved,
-                    rtol=0,
-                    atol=0,
-                )
+            for layer in model:
+                for name in ("w13_weight", "w2_weight"):
+                    saved = local_snapshots[layer.layer_id, name]
+                    torch.testing.assert_close(
+                        getattr(layer, name)[rank * 2 : (rank + 1) * 2].cpu(),
+                        saved,
+                        rtol=0,
+                        atol=0,
+                    )
         manager.cleanup()
         manager.cleanup()  # idempotent
         set_global_dwdp_manager(None)

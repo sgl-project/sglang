@@ -1,5 +1,5 @@
 # Adapted from NVIDIA TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM)
-"""Shared double-buffer event protocol and CUDA peer-weight prefetch."""
+"""Shared double-buffer event protocol and peer-weight slice copies."""
 
 from __future__ import annotations
 
@@ -15,6 +15,31 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
 
 logger = logging.getLogger(__name__)
+
+
+def copy_remote_expert_slices(
+    layer_idx, weight_names, get_remote_slices, peer_views, peer_ranges
+):
+    """Copy complete remote experts on the caller's current device stream."""
+    for name in weight_names:
+        remote_slices = get_remote_slices(layer_idx, name)
+        for dst_slice, expert_start, expert_end in remote_slices:
+            cursor = expert_start
+            dst_offset = 0
+            while cursor < expert_end:
+                peer_rank = lookup_owner(cursor, peer_ranges)
+                peer_start, peer_end = peer_ranges[peer_rank]
+                local_offset = cursor - peer_start
+                chunk_end = min(expert_end, peer_end)
+                n = chunk_end - cursor
+
+                peer_key = (peer_rank, layer_idx, name)
+                src = peer_views[peer_key]
+                dst_slice[dst_offset : dst_offset + n].copy_(
+                    src[local_offset : local_offset + n]
+                )
+                dst_offset += n
+                cursor = chunk_end
 
 
 class DwdpPrefetch:
@@ -109,25 +134,13 @@ class DWDPWeightManager(DwdpPrefetch):
         return self._weight_buffer.buffer_index_for_layer(layer_idx)
 
     def _prefetch_layer_per_slice(self, layer_idx: int) -> None:
-        for name in self._weight_names:
-            remote_slices = self._weight_buffer.get_remote_slices(layer_idx, name)
-            for dst_slice, expert_start, expert_end in remote_slices:
-                cursor = expert_start
-                dst_offset = 0
-                while cursor < expert_end:
-                    peer_rank = lookup_owner(cursor, self._peer_ranges)
-                    peer_start, peer_end = self._peer_ranges[peer_rank]
-                    local_offset = cursor - peer_start
-                    chunk_end = min(expert_end, peer_end)
-                    n = chunk_end - cursor
-
-                    peer_key = (peer_rank, layer_idx, name)
-                    src = self._peer_views[peer_key]
-                    dst_slice[dst_offset : dst_offset + n].copy_(
-                        src[local_offset : local_offset + n]
-                    )
-                    dst_offset += n
-                    cursor = chunk_end
+        copy_remote_expert_slices(
+            layer_idx,
+            self._weight_names,
+            self._weight_buffer.get_remote_slices,
+            self._peer_views,
+            self._peer_ranges,
+        )
 
     def release(self) -> None:
         if self._weight_buffer is not None:

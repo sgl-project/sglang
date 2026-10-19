@@ -16,6 +16,28 @@ def _check(ret, operation):
         raise RuntimeError(f"NPU DWDP: {operation} failed with ACL error {ret}")
 
 
+def tensor_from_pointer(pointer, nbytes, *, shape, dtype, device):
+    import torch_npu
+
+    storage = torch_npu._C._construct_storage_from_data_pointer(pointer, device, nbytes)
+    stride = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
+    return torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(
+        dict(
+            size=shape,
+            stride=stride,
+            nbytes=nbytes,
+            dtype=dtype,
+            data_ptr=pointer,
+            storage_offset=0,
+            device=device,
+            npu_format=2,
+            layout=torch.strided,
+            requires_grad=False,
+        ),
+        storage,
+    )
+
+
 class NPUWeightVMM:
     def __init__(self, acl, device):
         self.rt = acl.rt
@@ -63,12 +85,10 @@ class NPUWeightVMM:
     def create_weight(self, spec, rank, slot_key):
         """Return a full view, local source pointer, handle and page boundaries.
 
-        Pages intersecting the local shard are private to this layer. Their
-        remote edge bytes are filled once at setup. Only the pages completely
-        outside the local shard reuse a slot and need runtime prefetches.
+        Pages intersecting the local shard are private to this layer. Pages
+        completely outside it reuse a slot. Runtime prefetch refreshes all
+        remote experts, including the bytes on private boundary pages.
         """
-        import torch_npu
-
         shape, dtype = spec.full_shape, spec.dtype
         nbytes = spec.num_experts * spec.expert_bytes
         layout = self.layout(spec, rank)
@@ -90,24 +110,8 @@ class NPUWeightVMM:
             if key not in self.slots:
                 self.slots[key] = self._allocate(size)
             self._map(full + offset, size, self.slots[key])
-        storage = torch_npu._C._construct_storage_from_data_pointer(
-            full, self.device, nbytes
-        )
-        stride = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
-        tensor = torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(
-            dict(
-                size=shape,
-                stride=stride,
-                nbytes=nbytes,
-                dtype=dtype,
-                data_ptr=full,
-                storage_offset=0,
-                device=self.device,
-                npu_format=2,
-                layout=torch.strided,
-                requires_grad=False,
-            ),
-            storage,
+        tensor = tensor_from_pointer(
+            full, nbytes, shape=shape, dtype=dtype, device=self.device
         )
         return tensor, source + layout.data_offset, handle, layout
 

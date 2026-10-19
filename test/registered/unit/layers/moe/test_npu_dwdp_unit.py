@@ -1,5 +1,6 @@
 """NPU DWDP page coverage and failure cleanup without accelerator hardware."""
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace as NS
 
@@ -7,7 +8,10 @@ import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu.dwdp.manager import NPUDwdpManager
-from sglang.srt.hardware_backend.npu.dwdp.vmm import NPUWeightVMM
+from sglang.srt.hardware_backend.npu.dwdp.vmm import (
+    NPUWeightVMM,
+    tensor_from_pointer,
+)
 from sglang.srt.layers.moe.dwdp.layout import WeightSpec
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -112,7 +116,7 @@ def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, ran
 
 @pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("expert_bytes", [2, 64, 300, 1024])
-def test_remote_pages_cover_exactly_remote_weights(world, expert_bytes):
+def test_remote_slices_cover_all_remote_weights(world, expert_bytes):
     vmm = NPUWeightVMM.__new__(NPUWeightVMM)
     vmm.granularity = 1024
     spec = WeightSpec(
@@ -130,30 +134,135 @@ def test_remote_pages_cover_exactly_remote_weights(world, expert_bytes):
         assert page.page_start == start // 1024 * 1024
         assert page.page_end == (end + 1023) // 1024 * 1024
         assert page.total_size == (total + 1023) // 1024 * 1024
-        manager._specs, manager._pages, manager._weights, peers = {}, {}, {}, {}
-        for index, name in enumerate(("w13_weight", "w2_weight")):
-            manager._specs[5, name], manager._pages[5, name] = spec, page
-            manager._weights[5, name] = NS(data_ptr=lambda i=index: (i + 1) * 100000)
-            peers.update(
-                {(r, 5, name): (index + 1) * 1000000 + r * 10000 for r in range(world)}
-            )
-        covered = [set(), set()]
-        for initial in (True, False):
-            for peer, dst, src, size in manager._copy_plan(5, peers, initial=initial):
-                index, offset = dst // 100000 - 1, dst % 100000
-                assert peer != rank
-                assert (
-                    src
-                    == (index + 1) * 1000000
-                    + peer * 10000
-                    + offset
-                    - peer * spec.chunk_bytes
-                )
-                assert (page.page_start <= offset < page.page_end) == initial
+        manager._specs, manager._weights = {}, {}
+        manager._remote_slices, manager._peer_ranges = {}, {}
+        for name in ("w13_weight", "w2_weight"):
+            manager._specs[5, name] = spec
+            manager._weights[5, name] = torch.zeros(spec.full_shape, dtype=spec.dtype)
+        manager._prepare_copy_views()
+        for name in ("w13_weight", "w2_weight"):
+            full, covered = manager._weights[5, name], set()
+            for dst, expert_start, expert_end in manager._get_remote_slices(5, name):
+                offset = dst.data_ptr() - full.data_ptr()
+                size = dst.numel() * dst.element_size()
+                assert offset == expert_start * expert_bytes
+                assert size == (expert_end - expert_start) * expert_bytes
                 region = set(range(offset, offset + size))
-                assert not covered[index] & region
-                covered[index] |= region
-        assert covered == [set(range(total)) - set(range(start, end))] * 2
+                assert not covered & region
+                covered |= region
+                dst.fill_(1)
+            assert covered == set(range(total)) - set(range(start, end))
+            assert full[rank * 4 : (rank + 1) * 4].count_nonzero() == 0
+            assert full.count_nonzero() == total - spec.chunk_bytes
+
+
+@pytest.mark.parametrize("rank", [0, 1, 3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int8])
+def test_npu_uses_shared_copy_for_all_remote_edges(monkeypatch, rank, dtype):
+    import sglang.srt.hardware_backend.npu.dwdp.manager as npu_manager
+
+    manager = NPUDwdpManager.__new__(NPUDwdpManager)
+    manager.dwdp_size, manager.dwdp_rank = 4, rank
+    manager._specs, manager._weights, manager._peer_views = {}, {}, {}
+    manager._remote_slices, manager._peer_ranges = {}, {}
+    layers, local = [2, 5, 8, 11], {}
+    for pos, li in enumerate(layers):
+        local_experts = 1 + pos % 2
+        num_experts = 4 * local_experts
+        for name, width in (("w13_weight", 10), ("w2_weight", 14)):
+            width //= torch.tensor([], dtype=dtype).element_size()
+            manager._specs[li, name] = WeightSpec(
+                num_experts, (local_experts, width), (num_experts, width), dtype
+            )
+            manager._weights[li, name] = torch.empty(num_experts, width, dtype=dtype)
+            for peer in range(4):
+                value = (
+                    torch.arange(local_experts * width).reshape(local_experts, width)
+                    + pos * 20
+                    + peer * 4
+                ).to(dtype)
+                if peer == rank:
+                    start, end = peer * local_experts, (peer + 1) * local_experts
+                    manager._weights[li, name][start:end].copy_(value)
+                    local[li, name] = value.clone()
+                else:
+                    manager._peer_views[peer, li, name] = value
+    manager._prepare_copy_views()
+    calls, original = [], npu_manager.copy_remote_expert_slices
+
+    def copy(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(npu_manager, "copy_remote_expert_slices", copy)
+    for step in range(2):
+        if step:
+            for value in manager._peer_views.values():
+                value.add_(3)
+        for li in layers:
+            # Poison every remote byte, including the parts in resident pages.
+            for name in ("w13_weight", "w2_weight"):
+                for dst, *_ in manager._get_remote_slices(li, name):
+                    dst.fill_(-77)
+            manager._prefetch_layer_per_slice(li)
+            for name in ("w13_weight", "w2_weight"):
+                expected = torch.cat(
+                    [
+                        local[li, name]
+                        if peer == rank
+                        else manager._peer_views[peer, li, name]
+                        for peer in range(4)
+                    ]
+                )
+                torch.testing.assert_close(manager._weights[li, name], expected)
+                count = manager._specs[li, name].local_experts
+                torch.testing.assert_close(
+                    manager._weights[li, name][rank * count : (rank + 1) * count],
+                    local[li, name],
+                )
+    assert calls == layers * 2
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int8])
+def test_npu_peer_tensor_wrap_preserves_shard_metadata(monkeypatch, dtype):
+    calls, storage, pointer = [], object(), 0x100080
+
+    def wrap_storage(ptr, device, nbytes):
+        calls.append((ptr, device, nbytes))
+        return storage
+
+    def wrap_tensor(metadata, wrapped_storage):
+        assert wrapped_storage is storage
+        return metadata
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        NS(
+            _C=NS(
+                _construct_storage_from_data_pointer=wrap_storage,
+                _construct_NPU_Tensor_From_Storage_And_Metadata=wrap_tensor,
+            )
+        ),
+    )
+    shape, device = (2, 3, 5), NS(type="npu", index=1)
+    nbytes = 30 * torch.tensor([], dtype=dtype).element_size()
+    metadata = tensor_from_pointer(
+        pointer, nbytes, shape=shape, dtype=dtype, device=device
+    )
+    assert calls == [(pointer, device, nbytes)]
+    assert metadata == dict(
+        size=shape,
+        stride=(15, 5, 1),
+        nbytes=nbytes,
+        dtype=dtype,
+        data_ptr=pointer,
+        storage_offset=0,
+        device=device,
+        npu_format=2,
+        layout=torch.strided,
+        requires_grad=False,
+    )
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -162,7 +271,7 @@ def test_migration_releases_source_only_after_success(monkeypatch, fail):
     manager.device, manager.dwdp_rank = torch.device("cpu"), 0
     manager._position = {5: 0}
     manager._specs = {(5, "w13_weight"): WeightSpec(4, (2, 3), (4, 3), torch.float16)}
-    manager._weights, manager._pages, manager._local, manager._exports = {}, {}, {}, {}
+    manager._weights, manager._exports = {}, {}
     manager._vmm = NS(create_weight=lambda *args: (torch.empty(4, 3), 100, 1, object()))
     manager.acl = NS(
         rt=NS(
@@ -208,7 +317,8 @@ def test_cleanup_order_and_terminal_state(monkeypatch, state):
         {},
         {},
     )
-    manager._pages, manager._local, manager._exports, manager._plans = {}, {}, {}, {}
+    manager._exports, manager._peer_views = {}, {}
+    manager._remote_slices, manager._peer_ranges = {}, {}
     calls = []
 
     def close_imports():

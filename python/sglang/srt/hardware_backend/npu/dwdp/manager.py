@@ -14,10 +14,13 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.layers.moe.dwdp.layout import WeightSpec
-from sglang.srt.layers.moe.dwdp.weight_manager import DwdpPrefetch
+from sglang.srt.layers.moe.dwdp.weight_manager import (
+    DwdpPrefetch,
+    copy_remote_expert_slices,
+)
 from sglang.srt.runtime_context import get_parallel
 
-from .vmm import NPUWeightVMM, _check
+from .vmm import NPUWeightVMM, _check, tensor_from_pointer
 
 logger = logging.getLogger(__name__)
 _WEIGHTS = ("w13_weight", "w2_weight")
@@ -60,8 +63,8 @@ class NPUDwdpManager(DwdpPrefetch):
         self.group = parallel.tp_group
         self.device = torch.device("npu", torch.npu.current_device())
         self._moe_layer_indices, self._position = [], {}
-        self._specs, self._weights, self._pages = {}, {}, {}
-        self._local, self._exports, self._plans = {}, {}, {}
+        self._specs, self._weights, self._exports = {}, {}, {}
+        self._peer_views, self._peer_ranges, self._remote_slices = {}, {}, {}
         self._vmm = None
         self._state = "new"
 
@@ -175,23 +178,21 @@ class NPUDwdpManager(DwdpPrefetch):
                 {name: self._weights[li, name] for name in _WEIGHTS}
             )
 
-        peer_ptrs = {}
         for rank, handles in enumerate(self._gather(self._exports)):
+            if rank == self.dwdp_rank:
+                continue
             for key, handle in handles.items():
-                if rank == self.dwdp_rank:
-                    ptr = self._local[key]
-                else:
-                    page = self._vmm.layout(self._specs[key], rank)
-                    ptr = self._vmm.import_shard(
-                        handle, page.mnnvl_size, page.data_offset
-                    )
-                peer_ptrs[rank, *key] = ptr
-        for li in self._moe_layer_indices:
-            self._copy(
-                self._copy_plan(li, peer_ptrs, initial=True),
-                torch.npu.current_stream(self.device),
-            )
-            self._plans[li] = self._copy_plan(li, peer_ptrs)
+                spec = self._specs[key]
+                page = self._vmm.layout(spec, rank)
+                ptr = self._vmm.import_shard(handle, page.mnnvl_size, page.data_offset)
+                self._peer_views[rank, *key] = tensor_from_pointer(
+                    ptr,
+                    spec.chunk_bytes,
+                    shape=spec.chunk_shape,
+                    dtype=spec.dtype,
+                    device=self.device,
+                )
+        self._prepare_copy_views()
         torch.npu.synchronize(self.device)
         dist.barrier(group=self.group.cpu_group)
         torch.npu.empty_cache()
@@ -210,10 +211,10 @@ class NPUDwdpManager(DwdpPrefetch):
         param.data = data
         spec = self._specs[key]
         li, name = key
-        full, ptr, handle, page = self._vmm.create_weight(
+        full, ptr, handle, _ = self._vmm.create_weight(
             spec, self.dwdp_rank, (self._position[li] % 2, name, spec.dtype)
         )
-        self._weights[key], self._pages[key], self._local[key] = full, page, ptr
+        self._weights[key] = full
         _check(
             self.acl.rt.memcpy(
                 ptr, spec.chunk_bytes, param.data_ptr(), spec.chunk_bytes, 3
@@ -245,46 +246,36 @@ class NPUDwdpManager(DwdpPrefetch):
                 full = full.to(torch.float16)
             layer.replace_expert_tensor(name, full)
 
-    def _copy_plan(self, li, peer_ptrs, *, initial=False):
-        copies = []
-        for name in _WEIGHTS:
-            spec, page = self._specs[li, name], self._pages[li, name]
-            start = self.dwdp_rank * spec.chunk_bytes
-            end, total = start + spec.chunk_bytes, spec.num_experts * spec.expert_bytes
-            ranges = (
-                [(page.page_start, start), (end, min(page.page_end, total))]
-                if initial
-                else [(0, page.page_start), (page.page_end, total)]
-            )
-            for rank in range(self.dwdp_size):
-                if rank == self.dwdp_rank:
-                    continue
-                peer_start = rank * spec.chunk_bytes
-                for lo, hi in ranges:
-                    lo, hi = max(lo, peer_start), min(hi, peer_start + spec.chunk_bytes)
-                    if lo < hi:
-                        copies.append(
-                            (
-                                rank,
-                                self._weights[li, name].data_ptr() + lo,
-                                peer_ptrs[rank, li, name] + lo - peer_start,
-                                hi - lo,
-                            )
-                        )
-        return copies
+    def _prepare_copy_views(self):
+        for key, full in self._weights.items():
+            li, _ = key
+            spec = self._specs[key]
+            count = spec.local_experts
+            start, end = self.dwdp_rank * count, (self.dwdp_rank + 1) * count
+            self._peer_ranges[li] = [
+                (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
+            ]
+            slices = []
+            if start > 0:
+                slices.append((full[:start], 0, start))
+            if end < spec.num_experts:
+                slices.append((full[end:], end, spec.num_experts))
+            self._remote_slices[key] = slices
 
-    def _copy(self, plan, stream):
-        for _, dst, src, size in plan:
-            _check(
-                self.acl.rt.memcpy_async(dst, size, src, size, 3, stream.npu_stream),
-                "prefetch remote expert shard",
-            )
+    def _get_remote_slices(self, layer_idx, name):
+        return self._remote_slices[layer_idx, name]
 
     def _buffer_index_for_layer(self, layer_idx):
         return self._position[layer_idx] % 2
 
     def _prefetch_layer_per_slice(self, layer_idx):
-        self._copy(self._plans[layer_idx], self._copy_stream)
+        copy_remote_expert_slices(
+            layer_idx,
+            _WEIGHTS,
+            self._get_remote_slices,
+            self._peer_views,
+            self._peer_ranges[layer_idx],
+        )
 
     def prefetch_first_layers(self):
         if self._state != "ready":
@@ -297,6 +288,8 @@ class NPUDwdpManager(DwdpPrefetch):
         if self._state != "new":
             torch.npu.synchronize(self.device)
             dist.barrier(group=self.group.cpu_group)
+            self._peer_views.clear()
+            self._remote_slices.clear()
             if self._vmm is not None:
                 self._vmm.close_imports()
             dist.barrier(group=self.group.cpu_group)
@@ -307,10 +300,10 @@ class NPUDwdpManager(DwdpPrefetch):
             self._position,
             self._specs,
             self._weights,
-            self._pages,
-            self._local,
             self._exports,
-            self._plans,
+            self._peer_views,
+            self._peer_ranges,
+            self._remote_slices,
         ):
             data.clear()
         self._state = "closed"
