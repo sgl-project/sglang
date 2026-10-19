@@ -156,8 +156,8 @@ class TestFloatMovementGate(CustomTestCase):
                     ) as settle,
                     patch.object(
                         kv.swa_kv_pool,
-                        "move_kv_cache",
-                        wraps=kv.swa_kv_pool.move_kv_cache,
+                        "move_physical_pages",
+                        wraps=kv.swa_kv_pool.move_physical_pages,
                     ) as copies,
                 ):
                     if method == "make_room":
@@ -175,7 +175,9 @@ class TestFloatMovementGate(CustomTestCase):
                 sa.disagg_move_gate = lambda: True
                 sa.host_transfer_move_gate = lambda: True
                 with patch.object(
-                    kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
+                    kv.swa_kv_pool,
+                    "move_physical_pages",
+                    wraps=kv.swa_kv_pool.move_physical_pages,
                 ) as copies:
                     if method == "make_room":
                         self.assertGreaterEqual(
@@ -199,7 +201,9 @@ class TestFloatMovementGate(CustomTestCase):
                 a, kv, mk = build_geometry(1, ratio, True, pattern, True)
                 saved = payload(a, kv, mk)
                 with patch.object(
-                    kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
+                    kv.swa_kv_pool,
+                    "move_physical_pages",
+                    wraps=kv.swa_kv_pool.move_physical_pages,
                 ) as copies:
                     a.ensure_capacity(demand, demand)
                     got = a.alloc(demand)
@@ -214,7 +218,9 @@ class TestFloatMovementGate(CustomTestCase):
         a, kv, mk = build_geometry(1, (1, 1), True, "paired", True)
         saved = payload(a, kv, mk)
         with patch.object(
-            kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
+            kv.swa_kv_pool,
+            "move_physical_pages",
+            wraps=kv.swa_kv_pool.move_physical_pages,
         ) as copies:
             self.assertIsNotNone(a.alloc(2))
         self.assertEqual(copies.call_count, 0)
@@ -228,14 +234,18 @@ class TestFloatMovementGate(CustomTestCase):
         demand = ma.available_size() + 1
         sa.disagg_move_gate = lambda: False
         with patch.object(
-            kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
+            kv.swa_kv_pool,
+            "move_physical_pages",
+            wraps=kv.swa_kv_pool.move_physical_pages,
         ) as copies:
             self.assertIsNone(ma.alloc(demand))
         self.assertEqual(copies.call_count, 0)
         self.check_saved(a, saved)
         sa.disagg_move_gate = lambda: True
         with patch.object(
-            kv.swa_kv_pool, "move_kv_cache", wraps=kv.swa_kv_pool.move_kv_cache
+            kv.swa_kv_pool,
+            "move_physical_pages",
+            wraps=kv.swa_kv_pool.move_physical_pages,
         ) as copies:
             self.assertIsNotNone(ma.alloc(demand))
         self.assertGreater(copies.call_count, 0)

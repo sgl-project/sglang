@@ -39,6 +39,7 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -749,6 +750,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
     # under MAX_LEN, padded to the max. None when the raw list already is.
     global_num_tokens_padded_cpu: Optional[List[int]] = None
+    # Each DP rank's rows from a late-layer row switch on; None on steps that skip
+    # the exchange.
+    global_late_layer_num_tokens_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -773,10 +777,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
     encoder_swa_replay: bool = False
     # Encoder replay folded into the extend: per-row window floor [num_tokens]
-    # int64 (the request's replay start, 0 for other requests), and per-request
-    # leading replay rows the low-ratio compressors skip [bs] int32.
+    # int64 (the request's replay start, 0 for other requests).
     encoder_swa_row_floor: Optional[torch.Tensor] = None
-    encoder_swa_compress_skip: Optional[torch.Tensor] = None
     encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
@@ -1859,6 +1861,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu.copy_(
             global_num_tokens_pinned, non_blocking=self.use_pin_memory
         )
+        # Exchanged here, not in the model forward: every rank reaches this point
+        # after reshaping its batch and before it picks a prefill graph or eager.
+        if (
+            self.is_extend_in_batch
+            and sync_group_size > 1
+            and not model_runner.is_draft_worker
+        ):
+            local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
+            if local_late_rows is not None:
+                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                all_gather_single(
+                    late_rows,
+                    torch.tensor([local_late_rows], dtype=torch.int64),
+                    group=get_parallel().tp_group.cpu_group,
+                )
+                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
