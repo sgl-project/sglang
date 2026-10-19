@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
@@ -943,16 +944,18 @@ class TestEvictUntilAllocatable(CustomTestCase):
         # Each round frees ONE class-3 page (a whole 1-page chain): reaching
         # a min-class floor of 2 pages takes 2 rounds.
         tree = self._tree_stub(alloc, list(outs))
-        _evict_until_allocatable(tree, alloc, 2 * N * PS)
+        result = _evict_until_allocatable(tree, alloc, 2 * N * PS)
         self.assertGreaterEqual(alloc.available_size(), 2 * N * PS)
         self.assertEqual(tree.calls, 2)
+        self.assertEqual(result, EvictResult(num_tokens_evicted=2 * PS))
 
     def test_terminates_when_tree_dry(self):
         alloc, _ = self._allocator_with_tight_class()
         tree = self._tree_stub(alloc, [])  # nothing evictable
-        _evict_until_allocatable(tree, alloc, PS)
+        result = _evict_until_allocatable(tree, alloc, PS)
         self.assertEqual(alloc.available_size(), 0)  # need unmet, but no hang
         self.assertEqual(tree.calls, 1)
+        self.assertEqual(result, EvictResult())
 
 
 def _unified_tree(page_size=4, pool_size=256, disable=False):
@@ -1021,6 +1024,73 @@ class _TreeCoreBackendCase(CustomTestCase):
         )
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
+
+
+class TestShardedAllocationEviction(CustomTestCase):
+    def _cache_with_imbalanced_classes(self, *, cache_tight_page=True):
+        allocator = _make_allocator(pages_per_rank=4)
+        tree = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=ReqToTokenPool(
+                    size=8,
+                    max_context_len=128,
+                    device="cpu",
+                    enable_memory_saver=False,
+                ),
+                token_to_kv_pool_allocator=allocator,
+                page_size=PS,
+                tree_components=(ComponentType.FULL,),
+                tree_core_backend="python",
+            )
+        )
+        # These pages belong to active requests and cannot be evicted.
+        for owner in (0, 0, 1):
+            _alloc_extend(allocator, 0, PS, rotation_base=owner)
+
+        # LRU first frees an abundant class; only the second victim raises
+        # the minimum-class capacity that allocation admission uses.
+        abundant = _alloc_extend(allocator, 0, PS, rotation_base=1)
+        _insert(tree, [100] * PS, rotation_base=1, value=abundant)
+        tight = _alloc_extend(allocator, 0, PS, rotation_base=0)
+        if cache_tight_page:
+            _insert(tree, [200] * PS, rotation_base=0, value=tight)
+        self.assertEqual(allocator.class_free_page_counts(), [1, 2, 4, 4])
+        return tree, allocator
+
+    def test_direct_allocation_eviction_retries_and_counts_all_victims(self):
+        tree, allocator = self._cache_with_imbalanced_classes()
+        initial_available = allocator.available_size()
+        self.assertEqual(initial_available, GS)
+
+        # The shortfall is smaller than the initial free capacity: treating
+        # it as the absolute target would incorrectly skip the retry.
+        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+
+        self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
+        self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
+        self.assertEqual(result, EvictResult(num_tokens_evicted=2 * PS))
+        self.assertEqual(tree.full_evictable_size(), 0)
+
+    def test_allocation_eviction_stops_when_tight_class_cannot_be_reclaimed(self):
+        tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
+
+        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+
+        self.assertEqual(allocator.available_size(), GS)
+        self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
+        self.assertEqual(result, EvictResult(num_tokens_evicted=PS))
+        self.assertEqual(tree.full_evictable_size(), 0)
+
+    def test_explicit_eviction_still_uses_token_count(self):
+        tree, allocator = self._cache_with_imbalanced_classes()
+
+        result = tree.evict(EvictParams(num_tokens=PS))
+
+        self.assertEqual(allocator.available_size(), GS)
+        self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
+        self.assertEqual(result, EvictResult(num_tokens_evicted=PS))
+        self.assertEqual(tree.full_evictable_size(), PS)
 
 
 @parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
