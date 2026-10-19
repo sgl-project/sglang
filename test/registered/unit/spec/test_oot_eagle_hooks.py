@@ -2,15 +2,16 @@ import contextlib
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
 import torch
 
 from sglang.kernels.ops.speculative import spec_tree
 from sglang.srt.arg_groups.speculative_hook import _check_oot_speculative_algorithm
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import eagle_utils
+from sglang.srt.speculative import eagle_utils, eagle_worker_v2
 from sglang.srt.speculative.adaptive_spec_params import adaptive_unsupported_reason
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,9 +29,14 @@ class _PlatformWorker:
 
 
 def _platform(
-    *, out_of_tree: bool = True, supported: bool = True, worker_cls=None
+    *,
+    out_of_tree: bool = True,
+    supported: bool = True,
+    worker_cls=None,
+    graph: bool = True,
 ) -> Mock:
     platform = Mock(spec=SRTPlatform)
+    platform.capabilities = PlatformCapabilities(graph_capture=graph)
     platform.device_name = "custom"
     platform.is_out_of_tree.return_value = out_of_tree
     platform.supports_speculative_algorithm.return_value = supported
@@ -139,6 +145,82 @@ class TestOOTEagleKernelDispatch(CustomTestCase):
     def test_in_tree_verify_fallthrough_is_unchanged(self):
         self.assertEqual(
             self._run(_platform(out_of_tree=False), self._verify), (None, None, None)
+        )
+
+
+class TestOOTSpecGraphRunnerSelection(CustomTestCase):
+    def _select(self, platform: Mock, oot_runner_cls):
+        def builtin():
+            raise KeyError("custom")  # an OOT device is not a key of the maps
+
+        with patch.object(eagle_worker_v2, "current_platform", platform):
+            return eagle_worker_v2._select_spec_graph_runner_cls(
+                builtin_runner_cls=builtin, oot_runner_cls=oot_runner_cls
+            )
+
+    def test_no_capture_without_graph_capture(self):
+        oot = Mock(return_value=sentinel.runner)
+        self.assertIsNone(self._select(_platform(graph=False), oot))
+        oot.assert_not_called()
+
+    def test_builtin_platform_never_consults_the_platform(self):
+        oot = Mock(return_value=sentinel.runner)
+        with patch.object(
+            eagle_worker_v2, "current_platform", _platform(out_of_tree=False)
+        ):
+            selected = eagle_worker_v2._select_spec_graph_runner_cls(
+                builtin_runner_cls=lambda: sentinel.builtin_runner,
+                oot_runner_cls=oot,
+            )
+        self.assertIs(selected, sentinel.builtin_runner)
+        oot.assert_not_called()
+
+    def test_out_of_tree_draft_graphs_come_from_the_platform(self):
+        """An OOT device name used to index the device-keyed runner maps (KeyError)."""
+        platform = _platform()
+        runners = {
+            phase: Mock(name=phase) for phase in ("draft_decode", "draft_extend")
+        }
+        platform.get_speculative_graph_runner_cls.side_effect = (
+            lambda algorithm, phase: runners[phase]
+        )
+        worker = SimpleNamespace(
+            speculative_algorithm=SpeculativeAlgorithm.EAGLE,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            topk=1,
+            target_worker=SimpleNamespace(device="custom"),
+            draft_runner=None,
+            device="custom",
+            gpu_id=0,
+            draft_attn_backend=object(),
+            draft_extend_attn_backend=object(),
+            _specialized_graph_memory_usage={},
+            _specialized_graph_time_usage={},
+        )
+        decode_cfg = SimpleNamespace(backend="custom")
+        exec_cfg = SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=decode_cfg))
+        )
+        with contextlib.ExitStack() as stack:
+            for flag in DEVICE_FLAGS:
+                stack.enter_context(patch.object(eagle_worker_v2, flag, False))
+            for name, value in (
+                ("current_platform", platform),
+                ("check_cuda_graph_backend", lambda *args: False),
+                ("get_model", lambda: SimpleNamespace(model_impl="auto")),
+                ("get_exec", lambda: exec_cfg),
+                ("get_batch_sizes_to_capture", lambda runner: ([1], None)),
+                ("get_available_gpu_memory", lambda *args: 0.0),
+            ):
+                stack.enter_context(patch.object(eagle_worker_v2, name, value))
+            eagle_worker_v2.EagleDraftWorker._capture_cuda_graphs(worker)
+        for phase, runner in runners.items():
+            runner.assert_called_once_with(worker)
+        self.assertIs(worker.cuda_graph_runner, runners["draft_decode"].return_value)
+        self.assertIs(
+            worker.cuda_graph_runner_for_draft_extend,
+            runners["draft_extend"].return_value,
         )
 
 

@@ -116,7 +116,10 @@ class SRTPlatform(DeviceMixin):
         """Return the graph runner class, or None for the in-tree default.
 
         ``None`` means "no platform opinion": the caller falls back to the
-        in-tree device-keyed selection.
+        in-tree device-keyed selection. Adaptive speculative decoding also
+        builds one target verify runner per step count from this class, passing
+        ``attn_backend``, ``speculative_num_steps`` and
+        ``speculative_num_draft_tokens`` as keyword arguments.
         """
         return None
 
@@ -193,6 +196,17 @@ class SRTPlatform(DeviceMixin):
         class is constructed with the built-in worker's keyword arguments, must
         expose the same scheduler-facing interface, and must reject flags it
         cannot serve (for example multi-layer EAGLE).
+        """
+        return None
+
+    def get_speculative_graph_runner_cls(
+        self, algorithm: str, phase: str
+    ) -> Optional[type]:
+        """Return the EAGLE draft graph runner for ``phase``; None runs it eagerly.
+
+        ``phase`` is ``"draft_decode"`` or ``"draft_extend"``; the class is
+        constructed like the built-in runner for that phase. Not consulted when
+        ``capabilities.graph_capture`` is False.
         """
         return None
 

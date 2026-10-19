@@ -608,7 +608,12 @@ field defaults to the conservative answer.
     <tr>
       <td><code>get_graph_runner_cls()</code></td>
       <td><code>return None</code></td>
-      <td>Graph Runner class</td>
+      <td>Graph Runner class. Adaptive speculative decoding also builds one target verify runner per step count from it, passing <code>attn_backend</code>, <code>speculative_num_steps</code> and <code>speculative_num_draft_tokens</code> as keyword arguments.</td>
+    </tr>
+    <tr>
+      <td><code>get_speculative_graph_runner_cls(algorithm, phase)</code></td>
+      <td><code>return None</code></td>
+      <td>EAGLE draft graph runner for <code>"draft_decode"</code> or <code>"draft_extend"</code> on the built-in worker, constructed like the built-in runner for that phase. <code>None</code> runs the phase eagerly; not consulted when <code>capabilities.graph_capture</code> is False.</td>
     </tr>
     <tr>
       <td><code>get_speculative_worker_cls(algorithm)</code></td>
