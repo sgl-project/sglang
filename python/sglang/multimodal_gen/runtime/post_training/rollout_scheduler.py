@@ -43,6 +43,21 @@ def get_or_create_rollout_request_scheduler(
     )
 
 
+def truncate_rollout_schedule(
+    scheduler: FlowMatchEulerDiscreteScheduler, stop_step_index: int
+) -> torch.Tensor:
+    """Keep steps 0..stop_step_index and send the last one to the terminal sigma."""
+    num_steps = len(scheduler.timesteps)
+    if not 0 <= stop_step_index < num_steps:
+        raise ValueError(
+            f"rollout_stop_step_index must be in [0, {num_steps}), got {stop_step_index}"
+        )
+    end = stop_step_index + 1
+    scheduler.timesteps = scheduler.timesteps[:end]
+    scheduler.sigmas = torch.cat([scheduler.sigmas[:end], scheduler.sigmas[-1:]])
+    return scheduler.timesteps
+
+
 def prepare_rollout_request_scheduler(
     batch: Req,
     serving_scheduler: Any,
