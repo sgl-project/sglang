@@ -100,6 +100,8 @@ from sglang.srt.utils import is_npu
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
+from sglang.srt.distributed.communication_tags import P2PTag
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -491,6 +493,7 @@ class PrefillBootstrapQueue:
                 self.pp_rank,
                 self.pp_size,
                 self.scheduler.pp_poll_sync_work_list_bootstrap,
+                P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1126,6 +1129,7 @@ class SchedulerDisaggregationPrefillMixin:
                 parallel.pp_rank,
                 parallel.pp_size,
                 self.pp_poll_sync_work_list_inflight,
+                P2PTag.DISAGG_INFLIGHT_PP_SYNC,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(

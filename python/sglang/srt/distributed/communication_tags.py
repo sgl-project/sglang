@@ -14,3 +14,4 @@ class P2PTag(IntEnum):
     HICACHE_PP_SYNC = int.from_bytes(b"PpHi", byteorder="big")
     GRAMMAR_PP_SYNC = int.from_bytes(b"PpGr", byteorder="big")
     DISAGG_BOOTSTRAP_PP_SYNC = int.from_bytes(b"PpBs", byteorder="big")
+    DISAGG_INFLIGHT_PP_SYNC = int.from_bytes(b"PpIf", byteorder="big")
