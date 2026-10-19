@@ -2052,6 +2052,13 @@ class Req(ReqDllmMixin):
         self.swa_branching_seqlen = None
         self.extend_end = None
         self.dllm_initialized = False
+        if (
+            self.dllm_config is not None
+            and self.dllm_config.requires_separate_context_encoding
+        ):
+            # KV was released: rebuild context before starting a fresh canvas.
+            # Keep output_ids and the scores of already emitted tokens intact.
+            self.init_diffusion_llm(self.dllm_config)
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
