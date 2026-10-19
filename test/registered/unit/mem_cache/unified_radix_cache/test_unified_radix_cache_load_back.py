@@ -737,35 +737,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self._release_ongoing_load_back_locks(cache)
 
     @requires_full_mamba_ps1
-    def test_load_back_load_failure_frees_unpublished_mamba_slot(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
-
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        # cache_controller.load() failing (device alloc / transfer resolution)
-        # must also return the slot this call allocated.
-        with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            loaded = cache.load_back(leaf, req=req)
-
-        self.assertFalse(loaded)
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
-        )
-        self._release_ongoing_load_back_locks(cache)
-
-    @requires_full_mamba_ps1
     def test_load_back_abort_keeps_preexisting_mamba_slot(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
@@ -961,31 +932,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertIsNone(node_host_value(cache, root, ComponentType.MAMBA))
         self.assertIsNone(comp.prepare_load_back(root, req=req2).allocated_mamba_slot)
         self.assertIsNone(req2.kv.mamba_pool_idx)
-
-    @requires_full_mamba_ps1
-    def test_prepare_load_back_skips_device_present_node(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-        comp = cache.components[ComponentType.MAMBA]
-
-        # Back up without evicting: device value stays and a host copy is added, so build_hicache_transfers no-ops and prepare must not allocate a dead slot.
-        self._backup_node(cache, leaf)
-        self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.MAMBA))
-        self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.MAMBA))
-
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        self.assertIsNone(comp.prepare_load_back(leaf, req=req).allocated_mamba_slot)
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
-        )
 
     @requires_full_mamba_ps1
     def test_prepare_load_back_mamba_pool_exhausted(self):

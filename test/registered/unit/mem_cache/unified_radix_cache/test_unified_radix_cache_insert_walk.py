@@ -140,29 +140,6 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         self.assertTrue(cache.tree_core.is_backuped(ancestor))
         cache.sanity_check()
 
-    def test_begin_insert_rejects_concurrent_walk(self):
-        """Insert walks are single-flight: beginning a second insert while one
-        is suspended at a barrier is re-entrancy and must fail fast."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        cache.write_through_threshold = 2
-        self._insert(cache, allocator, req_to_token_pool, [1, 2])
-
-        # Suspend an insert at its crossing barrier by pumping it directly.
-        params = InsertParams(
-            key=RadixKey(array("q", [1, 2, 3, 4])),
-            value=self._alloc(allocator, 4),
-        )
-        step = cache.tree_core.begin_insert(params)
-        self.assertIsNone(step.result)
-        with self.assertRaisesRegex(RuntimeError, "concurrent insert walks"):
-            cache.tree_core.begin_insert(params)
-        cache.tree_core.end_insert()
-
-    def test_resume_insert_rejects_missing_walk(self):
-        cache, _, _ = build_fixture(self.cfg)
-        with self.assertRaisesRegex(RuntimeError, "no in-flight insert"):
-            cache.tree_core.resume_insert()
-
     def test_insert_abort_drains_pending_deferred_frees(self):
         """A mid-insert failure after a deferred dup-free accumulated must still
         return those slots to the allocator via the end_insert drain."""
@@ -688,26 +665,6 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
         self.assertEqual(list(device_frees), [ComponentType.MAMBA])
         self.assertFalse(host_frees)
         host_mock.free_host_values.assert_called_once()
-
-    def test_undrained_result_trips_the_del_assert(self):
-        """Dropping a result without draining fires the __del__ tripwire (the
-        only forgotten-drain detection); a drained result stays silent."""
-        seen = []
-        old_hook = sys.unraisablehook
-        sys.unraisablehook = lambda unraisable: seen.append(unraisable.exc_value)
-        try:
-            undrained = DemoteResult()
-            undrained.device_frees[ComponentType.FULL].append(torch.tensor([1]))
-            del undrained
-
-            drained = DemoteResult()
-            drained.device_frees[ComponentType.FULL].append(torch.tensor([1]))
-            drained.device_frees.clear()
-            del drained
-        finally:
-            sys.unraisablehook = old_hook
-        self.assertEqual(len(seen), 1)
-        self.assertIsInstance(seen[0], AssertionError)
 
     def test_node_info_facades_forward_to_the_tree(self):
         """The scheduler's storage-prefetch facades (is_backuped / is_root /

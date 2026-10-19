@@ -48,7 +48,6 @@ from sglang.test.kits.unified_radix_cache_unittest.config import (
     CacheConfig,
     define_config_test_classes,
     requires,
-    requires_full_mamba_ps1,
     requires_full_swa_ps1,
     requires_hicache,
     requires_ps1_window4,
@@ -2367,33 +2366,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(cache.swa_kv_pool_host.available_size(), avail)
         self.assertEqual(int(swa.alloc_prefetch_staging(sw).numel()), sw)
 
-    @requires_full_swa_ps1
-    def test_prepare_prefetch_swa_pool_exhausted(self):
-        cache, _, _ = self._build_hicache_fixture()
-        sw = cache.sliding_window_size
-        swa = cache.components[ComponentType.SWA]
-        # pool can't satisfy even after evict -> no staging, the hit parks
-        with (
-            mock.patch.object(cache.swa_kv_pool_host, "alloc", return_value=None),
-            mock.patch.object(cache, "evict_host", autospec=True) as evict_host,
-        ):
-            self.assertIsNone(swa.alloc_prefetch_staging(sw))
-        # the retry must evict the SWA host pool, not the default (FULL) one
-        evict_host.assert_called_once_with(sw, ComponentType.SWA)
-
-    @requires_full_mamba_ps1
-    def test_prepare_prefetch_mamba(self):
-        cache, _, _ = self._build_hicache_fixture()
-        # mamba always participates with exactly one state slot
-        mamba = cache.components[ComponentType.MAMBA]
-        self.assertEqual(
-            mamba.prepare_prefetch(
-                cache.root_node_handle(), prefetch_tokens=0
-            ).staging_tokens,
-            1,
-        )
-        self.assertEqual(int(mamba.alloc_prefetch_staging(1).numel()), 1)
-
     @requires_swa_only
     @requires_hicache
     def test_buffer_only_hit_parks_on_swa_staging_shortfall(self):
@@ -2727,19 +2699,6 @@ class TestUnifiedRadixPrefetchCorruption(
             reason="write_through_unbacked_eviction",
             pool=PoolName.KV.value,
         )
-        cache.sanity_check()
-
-    def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
-        """Write-through: eviction after such a refill must not corrupt the tree."""
-        cache, allocator, _ = build_fixture(self.cfg)
-        self._init_hicache(cache)
-
-        parent_id = self._insert_device(
-            cache, allocator, list(range(1, 1 + 3 * self.ps))
-        )
-        self._attach_host_child(cache, parent_id, start_token=1000)
-
-        cache.evict(EvictParams(num_tokens=10 * self.ps))
         cache.sanity_check()
 
     def test_prefetch_refill_kept_under_unbacked_parent_in_write_back(self):

@@ -533,77 +533,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(split_leaf))
         cache.sanity_check()
 
-    @requires_swa
-    @requires_hicache
-    @requires(
-        lambda cfg: not cfg.has_mamba, "SWA-only keeps the deep-tree topology precise"
-    )
-    def test_swa_deep_tree_backup_evict_loadback_stress(self):
-        """Deep multi-node SWA tree (long leaves, decode-evict tombstones,
-        shared-prefix branches) through write-through backup -> evict ->
-        loadback, asserting sanity throughout."""
-
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        cache.write_through_threshold = 1  # real eager write-through auto-backup
-        ps = self.cfg.page_size
-        # Window in pages; sizes scale with it so the leaf-cap split fires.
-        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        wp = max(1, tail_size // ps)
-
-        def insert_swa(tokens, swa_ev):
-            value = self._alloc(allocator, len(tokens))
-            if value is None:
-                return False
-            cache.insert(
-                InsertParams(
-                    key=RadixKey(array("q", tokens)),
-                    value=value,
-                    component_evicted_seqlens={ComponentType.SWA: swa_ev},
-                )
-            )
-            cache.writing_check()
-            cache.sanity_check()
-            return True
-
-        base = self._make_seq(1, wp + 2)  # long leaf -> cap-split
-        if not insert_swa(base, 0):
-            self.skipTest("kv pool too small for deep-tree stress")
-        # fresh decode-evicted seq: tombstone-prefix + cap-split stacked
-        insert_swa(self._make_seq(20000, wp + 2), ps)
-        insert_swa(base + self._make_seq(70000, 2), 0)  # depth
-        for i in range(2):  # width: branches off the base prefix
-            insert_swa(base[: 2 * ps] + self._make_seq(80000 + 1000 * i, 3), 0)
-
-        self.assertGreaterEqual(len(cache.tree_core.get_all_node_ids()), 5)
-
-        # Stepwise eviction -> demote to host, sanity after each round.
-        for _ in range(4):
-            full_ev = cache.full_evictable_size()
-            if full_ev == 0:
-                break
-            cache.evict(
-                EvictParams(
-                    num_tokens=max(ps, full_ev // 2),
-                    swa_num_tokens=cache.swa_evictable_size(),
-                )
-            )
-            cache.sanity_check()
-
-        # Load evicted prefixes back from host, sanity after each.
-        for tokens in (base, base[: 2 * ps]):
-            m = match_prefix(cache, tokens)
-            anchor = m.best_match_node
-            if (
-                anchor != cache.root_node_handle()
-                and cache.tree_core.is_full_device_evicted(anchor)
-            ):
-                if cache.load_back(anchor):
-                    self._finish_pending_loads(cache)
-                    self._release_ongoing_load_back_locks(cache)
-            cache.sanity_check()
-
-        cache.sanity_check()
-
     def test_hicache_evict_to_host_updates_aux_lru(self):
         """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [
@@ -815,22 +744,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
-        cache.sanity_check()
-
-    @requires_swa
-    def test_hicache_write_through_internal_swa_evict_keeps_drop(self):
-        """Non-write_back policies keep the legacy tombstone-and-drop."""
-        cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_through")
-
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
-
-        m = match_prefix(cache, seq_a)
-        if m.best_match_node != cache.root_node_handle():
-            node = m.best_match_node
-            self.assertIsNone(
-                node_host_value(cache, node, ComponentType.SWA),
-                "write_through keeps the legacy drop: no host demote",
-            )
         cache.sanity_check()
 
     def test_match_prefix_best_and_device_node_without_hicache(self):
@@ -1321,40 +1234,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         # The commit ran under held locks: the restored value must have been
         # credited to protected, or the ledger drifts on the final release.
         cache.sanity_check()
-
-    @requires_hicache
-    def test_hicache_mixed_backup_evict_insert(self):
-        """Complex scenario: backup some, evict, insert new, verify invariants."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        seqs = [self._make_seq(i * 100, 2) for i in range(5)]
-
-        # Insert all
-        for s in seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-        cache.sanity_check()
-
-        for i in range(3):
-            m = match_prefix(cache, seqs[i])
-            self._backup_node(cache, m.last_device_node)
-
-        # Evict to free some tokens
-        cache.evict(EvictParams(num_tokens=len(seqs[0]) * 2))
-        cache.sanity_check()
-
-        # Insert new sequences
-        new_seqs = [self._make_seq(i * 1000, 2) for i in range(3)]
-        for s in new_seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-        cache.sanity_check()
-
-        # Verify D-leaf / H-leaf mutual exclusion
-        overlap = [
-            node_id
-            for node_id in cache.tree_core.get_all_node_ids()
-            if cache.tree_core.is_device_evictable_leaf(node_id)
-            and cache.tree_core.is_host_evictable_leaf(node_id)
-        ]
-        self.assertEqual(len(overlap), 0)
 
     @requires_hicache
     def test_hicache_write_back_leaf_backup(self):

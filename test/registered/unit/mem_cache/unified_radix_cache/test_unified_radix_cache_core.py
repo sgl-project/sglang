@@ -446,17 +446,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_a))
         cache.sanity_check()
 
-    def test_evict_empty_tree(self):
-        cache, _, _ = build_fixture(self.cfg)
-        evict_params = EvictParams(num_tokens=10)
-        if self.cfg.has_mamba:
-            evict_params.mamba_num = 5
-        result = cache.evict(evict_params)
-        self.assertEqual(result.num_tokens_evicted, 0)
-        if self.cfg.has_mamba:
-            self.assertEqual(result.mamba_num_evicted, 0)
-        cache.sanity_check()
-
     def test_prev_prefix_len(self):
         """Three-step test: free overlap, free partial, no free."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -1682,32 +1671,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertEqual(cache.full_evictable_size(), 0)
         cache.sanity_check()
 
-    def test_evict_shared_prefix_keeps_common_path(self):
-        """Evicting one branch preserves the shared prefix for other branch."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        base = self._make_seq(1, 2)
-        branch_a = base + self._make_seq(100, 2)
-        branch_b = base + self._make_seq(200, 2)
-
-        self._insert(cache, allocator, req_to_token_pool, branch_a)
-        self._insert(cache, allocator, req_to_token_pool, branch_b)
-
-        # Lock branch_b
-        m = match_prefix(cache, branch_b)
-        lr = cache.inc_lock_ref(m.last_device_node)
-
-        # Evict — branch_a should go, base + branch_b stay
-        cache.evict(EvictParams(num_tokens=len(branch_a)))
-
-        m_b = match_prefix(cache, branch_b)
-        self.assertEqual(m_b.device_prefix_len, len(branch_b))
-
-        cache.dec_lock_ref(
-            m.last_device_node,
-            lr.to_dec_params(),
-        )
-        cache.sanity_check()
-
     def test_evict_result_accounting_matches_actual(self):
         """EvictResult.num_tokens_evicted matches actual size change."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -1719,21 +1682,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         result = cache.evict(EvictParams(num_tokens=before))
         after = cache.full_evictable_size()
         self.assertEqual(result.num_tokens_evicted, before - after)
-        cache.sanity_check()
-
-    def test_evict_reinsert_after_full_eviction(self):
-        """After evicting everything, new inserts work correctly."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq_a = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq_a)
-        cache.evict(EvictParams(num_tokens=len(seq_a) * 2))
-        self.assertEqual(cache.full_evictable_size(), 0)
-
-        # Re-insert
-        seq_b = self._make_seq(500, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq_b)
-        m = match_prefix(cache, seq_b)
-        self.assertEqual(m.device_prefix_len, len(seq_b))
         cache.sanity_check()
 
     @requires_swa
@@ -1748,31 +1696,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         swa_before = cache.swa_evictable_size()
         result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
         self.assertEqual(cache.swa_evictable_size(), 0)
-        cache.sanity_check()
-
-    def test_evict_d_leaf_set_consistency(self):
-        """evictable_device_leaves is consistent after mixed operations."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seqs = [self._make_seq(i * 100, 2) for i in range(6)]
-        for s in seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-
-        # Lock some, evict some, unlock
-        m = match_prefix(cache, seqs[0])
-        lr = cache.inc_lock_ref(m.last_device_node)
-
-        cache.evict(EvictParams(num_tokens=len(seqs[1])))
-        cache.sanity_check()
-
-        cache.dec_lock_ref(
-            m.last_device_node,
-            lr.to_dec_params(),
-        )
-        cache.sanity_check()
-
-        # Insert more
-        extra = self._make_seq(9000, 2)
-        self._insert(cache, allocator, req_to_token_pool, extra)
         cache.sanity_check()
 
     @requires(

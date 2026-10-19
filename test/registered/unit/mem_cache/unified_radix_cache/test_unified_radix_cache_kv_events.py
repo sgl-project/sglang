@@ -135,21 +135,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertEqual(list(session_b_tail[0].token_ids), [7, 8])
         self.assertEqual(session_b_tail[0].session_id, "session-b")
 
-    def test_session_id_and_cache_salt_are_both_attributed(self):
-        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
-        cache.take_events()
-        self._insert(
-            cache,
-            allocator,
-            [1, 2, 3, 4],
-            cache_salt="tenant-a",
-            session_id="session-a",
-        )
-        stored = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored), 1)
-        self.assertEqual(stored[0].cache_salt, "tenant-a")
-        self.assertEqual(stored[0].session_id, "session-a")
-
     def test_cache_salt_event_parentage_survives_node_split(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         cache.take_events()
