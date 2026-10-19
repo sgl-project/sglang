@@ -266,5 +266,117 @@ class TestQueueTimeAcrossRetraction(CustomTestCase):
         self.assertAlmostEqual(stats.get_queueing_time(), 0.2)
 
 
+class TestStorageAdmissionWait(CustomTestCase):
+    def _stats(self):
+        stats = rts.SchedulerReqTimeStats(
+            enable_metrics=True, metrics_collector=mock.MagicMock()
+        )
+        stats.set_wait_queue_entry_time(100.0)
+        return stats
+
+    def test_blocked_polls_accumulate_wait_episodes(self):
+        stats = self._stats()
+        for observe, output_key in (
+            (stats.observe_storage_prefetch_ready, "storage_prefetch_wait"),
+            (stats.observe_storage_staging_ready, "storage_staging_wait"),
+        ):
+            with (
+                self.subTest(gate=output_key),
+                mock.patch.object(rts.time, "perf_counter") as clock,
+            ):
+                for ts, ready in (
+                    (100.0, True),
+                    (100.1, False),
+                    (100.15, False),
+                    (100.2, False),
+                    (100.3, True),
+                    (100.4, True),
+                    (100.5, False),
+                    (100.6, True),
+                ):
+                    clock.return_value = ts
+                    observe(ready)
+                    if not ready:
+                        self.assertNotIn(
+                            output_key, stats.convert_to_output_meta_info()
+                        )
+                self.assertAlmostEqual(
+                    stats.convert_to_output_meta_info()[output_key], 0.3
+                )
+
+    def test_zero_missing_and_open_intervals_survive_serialization(self):
+        stats = self._stats()
+        stats.observe_storage_prefetch_ready(True)
+        stats.observe_storage_staging_ready(True)
+        zero = pickle.loads(pickle.dumps(stats)).convert_to_output_meta_info()
+        self.assertEqual(zero["storage_prefetch_wait"], 0.0)
+        self.assertEqual(zero["storage_staging_wait"], 0.0)
+
+        with mock.patch.object(rts.time, "perf_counter", return_value=100.1):
+            stats.observe_storage_prefetch_ready(False)
+            stats.observe_storage_staging_ready(False)
+        incomplete = pickle.loads(pickle.dumps(stats)).convert_to_output_meta_info()
+        self.assertNotIn("storage_prefetch_wait", incomplete)
+        self.assertNotIn("storage_staging_wait", incomplete)
+
+        legacy = rts.SchedulerReqTimeStats()
+        legacy.__setstate__({"has_timing_data": True, "queue_duration_s": 1.0})
+        missing = pickle.loads(pickle.dumps(legacy)).convert_to_output_meta_info()
+        self.assertNotIn("storage_prefetch_wait", missing)
+        self.assertNotIn("storage_staging_wait", missing)
+
+    def test_overlap_retraction_clock_rebase_and_retry(self):
+        stats = self._stats()
+        with mock.patch.object(
+            rts.time, "perf_counter", side_effect=[100.1, 100.2, 100.4, 100.5]
+        ):
+            stats.observe_storage_staging_ready(False)
+            stats.observe_storage_prefetch_ready(False)
+            stats.observe_storage_prefetch_ready(True)
+            stats.observe_storage_staging_ready(True)
+        stats.set_forward_entry_time(100.6)
+        stats.set_wait_queue_entry_time(101.0)
+        with mock.patch.object(rts.time, "perf_counter", side_effect=[101.1, 101.4]):
+            stats.observe_storage_prefetch_ready(False)
+            stats.observe_storage_prefetch_ready(True)
+        stats.set_forward_entry_time(101.5)
+
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
+            blob = pickle.dumps(stats)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_005.0):
+            blob = pickle.dumps(pickle.loads(blob))
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_009.0):
+            meta = pickle.loads(blob).convert_to_output_meta_info()
+        self.assertAlmostEqual(meta["storage_prefetch_wait"], 0.5)
+        self.assertAlmostEqual(meta["storage_staging_wait"], 0.4)
+        self.assertAlmostEqual(meta["queue_time"], 1.1)
+
+        with mock.patch.object(rts.time, "perf_counter", return_value=102.0):
+            stats.observe_storage_staging_ready(False)
+        stats.reset_prefill_retry_time()
+        stats.set_wait_queue_entry_time(103.0)
+        meta = stats.convert_to_output_meta_info()
+        self.assertEqual(meta["storage_prefetch_wait"], 0.0)
+        self.assertEqual(meta["storage_staging_wait"], 0.0)
+
+    def test_metrics_disabled_and_decode_do_not_record_local_prefetch(self):
+        for stats in (
+            rts.SchedulerReqTimeStats(),
+            rts.SchedulerReqTimeStats(
+                enable_metrics=True,
+                metrics_collector=mock.MagicMock(),
+                disagg_mode=rts.DisaggregationMode.DECODE,
+            ),
+        ):
+            stats.set_wait_queue_entry_time(100.0)
+            stats.observe_storage_prefetch_ready(False)
+            stats.observe_storage_prefetch_ready(True)
+            stats.observe_storage_staging_ready(False)
+            stats.observe_storage_staging_ready(True)
+            meta = stats.convert_to_output_meta_info()
+            self.assertNotIn("storage_prefetch_wait", meta)
+            self.assertNotIn("storage_staging_wait", meta)
+
+
 if __name__ == "__main__":
     unittest.main()

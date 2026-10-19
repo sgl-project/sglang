@@ -1,14 +1,14 @@
-"""Sampling kernels (top-k / top-p probability renormalization)."""
+"""Sampling kernels."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
+    CUDA_ONLY,
     CapabilityRequirement,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
 )
@@ -26,11 +26,6 @@ register_kernel(
                 CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3)),
             }
         ),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="FP32 [batch, vocab] softmax probabilities",
-        ),
-        description="Cake Blackwell softmax distributed by FlashInfer.",
     )
 )
 
@@ -62,45 +57,7 @@ def softmax(
     return torch.softmax(logits, dim=-1)
 
 
-register_kernel(
-    KernelSpec(
-        op="sampling.top_k_renorm_probs",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.sampling:top_k_renorm_probs",
-        format_signature=FormatSignature(
-            description="renormalize probs by top-k thresholding; returns tensor"
-        ),
-        description="Top-k probability renormalization (sgl_kernel wheel).",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="sampling.top_p_renorm_probs",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel.sampling:top_p_renorm_probs",
-        format_signature=FormatSignature(
-            description="renormalize probs by top-p thresholding; returns tensor"
-        ),
-        description="Top-p probability renormalization (sgl_kernel wheel).",
-    )
-)
-
-
-def top_k_renorm_probs(
-    probs: torch.Tensor, top_k: Union[torch.Tensor, int]
-) -> torch.Tensor:
-    """Renormalize ``probs`` by top-k thresholding."""
-    return get_kernel("sampling.top_k_renorm_probs", KernelBackend.AOT)(probs, top_k)
-
-
-def top_p_renorm_probs(
-    probs: torch.Tensor, top_p: Union[torch.Tensor, float]
-) -> torch.Tensor:
-    """Renormalize ``probs`` by top-p thresholding."""
-    return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(probs, top_p)
-
-
-__all__ = ["cake_softmax", "softmax", "top_k_renorm_probs", "top_p_renorm_probs"]
+__all__ = ["cake_softmax", "softmax"]
 
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
@@ -118,10 +75,6 @@ register_kernel(
         op="sampling.denoiser_statistics",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.denoiser_statistics:denoiser_statistics",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="FP32 probabilities, entropy and raw-logit argmax for contiguous [B,M,V] logits; optional BF16 probabilities.",
-        ),
+        capabilities=CUDA_ONLY,
     )
 )

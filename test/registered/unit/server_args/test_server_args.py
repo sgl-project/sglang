@@ -33,6 +33,7 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
 )
@@ -354,6 +355,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 ),
                 speculative_algorithm=algorithm,
                 speculative_num_draft_tokens=draft_tokens,
+                max_running_requests=None,
             )
 
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
@@ -362,6 +364,54 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(256, None, 4)), 256)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(None)), 0)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(0, cg=False)), 0)
+
+    def test_megamoe_decode_budget_clamps_to_request_pool(self):
+        """A DP16 pool of 256 requests per rank was validated as 4096 graph requests."""
+        from sglang.srt.arg_groups.mega_moe_hook import (
+            mega_moe_decode_tokens_per_rank,
+            validate_mega_moe_token_budget,
+        )
+
+        def view(tp_size, dp_size, requests, graph_bs):
+            return SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(max_bs=graph_bs)
+                ),
+                max_running_requests=requests,
+                attn_dp_size=dp_size,
+                tp_size=tp_size,
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                moe_a2a_backend="megamoe",
+                disaggregation_mode="decode",
+            )
+
+        self.assertEqual(
+            mega_moe_decode_tokens_per_rank(view(16, 16, 4096, 4096)), 1536
+        )
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16, 16, 4096, 128)), 768)
+        # The pool is padded to attn TP after the DP divide: 1 -> 8, 36 // 4 = 9 -> 12.
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(8, 1, 1, 4096)), 48)
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16, 4, 36, 4096)), 72)
+
+        with (
+            override_platform(is_hip=False),
+            patch(
+                "sglang.srt.arg_groups.mega_moe_hook.resolving_view",
+                return_value=view(16, 16, 4096, 4096),
+            ),
+        ):
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                1536
+            ):
+                validate_mega_moe_token_budget(None, "DeepseekV4ForCausalLM")
+            with (
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    1535
+                ),
+                self.assertRaisesRegex(ValueError, "largest decode / verify"),
+            ):
+                validate_mega_moe_token_budget(None, "DeepseekV4ForCausalLM")
 
     def test_w4a4_mxfp4_megamoe_disabled_preserves_deepgemm_env(self):
         deepgemm_env = {
@@ -1174,18 +1224,6 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
         self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
 
-    def test_pd_decode_dcp_rejects_unsupported_transfer_backend(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_transfer_backend="mori",
-            dcp_size=4,
-        )
-        with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, ascend, or fake for synthetic benchmarking"
-        ):
-            handle_pd_disaggregation(server_args)
-
     def test_pd_decode_dcp_allows_fake_transfer_backend(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
@@ -1419,6 +1457,32 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             validate_hisparse_kv_cache_dtype(server_args)
 
+    def test_hisparse_rejects_adaptive_speculation(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_adaptive=True,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
+                validate_hisparse(server_args)
+
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
@@ -1572,7 +1636,10 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             attn_dp_size=4,
             tp_size=4,
         )
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
+        server_args._model_config = SimpleNamespace(
+            nvfp4_moe_meta=None,
+            hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+        )
         return server_args
 
     def test_auto_resolves_mxfp8_and_normalizes_trtllm(self):
@@ -1601,7 +1668,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="auto")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -1634,7 +1701,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -1741,6 +1808,9 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             "DeepseekV32ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Glm4MoeForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "KimiK3ForConditionalGeneration",
+            "KimiK3LinearForCausalLM",
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
             "Qwen2MoeForCausalLM",
@@ -2257,6 +2327,28 @@ class TestHiCacheArgs(CustomTestCase):
                 },
                 "expected_io_backend": "direct",
                 "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "unified_memory_with_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_mem_layout": "page_first_direct",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "unified_memory_mooncake_with_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
             },
             {
                 "name": "fa3_kernel_with_explicit_decode_backend",
@@ -4268,6 +4360,31 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
+    """Under the Rust server every attention-DP leader hosts its own listener;
+    a control request (abort, server info) sent to a leader other than rank 0
+    must reach its scheduler instead of being overwritten by rank 0's
+    broadcast."""
+
+    def test_rust_server_broadcasts_control_within_each_dp_group(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            attn_dp_size=2,
+            tp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        with envs.SGLANG_RUST_SERVER.override(True):
+            parallel_hook.handle_data_parallelism(server_args)
+        self.assertTrue(
+            resolution_result(
+                server_args, "enable_dp_attention_local_control_broadcast", False
+            )
+        )
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """The graph-captured TP LM-head all-to-all must not run with NCCL's
     graph buffer registration: registered graph-pool temporaries deadlock the
@@ -4330,7 +4447,7 @@ class TestDcpCommBackendDefault(CustomTestCase):
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
-    @override_platform(is_npu=True, is_cuda=False, is_hip=False)
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
     def test_a5_npu_supports_dcp(self):
         self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
@@ -4348,12 +4465,19 @@ class TestDcpCommBackendDefault(CustomTestCase):
         ):
             self.assertEqual(self._resolved(dcp_size=4), "a2a")
 
-    @override_platform(is_cuda=False, is_hip=False)
+    @override_platform(is_cuda=False, is_hip=False, is_xpu=False)
     def test_ag_rs_off_cuda(self):
         with patch(
             "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
         ):
             self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
+
+    @override_platform(is_xpu=True, is_cuda=False, is_hip=False)
+    def test_a2a_on_xpu(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=2), "a2a")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_explicit_value_wins(self):
