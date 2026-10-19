@@ -452,6 +452,98 @@ class _FakeACL:
         return 0
 
 
+def _fake_import_vmm(monkeypatch):
+    rt = _FakeACL()
+    monkeypatch.setattr(
+        rt,
+        "mem_import_from_shareable_handle",
+        lambda size, device: rt.malloc_physical(size),
+        raising=False,
+    )
+    return NPUWeightVMM(NS(rt=rt), NS(index=0)), rt
+
+
+@pytest.mark.parametrize(
+    "failure", ["unmap_mem", "release_mem_address", "free_physical"]
+)
+def test_import_cleanup_retries_only_remaining_steps(monkeypatch, failure):
+    vmm, rt = _fake_import_vmm(monkeypatch)
+    for _ in range(2):
+        vmm.import_shard(8, 8, 1)
+    (handle, pointer, _), (done_handle, done_pointer, _) = vmm._imports
+    operations = ("unmap_mem", "release_mem_address", "free_physical")
+    failed_at = operations.index(failure)
+    values = (pointer, pointer, handle)
+    done_values = (done_pointer, done_pointer, done_handle)
+    pending = {(failure, values[failed_at])}
+    calls = []
+    for operation in operations:
+        original = getattr(rt, operation)
+
+        def invoke(value, operation=operation, original=original):
+            calls.append((operation, value))
+            if (operation, value) in pending:
+                pending.remove((operation, value))
+                return 1
+            return original(value)
+
+        monkeypatch.setattr(rt, operation, invoke)
+    with pytest.raises(RuntimeError, match="ACL error"):
+        vmm.close_imports()
+    remaining = [entry.copy() for entry in vmm._imports]
+    assert calls == list(zip(operations, done_values)) + list(
+        zip(operations[: failed_at + 1], values[: failed_at + 1])
+    )
+    assert rt.freed == [done_handle]
+    calls.clear()
+    # The old implementation repeats an already successful unmap here when
+    # address/handle release failed, which the fake ACL rejects.
+    vmm.close_imports()
+    assert remaining == [[handle, None if failed_at == 2 else pointer, failed_at == 0]]
+    assert calls == list(zip(operations[failed_at:], values[failed_at:]))
+    calls.clear()
+    vmm.close_imports()
+    vmm.close()
+    vmm.close()
+    assert calls == []
+    assert not vmm._imports and not rt.allocations
+    assert not rt.mappings and not rt.reservations
+
+
+@pytest.mark.parametrize("failure", ["reserve_mem_address", "map_mem"])
+def test_partial_import_cleanup_skips_unfinished_steps(monkeypatch, failure):
+    vmm, rt = _fake_import_vmm(monkeypatch)
+    original = getattr(rt, failure)
+    monkeypatch.setattr(
+        rt,
+        failure,
+        lambda *args: (None, 1) if failure == "reserve_mem_address" else 1,
+    )
+    with pytest.raises(RuntimeError, match="ACL error"):
+        vmm.import_shard(8, 8, 1)
+    monkeypatch.setattr(rt, failure, original)
+    handle, pointer, mapped = vmm._imports[0]
+    assert not mapped
+    assert (pointer is None) == (failure == "reserve_mem_address")
+    calls = []
+    for operation in ("unmap_mem", "release_mem_address", "free_physical"):
+        original = getattr(rt, operation)
+
+        def invoke(value, operation=operation, original=original):
+            calls.append((operation, value))
+            return original(value)
+
+        monkeypatch.setattr(rt, operation, invoke)
+    vmm.close_imports()
+    vmm.close_imports()
+    vmm.close()
+    assert calls == ([] if pointer is None else [("release_mem_address", pointer)]) + [
+        ("free_physical", handle)
+    ]
+    assert not vmm._imports and not rt.allocations
+    assert not rt.mappings and not rt.reservations
+
+
 def test_shared_page_pool_reuses_maximum_not_each_size():
     allocated, freed, mappings = [], [], []
 

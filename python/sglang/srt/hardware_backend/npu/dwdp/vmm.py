@@ -159,11 +159,14 @@ class NPUWeightVMM:
 
     def close_imports(self):
         while self._imports:
-            handle, ptr, mapped = self._imports[-1]
+            entry = self._imports[-1]
+            handle, ptr, mapped = entry
             if mapped:
                 _check(self.rt.unmap_mem(ptr), "unmap imported memory")
+                entry[2] = False
             if ptr is not None:
                 _check(self.rt.release_mem_address(ptr), "release imported address")
+                entry[1] = None
             _check(self.rt.free_physical(handle), "free imported handle")
             self._imports.pop()
 
