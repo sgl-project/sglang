@@ -603,15 +603,19 @@ def run_bench_serving(
                     # Format: "Cache hit rate:    82.2%" (from --cache-report)
                     parts = stripped_line.split()
                     if len(parts) >= 4:
-                        metrics["cache_hit_rate_pct"] = parts[-1].rstrip("%")
+                        metrics["cache_hit_rate_pct"] = parts[3].rstrip("%")
                 elif stripped_line.startswith("Device:") and stripped_line.endswith(
                     "%"
                 ):
-                    metrics["device_hit_rate_pct"] = stripped_line.split()[-1].rstrip(
-                        "%"
-                    )
+                    # Format: "Device:    19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["device_hit_rate_pct"] = parts[1].rstrip("%")
                 elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
-                    metrics["host_hit_rate_pct"] = stripped_line.split()[-1].rstrip("%")
+                    # Format: "Host:    19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
