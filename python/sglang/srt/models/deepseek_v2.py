@@ -1027,7 +1027,6 @@ class DeepseekV2MoE(nn.Module):
             from sglang.srt.layers.moe.glm_mxfp4_gluon import (
                 GlmMxfp4GluonMoeBackend,
             )
-
             from sglang.srt.layers.moe.gluon_backend import bind_gluon_moe_backend
 
             bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
