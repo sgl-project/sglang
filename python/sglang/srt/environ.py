@@ -978,6 +978,13 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # gfx950 KDA chunked prefill (K = V = 128): store the gated key chunk-major
+    # ([chunks, H, K, 64], tokens contiguous) for the state scan, with its tuned tile.
+    SGLANG_ROCM_KDA_CHUNK_MAJOR_SCAN = EnvBool(True)
+    # With it, extends of at most this many tokens run the scan that writes the output
+    # in the same pass (kernels/ops/attention/fla/kda_chunk_scan.py); 0 disables.
+    # Measured on MI350X: the launch it saves wins while the call is launch-bound.
+    SGLANG_ROCM_KDA_FUSED_OUTPUT_MAX_TOKENS = EnvInt(3072)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

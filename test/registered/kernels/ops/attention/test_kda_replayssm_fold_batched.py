@@ -15,9 +15,11 @@ must match the per-layer entry). GPU-only.
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: the four-step prefetched fold runs on gfx950 only.
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 if not torch.cuda.is_available():
     pytest.skip(
@@ -132,6 +134,41 @@ def test_fold_batched_matches_per_layer(
         f"batched fold != per-layer loop; max abs diff "
         f"{(ref - bat).abs().max().item():.3e}"
     )
+
+
+@pytest.mark.skipif(not torch.version.hip, reason="the four-step fold is gfx950-only")
+@pytest.mark.parametrize("has_track", [False, True], ids=["no-track", "track"])
+def test_four_step_fold_matches_dynamic_loop(has_track):
+    """The prefetched four-step fold (max_steps <= 4) must stay bit-identical to
+    the dynamic loop for every accept length up to 4, including track snapshots."""
+    num_layers, num_slots, HV, H, K, V, L = 3, 12, 12, 12, 128, 128, 16
+    r = _rand_rings(num_layers, num_slots, HV, H, K, V, L)
+    slots = torch.tensor([1, 2, 3, -1, 4, 5], device=DEV, dtype=torch.int32)
+    accept = torch.tensor([1, 2, 3, 4, 4, 0], device=DEV, dtype=torch.int32)
+    track_idx = track_step = None
+    if has_track:
+        track_idx = torch.arange(6, 12, device=DEV, dtype=torch.int32)
+        track_step = torch.tensor([0, -1, 2, 3, 3, 1], device=DEV, dtype=torch.int32)
+    folded = {}
+    for max_steps in (0, 4):
+        state = r["temporal"].clone()
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=state,
+            rawv_cache=r["rawv"],
+            rawk_cache=r["rawk"],
+            gk_cache=r["gk"],
+            beta_cache=r["beta"],
+            ssm_state_indices=slots,
+            accept_lens=accept,
+            max_cache_len=L,
+            num_k_heads=H,
+            mamba_track_indices=track_idx,
+            mamba_steps_to_track=track_step,
+            null_block_id=-1,
+            max_steps=max_steps,
+        )
+        folded[max_steps] = state
+    assert torch.equal(folded[0], folded[4])
 
 
 if __name__ == "__main__":
