@@ -31,7 +31,7 @@ _HC_NORM_KERNELS = [
     ("hc_combine_norm", "hc_combine_norm"),
     ("mhc_post_split_h", "mhc_post_split_h"),
     ("hc_combine_norm", "hc_combine_norm_mxfp8"),
-    ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+    ("rmsnorm_mxfp8", "rmsnorm_mxfp8"),
 ]
 for _mod, _fn in _HC_NORM_KERNELS:
     register_kernel(

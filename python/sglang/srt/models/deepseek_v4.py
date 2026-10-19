@@ -1539,7 +1539,7 @@ class MQALayer(MqaAttentionBase):
                 is_batch_invariant_mode_enabled()
                 or get_exec().deterministic.enable_deterministic_inference
             ):
-                from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
 
                 y, quant, scale = rmsnorm_mxfp8(
                     q, self.q_norm.weight, self.q_norm.variance_epsilon
