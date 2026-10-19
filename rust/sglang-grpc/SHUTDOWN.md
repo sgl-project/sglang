@@ -82,7 +82,7 @@ Python checks used Python 3.12.14 and the gRPC extension built from this change.
 | `python -m unittest test.registered.unit.entrypoints.test_grpc_shutdown_rpc -v` with the built extension | Passed: 3 tests; no skips |
 | Second `cargo +1.93.1 run -p sglang-api-codegen` | All checked-in output hashes unchanged |
 | `cargo +1.93.1 fmt --all -- --check`, isort 7.0.0, Ruff 0.15.1 formatting/lint, `git diff --check` | Passed |
-| Standalone GPU engine test | Blocked before Shutdown: engine warmup failed in CUDA JIT kernels |
+| Standalone GPU engine test with the built extension | Passed: real Qwen3-0.6B inference, readiness/admission changes, open-watch/listener closure, engine exit code 0 within 60 seconds, and scheduler exit; 94.756 seconds including startup |
 | TP/DP multi-rank and multi-node engine tests | Not run: only one GPU available |
 
 The wire tests verify concurrent empty acknowledgments, immediate health and
@@ -90,11 +90,25 @@ admission changes, unhealthy state observation, listener closure with an open
 watch, rejection of stale healthy snapshots, and teardown with a pending Python
 snapshot. The last case timed out before the GIL-release fix and passed afterward.
 
-The GPU attempts used an RTX 6000 Ada and cached `Qwen/Qwen3-0.6B` and
-`Qwen/Qwen2.5-0.5B-Instruct`. The initial compiler was CUDA 11.5, which rejected
-C++20. Retrying with installed CUDA 13.0 reached warmup but failed with
-`CUDA error: invalid resource handle` in QK normalization / RoPE. Using
-`SGLANG_FORCE_FUSED_OP_BACKEND=torch` and PyTorch sampling advanced to the
-KV-cache kernel, which failed with the same error. None of these runs reached
-the Shutdown call; they do not validate engine or scheduler exit. The GPU test
-must pass in a working engine environment before claiming that validation.
+The successful GPU run used an RTX 6000 Ada (driver 590.48.01),
+`Qwen/Qwen3-0.6B`, TP=1, DP=1, Torch 2.14.1+cu130, and CUDA 13.0. The engine
+used Triton attention, PyTorch sampling, and disabled CUDA graphs, as configured
+by the integration test. No fused-op fallback override was needed.
+
+Earlier startup failures were reproduced independently on unmodified upstream
+`678913a0f029394ad1f4ee64d1439421e9ea56ef`. The initial system compiler was
+CUDA 11.5, which rejected C++20. Switching to the CUDA 13 Python wheel supplied
+the compiler but not the toolkit's expected `lib64/libcudart.so` layout. The
+linker fell back to the system CUDA 11 library: `readelf -d` showed the JIT
+kernel depended on `libcudart.so.11.0`, despite compilation with CUDA 13.
+This produced `CUDA error: invalid resource handle` during kernel launches.
+
+For validation, a local toolkit layout under `CACHE_ROOT` linked the installed
+CUDA 13 compiler, headers, and libraries, including `lib64/libcudart.so`.
+`CUDA_HOME` and `LD_LIBRARY_PATH` selected that layout. A fresh JIT cache under
+`CACHE_ROOT` avoided reusing the incorrectly linked artifacts. The rebuilt
+kernel depended on `libcudart.so.13` and passed on default and non-default
+streams. Unmodified upstream then served a real request and exited with code 0
+on SIGTERM, with no surviving children. The PR's standalone Shutdown test passed
+in the same corrected environment. No engine/kernel source changes were needed
+to fix the environment.
