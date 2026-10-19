@@ -1106,7 +1106,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    @rank_consensus(same_results=["[req.rid for req in results]"])
+    @rank_consensus(same_results=["[req.rid for req in result]"])
     def process_disagg_prefill_inflight_queue(self: Scheduler) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
@@ -1125,7 +1125,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.pp_group,
                 parallel.pp_rank,
                 parallel.pp_size,
-                self.pp_poll_sync_work_list,
+                self.pp_poll_sync_work_list2,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
