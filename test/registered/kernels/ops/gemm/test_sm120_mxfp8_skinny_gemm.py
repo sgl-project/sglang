@@ -84,7 +84,7 @@ def test_matches_reference(n, k, m):
         assert not counters.any(), "split-K counters must return to zero"
 
 
-@pytest.mark.parametrize("n,k", [(1792, 5120), (5120, 2048)])  # split-K, BK 256
+@pytest.mark.parametrize("n,k", [(1792, 5120), (5120, 2048)])  # split-K, then BK 256
 @pytest.mark.parametrize("m", [1, MAX_M])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_input_dtypes(n, k, m, dtype):
@@ -134,15 +134,16 @@ def test_fused_quant_matches_flashinfer(m, backend):
     if backend == "cute-dsl" and not _cute_dsl_available():
         pytest.skip("FlashInfer CuTe-DSL is not installed")
     n, k = 8192, 1280
-    # FlashInfer's CUDA backend flushes BF16 subnormal inputs to zero; the
-    # CuTe-DSL backend (the one SGLang calls) and this kernel keep them.
+    # FlashInfer's CUDA backend departs from the CuTe-DSL backend (the one SGLang
+    # calls) on rows below about 2^-100, so it is compared from there up.
     lo = -120 if backend == "cute-dsl" else -100
     x = torch.randn(m, k, device="cuda")
     x *= torch.logspace(lo, 30, m, base=2.0, device="cuda")[:, None]
     x = x.bfloat16()
     x[0, 0:32] = 0
     x[0, 32:64] = 3.5  # amax / 448 is exactly 2^-7
-    x[0, 64:96] = 448.0 * 2.0**-127  # amax / 448 at the smallest UE8M0 scale
+    # amax / 448 at UE8M0 scale byte 0: the block quantizes to zero, as in FlashInfer
+    x[0, 64:96] = 448.0 * 2.0**-127
     q, sf = flashinfer.mxfp8_quantize(x, True, 32, backend=backend)
     q_lin, sf_lin = flashinfer.mxfp8_quantize(x, False, 32, backend=backend)
     # Selector weight (row j picks activation j) with block scale 2^64:
@@ -317,6 +318,9 @@ def test_weight_reload_keeps_captured_buffers(build_linear):
 
     n, k = 1792, 5120
     layer, _ = build_linear(n, k)
+    # The scale may alias weight_scale_inv, which the loader rewrites in place;
+    # a buffer of its own makes the reload copy the new scales into it.
+    layer.mxfp8_skinny_scale = layer.mxfp8_skinny_scale.clone()
     scale, counters = layer.mxfp8_skinny_scale, layer.mxfp8_skinny_counters
     assert counters is not None, "exercise the split-K counters"
     x = torch.randn(6, k, device="cuda", dtype=torch.bfloat16)
@@ -333,12 +337,9 @@ def test_weight_reload_keeps_captured_buffers(build_linear):
     assert layer.mxfp8_skinny_counters is counters
     assert torch.equal(scale, s)
     assert not counters.any()
-    # Same-size allocations that would take over buffers freed by the reload.
-    taken = [torch.full_like(counters, 7), torch.full_like(scale, 3.0)]
     graph.replay()
     assert torch.equal(out, layer(x)[0])
     assert not counters.any()
-    del taken
 
 
 def test_linear_gates(build_linear, skinny_rows):

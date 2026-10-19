@@ -1122,7 +1122,7 @@ class Fp8LinearMethod(LinearMethodBase):
             data.reshape(rows, k),
             layer.weight,
             scale,
-            layer.mxfp8_skinny_counters,
+            getattr(layer, "mxfp8_skinny_counters", None),
             a_sf=a_sf,
             out_dtype=data.dtype if a_sf is None else torch.bfloat16,
         )
