@@ -1603,18 +1603,21 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             request_tools = request.tools if tools else None
+            render_response_format = (
+                request.response_format is not None
+                and request.response_format.type in ("json_schema", "json_object")
+            )
 
-            # An empty system message hosts the request tools; dsv41 renders a
-            # system token for it, so it only gets one when tools need the host.
-            if messages[0]["role"] != "system" and (request_tools or not is_dsv41):
+            # An empty system message hosts the request tools and response_format;
+            # dsv41 renders a system token for it, so it only gets one when needed.
+            if messages[0]["role"] != "system" and (
+                request_tools or render_response_format or not is_dsv41
+            ):
                 messages.insert(0, {"role": "system", "content": ""})
-            # dpsk only support json_object, text response_format
-            if request.response_format and request.response_format.type in [
-                "text",
-                "json_schema",
-                "json_object",
-            ]:
-                dpsk_response_format = request.response_format.model_dump(by_alias=True)
+            if render_response_format:
+                dpsk_response_format = request.response_format.model_dump(
+                    exclude_unset=True, by_alias=True
+                )
                 if dpsk_response_format["type"] == "json_schema":
                     # convert type from json_schema to json_object to align dpsk official document
                     # https://api-docs.deepseek.com/api/create-chat-completion/
