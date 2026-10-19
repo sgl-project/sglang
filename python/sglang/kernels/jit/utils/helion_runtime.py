@@ -30,23 +30,20 @@ _compiled: dict[tuple[Any, str], Any] = {}
 
 
 @lru_cache(maxsize=None)
-def _warn_unsupported(reason: str) -> bool:
+def warn_helion_unsupported(reason: str) -> bool:
     logger.warning("Muse Spark Helion kernels are disabled: %s", reason)
     return False
 
 
 @lru_cache(maxsize=None)
-def _base_package_version(package: str) -> str | None:
+def base_package_version(package: str) -> str | None:
     try:
         return version(package).split("+", 1)[0]
     except PackageNotFoundError:
         return None
 
 
-def helion_supported(
-    op_name: str,
-    tensor: torch.Tensor,
-) -> bool:
+def helion_supported(tensor: torch.Tensor) -> bool:
     """Return whether a selected kernel is validated for this runtime/device."""
     if torch.compiler.is_compiling():
         return False
@@ -57,21 +54,12 @@ def helion_supported(
     forced_backend = get_fused_op_backend()
     if forced_backend is not None and forced_backend is not KernelBackend.HELION:
         return False
-    helion_version = _base_package_version("helion")
+    helion_version = base_package_version("helion")
     if helion_version != "1.4.0":
-        return _warn_unsupported(
+        return warn_helion_unsupported(
             f"Helion 1.4.0 is required, found {helion_version or 'not installed'}"
         )
-    if not tensor.is_cuda:
-        return False
-    if op_name == "norm_fp4_quant":
-        flashinfer_version = _base_package_version("flashinfer-python")
-        if flashinfer_version != "0.6.17":
-            return _warn_unsupported(
-                "NVFP4 quantization requires FlashInfer 0.6.17, found "
-                f"{flashinfer_version or 'not installed'}"
-            )
-    return True
+    return tensor.is_cuda
 
 
 def token_count_specialization_key(first_tensor: torch.Tensor, *_: Any) -> int:
@@ -167,9 +155,11 @@ def run_pinned_helion(
 
 
 __all__ = [
+    "base_package_version",
     "current_helion_config_bucket",
     "helion_config_bucket",
     "helion_supported",
     "run_pinned_helion",
     "token_count_specialization_key",
+    "warn_helion_unsupported",
 ]

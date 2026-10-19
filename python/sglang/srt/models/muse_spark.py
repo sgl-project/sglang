@@ -21,10 +21,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store import FusedQKNorm
 from sglang.kernels.ops.communication.muse_spark_all_gather import (
-    gemm_ag,
     gemm_ag_supported,
-    gemm_local,
-    reserve_projection_workspace,
 )
 from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
     all_gather_norm_residual_supported,
@@ -48,6 +45,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+    gemm_ag,
+    gemm_local,
+    reserve_projection_workspace,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -1064,11 +1066,11 @@ class MuseSpark1xModel(nn.Module):
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
-            from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce_cutedsl import (
-                FinalizePushWorkspace,
-            )
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
                 CustomAllReduceV2,
+            )
+            from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
+                FinalizePushWorkspace,
             )
 
             tp_group = get_parallel().tp_group

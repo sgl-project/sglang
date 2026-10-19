@@ -137,11 +137,22 @@ class _FusedNormFP4Quant(BaseFusedOp):
         if backend is not KernelBackend.HELION:
             return True
 
-        from sglang.kernels.jit.utils.helion_runtime import helion_supported
+        from sglang.kernels.jit.utils.helion_runtime import (
+            base_package_version,
+            helion_supported,
+            warn_helion_unsupported,
+        )
 
+        if not helion_supported(x):
+            return False
+        flashinfer_version = base_package_version("flashinfer-python")
+        if flashinfer_version != "0.6.17":
+            return warn_helion_unsupported(
+                "NVFP4 quantization requires FlashInfer 0.6.17, found "
+                f"{flashinfer_version or 'not installed'}"
+            )
         return (
-            helion_supported("norm_fp4_quant", x)
-            and x.shape[0] > 0
+            x.shape[0] > 0
             and x.dtype == torch.bfloat16
             and x.dim() == 2
             and x.is_contiguous()

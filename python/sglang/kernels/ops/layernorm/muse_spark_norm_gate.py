@@ -250,7 +250,7 @@ class FusedRMSNormGate(BaseFusedOp):
     ) -> bool:
         from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
-        if not helion_supported("rms_norm_gate", x):
+        if not helion_supported(x):
             return False
         self._ensure_cached_weight()
         return (

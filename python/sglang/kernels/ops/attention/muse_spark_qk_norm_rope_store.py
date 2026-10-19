@@ -378,7 +378,7 @@ class FusedQKNorm(BaseFusedOp):
         from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
         return (
-            helion_supported("qk_norm", qkv)
+            helion_supported(qkv)
             and (kv_store is None or kv_store[0].dtype == qkv.dtype)
             and qkv.shape[0] > 0
             and qkv.dtype == torch.bfloat16

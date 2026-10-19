@@ -14,6 +14,7 @@ Backends:
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -22,11 +23,13 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.communication import (
     muse_spark_moe_finalize_all_reduce_cutedsl,
 )
-from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce_cutedsl import (
-    FinalizePushWorkspace,
-)
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.runtime_context import get_forward
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
+        FinalizePushWorkspace,
+    )
 
 logger = logging.getLogger(__name__)
 _missing_cutedsl_warning_logged = False
@@ -357,7 +360,7 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
         from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
         return (
-            helion_supported("post_expert_finalize", output)
+            helion_supported(output)
             and output.shape[0] > 0
             and self.topk == 8
             and self.hidden_dim == 4096

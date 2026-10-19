@@ -31,7 +31,7 @@ from sglang.srt.utils.common import next_power_of_2, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce_cutedsl import (
+    from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
         FinalizePushWorkspace,
     )
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
