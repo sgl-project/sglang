@@ -40,6 +40,7 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -50,9 +51,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    cudnn_batch_prefill_with_kv_cache = LazyImport(
+        "flashinfer.prefill", "cudnn_batch_prefill_with_kv_cache"
+    )
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
