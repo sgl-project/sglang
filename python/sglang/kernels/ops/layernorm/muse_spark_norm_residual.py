@@ -19,15 +19,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
-from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
-    all_gather_norm_residual,
-)
 from sglang.kernels.ops.layernorm import _muse_spark_tuning
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
-from sglang.srt.layers.muse_spark.muse_spark_layers import (
-    MuseSpark1xNormPreservingResidualConnection,
-    MuseSpark1xRMSNormWithInputScale,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -175,23 +168,27 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         },
     }
 
-    def __init__(self, post_norm, residual_add, pre_norm):
+    def __init__(
+        self,
+        post_norm,
+        residual_add,
+        pre_norm,
+        *,
+        post_norm_is_input_scale: bool,
+        use_residual_gate: bool,
+    ):
+        """``post_norm_is_input_scale``: the post-norm scales its input by the
+        weight before normalizing. ``use_residual_gate``: ``residual_add`` is the
+        norm-preserving gated connection (``_alpha``/``_beta``/``gate``), not a
+        plain add. Both select kernel template specializations."""
         super().__init__()
         # Store module references (weights are owned by the decoder layer module tree)
         object.__setattr__(self, "_post_norm", post_norm)
         object.__setattr__(self, "_residual_add", residual_add)
         object.__setattr__(self, "_pre_norm", pre_norm)
 
-        # Introspection flags for CUDA C kernel template specialization
-        self._post_norm_is_input_scale = isinstance(
-            post_norm, MuseSpark1xRMSNormWithInputScale
-        )
-        self._use_residual_gate = isinstance(
-            residual_add, MuseSpark1xNormPreservingResidualConnection
-        )
-        self._pre_norm_is_input_scale = isinstance(
-            pre_norm, MuseSpark1xRMSNormWithInputScale
-        )
+        self._post_norm_is_input_scale = post_norm_is_input_scale
+        self._use_residual_gate = use_residual_gate
         self._hidden_size = post_norm.hidden_size
 
     def backend_eligible(
@@ -451,20 +448,29 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             fused_norm_residual as _jit_fused_norm_residual,
         )
 
-        self._ensure_cached_weights(branch_dtype)
-
         return _jit_fused_norm_residual(
             branch,
             stream,
-            self._post_norm.eps,
-            self._pre_norm.eps,
+            **self.jit_kernel_kwargs(branch_dtype),
+            want_router=router_dtype is not None,
+            pre_norm_bf16=pre_norm_dtype is torch.bfloat16,
+        )
+
+    def jit_kernel_kwargs(self, branch_dtype: torch.dtype = torch.bfloat16) -> dict:
+        """Norm and residual-gate arguments of the JIT kernels for this boundary.
+
+        Shared with ``communication.muse_spark_all_gather_norm_residual``, which
+        applies the same boundary to the TP all-gather of bf16 column slices.
+        """
+        self._ensure_cached_weights(branch_dtype)
+        return dict(
+            post_eps=self._post_norm.eps,
+            pre_eps=self._pre_norm.eps,
             post_norm_is_input_scale=self._post_norm_is_input_scale,
             post_weight=self._cc_post_weight if self._post_norm.has_weight else None,
             pre_weight=self._cc_pre_weight if self._pre_norm.has_weight else None,
             alpha=self._cc_alpha if self._use_residual_gate else None,
             beta=self._cc_beta if self._use_residual_gate else None,
-            want_router=router_dtype is not None,
-            pre_norm_bf16=pre_norm_dtype is torch.bfloat16,
         )
 
     def jit_selected(self) -> bool:
@@ -478,22 +484,4 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             and not self.is_torch_compile
             and BaseFusedOp.backend_eligible(self, KernelBackend.JIT)
             and _jit_launch_config_ok(self._hidden_size)
-        )
-
-    def forward_with_ag(
-        self, stream: torch.Tensor, local: torch.Tensor, comm
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply the boundary to the TP all-gather of bf16 column slices ``local``."""
-        self._ensure_cached_weights(torch.bfloat16)
-        return all_gather_norm_residual(
-            comm,
-            local,
-            stream,
-            self._post_norm.eps,
-            self._pre_norm.eps,
-            post_norm_is_input_scale=self._post_norm_is_input_scale,
-            post_weight=self._cc_post_weight if self._post_norm.has_weight else None,
-            pre_weight=self._cc_pre_weight if self._pre_norm.has_weight else None,
-            alpha=self._cc_alpha if self._use_residual_gate else None,
-            beta=self._cc_beta if self._use_residual_gate else None,
         )

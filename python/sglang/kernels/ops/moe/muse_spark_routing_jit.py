@@ -57,7 +57,7 @@ def _experts_per_lane(num_experts: int) -> int:
     return -(-per_lane // 4) * 4
 
 
-def fused_muse_spark_routing(
+def fused_muse_spark_routing_jit(
     gating_output: torch.Tensor,  # [num_tokens, num_experts] fp32
     bias: torch.Tensor,  # [num_experts] fp32
     topk: int,

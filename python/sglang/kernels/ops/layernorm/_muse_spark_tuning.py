@@ -1,13 +1,13 @@
-"""Hardware- and shape-keyed launch configs for the fused Triton ops.
+"""Hardware- and shape-keyed launch configs for the Muse Spark Triton norm ops.
 
 Mirrors the FlashInfer autotune-config pattern (a JSON per GPU, keyed on shape):
-``autotune_configs/fused_triton_ops/<hardware_key>.json`` holds, per op, an ordered
-list of rules ``{"when": {...}, <launch_param>: <val>, ...}`` (first match wins).
-Each op passes a portable default to :func:`resolve`, used whenever no rule matches.
+``configs/muse_spark/<hardware_key>.json`` next to this module holds, per op, an
+ordered list of rules ``{"when": {...}, <launch_param>: <val>, ...}`` (first match
+wins). Each op passes a portable default to :func:`resolve`, used whenever no
+rule matches (including when no file exists for the GPU).
 
 ``<hardware_key>`` is the normalized device name on CUDA (``NVIDIA_GB300``).
-``when`` keys
-are ``<param>`` (equality) or ``<param>_{lt,le,ge,gt,eq}``.
+``when`` keys are ``<param>`` (equality) or ``<param>_{lt,le,ge,gt,eq}``.
 """
 
 from __future__ import annotations
@@ -20,13 +20,7 @@ from typing import Callable
 
 import torch
 
-# Shares the curated-config tree with the FlashInfer autotune configs in srt/.
-_CONFIG_DIR = (
-    Path(__file__).resolve().parents[3]
-    / "srt"
-    / "autotune_configs"
-    / "fused_triton_ops"
-)
+_CONFIG_DIR = Path(__file__).resolve().parent / "configs" / "muse_spark"
 _METADATA_KEY = "_metadata"
 
 _COMPARATORS = {

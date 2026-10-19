@@ -103,6 +103,48 @@ def _fused_norm_fp4_quant_jit(
     return fp4, sf, pts, normed
 
 
+def _e2m1_codes(x: torch.Tensor) -> torch.Tensor:
+    """Round-to-nearest-even, saturating E2M1 nibble (sign in bit 3) of fp32 ``x``."""
+    ax = x.abs()
+    # Midpoints between 0, .5, 1, 1.5, 2, 3, 4, 6; ties go to the even code.
+    magnitude = (
+        (ax > 0.25).to(torch.uint8)
+        + (ax >= 0.75)
+        + (ax > 1.25)
+        + (ax >= 1.75)
+        + (ax > 2.5)
+        + (ax >= 3.5)
+        + (ax > 5.0)
+    )
+    return magnitude | (torch.signbit(x).to(torch.uint8) << 3)
+
+
+def _nvfp4_quantize_per_token_native(
+    rows: torch.Tensor, global_scale_inv: float
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(fp4, sf, per_token_scale)`` of bf16 ``rows`` [M, K], as the kernel lays them out."""
+    m, hidden_size = rows.shape
+    r = rows.float()
+    amax = r.abs().amax(-1)
+    nonzero = amax != 0
+    per_token_scale = torch.where(nonzero, amax * global_scale_inv, 0.0)
+    encode_scale = torch.where(
+        nonzero, 1.0 / per_token_scale, torch.finfo(torch.float32).max
+    )
+
+    blocks = r.view(m, hidden_size // _BLOCK, _BLOCK)
+    block_max = blocks.abs().amax(-1)
+    scale = encode_scale[:, None] * (block_max * (1.0 / 6.0))
+    sf = scale.clamp(max=torch.finfo(torch.float8_e4m3fn).max).to(torch.float8_e4m3fn)
+    sf_f32 = sf.float()
+    out_scale = torch.where(
+        sf_f32 == 0, 0.0, 1.0 / (sf_f32 * (1.0 / encode_scale[:, None]))
+    )
+    codes = _e2m1_codes(blocks * out_scale[..., None]).view(m, hidden_size)
+    fp4 = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return fp4, sf.view(torch.uint8), per_token_scale
+
+
 class _FusedNormFP4Quant(BaseFusedOp):
     """Backend dispatcher for the Muse Spark fused norm/quant boundary."""
 
@@ -174,7 +216,24 @@ class _FusedNormFP4Quant(BaseFusedOp):
         quantize: bool = True,
         want_normed: bool = False,
     ):
-        raise NotImplementedError("norm_fp4_quant has no device-independent backend")
+        """Torch reference for the JIT kernel's outputs.
+
+        Same formula and rounding points as the kernel, but IEEE reciprocals
+        where it uses ``rcp.approx``, so a value on a rounding boundary can land
+        one fp8/fp4 code apart.
+        """
+        assert quantize or want_normed
+        xf = x.float()
+        normed = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+        if weight is not None:
+            normed = normed * weight.float()
+        normed = normed.to(torch.bfloat16)
+        if not quantize:
+            return None, None, None, normed
+        fp4, sf, per_token_scale = _nvfp4_quantize_per_token_native(
+            normed, global_scale_inv
+        )
+        return fp4, sf, per_token_scale, normed if want_normed else None
 
     def forward_jit(
         self,

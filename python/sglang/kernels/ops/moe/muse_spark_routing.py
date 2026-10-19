@@ -13,6 +13,11 @@ operations in a single pass:
 7. Return results
 
 The kernel is CUDA graph compatible by accepting pre-allocated output buffers.
+
+Not ``moe.moe_fused_gate``: that router has no logit multiplier or EP
+local-expert map, adds the bias before softmax, zeroes padded-row weights, and
+rounds weights as ``score / (sum + eps) * scale`` instead of
+``score * (scale / (sum + eps))``.
 """
 
 from __future__ import annotations
@@ -767,7 +772,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
         """Fused JIT CUDA kernel implementation."""
         assert renormalize, "MuseSpark routing requires renormalize=True"
         from sglang.kernels.ops.moe.muse_spark_routing_jit import (
-            fused_muse_spark_routing as _jit_fused_muse_spark_routing,
+            fused_muse_spark_routing_jit,
         )
 
         # See forward_triton: the SoL buffer is written by the router itself.
@@ -782,7 +787,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
             if want_packed
             else None
         )
-        topk_weights, topk_ids, packed = _jit_fused_muse_spark_routing(
+        topk_weights, topk_ids, packed = fused_muse_spark_routing_jit(
             gating,
             self.expert_bias,
             topk,

@@ -24,6 +24,7 @@ from sglang.kernels.ops.communication.muse_spark_all_gather import (
     gemm_ag_supported,
 )
 from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
+    all_gather_norm_residual,
     all_gather_norm_residual_supported,
 )
 from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
@@ -176,6 +177,22 @@ def _use_split_bf16_router(num_tokens: int) -> bool:
     if num_tokens <= ROUTER_GEMM_MAX_TOKENS or not _split_bf16_router_supported():
         return False
     return True
+
+
+def _fused_norm_boundary(
+    post_norm: nn.Module, residual_add: nn.Module, pre_norm: nn.Module
+) -> FusedPostNormResidualPreNorm:
+    return FusedPostNormResidualPreNorm(
+        post_norm,
+        residual_add,
+        pre_norm,
+        post_norm_is_input_scale=isinstance(
+            post_norm, MuseSpark1xRMSNormWithInputScale
+        ),
+        use_residual_gate=isinstance(
+            residual_add, MuseSpark1xNormPreservingResidualConnection
+        ),
+    )
 
 
 class MuseSpark1xRouter(nn.Module):
@@ -944,7 +961,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # Each boundary -- post-norm, residual add, next pre-norm -- is one fused
         # kernel. The FFN boundary's pre-norm belongs to the next layer, so the
         # model binds it in bind_next_pre_attn_norm once every layer exists.
-        self._fused_attn_boundary = FusedPostNormResidualPreNorm(
+        self._fused_attn_boundary = _fused_norm_boundary(
             self.post_attn_norm,
             self.post_attention_residual_gate,
             self.pre_feedforward_layernorm,
@@ -956,7 +973,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         return config.mlp_layer_types[layer_idx] == "sparse"
 
     def bind_next_pre_attn_norm(self, next_pre_attn_norm: MuseSpark1xRMSNorm) -> None:
-        self._fused_ffn_boundary = FusedPostNormResidualPreNorm(
+        self._fused_ffn_boundary = _fused_norm_boundary(
             self.post_feedforward_layernorm,
             self.post_feedforward_residual_gate,
             next_pre_attn_norm,
@@ -992,8 +1009,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             ffn_output = self.mlp(ffn_input)
         # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
         if ffn_output.shape[-1] != stream.shape[-1]:
-            next_attn_input, stream = self._fused_ffn_boundary.forward_with_ag(
-                stream, ffn_output, get_parallel().tp_group.ca_comm
+            next_attn_input, stream = all_gather_norm_residual(
+                get_parallel().tp_group.ca_comm,
+                ffn_output,
+                stream,
+                **self._fused_ffn_boundary.jit_kernel_kwargs(),
             )
             return stream, next_attn_input
         if self._fused_ffn_boundary is None:
