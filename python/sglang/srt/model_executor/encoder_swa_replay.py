@@ -12,7 +12,6 @@ class FoldedExtend(msgspec.Struct, frozen=True):
     keep_rows: torch.Tensor  # [original rows] int64, folded-row index of each
     scheduled_row: torch.Tensor  # [folded rows] int64, original row, -1 if replayed
     row_floor: torch.Tensor  # [folded rows] int64
-    compress_skip: torch.Tensor  # [bs] int32, leading replay rows per request
     replay_lens: list[int]  # [bs] leading replay rows per request
     num_rows: int
 
@@ -29,20 +28,43 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def resets_swa_window(req) -> bool:
+    """Whether this step starts the request's SWA window: a new request slot or a
+    retraction. The prefill budget and `encoder_swa_reset` both read this."""
+    return req.kv.req_pool_idx is None or req.is_retracted
+
+
+def replay_len(prefix_len: int) -> int:
+    """Cached tokens replayed in front of a hit's extend: the last SWA window.
+    The prefill budget, the MLP-sync row count and the fold all read this."""
+    return min(prefix_len, 128)
+
+
+def folded_replay_rows(batch) -> int:
+    if not batch.forward_mode.is_extend_without_speculative():
+        return 0
+    return sum(
+        replay_len(end)
+        for reset, end in zip(batch.encoder_swa_reset, batch.prefix_lens)
+        if reset
+    )
+
+
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_row_floor = folded.row_floor
-    forward_batch.encoder_swa_compress_skip = folded.compress_skip
     forward_batch.encoder_swa_compress_rows = folded.keep_rows
 
 
-def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
+def drop_folded_rows(
+    *, logits_output, folded: FoldedExtend, tail_lens: Optional[list[int]] = None
+) -> None:
     """Hand downstream consumers (the DSpark draft) only the original extend rows."""
     hidden = logits_output.hidden_states
     token_indices = logits_output.hidden_states_token_indices
     if token_indices is not None:
         # Decoder-SWA tail rows index the folded extend; keep those on original rows.
         keep = _tail_rows_on_original(
-            folded=folded, num_tail_rows=token_indices.shape[0]
+            folded=folded, tail_lens=tail_lens, num_tail_rows=token_indices.shape[0]
         ).to(token_indices.device, non_blocking=True)
         logits_output.hidden_states_token_indices = folded.scheduled_row[
             token_indices[keep]
@@ -54,13 +76,11 @@ def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
         logits_output.hidden_states = hidden[folded.keep_rows]
 
 
-def _tail_rows_on_original(*, folded: FoldedExtend, num_tail_rows: int):
-    # Each request's tail is its last SWA_WINDOW folded rows; replay rows lead it.
-    from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
-
+def _tail_rows_on_original(
+    *, folded: FoldedExtend, tail_lens: list[int], num_tail_rows: int
+):
     keep, off = [], 0
-    for n, r in zip(folded.batch.extend_lens, folded.replay_lens):
-        tail = min(SWA_WINDOW, n)
+    for n, r, tail in zip(folded.batch.extend_lens, folded.replay_lens, tail_lens):
         keep.append(torch.arange(off + max(0, tail - (n - r)), off + tail))
         off += tail
     assert off == num_tail_rows, (off, num_tail_rows)
@@ -106,7 +126,7 @@ def _reset_windows_and_collect_hits(*, batch, window):
             raise ValueError(
                 "encoder SWA replay requires an even cached-prefix boundary"
             )
-        rows.append((i, max(0, end - 128), end))
+        rows.append((i, end - replay_len(end), end))
     return rows
 
 
@@ -165,8 +185,8 @@ def _engram_history(*, reqs, starts, runner):
     n = hasher.max_ngram_size - 1
     hist = []
     for r, s in zip(reqs, starts):
-        ids = list(r.full_untruncated_fill_ids[max(0, s - n) : s])
-        hist.append([0] * (n - len(ids)) + ids)
+        ids = r.full_untruncated_fill_ids[max(0, s - n) : s]
+        hist.append(hasher.history_row(ids))
     return torch.tensor(hist, dtype=torch.int32, device=runner.device)
 
 
@@ -216,7 +236,6 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         folded.engram_history = _engram_history(
             reqs=batch.reqs, starts=pre, runner=runner
         )
-    _set_execution_counts(batch=folded, scheduled=batch)
     floor = torch.tensor(
         [p if r else 0 for p, r in zip(pre, replay)], dtype=torch.int64
     )
@@ -231,9 +250,6 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
         keep_rows=keep_rows.to(device, non_blocking=True),
         scheduled_row=scheduled_row.to(device, non_blocking=True),
         row_floor=row_floor.to(device, non_blocking=True),
-        compress_skip=torch.tensor(replay, dtype=torch.int32).to(
-            device, non_blocking=True
-        ),
         replay_lens=replay,
         num_rows=fold_off,
     )
@@ -243,7 +259,7 @@ def _set_execution_counts(*, batch, scheduled) -> None:
     """MLP-sync counts of a batch copied from `scheduled` with different rows."""
     if scheduled.global_num_tokens is None:
         return
-    # The flag rejects attention DP, so the gather holds only this rank's count.
+    # Attention DP is admitted only with the fold, so the gather holds one count.
     if (
         len(scheduled.global_num_tokens) != 1
         or scheduled.global_num_tokens[0] != scheduled.extend_num_tokens
