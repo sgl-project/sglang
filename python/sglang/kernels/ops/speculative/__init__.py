@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
@@ -48,11 +53,6 @@ register_kernel(
             "tree_speculative_sampling_target_only_triton"
         ),
         capabilities=frozenset((CapabilityRequirement.CUDA, CapabilityRequirement.HIP)),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32", "int32", "int64"),
-            in_place=True,
-            description="target-only stochastic tree verification and bonus sampling",
-        ),
     )
 )
 
