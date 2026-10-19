@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_layout,
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
@@ -596,6 +597,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
+        kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
             if self.scheduler.enable_hisparse
