@@ -138,7 +138,7 @@ The default multimodal feature transport is automatic, and on a single CUDA node
 
 ### Render prompts with the Python chat template
 
-The recipes pass `--chat-template glm-5.3-flash`, which renders prompts, including image and video placeholders, with SGLang's built-in Python port of the checkpoint's `chat_template.jinja`; it requires a build that includes [PR #45154](https://github.com/sgl-project/sglang/pull/45154). Prompts are identical token for token, rendering is 4.7–17x faster, and request preprocessing of long agent conversations is up to 1.9x faster. `--reasoning-parser auto` and `--tool-call-parser auto` still resolve to `glm45` and `glm47`. To serve a customized template, pass its path instead (`--chat-template /path/to/chat_template.jinja`).
+The recipes pass `--chat-template glm-5.3-flash`, which renders prompts, including image and video placeholders, with SGLang's built-in Python port of the checkpoint's `chat_template.jinja`; it requires a build that includes [PR #45154](https://github.com/sgl-project/sglang/pull/45154). Prompts are identical token for token, rendering is 4.7–17x faster, and request preprocessing of long agent conversations is up to 1.9x faster. `--reasoning-parser auto` and `--tool-call-parser auto` still resolve to `glm45` and `glm47`. The flag applies to SGLang's default Python HTTP frontend; leave it out with the Rust frontend (`SGLANG_RUST_SERVER=1`), which renders GLM-5.3-Flash from the checkpoint's template on its own and reads `--chat-template` as a file path. To serve a customized template, pass its path instead (`--chat-template /path/to/chat_template.jinja`).
 
 ## 3. Advanced usage
 
