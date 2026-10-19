@@ -52,11 +52,17 @@ def test_qk_norm_matches_native(num_tokens, rope, cache_dtype):
     q, k = op(qkv, *args, kv_store=store, backend=KernelBackend.TRITON)
 
     assert q.dtype == ref_q.dtype and k.dtype == ref_k.dtype
-    torch.testing.assert_close(q.float(), ref_q.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(k.float(), ref_k.float(), rtol=2e-2, atol=2e-2)
+    _assert_close(q, ref_q)
+    _assert_close(k, ref_k)
     if cache_dtype is not None:
         for out, ref in zip(store[:2], ref_store[:2]):
-            torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+            _assert_close(out, ref)
+
+
+def _assert_close(out, ref):
+    # One e4m3 step is 2^-3 relative; Triton and torch may round a tie apart.
+    tol = 0.125 if out.dtype == torch.float8_e4m3fn else 2e-2
+    torch.testing.assert_close(out.float(), ref.float(), rtol=tol, atol=tol)
 
 
 if __name__ == "__main__":
