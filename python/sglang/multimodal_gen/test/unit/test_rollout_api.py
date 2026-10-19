@@ -397,10 +397,12 @@ class TestBuildSamplingKwargs(unittest.TestCase):
             self._make_request(
                 rollout_sde_step_indices=[0, 2],
                 rollout_return_step_indices=[1, 3],
+                rollout_stop_step_index=2,
             )
         )
         self.assertEqual(kwargs["rollout_sde_step_indices"], [0, 2])
         self.assertEqual(kwargs["rollout_return_step_indices"], [1, 3])
+        self.assertEqual(kwargs["rollout_stop_step_index"], 2)
 
     def test_step_index_filters_default_dropped_as_none(self):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (

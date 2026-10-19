@@ -92,6 +92,8 @@ class RolloutRequest(BaseModel):
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None
     rollout_return_step_indices: Optional[list[int]] = None
+    # last denoising step to run; it steps straight to the terminal sigma
+    rollout_stop_step_index: Optional[int] = None
 
     image_path: Optional[list[str]] = None
 
