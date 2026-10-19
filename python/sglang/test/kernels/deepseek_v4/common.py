@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_forward,
 )
 from sglang.srt.utils import get_device
 
@@ -197,3 +198,60 @@ def to_seq_extend(
     extend_lens = torch.tensor([e for _, e in seq_extend_pairs], dtype=torch.int64)
     num_q = int(extend_lens.sum().item())
     return seq_lens, extend_lens, num_q
+
+
+def run_compress_prefill(
+    ctx: LegacyContext | PagedContext,
+    pool: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+) -> torch.Tensor:
+    num_q = int(extend_lens_cpu.sum().item())
+    plan = ctx.make_prefill_plan(seq_lens_cpu, extend_lens_cpu, num_q)
+    return compress_forward(
+        pool,
+        kv_score_input,
+        ape,
+        plan,
+        head_dim=ctx.head_dim,
+        compress_ratio=ctx.compress_ratio,
+    )
+
+
+def run_compress_decode(
+    ctx: LegacyContext | PagedContext,
+    pool: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    seq_lens_gpu: torch.Tensor,
+) -> torch.Tensor:
+    plan = ctx.make_decode_plan(seq_lens_gpu)
+    return compress_forward(
+        pool,
+        kv_score_input,
+        ape,
+        plan,
+        head_dim=ctx.head_dim,
+        compress_ratio=ctx.compress_ratio,
+    )
+
+
+def ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
+    """UE8M0 exponent of ``x`` rounded up, as the FP4 indexer quantizers store it."""
+    bits = x.to(torch.float32).contiguous().view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    exp = exp + (mantissa != 0).to(torch.int32)
+    return exp.clamp(1, 254)
+
+
+def fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
+    """E2M1 nibble of ``x`` (sign in bit 3), saturating at 6.0."""
+    ax = torch.minimum(x.abs(), torch.tensor(6.0, device=x.device))
+    idx = torch.zeros_like(ax, dtype=torch.uint8)
+    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        idx += (ax > threshold).to(torch.uint8)
+    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
+    return idx | sign
