@@ -40,7 +40,7 @@ export const benchmarks = [
     notes: "NEXTN EP4; full 1319-question GSM8K on this exact recipe (1285/1319). bs=1 output 160.0 tok/s (TPOT 5.12 ms). Acceptance length 2.56-2.59.",
   },
   {
-    match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    match: { hw: "mi325x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "rocm724-mi30x nightly 20261011 + ROCm gated-MLA fix",
     accuracy: { gsm8k_pct: 97.27, stop_rate_pct: 99.92 },
     notes: "Measured by AMD on 8x MI325X with a pre-release Ling-3.1-flash checkpoint, not rerun by SGLang on the public one. Full 1319-question GSM8K: 1283 correct, 1318 stops, one 8192-token truncation, zero request errors. AITER e7d2453f.",
