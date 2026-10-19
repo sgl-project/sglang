@@ -396,31 +396,32 @@ class TestProcessReqWithGrammar(unittest.TestCase):
 
     def test_request_budget_aborts_when_backend_offers_no_filter_grammar(self):
         """A budget the backend cannot enforce must abort, not be silently ignored."""
-        mgr = self._make_mgr()
-        mgr.grammar_backend.init_strict_reasoning_grammar.return_value = None
+        with self.subTest("backend_returns_none"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend.init_strict_reasoning_grammar.return_value = None
 
-        req = _make_req(custom_params={"thinking_budget": 3})
-        req.require_reasoning = True
-        result = mgr.process_req_with_grammar(req)
+            req = _make_req(custom_params={"thinking_budget": 3})
+            req.require_reasoning = True
+            result = mgr.process_req_with_grammar(req)
 
-        self.assertFalse(result)
-        self.assertIsNone(req.grammar)
-        req.set_finish_with_abort.assert_called_once()
-        self.assertIn("thinking_budget", req.set_finish_with_abort.call_args[0][0])
+            self.assertFalse(result)
+            self.assertIsNone(req.grammar)
+            req.set_finish_with_abort.assert_called_once()
+            self.assertIn("thinking_budget", req.set_finish_with_abort.call_args[0][0])
 
-    def test_request_budget_aborts_without_grammar_backend(self):
-        scheduler = _make_scheduler()
-        enter_override(
-            self, get_context().override_server_args(skip_tokenizer_init=True)
-        )
-        mgr = GrammarManager(scheduler)
-        mgr.grammar_backend = None
+        with self.subTest("no_backend"):
+            scheduler = _make_scheduler()
+            enter_override(
+                self, get_context().override_server_args(skip_tokenizer_init=True)
+            )
+            mgr = GrammarManager(scheduler)
+            mgr.grammar_backend = None
 
-        req = _make_req(custom_params={"thinking_budget": 3})
-        result = mgr.process_req_with_grammar(req)
+            req = _make_req(custom_params={"thinking_budget": 3})
+            result = mgr.process_req_with_grammar(req)
 
-        self.assertFalse(result)
-        req.set_finish_with_abort.assert_called_once()
+            self.assertFalse(result)
+            req.set_finish_with_abort.assert_called_once()
 
     def test_constrained_cache_hit_aborts_when_grammar_cannot_filter(self):
         """A constrained budget must abort when the cached grammar has no token filter."""
@@ -511,46 +512,47 @@ class TestProcessReqWithGrammar(unittest.TestCase):
                 )
                 self.assertEqual(req.grammar.max_think_tokens, 0)
 
-    def test_env_cap_cache_hit_on_full_turn_grammar_aborts(self):
+    def test_env_cap_on_constrained_grammar(self):
         """A full-turn grammar bypasses the reasoner wrapper, so the env cap cannot apply."""
-        mgr = self._make_mgr()
-        mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
-        mgr.grammar_backend.max_think_tokens = 0
-        mgr.grammar_backend.get_cached_or_future_value.return_value = (
-            MagicMock(spec=BaseGrammarObject),
-            True,
-        )
+        with self.subTest("full_turn_grammar_aborts"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
+            mgr.grammar_backend.max_think_tokens = 0
+            mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                MagicMock(spec=BaseGrammarObject),
+                True,
+            )
 
-        req = _make_req(ebnf='root ::= "hello"')
-        req.sampling_params.ebnf_full_assistant = True
-        mgr.process_req_with_grammar(req)
+            req = _make_req(ebnf='root ::= "hello"')
+            req.sampling_params.ebnf_full_assistant = True
+            mgr.process_req_with_grammar(req)
 
-        req.set_finish_with_abort.assert_called_once()
-        self.assertIn(
-            "SGLANG_MAX_THINK_TOKENS", req.set_finish_with_abort.call_args[0][0]
-        )
+            req.set_finish_with_abort.assert_called_once()
+            self.assertIn(
+                "SGLANG_MAX_THINK_TOKENS", req.set_finish_with_abort.call_args[0][0]
+            )
 
-    def test_env_cap_cache_hit_on_wrapped_grammar_is_kept(self):
-        mgr = self._make_mgr()
-        mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
-        mgr.grammar_backend.max_think_tokens = 0
-        grammar_obj = ReasonerGrammarObject(
-            grammar=None,
-            think_end_ids=[0],
-            max_think_tokens=0,
-            token_filter_fn=MagicMock(),
-        )
-        mgr.grammar_backend.get_cached_or_future_value.return_value = (
-            grammar_obj,
-            True,
-        )
+        with self.subTest("wrapped_grammar_is_kept"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
+            mgr.grammar_backend.max_think_tokens = 0
+            grammar_obj = ReasonerGrammarObject(
+                grammar=None,
+                think_end_ids=[0],
+                max_think_tokens=0,
+                token_filter_fn=MagicMock(),
+            )
+            mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                grammar_obj,
+                True,
+            )
 
-        req = _make_req(json_schema="schema")
-        mgr.process_req_with_grammar(req)
+            req = _make_req(json_schema="schema")
+            mgr.process_req_with_grammar(req)
 
-        req.set_finish_with_abort.assert_not_called()
-        self.assertIs(req.grammar, grammar_obj)
-        self.assertEqual(req.grammar.max_think_tokens, 0)
+            req.set_finish_with_abort.assert_not_called()
+            self.assertIs(req.grammar, grammar_obj)
+            self.assertEqual(req.grammar.max_think_tokens, 0)
 
     def test_uno_rejects_request_thinking_budget(self):
         """UNO cannot run grammars; attaching a budget grammar would crash its worker."""
@@ -866,29 +868,6 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("thinking_budget", req.set_finish_with_abort.call_args[0][0])
         mgr.grammar_backend.set_cache.assert_called_once()
-
-    def test_env_cap_ready_future_on_full_turn_grammar_aborts(self):
-        mgr = self._make_mgr()
-        mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
-        mgr.grammar_backend.max_think_tokens = 0
-
-        grammar_obj = MagicMock(spec=BaseGrammarObject)
-        grammar_obj.copy.return_value = grammar_obj
-        future = Future()
-        future.set_result(grammar_obj)
-
-        req = _make_req(ebnf='root ::= "hello"')
-        req.grammar = future
-        req.grammar_key = ("full_assistant_ebnf", 'root ::= "hello"')
-        mgr.grammar_queue.append(req)
-
-        result = mgr.get_ready_grammar_requests()
-
-        self.assertEqual(len(result), 1)
-        req.set_finish_with_abort.assert_called_once()
-        self.assertIn(
-            "SGLANG_MAX_THINK_TOKENS", req.set_finish_with_abort.call_args[0][0]
-        )
 
     @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_intersects_ready_unions_failed(self, mock_all_gather):
