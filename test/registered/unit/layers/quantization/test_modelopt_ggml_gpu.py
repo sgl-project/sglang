@@ -7,6 +7,12 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    StandardTopKOutputPacked,
+    TopKConfig,
+)
 from sglang.srt.layers.quantization.modelopt_ggml import (
     ModelOptGGMLLinearMethod,
     ModelOptGGMLMoEMethod,
@@ -99,6 +105,11 @@ class TestModelOptGGMLGPU(CustomTestCase):
                             tokens, 2, dtype=torch.float32, device="cuda"
                         )
                         weights = weights / weights.sum(-1, keepdim=True) * 1.7
+                        if tokens == 65:
+                            router_logits = torch.randn(tokens, 4, device="cuda")
+                            weights, ids = router_logits.softmax(-1).topk(2, dim=-1)
+                            weights = weights / weights.sum(-1, keepdim=True)
+                            ids = ids.int()
                         first = torch.einsum(
                             "tkoh,th->tko", dense1[ids.long()], x.float()
                         ).to(x.dtype)
@@ -111,8 +122,18 @@ class TestModelOptGGMLGPU(CustomTestCase):
                             "tkhi,tki->tkh", dense2[ids.long()], intermediate.float()
                         ).to(x.dtype)
                         expected = (per_expert * weights.unsqueeze(-1)).sum(1)
+                        topk_output = (
+                            StandardTopKOutputPacked(weights, ids, None, ids)
+                            if tokens == 7
+                            else StandardTopKOutput(weights, ids, None)
+                        )
+                        if tokens == 65:
+                            layer.layer_id = 0
+                            topk_output = BypassedTopKOutput(
+                                x, router_logits, TopKConfig(top_k=2, torch_native=True)
+                            )
                         dispatch = SimpleNamespace(
-                            hidden_states=x, topk_output=(weights, ids, None)
+                            hidden_states=x, topk_output=topk_output
                         )
                         self.assert_relative_error(
                             method.apply(layer, dispatch).hidden_states, expected

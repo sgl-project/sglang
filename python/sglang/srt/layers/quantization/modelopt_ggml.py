@@ -259,14 +259,19 @@ class ModelOptGGMLMoEMethod(FusedMoEMethodBase):
         self, layer: FusedMoE, dispatch_output: StandardDispatchOutput
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import BypassedTopKOutput
         from sglang.srt.layers.quantization.gguf import fused_moe_gguf
 
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        topk_output = dispatch_output.topk_output
+        if isinstance(topk_output, BypassedTopKOutput):
+            topk_output = topk_output.to_standard(layer_id=layer.layer_id)
+        # GGUF kernels read expert IDs as int32.
+        topk_ids = topk_output.topk_ids.to(torch.int32)
         output = fused_moe_gguf(
             x=dispatch_output.hidden_states,
             w1=layer.w13_weight.flatten(-2),
             w2=layer.w2_weight.flatten(-2),
-            topk_weights=topk_weights,
+            topk_weights=topk_output.topk_weights,
             topk_ids=topk_ids,
             qweight_type=self.quant_type,
             qweight_type2=self.quant_type,
