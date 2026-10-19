@@ -1,11 +1,6 @@
-"""DeepSeek-V4.1's decoder-replay tail layers, run from CUDA graphs on eager steps.
-
-Under decoder SWA bounded replay the layers from ``late_layer_start`` on run over
-each request's last SWA_WINDOW extend rows. An eager prefill step replays them
-from a `RowBucketGraphRunner` graph of the tail's row bucket (a multiple of
-SWA_WINDOW) instead of launching each kernel from the host. Inside the graph the
-SWA KV store, the attention and the low-ratio sources are eager breaks that read
-the step's live tail metadata and its real row count.
+"""DeepSeek-V4.1's decoder-replay tail layers (``late_layer_start`` on), replayed
+from `RowBucketGraphRunner` graphs on eager prefill steps. The SWA KV store, the
+attention and the low-ratio sources stay eager breaks of those graphs.
 """
 
 from __future__ import annotations
@@ -85,10 +80,9 @@ bcg_tail_kv_store = eager_on_graph(True)(_tail_kv_store)
 
 
 def _flatten_state(state: HcState):
-    """The state's row tensors, a key for their structure, and the inverse. A
-    normed input and the mix stats are dropped, as `HcState.take_rows` drops a
-    quantized input: the first tail layer rebuilds them, so every step keys the
-    same graphs whatever the previous post left behind."""
+    """The state's row tensors, whether ``pre`` is among them, and the inverse.
+    The normed input and mix stats are dropped (the first tail layer rebuilds
+    them), so every step keys the same graphs."""
     assert isinstance(state.streams, torch.Tensor), "tail graphs are CUDA only"
     has_pre = state.pre is not None
     leaves = [state.streams, state.pre] if has_pre else [state.streams]
@@ -100,9 +94,6 @@ def _flatten_state(state: HcState):
 
 
 class DecoderReplayTail:
-    """The decoder-replay tail layers of one DeepSeek-V4.1 model, run from
-    `RowBucketGraphRunner` graphs on eager prefill steps."""
-
     def __init__(
         self,
         *,
@@ -120,8 +111,6 @@ class DecoderReplayTail:
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
-        """The tail graphs of a model whose tail writes the source layer's KV, or
-        None where they stay off."""
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
         if not (
             model.tail_writes_source_kv
@@ -143,9 +132,8 @@ class DecoderReplayTail:
     def plan(
         self, tail: LateLayerTail, *, num_tokens: int, tail_in_graph: bool
     ) -> bool:
-        """Whether this step runs its tail layers from a graph. Every extend step
-        with a tail reports its token count to the warm gate here; prefill-graph
-        steps keep the tail in their own graph."""
+        """Whether this step runs its tail layers from a graph; also reports the
+        step's token count to the warm gate."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
@@ -172,9 +160,8 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         capture_dspark: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """Run the tail layers on the tail rows. Returns the materialized residual
-        and pre of those rows and the DSpark auxiliary states, all views of graph
-        buffers that stay valid until the next replay."""
+        """Returns the tail rows' materialized residual and pre and the DSpark
+        auxiliary states, as views of graph buffers valid until the next replay."""
         leaves, has_pre, rebuild = _flatten_state(state)
         num_state = len(leaves)
 
@@ -228,8 +215,7 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         capture_dspark: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """The tail layers on the static rows: the graphs' body, the same stages
-        as the model loop past the tail switch."""
+        """The graphs' body; mirrors the model loop past the tail switch."""
         model = self._model
         aux: List[torch.Tensor] = []
         residual_batch.start(forward_batch)

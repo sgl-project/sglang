@@ -1,14 +1,8 @@
-"""Breakable CUDA graphs of a layer range that runs over a varying row count.
+"""Breakable CUDA graphs of a layer range that runs over a varying number of rows,
+one graph per row bucket (a multiple of ``row_step``).
 
-A model can run some of its layers over a subset of a step's rows whose size
-changes every step. On an eager step those rows still pay one host launch per
-kernel, so the range replays a breakable graph captured for the row bucket (a
-multiple of ``row_step``) instead. Every bucket reads static row buffers sized
-once for the largest bucket and shared by all of them. A bucket is captured on
-its first use, on every TP rank in the same step, largest first, into the global
-graph pool on the global capture stream, so it reuses memory the other graphs
-already hold. Ops that read per-step state (KV slots, attention metadata) must
-be eager breaks of the body; they read the step's real row count from
+Ops of the body that read per-step state (KV slots, attention metadata) must be
+eager breaks; they read the step's real row count from
 ``forward_batch.global_num_token_non_padded_cpu``.
 """
 
@@ -43,8 +37,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The layer range's body: the static row inputs and the batch it runs on in, its
-# outputs (row tensors, or None) out.
 Body = Callable[[List[torch.Tensor], "ForwardBatch"], List[Optional[torch.Tensor]]]
 
 
@@ -56,16 +48,11 @@ class _Graph:
         # MoE top-k masks rows at or past this count; captured by address.
         self.num_token_non_padded = num_token_non_padded
         self.outputs = outputs
-        # The capture step's batch and attention metadata: kernels write
-        # buffers cached on them, so the graph keeps them alive.
+        # Kernels write buffers cached on the capture batch and attention metadata.
         self.batch = batch
 
 
 class RowBucketGraphRunner:
-    """Breakable CUDA graphs of a layer range, keyed by padded row count; the
-    static input buffers are sized once for the largest bucket and shared by
-    every bucket."""
-
     def __init__(self, *, row_step: int, max_rows: int, label: str) -> None:
         self.row_step = row_step
         self.max_rows = max_rows - max_rows % row_step
@@ -78,10 +65,9 @@ class RowBucketGraphRunner:
 
     def ready(self, num_tokens: int) -> bool:
         """Whether graphs may run from this step on; every extend forward reports
-        its token count here. Some kernels size cached workspaces lazily by row
-        count and reallocate them when a bigger step comes, which would leave an
-        earlier capture reading freed memory; a forward of a full prefill chunk
-        (the prefill graphs' own capture warmups included) has grown them all."""
+        its token count here. Kernels that size cached workspaces lazily by row
+        count reallocate them on a bigger step, which would leave earlier captures
+        reading freed memory; a full prefill chunk has grown them all."""
         if not self._warm:
             chunk = get_schedule().chunked_prefill_size
             self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
@@ -105,12 +91,11 @@ class RowBucketGraphRunner:
         body: Body,
         context: Callable[[ForwardBatch], ContextManager],
     ) -> List[Optional[torch.Tensor]]:
-        """Run ``body`` on the ``live`` rows from the graph of their bucket,
-        capturing it first if needed. ``key`` names everything besides the row
-        count and the inputs' shapes that changes what ``body`` records. Returns
-        the body's outputs cut to the live rows: views of graph buffers that stay
-        valid until the next replay. ``context`` is entered around capture and
-        replay with the batch the eager breaks read."""
+        """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
+        it on first use. ``key`` names whatever besides row count and input shapes
+        changes what ``body`` records; ``context`` wraps capture and replay with
+        the batch the eager breaks read. Returns the outputs cut to the live
+        rows, as views of graph buffers valid until the next replay."""
         num_rows = live[0].shape[0]
         rows = self.bucket_rows(num_rows)
         assert rows is not None, num_rows
