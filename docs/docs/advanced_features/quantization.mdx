@@ -317,7 +317,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), **NVFP
 
 On SM80-SM90, `auto` selects Marlin for NVFP4. The FlashInfer NVFP4 backends require FlashInfer to be installed.
 
-On ROCm, `auto` selects `triton`. `aiter` is opt-in because it accepts only the pre-quantized `(x_fp4, x_scales)` input; the fused-epilogue projections used by some models (for example DeepSeek MLA attention) raise an error under it. Layers with N <= 128 stay on Triton under `aiter`. The deprecated `SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1` is still honored as `--fp4-gemm-backend aiter` when the flag is left at `auto`.
+On ROCm gfx95, `auto` picks per Quark MXFP4 layer: `aiter` when AITER's tuned a4w4 GEMM CSV (`AITER_CONFIG_GEMM_A4W4`, or AITER's bundled tables) has a row for the layer's (N, K) on this GPU, `triton` otherwise. On other ROCm GPUs, `auto` selects `triton`. `aiter` uses the AITER GEMM for every eligible layer, tuned or not. Under both, projections that receive the fused-epilogue inputs (for example DeepSeek MLA `kv_b_proj`) and layers with N <= 128 stay on Triton. The deprecated `SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1` is still honored as `--fp4-gemm-backend aiter` when the flag is left at `auto`.
 
 ## Offline Quantization
 

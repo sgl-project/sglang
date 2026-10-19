@@ -196,9 +196,9 @@ def resolve_rocm_fp4_gemm_backend(
             return "aiter" if legacy_use_aiter_asm and is_gfx95 else "triton"
 
     if backend == "auto":
-        # AITER stays opt-in: its preshuffled weights cannot serve the Quark
-        # tuple-input fusion paths (e.g. DeepSeek MLA projections) yet.
-        return "triton"
+        # On gfx95, auto stays unresolved: each Quark MXFP4 layer then uses the
+        # AITER GEMM if AITER's a4w4 tuned CSV covers its shape, else Triton.
+        return "auto" if is_gfx95 else "triton"
     if backend == "aiter" and not is_gfx95:
         raise ValueError(
             "--fp4-gemm-backend=aiter requires an AMD gfx95 GPU (MI350/MI355). "
