@@ -420,6 +420,8 @@ class TestAttnBankSpMoeStages(CustomTestCase):
         residual = torch.randn(4, HIDDEN, generator=torch.Generator().manual_seed(9))
 
         class Update:
+            bind = None
+            replay_update = None
             is_plain_add = True
 
             def slice_residual_attn_tp(self, residual):

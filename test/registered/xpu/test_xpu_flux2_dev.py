@@ -51,14 +51,15 @@ XPU_FLUX2_CASES = [
                 "--text-encoder-precisions",
                 "bf16",
             ],
+            # The xpu_b60.json baseline for this case records device time.
+            env_vars={"SGLANG_DIFFUSION_SYNC_STAGE_PROFILING": "1"},
         ),
         DiffusionSamplingParams(
             prompt="A curious raccoon in a top hat, oil painting",
             output_size="1024x1024",
         ),
-        # XPU has no perf/consistency baseline in
-        # multimodal_gen/test/server/perf_baselines/. CLIP-score guard below
-        # is the accuracy check; skip the CUDA-only latency/consistency ones.
+        # Only the e2e/load guards use the xpu_b60.json baseline; the
+        # CLIP-score guard below is the accuracy check.
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
