@@ -46,12 +46,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
-from sglang.srt.utils.common import (
-    add_prometheus_middleware,
+from sglang.srt.observability.http_request_metrics import (
     add_prometheus_track_response_middleware,
     init_http_request_metrics,
 )
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.common import add_prometheus_middleware
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 

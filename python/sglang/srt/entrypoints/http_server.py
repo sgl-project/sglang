@@ -169,6 +169,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.http_request_metrics import (
+    add_prometheus_track_response_middleware,
+    init_http_request_metrics,
+)
 from sglang.srt.observability.trace import (
     fastapi_telemetry_disabled_kwargs,
     process_tracing_init,
@@ -181,12 +185,10 @@ from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
     build_server_info,
     delete_directory,
     freeze_gc,
     get_bool_env_var,
-    init_http_request_metrics,
     is_mps,
     kill_process_tree,
     set_uvicorn_logging_configs,

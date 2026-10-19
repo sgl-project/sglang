@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 import sglang.srt.entrypoints.http_server as http_server
-from sglang.srt.utils import common
+from sglang.srt.observability import http_request_metrics
 from sglang.test.test_utils import CustomTestCase
 
 UNKNOWN_PATH = "/__no_such_route__"
@@ -38,7 +38,7 @@ class TestHttpRequestMetrics(CustomTestCase):
         self.assertEqual("False", result.stdout.strip(), result.stderr[-2000:])
 
     def test_records_requests(self):
-        common.init_http_request_metrics()
+        http_request_metrics.init_http_request_metrics()
         TestClient(http_server.app).get(UNKNOWN_PATH)
 
         self.assertEqual(
