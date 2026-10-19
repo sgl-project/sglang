@@ -210,9 +210,10 @@ def fast_prefill_plan(
     kv_lens_host: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
+    uniform_verify_width: Optional[int] = None,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
-    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
@@ -258,6 +259,30 @@ def fast_prefill_plan(
         paged_kv_indices,
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
+
+    if custom_mask is not None:
+        # EAGLE's mask remains data-dependent: pack every actual tree-mask
+        # bit, including rejected branches. Only its row lengths are known
+        # on the host, so no device scalar read is needed for allocation.
+        assert uniform_verify_width is not None and page_size == 1
+        from sglang.kernels.ops.speculative.pack_verify_mask import (
+            pack_verify_mask_into,
+        )
+
+        packed_lengths = (kv_lens_host * uniform_verify_width + 7) // 8
+        packed_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
+        packed_indptr[1:] = torch.cumsum(packed_lengths, dim=0)
+        assert int(packed_indptr[-1]) <= self._custom_mask_buf.numel()
+        self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
+        pack_verify_mask_into(
+            custom_mask,
+            paged_kv_indptr,
+            self._mask_indptr_buf,
+            self._custom_mask_buf,
+            batch_size=batch_size,
+            query_width=uniform_verify_width,
+            max_kv_len=max_kv_len,
+        )
 
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
@@ -855,9 +880,24 @@ class FlashInferAttnBackend(AttentionBackend):
             # call_begin_forward therefore applies verbatim; installing the
             # sync-free plan removes three blocking .to("cpu") reads per
             # replay that otherwise stall the CPU behind the in-flight graph.
-            # EAGLE target-verify keeps the plain plan(): its spec input is
-            # not DFLASH_VERIFY, and this branch keys off the capture-time
-            # spec_info of these per-bs wrappers.
+            # EAGLE uses the separate opt-in branch below because it must
+            # also pack its actual tree mask on every replay.
+            for w in self.prefill_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
+
+        if (
+            in_capture
+            and envs.SGLANG_FLASHINFER_VERIFY_HOST_PLAN.get()
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            and spec_info.topk == 1
+            and seq_lens_cpu is not None
+            and self.prefill_backend == "fa2"
+            and self.dispatch_reason is None
+            and self.flashinfer_kv_cache_dtype
+            in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
+        ):
             for w in self.prefill_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
@@ -2289,6 +2329,21 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        # A cuda-graph wrapper built with custom_mask_buf always runs MaskMode.CUSTOM,
+        # but plan(custom_mask=None) skips refilling that buffer, so the kernel would
+        # silently read stale capture-time mask bits.
+        if (
+            spec_info is not None
+            and use_custom_mask is None
+            and wrapper_paged.is_cuda_graph_enabled
+            and wrapper_paged._custom_mask_buf is not None
+        ):
+            raise RuntimeError(
+                f"{spec_info.spec_input_type} verify planned without a custom mask on "
+                "a cuda-graph wrapper captured with one; capture and replay must agree "
+                "on custom_mask."
+            )
+
         # fast_prefill_plan (installed at capture) is sync-free: it needs the
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.
@@ -2307,10 +2362,13 @@ class FlashInferIndicesUpdaterPrefill:
             assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
                 f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             )
-            assert use_custom_mask is None, (
-                "fast_prefill_plan does not support custom_mask; keep the plain plan()"
-            )
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            eagle_verify = spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            assert use_custom_mask is None or eagle_verify
+            if eagle_verify:
+                # EAGLE carries the committed prefix length; its generated KV
+                # layout includes the complete candidate window after it.
+                seq_lens_cpu_i32 = seq_lens_cpu_i32 + num_tokens_per_req
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2327,6 +2385,8 @@ class FlashInferIndicesUpdaterPrefill:
                 max_q_len=num_tokens_per_req,
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
+            if eagle_verify:
+                paged_plan_kwargs["uniform_verify_width"] = num_tokens_per_req
 
         if window_left >= 0:
             # selects the module with the per-element window mask compiled in
@@ -2352,6 +2412,30 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
+
+
+def _build_draft_indptr_host(
+    seq_lens_cpu: torch.Tensor, topk: int, num_steps: int
+) -> torch.Tensor:
+    """Mirror the draft kernel's prefix sums from resolved host lengths.
+
+    At draft entry, positions repeat each committed sequence length ``topk``
+    times. Step i adds i+1 tokens per branch. This also covers the graph
+    runner's padded rows, whose CPU lengths have already been filled.
+    """
+    assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
+    offsets = [0]
+    for length in seq_lens_cpu.tolist():
+        for _ in range(topk):
+            offsets.append(offsets[-1] + length)
+    return torch.tensor(
+        [
+            [offset + branch * (step + 1) for branch, offset in enumerate(offsets)]
+            for step in range(num_steps)
+        ],
+        dtype=torch.int32,
+        device="cpu",
+    )
 
 
 class FlashInferMultiStepDraftBackend:
@@ -2432,8 +2516,23 @@ class FlashInferMultiStepDraftBackend:
             req_pool_indices=forward_batch.req_pool_indices,
             bs=num_seqs,
         )
+        host_lengths = forward_batch.seq_lens_cpu
+        use_host_indptr = (
+            envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            and self.draft_window_size == 0
+            and host_lengths is not None
+            and host_lengths.device.type == "cpu"
+            and host_lengths.numel() == num_seqs
+        )
+        # The existing token-block kernel copies every index, but distributes
+        # long contexts across CTAs instead of serially walking them in 3 CTAs.
+        num_blocks = (
+            min(32, max(1, (max(host_lengths.tolist(), default=0) + 511) // 512))
+            if use_host_indptr
+            else 1
+        )
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
+            (self.speculative_num_steps * num_blocks, num_seqs, self.topk)
         ](
             src.row_ids,
             src.ids,
@@ -2453,24 +2552,33 @@ class FlashInferMultiStepDraftBackend:
             ENTRY_PAGE_SIZE=src.entry_page_size,
             v2p=src.v2p,
             TRANSLATE=src.v2p is not None,
+            NUM_STEPS=self.speculative_num_steps if use_host_indptr else 0,
         )
 
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
+        # resolve_seq_lens_cpu already supplies the committed lengths after
+        # acceptance/rollback. Do not drain the GPU queue to read them again.
+        indptr_cpu_whole = (
+            _build_draft_indptr_host(
+                host_lengths, self.topk, self.speculative_num_steps
+            )
+            if use_host_indptr
+            else self.kv_indptr[:, : bs + 1].cpu()
+        )
         global global_override_indptr_cpu
-
-        for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
-            ]
-            global_override_indptr_cpu = indptr_cpu_whole[i]
-            call_fn(i, forward_batch)
-
-        global_override_indptr_cpu = None
+        previous_override = global_override_indptr_cpu
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+                forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                    : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
+                ]
+                global_override_indptr_cpu = indptr_cpu_whole[i]
+                call_fn(i, forward_batch)
+        finally:
+            global_override_indptr_cpu = previous_override
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(

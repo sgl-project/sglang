@@ -36,8 +36,6 @@ State management:
   - single state_ready_mbar after both passes (TMEM no-overlap constraint)
 """
 
-import os
-import sys
 import warnings
 
 import cutlass.cutlass_dsl as _dsl_mod
@@ -62,54 +60,11 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import Field, OperandMajorMode, OperandSource
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Int32, T
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# GDN tile scheduler: import from the public FlashInfer release
-# (`pip install flashinfer-python>=0.6.13`). Fall back to a local
-# dynamic-kernel-generator checkout only if FlashInfer is unavailable.
-try:
-    from flashinfer.gdn_kernels.blackwell.gated_delta_net_tile_scheduler import (
-        GDNTileScheduler,
-        GDNTileSchedulerParams,
-    )
-except ImportError:
-    # Try multiple locations for GDNTileScheduler (workspace layout vs kda_optimized layout)
-    _GDN_PATHS = [
-        # workspace/flash-linear-attention/prefill -> ../../../dynamic-kernel-generator
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            "..",
-            "..",
-            "dynamic-kernel-generator",
-            "cutlass_ir",
-            "compiler",
-            "python",
-            "examples",
-            "blackwell",
-            "gated_delta_net",
-        ),
-        # scripts/kda_optimized -> ../../dynamic-kernel-generator
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            "..",
-            "dynamic-kernel-generator",
-            "cutlass_ir",
-            "compiler",
-            "python",
-            "examples",
-            "blackwell",
-            "gated_delta_net",
-        ),
-    ]
-    for _p in _GDN_PATHS:
-        if os.path.isdir(_p):
-            sys.path.insert(0, _p)
-            break
-    from gated_delta_net_tile_scheduler import GDNTileSchedulerParams, GDNTileScheduler
-
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
+from flashinfer.gdn_kernels.blackwell.gated_delta_net_tile_scheduler import (
+    GDNTileScheduler,
+    GDNTileSchedulerParams,
+)
 
 
 def transform_partitioned_tensor_layout(tensor):
