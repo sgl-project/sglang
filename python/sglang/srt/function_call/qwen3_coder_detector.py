@@ -390,6 +390,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 4. Function End: </function>
             # -------------------------------------------------------
             if current_slice.startswith(self.function_end_token):
+                if self.current_func_name is None:
+                    # Stray closing tag (no function is open, e.g. a repeated
+                    # `</function>` after `</tool_call>`): consume it without
+                    # emitting another `}` into the finished call's arguments.
+                    self.parsed_pos += len(self.function_end_token)
+                    continue
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
