@@ -29,6 +29,7 @@ from sglang.srt.configs.moe_model_registry import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.layers.moe.utils import AscendOpsConfig
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -296,6 +297,36 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
+    ascend_ops_config = cfg.ascend_ops_config
+    if ascend_ops_config is not None and a2a_backend != "ascend_ops":
+        raise ValueError(
+            "--ascend-ops-config requires --moe-a2a-backend ascend_ops; "
+            f"got {a2a_backend!r}."
+        )
+    if a2a_backend == "ascend_ops":
+        if not get_platform().is_npu:
+            raise ValueError(
+                "--moe-a2a-backend ascend_ops is only supported on NPU."
+            )
+        try:
+            parsed_ascend_ops_config = AscendOpsConfig.from_json_str(
+                ascend_ops_config
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid --ascend-ops-config for moe-a2a-backend=ascend_ops: "
+                f"{exc}"
+            ) from exc
+        if cfg.enable_waterfill:
+            raise ValueError(
+                "--enable-waterfill is incompatible with "
+                "--moe-a2a-backend ascend_ops."
+            )
+        logger.info(
+            "ascend_ops MoE backend enabled with prefill=%s, decode=%s.",
+            parsed_ascend_ops_config.prefill,
+            parsed_ascend_ops_config.decode,
+        )
     if cfg.enable_waterfill:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True

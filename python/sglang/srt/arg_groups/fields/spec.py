@@ -193,6 +193,7 @@ class Spec(msgspec.Struct):
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "ascend_ops",
             ],
             resolvable=True,
         ),
