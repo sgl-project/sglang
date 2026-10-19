@@ -31,6 +31,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.dsv4.fp8_wo_a import (
+    sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope,
+)
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
@@ -1354,6 +1357,15 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+        )
+        self.use_fused_rope_quant = (
+            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
+            and self.wo_a_fp8
+            and _FP8_WO_A_UE8M0
+            and not _is_npu
+            and not _is_hip
+            and self.qk_rope_head_dim == 64
+            and self.head_dim == 512
         )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -2740,6 +2752,14 @@ class MQALayer(MqaAttentionBase):
                 self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
+            fuse_rope_quant = (
+                self.use_fused_rope_quant
+                and not is_in_breakable_cuda_graph()
+                and inv_rope is None
+                and o.shape[-1] == 512
+                and o.dtype == torch.bfloat16
+            )
+
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
                     forward_batch, positions, o.dtype, inverse=True
@@ -2751,7 +2771,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif inv_rope is None and not fuse_rope_wo_a:
+            elif inv_rope is None and not fuse_rope_wo_a and not fuse_rope_quant:
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
@@ -2805,7 +2825,14 @@ class MQALayer(MqaAttentionBase):
                 if _FP8_WO_A_UE8M0:
                     # Blackwell (including SM120): UE8M0 scales via the dedicated
                     # JIT kernel.
-                    o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                    if fuse_rope_quant:
+                        o_fp8, o_s = (
+                            sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+                                o, self.freqs_cis, positions
+                            )
+                        )
+                    else:
+                        o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                     recipe = (1, 1, 128)
                 else:
                     # sm90 (Hopper): fp32 scales.
