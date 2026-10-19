@@ -756,6 +756,8 @@ Pending update...
 
 ### 3.6 Agentic Long-Context with HiCache DRAM Offload (MI355X FP4, DSpark)
 
+These commands target current SGLang main, where the unified radix tree is the default and does not require an environment-variable opt-in.
+
 Three commands follow, one per concurrency range. They share the model, parser, attention and DSpark flags, and differ in parallelism, MoE path and host offload:
 
 | | TP8 | TP8 + HiCache | DP8 | DP8 EP8 MegaMoE |
@@ -778,7 +780,6 @@ Four adjustments are not in the commands below. Add them when they apply:
 **TP8, concurrency 1–16:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
@@ -819,7 +820,6 @@ python3 -m sglang.launch_server \
 **DP8 (DP Attention), concurrency 128:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
@@ -869,7 +869,6 @@ python3 -m sglang.launch_server \
 **DP8 EP8 MegaMoE, concurrency 128–384:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
