@@ -37,7 +37,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHostKVCache(CustomTestCase):
@@ -934,6 +934,102 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         self.assertFalse(mirror._is_device_layer_owned(stub, 1))
         # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
         self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
+
+
+class TestDeepSeekV4HostPoolSizePerToken(CustomTestCase):
+    """Verify size_per_token returns per-token bytes for DeepSeek V4 host pools.
+
+    Before the fix, DeepSeekV4PagedHostPool and DeepSeekV4StateHostPool returned
+    item_bytes / state_page_bytes (per-page) instead of per-token, causing
+    load_back_bytes_total and hicache_backup_bytes_total metrics to be inflated
+    by a factor of slot_page_size.
+
+    Test configs use DeepSeek-V4-Pro real values:
+    - 61 layers: 1 SWA (ratio=0) + 30 C4 (ratio=4) + 30 C128 (ratio=128)
+    - V4 layout: bytes_per_token=584, page_align=576
+    - SWA: swa_page_size=128, item_bytes=page_bytes(128)=74880, slot_page_size=128
+    - C4:  native page_size=64, item_bytes=page_bytes(64)=37440, slot_page_size=256
+    - C128: native page_size=2,  item_bytes=page_bytes(2)=1728,   slot_page_size=256
+    """
+
+    @staticmethod
+    def _make_v4_paged_pool(layer_num, item_bytes, slot_page_size):
+        pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        pool.layer_num = layer_num
+        pool.item_bytes = item_bytes
+        pool.slot_page_size = slot_page_size
+        pool.page_size = slot_page_size
+        return pool
+
+    @staticmethod
+    def _make_v4_state_pool(layer_num, state_page_bytes, page_size):
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4StateHostPool
+
+        pool = DeepSeekV4StateHostPool.__new__(DeepSeekV4StateHostPool)
+        pool.layer_num = layer_num
+        pool.state_page_bytes = state_page_bytes
+        pool.page_size = page_size
+        return pool
+
+    def test_swa_size_per_token(self):
+        """SWA pool: 61 layers, item_bytes divisible by slot_page_size."""
+        pool = self._make_v4_paged_pool(
+            layer_num=61, item_bytes=74880, slot_page_size=128
+        )
+        self.assertEqual(pool.get_size_per_token(), 61 * 74880 // 128)
+        # Not equal to item_bytes (the old buggy value)
+        self.assertNotEqual(pool.get_size_per_token(), 74880)
+
+    def test_c4_size_per_token(self):
+        """C4 pool: 30 layers, item_bytes not divisible by slot_page_size.
+
+        page_align=576 is not a multiple of 256, so item_bytes=37440
+        is not divisible by slot_page_size=256 (37440 % 256 = 64).
+        Floor division gives a small undercount; this is acceptable
+        and far better than the old per-page value.
+        """
+        pool = self._make_v4_paged_pool(
+            layer_num=30, item_bytes=37440, slot_page_size=256
+        )
+        self.assertEqual(pool.get_size_per_token(), 30 * 37440 // 256)
+
+    def test_c128_size_per_token(self):
+        """C128 pool: 30 layers, item_bytes=1728, slot_page_size=256."""
+        pool = self._make_v4_paged_pool(
+            layer_num=30, item_bytes=1728, slot_page_size=256
+        )
+        self.assertEqual(pool.get_size_per_token(), 30 * 1728 // 256)
+
+    def test_state_size_per_token(self):
+        """CompressState pool: 30 layers, state_page_bytes, page_size=128."""
+        pool = self._make_v4_state_pool(
+            layer_num=30, state_page_bytes=256, page_size=128
+        )
+        self.assertEqual(pool.get_size_per_token(), 30 * 256 // 128)
+
+    def test_ksize_equals_size(self):
+        """V4 packs K+V together, so get_ksize_per_token == get_size_per_token."""
+        pool = self._make_v4_paged_pool(
+            layer_num=61, item_bytes=74880, slot_page_size=128
+        )
+        self.assertEqual(
+            pool.get_ksize_per_token(), pool.get_size_per_token()
+        )
+
+    def test_transfer_num_bytes_correctness(self):
+        """num_tokens * get_size_per_token() == actual bytes transferred.
+
+        For SWA where item_bytes is divisible by slot_page_size, this is
+        exact. This verifies the formula used by
+        HybridCacheController._transfer_num_bytes.
+        """
+        layer_num, item_bytes, slot_page_size = 61, 74880, 128
+        pool = self._make_v4_paged_pool(layer_num, item_bytes, slot_page_size)
+        num_tokens = 256  # 2 pages
+        num_pages = num_tokens // slot_page_size
+        actual_bytes = num_pages * item_bytes * layer_num
+        reported_bytes = num_tokens * pool.get_size_per_token()
+        self.assertEqual(reported_bytes, actual_bytes)
 
 
 if __name__ == "__main__":
