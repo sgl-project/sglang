@@ -180,6 +180,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_B = None
         self.lora_output_offset = None
         self.has_lora_output_offset = False
+        self._fused_lora_cache: tuple[tuple, torch.Tensor, torch.Tensor] | None = None
 
     @property
     def weight(self):
@@ -275,6 +276,86 @@ class BaseLayerWithLoRA(nn.Module):
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
+
+    @property
+    def lora_active(self) -> bool:
+        """Whether ``forward`` adds anything to the base layer's output."""
+        if self.disable_lora:
+            return False
+        if self.merged:
+            return self.has_lora_output_offset
+        return self.lora_A is not None
+
+    @staticmethod
+    def _interleave_swiglu_rows(t: torch.Tensor) -> torch.Tensor:
+        # [gate | value] rows -> [value_0, gate_0, value_1, gate_1, ...]
+        half = t.shape[0] // 2
+        return torch.stack((t[half:], t[:half]), dim=1).reshape(t.shape)
+
+    def _fused_lora_factors(
+        self, device: torch.device, swiglu_rows: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        lora_A, lora_B = self.lora_A, self.lora_B
+        if isinstance(lora_B, DTensor):
+            lora_A, lora_B = lora_A.to_local(), lora_B.to_local()
+        key = (
+            lora_A.data_ptr(),
+            lora_A._version,
+            lora_B.data_ptr(),
+            lora_B._version,
+            swiglu_rows,
+            device,
+        )
+        cached = self._fused_lora_cache
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        A = self.slice_lora_a_weights(lora_A.to(device))
+        B = self.slice_lora_b_weights(lora_B.to(device))
+        if A.dim() == 3:
+            # Stacked groups: one shrink GEMM, then a block-diagonal expand.
+            A = A.reshape(-1, A.shape[-1])
+            B = torch.block_diag(*B.unbind(0))
+        if swiglu_rows:
+            B = self._interleave_swiglu_rows(B)
+        A, B = A.contiguous(), B.contiguous()
+        self._fused_lora_cache = (key, A, B)
+        return A, B
+
+    def fused_lora_delta(
+        self, x: torch.Tensor, *, swiglu_rows: bool = False
+    ) -> torch.Tensor | None:
+        """``forward(x) - base_layer(x)`` as a contiguous BF16 ``[tokens, out]``.
+
+        For GEMM epilogues that add the adapter's update themselves. None when
+        there is nothing to add. ``swiglu_rows`` orders the columns like the
+        interleaved FLUX.3 PrimsTS SwiGLU weight (``[value_i, gate_i]`` pairs).
+        """
+        if not self.lora_active:
+            return None
+        runtime_lora_scale = 1.0 if self.merged else self._runtime_lora_scale()
+        if runtime_lora_scale == 0.0:
+            return None
+        x_2d = x.reshape(-1, x.shape[-1])
+        delta = None
+        if not self.merged:
+            A, B = self._fused_lora_factors(device=x.device, swiglu_rows=swiglu_rows)
+            scale = self.strength * runtime_lora_scale
+            if self.lora_alpha != self.lora_rank:
+                scale *= self.lora_alpha / self.lora_rank  # type: ignore
+            hidden = x_2d.to(dtype=A.dtype) @ A.T
+            if scale != 1.0:
+                hidden = hidden * scale
+            delta = hidden @ B.T
+        offset = self._active_lora_output_offset()
+        if offset is not None:
+            offset = offset.to(device=x.device) * runtime_lora_scale
+            if swiglu_rows:
+                offset = self._interleave_swiglu_rows(offset)
+            if delta is None:
+                delta = offset.expand(x_2d.shape[0], -1)
+            else:
+                delta = delta + offset.to(dtype=delta.dtype)
+        return delta.to(torch.bfloat16).contiguous()
 
     def _scaled_lora_output_offset(
         self,

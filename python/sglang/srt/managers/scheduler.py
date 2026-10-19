@@ -590,6 +590,11 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
+            draft_swa_window=(
+                self.draft_worker.draft_swa_window
+                if self.draft_worker is not None
+                else 0
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -3909,7 +3914,6 @@ class Scheduler(
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
