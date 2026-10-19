@@ -180,6 +180,9 @@ class CompressorAscendBackendMixin:
         ]
 
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
+        # precision test
+        # precision test
+        # precision test
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
