@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils import _module_path_match, is_layer_skipped
 
 
 class _INT8Activation(NamedTuple):
@@ -107,7 +107,9 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         if not isinstance(layer, LinearBase):
             return None
-        if is_layer_skipped(
+        if any(
+            _module_path_match(ignored, prefix) for ignored in self.ignored_layers
+        ) or is_layer_skipped(
             prefix,
             self.ignored_layers,
             fused_mapping=self.packed_modules_mapping,
@@ -234,6 +236,9 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
             weight_scale.flatten(),
             requires_grad=False,
         )
+        # Convert GEMM bias once instead of on every denoising step.
+        if layer.bias is not None and not layer.skip_bias_add:
+            layer.bias.data = layer.bias.data.to(torch.float32)
 
     def apply(
         self,
@@ -262,7 +267,7 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
             layer.weight,
             layer.weight_scale,
             pertoken_scale=dynamic_scale.flatten(),
-            bias=bias.to(torch.float32) if bias is not None else None,
+            bias=bias,
             output_dtype=output_dtype,
         )
         return output.reshape(*input_shape[:-1], output.shape[-1])

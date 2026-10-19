@@ -6,6 +6,8 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+import sglang.multimodal_gen.envs as envs
+
 
 class MiniMaxH3RMSNorm(nn.RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -39,7 +41,8 @@ def _triton_ops():
 
 def _rows_supported(x: torch.Tensor) -> bool:
     return (
-        x.device.type == "npu"
+        envs.SGLANG_DIFFUSION_MINIMAX_H3_NPU_TRITON
+        and x.device.type == "npu"
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.ndim == 2
         and 0 < x.shape[1] <= 8192

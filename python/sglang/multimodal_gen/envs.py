@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_NPU_TRITON: bool = True
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
@@ -354,6 +355,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adaln_proj weights; keep off until an e2e trajectory gate clears it.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
+    # Set false to use the native MiniMax H3 normalization/modulation/gate paths.
+    "SGLANG_DIFFUSION_MINIMAX_H3_NPU_TRITON": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_NPU_TRITON", "true"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
