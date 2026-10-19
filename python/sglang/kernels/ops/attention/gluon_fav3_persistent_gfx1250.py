@@ -19,8 +19,8 @@ import torch
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
-from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
-    _AttentionConfig,
+from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import _AttentionConfig
+from sglang.kernels.ops.attention.gluon_fav3_gfx1250_policy import (
     _get_persistent_query_groups,
     get_num_cus,
 )

@@ -38,23 +38,30 @@ validated by the TokenSpeed/Triton optimization work.
 
 from __future__ import annotations
 
-import functools
 import math
-from typing import NamedTuple
 
 import torch
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
-from triton.runtime import driver
 
+from sglang.kernels.ops.attention.gluon_fav3_gfx1250_policy import (
+    FAv3Guard,
+    FAv3LaunchConfig,
+    FAv3NumericalMode,
+    resolve_fav3_execution_policy,
+    select_fav3_launch_config,
+)
 
-class FAv3LaunchConfig(NamedTuple):
-    schedule: str
-    block_m: int
-    block_n: int
-    num_warps: int
-    tdm_output: bool
-    llvm_fn_attrs: str
+# Keep flag values usable by both host tests and Gluon without reading GPU data
+# on the host. NORM_UNSAFE covers Q/K norms and the V product/sum bounds.
+_NORM_UNSAFE = gl.constexpr(FAv3Guard.NORM_UNSAFE.value)
+_FUSED_EXP_UNSAFE = gl.constexpr(FAv3Guard.FUSED_EXP_UNSAFE.value)
+_ROUTE_NORM = gl.constexpr(0)
+_ROUTE_FUSED_EXP = gl.constexpr(1)
+_ROUTE_STABLE = gl.constexpr(2)
+# The two bounded algorithms share an entry point; stable fallback keeps its
+# own register allocation. These are launch routes, not guard flag values.
+_ROUTE_NORM_OR_FUSED_EXP = gl.constexpr(3)
 
 
 @gluon.jit
@@ -951,76 +958,6 @@ def _attention_forward_pingpong(
 # Specialize tensor strides as in TokenSpeed so TDM address arithmetic folds
 # at compile time. Shape specialization already distinguishes these launches.
 @gluon.jit
-def _attention_forward_selected(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    output_ptr,
-    invalid_ptr,
-    stride_qb: gl.constexpr,
-    stride_qh: gl.constexpr,
-    stride_qs: gl.constexpr,
-    stride_qd: gl.constexpr,
-    stride_kb: gl.constexpr,
-    stride_kh: gl.constexpr,
-    stride_ks: gl.constexpr,
-    stride_kd: gl.constexpr,
-    stride_vb: gl.constexpr,
-    stride_vh: gl.constexpr,
-    stride_vs: gl.constexpr,
-    stride_vd: gl.constexpr,
-    stride_ob: gl.constexpr,
-    stride_oh: gl.constexpr,
-    stride_os: gl.constexpr,
-    stride_od: gl.constexpr,
-    SOFTMAX_SCALE: gl.constexpr,
-    SEQLEN_Q: gl.constexpr,
-    SEQLEN_K: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    HEAD_SIZE: gl.constexpr,
-    FAST_EXP: gl.constexpr,
-    TDM_OUTPUT: gl.constexpr = False,
-    USE_QUERY_BUFFER: gl.constexpr = True,
-    USE_OUTPUT_BUFFER: gl.constexpr = True,
-):
-    if (gl.load(invalid_ptr) == 0) == FAST_EXP:
-        _attention_forward_pingpong(
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            output_ptr,
-            stride_qb,
-            stride_qh,
-            stride_qs,
-            stride_qd,
-            stride_kb,
-            stride_kh,
-            stride_ks,
-            stride_kd,
-            stride_vb,
-            stride_vh,
-            stride_vs,
-            stride_vd,
-            stride_ob,
-            stride_oh,
-            stride_os,
-            stride_od,
-            SOFTMAX_SCALE,
-            SEQLEN_Q,
-            SEQLEN_K,
-            BLOCK_M,
-            BLOCK_N,
-            HEAD_SIZE,
-            TDM_OUTPUT,
-            USE_QUERY_BUFFER,
-            USE_OUTPUT_BUFFER,
-            FAST_EXP=FAST_EXP,
-        )
-
-
-# Keep layout strides constant through the guarded dispatch as well.
-@gluon.jit
 def _attention_forward_norm_selected(
     q_ptr,
     k_ptr,
@@ -1077,10 +1014,8 @@ def _attention_forward_norm_selected(
         stride_os,
         stride_od,
     )
-    # Route 3 combines the norm-bounded and element-bounded algorithms.
-    # Keep the raw algorithm separate to preserve its register allocation.
-    if ROUTE == 3:
-        if (bits & 1) == 0:
+    if ROUTE == _ROUTE_NORM_OR_FUSED_EXP:
+        if (bits & _NORM_UNSAFE) == 0:
             _attention_forward_pingpong(
                 *forward_args,
                 SOFTMAX_SCALE,
@@ -1095,7 +1030,7 @@ def _attention_forward_norm_selected(
                 FAST_EXP=False,
                 NORM_EXP=True,
             )
-        elif bits == 1:
+        elif bits == _NORM_UNSAFE:
             _attention_forward_pingpong(
                 *forward_args,
                 SOFTMAX_SCALE,
@@ -1112,9 +1047,9 @@ def _attention_forward_norm_selected(
             )
     else:
         selected = (
-            ((ROUTE == 0) & ((bits & 1) == 0))
-            | ((ROUTE == 1) & (bits == 1))
-            | ((ROUTE == 2) & (bits == 3))
+            ((ROUTE == _ROUTE_NORM) & ((bits & _NORM_UNSAFE) == 0))
+            | ((ROUTE == _ROUTE_FUSED_EXP) & (bits == _NORM_UNSAFE))
+            | ((ROUTE == _ROUTE_STABLE) & (bits == (_NORM_UNSAFE | _FUSED_EXP_UNSAFE)))
         )
         if selected:
             _attention_forward_pingpong(
@@ -1128,61 +1063,9 @@ def _attention_forward_norm_selected(
                 TDM_OUTPUT,
                 USE_QUERY_BUFFER,
                 USE_OUTPUT_BUFFER,
-                FAST_EXP=ROUTE == 1,
-                NORM_EXP=ROUTE == 0,
+                FAST_EXP=ROUTE == _ROUTE_FUSED_EXP,
+                NORM_EXP=ROUTE == _ROUTE_NORM,
             )
-
-
-@gluon.jit
-def _range_atomic(
-    q,
-    k,
-    invalid_ptr,
-    NQ: gl.constexpr,
-    NK: gl.constexpr,
-    SQ: gl.constexpr,
-    SK: gl.constexpr,
-    H: gl.constexpr,
-    QB: gl.constexpr,
-    QS: gl.constexpr,
-    QH: gl.constexpr,
-    QD: gl.constexpr,
-    KB: gl.constexpr,
-    KS: gl.constexpr,
-    KH: gl.constexpr,
-    KD: gl.constexpr,
-    BOUND: gl.constexpr,
-    CONTIGUOUS: gl.constexpr,
-    BLOCK: gl.constexpr,
-):
-    pid = gl.program_id(0)
-    q_blocks: gl.constexpr = gl.cdiv(NQ, BLOCK)
-    offsets = gl.arange(0, BLOCK, layout=gl.BlockedLayout([1], [32], [4], [0]))
-    if pid < q_blocks:
-        index = pid.to(gl.int64) * BLOCK + offsets
-        if CONTIGUOUS:
-            ptr = q + index
-        else:
-            batch = index // (SQ * H * 128)
-            seq = (index // (H * 128)) % SQ
-            head = (index // 128) % H
-            dim = index % 128
-            ptr = q + batch * QB + seq * QS + head * QH + dim * QD
-        values = gl.load(ptr, mask=index < NQ, other=0).to(gl.float32)
-    else:
-        index = (pid - q_blocks).to(gl.int64) * BLOCK + offsets
-        if CONTIGUOUS:
-            ptr = k + index
-        else:
-            batch = index // (SK * H * 128)
-            seq = (index // (H * 128)) % SK
-            head = (index // 128) % H
-            dim = index % 128
-            ptr = k + batch * KB + seq * KS + head * KH + dim * KD
-        values = gl.load(ptr, mask=index < NK, other=0).to(gl.float32)
-    invalid = gl.max((~(gl.abs(values) <= BOUND)).to(gl.int32), 0)
-    if invalid != 0:
-        gl.atomic_or(invalid_ptr, invalid, sem="relaxed")
 
 
 @gluon.jit
@@ -1195,81 +1078,6 @@ def _guard_bound(scale):
     # At magnitude <=1024, rounding the scaled maximum introduces at most
     # 2**-14 of exponent error, keeping its fused exponent near zero.
     return math.sqrt(1024 / (128 * scale * 1.4426950408889634)) * (1 - 1e-5)
-
-
-def _check_bounded_inputs(query, key, invalid, softmax_scale):
-    block = 8192
-    count = math.ceil(query.numel() / block) + math.ceil(key.numel() / block)
-    _clear_invalid[(1,)](invalid, num_warps=4)
-    _range_atomic[(count,)](
-        query,
-        key,
-        invalid,
-        query.numel(),
-        key.numel(),
-        query.shape[1],
-        key.shape[1],
-        query.shape[2],
-        *query.stride(),
-        *key.stride(),
-        _guard_bound(softmax_scale),
-        query.is_contiguous() and key.is_contiguous(),
-        block,
-        num_warps=4,
-    )
-
-
-def _launch_guarded_attention(query, key, value, output, invalid, softmax_scale):
-    # These ordered kernels are captured together. Every replay clears and
-    # recomputes the flag, so mutated inputs cannot reuse an earlier decision.
-    _check_bounded_inputs(query, key, invalid, softmax_scale)
-    batch, seqlen_q, num_heads, _ = query.shape
-    seqlen_k = key.shape[1]
-    query_tiles = math.ceil(seqlen_q / 256)
-    grid = (
-        (query_tiles, num_heads, batch)
-        if seqlen_k >= 16384
-        else (batch, num_heads, query_tiles)
-    )
-    strides = tuple(
-        s
-        for tensor in (query, key, value, output)
-        for s in (
-            tensor.stride(0),
-            tensor.stride(2),
-            tensor.stride(1),
-            tensor.stride(3),
-        )
-    )
-    query_tile_bytes = (
-        255 * query.stride(1) + 127 * query.stride(3) + 1
-    ) * query.element_size()
-    output_tile_bytes = (
-        255 * output.stride(1) + 127 * output.stride(3) + 1
-    ) * output.element_size()
-    for fast in (True, False):
-        _attention_forward_selected[grid](
-            query,
-            key,
-            value,
-            output,
-            invalid,
-            *strides,
-            softmax_scale,
-            seqlen_q,
-            seqlen_k,
-            256,
-            64,
-            128,
-            fast,
-            TDM_OUTPUT=True,
-            USE_QUERY_BUFFER=query_tile_bytes <= 2**31,
-            USE_OUTPUT_BUFFER=output_tile_bytes <= 2**31,
-            num_warps=8,
-            waves_per_eu=2,
-            llvm_fn_attrs="amdgpu-sched-strategy=max-ilp",
-            enable_fp_fusion=True,
-        )
 
 
 def _norm_guard_bound(scale):
@@ -1319,7 +1127,9 @@ def _norm_range_atomic(
     invalid_fma = (
         gl.sum(gl.sum(((gl.abs(x) > FMA_BOUND) | (x != x)).to(gl.int32), 1), 0) != 0
     )
-    bits = invalid_norm.to(gl.int32) | (invalid_fma.to(gl.int32) << 1)
+    bits = (invalid_norm.to(gl.int32) * _NORM_UNSAFE) | (
+        invalid_fma.to(gl.int32) * _FUSED_EXP_UNSAFE
+    )
     if bits != 0:
         gl.atomic_or(invalid_ptr, bits, sem="relaxed")
 
@@ -1362,7 +1172,7 @@ def _value_range_atomic(
         | ((x != 0.0) & (x < 2.3283064365386963e-10))
     )
     if gl.sum(invalid.to(gl.int32), 0) != 0:
-        gl.atomic_or(invalid_ptr, 1, sem="relaxed")
+        gl.atomic_or(invalid_ptr, _NORM_UNSAFE, sem="relaxed")
 
 
 def _check_norm_bounded_inputs(q, k, v, invalid, scale):
@@ -1415,7 +1225,7 @@ def _launch_norm_guarded_attention(query, key, value, output, invalid, softmax_s
     output_tile_bytes = (
         255 * output.stride(1) + 127 * output.stride(3) + 1
     ) * output.element_size()
-    for route in (3, 2):
+    for route in (_ROUTE_NORM_OR_FUSED_EXP.value, _ROUTE_STABLE.value):
         _attention_forward_norm_selected[grid](
             query,
             key,
@@ -1438,120 +1248,6 @@ def _launch_norm_guarded_attention(query, key, value, output, invalid, softmax_s
             llvm_fn_attrs="amdgpu-sched-strategy=max-ilp",
             enable_fp_fusion=True,
         )
-
-
-@functools.lru_cache(maxsize=None)
-def _get_num_cus(device_index: int) -> int:
-    properties = driver.active.utils.get_device_properties(device_index)
-    return int(properties["multiprocessor_count"])
-
-
-def get_num_cus(device: torch.device | int | None = None) -> int:
-    """Return the CU count for a specific device, cached per device index."""
-    if device is None:
-        device_index = driver.active.get_device_interface().current_device()
-    elif isinstance(device, torch.device):
-        device_index = device.index
-        if device_index is None:
-            device_index = driver.active.get_device_interface().current_device()
-    else:
-        device_index = int(device)
-    return _get_num_cus(device_index)
-
-
-def _get_persistent_query_groups(
-    batch: int, num_heads: int, seqlen_q: int, num_cus: int
-) -> int:
-    """Balance persistent query work without underfilling the device."""
-    if num_cus <= 0:
-        raise ValueError("num_cus must be positive")
-    query_blocks = math.ceil(seqlen_q / 128)
-    query_groups = math.ceil(query_blocks / 29)
-    batch_heads = batch * num_heads
-
-    # Align the grid to a whole multiple of the CU count, while retaining
-    # at least two workgroups per CU. Small grids keep the existing grouping.
-    group_multiple = num_cus // math.gcd(batch_heads, num_cus)
-    aligned_groups = query_groups // group_multiple * group_multiple
-    if aligned_groups * batch_heads < 2 * num_cus:
-        return query_groups
-
-    # Compare the estimated query tiles on the most heavily loaded CU.
-    # Fewer groups reuse K/V longer, but must not increase the longest workload.
-    original_tiles = math.ceil(query_groups * batch_heads / num_cus) * math.ceil(
-        query_blocks / query_groups
-    )
-    aligned_tiles = (aligned_groups * batch_heads // num_cus) * math.ceil(
-        query_blocks / aligned_groups
-    )
-    return aligned_groups if aligned_tiles < original_tiles else query_groups
-
-
-def select_fav3_launch_config(
-    batch: int,
-    num_heads: int,
-    seqlen_q: int,
-    *,
-    seqlen_k: int | None = None,
-    num_cus: int | None = None,
-    head_size: int = 128,
-    dtype: torch.dtype = torch.bfloat16,
-) -> FAv3LaunchConfig:
-    """Select a gfx1250 launch while retaining the BF16/D128 specializations."""
-    if head_size not in (64, 128, 256):
-        raise ValueError(
-            f"Gluon FAv3 requires head_size in (64, 128, 256), got {head_size}"
-        )
-    if dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError("Gluon FAv3 requires BF16 or FP16")
-    if min(batch, num_heads, seqlen_q) <= 0:
-        raise ValueError("batch, num_heads, and seqlen_q must be positive")
-    if num_cus is None:
-        num_cus = get_num_cus()
-
-    persistent_groups = _get_persistent_query_groups(
-        batch, num_heads, seqlen_q, num_cus
-    )
-    persistent_workgroups = batch * num_heads * persistent_groups
-    if (
-        head_size == 128
-        and dtype == torch.bfloat16
-        and seqlen_k is not None
-        and 257 <= seqlen_k <= 512
-        and persistent_workgroups >= num_cus
-    ):
-        return FAv3LaunchConfig(
-            "persistent",
-            128,
-            256,
-            4,
-            True,
-            "amdgpu-sched-strategy=iterative-ilp",
-        )
-
-    wide_block_m = 256
-    workgroups = batch * num_heads * math.ceil(seqlen_q / wide_block_m)
-    # D256 spills heavily with the wide eight-wave tile. The four-wave
-    # pipeline keeps its larger output accumulator in registers.
-    if head_size != 256 and workgroups >= num_cus:
-        # TDM output is profitable at and above the same full-device boundary
-        # that admits the wide ping-pong tile.
-        scheduler = (
-            "amdgpu-sched-strategy=max-ilp"
-            if seqlen_k is not None and (seqlen_k <= 512 or seqlen_k >= 16_384)
-            else ""
-        )
-        return FAv3LaunchConfig("pingpong", 256, 64, 8, head_size == 128, scheduler)
-    # max-ilp intermittently corrupts FP16 inputs with nonzero storage offsets.
-    # Use default pipeline scheduling until the affected cases are understood.
-    return FAv3LaunchConfig(
-        "pipeline",
-        128,
-        64,
-        4,
-        False,
-        "" if dtype == torch.float16 else "amdgpu-sched-strategy=max-ilp",
-    )
 
 
 def gluon_fav3_attention(
@@ -1598,66 +1294,24 @@ def gluon_fav3_attention(
     if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
         raise ValueError("Gluon FAv3 requires contiguous head dimensions")
 
-    if softmax_scale is None:
-        softmax_scale = head_size**-0.5
-    softmax_scale = float(softmax_scale)
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0.0:
-        raise ValueError("softmax_scale must be finite and positive")
-
     arch = getattr(torch.cuda.get_device_properties(query.device), "gcnArchName", "")
     if "gfx1250" not in arch:
         raise RuntimeError(
             f"Gluon FAv3 requires gfx1250, found {arch or 'unknown GPU'}"
         )
 
-    config = launch_config or select_fav3_launch_config(
-        batch,
-        num_heads,
-        seqlen_q,
-        seqlen_k=seqlen_k,
-        num_cus=get_num_cus(query.device),
-        head_size=head_size,
-        dtype=query.dtype,
+    policy = resolve_fav3_execution_policy(
+        query, key, value, softmax_scale=softmax_scale, launch_config=launch_config
     )
+    config = policy.launch_config
+    softmax_scale = policy.softmax_scale
     if config.schedule == "persistent":
-        if query.dtype != torch.bfloat16 or head_size != 128:
-            raise ValueError("persistent requires BF16 with head_size=128")
-        expected_geometry = (128, 256, 4)
-        actual_geometry = (config.block_m, config.block_n, config.num_warps)
-        if actual_geometry != expected_geometry:
-            raise ValueError(
-                "persistent requires (block_m, block_n, num_warps)="
-                f"{expected_geometry}, got {actual_geometry}"
-            )
-        if not config.tdm_output:
-            raise ValueError("persistent requires TDM output and stable softmax")
-        if query.is_contiguous() and key.is_contiguous() and value.is_contiguous():
-            from sglang.kernels.ops.attention.gluon_fav3_persistent_gfx1250 import (
-                gluon_fav3_persistent_attention,
-            )
-
-            return gluon_fav3_persistent_attention(
-                query,
-                key,
-                value,
-                softmax_scale=softmax_scale,
-            )
-        config = FAv3LaunchConfig(
-            "pingpong",
-            256,
-            64,
-            8,
-            True,
-            "amdgpu-sched-strategy=max-ilp",
+        from sglang.kernels.ops.attention.gluon_fav3_persistent_gfx1250 import (
+            gluon_fav3_persistent_attention,
         )
-    if config.schedule not in ("pipeline", "pingpong"):
-        raise ValueError(f"unsupported FAv3 schedule: {config.schedule}")
-    expected_geometry = (128, 64, 4) if config.schedule == "pipeline" else (256, 64, 8)
-    actual_geometry = (config.block_m, config.block_n, config.num_warps)
-    if actual_geometry != expected_geometry:
-        raise ValueError(
-            f"{config.schedule} requires (block_m, block_n, num_warps)="
-            f"{expected_geometry}, got {actual_geometry}"
+
+        return gluon_fav3_persistent_attention(
+            query, key, value, softmax_scale=softmax_scale
         )
     kernel = (
         _attention_forward_pingpong
@@ -1680,15 +1334,7 @@ def gluon_fav3_attention(
         else (batch, num_heads, query_tiles)
     )
     with torch.cuda.device(query.device):
-        if (
-            launch_config is None
-            and config.schedule == "pingpong"
-            and query.dtype == torch.bfloat16
-            and head_size == 128
-            and min(seqlen_q, seqlen_k) >= 65_536
-            and seqlen_k < 2**31
-            and softmax_scale == head_size**-0.5
-        ):
+        if policy.numerical_mode == FAv3NumericalMode.GUARDED:
             invalid = torch.empty((), dtype=torch.int32, device=query.device)
             _launch_norm_guarded_attention(
                 query, key, value, output, invalid, softmax_scale
@@ -1735,5 +1381,6 @@ def gluon_fav3_attention(
 __all__ = [
     "FAv3LaunchConfig",
     "gluon_fav3_attention",
+    "resolve_fav3_execution_policy",
     "select_fav3_launch_config",
 ]

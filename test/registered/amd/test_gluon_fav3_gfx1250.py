@@ -3,8 +3,11 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.gluon_fav3_gfx1250_policy import FAv3Guard
 from sglang.test.ci.ci_register import register_amd_ci
 
+# Match upstream's MI45x registration. Runner provisioning and workflow
+# consumption belong to upstream CI; this suite requires actual gfx1250 execution.
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu-mi45x", nightly=True)
 
 
@@ -13,65 +16,6 @@ def _is_gfx1250() -> bool:
         return False
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     return "gfx1250" in arch
-
-
-def test_persistent_launch_selection_cpu():
-    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
-        select_fav3_launch_config,
-    )
-
-    config = select_fav3_launch_config(
-        2,
-        40,
-        176_400,
-        seqlen_k=512,
-        num_cus=1,
-    )
-    assert config.schedule == "persistent"
-    assert (config.block_m, config.block_n, config.num_warps) == (128, 256, 4)
-    assert config.tdm_output
-    assert config.llvm_fn_attrs == "amdgpu-sched-strategy=iterative-ilp"
-
-    non_wan = select_fav3_launch_config(
-        1,
-        40,
-        32_768,
-        seqlen_k=511,
-        num_cus=256,
-    )
-    assert non_wan.schedule == "persistent"
-
-    underfilled = select_fav3_launch_config(
-        1,
-        8,
-        4_096,
-        seqlen_k=512,
-        num_cus=256,
-    )
-    assert underfilled.schedule != "persistent"
-
-    for unsupported_k in (256, 513):
-        unsupported = select_fav3_launch_config(
-            2,
-            40,
-            176_400,
-            seqlen_k=unsupported_k,
-            num_cus=256,
-        )
-        assert unsupported.schedule != "persistent"
-
-    stable_self_config = select_fav3_launch_config(
-        2,
-        40,
-        176_400,
-        seqlen_k=176_400,
-        num_cus=256,
-    )
-    assert stable_self_config.schedule == "pingpong"
-    single_video = select_fav3_launch_config(
-        1, 40, 176_400, seqlen_k=176_400, num_cus=256
-    )
-    assert single_video.schedule == "pingpong"
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
@@ -467,10 +411,10 @@ def test_auto_short_kv_boundary_matches_fp64(seqlen_k):
         "single-outlier",
     ],
 )
-def test_guarded_exponent_matches_fp64(seqlen_k, case):
+def test_element_bound_routes_match_fp64(seqlen_k, case):
     from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
         _guard_bound,
-        _launch_guarded_attention,
+        _launch_norm_guarded_attention,
     )
 
     torch.manual_seed(8459)
@@ -503,9 +447,14 @@ def test_guarded_exponent_matches_fp64(seqlen_k, case):
     )
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     invalid = torch.empty((), device=query.device, dtype=torch.int32)
-    _launch_guarded_attention(query, key, value, output, invalid, scale)
+    _launch_norm_guarded_attention(query, key, value, output, invalid, scale)
     fallback = case in ("above", "large-positive", "large-negative", "single-outlier")
-    assert invalid.item() == int(fallback)
+    expected_flags = FAv3Guard.NONE
+    if fallback:
+        expected_flags = FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE
+    elif case == "below":
+        expected_flags = FAv3Guard.NORM_UNSAFE
+    assert invalid.item() == expected_flags
     actual = output.double()
     reference_rms = expected.square().mean().sqrt()
     assert torch.isfinite(actual).all()
@@ -513,83 +462,6 @@ def test_guarded_exponent_matches_fp64(seqlen_k, case):
     torch.testing.assert_close(
         actual, expected, rtol=0.01, atol=0.01 * reference_rms.item()
     )
-
-
-@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
-def test_guard_recomputed_on_graph_replay():
-    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
-        _launch_guarded_attention,
-    )
-
-    torch.manual_seed(20261015)
-    query = torch.randn(2, 257, 3, 128, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn(2, 769, 3, 128, device="cuda", dtype=torch.bfloat16)
-    value = torch.randn_like(key)
-    original_query, original_key = query.clone(), key.clone()
-    output = torch.empty_like(query)
-    invalid = torch.empty((), device=query.device, dtype=torch.int32)
-    scale = 128**-0.5
-
-    def launch():
-        _launch_guarded_attention(query, key, value, output, invalid, scale)
-
-    for _ in range(3):
-        launch()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        launch()
-    for fallback in (False, True, False, True, False):
-        if fallback:
-            query.fill_(66048)
-            key.fill_(-66048)
-            expected = value.double().mean(1, keepdim=True).expand(query.shape)
-        else:
-            query.copy_(original_query)
-            key.copy_(original_key)
-            expected = _fp64_attention(query, key, value, scale)
-        invalid.fill_(int(not fallback))
-        graph.replay()
-        assert invalid.item() == int(fallback)
-        reference_rms = expected.square().mean().sqrt()
-        actual = output.double()
-        assert torch.isfinite(actual).all()
-        assert (actual - expected).square().mean().sqrt() <= 0.003 * reference_rms
-        torch.testing.assert_close(
-            actual, expected, rtol=0.01, atol=0.01 * reference_rms.item()
-        )
-
-
-@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
-@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
-def test_exponent_guard_rejects_nonfinite_inputs(nonfinite):
-    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import _check_bounded_inputs
-
-    query = torch.zeros((1, 257, 1, 128), device="cuda", dtype=torch.bfloat16)
-    key = torch.zeros((1, 769, 1, 128), device="cuda", dtype=torch.bfloat16)
-    key[0, -1, 0, -1] = nonfinite
-    invalid = torch.empty((), device=query.device, dtype=torch.int32)
-    _check_bounded_inputs(query, key, invalid, 128**-0.5)
-    assert invalid.item() == 1
-
-
-@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
-def test_exponent_guard_checks_values_beyond_4gib():
-    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import _check_bounded_inputs
-
-    free_memory, _ = torch.cuda.mem_get_info()
-    if free_memory < 12 * 1024**3:
-        pytest.skip("requires 12 GiB free for the large query")
-    query = torch.zeros((1, 262_145, 64, 128), device="cuda", dtype=torch.bfloat16)
-    key = torch.zeros((1, 65, 64, 128), device="cuda", dtype=torch.bfloat16)
-    invalid = torch.empty((), device=query.device, dtype=torch.int32)
-    # This element is past both the 4 GiB byte boundary and signed int32 indexing.
-    query[0, -1, -1, -1] = 16
-    _check_bounded_inputs(query, key, invalid, 128**-0.5)
-    assert invalid.item() == 1
-    query[0, -1, -1, -1] = 0
-    _check_bounded_inputs(query, key, invalid, 128**-0.5)
-    assert invalid.item() == 0
 
 
 def _assert_norm_attention_fp64(query, key, value, output):
@@ -606,18 +478,18 @@ def _assert_norm_attention_fp64(query, key, value, output):
 @pytest.mark.parametrize(
     "case,expected_bits",
     [
-        ("random", 0),
-        ("strided", 0),
-        ("below", 0),
-        ("above", 1),
-        ("sparse", 2),
-        ("negative", 0),
-        ("tiny-value", 1),
-        ("large-value", 1),
-        ("value-low", 0),
-        ("value-high", 0),
-        ("extreme", 3),
-        ("constant", 0),
+        ("random", FAv3Guard.NONE),
+        ("strided", FAv3Guard.NONE),
+        ("below", FAv3Guard.NONE),
+        ("above", FAv3Guard.NORM_UNSAFE),
+        ("sparse", FAv3Guard.FUSED_EXP_UNSAFE),
+        ("negative", FAv3Guard.NONE),
+        ("tiny-value", FAv3Guard.NORM_UNSAFE),
+        ("large-value", FAv3Guard.NORM_UNSAFE),
+        ("value-low", FAv3Guard.NONE),
+        ("value-high", FAv3Guard.NONE),
+        ("extreme", FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE),
+        ("constant", FAv3Guard.NONE),
     ],
 )
 def test_norm_guarded_attention_matches_fp64(seqlen_k, case, expected_bits):
@@ -692,20 +564,28 @@ def test_norm_guard_routes_recomputed_on_graph_replay(seqlen_k):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
-    for bits in (0, 1, 2, 3, 0):
+    for bits in (
+        FAv3Guard.NONE,
+        FAv3Guard.NORM_UNSAFE,
+        FAv3Guard.FUSED_EXP_UNSAFE,
+        FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE,
+        FAv3Guard.NONE,
+    ):
         query.copy_(original_query)
         key.copy_(original_key)
-        if bits == 1:
+        if bits == FAv3Guard.NORM_UNSAFE:
             query.fill_(2)
             key.fill_(2)
-        elif bits == 2:
+        elif bits == FAv3Guard.FUSED_EXP_UNSAFE:
             query.zero_()
             key.zero_()
             query[..., 0] = 15
             key[..., 0] = 15
-        elif bits == 3:
+        elif bits == (FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE):
             query.fill_(66048)
             key.fill_(-66048)
+        # Poison the previous decision: replay must clear and recompute it.
+        flags.fill_(int(bits ^ (FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE)))
         graph.replay()
         assert flags.item() == bits
         _assert_norm_attention_fp64(query, key, value, output)
@@ -725,7 +605,10 @@ def test_norm_guard_rejects_nonfinite_inputs(operand, nonfinite):
     {"query": query, "key": key, "value": value}[operand][0, -1, 0, -1] = nonfinite
     flags = torch.empty((), device=query.device, dtype=torch.int32)
     _check_norm_bounded_inputs(query, key, value, flags, 128**-0.5)
-    assert flags.item() == (1 if operand == "value" else 3)
+    expected = FAv3Guard.NORM_UNSAFE
+    if operand != "value":
+        expected |= FAv3Guard.FUSED_EXP_UNSAFE
+    assert flags.item() == expected
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
@@ -741,7 +624,11 @@ def test_norm_guard_checks_values_beyond_4gib():
     key = torch.zeros((1, 65, 64, 128), device="cuda", dtype=torch.bfloat16)
     value = torch.ones_like(key)
     flags = torch.empty((), device=query.device, dtype=torch.int32)
-    for magnitude, bits in ((15, 2), (16, 3), (0, 0)):
+    for magnitude, bits in (
+        (15, FAv3Guard.FUSED_EXP_UNSAFE),
+        (16, FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE),
+        (0, FAv3Guard.NONE),
+    ):
         query[0, -1, -1, -1] = magnitude
         _check_norm_bounded_inputs(query, key, value, flags, 128**-0.5)
         assert flags.item() == bits
@@ -765,8 +652,11 @@ def test_norm_guarded_attention_with_large_query_stride():
     value = torch.randn_like(key)
     output = torch.empty(query.shape, device=query.device, dtype=query.dtype)
     flags = torch.empty((), device=query.device, dtype=torch.int32)
-    for bits in (0, 3):
-        if bits == 3:
+    for bits in (
+        FAv3Guard.NONE,
+        FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE,
+    ):
+        if bits != FAv3Guard.NONE:
             query[0, 1, 1, -1] = 66048
         _launch_norm_guarded_attention(query, key, value, output, flags, 128**-0.5)
         assert flags.item() == bits
@@ -841,7 +731,12 @@ def test_norm_probability_rounding_boundaries(num_warps, block_m):
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
 @pytest.mark.parametrize("layout", ["sliced", "transposed"])
 @pytest.mark.parametrize(
-    "route,expected_bits", [("norm", 0), ("bounded", 1), ("raw", 3)]
+    "route,expected_bits",
+    [
+        ("norm", FAv3Guard.NONE),
+        ("bounded", FAv3Guard.NORM_UNSAFE),
+        ("stable", FAv3Guard.NORM_UNSAFE | FAv3Guard.FUSED_EXP_UNSAFE),
+    ],
 )
 def test_guarded_attention_independent_layout_strides(layout, route, expected_bits):
     from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
@@ -877,48 +772,6 @@ def test_guarded_attention_independent_layout_strides(layout, route, expected_bi
     assert invalid.item() == expected_bits
     _assert_norm_attention_fp64(query, key, value, output)
     assert torch.all(storage[untouched] == 7.0)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_size", [64, 128, 256])
-def test_extended_launch_selection_cpu(dtype, head_size):
-    from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import (
-        select_fav3_launch_config,
-    )
-
-    pipeline_scheduler = (
-        "" if dtype == torch.float16 else "amdgpu-sched-strategy=max-ilp"
-    )
-    small_config = select_fav3_launch_config(
-        2,
-        3,
-        129,
-        seqlen_k=257,
-        num_cus=256,
-        head_size=head_size,
-        dtype=dtype,
-    )
-    assert small_config.schedule == "pipeline"
-    assert small_config.llvm_fn_attrs == pipeline_scheduler
-
-    config = select_fav3_launch_config(
-        1,
-        40,
-        32768,
-        seqlen_k=511,
-        num_cus=256,
-        head_size=head_size,
-        dtype=dtype,
-    )
-    if dtype == torch.bfloat16 and head_size == 128:
-        assert config.schedule == "persistent"
-    elif head_size == 256:
-        assert config.schedule == "pipeline"
-        assert not config.tdm_output
-        assert config.llvm_fn_attrs == pipeline_scheduler
-    else:
-        assert config.schedule == "pingpong"
-        assert config.tdm_output is (head_size == 128)
 
 
 def _assert_extended_attention_fp64(query, key, value, output, scale):
@@ -1081,4 +934,6 @@ def test_forced_persistent_rejects_other_dtypes_and_dimensions(dtype, head_size)
 
 
 if __name__ == "__main__":
+    if not _is_gfx1250():
+        raise RuntimeError("The MI45x numerical suite requires an AMD gfx1250 GPU")
     sys.exit(pytest.main([__file__, "-v"]))
