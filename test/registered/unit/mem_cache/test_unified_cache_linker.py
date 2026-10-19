@@ -8,9 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-import test_unified_radix_cache_unittest as shared_cache_suite
 import torch
-from test_unified_radix_cache_unittest import (
+import unified_radix_cache_fixtures as shared_cache_suite
+from unified_radix_cache_fixtures import (
     CacheConfig,
     _device_lock_ref,
     _device_value,
@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
@@ -320,7 +321,9 @@ class _TreeCoreBackendTestMixin:
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
+class TestUnifiedCacheLinkerPythonBackend(
+    _TreeCoreBackendTestMixin, _InsertWalkSuite, CustomTestCase
+):
     def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
         """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
         req.kv.cache_protected_len = req.prefix_len
@@ -808,7 +811,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
-    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite
+    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite, CustomTestCase
 ):
     """TreeCore linker contracts shared by the Python and Rust inspectors."""
 

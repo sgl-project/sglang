@@ -11,7 +11,7 @@ from collections import defaultdict
 from unittest import mock
 
 import torch
-from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
+from unified_radix_cache_fixtures import CacheConfig, UnifiedRadixCacheFixtures
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -180,11 +180,11 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
     cfg = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
     _rid = 0
     # Borrow the fixture helpers without inheriting the full gated suite.
-    _make_req = UnifiedRadixCacheSuite._make_req
-    _alloc = UnifiedRadixCacheSuite._alloc
-    _insert = UnifiedRadixCacheSuite._insert
-    _init_hicache = UnifiedRadixCacheSuite._init_hicache
-    _build_hicache_fixture = UnifiedRadixCacheSuite._build_hicache_fixture
+    _make_req = UnifiedRadixCacheFixtures._make_req
+    _alloc = UnifiedRadixCacheFixtures._alloc
+    _insert = UnifiedRadixCacheFixtures._insert
+    _init_hicache = UnifiedRadixCacheFixtures._init_hicache
+    _build_hicache_fixture = UnifiedRadixCacheFixtures._build_hicache_fixture
 
     def test_write_through_backup_survives_mamba_path_cap(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()

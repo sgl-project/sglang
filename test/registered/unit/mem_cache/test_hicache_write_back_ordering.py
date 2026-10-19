@@ -5,9 +5,9 @@ from array import array
 from unittest.mock import patch
 
 import torch
-from test_unified_radix_cache_unittest import (
+from unified_radix_cache_fixtures import (
     CacheConfig,
-    UnifiedRadixCacheSuite,
+    UnifiedRadixCacheFixtures,
     build_fixture,
 )
 
@@ -20,8 +20,8 @@ register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestHiCacheWriteBackOrdering(unittest.TestCase):
-    _init_hicache = UnifiedRadixCacheSuite._init_hicache
-    _make_req = UnifiedRadixCacheSuite._make_req
+    _init_hicache = UnifiedRadixCacheFixtures._init_hicache
+    _make_req = UnifiedRadixCacheFixtures._make_req
     _rid = 0
 
     def _request(self, cache, allocator, req_pool, start, length=8):

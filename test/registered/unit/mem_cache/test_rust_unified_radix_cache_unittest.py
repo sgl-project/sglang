@@ -3,6 +3,7 @@
 import unittest
 
 import test_unified_radix_cache_unittest as shared_suite
+import unified_radix_cache_fixtures as fixtures
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -13,12 +14,12 @@ class RustBackendSuite(unittest.TestSuite):
     """Scope the test backend to this suite without polluting discovery."""
 
     def run(self, result, debug=False):
-        previous = shared_suite._TREE_CORE_TEST_BACKEND
-        shared_suite._TREE_CORE_TEST_BACKEND = "rust"
+        previous = fixtures._TREE_CORE_TEST_BACKEND
+        fixtures._TREE_CORE_TEST_BACKEND = "rust"
         try:
             return super().run(result, debug)
         finally:
-            shared_suite._TREE_CORE_TEST_BACKEND = previous
+            fixtures._TREE_CORE_TEST_BACKEND = previous
 
 
 def load_tests(loader, standard_tests, pattern):
