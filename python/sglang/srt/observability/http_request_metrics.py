@@ -25,13 +25,13 @@ class _HttpRequestMetrics:
     def __init__(self):
         from prometheus_client import Counter, Gauge
 
-        self.request_counter = Counter(
+        self.requests_total = Counter(
             name="sglang:http_requests_total",
             documentation="Total number of HTTP requests by endpoint and method",
             labelnames=["endpoint", "method"],
         )
 
-        self.response_counter = Counter(
+        self.responses_total = Counter(
             name="sglang:http_responses_total",
             documentation="Total number of HTTP responses by endpoint and status code",
             labelnames=["endpoint", "status_code", "method"],
@@ -57,13 +57,14 @@ _http_request_metrics: Optional[_HttpRequestMetrics] = None
 
 
 def init_http_request_metrics():
-    # Called after PROMETHEUS_MULTIPROC_DIR is set, since importing
-    # prometheus_client earlier keeps the metrics out of /metrics.
+    # Call after PROMETHEUS_MULTIPROC_DIR is set: prometheus_client picks its
+    # value backend on import.
     global _http_request_metrics
-    _http_request_metrics = _HttpRequestMetrics()
+    if _http_request_metrics is None:
+        _http_request_metrics = _HttpRequestMetrics()
 
 
-def add_prometheus_track_response_middleware(app):
+def add_http_request_metrics_middleware(app):
     """Records nothing until init_http_request_metrics() runs in this process."""
     # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
     # that passes `receive` through, so request.is_disconnected() keeps working.
@@ -83,7 +84,7 @@ def add_prometheus_track_response_middleware(app):
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
-        metrics.request_counter.labels(endpoint=path, method=method).inc()
+        metrics.requests_total.labels(endpoint=path, method=method).inc()
         metrics.requests_active.labels(endpoint=path, method=method).inc()
         if routing_key:
             metrics.routing_keys_active.inc(routing_key)
@@ -91,7 +92,7 @@ def add_prometheus_track_response_middleware(app):
         try:
             response = await call_next(request)
 
-            metrics.response_counter.labels(
+            metrics.responses_total.labels(
                 endpoint=path,
                 method=method,
                 status_code=str(response.status_code),

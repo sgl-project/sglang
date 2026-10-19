@@ -47,7 +47,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.srt.observability.http_request_metrics import (
-    add_prometheus_track_response_middleware,
+    add_http_request_metrics_middleware,
     init_http_request_metrics,
 )
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
@@ -436,7 +436,7 @@ def create_app(server_args: ServerArgs):
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)
-        add_prometheus_track_response_middleware(app)
+        add_http_request_metrics_middleware(app)
         init_http_request_metrics()
     app.add_middleware(
         CORSMiddleware,
