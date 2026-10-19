@@ -3296,9 +3296,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
 
+            # A request aborted before its first forward (e.g. a PD bootstrap
+            # or KV transfer failure) processed no prompt tokens.
+            prompt_tokens = recv_obj.prompt_tokens[i]
+            if finish_reason.get("type") == "abort" and not self._entered_forward(
+                recv_obj, i
+            ):
+                prompt_tokens = 0
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
-                recv_obj.prompt_tokens[i],
+                prompt_tokens,
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
@@ -3308,6 +3316,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 is_streaming=getattr(state.obj, "stream", False),
                 time_per_output_token=time_per_output_token,
             )
+
+    @staticmethod
+    def _entered_forward(recv_obj, i: int) -> bool:
+        # Without scheduler time stats, keep counting as before.
+        time_stats = recv_obj.time_stats
+        if not time_stats or i >= len(time_stats):
+            return True
+        return time_stats[i].forward_entry_time > 0
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         if self.dump_requests_exclude_meta_keys and isinstance(
