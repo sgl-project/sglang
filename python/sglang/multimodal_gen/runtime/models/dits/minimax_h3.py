@@ -81,8 +81,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.minimax_h3_npu import (
     MiniMaxH3RMSNorm,
-    indexed_gate as indexed_gate_npu,
-    rmsnorm_modulate as rmsnorm_modulate_npu,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -409,10 +407,6 @@ def _modulate_rmsnorm_scale_shift(
     ``fused`` (quality lossless / high) runs one fp32 pass with one rounding,
     which moves the denoising trajectory at rounding level.
     """
-    if x.device.type == "npu" and x.dtype == dtype:
-        result = rmsnorm_modulate_npu(x, norm, shift, scale, indices)
-        if result is not None:
-            return result[0]
     if (
         fused
         and x.dtype == dtype == _BF16_DTYPE
@@ -430,11 +424,6 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
         and linear.quant_method is not None
         and linear.quant_method.accepts_mxfp8_input(linear)
     )
-
-
-def _quantize_rmsnorm(linear: nn.Module, *args, **kwargs):
-    quantize = getattr(linear.quant_method, "quantize_rmsnorm", None)
-    return quantize(*args, **kwargs) if quantize is not None else None
 
 
 def _modulate_scale_shift(
@@ -471,10 +460,6 @@ def _modulate_gate(
     allow_inplace: bool = True,
 ) -> torch.Tensor:
     """Apply an indexed gated residual, optionally reusing the input buffer."""
-    if x.device.type == "npu" and x.dtype == dtype:
-        out = indexed_gate_npu(x, gate, other, indices, allow_inplace=allow_inplace)
-        if out is not None:
-            return out
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
         x.is_cuda
@@ -1584,10 +1569,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
     ) -> torch.Tensor:
-        norm_quant = _quantize_rmsnorm(self.attn.qkv_proj, x, self.norm1)
         h = self.attn(
-            self.norm1(x) if norm_quant is None else norm_quant[0],
-            x_prequant=None if norm_quant is None else norm_quant[1],
+            self.norm1(x),
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -1710,17 +1693,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         # a block-local buffer.
         residual = x
         h_prequant = None
-        norm_quant = _quantize_rmsnorm(
-            self.attn.qkv_proj,
-            x,
-            self.norm1,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-        )
-        if norm_quant is not None:
-            h, h_prequant = norm_quant
-        elif _accepts_mxfp8_input(self.attn.qkv_proj):
+        if _accepts_mxfp8_input(self.attn.qkv_proj):
             h = self.norm1(x)
             if can_use_mxfp8_swizzled(h):
                 # the bf16 modulated rows stay in h for the VDN branch projections
@@ -1763,18 +1736,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        norm_quant = _quantize_rmsnorm(
-            self.mlp.fc1,
-            x,
-            self.norm2,
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
-            keep_float=False,
-        )
-        if norm_quant is not None:
-            h = self.mlp(norm_quant[1])
-        elif _accepts_mxfp8_input(self.mlp.fc1):
+        if _accepts_mxfp8_input(self.mlp.fc1):
             h = self.norm2(x)
             if can_use_mxfp8_swizzled(h):
                 _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(

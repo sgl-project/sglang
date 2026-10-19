@@ -129,28 +129,6 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: NPUOnlineW8A8DiffusionConfig) -> None:
         self.quant_config = quant_config
 
-    def quantize_rmsnorm(
-        self,
-        x: torch.Tensor,
-        norm: torch.nn.RMSNorm,
-        shift: torch.Tensor | None = None,
-        scale: torch.Tensor | None = None,
-        indices: torch.Tensor | None = None,
-        *,
-        keep_float: bool = True,
-    ):
-        from sglang.multimodal_gen.runtime.layers.minimax_h3_npu import (
-            rmsnorm_modulate,
-        )
-
-        result = rmsnorm_modulate(
-            x, norm, shift, scale, indices, quantize=True, keep_float=keep_float
-        )
-        if result is None:
-            return None
-        normalized, data, scales = result
-        return normalized, _INT8Activation(data, scales, x.dtype)
-
     def quantize_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, norm: torch.nn.RMSNorm
     ):
