@@ -78,16 +78,16 @@ def _kda_track_ssm_kernel(
     dst = tl.load(track_dst + r).to(tl.int64)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
+    # Both branches yield the pool dtype: h_track is fp32 while the pool may
+    # be bf16 (--mamba-ssm-dtype bfloat16).
     if mode == 1:
         src = tl.load(cache_indices + r).to(tl.int64)
         val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
     else:
-        val = tl.load(h_track + r.to(tl.int64) * stride_h_row + offs, mask=mask)
-    tl.store(
-        ssm_pool + dst * stride_ssm_slot + offs,
-        val.to(ssm_pool.dtype.element_ty),
-        mask=mask,
-    )
+        val = tl.load(h_track + r.to(tl.int64) * stride_h_row + offs, mask=mask).to(
+            ssm_pool.dtype.element_ty
+        )
+    tl.store(ssm_pool + dst * stride_ssm_slot + offs, val, mask=mask)
 
 
 def kda_track_conv_window(
