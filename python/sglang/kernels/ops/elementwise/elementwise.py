@@ -111,6 +111,49 @@ def fused_sigmoid_mul(
 
 
 @triton.jit
+def _sigmoid_gate_mul_broadcast_kernel(
+    out_ptr,
+    gate_ptr,
+    x_ptr,
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    g = tl.load(gate_ptr + row).to(tl.float32)
+    g = tl.sigmoid(g)
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_dim
+    x = tl.load(x_ptr + row * hidden_dim + offs, mask=mask).to(tl.float32)
+    out = x * g
+    tl.store(
+        out_ptr + row * hidden_dim + offs,
+        out.to(x_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def sigmoid_gate_mul_broadcast(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Compute ``x * sigmoid(gate)`` where gate is (N, 1) and x is (N, D)."""
+    bs, hidden_dim = x.shape
+    out = torch.empty_like(x)
+    BLOCK_SIZE = triton.next_power_of_2(hidden_dim)
+    max_warps = 16 if _is_hip else 32
+    num_warps = max(
+        min(triton.next_power_of_2(triton.cdiv(hidden_dim, 8 * 32)), max_warps), 4
+    )
+    _sigmoid_gate_mul_broadcast_kernel[(bs,)](
+        out,
+        gate,
+        x,
+        hidden_dim=hidden_dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return out
+
+
+@triton.jit
 def _fused_gate_sigmoid_mul_add_kernel(
     hidden_states_ptr,  # [num_tokens, hidden_dim]
     gate_weight_ptr,  # [hidden_dim]

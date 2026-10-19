@@ -23,7 +23,7 @@ DEVICE = "cuda"
     ],
 )
 def test_sigmoid_gate_mul_broadcast_correctness(shape, dtype):
-    from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (
+    from sglang.kernels.ops.elementwise.elementwise import (
         sigmoid_gate_mul_broadcast,
     )
 
@@ -42,7 +42,7 @@ def test_sigmoid_gate_mul_broadcast_correctness(shape, dtype):
 
 @pytest.mark.parametrize("shape", [(4, 4096), (1, 128)])
 def test_sigmoid_gate_mul_broadcast_does_not_modify_inputs(shape):
-    from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (
+    from sglang.kernels.ops.elementwise.elementwise import (
         sigmoid_gate_mul_broadcast,
     )
 
@@ -60,7 +60,7 @@ def test_sigmoid_gate_mul_broadcast_does_not_modify_inputs(shape):
 
 
 def test_sigmoid_gate_mul_broadcast_output_dtype():
-    from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (
+    from sglang.kernels.ops.elementwise.elementwise import (
         sigmoid_gate_mul_broadcast,
     )
 
@@ -72,7 +72,7 @@ def test_sigmoid_gate_mul_broadcast_output_dtype():
 
 
 def test_sigmoid_gate_mul_broadcast_contiguous_output():
-    from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (
+    from sglang.kernels.ops.elementwise.elementwise import (
         sigmoid_gate_mul_broadcast,
     )
 
