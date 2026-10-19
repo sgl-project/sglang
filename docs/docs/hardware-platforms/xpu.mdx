@@ -362,21 +362,61 @@ the `cuda_graph` tag is a no-op there.
 
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
-SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.
+SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](https://github.com/kvcache-ai/Mooncake) and [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backends. Both are covered by the XPU nightly P/D test.
 
-**Tested models:**
+**Tested configurations:**
 
-| Model | Notes |
-|:---:|:---:|
-| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Used in integration tests; verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
-| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+| Model | Backend | Notes |
+|:---:|:---:|:---:|
+| [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Mooncake (TENT, Level Zero IPC) | Used in the XPU nightly P/D test; homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | NIXL (UCX with Level Zero) | Used in the XPU nightly P/D test; homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | NIXL | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | NIXL | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
 
-**Prerequisites:** `pip install nixl sglang-router`
+### Mooncake backend
+
+Mooncake supports Intel XPU through its TENT engine. The PyPI `mooncake-transfer-engine` wheel does not include it, so either use the XPU Docker image, which builds Mooncake from a pinned upstream commit (see `docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`. The image builds Mooncake without its store (`-DWITH_STORE=OFF`), so the Mooncake store HiCache L3 backend (`--hicache-storage-backend mooncake`) is not available on XPU.
+
+**Prerequisites:** Mooncake with XPU support (above) and `pip install sglang-router`.
+
+Set `MC_USE_TENT=1` on both the prefill and decode servers, and leave `MOONCAKE_PROTOCOL` at its default. On one node, the TENT engine then copies KV card to card through Level Zero IPC, so no RDMA NIC is needed.
+
+Both servers must see both cards: give them the same `ZE_AFFINITY_MASK` and pick each server's card with `--base-gpu-id`. If a server cannot see the peer's card, TENT logs `... is on a device not visible here ... using another route` and does not copy card to card.
+
+Inside a container, run with `--cap-add SYS_PTRACE`, or `--privileged` as in the Docker example above. TENT imports the peer's buffer through `pidfd_getfd()`, which Docker blocks by default; without it TENT logs `cannot map peer buffer ... Operation not permitted ... using another route`, and requests still succeed but KV no longer goes card to card.
 
 **Start the prefill server (GPU 0):**
 
 ```bash
-ZE_AFFINITY_MASK=0 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+ZE_AFFINITY_MASK=0,1 MC_USE_TENT=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-1.5B-Instruct --trust-remote-code --device xpu \
+    --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
+```
+
+**Start the decode server (GPU 1):**
+
+```bash
+ZE_AFFINITY_MASK=0,1 MC_USE_TENT=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-1.5B-Instruct --trust-remote-code --device xpu --base-gpu-id 1 \
+    --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
+```
+
+Start the router and send a request as shown for NIXL below, using `Qwen/Qwen2.5-1.5B-Instruct` as the model.
+
+`SGLANG_MOONCAKE_CUSTOM_MEM_POOL` (`NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`) selects Mooncake's CUDA allocators and is CUDA-only; do not set it on XPU.
+
+### NIXL backend
+
+**Prerequisites:** NIXL on a UCX built with the Level Zero transport (`--with-ze`), and `pip install sglang-router`. The PyPI `nixl` wheel bundles a UCX without it, so either use the XPU Docker image, which builds UCX, Abseil, and NIXL from pinned upstream commits (see `docker/xpu.Dockerfile`), or build them from source the same way.
+
+Inside a container, run with `--cap-add SYS_PTRACE`, or `--privileged` as in the Docker example above: UCX's ze_ipc transport maps the peer's device memory through `pidfd_getfd()`, which Docker blocks by default, and the first transfer fails with `Operation not permitted`.
+
+**Start the prefill server (GPU 0):**
+
+```bash
+ZE_AFFINITY_MASK=0 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
     --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
     --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
@@ -385,7 +425,7 @@ ZE_AFFINITY_MASK=0 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
 **Start the decode server (GPU 1):**
 
 ```bash
-ZE_AFFINITY_MASK=1 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+ZE_AFFINITY_MASK=1 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
     --disaggregation-mode decode --disaggregation-transfer-backend nixl \
     --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
@@ -409,4 +449,4 @@ curl http://127.0.0.1:8000/v1/completions \
     -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "The capital of France is", "max_tokens": 32}'
 ```
 
-> **Note:** `UCX_POSIX_USE_PROC_LINK=n` is required on Intel XPU to avoid UCX shared-memory transport issues.
+> **Note:** If UCX's shared-memory transport fails to attach a peer's segment (it opens `/proc/<pid>/fd/<fd>`, which needs ptrace rights), set `UCX_POSIX_USE_PROC_LINK=n` to have it open the segment by its `/dev/shm` path instead.
