@@ -1563,8 +1563,8 @@ class Step5ForCausalLM(nn.Module):
         self.nvfp4_expert_layouts = self.model.nvfp4_expert_layouts
         self.tie_word_embeddings = False
         self.num_fused_shared_experts = 0
-        # Only the first load_weights call (the checkpoint) must cover every target weight;
-        # later calls are weight updates and, as for other models, may stream any subset.
+        # Only the checkpoint load must cover every target weight; later load_weights calls
+        # are weight updates and, as for other models, may stream any subset.
         self._checkpoint_loaded = False
         self._checkpoint_duplicate_names = frozenset()
         self.lm_head = ParallelLMHead(
@@ -1961,6 +1961,11 @@ class Step5ForCausalLM(nn.Module):
             if layer.use_moe and layer.moe.use_nvfp4_experts:
                 step5_check_nvfp4_expert_scales(layer.moe.experts, layer.moe.prefix)
         return original_names
+
+    def post_load_weights(self) -> None:
+        # Loaders that bypass load_weights (dummy, sharded state, remote) call this once
+        # their weights are in place, so the next load_weights is an update.
+        self._checkpoint_loaded = True
 
     @torch.no_grad()
     def forward(

@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
+from sglang.srt.model_loader.loader import post_load_weights
 from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
 from sglang.srt.models.step5_mtp import Step5MTP
@@ -36,12 +37,13 @@ class _RecordingParam:
         self._calls.append((self, weight, shard_id, expert_id))
 
 
-class _FakeStep5:
+class _FakeStep5(Step5ForCausalLM):
     """The attributes Step5ForCausalLM.load_weights reads, around one MoE layer and a norm.
 
     FP8 experts use 2x2 weight blocks so 4x4 test tensors span several scale blocks."""
 
     def __init__(self, *, bf16_experts: bool = False):
+        torch.nn.Module.__init__(self)
         self.calls = []
         fp8, fp32 = torch.float8_e4m3fn, torch.float32
         self.params = {
@@ -83,17 +85,11 @@ class _FakeStep5:
         assert name == _EXPERTS.rstrip(".")
         return self.experts
 
-    def _checkpoint_duplicate_owners(self, expected, model_path):
-        return Step5ForCausalLM._checkpoint_duplicate_owners(expected, model_path)
-
     def _indexed_duplicate_weights(self, weights, duplicates, model_path):
         self.duplicate_scans += 1
         return Step5ForCausalLM._indexed_duplicate_weights(
             weights, duplicates, model_path
         )
-
-    def load_weights(self, weights):
-        return Step5ForCausalLM.load_weights(self, weights)
 
     def expert_calls(self, param_name: str) -> list[tuple[str, int]]:
         param = self.params[_EXPERTS + param_name]
@@ -288,6 +284,19 @@ class TestStep5WeightUpdates(CustomTestCase):
                 model.load_weights(
                     [("model.norm.weight", norm), ("model.norm.weight", 2 * norm)]
                 )
+
+
+class TestStep5LoadersThatBypassLoadWeights(CustomTestCase):
+    def test_first_update_after_a_dummy_start_may_stream_a_subset(self):
+        """With --load-format dummy (or another loader that writes weights without
+        load_weights), the first streamed RL update is an update, not the checkpoint."""
+        model = _FakeStep5()
+        post_load_weights(model)
+
+        model.load_weights([("model.norm.weight", torch.ones(8, dtype=torch.bfloat16))])
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(model.duplicate_scans, 0)
 
 
 _MTP = "model.layers.92."

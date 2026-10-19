@@ -273,6 +273,10 @@ class Step3p7ForConditionalGeneration(nn.Module):
     def set_embed_and_head(self, embed, head):
         self.language_model.set_embed_and_head(embed, head)
 
+    def post_load_weights(self) -> None:
+        if isinstance(self.language_model, Step5ForCausalLM):
+            self.language_model.post_load_weights()
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         if get_step5_text_config(self.config) is not None:
             return self._load_step5_weights(weights)
