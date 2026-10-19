@@ -378,12 +378,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
         graph_key = self._make_graph_key(self.bs)
+        mla_dcp_graph = getattr(self, "mla_dcp_graph", False)
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify() and not self.mla_dcp_graph:
+            if forward_batch.forward_mode.is_target_verify() and not mla_dcp_graph:
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
                 # recompute from the live batch as before — reading the
@@ -412,7 +413,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens_cpu = forward_batch.seq_lens.cpu()
                 if forward_batch.forward_mode.is_target_verify():
                     seq_lens_cpu = seq_lens_cpu + self.captured_req_width
-                if self.mla_dcp_graph:
+                if mla_dcp_graph:
                     parallel = get_parallel()
                     seq_lens_cpu = get_dcp_lens(
                         seq_lens_cpu, parallel.dcp_size, parallel.dcp_rank

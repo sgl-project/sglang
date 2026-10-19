@@ -815,7 +815,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             indices,
             self.dcp_size,
             self.dcp_rank,
-            self.page_size if self.index_head_dim is not None else 1,
+            1
+            if getattr(self, "dcp_localizes_write_indices", False)
+            else self.page_size,
         )
         return local_indices[local_indices >= 0]
 
