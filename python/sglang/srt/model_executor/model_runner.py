@@ -732,6 +732,7 @@ class ModelRunner:
             model=self.model,
             hf_config=self.model_config.hf_config,
             capture_tail_hooks=self.capture_tail_hooks,
+            is_draft=self.is_draft_worker,
         )
 
     def init_memory_saver_adapter(self):

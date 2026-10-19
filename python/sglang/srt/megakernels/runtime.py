@@ -58,11 +58,12 @@ def install_megakernel(
     model: torch.nn.Module,
     hf_config: PretrainedConfig,
     capture_tail_hooks: list[Callable[..., None]],
+    is_draft: bool,
 ) -> None:
     """Build the model's spec and install its forward; runs before KV cache sizing."""
     if not megakernel_enabled():
         return
-    spec = _find_spec_on_every_rank(hf_config=hf_config)
+    spec = _find_spec_on_every_rank(hf_config=hf_config, is_draft=is_draft)
     if spec is None:
         return
     # Resolution checked the target's spec on the server arguments; a draft's spec
@@ -143,9 +144,10 @@ def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]
 
 
 def _find_spec_on_every_rank(
-    *, hf_config: PretrainedConfig
+    *, hf_config: PretrainedConfig, is_draft: bool
 ) -> Optional[MegakernelSpec]:
-    """The spec every rank found, None when no rank has one registered; else raise."""
+    """The spec every rank found; for a draft model, None when no rank has one
+    registered; else raise on every rank."""
     archs = hf_config.architectures
     spec, why = find_spec(architectures=archs, isa=device_isa())
     # Ranks branch together; one skipping the collectives below would hang its peers.
@@ -157,9 +159,18 @@ def _find_spec_on_every_rank(
         )
     )
     if not any(is_registered for is_registered, _, _ in lookups):
-        # A draft model may have no registered spec.
-        logger.info("NVIDIA megakernel: %s; %s keeps its own forward", why, archs)
-        return None
+        if is_draft:
+            # A draft model may have no registered spec.
+            logger.info("NVIDIA megakernel: %s; %s keeps its own forward", why, archs)
+            return None
+        # resolution found the target's spec, so the plugin failed to load here
+        _refuse(
+            [
+                f"{why} in the model workers, though argument resolution found it; "
+                "see 'Failed to load plugin' or 'Failed to execute general plugin' "
+                "above"
+            ]
+        )
     _refuse(
         [
             f"rank {rank}: {why}"
@@ -181,7 +192,8 @@ def _requirement_reasons(
     """The spec's requirements this runner can check without the server arguments."""
     req, tp_size = spec.requires, get_parallel().tp_size
     reasons = []
-    if tp_size not in req.tp_sizes:
+    # an empty set accepts any TP size, as at argument resolution
+    if req.tp_sizes and tp_size not in req.tp_sizes:
         reasons.append(f"tp_size {tp_size} is not one of {sorted(req.tp_sizes)}")
     graph = get_exec().graph.cuda_graph_config
     backend = Backend.DISABLED if graph is None else graph.decode.backend

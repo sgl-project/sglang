@@ -58,6 +58,9 @@ SPEC = MegakernelSpec(
     ),
 )
 
+# an empty field accepts any value
+EMPTY_TP_SPEC = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
+
 
 def server_args(**kw):
     """Arguments as the resolution step sees them, with the graph config resolved."""
@@ -131,6 +134,13 @@ class TestMegakernelGuards(CustomTestCase):
             spec, reasons = reasons_for(server_args(), arch=arch, isa=isa)
             self.assertIsNone(spec)
             self.assertIn(why, reasons[0])
+
+    def test_an_empty_tp_set_accepts_any_tp_size(self):
+        """Requirements: an empty field accepts any value (resolution check)."""
+        with patch.dict(registry._REGISTRY, clear=True):
+            registry.register(architecture=ARCH, path=f"{__name__}:EMPTY_TP_SPEC")
+            _, reasons = reasons_for(server_args(tp_size=8))
+        self.assertFalse(any("tp_size" in r for r in reasons), reasons)
 
     def test_a_plugin_that_registered_nothing_is_named(self):
         """A plugin that fails to load is only logged, so an empty registry must not

@@ -105,7 +105,14 @@ def server_args(**kw):
 
 
 def install(
-    *, archs=(ARCH,), gathered=None, tokens=2, graphs=True, hooks=None, lm=None
+    *,
+    archs=(ARCH,),
+    gathered=None,
+    tokens=2,
+    graphs=True,
+    hooks=None,
+    lm=None,
+    is_draft=False,
 ):
     """install_megakernel on an Lm as rank 0 of the published server; gathered maps
     a gathered value to what the other ranks report, default the same as this rank."""
@@ -126,6 +133,7 @@ def install(
             model=lm,
             hf_config=SimpleNamespace(architectures=list(archs)),
             capture_tail_hooks=hooks,
+            is_draft=is_draft,
         )
     return lm
 
@@ -226,14 +234,28 @@ class TestMegakernelRuntime(CustomTestCase):
         model = SimpleNamespace()  # any attribute read would raise
         with patch.object(runtime, "megakernel_enabled", return_value=False):
             runtime.install_megakernel(
-                model=model, hf_config=None, capture_tail_hooks=[]
+                model=model, hf_config=None, capture_tail_hooks=[], is_draft=False
             )
         self.assertEqual(vars(model), {})
 
-    def test_a_model_without_a_spec_on_every_rank_keeps_its_forward(self):
-        lm = install(archs=["DraftWithoutSpec"])
+    def test_a_draft_without_a_spec_on_every_rank_keeps_its_forward(self):
+        with self.assertLogs(runtime.logger, "INFO") as logs:
+            lm = install(archs=["DraftWithoutSpec"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIsNone(runtime.built_megakernel(lm))
+        self.assertIn("keeps its own forward", "".join(logs.output))
+
+    def test_a_target_without_a_spec_on_every_rank_is_refused(self):
+        """Resolution found the target's spec, but the plugin failed in every
+        worker: the flag must not silently run the model's own forward."""
+        with self.assertRaisesRegex(ValueError, "in the model workers"):
+            install(archs=["TargetWithoutSpec"])
+
+    def test_an_empty_tp_set_accepts_any_tp_size(self):
+        """Requirements: an empty field accepts any value (post-load check)."""
+        spec = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
+        reasons = runtime._requirement_reasons(spec=spec, hf_config=SimpleNamespace())
+        self.assertFalse(any("tp_size" in r for r in reasons), reasons)
 
     def test_every_rank_refuses_when_any_rank_cannot_serve(self):
         # rank 1 lacks the spec: rank 0 must raise too, or it waits in the build
