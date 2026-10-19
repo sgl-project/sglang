@@ -165,7 +165,16 @@ class KVArgsRegisterInfo:
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]):
+    def from_zmq(cls, msg: List[bytes], *, max_state_components: Optional[int] = None):
+        if len(msg) < 10:
+            raise ValueError(
+                f"registration requires at least 10 frames, got {len(msg)}"
+            )
+        for frame_index in (4, 5):
+            if len(msg[frame_index]) % 8 != 0:
+                raise ValueError(
+                    f"registration frame {frame_index} length must be divisible by 8"
+                )
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -173,15 +182,21 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
-            dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
+            dst_state_data_ptrs=unpack_int_lists(
+                msg[6], "Q", max_lists=max_state_components
+            ),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
             dst_state_item_lens=(
-                unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
+                unpack_int_lists(msg[10], "I", max_lists=max_state_components)
+                if len(msg) > 10
+                else []
             ),
             dst_state_dim_per_tensor=(
-                unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
+                unpack_int_lists(msg[11], "I", max_lists=max_state_components)
+                if len(msg) > 11
+                else []
             ),
             dst_kv_layer_ids=(
                 list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
@@ -189,7 +204,7 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_state_layer_ids=(
-                unpack_int_lists(msg[13], "I")
+                unpack_int_lists(msg[13], "I", max_lists=max_state_components)
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
@@ -885,6 +900,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     f"decode={mapped_dst_lens[layer_id]}"
                 )
         return None
+
+    def _parse_peer_registration(
+        self, msg: List[bytes]
+    ) -> Optional[Tuple[str, KVArgsRegisterInfo]]:
+        try:
+            registration = KVArgsRegisterInfo.from_zmq(
+                msg,
+                max_state_components=len(getattr(self.kv_args, "state_types", [])),
+            )
+        except (IndexError, UnicodeDecodeError, ValueError, struct.error) as exc:
+            logger.warning("Ignoring malformed Mooncake peer registration: %s", exc)
+            return None
+        return registration.mooncake_session_id, registration
 
     def _publish_peer_registration(
         self, mooncake_session_id: str, decode_kv_args: KVArgsRegisterInfo
@@ -2905,9 +2933,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    parsed_registration = self._parse_peer_registration(
+                        waiting_req_bytes
+                    )
+                    if parsed_registration is None:
+                        continue
+                    mooncake_session_id, decode_kv_args = parsed_registration
                     decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
@@ -2942,6 +2974,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     continue
                 else:
+                    mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
                     if room not in self.transfer_infos:

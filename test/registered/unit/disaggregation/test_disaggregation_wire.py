@@ -631,15 +631,62 @@ class TestDisaggregationWire(unittest.TestCase):
             b"2",
         ]
 
-        info = KVArgsRegisterInfo.from_zmq(msg)
+        info = KVArgsRegisterInfo.from_zmq(msg, max_state_components=0)
 
         self.assertEqual(info.staging_base_ptr, 0x3000)
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
         self.assertEqual(info.dst_kv_item_lens, [])
-        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        info = KVArgsRegisterInfo.from_zmq(
+            msg + [b"", struct.pack("Q", 128)], max_state_components=0
+        )
         self.assertEqual(info.dst_kv_item_lens, [128])
+
+    def test_mooncake_registration_rejects_state_component_amplification(self):
+        declared_lists = 100_000
+        oversized_state_frame = struct.pack("<I", declared_lists) + bytes(
+            4 * declared_lists
+        )
+        msg = [
+            b"None",
+            b"127.0.0.1",
+            b"1234",
+            b"untrusted-session",
+            struct.pack("Q", 0x1000),
+            struct.pack("Q", 0x2000),
+            oversized_state_frame,
+            b"0",
+            b"1",
+            b"128",
+        ]
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(state_types=[])
+
+        with self.assertLogs(
+            "sglang.srt.disaggregation.mooncake.conn", level="WARNING"
+        ) as logs:
+            self.assertIsNone(manager._parse_peer_registration(msg))
+
+        self.assertIn(
+            "buffer-list count 100000 exceeds limit 0", "\n".join(logs.output)
+        )
+
+    def test_unpack_list_of_buffers_rejects_malformed_frames(self):
+        malformed = (
+            b"\x00",
+            struct.pack("<II", 2, 0),
+            struct.pack("<II", 1, 2) + b"x",
+            struct.pack("<II", 1, 1) + b"xy",
+        )
+        for frame in malformed:
+            with self.subTest(frame=frame):
+                with self.assertRaises(ValueError):
+                    unpack_list_of_buffers(frame)
+
+        misaligned_ints = pack_list_of_buffers([b"\x00"])
+        with self.assertRaisesRegex(ValueError, "not divisible by 8"):
+            unpack_int_lists(misaligned_ints, "Q")
 
     def test_int_lists_roundtrip(self):
         cases = [
