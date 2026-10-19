@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
 )
@@ -82,6 +83,32 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
             self.assertFalse(kwargs["ssl"])
+
+
+class TestWarmupWithImage(unittest.TestCase):
+    def _choose(self, *, replay, cuda, has_image=True):
+        disagg = SimpleNamespace(language_only=False, language_model_only=False)
+        exec_ = SimpleNamespace(
+            features=SimpleNamespace(enable_encoder_swa_bounded_replay=replay)
+        )
+        with (
+            patch.object(http_server, "get_disagg", return_value=disagg),
+            patch.object(http_server, "get_exec", return_value=exec_),
+            patch.object(
+                http_server, "get_platform", return_value=SimpleNamespace(is_cuda=cuda)
+            ),
+            patch.object(http_server, "is_mps", return_value=False),
+        ):
+            return http_server._warmup_with_image(
+                {"has_image_understanding": has_image}
+            )
+
+    def test_encoder_replay_warms_images_on_cuda_only(self):
+        # Encoder SWA bounded replay rejects image requests off CUDA.
+        self.assertTrue(self._choose(replay=True, cuda=True))
+        self.assertFalse(self._choose(replay=True, cuda=False))
+        self.assertTrue(self._choose(replay=False, cuda=False))
+        self.assertFalse(self._choose(replay=True, cuda=True, has_image=False))
 
 
 if __name__ == "__main__":
