@@ -35,7 +35,7 @@ use super::pd_routing::PDRoutingFields;
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreCall, CoreEvent};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -50,10 +50,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(super) struct ChatRequest {
     #[serde(flatten)]
-    request: CreateChatCompletionRequest,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    pub(super) request: CreateChatCompletionRequest,
+    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -72,12 +72,8 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if request.model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{}` does not exist", request.model),
-            false,
-        );
+    if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
@@ -195,11 +191,7 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    // V4 prefills <think>, so the generated stream has no opening marker.
-    let starts_in_reasoning = matches!(
-        reasoning_parser.as_deref(),
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4")
-    ) && prompt.ends_with("<think>");
+    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
     let mut prompt = Some(prompt);
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -492,7 +484,7 @@ pub(super) async fn unary_chat(
             reasoning_parser.as_deref(),
             &reasoning_options,
             &output.text,
-            &output.token_ids,
+            output.stop_trimmed_token_ids(),
         );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
@@ -630,7 +622,7 @@ pub(super) fn chat_event_stream(
             let mut emitted = Vec::with_capacity(2);
             if reasoning_enabled {
                 let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
+                    reasoning_splitters[index].split(&output.text, output.stop_trimmed_token_ids());
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {
@@ -756,7 +748,9 @@ pub(super) fn chat_event_stream(
     };
 
     async_stream::stream! {
-        let mut tool_calls_seen = vec![false; count];
+        // Each choice's first tool call, whose deltas (a name and argument
+        // fragments, for some parsers) alone pass without parallel tool calls.
+        let mut first_tool_call: Vec<Option<u32>> = vec![None; count];
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(response) = item.data.as_mut() {
@@ -764,15 +758,13 @@ pub(super) fn chat_event_stream(
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
                         if let Some(calls) = choice.delta.tool_calls.as_mut() {
-                            if tool_calls_seen.get(index).copied().unwrap_or(false) {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                                if !calls.is_empty()
-                                    && let Some(seen) = tool_calls_seen.get_mut(index)
-                                {
-                                    *seen = true;
-                                }
+                            let seen = first_tool_call.get(index).copied().flatten();
+                            let first = seen.or(calls.first().map(|call| call.index));
+                            calls.retain(|call| Some(call.index) == first);
+                            if let (Some(first), Some(slot)) = (first, first_tool_call.get_mut(index))
+                                && !calls.is_empty()
+                            {
+                                *slot = Some(first);
                             }
                             if calls.is_empty() {
                                 choice.delta.tool_calls = None;
@@ -854,12 +846,21 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
+fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        merge_template_stops, starts_in_reasoning, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
@@ -873,6 +874,30 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn prefilled_think_starts_in_reasoning() {
+        let glm = Some("glm45");
+        assert!(starts_in_reasoning(glm, "<|user|>hi<|assistant|><think>"));
+        assert!(!starts_in_reasoning(
+            glm,
+            "<|user|>hi<|assistant|><think></think>"
+        ));
+        let qwen = Some("qwen3");
+        assert!(starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n"
+        ));
+        assert!(!starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(starts_in_reasoning(
+            Some("deepseek-v4"),
+            "<｜Assistant｜><think>"
+        ));
+        assert!(!starts_in_reasoning(None, "<think>\n"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
@@ -1229,6 +1254,7 @@ mod tests {
                     .unwrap();
             let state = Arc::new(super::super::AppState {
                 core,
+                generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
                 chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
             });

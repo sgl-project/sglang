@@ -1398,18 +1398,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
-        components = self.components
-        if self.is_write_back:
-            swa = self.components_by_type.get(ComponentType.SWA)
-            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in components
+            for component in self.components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
+        if self.is_write_back:
+            return False
         if state.is_new_leaf:
             leaf_end = state.total_prefix_length + len(state.target_node.key)
             return (
@@ -2786,7 +2784,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             remaining = remaining[prefix_len:]
 
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
         """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
         ranges: list[tuple[int, int]] = []
@@ -2794,7 +2796,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             seg_end = pos + prefix_len
             if seg_end <= start:
                 continue
-            if child.component_data[ComponentType.SWA].value is not None:
+            if child.component_data[component_type].value is not None:
                 continue
             lo, hi = max(start, pos), min(end, seg_end)
             if ranges and ranges[-1][1] == lo:
@@ -2811,6 +2813,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA slice to an existing tombstoned tree span."""
         assert len(swa_values) == window_end - window_start, (
@@ -2825,7 +2828,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 continue
             seg_start = max(pos, window_start)
             assign_end = min(seg_end, window_end)
-            assert child.component_data[ComponentType.SWA].value is None, (
+            assert child.component_data[component_type].value is None, (
                 f"attach_swa_window over live SWA at [{seg_start}, {assign_end}) "
                 f"of [{window_start}, {window_end})"
             )
@@ -2836,6 +2839,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 assign_end,
                 swa_values[seg_start - window_start : assign_end - window_start],
                 actions,
+                component_type,
             )
             covered = assign_end
             if covered >= window_end:
@@ -2853,6 +2857,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         seg_end: int,
         values: torch.Tensor,
         actions: list[CacheAction | ComponentAction],
+        component_type: ComponentType,
     ) -> None:
         target = node
         if seg_start > node_start:
@@ -2864,7 +2869,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if action is not None:
                 actions.append(action)
             target = fragment
-        self.set_component_device_value(target.id, ComponentType.SWA, values.clone())
+        self.set_component_device_value(target.id, component_type, values.clone())
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

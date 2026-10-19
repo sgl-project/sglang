@@ -402,10 +402,16 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float], num_tokens: int):
-        """The packed FlashInfer prefill kernel requires more than one token."""
+    def effective_extend_kernel(
+        self, lower_bound: Optional[float], num_tokens: int, num_seqs: int = 1
+    ):
+        """The packed FlashInfer prefill kernel requires more than one token per
+        sequence. A batch where every sequence extends exactly one token (e.g.
+        retracted requests re-entering with a fully cached prefix) would fall to
+        FlashInfer's grouped recurrent kernel, which only accepts a bf16 state
+        pool; the KDA pool is fp32, so route those batches to Triton."""
         kernel = self.extend_kernel
-        if self.prefill_backend.is_flashinfer() and num_tokens <= 1:
+        if self.prefill_backend.is_flashinfer() and num_tokens <= max(num_seqs, 1):
             return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
             kernel = self.triton_kernel
@@ -424,7 +430,9 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"), q.shape[1])
+        kernel = self.effective_extend_kernel(
+            kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
+        )
         return kernel.extend(
             q,
             k,
@@ -1110,7 +1118,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound, q.shape[1]
+                layer.lower_bound, q.shape[1], query_start_loc.numel() - 1
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "
