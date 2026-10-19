@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -145,15 +146,16 @@ class TestRunningTimeout(CustomTestCase):
         enter_scope(self, published_topology())
 
     def test_dllm_running_timeout_for_manager_held_reqs(self):
-        """Started requests must remain timeout-eligible between denoising rounds."""
+        """Between-round timeouts must preserve their reason through abort cleanup."""
         now = time.perf_counter()
         stale = _req("stale", forward_entry=now - 10)
         fresh = _req("fresh", forward_entry=now)
         unstarted = _req("unstarted", forward_entry=0.0)
         reqs = [stale, fresh, unstarted]
         s = _scheduler([])
-        s.dllm_config = SimpleNamespace()
-        s.dllm_manager = SimpleNamespace(waiting_queue=list(reqs))
+        s.dllm_config = SimpleNamespace(max_running_requests=3)
+        s.dllm_manager = DllmManager(s.dllm_config)
+        s.dllm_manager.waiting_queue = list(reqs)
 
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
@@ -163,6 +165,33 @@ class TestRunningTimeout(CustomTestCase):
             self.assertEqual([a.rid for a in s._poll_timeout_aborts()], ["stale"])
 
         self.assertEqual(s.dllm_manager.waiting_queue, reqs)
+        s.running_batch = _batch([])
+        s.chunked_req = None
+        s.mm_receiver = None
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.grammar_manager = MagicMock()
+        s.tree_cache = MagicMock(spec=["finish"])
+        stale.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        with patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        ):
+            s.abort_request(aborts[0])
+
+        sent_abort, sent_req = (
+            s.ipc_channels.send_to_tokenizer.send_output.call_args.args
+        )
+        self.assertIs(sent_req, stale)
+        self.assertEqual(sent_abort.rid, "stale")
+        self.assertEqual(
+            sent_abort.finished_reason,
+            {
+                "type": "abort",
+                "status_code": 503,
+                "message": "Request running timeout reached.",
+            },
+        )
+        self.assertEqual(s.dllm_manager.waiting_queue, [fresh, unstarted])
 
     def test_emits_only_stale_unfinished_reqs_without_marking(self):
         now = time.perf_counter()
