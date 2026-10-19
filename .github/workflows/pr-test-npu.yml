@@ -889,20 +889,46 @@ jobs:
             python3 -m coverage html --rcfile=/tmp/report-rc \
             --directory="${REPORT_DIR}"
 
-          # Surface the total directly on the run page.
+          # NPU-only view, generated in parallel with the full report:
+          # denominator = the whole hardware_backend/npu tree, files never
+          # imported by the traced processes count as 0% ([run] source
+          # semantics). source has no report-time CLI flag, so it needs a
+          # separate rcfile; putting it in /tmp/report-rc would shrink the
+          # full report's scope too. [paths] is shared so measured files
+          # still resolve to the covstub copy.
+          {
+            echo "[run]"
+            echo "branch = True"
+            echo "source = ${COVSTUB}/sglang/srt/hardware_backend/npu"
+            echo "[paths]"
+            echo "sglang ="
+            echo "    ${COVSTUB}/sglang/"
+            echo "    */python/sglang/"
+          } > /tmp/report-rc-npu
+          rm -rf "${REPORT_DIR}-npu"
+          COVERAGE_FILE=/tmp/.coverage-all \
+            python3 -m coverage html --rcfile=/tmp/report-rc-npu \
+            --directory="${REPORT_DIR}-npu"
+
+          # Surface the totals directly on the run page.
           # GITHUB_STEP_SUMMARY may be unset on the k8s runner pool.
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             {
               echo "### Coverage"
               echo '```'
+              echo "python/sglang (measured files only):"
               COVERAGE_FILE=/tmp/.coverage-all \
                 python3 -m coverage report --rcfile=/tmp/report-rc | tail -n 1
+              echo "python/sglang/srt/hardware_backend/npu (full-tree denominator):"
+              COVERAGE_FILE=/tmp/.coverage-all \
+                python3 -m coverage report --rcfile=/tmp/report-rc-npu | tail -n 1
               echo '```'
-              echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`index.html\`."
+              echo "Full line-by-line report: download the \`coverage-html-report\` artifact and open \`htmlcov/index.html\` (NPU-only view: \`htmlcov-npu/index.html\`)."
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
 
           echo "HTML coverage report: ${REPORT_DIR}"
+          echo "NPU-only HTML coverage report: ${REPORT_DIR}-npu"
 
       - name: Upload HTML coverage report
         # Report upload must never block the baseline publish pipeline.
@@ -910,7 +936,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-html-report
-          path: /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/htmlcov
+          # Two paths -> artifact root becomes the run dir, so the archive
+          # holds htmlcov/ and htmlcov-npu/ side by side.
+          path: |
+            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/htmlcov
+            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/htmlcov-npu
           if-no-files-found: ignore
 
       - name: Archive outputs
@@ -945,12 +975,20 @@ jobs:
           mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
           mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
 
-          # Also keep the HTML report on the shared disk, one tar.gz per run
-          # (packaged to avoid flooding the disk with many small HTML files).
-          # Old copies accumulate; prune manually when needed.
+          # Also keep the HTML reports on the shared disk. Fixed names (no
+          # run-id suffix): only the latest run's reports are kept, old ones
+          # are replaced — same retention semantics as the baseline above.
+          # The [ -d ] guards cover the continue-on-error generation step:
+          # when html/htmlcov-npu was not produced, packaging is skipped and
+          # the baseline publish proceeds. A tar failure itself still aborts
+          # this step red (same exposure as the pre-existing full-report
+          # tar): by then the baseline mv has already completed, and the
+          # skipped Cleanup keeps RUN_DIR around for manual recovery.
           if [ -d "${RUN_DIR}/htmlcov" ]; then
-            tar -czf "${PUBLISH_DIR}/htmlcov-${{ github.run_id }}-attempt-${{ github.run_attempt }}.tar.gz" \
-              -C "${RUN_DIR}" htmlcov
+            tar -czf "${PUBLISH_DIR}/htmlcov.tar.gz" -C "${RUN_DIR}" htmlcov
+          fi
+          if [ -d "${RUN_DIR}/htmlcov-npu" ]; then
+            tar -czf "${PUBLISH_DIR}/htmlcov-npu.tar.gz" -C "${RUN_DIR}" htmlcov-npu
           fi
 
           echo "Published baseline to ${PUBLISH_DIR}"
