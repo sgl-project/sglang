@@ -128,7 +128,7 @@ def _worker(rank, devices, port, dtype, large):
     ):
         # Non-contiguous layer IDs and different intermediate widths catch
         # incorrect layer-index-based slot assignment and view sizing.
-        model = torch.nn.ModuleList()
+        moe_layers = []
         refs = []
         int8 = dtype == torch.int8
         input_dtype = torch.bfloat16 if int8 else dtype
@@ -137,7 +137,7 @@ def _worker(rank, devices, port, dtype, large):
             width = (2048 + 256 * (pos // 2)) if large else 64 * (1 + pos % 2)
             if int8:
                 with torch.device(f"npu:{devices[rank]}"):
-                    model.append(_int8_layer(layer_id, hidden, width, rank, large))
+                    moe_layers.append(_int8_layer(layer_id, hidden, width, rank, large))
                     refs.append(_int8_layer(layer_id, hidden, width, None, large))
                 continue
             with torch.device(f"npu:{devices[rank]}"):
@@ -169,7 +169,11 @@ def _worker(rank, devices, port, dtype, large):
                 weight.data = torch_npu.npu_format_cast(weight.data, 29 if large else 2)
                 assert torch_npu.get_npu_format(weight) == (29 if large else 2)
             refs.append((w13.to(dtype).float(), w2.to(dtype).float(), b13, b2))
-            model.append(layer)
+            moe_layers.append(layer)
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(10)])
+        for layer in moe_layers:
+            model.layers[layer.layer_id] = layer
         manager = DwdpManager(args)
         original_migrate = manager._migrate_weight
         migrated = []
@@ -190,7 +194,8 @@ def _worker(rank, devices, port, dtype, large):
 
         with patch.object(NPUWeightVMM, "_map", record_map):
             manager.setup(model)
-        assert len(migrated) == len(model) * 2
+        assert manager._moe_layer_indices == [2, 4, 7, 9]
+        assert len(migrated) == len(moe_layers) * 2
         if large:
             pool = manager._vmm._page_pool
             assert all(pool.num_pages(slot) >= 2 for slot in (0, 1))
@@ -209,7 +214,7 @@ def _worker(rank, devices, port, dtype, large):
         # Every size uses the same remote-expert copy path, including remote
         # bytes inside local boundary pages. Large weights also reuse remote
         # page slots across layers and exercise partial-page local shards.
-        assert len(manager._peer_views) == len(model) * 2
+        assert len(manager._peer_views) == len(moe_layers) * 2
         for (peer, li, name), view in manager._peer_views.items():
             assert peer != rank
             spec = manager._specs[li, name]
@@ -220,7 +225,7 @@ def _worker(rank, devices, port, dtype, large):
             (layer.layer_id, name): getattr(layer, name)[rank * 2 : (rank + 1) * 2]
             .cpu()
             .clone()
-            for layer in model
+            for layer in moe_layers
             for name in ("w13_weight", "w2_weight")
         }
         for li, name in local_snapshots:
@@ -235,7 +240,7 @@ def _worker(rank, devices, port, dtype, large):
                     dst.fill_(-77)
             torch.npu.synchronize()
             manager.prefetch_first_layers()
-            for layer, reference in zip(model, refs):
+            for layer, reference in zip(moe_layers, refs):
                 tokens = 3 + step + rank
                 gen = torch.Generator().manual_seed(900 + step + rank)
                 x = (torch.randn(tokens, hidden, generator=gen) * 0.1).to(input_dtype)
@@ -271,7 +276,7 @@ def _worker(rank, devices, port, dtype, large):
                         )
                         expected[token] += weights[token, k].float() * val
                 torch.testing.assert_close(out, expected, rtol=0.04, atol=5e-4)
-            for layer in model:
+            for layer in moe_layers:
                 for name in ("w13_weight", "w2_weight"):
                     saved = local_snapshots[layer.layer_id, name]
                     torch.testing.assert_close(

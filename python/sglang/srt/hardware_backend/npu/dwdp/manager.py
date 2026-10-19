@@ -13,6 +13,7 @@ import socket
 import torch
 import torch.distributed as dist
 
+from sglang.srt.layers.moe.dwdp.layer_utils import collect_moe_layers
 from sglang.srt.layers.moe.dwdp.layout import WeightSpec
 from sglang.srt.layers.moe.dwdp.weight_manager import (
     DwdpPrefetch,
@@ -56,18 +57,7 @@ class NPUDwdpManager(DwdpPrefetch):
         dist.all_gather_object(values, value, group=self.group.cpu_group)
         return values
 
-    @staticmethod
-    def _collect_moe_layers(model):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-        return sorted(
-            (
-                (layer.layer_id, layer)
-                for layer in model.modules()
-                if isinstance(layer, FusedMoE)
-            ),
-            key=lambda item: item[0],
-        )
+    _collect_moe_layers = staticmethod(collect_moe_layers)
 
     def _validate(self, layers):
         from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
@@ -81,8 +71,6 @@ class NPUDwdpManager(DwdpPrefetch):
         }
         if not layers:
             raise ValueError("NPU DWDP requires at least one FusedMoE layer")
-        if len({li for li, _ in layers}) != len(layers):
-            raise ValueError("NPU DWDP requires unique MoE layer IDs")
         for li, layer in layers:
             if layer.moe_ep_size != self.dwdp_size or layer.moe_tp_size != 1:
                 raise ValueError("NPU DWDP requires EP=DWDP=TP and MoE TP=1")

@@ -1,7 +1,9 @@
 """NPU DWDP page coverage and failure cleanup without accelerator hardware."""
 
+import ast
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -18,6 +20,72 @@ from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_shared_layer_discovery_preserves_cuda_scope(monkeypatch, wrapped):
+    from sglang.srt.layers.moe.dwdp.layer_utils import collect_moe_layers
+
+    class MoE(torch.nn.Module):
+        def __init__(self, layer_id):
+            super().__init__()
+            self.layer_id = layer_id
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.moe.fused_moe_triton.layer",
+        NS(FusedMoE=MoE),
+    )
+    first, second, last = MoE(91), MoE(5), MoE(-7)
+    decoder = torch.nn.Module()
+    decoder.layers = torch.nn.ModuleList(
+        [
+            torch.nn.Identity(),
+            torch.nn.Sequential(first, second),
+            torch.nn.Identity(),
+            last,
+        ]
+    )
+    decoder.outside_layers = MoE(42)
+    model = torch.nn.Module()
+    model.model, model.outside_decoder = decoder, MoE(100)
+    # Preserve decoder indices and the first MoE per layer, even when actual
+    # layer_id values disagree. Do not expand discovery to other modules.
+    assert collect_moe_layers(model if wrapped else decoder) == [
+        (1, first),
+        (3, last),
+    ]
+    assert NPUDwdpManager._collect_moe_layers is collect_moe_layers
+    assert (
+        collect_moe_layers(NS(layers=torch.nn.ModuleList([torch.nn.Identity()]))) == []
+    )
+    with pytest.raises(AttributeError):
+        collect_moe_layers(torch.nn.ModuleList([first]))
+
+
+def test_cuda_manager_binds_shared_layer_discovery():
+    from sglang.srt.layers.moe.dwdp import layer_utils
+
+    # Inspect the CUDA class without importing its driver-only dependencies.
+    source = Path(layer_utils.__file__).with_name("dwdp_manager.py").read_text()
+    tree = ast.parse(source)
+    manager = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+    binding = next(
+        node
+        for node in manager.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_collect_moe_layers"
+            for target in node.targets
+        )
+    )
+    assert ast.unparse(binding.value) == "staticmethod(collect_moe_layers)"
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "sglang.srt.layers.moe.dwdp.layer_utils"
+        and any(alias.name == "collect_moe_layers" for alias in node.names)
+        for node in tree.body
+    )
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2])

@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.layers.moe.dwdp.layer_utils import collect_moe_layers
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     build_layer_weight_specs,
@@ -143,17 +144,7 @@ class DwdpManager:
             self._weight_manager.release()
             self._weight_manager = None
 
-    @staticmethod
-    def _collect_moe_layers(model: nn.Module) -> List[Tuple[int, FusedMoE]]:
-        decoder = model.model if hasattr(model, "model") else model
-        moe_layers = []
-        for layer_idx, layer in enumerate(decoder.layers):
-            experts = next(
-                (m for m in layer.modules() if isinstance(m, FusedMoE)), None
-            )
-            if experts is not None:
-                moe_layers.append((layer_idx, experts))
-        return moe_layers
+    _collect_moe_layers = staticmethod(collect_moe_layers)
 
     def _fill_edge_bytes(
         self,
