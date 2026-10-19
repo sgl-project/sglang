@@ -277,6 +277,20 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
+        # FA3 kernels stop at head_dim 256; wider MHA layers (Gemma-4 full
+        # attention, 512) run FA4 while the rest of the model stays on FA3.
+        # Absorbed MLA is wider too but is a native FA3 path. _ver_for routes
+        # per layer; this attribute covers the model-level init decisions.
+        model_head_dim = model_runner.model_config.head_dim
+        self.fa3_upgrades_to_fa4 = (
+            self.fa_impl_ver == 3 and not self.use_mla and model_head_dim > 256
+        )
+        if self.fa3_upgrades_to_fa4 and self.kv_cache_dtype != torch.bfloat16:
+            raise ValueError(
+                f"FA4 has no {self.kv_cache_dtype_str} KV cache path on SM90, and "
+                f"the fa3 backend runs head_dim {model_head_dim} layers on FA4. "
+                "Use a BF16 KV cache."
+            )
         device_capability = get_device_capability()
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
@@ -380,6 +394,17 @@ class FlashAttentionBackend(AttentionBackend):
             _should_disable_scheduler_metadata_precompute()
         )
 
+    def _ver_for(self, layer: RadixAttention, *, needs_fa4: bool = False) -> int:
+        # FA3 kernels stop at head_dim 256; image masks exist only in FA4.
+        # Absorbed MLA reports head_dim 576 but runs FA3 at 64 + qv 512.
+        if (
+            self.fa_impl_ver == 3
+            and not self.use_mla
+            and (needs_fa4 or max(layer.head_dim, layer.v_head_dim) > 256)
+        ):
+            return 4
+        return self.fa_impl_ver
+
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
     ) -> Optional[LocalAttentionMetadataBuilder]:
@@ -416,6 +441,10 @@ class FlashAttentionBackend(AttentionBackend):
         if self._get_scheduler_metadata is None or self.use_mla:
             return None
         if self._disable_scheduler_metadata_precompute:
+            return None
+        # Sized from the model-level head_dim, which FA3 rejects above 256; the
+        # only consumers (non-SWA layers) run FA4 then anyway.
+        if self.fa3_upgrades_to_fa4:
             return None
         # Always use window_size=(-1, -1) because scheduler_metadata is only
         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
@@ -1415,6 +1444,7 @@ class FlashAttentionBackend(AttentionBackend):
         logical_batch_size: int,
         kv_head_num: int,
         is_prefill: bool,
+        ver: int,
     ) -> tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -1427,7 +1457,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
-            and (not is_prefill or self.fa_impl_ver != 4)
+            and (not is_prefill or ver != 4)
         ):
             if layer.k_scale is not None:
                 descale_shape = (logical_batch_size, kv_head_num)
@@ -1494,7 +1524,10 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_event=None,
         return_lse: bool = False,
     ):
-        if score_mod is not None and self.fa_impl_ver != 4:
+        ver = self._ver_for(
+            layer, needs_fa4=self.forward_metadata.image_token_ranges is not None
+        )
+        if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if return_lse and self.use_mla:
             raise NotImplementedError("MLA extend does not return an LSE.")
@@ -1577,6 +1610,7 @@ class FlashAttentionBackend(AttentionBackend):
             logical_batch_size=forward_batch.batch_size,
             kv_head_num=layer.tp_k_head_num,
             is_prefill=True,
+            ver=ver,
         )
         use_local_attn = (
             self.local_attn_builder is not None
@@ -1601,7 +1635,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["aux_tensors"] = aux_tensors
         if metadata.image_token_ranges is not None:
             if (
-                self.fa_impl_ver != 4
+                ver != 4
                 or cp_active
                 or use_local_attn
                 or use_cascade_attn
@@ -1631,7 +1665,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
         if rel_bias is not None:
-            if self.fa_impl_ver != 4:
+            if ver != 4:
                 raise RuntimeError(
                     "rel_bias (sheared bias) is only supported by the FA4 backend."
                 )
@@ -1716,7 +1750,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softcap=layer.logit_cap,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
-                        ver=self.fa_impl_ver,
+                        ver=ver,
                         **kwargs,
                     )
 
@@ -1802,7 +1836,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=self.num_splits,
                     out=_fa_out,
-                    ver=self.fa_impl_ver,
+                    ver=ver,
                     **kwargs,
                 )
 
@@ -1859,7 +1893,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
+                    ver=ver,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1900,7 +1934,7 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=False,
                         return_softmax_lse=True,
                         out=_fa_out,
-                        ver=self.fa_impl_ver,
+                        ver=ver,
                         **kwargs,
                     )
                 else:
@@ -1927,7 +1961,7 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
                         out=_fa_out,
-                        ver=self.fa_impl_ver,
+                        ver=ver,
                         **kwargs,
                     )
                 if forward_batch.mha_return_lse:
@@ -1996,7 +2030,7 @@ class FlashAttentionBackend(AttentionBackend):
                             k_descale=fa_k_descale,
                             v_descale=fa_v_descale,
                             num_splits=self.num_splits,
-                            ver=self.fa_impl_ver,
+                            ver=ver,
                         )
 
                     cp_strategy = get_cp_strategy()
@@ -2026,7 +2060,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_descale=fa_v_descale,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
-                        ver=self.fa_impl_ver,
+                        ver=ver,
                     )
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
@@ -2049,7 +2083,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 v_descale=fa_v_descale,
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
-                                ver=self.fa_impl_ver,
+                                ver=ver,
                             )
                         )
                         o, _ = merge_state_v2_wrapper(
@@ -2089,7 +2123,8 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_event=None,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        if score_mod is not None and self.fa_impl_ver != 4:
+        ver = self._ver_for(layer)
+        if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if return_lse and self.use_mla:
             raise NotImplementedError("MLA decode does not return an LSE.")
@@ -2158,7 +2193,7 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["aux_tensors"] = aux_tensors
         kwargs.update(self._mxfp8_sf_kwargs(layer, forward_batch, q_descale))
         if rel_bias is not None:
-            if self.fa_impl_ver != 4:
+            if ver != 4:
                 raise RuntimeError(
                     "rel_bias (sheared bias) is only supported by the FA4 backend."
                 )
@@ -2191,6 +2226,7 @@ class FlashAttentionBackend(AttentionBackend):
             logical_batch_size=forward_batch.batch_size,
             kv_head_num=layer.tp_k_head_num,
             is_prefill=False,
+            ver=ver,
         )
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
@@ -2220,7 +2256,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
+                    ver=ver,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -2241,7 +2277,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
+                    ver=ver,
                     **kwargs,
                 )
             else:
@@ -2303,7 +2339,7 @@ class FlashAttentionBackend(AttentionBackend):
                         else self.num_splits
                     ),
                     out=_fa_out,
-                    ver=self.fa_impl_ver,
+                    ver=ver,
                     scheduler_metadata=sched_meta,
                     **kwargs,
                 )
@@ -2333,7 +2369,7 @@ class FlashAttentionBackend(AttentionBackend):
                             softcap=layer.logit_cap,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
-                            ver=self.fa_impl_ver,
+                            ver=ver,
                             **kwargs,
                         )
                     )
@@ -2380,7 +2416,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=fa_v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
-                ver=self.fa_impl_ver,
+                ver=ver,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -2402,7 +2438,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=fa_v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
+                    ver=ver,
                 )
                 o, _ = merge_state_v2(
                     o,

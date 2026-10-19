@@ -1658,6 +1658,74 @@ class TestFlashAttention4SM90(CustomTestCase):
                     out.float(), torch.cat(refs), atol=0.01, rtol=0.01
                 )
 
+    def test_fa3_matches_fa4_on_gemma4_swa_layer(self):
+        """FA3 and FA4 agree on a Gemma-4 sliding-window layer (hd256, window 1023).
+
+        The fa3 backend keeps these layers on FA3 while the hd512 full layers
+        run FA4 (fa_utils-style upgrade), so both kernels
+        must read the paged KV and the window edge identically, for decode and
+        for an MTP verify step, with contexts shorter and longer than the window.
+        """
+        window = (1023, 0)
+        lengths = (9, 700, 1024, 2900)
+        for page_size, q_len in itertools.product((1, 64), (1, 5)):
+            with self.subTest(page=page_size, q_len=q_len):
+                torch.manual_seed(7)
+                batch = len(lengths)
+                pages_per_seq = (max(lengths) + page_size - 1) // page_size
+                table = (
+                    torch.randperm(batch * pages_per_seq, device="cuda")
+                    .reshape(batch, -1)
+                    .int()
+                )
+                q = (
+                    torch.randn(
+                        batch * q_len, 32, 256, device="cuda", dtype=torch.bfloat16
+                    )
+                    * 0.3
+                )
+                k = (
+                    torch.randn(
+                        batch * pages_per_seq,
+                        page_size,
+                        16,
+                        256,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    * 0.3
+                )
+                v = torch.randn_like(k) * 0.3
+                # Large +-V on the keys at each query's window edge, so a window
+                # off by one key moves the output well past the tolerance.
+                for b, length in enumerate(lengths):
+                    for key in range(length - q_len - 1024, length - 1023):
+                        if key >= 0:
+                            page = table[b, key // page_size]
+                            v[page, key % page_size] = 20.0 if key % 2 else -20.0
+                outs = [
+                    flash_attn_with_kvcache(
+                        q,
+                        k,
+                        v,
+                        page_table=table,
+                        cache_seqlens=torch.tensor(
+                            lengths, device="cuda", dtype=torch.int32
+                        ),
+                        cu_seqlens_q=torch.arange(
+                            0, (batch + 1) * q_len, q_len, device="cuda"
+                        ).int(),
+                        max_seqlen_q=q_len,
+                        softmax_scale=256**-0.5,
+                        causal=True,
+                        window_size=window,
+                        num_splits=0,
+                        ver=ver,
+                    )
+                    for ver in (3, 4)
+                ]
+                torch.testing.assert_close(outs[0], outs[1], atol=1e-2, rtol=1e-2)
+
     def test_image_mask(self):
         """Future tokens are visible only within one image, also after a prefix.
 
