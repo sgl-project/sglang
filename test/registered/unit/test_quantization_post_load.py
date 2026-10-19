@@ -9,7 +9,7 @@ from sglang.srt.model_loader.loader import device_loading_context
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
 def _process_device() -> torch.device | None:
@@ -140,18 +140,31 @@ class TestModulePostLoadValidation(unittest.TestCase):
 
         self.assertEqual(module.weight.device, PROCESS_DEVICE)
 
-    def test_rejects_meta_before_moving_other_state(self):
+    def test_parks_existing_meta_tensor_and_stages_the_rest(self):
         module = nn.Module()
         module.meta_weight = nn.Parameter(torch.empty(1, device="meta"))
         module.register_buffer("scale", torch.ones(1))
         scale_ptr = module.scale.data_ptr()
+        meta_weight = module.meta_weight
+
+        with stage_module_for_post_load(module, torch.device("cpu")):
+            # offloader-parked meta state passes through untouched
+            self.assertTrue(module.meta_weight.is_meta)
+            module.scale.add_(1)
+
+        self.assertIs(module.meta_weight, meta_weight)
+        self.assertTrue(module.meta_weight.is_meta)
+        self.assertEqual(module.scale.device.type, "cpu")
+        self.assertEqual(module.scale.data_ptr(), scale_ptr)
+        torch.testing.assert_close(module.scale, torch.full((1,), 2.0))
+
+    def test_rejects_meta_produced_by_post_load_processing(self):
+        module = nn.Module()
+        module.register_buffer("scale", torch.ones(1))
 
         with self.assertRaisesRegex(RuntimeError, "meta tensor"):
             with stage_module_for_post_load(module, torch.device("cpu")):
-                self.fail("context should not be entered")
-
-        self.assertEqual(module.scale.device.type, "cpu")
-        self.assertEqual(module.scale.data_ptr(), scale_ptr)
+                module.new_weight = nn.Parameter(torch.empty(1, device="meta"))
 
 
 if __name__ == "__main__":

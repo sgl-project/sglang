@@ -34,6 +34,11 @@ pub const MAX_GRPC_DECODING_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// caller.
 pub const MAX_CONCURRENT_STREAMS: u32 = 64;
 
+/// Reset streams h2 tolerates before the server accepts them. A router cancels
+/// every prefix query it stops waiting for, and a burst of those against a busy
+/// indexer exceeds h2's default of 20, which tears down the whole connection.
+pub const MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 4096;
+
 static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 
 /// Storage backend for the indexer. Every mutation flows through
@@ -182,7 +187,18 @@ where
 /// [`KvIndexerService::into_server`]: that sets the per-message ceiling, this
 /// bounds how many messages can be in flight against it at once.
 pub fn server_builder() -> Server {
-    Server::builder().max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+    server_builder_with_max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+}
+
+/// A transport builder with an explicit stream bound for high-fanout fleets.
+///
+/// The default entry point keeps the stable 64-stream behavior, while the
+/// standalone Indexer binary can raise the bound when it has one bridge per
+/// worker.
+pub fn server_builder_with_max_concurrent_streams(max_concurrent_streams: u32) -> Server {
+    Server::builder()
+        .max_concurrent_streams(max_concurrent_streams)
+        .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_ACCEPT_RESET_STREAMS))
 }
 
 #[tonic::async_trait]
@@ -775,6 +791,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
+            parent_block_hash: None,
         }
     }
 

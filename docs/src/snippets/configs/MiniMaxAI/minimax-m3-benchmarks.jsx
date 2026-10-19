@@ -26,7 +26,7 @@
 // Per-platform re-measurement under sgl-eval is in progress; rows still pending
 // show `gsm8k_pct: null` (no GSM8K row rendered) with the legacy-harness number
 // kept in a comment. Legacy harnesses were NOT comparable across platforms
-// (NVIDIA: few_shot_gsm8k --num-questions 200; AMD: run_eval gsm8k 1319 examples) —
+// (NVIDIA: removed completion harness, 200 questions; AMD: run_eval gsm8k 1319 examples) —
 // which is exactly why we re-measure on one harness.
 export const benchmarks = [
   {

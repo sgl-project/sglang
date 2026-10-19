@@ -9,13 +9,12 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    HUNYUAN_QKNORM,
     BitExactFusionGate,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
     hunyuan_qkv_rope_pack,
-    mark_fused_gelu_site,
-    mark_hunyuan_qknorm_site,
     tensors_equal,
     try_hunyuan_qknorm,
 )
@@ -106,10 +105,10 @@ class HunyuanMLP(MLP):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        mark_fused_gelu_site(self, "fc_in")
+        FUSED_LINEAR_GELU.mark(self, "fc_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.fc_in, x):
             x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
         else:
             x, _ = self.fc_in(x)
@@ -173,9 +172,6 @@ def _hunyuan_pack_qkv(
         sig=sig,
         equal=tensors_equal,
         logger=logger,
-        mismatch_msg=(
-            "HunyuanVideo fused QKV RoPE pack is not bit-exact on this platform"
-        ),
     )
 
 
@@ -364,7 +360,7 @@ class MMDoubleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
-        mark_hunyuan_qknorm_site(self)
+        HUNYUAN_QKNORM.mark(self)
 
     def forward(
         self,
@@ -562,7 +558,7 @@ class MMSingleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
-        mark_hunyuan_qknorm_site(self)
+        HUNYUAN_QKNORM.mark(self)
 
     def forward(
         self,
@@ -669,7 +665,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         self.out_channels = (
             config.in_channels if config.out_channels is None else config.out_channels
         )
-        self.unpatchify_channels = self.out_channels
         self.guidance_embeds = config.guidance_embeds
         self.rope_dim_list = list(config.rope_axes_dim)
         self.rope_theta = config.rope_theta
@@ -960,9 +955,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         teacache_params = forward_batch.teacache_params
         assert teacache_params is not None, "teacache_params is not initialized"
-        assert isinstance(
-            teacache_params, TeaCacheParams
-        ), "teacache_params is not a TeaCacheParams"
+        assert isinstance(teacache_params, TeaCacheParams), (
+            "teacache_params is not a TeaCacheParams"
+        )
         num_inference_steps = forward_batch.num_inference_steps
         teache_thresh = teacache_params.teacache_thresh
 
@@ -1006,9 +1001,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = (
-            self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
-        )
+        ) = self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
         normed_inp = self.double_blocks[0].img_attn_norm.norm(inp)
         modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
         if self.cnt == 0 or self.cnt == num_inference_steps - 1:
@@ -1023,9 +1016,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 9.61237896e-02,
             ]
             rescale_func = np.poly1d(coefficients)
-            assert (
-                self.previous_modulated_input is not None
-            ), "previous_modulated_input is not initialized"
+            assert self.previous_modulated_input is not None, (
+                "previous_modulated_input is not initialized"
+            )
             self.accumulated_rel_l1_distance += rescale_func(
                 (
                     (modulated_inp - self.previous_modulated_input).abs().mean()

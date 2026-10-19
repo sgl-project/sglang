@@ -105,6 +105,10 @@ def _next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
+def _triton_key() -> str:
+    return "triton-stub"
+
+
 class _Config:
     """Minimal stand-in for ``triton.Config`` used in ``@triton.autotune``."""
 
@@ -158,7 +162,10 @@ class Stream:
     """
 
     def __init__(self, device: Any = None, priority: int = 0) -> None:
-        pass
+        import torch
+
+        self.device = torch.device(device or "mps")
+        self.priority = priority
 
     def synchronize(self) -> None:
         pass
@@ -272,13 +279,24 @@ _cached_props: _MPSDeviceProperties | None = None
 
 
 def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG001
-    """Return the properties of the MPS device. Results are cached after first call."""
+    """Implement ``torch.mps.get_device_properties``, not other device backends.
+
+    Metal's recommended working-set limit bounds usable GPU memory, even though
+    Apple Silicon shares physical RAM with the CPU.
+    """
     global _cached_props
     if _cached_props is None:
-        import psutil
+        import torch
+
+        total_memory = int(torch.mps.recommended_max_memory())
+        if total_memory <= 0:
+            raise RuntimeError(
+                "torch.mps.recommended_max_memory() returned a non-positive "
+                "Metal working-set limit"
+            )
 
         _cached_props = _MPSDeviceProperties(
-            total_memory=psutil.virtual_memory().total,
+            total_memory=total_memory,
         )
     return _cached_props
 
@@ -438,6 +456,10 @@ def install_platform_stubs() -> None:
         jit_mod.KernelInterface = _KernelInterface
         runtime.jit = jit_mod
 
+        cache_mod = _make_mock("triton.runtime.cache")
+        cache_mod.triton_key = _triton_key
+        runtime.cache = cache_mod
+
         # Torch 2.13 imports these as classes while initializing Inductor, even on
         # MPS where no Triton kernel is compiled. Define them explicitly so the
         # catch-all meta-path finder does not materialize class names as modules.
@@ -465,7 +487,7 @@ def install_platform_stubs() -> None:
             pass
 
         compiler_impl.ASTSource = _ASTSource
-        compiler_impl.triton_key = lambda: "triton-stub"
+        compiler_impl.triton_key = _triton_key
         compiler_root.compiler = compiler_impl
         triton.compiler = compiler_root
 

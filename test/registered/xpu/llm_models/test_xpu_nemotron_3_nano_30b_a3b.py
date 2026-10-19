@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
+register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 
 @unittest.skipUnless(
@@ -27,7 +27,6 @@ class TestNemotron3Nano30BA3BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     max_tokens = 8192
     # Client-side eval concurrency (mixin default is 1).
     num_threads = 4
-    env = {"SGLANG_USE_SGL_XPU": "1"}
 
     # Hybrid-mamba layout needs --model-impl sglang, a fixed page size, and
     # the nemotron_3 reasoning / qwen3_coder tool-call parsers.

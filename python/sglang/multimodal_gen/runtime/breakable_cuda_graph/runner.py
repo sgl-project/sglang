@@ -31,8 +31,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, fields, is_dataclass, replace
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -64,17 +64,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("[BCG] ignoring invalid float %s=%r", name, raw)
-        return default
-
-
 def _map_tensors(obj, fn):
     """Rebuild ``obj`` applying ``fn`` to every tensor leaf, recursing into
     list/tuple/dict containers; everything else passes through unchanged."""
@@ -86,6 +75,14 @@ def _map_tensors(obj, fn):
         return [_map_tensors(o, fn) for o in obj]
     if isinstance(obj, dict):
         return {k: _map_tensors(v, fn) for k, v in obj.items()}
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return replace(
+            obj,
+            **{
+                field.name: _map_tensors(getattr(obj, field.name), fn)
+                for field in fields(obj)
+            },
+        )
     return obj
 
 
@@ -100,6 +97,9 @@ def _flatten_tensors(obj, out: list):
     elif isinstance(obj, dict):
         for k in sorted(obj):
             _flatten_tensors(obj[k], out)
+    elif is_dataclass(obj) and not isinstance(obj, type):
+        for field in fields(obj):
+            _flatten_tensors(getattr(obj, field.name), out)
 
 
 def _flatten_kwargs(kwargs: dict[str, Any]) -> list[torch.Tensor]:
@@ -120,6 +120,16 @@ def _signature_leaf(obj: Any) -> Any:
         return (
             "dict",
             tuple((k, _signature_leaf(obj[k])) for k in sorted(obj)),
+        )
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return (
+            "dataclass",
+            type(obj).__module__,
+            type(obj).__qualname__,
+            tuple(
+                (field.name, _signature_leaf(getattr(obj, field.name)))
+                for field in fields(obj)
+            ),
         )
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return ("const", obj)
@@ -163,6 +173,15 @@ def _signature_summary_leaf(sig: Any, *, depth: int = 0) -> Any:
         if len(items) > 4:
             preview += (("...", len(items) - 4),)
         return (tag, len(items), preview)
+    if tag == "dataclass":
+        items = sig[3]
+        preview = tuple(
+            (name, _signature_summary_leaf(value, depth=depth + 1))
+            for name, value in items[:4]
+        )
+        if len(items) > 4:
+            preview += (("...", len(items) - 4),)
+        return (tag, sig[2], preview)
     return sig
 
 
@@ -179,6 +198,16 @@ def _clone_output(out: Any) -> Any:
         return tuple(_clone_output(o) for o in out)
     if isinstance(out, list):
         return [_clone_output(o) for o in out]
+    if isinstance(out, dict):
+        return {k: _clone_output(v) for k, v in out.items()}
+    if is_dataclass(out) and not isinstance(out, type):
+        return replace(
+            out,
+            **{
+                field.name: _clone_output(getattr(out, field.name))
+                for field in fields(out)
+            },
+        )
     return out
 
 
@@ -216,6 +245,9 @@ class BaseBreakableCudaGraphRunner:
     runner can stand in for the wrapped module ("other functions directly
     pass").
     """
+
+    # Graphs captured in this process across all runners; read after warmup.
+    num_captures: ClassVar[int] = 0
 
     def __init__(
         self,
@@ -344,14 +376,65 @@ class BaseBreakableCudaGraphRunner:
                 "[Diffusion BCG]   differing fields (serving vs captured): %s",
                 diffs[:8],
             )
-        logger.warning(
-            "[Diffusion BCG] hint: graphs replay only for the exact shapes "
-            "captured at warmup. A ``hidden_states`` difference above means "
-            "the request resolution was never captured (the auto-derived "
-            "warmup resolution is the model default, which can differ from "
-            "the resolutions you actually serve) -- declare every served "
-            "resolution explicitly, e.g. --warmup-resolutions 1024x1024."
-        )
+        temporal_miss = self._has_temporal_shape_miss(key)
+        if temporal_miss:
+            logger.warning(
+                "[Diffusion BCG] hint: the ``hidden_states`` temporal (frame) "
+                "dimension differs between serving and the captured graph. "
+                "Breakable CUDA graphs replay only the exact frame count "
+                "captured at warmup; the warmup frame count defaults to the "
+                "model sampling default, which can differ from the frames you "
+                "actually serve -- declare it explicitly, e.g. "
+                "--warmup-num-frames 17 (and --warmup-resolutions WxH)."
+            )
+        else:
+            logger.warning(
+                "[Diffusion BCG] hint: graphs replay only for the exact shapes "
+                "captured at warmup. A ``hidden_states`` difference above means "
+                "the request resolution was never captured (the auto-derived "
+                "warmup resolution is the model default, which can differ from "
+                "the resolutions you actually serve) -- declare every served "
+                "resolution explicitly, e.g. --warmup-resolutions 1024x1024."
+            )
+
+    def _has_temporal_shape_miss(self, key: tuple) -> bool:
+        """True when a captured ``hidden_states`` differs only in its temporal dim.
+
+        Video latents are shaped ``[B, C, F, H, W]``; a mismatch in ``F`` (not
+        ``H``/``W``) points to a frame-count gap rather than a resolution gap.
+        """
+
+        def _hidden_shape(k: tuple) -> tuple | None:
+            for name, leaf in k:
+                if name != "hidden_states":
+                    continue
+                # tensor leaf: ("tensor", shape, dtype)
+                if (
+                    isinstance(leaf, tuple)
+                    and len(leaf) == 3
+                    and leaf[0] == "tensor"
+                    and isinstance(leaf[1], tuple)
+                    and len(leaf[1]) == 5
+                ):
+                    return leaf[1]
+            return None
+
+        serving = _hidden_shape(key)
+        if serving is None:
+            return False
+        for captured_key in self.entries:
+            cap = _hidden_shape(captured_key)
+            if cap is None:
+                continue
+            same_spatial = (
+                serving[0] == cap[0]
+                and serving[1] == cap[1]
+                and serving[3] == cap[3]
+                and serving[4] == cap[4]
+            )
+            if same_spatial and serving[2] != cap[2]:
+                return True
+        return False
 
     def replay(self, entry: _CaptureEntry, kwargs: dict[str, Any]) -> Any:
         live_leaves = _flatten_kwargs(kwargs)
@@ -511,6 +594,7 @@ class BaseBreakableCudaGraphRunner:
             raise _CaptureRejected(
                 f"{limit_reason}; disabling this BCG runner and using eager"
             )
+        BaseBreakableCudaGraphRunner.num_captures += 1
         return entry
 
 

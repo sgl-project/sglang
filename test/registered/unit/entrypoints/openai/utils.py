@@ -27,6 +27,8 @@ from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
@@ -40,12 +42,17 @@ if torch is not None:
 
 
 class MockTokenizerManager:
+    # The model id the cases address; /v1/responses validates ``model`` against it.
+    SERVED_MODEL_NAME = "x"
+
     def __init__(self, *, is_multimodal: bool = False):
         self.model_config = Mock(is_multimodal=is_multimodal, context_len=4096)
         self.model_config.get_default_sampling_params.return_value = {}
         self.model_config.hf_config = Mock(
             model_type="llama", architectures=["LlamaForCausalLM"]
         )
+        self.served_model_name = self.SERVED_MODEL_NAME
+        self.lora_registry = None
         self.server_args = Mock(
             enable_cache_report=False,
             reasoning_parser=None,
@@ -79,9 +86,15 @@ class MockTemplateManager:
         self.completion_template_name = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+    """The serving layer reads its config from the bags, so the fixture
+    publishes one. Idempotent: a caller that already published keeps its own,
+    which is how a test states a value the default record does not carry."""
+    if not get_context().is_config_namespace_published("serving"):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
     return OpenAIServingResponses(
         MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
     )

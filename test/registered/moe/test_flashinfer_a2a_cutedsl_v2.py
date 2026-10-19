@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=556, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 
@@ -46,9 +46,8 @@ class TestCuteDslFlashinferA2A(CustomTestCase):
                 "4",
                 "--ep-size",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--enable-dp-lm-head",
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",

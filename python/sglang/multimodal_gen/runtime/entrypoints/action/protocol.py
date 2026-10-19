@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import io
+import itertools
 import time
 import uuid
 from functools import lru_cache
@@ -97,7 +98,45 @@ def _decode_tensor_payload(payload: dict[str, Any]) -> Any:
     return array
 
 
+def _uint8_pixels(rows: list) -> np.ndarray | None:
+    """3-level lists of ints in [0, 255] -> uint8; ``bytes()`` runs in C."""
+    try:
+        height, width, channels = len(rows), len(rows[0]), len(rows[0][0])
+        if any(len(row) != width for row in rows):
+            return None
+        flat = bytes(itertools.chain.from_iterable(itertools.chain.from_iterable(rows)))
+    except (TypeError, ValueError):
+        return None
+    if len(flat) != height * width * channels:
+        return None
+    return np.frombuffer(flat, dtype=np.uint8).reshape(height, width, channels)
+
+
+def _pixel_list_to_array(value: list) -> Any:
+    """JSON pixel lists (``image.tolist()``) -> numpy; other lists are unchanged.
+
+    Nested Python lists cost seconds per request in the IPC tree walks and
+    pickling between the server processes; one array costs nothing.
+    """
+    try:
+        first = value[0][0][0]
+    except (TypeError, IndexError, KeyError):
+        return value
+    if isinstance(first, bool) or not isinstance(first, (int, float)):
+        return value
+    array = _uint8_pixels(value) if isinstance(first, int) else None
+    if array is not None:
+        return array
+    try:
+        array = np.asarray(value)
+    except ValueError:
+        return value
+    return array if array.dtype.kind in "iuf" else value
+
+
 def _normalize_image_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return _pixel_list_to_array(value)
     if not isinstance(value, dict):
         return value
     if "b64_json" in value or "base64" in value:
@@ -114,6 +153,9 @@ def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         normalized["images"] = {
             name: _normalize_image_value(value) for name, value in images.items()
         }
+    for name, value in observation.items():
+        if name.startswith("observation.images."):
+            normalized[name] = _normalize_image_value(value)
     for name in ("image", "image_path", "input_reference"):
         if name in normalized:
             value = normalized[name]
@@ -158,12 +200,17 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, Cosmos3Config):
         return cosmos3_action_metadata(server_args)
+    metadata = pipeline_config.action_metadata(server_args)
+    if metadata is not None:
+        return metadata
 
     policy_family = getattr(
         pipeline_config,
         "policy_family",
         type(pipeline_config).__name__.removesuffix("PipelineConfig").lower(),
     )
+    prefix_graph_enabled = pipeline_config.prefix_cuda_graph_available()
+    action_graph_enabled = pipeline_config.action_cuda_graph_available()
     return {
         "object": "action.metadata",
         "model": server_args.served_model_name,
@@ -184,6 +231,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
         "runtime": {
             "materialize_dtype": pipeline_config.materialize_dtype,
             "enable_autocast": pipeline_config.enable_autocast,
+            "cuda_graph": {
+                "prefix_enabled": prefix_graph_enabled,
+                "prefix_max_entries": pipeline_config.prefix_cuda_graph_max_entries,
+                "action_enabled": action_graph_enabled,
+                "action_max_entries": pipeline_config.action_cuda_graph_max_entries,
+                "prompt_token_buckets": list(pipeline_config.prompt_token_buckets),
+            },
             "parallelism": {
                 "num_gpus": server_args.num_gpus,
                 "tp_size": server_args.tp_size,
@@ -201,11 +255,13 @@ def action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "prefix_cache": (
                 "auto" if pipeline_config.enable_global_prefix_cache else False
             ),
-            "cuda_graph": "auto" if pipeline_config.enable_action_cuda_graph else False,
+            "cuda_graph": (
+                "auto" if prefix_graph_enabled or action_graph_enabled else False
+            ),
         },
         "capabilities": {
             "exact_prefix_cache": True,
-            "cuda_graph": pipeline_config.enable_action_cuda_graph,
+            "cuda_graph": prefix_graph_enabled or action_graph_enabled,
             "realtime_websocket": True,
             "openpi_websocket": True,
             "batch_inputs": False,
@@ -376,6 +432,11 @@ def _build_action_model_sampling_params(
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
         "enable_cuda_graph": _runtime_bool(cuda_graph, True),
     }
+    # Optional per-request overrides; absent keys keep the model defaults.
+    for name in ("seed", "guidance_scale", "guidance_scale_action"):
+        value = parameters.get(name, observation.get(name))
+        if value is not None:
+            sampling_kwargs[name] = value
     supported_fields = _sampling_params_field_names(sampling_params_cls)
     sp = sampling_params_cls(
         **{

@@ -136,13 +136,13 @@ class BenchArgs:
             "--gsp-system-prompt-len",
             type=int,
             default=BenchArgs.gsp_system_prompt_len,
-            help="System prompt length, used" "only for generate-shared-prefix",
+            help="System prompt length, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-question-len",
             type=int,
             default=BenchArgs.gsp_question_len,
-            help="Question length, used" "only for generate-shared-prefix",
+            help="Question length, usedonly for generate-shared-prefix",
         )
         parser.add_argument(
             "--gsp-output-len",
@@ -259,9 +259,9 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert (
-            "SGLANG_TORCH_PROFILER_DIR" in os.environ
-        ), "Please set SGLANG_TORCH_PROFILER_DIR."
+        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, (
+            "Please set SGLANG_TORCH_PROFILER_DIR."
+        )
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         known_files = None
         backend.start_profile(

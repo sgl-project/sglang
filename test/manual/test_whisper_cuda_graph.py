@@ -97,14 +97,14 @@ class TestWhisperCudaGraph(CustomTestCase):
             result = self._transcribe()
             self.assertIn("text", result)
             results.append(result["text"])
-            print(f"Request {i+1}: {result['text'][:80]}...")
+            print(f"Request {i + 1}: {result['text'][:80]}...")
 
         # All transcriptions of the same audio should be identical
         for i in range(1, len(results)):
             self.assertEqual(
                 results[0],
                 results[i],
-                f"Transcription {i+1} differs from first transcription",
+                f"Transcription {i + 1} differs from first transcription",
             )
 
     def test_transcription_quality(self):

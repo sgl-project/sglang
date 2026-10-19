@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
@@ -117,6 +117,63 @@ def causal_conv1d_update_ref(
     if unsqueeze:
         out = out.squeeze(-1)
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+
+
+def test_causal_conv1d_branches_from_cloned_query_state():
+    device = get_device()
+    dtype = torch.bfloat16
+    torch.manual_seed(7)
+    dim, width = 96, 4
+    item_lens = [2, 5, 7]
+    total_tokens = sum(item_lens)
+
+    source_state = torch.randn(1, dim, width - 1, device=device, dtype=dtype)
+    source_state_before = source_state.clone()
+    branch_states = source_state.expand(len(item_lens), -1, -1).contiguous().clone()
+    x = torch.randn(dim, total_tokens, device=device, dtype=dtype)
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(item_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_indices = torch.arange(len(item_lens), dtype=torch.int32, device=device)
+
+    actual = causal_conv1d_fn(
+        x,
+        weight,
+        bias=bias,
+        conv_states=branch_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=torch.tensor(item_lens),
+        cache_indices=cache_indices,
+        has_initial_state=torch.ones(len(item_lens), dtype=torch.bool, device=device),
+        activation="silu",
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    expected_outputs = []
+    expected_states = []
+    for item in torch.split(x, item_lens, dim=-1):
+        item_output, item_state = causal_conv1d_ref(
+            item.unsqueeze(0),
+            weight,
+            bias,
+            initial_states=source_state,
+            return_final_states=True,
+            activation="silu",
+        )
+        expected_outputs.append(item_output.squeeze(0))
+        expected_states.append(item_state.squeeze(0))
+
+    torch.testing.assert_close(
+        actual, torch.cat(expected_outputs, dim=-1), atol=5e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        branch_states, torch.stack(expected_states), atol=5e-2, rtol=1e-2
+    )
+    assert torch.equal(source_state, source_state_before)
 
 
 @pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
@@ -376,6 +433,62 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
+    """Initial states may be bf16 even when the current hidden states are fp16."""
+    device = get_device()
+    torch.manual_seed(0)
+    dim, width = 64, 4
+    seqlens = [7, 9]
+    query_start_loc = torch.tensor([0, 7, 16], dtype=torch.int32, device=device)
+    x = torch.randn(dim, sum(seqlens), dtype=torch.float16, device=device)
+    weight = torch.randn(dim, width, dtype=torch.float16, device=device)
+    bias = torch.randn(dim, dtype=torch.float16, device=device)
+
+    conv_states = torch.randn(
+        4, width - 1, dim, dtype=torch.bfloat16, device=device
+    ).transpose(1, 2)
+    conv_states_ref = conv_states.clone()
+    cache_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([True, False], dtype=torch.bool, device=device)
+
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=torch.tensor(seqlens),
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation="silu",
+    )
+
+    expected = []
+    offset = 0
+    for i, seqlen in enumerate(seqlens):
+        state_idx = cache_indices[i]
+        x_i = x[:, offset : offset + seqlen].unsqueeze(0)
+        initial_state = (
+            conv_states_ref[state_idx].unsqueeze(0).to(x.dtype)
+            if has_initial_state[i]
+            else None
+        )
+        out_i, _ = causal_conv1d_ref(
+            x_i,
+            weight,
+            bias,
+            initial_states=initial_state,
+            return_final_states=True,
+            final_states_out=conv_states_ref[state_idx].unsqueeze(0),
+            activation="silu",
+        )
+        expected.append(out_i.squeeze(0))
+        offset += seqlen
+
+    torch.testing.assert_close(out, torch.cat(expected, dim=-1), rtol=1e-2, atol=5e-2)
+    torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 TOOL_CALL_BEGIN = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
@@ -47,10 +48,7 @@ def _get_param_type(tools: list[Tool], function_name: str, param_name: str) -> s
         parameters = getattr(function, "parameters", None)
         if not isinstance(parameters, dict):
             continue
-        properties = parameters.get("properties")
-        if not isinstance(properties, dict):
-            continue
-        definition = properties.get(param_name)
+        definition = get_schema_properties(parameters).get(param_name)
         if isinstance(definition, dict) and isinstance(definition.get("type"), str):
             return definition["type"]
     return "string"

@@ -15,7 +15,7 @@ from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_m
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _MAX_BS = 4
 _DRAFT = 3
@@ -148,6 +148,7 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
         req_to_token_pool=object(),
+        kv_index_translator=None,
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),

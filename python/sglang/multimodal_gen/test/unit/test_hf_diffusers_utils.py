@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import huggingface_hub
 import modelscope
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
@@ -298,6 +299,46 @@ def test_metadata_only_cached_lora_snapshot_is_a_usable_hit(
     assert calls == ["probe"]
 
 
+def test_cached_lora_snapshot_downloads_missing_selected_weight(monkeypatch, tmp_path):
+    calls = []
+    selected_file = "loras/adapter.safetensors"
+
+    def fake_snapshot_download(**kwargs):
+        calls.append("probe" if kwargs.get("local_files_only") else "download")
+        if not kwargs.get("local_files_only"):
+            target = tmp_path / selected_file
+            target.parent.mkdir()
+            target.write_bytes(b"weights")
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", fake_snapshot_download)
+
+    result = maybe_download_model(
+        "org/repo",
+        is_lora=True,
+        allow_patterns=["*.json", selected_file],
+    )
+
+    assert result == str(tmp_path)
+    assert calls == ["probe", "download"]
+
+
+def test_cached_lora_snapshot_reports_missing_selected_weight_offline(
+    recording_snapshot_download, tmp_path
+):
+    calls = recording_snapshot_download(tmp_path)
+
+    with pytest.raises(ValueError, match="loras/adapter.safetensors"):
+        maybe_download_model(
+            "org/repo",
+            download=False,
+            is_lora=True,
+            allow_patterns=["*.json", "loras/adapter.safetensors"],
+        )
+
+    assert calls == ["probe"]
+
+
 def test_force_diffusers_model_stub_keeps_its_existing_path(
     recording_snapshot_download, tmp_path
 ):
@@ -310,6 +351,50 @@ def test_force_diffusers_model_stub_keeps_its_existing_path(
         maybe_download_model("org/repo", force_diffusers_model=True)
 
     assert calls == ["probe", "download", "download"]
+
+
+@pytest.mark.parametrize(
+    "cached, expected_downloads",
+    [
+        ("complete", ["model_index.json"]),
+        ("manifest", ["_overlay/overlay_manifest.json"]),
+        ("metadata", ["_overlay/overlay_manifest.json", "model_index.json"]),
+    ],
+)
+def test_complete_cached_checkpoint_skips_overlay_probe(
+    monkeypatch, tmp_path, cached, expected_downloads
+):
+    """hf_hub_download waits out Hub rate limits before reporting a file the repo
+    never had, so a complete cached checkpoint must not probe its overlay manifest.
+    A cached manifest still marks an overlay repo, and a metadata-only snapshot,
+    which an overlay repo leaves, still asks the Hub."""
+    repo_cache = tmp_path / "models--org--repo"
+    snapshot = repo_cache / "snapshots" / ("a" * 40)
+    (snapshot / "_overlay").mkdir(parents=True)
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / "main").write_text("a" * 40)
+    _write_model_index(snapshot)
+    if cached != "metadata":
+        _populate_components(snapshot, ("scheduler", "tokenizer"), weights=False)
+        _populate_components(snapshot, ("text_encoder", "transformer", "vae"))
+    if cached == "manifest":
+        (snapshot / "_overlay" / "overlay_manifest.json").write_text(
+            '{"source_model_id": "org/source"}'
+        )
+    downloads = []
+
+    def fake_hf_hub_download(repo_id, filename, **kwargs):
+        downloads.append(filename)
+        return str(snapshot / filename)
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", False)
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", fake_hf_hub_download)
+
+    config = hf_diffusers_utils.maybe_download_model_index("org/repo")
+
+    assert config["_class_name"] == "LongLive2Pipeline"
+    assert downloads == expected_downloads
 
 
 def test_modelscope_file_download_preserves_local_dir(monkeypatch, tmp_path):

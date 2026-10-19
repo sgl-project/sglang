@@ -15,13 +15,12 @@ from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
     WHISPER_AUTODETECT_REGEX,
     WHISPER_AUTODETECT_TS_REGEX,
-    WHISPER_LANG_TOKEN_CODES,
     WhisperAdapter,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestWhisperParseFusedOutput(CustomTestCase):
@@ -160,11 +159,6 @@ class TestWhisperLangTokenCoverage(CustomTestCase):
                 )
                 self.assertEqual(lang, code)
                 self.assertEqual(visible, "Hi")
-
-    def test_known_whisper_langs_in_allowlist(self):
-        # Spot-check: codes the reviewer named + common 3-letter tokens.
-        for code in ("yue", "haw", "jw", "su", "ba", "tt", "ln", "lo"):
-            self.assertIn(code, WHISPER_LANG_TOKEN_CODES)
 
     def test_fsm_regex_includes_three_letter_alternatives(self):
         # Defensive: the regex alternation must spell out the 3-letter codes

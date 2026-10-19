@@ -106,7 +106,7 @@ struct UpdateSconvCacheKernel {
     // x channel-contiguous (may be a non-contiguous row view); cache contiguous
     // [slots, W1, D]. cache_indices/qsl int32, has_state torch-bool (shape/device only).
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(x);
-    TensorMatcher({-1, W1s, D}).with_dtype<DType>().with_device(dev).verify(cache);
+    TensorMatcher({-1, W1s, D}).with_strides({-1, -1, 1}).with_dtype<DType>().with_device(dev).verify(cache);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(dev).verify(cache_indices);
     TensorMatcher({B}).with_device(dev).verify(has_state);
     TensorMatcher({-1}).with_dtype<int32_t>().with_device(dev).verify(qsl);
