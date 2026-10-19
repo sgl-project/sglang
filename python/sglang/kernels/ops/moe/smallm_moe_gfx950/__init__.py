@@ -16,6 +16,7 @@ On by default; SGLANG_ROCM_SMALLM_MOE=0 turns it off. Any build/load failure dis
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -25,10 +26,10 @@ import torch
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
 )
+from sglang.srt.environ import envs
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "smallm_moe.hip")
-_ENV = "SGLANG_ROCM_SMALLM_MOE"
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 # Dispatch cap: above this token count aiter's flydsl path is faster (crossover ~44
@@ -43,6 +44,7 @@ _available = None
 _disabled_reason = None
 _build_dir = None
 _ws: dict = {}
+logger = logging.getLogger(__name__)
 
 
 class SmallMMoeUnavailable(RuntimeError):
@@ -166,7 +168,7 @@ def smallm_moe_enabled() -> bool:
     (hidden 4096, top-10 plus the optional fused shared expert). There is no model-name check;
     smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
-    if os.environ.get(_ENV, "1") == "0":
+    if not envs.SGLANG_ROCM_SMALLM_MOE.get():
         return False
     if _available is None:
         arch = ""
@@ -178,9 +180,11 @@ def smallm_moe_enabled() -> bool:
             and os.path.exists(_hipcc())
         )
         if not _available:
-            print(
-                f"[smallm_moe] not enabled (arch={arch!r}, hip={_hip_version()}, hipcc={os.path.exists(_hipcc())}); aiter fused_moe stays in use",
-                flush=True,
+            logger.info(
+                "smallm_moe not enabled (arch=%r, hip=%s, hipcc=%s); aiter fused_moe stays in use",
+                arch,
+                _hip_version(),
+                os.path.exists(_hipcc()),
             )
     return _available and _disabled_reason is None
 
@@ -188,9 +192,9 @@ def smallm_moe_enabled() -> bool:
 def _disable(reason):
     global _disabled_reason
     _disabled_reason = reason
-    print(
-        f"[smallm_moe] disabling the gfx950 small-M MoE kernel, falling back to aiter fused_moe: {reason}",
-        flush=True,
+    logger.warning(
+        "smallm_moe: disabling the gfx950 small-M MoE kernel, falling back to aiter fused_moe: %s",
+        reason,
     )
     raise SmallMMoeUnavailable(reason)
 
@@ -229,10 +233,7 @@ def _get_kernels(inter: int, pre: str):
             except RuntimeError as e:
                 _disable(str(e))
             _kernels["_mod"] = mod
-            print(
-                f"[smallm_moe] gfx950 small-M MoE kernels active (built {co})",
-                flush=True,
-            )
+            logger.info("smallm_moe: gfx950 small-M MoE kernels active (built %s)", co)
         mod = _kernels["_mod"]
         try:
             kk = {
