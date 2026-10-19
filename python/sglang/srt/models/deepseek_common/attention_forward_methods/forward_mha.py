@@ -269,11 +269,9 @@ class DeepseekMHAForwardMixin:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
-                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.extend_prefix_lens,
+                        forward_batch.attn_dcp_metadata,
                         forward_batch.extend_prefix_lens_cpu,
-                        forward_batch.extend_seq_lens,
+                        forward_batch.extend_seq_lens_cpu,
                         kv_a,
                         k_pe,
                     )
@@ -525,16 +523,22 @@ class DeepseekMHAForwardMixin:
                 v = packed_prefix_v[packed_offset:packed_end]
                 packed_offset = packed_end
             else:
-                kv_indices = forward_batch.prefix_chunk_kv_indices[i]
-                kv_a_normed, k_pe = get_mla_kv_buffer(
-                    kv_indices, kv_a_dtype, forward_batch
-                )
-                kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
-                    kv_a_normed,
-                    k_pe,
-                    forward_batch.prefix_chunk_seq_lens_cpu[i],
-                    forward_batch.prefix_chunk_starts_cpu[i],
-                )
+                if get_parallel().dcp_enabled:
+                    kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mha,
+                        forward_batch.prefix_chunk_gather_plans[i],
+                        self.kv_lora_rank,
+                        self.qk_rope_head_dim,
+                        kv_a_dtype,
+                    )
+                else:
+                    kv_a_normed, k_pe = get_mla_kv_buffer(
+                        forward_batch.prefix_chunk_kv_indices[i],
+                        kv_a_dtype,
+                        forward_batch,
+                    )
+                    kv_a_normed, k_pe = kv_a_normed.contiguous(), k_pe.contiguous()
                 kv = self.kv_b_proj(kv_a_normed)[0]
                 kv = kv.view(
                     -1,

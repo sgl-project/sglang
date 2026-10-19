@@ -134,9 +134,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+        return super().get_mla_kv_buffer(layer, loc, dst_dtype, out=out)
 
     def transfer_values_on_device(
         self, dst_indices: torch.Tensor, src_indices: torch.Tensor

@@ -236,11 +236,9 @@ class DeepseekMHARocmForwardMixin:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
-                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.extend_prefix_lens,
+                        forward_batch.attn_dcp_metadata,
                         forward_batch.extend_prefix_lens_cpu,
-                        forward_batch.extend_seq_lens,
+                        forward_batch.extend_seq_lens_cpu,
                         kv_a,
                         k_pe,
                     )

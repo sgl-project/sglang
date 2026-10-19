@@ -4629,6 +4629,8 @@ class HybridLinearKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         # Wait for HiCache load-back here; the inner pool's counter is disabled.
@@ -4638,7 +4640,7 @@ class HybridLinearKVPool(KVCache):
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
         # pool never translates.
         with self._transfer_id_context(layer):
-            return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+            return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype, out=out)
 
     def set_index_k_scale_buffer(
         self,
@@ -5060,11 +5062,19 @@ class MLATokenToKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
+        if out is not None:
+            cache_k_nope, cache_k_rope = out.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+            return cache_k_nope, cache_k_rope
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,
