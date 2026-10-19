@@ -75,6 +75,7 @@ Python checks used Python 3.12.14 and the gRPC extension built from this change.
 
 | Check | Result |
 | --- | --- |
+| `cargo +1.93.1 test --workspace -j 4` after updating the benchmark gRPC mock | Passed: 538 tests; no failures or ignored tests |
 | `cargo +1.93.1 test -p sglang-api-types -p sglang-grpc -p sglang-server -j 4` | Passed: 23 API-types, 21 gRPC, 365 native-server tests |
 | `cargo +1.93.1 test -p sglang-grpc -j 4` after listener teardown fix | Passed: 21 tests |
 | Bridge, tokenizer request cleanup, Python API JSON and parity suites listed above | Passed: 95 tests |
