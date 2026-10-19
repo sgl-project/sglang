@@ -32,8 +32,8 @@ from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -209,8 +209,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         im_end_id: int = image_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-        ids = pattern.pad_input_tokens(input_ids, image_inputs)
+        ids = pad_mm_token_pairs(
+            input_ids, image_inputs, data_token_pairs=media_token_pairs
+        )
         return ids
 
     def prepare_attn_masks(

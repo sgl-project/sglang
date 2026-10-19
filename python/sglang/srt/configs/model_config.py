@@ -998,6 +998,12 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+            if self.hf_text_config.mtp_local_layer_ids:
+                # A local MTP depth keeps the trunk's window unless it declares
+                # its own: the draft backend builds its window rail only if set.
+                self.sliding_window_size = (
+                    self.hf_text_config.mtp_local_extent or self.sliding_window_size
+                )
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
@@ -2317,6 +2323,7 @@ multimodal_model_archs = [
     "NemotronH_Nano_Omni_Reasoning_V3",
     "NemotronH_Omni_Reasoning_V3",
     "MuseGlimmerForConditionalGeneration",
+    "MuseSparkForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -2394,6 +2401,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
+    "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
@@ -2677,6 +2685,17 @@ def get_hybrid_layer_ids(
     elif "UnlimitedOCRForCausalLM" in model_architectures:
         swa_attention_layer_ids = list(range(num_hidden_layers))
         full_attention_layer_ids = []
+    elif "MuseSparkForConditionalGeneration" in model_architectures:
+        swa_attention_layer_ids = [
+            i
+            for i, kind in enumerate(hf_text_config.layer_types)
+            if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i
+            for i, kind in enumerate(hf_text_config.layer_types)
+            if kind == "full_attention"
+        ]
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern
