@@ -69,9 +69,9 @@ from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspector i
     UnifiedTreeCoreInspector,
 )
 
-# A dedicated test entry point overrides this without changing the process-wide
-# production backend selection. Direct Python-core tests in this module remain
-# Python-only; every fixture-backed cache test is shared by both inspectors.
+# The Rust re-run entry point overrides this without changing the process-wide
+# production backend selection. Every cache built by build_fixture follows it;
+# tests that construct a Python core directly stay Python-only.
 _TREE_CORE_TEST_BACKEND: Optional[str] = "python"
 
 
