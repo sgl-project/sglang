@@ -323,6 +323,25 @@ def _as_int_list(values) -> Optional[List[int]]:
     return [int(v) for v in values]
 
 
+def _gather_low_ratio_projection(layer, x, forward_batch, total: int) -> torch.Tensor:
+    compressor = layer.compressor
+    if layer.compress_ratio == 1:
+        projected = compressor.wkv(x)
+    elif compressor.use_fused_gate:
+        projected = compressor.project_fused(x)
+    else:
+        projected = torch.cat(compressor.project(x), dim=-1)
+    return cp_materialize_global_token_order(
+        projected, forward_batch, torch.cuda.current_stream()
+    )[:total]
+
+
+def _split_low_ratio_projection(layer, projected: torch.Tensor):
+    if layer.compress_ratio == 1:
+        return projected, None
+    return projected.chunk(2, dim=-1)
+
+
 def _low_ratio_compression_metadata(
     compress_ratio: int, seq_lens_casual: torch.Tensor, raw_out_loc: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3247,10 +3266,14 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            projected = _gather_low_ratio_projection(layer, x, forward_batch, total)
+            self._low_ratio_compress_torch(
+                layer,
+                None,
+                req_global,
+                pos_global,
+                _split_low_ratio_projection(layer, projected),
+            )
         if run_indexer and layer.indexer is not None:
             # A rank's local rows are not the batch's, so no req_rows to pass.
             self._low_ratio_index_topk(
@@ -3263,7 +3286,9 @@ class DeepseekV4AttnBackend(
                 rows_per_request=q_lens_cpu,
             )
 
-    def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
+    def _low_ratio_compress(
+        self, layer, x, req, pos, forward_batch, projected=None
+    ) -> None:
         if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
         elif (
@@ -3297,6 +3322,7 @@ class DeepseekV4AttnBackend(
                 req,
                 pos,
                 extend_offsets=(start_loc.to(torch.int32), seq_lens.to(torch.int32)),
+                projected=projected,
             )
         else:
             self._low_ratio_compress_torch(
@@ -3304,6 +3330,11 @@ class DeepseekV4AttnBackend(
                 x,
                 req,
                 pos,
+                projected=(
+                    None
+                    if projected is None
+                    else _split_low_ratio_projection(layer, projected)
+                ),
                 fuse_index_store=(
                     forward_batch.forward_mode.is_target_verify()
                     and layer.compressor.use_fused_compress
@@ -3374,7 +3405,7 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_compress_fused(
-        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None, projected=None
     ) -> None:
         """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
         (first row, row count) of each request."""
@@ -3406,7 +3437,7 @@ class DeepseekV4AttnBackend(
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                compressor.wkv(x) if projected is None else projected,
                 compressor.norm.weight.data,
                 pos,
                 core.raw_out_loc,
@@ -3422,7 +3453,7 @@ class DeepseekV4AttnBackend(
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
             args = (
-                compressor.project_fused(x),
+                compressor.project_fused(x) if projected is None else projected,
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
                 pos,

@@ -70,7 +70,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _as_int_list,
+    _gather_low_ratio_projection,
     _prefill_graph_max_seq_len,
+    _split_low_ratio_projection,
     _tail_rows,
     late_layer_num_tokens,
     late_layer_whole_extend,
@@ -111,7 +113,7 @@ from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     interleave_rows_per_request,
 )
-from sglang.srt.layers.cp.utils import cp_materialize_global_token_order, is_cp_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     set_local_dp_buffer_len,
@@ -3641,17 +3643,26 @@ class DeepseekV4HipRadixBackend(
         num_local = sum(q_lens_cpu)
         q_lora = _first_rows(q_lora, num_local)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
+            projected = _gather_low_ratio_projection(layer, x, forward_batch, total)
             if tail is None:
-                # x_global is the extend itself, so the fused prefill store of the
-                # non-CP path applies with the batch's own extend offsets
+                # the gathered rows are the extend itself, so the fused prefill store
+                # of the non-CP path applies with the batch's own extend offsets
                 self._low_ratio_compress(
-                    layer, x_global, req_global, pos_global, forward_batch
+                    layer,
+                    None,
+                    req_global,
+                    pos_global,
+                    forward_batch,
+                    projected=projected,
                 )
             else:
-                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+                self._low_ratio_compress_torch(
+                    layer,
+                    None,
+                    req_global,
+                    pos_global,
+                    _split_low_ratio_projection(layer, projected),
+                )
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(
                 layer,
