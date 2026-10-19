@@ -11,10 +11,10 @@ from sglang.kernels.ops.attention.decode_attention import (
 )
 from sglang.kernels.ops.attention.extend_attention import (
     _compact_extend_q_tiles_per_head,
+    align_window_kv_to_tiles,
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
-    redundant_attention,
 )
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.prefill_attention import (
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.extend_attention import redundant_attention
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
@@ -1129,6 +1130,51 @@ class TestTritonAttention(CustomTestCase):
             # Check that prefix and extend are concatenated correctly
             unified_seq = unified_kv_indices[start_idx:end_idx]
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
+
+    def test_unified_sliding_window_chunked_matches_unchunked(self):
+        """Deterministic inference: a chunk whose window starts off a tile boundary
+        must match the unchunked prefill bit for bit."""
+        torch.manual_seed(0)
+        device = get_device()
+        seq_len, window, prefix = 3000, 128, 2192  # window starts at 2064
+        q = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        k = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        v = torch.randn_like(k)
+        i32 = lambda *x: torch.tensor(x, dtype=torch.int32, device=device)
+        arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+
+        def run(prefix_len):
+            win = min(prefix_len, window)
+            indptr, indices = align_window_kv_to_tiles(
+                i32(0, win),
+                arange(prefix_len - win, prefix_len),
+                i32(prefix_len - win),
+                1,
+            )
+            extend_len = seq_len - prefix_len
+            kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+                indptr, indices, i32(0), i32(extend_len), arange(prefix_len, seq_len), 1
+            )
+            o = torch.empty_like(q[prefix_len:])
+            extend_attention_fwd_unified(
+                q[prefix_len:],
+                o,
+                k,
+                v,
+                1.0,
+                1.0,
+                i32(0, extend_len),
+                kv_indptr,
+                kv_indices,
+                kv_prefix_lens.to(torch.int32),
+                extend_len,
+                sm_scale=0.125,
+                sliding_window_size=window,
+                window_start_pos=i32(prefix_len) - (indptr[1:] - indptr[:-1]),
+            )
+            return o
+
+        self.assertTrue(torch.equal(run(prefix), run(0)[prefix:]))
 
 
 if __name__ == "__main__":

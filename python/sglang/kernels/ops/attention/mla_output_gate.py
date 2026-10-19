@@ -39,6 +39,7 @@ def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
         not _is_npu
         and x.is_cuda
         and gate.is_cuda
+        and not _is_npu
         and x.dtype == torch.bfloat16
         and gate.dtype == torch.bfloat16
         and x.shape == gate.shape

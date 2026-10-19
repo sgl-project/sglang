@@ -8,7 +8,7 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -33,10 +33,23 @@ def init_mla_dcp_metadata(
     if forward_batch.forward_mode.is_target_verify():
         query_len = int(forward_batch.spec_info.draft_token_num)
         effective_seq_lens = forward_batch.seq_lens.to(torch.int64) + query_len
+        metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
+            effective_seq_lens,
+            query_len,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            interleave_size=1,
+        )
         metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
-            forward_batch.seq_lens, query_len, parallel.dcp_size, parallel.dcp_rank
+            forward_batch.seq_lens,
+            query_len,
+            parallel.dcp_size,
+            parallel.dcp_rank,
+            local_query_lens=metadata.dcp_spec_seq_lens,
         )
     else:
+        metadata.dcp_spec_seq_lens = None
+        metadata.dcp_mtp_attn_mask = None
         effective_seq_lens = forward_batch.seq_lens
         if (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -89,6 +102,11 @@ def init_mla_dcp_graph_state(
         "dcp_seq_lens": torch.zeros(max_bs, dtype=torch.int32, device=device),
     }
     if speculative_num_draft_tokens is not None:
+        buffers["dcp_spec_seq_lens"] = torch.zeros(
+            max_bs * speculative_num_draft_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
         buffers["dcp_mtp_attn_mask"] = torch.ones(
             (max_bs, speculative_num_draft_tokens, graph_num_pages * page_size),
             dtype=torch.bool,
@@ -148,12 +166,22 @@ def update_mla_dcp_graph_metadata(
         metadata.seq_lens_cpu_list = local_seq_lens.cpu().int().tolist()
 
     if forward_mode.is_target_verify():
+        metadata.dcp_spec_seq_lens.copy_(
+            get_dcp_chain_spec_lens(
+                effective_seq_lens,
+                query_len,
+                parallel.dcp_size,
+                parallel.dcp_rank,
+                interleave_size=1,
+            )
+        )
         dcp_mask = build_mla_dcp_mtp_mask(
             seq_lens[:bs],
             query_len,
             parallel.dcp_size,
             parallel.dcp_rank,
             max_local_kv_len=active_num_pages * page_size,
+            local_query_lens=metadata.dcp_spec_seq_lens,
         )
         active_mask_width = active_num_pages * page_size
         metadata.dcp_mtp_attn_mask[:, :, :active_mask_width].copy_(dcp_mask)
@@ -212,8 +240,9 @@ def build_mla_dcp_mtp_mask(
     dcp_rank: int,
     *,
     max_local_kv_len: int | None = None,
+    local_query_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build FIA's rank-local causal mask for a fixed DSPARK verify window."""
+    """Adapt common per-query DCP frontiers to FIA's fixed verify mask."""
     prefix_lens = prefix_lens.to(torch.int64)
     total_lens = prefix_lens + query_len
     local_seq_lens = get_dcp_lens(total_lens, dcp_size, dcp_rank).to(torch.int32)
@@ -232,13 +261,12 @@ def build_mla_dcp_mtp_mask(
     if query_len == 0 or max_local_kv_len == 0:
         return mask.contiguous()
 
-    q_idx = torch.arange(query_len, device=prefix_lens.device, dtype=torch.int64)
+    if local_query_lens is None:
+        local_query_lens = get_dcp_chain_spec_lens(
+            total_lens, query_len, dcp_size, dcp_rank, interleave_size=1
+        )
     k_idx = torch.arange(max_local_kv_len, device=prefix_lens.device, dtype=torch.int64)
-    last_visible = torch.div(
-        prefix_lens[:, None] + q_idx[None, :] - dcp_rank,
-        dcp_size,
-        rounding_mode="floor",
+    mask = k_idx[None, None, :] >= local_query_lens.view(
+        prefix_lens.numel(), query_len, 1
     )
-    mask = k_idx[None, None, :] > last_visible[:, :, None]
-    mask |= k_idx[None, None, :] >= local_seq_lens.to(torch.int64)[:, None, None]
     return mask.contiguous()

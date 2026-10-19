@@ -15,20 +15,21 @@ def mask_empty_mla_dcp_shards_npu(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Represent an empty local KV shard as the online-softmax identity.
 
-    Short sequences can leave a rank with no local KV. FIA's undefined
-    empty-shard output must not participate in the cross-rank LSE merge.
+    Lengths may be per request (decode) or per query (target verify). A verify
+    query can have no visible local KV even when a later query in that request
+    has one. FIA's empty-row output must not enter the cross-rank LSE merge.
     """
     num_rows = partial_output.shape[0]
-    num_reqs = local_seq_lens.numel()
-    if num_reqs == 0:
+    num_lengths = local_seq_lens.numel()
+    if num_lengths == 0:
         return partial_output, partial_lse
-    if num_rows % num_reqs != 0:
+    if num_rows % num_lengths != 0:
         raise ValueError(
             "DCP attention rows must be divisible by local sequence lengths: "
-            f"rows={num_rows}, requests={num_reqs}."
+            f"rows={num_rows}, lengths={num_lengths}."
         )
-    rows_per_req = num_rows // num_reqs
-    valid = (local_seq_lens > 0).repeat_interleave(rows_per_req).view(-1, 1, 1)
+    rows_per_length = num_rows // num_lengths
+    valid = (local_seq_lens > 0).repeat_interleave(rows_per_length).view(-1, 1, 1)
     return (
         torch.where(valid, partial_output, torch.zeros_like(partial_output)),
         torch.where(
