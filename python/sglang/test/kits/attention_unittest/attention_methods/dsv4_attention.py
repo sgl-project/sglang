@@ -22,9 +22,19 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
+    dequantize_dsv41_packed_main_kv,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+    DeepseekV41Compressor,
+    DeepseekV41Indexer,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.dsv41_main_kv_layout import (
+    resolve_dsv41_main_kv_layout_specs,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -281,12 +291,23 @@ class TinyDSV4ModelConfig:
             kv_lora_rank=DSV4_KV_LORA_RANK,
             v_head_dim=DSV4_V_HEAD_DIM,
             index_topk=DSV4_INDEX_TOPK,
+            index_head_dim=128,
+            index_n_heads=64,
+            q_lora_rank=DSV4_HEAD_DIM,
+            rms_norm_eps=1e-6,
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
             # Ratio 1/2 layers are their own kv_source (one-layer fixtures).
             kv_source_layer_ids=[
                 i for i, ratio in enumerate(compression_ratios) if ratio in (1, 2)
             ],
+            index_source_layer_ids=[
+                i for i, ratio in enumerate(compression_ratios) if ratio in (1, 2)
+            ],
+            candidate_source_layer_id=-1,
+            candidate_topk_blocks=0,
+            candidate_block_size=0,
+            model_type="deepseek_v41",
         )
         self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
@@ -316,6 +337,8 @@ class MockDSV4ModelRunner:
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
         compression_ratios: list[int] = None,
+        main_kv_layout_specs=None,
+        dsv41_main_kv_consumer: str = "auto",
     ):
         if compression_ratios is None:
             compression_ratios = [0]
@@ -378,6 +401,10 @@ class MockDSV4ModelRunner:
             tp_size=1,
             device=device,
             mem_fraction_static=0.8,
+            dsv41_main_kv_layout=(
+                "packed_fp4" if main_kv_layout_specs is not None else "auto"
+            ),
+            dsv41_main_kv_consumer=dsv41_main_kv_consumer,
         )
         self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
@@ -415,6 +442,7 @@ class MockDSV4ModelRunner:
             # Full locs are the identity-mapped SWA locs below, so the c1/c2
             # latent pools (slot = loc // ratio) only need to span swa_size.
             full_size=swa_size,
+            main_kv_layout_specs=main_kv_layout_specs,
         )
         # Register identity full->swa mapping over swa_size full locs.
         identity = torch.arange(swa_size, dtype=torch.int64, device=device)
@@ -619,6 +647,8 @@ class DSV4AttentionFixture:
     # Selects dense vs sparse-prefill C4 seeding; lives on the fixture because
     # the reference re-seeds after rebuilding metadata (`_seed_c4_if_needed`).
     seed_c4_for_sparse_prefill: bool = False
+    # Packed eager-prefill tests keep the metadata written by the real indexer.
+    use_producer_page_indices: bool = False
 
 
 @dataclass
@@ -702,6 +732,7 @@ def build_dsv4_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     compression_ratios: list[int] = None,
+    packed_main_kv: bool = False,
 ) -> DSV4AttentionFixture:
     # SWA-only (compress_ratio=0) is the SGLang path that handles the
     # last-`SWA_WINDOW`-tokens slice for *all* sequence lengths. seq_len >
@@ -728,6 +759,11 @@ def build_dsv4_attention_fixture(
         context_len=max_context_len,
         compression_ratios=compression_ratios,
     )
+    main_kv_layout_specs = (
+        resolve_dsv41_main_kv_layout_specs("packed_fp4", case.page_size)
+        if packed_main_kv
+        else None
+    )
     runner = MockDSV4ModelRunner(
         case=case,
         model_config=model_config,
@@ -739,6 +775,8 @@ def build_dsv4_attention_fixture(
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
         compression_ratios=compression_ratios,
+        main_kv_layout_specs=main_kv_layout_specs,
+        dsv41_main_kv_consumer="direct" if packed_main_kv else "auto",
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -1318,12 +1356,13 @@ def _pure_torch_dsv4_combined_reference(
     current_batch = getattr(fixture, "_current_batch", None)
     if current_batch is None:
         current_batch = fixture.forward_batch
-    fixture.backend.init_forward_metadata(current_batch)
-    # Re-apply the C4 seeding too, since `on_after_cuda_graph_warmup` rolls
-    # `forward_metadata` back to the raw captured value (which clears
-    # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
-    # reference must observe the same seeded indices the backend forward saw.
-    _seed_c4_if_needed(fixture)
+    if not fixture.use_producer_page_indices:
+        fixture.backend.init_forward_metadata(current_batch)
+        # Re-apply the C4 seeding too, since `on_after_cuda_graph_warmup` rolls
+        # `forward_metadata` back to the raw captured value (which clears
+        # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
+        # reference must observe the same seeded indices the backend forward saw.
+        _seed_c4_if_needed(fixture)
     md = fixture.backend.forward_metadata.core_metadata
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
@@ -1610,6 +1649,142 @@ def run_dsv4_draft_extend_attention_case(
             save_kv_cache=False,
             attn_sink=fixture.actual_module.attn_sink,
         )
+        expected = _pure_torch_dsv4_combined_reference(fixture, q_input)
+
+    torch.testing.assert_close(
+        actual.float(), expected.float(), atol=DSV4_ATOL, rtol=DSV4_RTOL
+    )
+
+
+def run_dsv41_packed_prefill_case(
+    testcase,
+    case: DSV4AttentionCase,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+) -> None:
+    """Run packed C1/C2 eager prefill through the real low-ratio producer."""
+    assert case.compress_ratio in (1, 2)
+    assert case.forward_mode.is_extend_without_speculative()
+    if torch.cuda.get_device_capability()[0] != 9:
+        testcase.skipTest("packed Main-KV mixed attention requires SM90")
+
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _get_flashmla_capabilities,
+    )
+
+    capabilities = _get_flashmla_capabilities()
+    if not capabilities["mixed_kvcache_supported"]:
+        testcase.skipTest("FlashMLA mixed packed-Main attention is unavailable")
+
+    fixture = build_dsv4_attention_fixture(
+        testcase,
+        case,
+        dtype=dtype,
+        device=device,
+        compression_ratios=[case.compress_ratio],
+        packed_main_kv=True,
+    )
+    fixture.use_producer_page_indices = True
+    runner = fixture.runner
+    max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
+
+    config = runner.model_config.hf_text_config
+    freqs_cis = torch.ones(
+        max_context_len + case.page_size,
+        DSV4_QK_ROPE_HEAD_DIM // 2,
+        dtype=torch.complex64,
+        device=device,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        compress_ratio=case.compress_ratio,
+        rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
+        freqs_cis=freqs_cis,
+        compressor=DeepseekV41Compressor(
+            hidden_size=DSV4_HEAD_DIM,
+            head_dim=DSV4_HEAD_DIM,
+            compress_ratio=case.compress_ratio,
+            eps=config.rms_norm_eps,
+            fused_compress=False,
+        ).to(device),
+        indexer=DeepseekV41Indexer(
+            config,
+            layer_id=0,
+            head_dim=DSV4_HEAD_DIM,
+            quant_config=None,
+            prefix="packed_prefill_test",
+        ).to(device),
+    )
+
+    num_entries = max(case.seq_lens) // case.compress_ratio + 2
+    seed_latent = torch.randn(
+        num_entries, DSV4_HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    seed_slots = torch.arange(num_entries, dtype=torch.int64, device=device)
+    seed_freqs = freqs_cis[:num_entries]
+    pool = runner.token_to_kv_pool
+    pool.set_extra_key_buffer_fused(
+        layer_id=0,
+        loc=seed_slots,
+        cache_k=seed_latent,
+        freqs_cis=seed_freqs,
+    )
+    pool.set_index_k_fp4(
+        layer_id=0,
+        loc=seed_slots,
+        cache_k=layer.indexer.index_keys(seed_latent, seed_freqs),
+    )
+
+    q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+    q_lora = torch.randn(
+        case.num_input_tokens,
+        config.q_lora_rank,
+        dtype=dtype,
+        device=device,
+    )
+    with (
+        torch.no_grad(),
+        forward_context(ForwardContext(attn_backend=fixture.backend)),
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
+    ):
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+        fixture.backend.forward_low_ratio_sources(
+            layer=layer,
+            x=fixture.input_hidden,
+            q_lora=q_lora,
+            positions=fixture.forward_batch.positions,
+            forward_batch=fixture.forward_batch,
+        )
+
+        metadata = fixture.backend.forward_metadata.core_attn_metadata
+        page_indices = metadata.sparse_page_indices(case.compress_ratio)
+        topk_lengths = metadata.sparse_topk_lengths(case.compress_ratio)
+        for row, length_tensor in enumerate(topk_lengths):
+            length = int(length_tensor.item())
+            testcase.assertGreater(length, 0)
+            testcase.assertTrue(
+                bool((page_indices[row, :length] >= 0).all()),
+                f"{case.name} row {row} contains masked Main-KV indices",
+            )
+
+        actual = fixture.backend.forward(
+            q=q_input,
+            k=q_input,
+            v=q_input,
+            layer=fixture.actual_module.attn,
+            forward_batch=fixture.forward_batch,
+            compress_ratio=case.compress_ratio,
+            save_kv_cache=False,
+            attn_sink=fixture.actual_module.attn_sink,
+        )
+        testcase.assertIsNone(fixture.backend.forward_metadata.sparse_prefill_cache)
+
+        packed_view = pool.get_extra_key_view(layer_id=0)
+        fixture._extra_bf16_k = dequantize_dsv41_packed_main_kv(  # type: ignore[attr-defined]
+            packed_view.storage, packed_view.spec.page_slots
+        ).reshape(-1, DSV4_HEAD_DIM)
         expected = _pure_torch_dsv4_combined_reference(fixture, q_input)
 
     torch.testing.assert_close(

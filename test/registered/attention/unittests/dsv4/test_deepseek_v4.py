@@ -35,6 +35,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
     run_dsv4_draft_extend_attention_case,
+    run_dsv41_packed_prefill_case,
     run_dsv4_target_verify_attention_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
@@ -89,6 +90,28 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             page_size=DSV4_PAGE_SIZE,
             prefix_lens=(128,),
             compress_ratio=128,
+        ),
+    )
+    PACKED_PREFILL_CASES = (
+        DSV4AttentionCase(
+            name="dsv41_packed_c1_eager_prefill",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(33,),
+            extend_lens=(7,),
+            compress_ratio=1,
+        ),
+        DSV4AttentionCase(
+            name="dsv41_packed_c2_eager_prefill",
+            backend="dsv4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(33,),
+            extend_lens=(7,),
+            compress_ratio=2,
         ),
     )
     # SWA + C4 / SWA + C128 cases. Each pre-populates the extra K cache directly
@@ -166,6 +189,15 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.CUDA_GRAPH_DECODE_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_cuda_graph_decode_case(self, case)
+
+    def test_packed_c1_c2_eager_prefill(self):
+        for case in self.PACKED_PREFILL_CASES:
+            with self.subTest(
+                case=case.name,
+                backend=case.backend,
+                compress_ratio=case.compress_ratio,
+            ):
+                run_dsv41_packed_prefill_case(self, case)
 
     # EAGLE target_verify (chain only — DSV4 asserts topk <= 1). One case per
     # compress_ratio so SWA, SWA+C4, and SWA+C128 all run through the
