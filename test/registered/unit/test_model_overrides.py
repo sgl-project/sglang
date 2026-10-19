@@ -1804,8 +1804,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         """With the radix cache on, deterministic mode must not reuse cached prefixes
         through the hybrid SWA pool, whose reusable length follows eviction state."""
 
-        def disabled(arch, **kwargs):
-            sa = self._construct(arch, "llama", attention_backend="triton", **kwargs)
+        def disabled(arch, config_extra=None, **kwargs):
+            sa = self._construct(
+                arch, "llama", config_extra, attention_backend="triton", **kwargs
+            )
             return resolution_result(sa, "disable_hybrid_swa_memory")
 
         self.assertTrue(
@@ -1821,6 +1823,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertFalse(disabled("GptOssForCausalLM"))
         self.assertFalse(
             disabled("LlamaForCausalLM", enable_deterministic_inference=True)
+        )
+        # A hybrid SWA model outside the verified list keeps its pool (Laguna does not start without it).
+        self.assertFalse(
+            disabled(
+                "LagunaForCausalLM",
+                enable_deterministic_inference=True,
+                config_extra={
+                    "layer_types": ["sliding_attention", "full_attention"],
+                    "sliding_window": 64,
+                },
+            )
         )
 
     def test_deterministic_incompatible_backend_raises(self):
