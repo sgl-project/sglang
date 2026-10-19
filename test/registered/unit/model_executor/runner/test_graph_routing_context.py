@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -239,6 +240,62 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.can_run_graph = lambda batch: True
         model_runner.decode_cuda_graph_runner = runner
         return model_runner, model, static, model_runner.attn_backend
+
+    def _capture_cpu_runner(self):
+        model_runner, model, _, backend = self._cpu_runner()
+        runner = model_runner.decode_cuda_graph_runner
+        runner.capture_bs = [1, 4]
+        runner.capture_forward_mode = ForwardMode.DECODE
+        runner.captured_forward_batches = {}
+        runner.captured_forward_batches_cross = {}
+        runner.input_ids = torch.arange(4)
+        runner.req_pool_indices = torch.arange(4)
+        runner.seq_lens = torch.ones(4, dtype=torch.int32)
+        runner.out_cache_loc = torch.arange(4)
+        runner.positions = torch.arange(4)
+        runner.mrope_positions = torch.zeros((3, 4), dtype=torch.int64)
+        runner.num_token_non_padded = torch.zeros(1, dtype=torch.int64)
+        model_runner.kv_index_translator = SimpleNamespace(
+            bind_runner_slots=lambda batch: None
+        )
+        backend.init_forward_metadata_capture_cpu_graph = lambda *args: None
+        for size in reversed(runner.capture_bs):
+            runner.graphs[size], _ = runner.capture_one_batch_size(
+                size, model.forward, skip_cross_attention=True
+            )
+        return runner, model, backend
+
+    def test_cpu_capture_without_tracking_keeps_live_routes(self):
+        """Padded CPU replays keep every live route when count tracking is disabled."""
+        with get_parallel().override(
+            tp_size=1,
+            moe_ep_size=1,
+            attn_tp_size=1,
+            tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
+        ):
+            self.assertFalse(enable_num_token_non_padded())
+            runner, model, backend = self._capture_cpu_runner()
+            for size in (3, 4, 2, 1):
+                with self.subTest(size=size):
+                    incoming = _batch(size, size, prepared=False)
+                    incoming.global_num_token_non_padded = None
+                    with forward_context(
+                        ForwardContext(attn_backend=backend), forward_batch=incoming
+                    ):
+                        eager = model.forward(
+                            incoming.input_ids, incoming.positions, incoming
+                        )
+                    output = runner.execute(incoming)
+                    torch.testing.assert_close(
+                        output.next_token_logits, eager.next_token_logits
+                    )
+                    prepared, bound, _, ids = model.seen[-1]
+                    self.assertIsNone(bound)
+                    self.assertTrue((ids >= 0).all())
+                    self.assertEqual(prepared.batch_size, 4 if size > 1 else 1)
+                    self.assertFalse(has_forward_context())
+            for captured in runner.captured_forward_batches.values():
+                self.assertIsNone(captured.num_token_non_padded)
 
     def _assert_replay(self, model_runner, model, static, backend):
         persistent_bound = static.num_token_non_padded

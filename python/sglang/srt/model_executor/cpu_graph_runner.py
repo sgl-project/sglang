@@ -835,7 +835,9 @@ class CPUGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
+            num_token_non_padded=(
+                self.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=self.capture_forward_mode,
         )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
