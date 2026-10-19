@@ -238,11 +238,11 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
 # The context whose segments are being registered with NCCL right now. The
 # registration has no timeout of its own, so the scheduler watchdog reads this
 # to name a stall inside it.
-_registration_in_progress: Optional["SymmetricMemoryContext"] = None
+_registering_context: Optional["SymmetricMemoryContext"] = None
 
 
 def describe_registration_in_progress() -> Optional[str]:
-    ctx = _registration_in_progress
+    ctx = _registering_context
     if ctx is None:
         return None
     return f"comm={ctx._comm_ptr} group={ctx.group_coordinator.unique_name}"
@@ -333,15 +333,15 @@ class SymmetricMemoryContext:
         3. Thread-safe access to the segment registry
         """
 
-        global _registration_in_progress
+        global _registering_context
 
+        _registering_context = self
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        _registration_in_progress = self
         try:
             result = _register_func(self._comm_ptr)
         finally:
-            _registration_in_progress = None
+            _registering_context = None
         assert result == 0, (
             f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
         )
