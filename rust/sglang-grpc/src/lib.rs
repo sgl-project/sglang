@@ -1,3 +1,4 @@
+mod auth;
 pub mod bridge;
 pub mod server;
 pub mod tokenizers;
@@ -59,14 +60,19 @@ fn start_server_thread(
     rt: tokio::runtime::Runtime,
     listener: TcpListener,
     service: server::ServerMode,
+    api_key: Option<String>,
 ) -> PyResult<GrpcServerHandle> {
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
     let join_handle = std::thread::Builder::new()
         .name("sglang-grpc".to_string())
         .spawn(move || {
-            if let Err(e) = rt.block_on(server::run_grpc_server(listener, service, shutdown_clone))
-            {
+            if let Err(e) = rt.block_on(server::run_grpc_server(
+                listener,
+                service,
+                shutdown_clone,
+                api_key,
+            )) {
                 tracing::error!("gRPC server exited with error: {}", e);
             }
         })
@@ -82,10 +88,12 @@ fn start_server_thread(
 
 /// Start a follower server exposing only GetServerInfo, without an inference bridge.
 #[pyfunction]
+#[pyo3(signature = (host, port, server_info_json, *, api_key=None))]
 fn start_metadata_server(
     host: String,
     port: u16,
     server_info_json: String,
+    api_key: Option<String>,
 ) -> PyResult<GrpcServerHandle> {
     let listener = bind_listener(&host, port)?;
     // Metadata is a startup snapshot; it needs neither Python callbacks nor a
@@ -103,6 +111,7 @@ fn start_metadata_server(
         rt,
         listener,
         server::ServerMode::Metadata(server::MetadataService { server_info_json }),
+        api_key,
     )
 }
 
@@ -214,7 +223,7 @@ fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo>
 /// Returns:
 ///     GrpcServerHandle that can be used to shut down the server.
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300, *, api_key=None))]
 fn start_server(
     host: String,
     port: u16,
@@ -222,6 +231,7 @@ fn start_server(
     worker_threads: usize,
     response_channel_capacity: usize,
     response_timeout_secs: u64,
+    api_key: Option<String>,
 ) -> PyResult<GrpcServerHandle> {
     // Best-effort: embedding processes may initialize tracing themselves.
     let _ = tracing_subscriber::fmt()
@@ -289,6 +299,7 @@ fn start_server(
             bridge,
             response_timeout,
         },
+        api_key,
     )
 }
 

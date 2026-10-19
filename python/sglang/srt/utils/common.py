@@ -3686,6 +3686,7 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
     return grpc_native.start_metadata_server(
         host=serving.host,
         port=serving.grpc_port,
+        api_key=serving.api_key,
         server_info_json=json.dumps(
             msgspec_to_builtins(
                 redact_watermark_secrets(build_server_info(server_args, scheduler_info))
