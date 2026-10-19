@@ -27,14 +27,14 @@ def inputs(lengths, requests):
     )
 
 
-def make_backend(mode, seq, req, *, fusion=True):
+def make_backend(mode, seq, req, *, fusion=True, pool=POOL):
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = torch.device("cuda")
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
     backend.num_q_heads = 64
     backend.physical_page_size = 64
     backend.dsa_index_topk = TOPK
-    backend.dsa_index_kpool = POOL
+    backend.dsa_index_kpool = pool
     backend.speculative_num_draft_tokens = NEXT_N
     backend.dsa_drop_wide_page_table = False
     backend.dsa_decode_impl = "fa3"
