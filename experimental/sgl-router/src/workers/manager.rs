@@ -34,8 +34,9 @@ const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
 /// The router serves a single configured model; apply its circuit-breaker
-/// config when this worker advertises that model id. Falls back to `None`
-/// (default config) otherwise.
+/// config when this worker advertises that model id, and the default config
+/// otherwise. Under `--disable-circuit-breaker` there is none, so the worker's
+/// breaker never opens.
 fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
     let model = &cfg.model;
     let cbc = model.circuit_breaker.as_ref()?;
@@ -45,7 +46,7 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
             cool_down: Duration::from_secs(cbc.cool_down_secs),
         });
     }
-    None
+    Some(CircuitBreakerConfig::default())
 }
 
 /// Whether `worker_url` is one the router will dial in cleartext.
@@ -119,8 +120,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `router_inflight_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
-/// `cfg` is `None` the default CB config is used for every worker
-/// (threshold = 3).
+/// `cfg` is `None` no worker's circuit breaker ever opens.
 ///
 /// Introspects workers with a 2-second timeout, sending `--worker-api-key`
 /// when set.  Tests that want a tighter timeout call
@@ -580,6 +580,7 @@ async fn register_one(
         protocol,
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
+        grpc_port: info.grpc_port,
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -599,6 +600,12 @@ async fn register_one(
     // traffic — a spec refused above never reaches the wire at all.
     if previous_protocol != Some(protocol) {
         log_protocol_resolution(&worker_url, info.enable_http2, cleartext);
+        if info.grpc_port.is_none() && cfg.is_some_and(|c| c.server.grpc_port.is_some()) {
+            tracing::warn!(
+                worker_url = %worker_url,
+                "worker reports no --grpc-port; gRPC requests routed to it fail",
+            );
+        }
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -674,6 +681,22 @@ mod tests {
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cb_config_for_spec_is_none_only_when_disabled() {
+        let mut cfg = cfg_with_model_cb("m", 5, 60);
+        let spec = WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("other".into())],
+            ..Default::default()
+        };
+        let cb = cb_config_for_spec(&spec, &cfg).expect("default breaker for another model");
+        assert_eq!(cb.threshold.get(), 3);
+        cfg.model.circuit_breaker = None;
+        assert!(cb_config_for_spec(&spec, &cfg).is_none());
     }
 
     #[test]

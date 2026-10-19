@@ -26,9 +26,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.mm_utils import hash_feature
 from sglang.srt.managers.schedule_batch import (
+    MM_PAD_SHIFT_VALUE,
     Modality,
     MultimodalDataItem,
-    _compute_pad_value,
 )
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,7 +66,8 @@ class TestMmHashesContract(CustomTestCase):
         ):
             item.set_pad_value()
         self.assertEqual(item.hash, 0xDEADBEEF)
-        self.assertEqual(item.pad_value, _compute_pad_value(0xDEADBEEF))
+        self.assertEqual(len(item.padding_values()), 4)
+        self.assertEqual(item.pad_value, item.padding_values()[0])
 
     def test_set_pad_value_is_deterministic_across_items(self):
         """Two items with the same preset hash must derive the same pad_value."""
@@ -75,7 +76,7 @@ class TestMmHashesContract(CustomTestCase):
         # No feature payload — set_pad_value uses the preset hash.
         a.set_pad_value()
         b.set_pad_value()
-        self.assertEqual(a.pad_value, b.pad_value)
+        self.assertEqual(a.padding_values(), b.padding_values())
         self.assertEqual(a.hash, b.hash)
 
     def test_set_pad_value_distinguishes_different_preset_hashes(self):
@@ -93,7 +94,41 @@ class TestMmHashesContract(CustomTestCase):
         item.set_hash(0xBBBB)
 
         self.assertEqual(item.hash, 0xBBBB)
-        self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
+        expected = MultimodalDataItem(modality=Modality.IMAGE, hash=0xBBBB)
+        expected.set_pad_value()
+        self.assertEqual(item.padding_values(), expected.padding_values())
+
+    def test_wide_padding_is_shared_by_all_modalities(self):
+        expected = (
+            4445679232235744898,
+            1252851680943950380,
+            4490111419971165939,
+            1999168716371743145,
+        )
+        for modality in Modality.all():
+            with self.subTest(modality=modality):
+                a = MultimodalDataItem(modality=modality, hash=7)
+                b = MultimodalDataItem(modality=modality, hash=7 + (1 << 30))
+                a.set_pad_value()
+                b.set_pad_value()
+                self.assertNotEqual(a.pad_value, b.pad_value)
+                self.assertEqual(a.padding_values(), expected)
+                self.assertEqual(
+                    a.padding_sequence(6), list(a.pad_values) + list(a.pad_values[:2])
+                )
+                for value in a.padding_values():
+                    self.assertGreaterEqual(value, MM_PAD_SHIFT_VALUE)
+                    self.assertLess(value, 1 << 63)
+
+    def test_set_hash_and_constructor_normalize_identically(self):
+        for value in (-1, 1 << 64, (1 << 128) + 7):
+            with self.subTest(value=value):
+                a = MultimodalDataItem(modality=Modality.IMAGE, hash=value)
+                b = MultimodalDataItem(modality=Modality.IMAGE)
+                a.set_pad_value()
+                b.set_hash(value)
+                self.assertEqual(a.hash, b.hash)
+                self.assertEqual(a.padding_values(), b.padding_values())
 
 
 class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCase):
@@ -127,8 +162,8 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
                     ):
                         received.set_pad_value()
                     self.assertEqual(
-                        (received.hash, received.pad_value),
-                        (expected.hash, expected.pad_value),
+                        (received.hash, received.padding_values()),
+                        (expected.hash, expected.padding_values()),
                     )
 
     async def test_overrides_and_device_features_stay_on_caller_thread(self):
