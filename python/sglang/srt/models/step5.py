@@ -347,6 +347,30 @@ def _step5_routed_expert_row(name: str, num_experts: int) -> tuple[str, int] | N
     return f"{head}.moe.{projection}", int(expert)
 
 
+_STEP5_ROUTED_EXPERT_WEIGHTS = {
+    "gate_proj.weight": "w13_weight",
+    "up_proj.weight": "w13_weight",
+    "down_proj.weight": "w2_weight",
+}
+
+
+def _step5_refuse_fp8_into_bf16_expert(
+    name: str, weight: torch.Tensor, params_dict: Mapping, num_experts: int
+) -> None:
+    # The weight loader would cast it to BF16 without its scales.
+    if weight.dtype != torch.float8_e4m3fn:
+        return
+    row = _step5_routed_expert_row(name, num_experts)
+    head, marker, source = (name if row is None else row[0]).rpartition(".moe.")
+    if not marker or source not in _STEP5_ROUTED_EXPERT_WEIGHTS:
+        return
+    param_name = f"{head}.moe.experts.{_STEP5_ROUTED_EXPERT_WEIGHTS[source]}"
+    if param_name in params_dict and params_dict[param_name].dtype == torch.bfloat16:
+        raise ValueError(
+            f"Refusing FP8 weight {name} for BF16 expert parameter {param_name}"
+        )
+
+
 def _step5_indexed_nvfp4_layers(checkpoint_path) -> dict[int, str] | None:
     if not checkpoint_path:
         return None
@@ -1728,11 +1752,20 @@ class Step5ForCausalLM(nn.Module):
             weights = self._indexed_duplicate_weights(
                 weights, duplicates, self.checkpoint_path
             )
+        if isinstance(weights, list):
+            # Refuse a tensor/distributed bucket before writing any of it.
+            for original_name, loaded_weight in weights:
+                _step5_refuse_fp8_into_bf16_expert(
+                    original_name, loaded_weight, params_dict, config.moe_num_experts
+                )
         first_copies = {}
         for original_name, loaded_weight in weights:
             name = original_name
             if name.startswith("vision_model.") or name == "vit_large_projector.weight":
                 continue
+            _step5_refuse_fp8_into_bf16_expert(
+                name, loaded_weight, params_dict, config.moe_num_experts
+            )
             if name.startswith("model.layers."):
                 _, _, index, local = name.split(".", 3)
                 if (

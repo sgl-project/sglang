@@ -40,7 +40,7 @@ class _RecordingParam:
 class _FakeStep5:
     """The attributes Step5ForCausalLM.load_weights reads, around one FP8 MoE layer and a norm."""
 
-    def __init__(self):
+    def __init__(self, bf16_experts: bool = False):
         self.calls = []
         fp8, fp32 = torch.float8_e4m3fn, torch.float32
         self.params = {
@@ -50,6 +50,12 @@ class _FakeStep5:
             _EXPERTS + "w2_weight_scale_inv": _RecordingParam(fp32, self.calls),
             "model.norm.weight": _RecordingParam(torch.bfloat16, self.calls),
         }
+        if bf16_experts:
+            self.params = {
+                _EXPERTS + "w13_weight": _RecordingParam(torch.bfloat16, self.calls),
+                _EXPERTS + "w2_weight": _RecordingParam(torch.bfloat16, self.calls),
+                "model.norm.weight": self.params["model.norm.weight"],
+            }
         self.config = SimpleNamespace(
             moe_num_experts=_NUM_EXPERTS,
             num_hidden_layers=92,
@@ -231,6 +237,36 @@ class TestStep5WeightUpdates(CustomTestCase):
                     2, 0
                 ).repeat_interleave(2, 1)
                 torch.testing.assert_close(dequantized, bf16.float(), rtol=0.07, atol=0)
+
+    def test_refuse_fp8_into_bf16_experts_before_writing_the_bucket(self):
+        """An FP8 tensor for a checkpoint-BF16 expert is refused rather than cast without
+        its scales, and nothing else in its bucket is written."""
+        model = _FakeStep5(bf16_experts=True)
+        model.load_weights(
+            [
+                ("model.norm.weight", torch.ones(8, dtype=torch.bfloat16)),
+                *(
+                    (
+                        f"{_PACKED}{projection}.weight",
+                        torch.zeros(_NUM_EXPERTS, 4, 4, dtype=torch.bfloat16),
+                    )
+                    for projection in ("gate_proj", "up_proj", "down_proj")
+                ),
+            ]
+        )
+        model.calls.clear()
+
+        with self.assertRaisesRegex(ValueError, "BF16 expert parameter"):
+            model.load_weights(
+                [
+                    ("model.norm.weight", torch.ones(8, dtype=torch.bfloat16)),
+                    (
+                        _EXPERTS + "1.gate_proj.weight",
+                        torch.zeros(4, 4, dtype=torch.float8_e4m3fn),
+                    ),
+                ]
+            )
+        self.assertEqual(model.calls, [])
 
     def test_may_send_any_subset_and_skip_the_disk_index(self):
         model = _loaded()
