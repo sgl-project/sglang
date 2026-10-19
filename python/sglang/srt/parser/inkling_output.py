@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 from collections.abc import Sequence
@@ -43,7 +44,11 @@ class InklingOutputDelta(msgspec.Struct, frozen=True):
 
 
 class InklingOutputParser:
-    """Control tokens are identified by ID; ordinary tokens spelling a marker remain text."""
+    """Control tokens are identified by ID; ordinary tokens spelling a marker remain text.
+
+    TMLv0's parser only parses whole token sequences, so each message is parsed
+    once when it closes; text and thinking stream from their tokens meanwhile.
+    """
 
     def __init__(
         self,
@@ -62,12 +67,32 @@ class InklingOutputParser:
         self._content_kind_ids = frozenset(
             tokenizer.encode_special(name) for name in _CONTENT_KIND_NAMES
         )
+        self._streamed_kind_ids = frozenset(
+            tokenizer.encode_special(name)
+            for name in ("content_text", "content_thinking")
+        )
+        self._thinking_id = tokenizer.encode_special("content_thinking")
+        self._header_ids = {
+            tokenizer.encode_special(f"message_{role}"): role == "model"
+            for role in ("model", "user", "system", "tool")
+        }
+        self._end_sampling_id = tokenizer.encode_special("content_model_end_sampling")
+        # A parse that yields no content raises EmptyResponseError, so each closed
+        # message is parsed after a non-empty one and that leading message dropped.
+        self._parse_prefix = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+            *tokenizer.encode_ordinary("."),
+            tokenizer.encode_special("end_message"),
+        ]
         self._text_opener_ids = (
             tokenizer.encode_special("message_model"),
             tokenizer.encode_special("content_text"),
         )
         self._end_message_id = tokenizer.encode_special("end_message")
         self._message_ids: list[int] = []
+        self._kind_id: int | None = None
+        self._text_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._streamed = ""
         self._held_reasoning = ""
         self._model_authored = True
@@ -151,13 +176,6 @@ class InklingOutputParser:
 
     def _flush(self) -> InklingOutputDelta:
         delta = _DeltaBuilder()
-        try:
-            updates = self._parser.flush_updates()
-        except self._tml.v0.ParseError as exc:
-            self._recover_message(delta, exc)
-            return delta.build()
-        for update in updates:
-            self._apply(update.update, delta)
         self._surface_unclosed_message(delta)
         self._release_held_reasoning(delta)
         return delta.build()
@@ -189,30 +207,47 @@ class InklingOutputParser:
         self._parse(token_id, delta)
 
     def _parse(self, token_id: int, delta: _DeltaBuilder) -> None:
+        if self._at_message_boundary:
+            self._model_authored = self._header_ids.get(token_id, True)
+            if token_id == self._end_sampling_id:
+                return
         self._at_message_boundary = False
         self._message_ids.append(token_id)
+        if token_id == self._end_message_id:
+            self._close_message(delta)
+        elif self._kind_id is None:
+            if token_id in self._content_kind_ids:
+                self._kind_id = token_id
+        elif self._kind_id in self._streamed_kind_ids and self._model_authored:
+            text = self._token_text(token_id)
+            self._emit_text(self._kind_id == self._thinking_id, text, delta)
+            self._streamed += text
+
+    def _token_text(self, token_id: int) -> str:
+        # Inside a text block a special reads as its spelling.
+        tokenizer = self._tml.tokenizer
+        if tokenizer.is_special_token(token_id):
+            return self._text_decoder.decode(tokenizer.decode([token_id]).encode())
+        return self._text_decoder.decode(tokenizer.decode_bytes([token_id]))
+
+    def _close_message(self, delta: _DeltaBuilder) -> None:
         try:
-            updates = self._parser.parse_token(token_id)
+            messages = self._parser.parse_tokens(
+                self._parse_prefix + self._message_ids
+            )[1:]
         except self._tml.v0.ParseError as exc:
             self._recover_message(delta, exc)
             return
-        for update in updates:
-            self._apply(update.update, delta)
+        for message in messages:
+            self._complete_message(message, delta)
+        self._reset_message()
 
-    def _apply(self, update: Any, delta: _DeltaBuilder) -> None:
-        chat = self._tml.chat
-        if isinstance(update, chat.StreamingMessageHeader):
-            self._model_authored = update.author.kind == chat.AuthorKind.Model
-            self._streamed = ""
-        elif isinstance(update, chat.StreamingContent):
-            if self._model_authored:
-                self._emit_text(update.content, update.content.text, delta)
-                self._streamed += update.content.text
-        else:
-            self._complete_message(update, delta)
-            self._message_ids = []
-            self._streamed = ""
-            self._at_message_boundary = True
+    def _reset_message(self) -> None:
+        self._message_ids = []
+        self._kind_id = None
+        self._text_decoder.reset()
+        self._streamed = ""
+        self._at_message_boundary = True
 
     def _complete_message(self, message: Any, delta: _DeltaBuilder) -> None:
         chat = self._tml.chat
@@ -221,7 +256,8 @@ class InklingOutputParser:
             logger.debug("Dropping non-model Inkling output message: %r", message)
         elif isinstance(content, (chat.Text, chat.Thinking)):
             if content.text.startswith(self._streamed):
-                self._emit_text(content, content.text[len(self._streamed) :], delta)
+                thinking = isinstance(content, chat.Thinking)
+                self._emit_text(thinking, content.text[len(self._streamed) :], delta)
             self._release_held_reasoning(delta)
         elif isinstance(content, chat.InvokeTool):
             if self._parse_tool_calls and content.text is None:
@@ -230,10 +266,8 @@ class InklingOutputParser:
             else:
                 delta.content.append(self._payload_text())
 
-    def _emit_text(self, content: Any, text: str, delta: _DeltaBuilder) -> None:
-        if not (
-            self._separate_reasoning and isinstance(content, self._tml.chat.Thinking)
-        ):
+    def _emit_text(self, thinking: bool, text: str, delta: _DeltaBuilder) -> None:
+        if not (self._separate_reasoning and thinking):
             delta.content.append(text)
         elif self._hold_reasoning:
             self._held_reasoning += text
@@ -269,11 +303,8 @@ class InklingOutputParser:
         if text.startswith(emitted):
             delta.content.append(text[len(emitted) :])
         self._held_reasoning = ""
-        self._parser.reset()
-        self._message_ids = []
-        self._streamed = ""
+        self._reset_message()
         self._model_authored = True
-        self._at_message_boundary = True
         self._in_unframed_text = False
 
     def _payload_ids(self) -> list[int]:

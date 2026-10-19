@@ -15,7 +15,7 @@ from pathlib import Path
 
 from tml_renderers import chat, tokenizers, v0
 
-TOKENIZER = tokenizers.o200k_base_chat()
+TOKENIZER = tokenizers.O200kBaseChatTokenizer()
 RENDERER = v0.Renderer(TOKENIZER)
 IMAGE_PLACEHOLDER = -101
 
@@ -348,7 +348,7 @@ def output(name, text):
             re.sub(r"\[\[ORD:.*?\]\]", "", text),
         )
     )
-    for message in parser.parse_tokens(ids) + parser.flush():
+    for message in parser.parse_tokens(ids):
         part = message.content
         if isinstance(part, chat.Text):
             content.append(part.text)
