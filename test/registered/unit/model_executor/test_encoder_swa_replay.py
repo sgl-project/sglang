@@ -301,11 +301,8 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         )
 
     def test_prompt_logprob_reader_keeps_its_whole_tail(self):
-        """A request scoring prompt rows runs its whole folded extend through the
-        late layers, so its tail is longer than a window and begins with its
-        replay rows; the draft must still get exactly the scheduled rows."""
+        """A prompt-logprob reader's tail is its whole folded extend, replay rows included."""
         fx = _Fixture()
-        # The large hit scores its prompt from its 10th new token on.
         fx.batch.extend_logprob_start_lens = [40, 10, 5]
         folded = _fold_batch(batch=fx.batch, runner=fx.runner, rows=HITS)
         fb = folded.batch

@@ -52,9 +52,7 @@ def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
 def drop_folded_rows(
     *, logits_output, folded: FoldedExtend, tail_lens: Optional[list[int]] = None
 ) -> None:
-    """Hand downstream consumers (the DSpark draft) only the original extend rows.
-    tail_lens: each request's decoder-SWA tail rows when the model returned only
-    those (a prompt-logprob reader's tail is its whole extend)."""
+    """Hand downstream consumers (the DSpark draft) only the original extend rows."""
     hidden = logits_output.hidden_states
     token_indices = logits_output.hidden_states_token_indices
     if token_indices is not None:
@@ -75,7 +73,6 @@ def drop_folded_rows(
 def _tail_rows_on_original(
     *, folded: FoldedExtend, tail_lens: list[int], num_tail_rows: int
 ):
-    # Each request's tail is its last folded rows; its replay rows lead the extend.
     keep, off = [], 0
     for n, r, tail in zip(folded.batch.extend_lens, folded.replay_lens, tail_lens):
         keep.append(torch.arange(off + max(0, tail - (n - r)), off + tail))
