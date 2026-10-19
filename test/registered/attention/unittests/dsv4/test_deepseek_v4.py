@@ -19,6 +19,8 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import CapturedPrefillInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
@@ -829,6 +831,67 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     combine.call_args.kwargs["topk_indices"].shape,
                     (2, expected_extent),
                 )
+
+
+class TestDSV4FullTopKCapturedFallback(CustomTestCase):
+    """CPU-only: the captured full-top-k fallback keeps every configured k."""
+
+    def _topk_calls(self, index_topk: int, width: int):
+        rows = 2
+        metadata = SimpleNamespace(
+            compressed_page_size=64,
+            max_compressed_seq_len=width,
+            compressed_seq_lens=torch.tensor([width, width // 2], dtype=torch.int32),
+            page_table=torch.zeros(rows, width // 64, dtype=torch.int32),
+            use_topk_v2=False,
+            row_chunks=lambda: [(slice(0, rows), None)],
+        )
+        inputs = CapturedPrefillInputs(
+            indexer=SimpleNamespace(index_topk=index_topk, n_local_heads=1, n_heads=1),
+            layer_id=0,
+            q=torch.zeros(rows, 1, 128, dtype=torch.bfloat16),
+            weights=torch.ones(rows, 1, dtype=torch.bfloat16),
+            paged_metadata=metadata,
+            out_page_indices=torch.full((rows, index_topk), -1, dtype=torch.int32),
+            out_raw_indices=torch.full((rows, index_topk), -1, dtype=torch.int32),
+        )
+        calls = []
+        with (
+            mock.patch.object(
+                full_topk,
+                "quantize_index_q",
+                return_value=(torch.zeros(rows, 1, 64), torch.zeros(rows, 1)),
+            ),
+            mock.patch.object(full_topk, "get_index_k_cache", return_value=object()),
+            mock.patch.object(
+                full_topk,
+                "deep_gemm_fp4_paged_mqa_logits",
+                return_value=torch.zeros(rows, width),
+            ),
+            mock.patch.object(
+                full_topk,
+                "topk_transform_paged_torch",
+                side_effect=lambda *a, **_: calls.append(("torch", a[3].shape[1])),
+            ),
+            mock.patch.object(
+                full_topk,
+                "topk_transform_paged_from_metadata",
+                side_effect=lambda *a, **_: calls.append(("kernel", None)),
+            ),
+        ):
+            full_topk.FullTopKIndexer._deep_gemm_prefill_captured(
+                SimpleNamespace(token_to_kv_pool=None), inputs
+            )
+        return calls
+
+    def test_v1_limit_uses_output_width(self):
+        for k, width, expected in (
+            (1024, 512, ("kernel", None)),
+            (2048, 4096, ("torch", 2048)),
+            (2048, 512, ("torch", 512)),
+        ):
+            with self.subTest(k=k, width=width):
+                self.assertEqual(self._topk_calls(k, width), [expected])
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):

@@ -28,6 +28,10 @@ def _jit_topk_v1_module():
     )
 
 
+# Largest ``k`` the v1 kernel selects (kMaxTopK in deepseek_v4/topk_v1.cuh).
+TOPK_V1_MAX_K = 1024
+
+
 @cache_once
 def _jit_topk_v2_module():
     from sglang.kernels.jit.utils.occupancy import (
