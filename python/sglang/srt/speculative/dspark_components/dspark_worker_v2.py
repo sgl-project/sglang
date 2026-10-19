@@ -88,6 +88,7 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -720,9 +721,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             # A newly placed request's ring holds nothing below its cached prefix.
             placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
             if placed:
+                # Pinned copies and a device gather: a list index or a pageable
+                # copy here would wait for the whole target forward.
                 draft_pool.set_swa_valid_from(
-                    batch.req_pool_indices[placed],
-                    torch.tensor(
+                    batch.req_pool_indices.index_select(
+                        0, async_h2d(placed, dtype=torch.int64, device=device)
+                    ),
+                    async_h2d(
                         [batch.prefix_lens[i] for i in placed],
                         dtype=torch.int64,
                         device=device,
