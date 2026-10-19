@@ -14,10 +14,7 @@ from sglang.kernels.ops.attention.deep_select import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.kernels.ops.attention.dsv4.topk import (
-    TOPK_V1_MAX_K,
-    topk_transform_paged_torch,
-)
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -178,12 +175,7 @@ class FullTopKIndexer:
         width = metadata.max_compressed_seq_len
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
-        # With top-k v2 off (the low-ratio prefill metadata), the metadata path runs
-        # the v1 kernel, which takes k from the output width and caps it at
-        # TOPK_V1_MAX_K; wider outputs use the torch top-k over min(k, width) columns.
-        out_width = inputs.out_page_indices.shape[1]
-        torch_topk = not metadata.use_topk_v2 and out_width > TOPK_V1_MAX_K
-        topk = min(out_width, width)
+        topk = min(indexer.index_topk, width)
         for rows, plan in metadata.row_chunks():
             logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
@@ -194,22 +186,11 @@ class FullTopKIndexer:
                 plan,
                 width,
             )
-            if torch_topk:
-                topk_transform_paged_torch(
-                    logits,
-                    lens[rows],
-                    page_table[rows],
-                    inputs.out_page_indices[rows, :topk],
-                    page_size,
-                    inputs.out_raw_indices[rows, :topk],
-                )
-                continue
-            # Per row up to its own length: a wide graph then costs only the
-            # logits buffer, not a full-static-width top-k.
-            topk_transform_paged_from_metadata(
+            topk_transform_paged_torch(
                 logits,
-                metadata,
-                inputs.out_page_indices,
-                inputs.out_raw_indices,
-                rows=rows,
+                lens[rows],
+                page_table[rows],
+                inputs.out_page_indices[rows, :topk],
+                page_size,
+                inputs.out_raw_indices[rows, :topk],
             )
