@@ -6,11 +6,14 @@ import torch
 
 from sglang.srt.models.dflash import (
     CandidateSelector,
+    DFlash2BeamDraftModel,
     DFlash2DraftModel,
+    EntryClass,
     _grouped_conv,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=31, suite="base-a-test-cpu")
 
@@ -411,6 +414,39 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+def test_beam_draft_architecture_keeps_the_candidate_selector():
+    assert issubclass(DFlash2BeamDraftModel, DFlash2DraftModel)
+    assert DFlash2BeamDraftModel in EntryClass
+
+
+class TestDFlashDPEmbedding(CustomTestCase):
+    def test_singleton_attention_tp_reuses_the_full_embedding(self):
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        embedding = SimpleNamespace(weight=weight, use_attn_tp_group=True)
+        worker = SimpleNamespace(
+            _full_embed_gpu=None,
+            _target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model=SimpleNamespace(get_input_embeddings=lambda: embedding)
+                )
+            ),
+        )
+        with get_parallel().override(
+            attn_dp_enabled=True,
+            attn_tp_group=SimpleNamespace(world_size=1),
+            tp_group=SimpleNamespace(world_size=4),
+        ):
+            DFlashWorkerV2._cache_full_embed_weight(worker)
+        self.assertIs(worker._full_embed_gpu, weight)
+        ids = torch.tensor([[0, 7], [3, 1]])
+        torch.testing.assert_close(
+            torch.nn.functional.embedding(ids, worker._full_embed_gpu), weight[ids]
+        )
 
 
 if __name__ == "__main__":

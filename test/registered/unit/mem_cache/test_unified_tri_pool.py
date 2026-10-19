@@ -494,7 +494,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         allocator.free_group_begin()
         allocator.free_full_segment(full_indices, start_pos=0)
-        self.assertTrue(allocator.full_free_group)
+        self.assertTrue(allocator.full_page_reps_group)
 
         donor = allocator.mamba_full_cache_donor()
         self.assertIsNotNone(donor)
@@ -502,6 +502,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         self.assertEqual(allocator.free_group, [])
         self.assertEqual(allocator.free_page_reps_group, [])
+        self.assertEqual(allocator.full_page_reps_group, [])
         self.assertEqual(allocator.full_free_group, [])
         self.assertLess(
             allocator.full_attn_allocator.allocated_count(), allocated_before

@@ -38,6 +38,12 @@ def _load_megamoe_module(monkeypatch):
         "sglang.srt.layers.moe.token_dispatcher": types.ModuleType(
             "sglang.srt.layers.moe.token_dispatcher"
         ),
+        "sglang.srt.layers.dp_attention": types.ModuleType(
+            "sglang.srt.layers.dp_attention"
+        ),
+        "sglang.srt.layers.logits_processor": types.ModuleType(
+            "sglang.srt.layers.logits_processor"
+        ),
         "sglang.srt.runtime_context": types.ModuleType("sglang.srt.runtime_context"),
         "deep_gemm": types.ModuleType("deep_gemm"),
         "deep_gemm.utils": types.ModuleType("deep_gemm.utils"),
@@ -56,6 +62,12 @@ def _load_megamoe_module(monkeypatch):
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
+    runtime_context.get_parallel = lambda: types.SimpleNamespace(dp_size=4)
+    dp_attention = fake_modules["sglang.srt.layers.dp_attention"]
+    dp_attention.get_is_extend_in_batch = lambda: False
+    dp_attention.get_dp_global_num_tokens = lambda: None
+    logits_processor = fake_modules["sglang.srt.layers.logits_processor"]
+    logits_processor.get_in_autotune_dummy_run = lambda: False
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
     base.MoeQuantInfo = MoeQuantInfo
     base.MoeRunnerConfig = MoeRunnerConfig
@@ -355,6 +367,51 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     runtime_context = sys.modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 0
     assert module._resolve_max_tokens_per_rank() == 1024
+
+
+def test_decode_workspace_is_chosen_only_when_every_rank_fits(monkeypatch):
+    """MegaMOE is a cross-rank collective: every EP rank must pick the same
+    workspace, and the small one only when no rank's padded batch exceeds it."""
+    module = _load_megamoe_module(monkeypatch)
+    dp_attention = sys.modules["sglang.srt.layers.dp_attention"]
+
+    def mega(capacity):
+        return types.SimpleNamespace(
+            _fleet_params=types.SimpleNamespace(max_tokens_per_rank=capacity)
+        )
+
+    large, small = mega(4608), mega(160)
+    quant_info = module.FlashInferMegaMoeQuantInfo(
+        mega=large, mega_forward=object(), mega_decode=small
+    )
+
+    def select(*, is_extend, global_num_tokens):
+        monkeypatch.setattr(dp_attention, "get_is_extend_in_batch", lambda: is_extend)
+        monkeypatch.setattr(
+            dp_attention, "get_dp_global_num_tokens", lambda: global_num_tokens
+        )
+        return module._select_mega_for_forward(quant_info)
+
+    assert select(is_extend=False, global_num_tokens=[160, 0, 37, 160]) is small
+    # Any rank extending, even with a decode-sized batch.
+    assert select(is_extend=True, global_num_tokens=[1, 1, 1, 1]) is large
+    # Decode above the small capacity on one rank only.
+    assert select(is_extend=False, global_num_tokens=[12, 161, 12, 12]) is large
+    # A prefill-sized forward can still publish extend=False.
+    assert select(is_extend=False, global_num_tokens=[4108] * 4) is large
+    # Under DP a singleton list is this rank's count only.
+    assert select(is_extend=False, global_num_tokens=[8]) is large
+    assert select(is_extend=False, global_num_tokens=None) is large
+
+
+def test_decode_capacity_at_or_above_main_capacity_is_disabled(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    envs = sys.modules["sglang.srt.environ"].envs
+    for configured, expected in ((0, 0), (160, 160), (4608, 0), (8192, 0)):
+        envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = (
+            types.SimpleNamespace(get=lambda v=configured: v)
+        )
+        assert module._resolve_decode_max_tokens_per_rank(4608) == expected
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
