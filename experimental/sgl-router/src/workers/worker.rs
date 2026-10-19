@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -48,6 +49,8 @@ pub struct EngineProfile {
     pub dp_ranks: u32,
     /// The engine's OpenAI-layer server args; `None` if unread.
     pub openai: Option<Arc<OpenAiSettings>>,
+    /// The engine's native gRPC port; `None` means gRPC clients cannot reach it.
+    pub grpc_port: Option<u16>,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -56,8 +59,28 @@ impl From<WireProtocol> for EngineProfile {
             protocol,
             dp_ranks: 1,
             openai: None,
+            grpc_port: None,
         }
     }
+}
+
+/// The engine's own default message cap (`DEFAULT_GRPC_MAX_MESSAGE_SIZE` in
+/// rust/sglang-grpc), so the router never rejects what the engine accepts.
+pub const GRPC_MAX_MESSAGE_BYTES: usize = 64 << 20;
+
+/// A client that dials on first use; only an unparsable address yields `None`.
+fn grpc_client(host: &str, port: u16) -> Option<SglangServiceClient<tonic::transport::Channel>> {
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{host}:{port}"))
+        .map_err(|error| tracing::warn!(host, port, %error, "invalid engine gRPC address"))
+        .ok()?
+        .connect_timeout(Duration::from_secs(5))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_while_idle(true);
+    Some(
+        SglangServiceClient::new(endpoint.connect_lazy())
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES),
+    )
 }
 
 /// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
@@ -202,6 +225,8 @@ pub struct Worker {
     /// Forwarding wire protocol, resolved from `/server_info` before this
     /// worker was constructed. Immutable: see [`WireProtocol`].
     protocol: WireProtocol,
+    /// Reaches the engine's native gRPC server, for requests that arrived over gRPC.
+    grpc: Option<SglangServiceClient<tonic::transport::Channel>>,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -228,6 +253,8 @@ pub struct Worker {
     services: RwLock<BTreeSet<String>>,
     /// Router in-flight requests per DP rank; one slot per rank.
     dp_rank_inflight: Arc<[AtomicUsize]>,
+    /// Round-robin position over this worker's DP ranks.
+    dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
 }
 
@@ -237,8 +264,8 @@ impl Worker {
     }
 
     /// Construct a worker with an explicit circuit-breaker configuration and
-    /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`
-    /// for the default breaker config (threshold = 3, cool_down = 30 s).
+    /// engine profile (a bare [`WireProtocol`] means one DP rank). Pass `None`,
+    /// as under `--disable-circuit-breaker`, for a breaker that never opens.
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
@@ -248,12 +275,14 @@ impl Worker {
             protocol,
             dp_ranks,
             openai,
+            grpc_port,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
-            None => Arc::new(CircuitBreaker::new()),
+            None => Arc::new(CircuitBreaker::disabled()),
         };
         let bootstrap_host = parse_bootstrap_host(&spec.url);
+        let grpc = grpc_port.and_then(|port| grpc_client(&bootstrap_host, port));
         let active_requests = Arc::new(AtomicUsize::new(0));
         let slots = SlotRegistry::new();
         Self {
@@ -261,6 +290,7 @@ impl Worker {
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
             protocol,
+            grpc,
             model_ids: spec.model_ids,
             breaker,
             active_requests,
@@ -271,6 +301,7 @@ impl Worker {
             version_group: spec.version_group,
             services: RwLock::new(spec.services),
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+            dp_rank_turn: AtomicUsize::new(0),
             openai,
         }
     }
@@ -356,12 +387,21 @@ impl Worker {
         self.protocol
     }
 
+    pub fn grpc(&self) -> Option<SglangServiceClient<tonic::transport::Channel>> {
+        self.grpc.clone()
+    }
+
     pub fn dp_ranks(&self) -> u32 {
         self.dp_rank_inflight.len() as u32
     }
 
     pub fn dp_rank_inflight(&self, rank: u32) -> usize {
         self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
+    }
+
+    /// Advances the round-robin DP-rank position and returns the previous one.
+    pub fn next_dp_rank_turn(&self) -> usize {
+        self.dp_rank_turn.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {

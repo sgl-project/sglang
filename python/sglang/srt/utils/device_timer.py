@@ -95,8 +95,8 @@ class GapTimer(DeviceTimer):
 
 @dataclass
 class _TimingInterval:
-    start_event: torch.cuda.Event
-    end_event: Optional[torch.cuda.Event] = None
+    start_event: torch.Event
+    end_event: Optional[torch.Event] = None
     metadata: Optional[Dict] = None
     _started: bool = False
     _completed: bool = False
@@ -117,12 +117,14 @@ class _TimingInterval:
 
     @staticmethod
     def create():
-        start_event = torch.cuda.Event(enable_timing=True)
+        device_module = torch.get_device_module()
+        start_event = device_module.Event(enable_timing=True)
         start_event.record()
         return _TimingInterval(start_event=start_event)
 
     def end(self, metadata: Dict):
-        end_event = torch.cuda.Event(enable_timing=True)
+        device_module = torch.get_device_module()
+        end_event = device_module.Event(enable_timing=True)
         end_event.record()
 
         assert self.end_event is None

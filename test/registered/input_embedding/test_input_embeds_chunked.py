@@ -21,7 +21,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -33,6 +32,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
@@ -108,7 +108,8 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def _assert_server_alive(self):
         self.assertIsNone(self.process.poll(), "server process crashed")

@@ -261,6 +261,42 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
+    async def test_cumulative_stream_backlog_preserves_customized_info(self):
+        """Cumulative streaming returns only the last queued output.
+
+        A customized_info key that arrived on an earlier queued output must
+        still reach the client through the accumulated state.
+        """
+        self.tm.incremental_streaming_output = False
+        key = "request_score"
+        hidden_key = "hidden_metric"
+        stream = self.tm._wait_one_response(self.state.obj)
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
+        self.state.out_list.extend(
+            [
+                {"output_ids": [1], "meta_info": first_meta_info},
+                {
+                    "output_ids": [1, 2],
+                    "meta_info": {"finish_reason": {"type": "length"}},
+                },
+            ]
+        )
+        self.state.finished = True
+        self.state.event.set()
+
+        out = await anext(stream)
+
+        self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
     async def test_cancelling_pending_wait_removes_event_waiter(self):
         stream = self.tm._wait_one_response(self.state.obj)
         pending = asyncio.create_task(anext(stream))
@@ -1190,6 +1226,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)
