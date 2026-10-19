@@ -7,13 +7,9 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Disabled: FDFO throughput regression since #42846.
-register_npu_ci(
-    est_time=400,
-    suite="nightly-2-npu-a3",
-    nightly=True,
-    disabled="The model is no longer maintained",
-)
+# Moved from nightly-2-npu-a3 to full-2-npu-a3: the model is no longer
+# maintained, so the test only runs in the manually dispatched full test.
+register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
 
 
 class TestLLaDA2MiniFDFO(CustomTestCase):
