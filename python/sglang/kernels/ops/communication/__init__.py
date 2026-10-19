@@ -37,6 +37,8 @@ for _mod, _fn in [
     ("sp_collective", "reduce_scatter_pull"),
     ("sp_collective", "all_gather"),
     ("sp_collective", "all_gather_direct"),
+    ("attn_res_collective", "attn_res_fused_pull_rs"),
+    ("attn_res_collective", "attn_res_fused_direct_ag"),
 ]:
     register_kernel(
         KernelSpec(

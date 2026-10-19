@@ -230,18 +230,6 @@ del _mod, _fn
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn, _backend, _device in [
     ("attn_res", "attn_res_fused_tma", KernelBackend.JIT, CapabilityRequirement.CUDA),
-    (
-        "attn_res",
-        "attn_res_fused_pull_rs",
-        KernelBackend.JIT,
-        CapabilityRequirement.CUDA,
-    ),
-    (
-        "attn_res",
-        "attn_res_fused_direct_ag",
-        KernelBackend.JIT,
-        CapabilityRequirement.CUDA,
-    ),
     ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
     (
         "mla_output_gate",

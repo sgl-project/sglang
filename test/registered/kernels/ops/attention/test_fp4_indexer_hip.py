@@ -49,7 +49,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     index_k_page8_views,
     index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
-    indexer_head_weights,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
@@ -76,6 +75,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     _fp4_e2m1_code_rne,
