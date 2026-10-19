@@ -85,8 +85,8 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_v41_vision_admits_cuda_megamoe_with_dp_attention(self):
         """A vision-capable checkpoint must initialize for text or image serving
-        with DP attention and CUDA MegaMoE. CP, PP and other A2A paths still lack
-        vision routing support and must fail before constructing the tower.
+        with DP attention and prefill CP, using no A2A or CUDA MegaMoE.
+        PP and unsupported A2A paths must fail before constructing the tower.
         """
         self._publish(enforce=False)
         config = DeepSeekV4Config(
@@ -112,7 +112,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             (MoeA2ABackend.NONE, True, 1, 1, True),
             (MoeA2ABackend.MEGAMOE, False, 1, 1, False),
             (MoeA2ABackend.DEEPEP, True, 1, 1, False),
-            (MoeA2ABackend.MEGAMOE, True, 2, 1, False),
+            (MoeA2ABackend.DEEPEP, True, 2, 1, False),
             (MoeA2ABackend.MEGAMOE, True, 1, 2, False),
         )
         for backend, cuda, cp, pp, admitted in cases:
