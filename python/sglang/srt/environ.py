@@ -790,10 +790,8 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
-    # Plain host-pool path: private THP mapping, MADV_DONTFORK, prefaulted by
-    # SGLANG_HICACHE_HOST_ALLOC_THREADS threads (mmap_allocator.py).
-    SGLANG_HICACHE_HOST_PARALLEL_ALLOC = EnvBool(False)
-    SGLANG_HICACHE_HOST_ALLOC_THREADS = EnvInt(32)
+    # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
+    SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport

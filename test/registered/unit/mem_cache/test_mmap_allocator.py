@@ -101,11 +101,7 @@ class TestMmapAllocator(unittest.TestCase):
                 mm.close()
 
     def test_private_parallel_prefaulted_is_resident_and_zeroed(self):
-        """Every page resident (cudaHostRegister pins it) and zero-filled.
-
-        Sized to give each thread several THP-aligned chunks plus a ragged
-        tail, so the chunking arithmetic is exercised, not just one chunk.
-        """
+        """Fully resident and zeroed, including a ragged non-THP-aligned tail."""
         alloc_bytes = 9 * 2 * 1024 * 1024 + 3 * mmap.PAGESIZE
         for threads in (1, 4, 64):
             with self.subTest(threads=threads):
@@ -118,12 +114,7 @@ class TestMmapAllocator(unittest.TestCase):
                     mm.close()
 
     def test_private_parallel_mapping_is_not_inherited_by_fork(self):
-        """MADV_DONTFORK is what makes MAP_PRIVATE safe to pin.
-
-        Without it, a fork turns the pinned pages copy-on-write and a parent
-        write after the fork moves the parent off the page the device reads.
-        A child touching the buffer must therefore fault, not read it.
-        """
+        """MADV_DONTFORK: a forked child touching the buffer must SIGSEGV."""
         alloc_bytes = 4 * mmap.PAGESIZE
         mm = _mmap_private_parallel_prefaulted(alloc_bytes, 2)
         addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
@@ -142,10 +133,7 @@ class TestMmapAllocator(unittest.TestCase):
         from sglang.srt.environ import envs
 
         dims = (3, 1024 * 1024)
-        with (
-            envs.SGLANG_HICACHE_HOST_PARALLEL_ALLOC.override(True),
-            envs.SGLANG_HICACHE_HOST_ALLOC_THREADS.override(4),
-        ):
+        with envs.SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS.override(4):
             with unittest.mock.patch(
                 "sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_prefaulted",
                 side_effect=AssertionError("shared path must not run"),

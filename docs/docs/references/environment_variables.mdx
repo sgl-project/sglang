@@ -1223,14 +1223,9 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Speed up host KV cache allocation (HiCache host pools) on the plain mmap path (i.e. when <code>SGLANG_HUGEPAGE_SIZE</code> is not set or its allocation fails). The pool is mapped <code>MAP_PRIVATE | MAP_ANONYMOUS</code> with <code>MADV_HUGEPAGE</code> (transparent huge pages, effective when <code>/sys/kernel/mm/transparent_hugepage/enabled</code> is <code>always</code> or <code>madvise</code>) and <code>MADV_DONTFORK</code>, then prefaulted in parallel by <code>SGLANG_HICACHE_HOST_ALLOC_THREADS</code> threads before it is pinned. A <code>fork()</code>ed child process cannot access the buffer. Any failure falls back to the default shared mapping.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_ALLOC_THREADS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of threads used to prefault a host pool when <code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC</code> is enabled.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>32</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When positive, host KV cache pools on the plain mmap path (<code>SGLANG_HUGEPAGE_SIZE</code> unset or failed) are mapped <code>MAP_PRIVATE | MAP_ANONYMOUS</code> with <code>MADV_HUGEPAGE</code> and <code>MADV_DONTFORK</code>, and prefaulted by this many threads before pinning. A <code>fork()</code>ed child cannot access the buffer. Any failure falls back to the default shared mapping. <code>0</code> disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HF3FS_CONFIG_PATH</code></td>
