@@ -4,6 +4,8 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     NOPE_ROPE_BYTES,
     PADDED_SCALE_PER_TOKEN,
     dequantize_k_cache_paged,
+)
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
     dequantize_k_cache_paged_ref,
 )
 
