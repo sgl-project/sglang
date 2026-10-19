@@ -402,6 +402,10 @@ class EagerRunner(BaseRunner):
             )
 
         stream = torch.cuda.current_stream()
+        # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
+        # DSpark aux capture is on, else it overrides the packed aux.
+        if aux_hidden_states is not None and isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:
@@ -418,10 +422,7 @@ class EagerRunner(BaseRunner):
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_before_norm = hidden_states
-            # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
-            # DSpark aux capture is on, else it overrides the packed aux.
-            if aux_hidden_states is None:
-                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
+            logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
