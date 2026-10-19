@@ -1617,7 +1617,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 dpsk_response_format = request.response_format.model_dump(by_alias=True)
                 if dpsk_response_format["type"] == "json_schema":
                     # convert type from json_schema to json_object to align dpsk official document
-                    # https://api-docs.deepseek.com/zh-cn/api/create-chat-completion
+                    # https://api-docs.deepseek.com/api/create-chat-completion/
                     dpsk_response_format["type"] = "json_object"
                 messages[0]["response_format"] = dpsk_response_format
             if request_tools:
