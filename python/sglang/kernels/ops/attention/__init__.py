@@ -36,6 +36,9 @@ _TRITON_KERNELS = [
     ("dsa.metadata", "fused_dsa_decode_metadata"),
     ("dsa.metadata", "fused_dsa_target_verify_metadata"),
     ("dsa.metadata", "fused_dsa_draft_extend_metadata"),
+    ("dsa.kpool_metadata.decode", "fused_dsa_decode_metadata_kpool"),
+    ("dsa.kpool_metadata.verify", "fused_dsa_target_verify_metadata_kpool"),
+    ("dsa.kpool_metadata.draft_extend", "fused_dsa_draft_extend_metadata_kpool"),
     ("rocm_mla_decode_rope", "decode_attention_fwd_grouped_rope"),
     ("verify_splitkv", "verify_splitkv_fwd"),
     ("unified_attention_3d_mtp", "unified_attention_3d_mtp_func"),
@@ -185,7 +188,6 @@ for _mod, _fn in [
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
     ("dsa.transform_index", "transform_index_page_table_dcp"),
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs"),
-    ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
 ]:
     register_kernel(
         KernelSpec(

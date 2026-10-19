@@ -763,7 +763,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="NSA fused quantize + indexed K-cache store",
         candidate_path=(
-            "python/sglang/kernels/ops/attention/dsa/fused_store_index_cache.py"
+            "python/sglang/kernels/ops/kvcache/dsa_fused_store_index_cache.py"
             "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
         ),
         active_keywords=("fused_store_index_k_cache",),

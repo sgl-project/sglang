@@ -51,13 +51,13 @@ class DSAMetadataManagementMixin:
         self._fused_draft_extend_metadata = fused_dsa_draft_extend_metadata
         if self.experimental_kpool_metadata_fusion:
             from sglang.kernels.ops.attention.dsa.kpool_metadata.decode import (
-                fused_dsa_decode_metadata as decode,
+                fused_dsa_decode_metadata_kpool as decode,
             )
             from sglang.kernels.ops.attention.dsa.kpool_metadata.draft_extend import (
-                fused_dsa_draft_extend_metadata as draft_extend,
+                fused_dsa_draft_extend_metadata_kpool as draft_extend,
             )
             from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
-                fused_dsa_target_verify_metadata as verify,
+                fused_dsa_target_verify_metadata_kpool as verify,
             )
 
             self._fused_decode_metadata = partial(

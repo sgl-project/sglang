@@ -32,7 +32,6 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
 )
-from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
     prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
@@ -46,6 +45,7 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     mla_quantize_for_fp8_no_rope,
 )
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )

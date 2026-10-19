@@ -11,7 +11,6 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     _ceil_ue8m0_exp,
     _fp4_e2m1_code_rne,
-    quantize_fp4_indexer_tensor,
 )
 
 INDEX_HEAD_DIM = 128
@@ -182,62 +181,6 @@ def finish_flat_indexer_topk(
         raw_indices is not None,
         triton.next_power_of_2(k),
         num_warps=4,
-    )
-
-
-@triton.jit
-def _store_fp4_index_k_cache_kernel(
-    k_fp4,
-    k_sf,
-    cache,
-    loc,
-    page_size: tl.constexpr,
-    cache_stride: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK)
-    cache_loc = tl.load(loc + token_id)
-    page = cache_loc // page_size
-    page_offset = cache_loc - page * page_size
-
-    k = tl.load(k_fp4 + token_id * BLOCK + offsets)
-    tl.store(cache + page * cache_stride + page_offset * BLOCK + offsets, k)
-
-    sf = tl.load(k_sf + token_id)
-    sf_offsets = tl.arange(0, 4)
-    sf_bytes = (sf >> (sf_offsets * 8)) & 0xFF
-    tl.store(
-        cache + page * cache_stride + page_size * BLOCK + page_offset * 4 + sf_offsets,
-        sf_bytes,
-    )
-
-
-def store_fp4_index_k_cache(
-    input: torch.Tensor,
-    cache: torch.Tensor,
-    loc: torch.Tensor,
-    *,
-    page_size: int,
-    rne: bool = False,
-) -> None:
-    assert input.shape[-1] == 128
-    k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
-    n_tokens = input.numel() // input.shape[-1]
-    assert k_fp4.shape == (n_tokens, 64)
-    assert k_sf.shape == (n_tokens,)
-    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
-
-    if n_tokens == 0:
-        return
-    _store_fp4_index_k_cache_kernel[(n_tokens,)](
-        k_fp4.view(torch.uint8),
-        k_sf,
-        cache,
-        loc,
-        page_size,
-        cache.stride(0),
-        BLOCK=64,
     )
 
 
