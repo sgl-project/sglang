@@ -4,6 +4,15 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.hardware_backend.npu.moe.contracts import (
+    INT4,
+    INT8,
+    MXFP4,
+    MXFP8,
+    QuantizedOperand,
+    unpack_operand,
+)
+from sglang.srt.hardware_backend.npu.moe.quant import quantize_mxfp4_activation
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
@@ -139,10 +148,9 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if isinstance(x, tuple):
+        if isinstance(x, (tuple, QuantizedOperand)):
             """dynamic_scale is calculated in malprolog kernel"""
-            original_dtype = torch.bfloat16
-            quant_out, dynamic_scale = x
+            quant_out, dynamic_scale, original_dtype, _ = unpack_operand(x, INT8)
         else:
             original_dtype = x.dtype
             quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
@@ -263,16 +271,14 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if isinstance(x, tuple):
+        if isinstance(x, (tuple, QuantizedOperand)):
             # MLAProlog supplies a [tokens, hidden] quantized query norm.
-            qx, input_scale = x
-            input_shape = qx.shape
+            qx, input_scale, original_dtype, input_shape = unpack_operand(x, MXFP8)
             if input_scale.dtype == torch.uint8:
                 input_scale = input_scale.view(_get_float8_e8m0fnu_dtype())
             input_scale = input_scale.reshape(
                 qx.shape[0], qx.shape[1] // (2 * MXFP8_BLOCK_SIZE), 2
             ).contiguous()
-            original_dtype = torch.bfloat16
         else:
             original_dtype = x.dtype
             if original_dtype not in (torch.float16, torch.bfloat16):
@@ -392,10 +398,13 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         bias: Optional[torch.Tensor] = None,
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-            x, dst_type=torch.quint4x2
-        )
+        if isinstance(x, QuantizedOperand):
+            quant_out, dynamic_scale, original_dtype, _ = unpack_operand(x, INT4)
+        else:
+            original_dtype = x.dtype
+            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+                x, dst_type=torch.quint4x2
+            )
         return torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,
@@ -647,28 +656,39 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
-            original_dtype = torch.bfloat16
+        if isinstance(x, (tuple, QuantizedOperand)):
+            quantized_x, dynamic_scale, original_dtype, input_shape = unpack_operand(
+                x, MXFP8
+            )
+            if quantized_x.dtype != torch.float8_e4m3fn:
+                raise ValueError("W4A8 prequantized input must use MXFP8 E4M3")
+            if dynamic_scale.dtype == torch.uint8:
+                dynamic_scale = dynamic_scale.view(e8m0_dtype)
+            dynamic_scale = dynamic_scale.reshape(
+                quantized_x.shape[0], quantized_x.shape[1] // 64, 2
+            )
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
+            input_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
+            quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
 
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-
-        # Dynamic MXFP8 activation quantisation (A8).
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
-
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        if bias is not None:
+            # W4A8 QuantMatmulV5 expects a BF16 bias with a batch dimension.
+            bias = bias.to(torch.bfloat16)
+            if bias.ndim == 1:
+                bias = bias.unsqueeze(0)
 
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
@@ -793,19 +813,17 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         e8m0_dtype = _get_float8_e8m0fnu_dtype()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
-            original_dtype = torch.bfloat16
-
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-
-        # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=fp4_dtype, round_mode="round"
-        )
+        if isinstance(x, QuantizedOperand):
+            qx, input_scale, original_dtype, input_shape = unpack_operand(x, MXFP4)
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
+            input_shape = x.shape
+            qx, input_scale = quantize_mxfp4_activation(
+                x.reshape(-1, x.shape[-1]), fp4_dtype
+            )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
         # time): x1_dtype = x2_dtype = fp4, group_sizes=[1, 1, block].

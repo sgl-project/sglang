@@ -16,6 +16,7 @@ kernels."""
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import partial as _functools_partial
 from typing import Optional
 
 import torch
@@ -256,11 +257,50 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
+def _update_and_read_residual_npu(
+    quant_format, norm, hidden_states, residual, post_residual_addition
+):
+    """Ascend NPU fused (add +) RMSNorm + dynamic quantization, selected by
+    the complete consumer contract set at the boundary. The quant format is
+    ``npu_<contract kind>`` (``npu_mxfp8``, ``npu_mxfp4``, ``npu_int8``,
+    ``npu_int4``). The output is a typed quantized operand; a consumer needing
+    a floating-point normalized tensor must not select this kernel."""
+    from sglang.srt.hardware_backend.npu.layernorm_quant import (
+        native_add_rmsnorm_quant,
+    )
+    from sglang.srt.hardware_backend.npu.moe.contracts import (
+        INT4,
+        INT8,
+        MXFP4,
+        MXFP8,
+    )
+
+    contracts = {"mxfp8": MXFP8, "mxfp4": MXFP4, "int8": INT8, "int4": INT4}
+    contract = contracts[quant_format.removeprefix("npu_")]
+    if post_residual_addition is not None and residual is not None:
+        residual = residual + post_residual_addition
+    readout = native_add_rmsnorm_quant(
+        hidden_states,
+        residual,
+        getattr(norm, "gemma_weight", norm.weight).data,
+        norm.variance_epsilon,
+        contract,
+    )
+    return (
+        readout.operand,
+        hidden_states if residual is None else readout.updated_residual,
+    )
+
+
 def _norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
+    if quant_format.startswith("npu_"):
+        return _functools_partial(
+            _update_and_read_residual_npu, quant_format=quant_format
+        )
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":

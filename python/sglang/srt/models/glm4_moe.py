@@ -198,11 +198,22 @@ class Glm4MoeMLP(nn.Module):
         self,
         x,
         forward_batch=None,
+        gateup_pre_quant=None,
     ):
         if self.is_replicated and x.shape[0] == 0:
             return x
+        if getattr(self, "_npu_tp_shared", False) and x.shape[0]:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                shared_gmm1,
+                shared_gmm1_mode,
+            )
 
-        gate_up, _ = self.gate_up_proj(x)
+            if shared_gmm1_mode(self) != "baseline":
+                return shared_gmm1(self, x, gateup_pre_quant)
+
+        gate_up, _ = self.gate_up_proj(
+            x if gateup_pre_quant is None else gateup_pre_quant
+        )
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -396,6 +407,8 @@ class Glm4MoeGate(nn.Module):
         )
 
     def forward(self, hidden_states):
+        if getattr(self, "_npu_gate_method", None) is not None:
+            return self._npu_gate_method.apply(self, hidden_states).float()
         logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
         return logits
 
@@ -417,6 +430,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                npu_tp_shared_expert_count,
+            )
+
+            self.num_fused_shared_experts = npu_tp_shared_expert_count(
+                config, quant_config, self.num_fused_shared_experts
+            )
 
         self.config = config
         self.layer_id = layer_id
@@ -435,6 +456,17 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
 
         self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                configure_online_gate,
+            )
+
+            # Opt-in --online-quantization gate:SCHEME converts the loaded
+            # FP32 gate weight once after loading; without it the float gate
+            # stays and the fused norm boundary stays disabled.
+            self._npu_gate_online = configure_online_gate(
+                self.gate, add_prefix("gate", prefix), quant_config
+            )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts + self.num_fused_shared_experts,
@@ -447,6 +479,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
+        )
+
+        self._fuse_npu_tp_routed_scale, self._fuse_npu_tp_shared = (
+            self.experts.configure_ascend_tp_finalize_fusion()
+            if _is_npu
+            else (False, False)
         )
 
         self.topk = TopK(
@@ -553,6 +591,25 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._fuse_npu_tp_shared &= (
+            hasattr(self, "shared_experts") and not self._fuse_shared_experts_inside_sbo
+        )
+        self._npu_tp_shared_overlap = False
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                can_overlap_tp_shared,
+            )
+
+            self._npu_tp_shared_overlap = can_overlap_tp_shared(self.experts) and (
+                hasattr(self, "shared_experts")
+                and not self._fuse_shared_experts_inside_sbo
+            )
+        if _is_npu and self._npu_tp_shared_overlap and self.alt_stream is None:
+            self.alt_stream = get_stream("npu_moe")
+        if _is_npu and hasattr(self, "shared_experts"):
+            self.shared_experts._npu_tp_shared = (
+                not self._enable_a2a_moe and self.experts.moe_ep_size == 1
+            )
 
     def get_moe_weights(self):
         return [
@@ -570,11 +627,20 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.moe.contracts import (
+                    QuantizedOperand,
+                )
+
+                if isinstance(hidden_states, QuantizedOperand):
+                    # The decoder boundary already fused norm+quant.
+                    return self.forward_normal_quantized(hidden_states)
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and get_is_capture_mode()
+                and (get_is_capture_mode() or self._npu_tp_shared_overlap)
+                and not torch.compiler.is_compiling()
             ):
                 return self.forward_normal_dual_stream(hidden_states)
             else:
@@ -582,32 +648,96 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
+    def forward_normal_quantized(self, operand) -> torch.Tensor:
+        """MoE forward when every consumer takes the boundary's typed operand
+        (fused add+RMSNorm+quant; quantized router gate, W13 and shared
+        experts share the one activation)."""
+        from sglang.srt.hardware_backend.npu.moe.norm_gate import gate_forward
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            record_quantized_operand,
+        )
+
+        record_quantized_operand(operand)
+        data = operand.data
+        if data.shape[0] > 0:
+            router_logits = gate_forward(self.gate, operand)
+            topk_output = self.topk(data, router_logits)
+            shared_output = self._forward_shared_experts(operand, operand)
+        else:
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(data.device)
+
+        if (
+            self._fuse_npu_tp_shared and not get_is_capture_mode()
+        ) and shared_output is not None:
+            final_hidden_states = self.experts(
+                operand,
+                topk_output,
+                pre_quant_input=operand,
+                shared_output=shared_output,
+            )
+            shared_output = None
+        else:
+            final_hidden_states = self.experts(
+                operand, topk_output, pre_quant_input=operand
+            )
+        if not self._fuse_npu_tp_routed_scale:
+            final_hidden_states *= self.routed_scaling_factor
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        return final_hidden_states
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
+        current_stream = torch.get_device_module(hidden_states.device).current_stream()
+        pre_quant_input = self._prequantize_npu_tp_input(hidden_states)
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states)
+        shared_output = self._forward_shared_experts(hidden_states, pre_quant_input)
 
-        with torch.cuda.stream(self.alt_stream):
+        with torch.get_device_module(hidden_states.device).stream(self.alt_stream):
+            if _is_npu:
+                hidden_states.record_stream(self.alt_stream)
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if (
+                self._fuse_npu_tp_shared and not get_is_capture_mode()
+            ) and shared_output is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                    shared_output=shared_output,
+                    shared_output_ready=lambda: self.alt_stream.wait_stream(
+                        current_stream
+                    ),
+                )
+                shared_output = None
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                )
+            if (
+                not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            ) and not self._fuse_npu_tp_routed_scale:
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
+        if _is_npu:
+            final_hidden_states.record_stream(current_stream)
+        if shared_output is not None:
+            final_hidden_states += shared_output
         return final_hidden_states
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        pre_quant_input = self._prequantize_npu_tp_input(hidden_states)
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states, pre_quant_input)
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
@@ -615,8 +745,21 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not _use_aiter:
+        if (
+            self._fuse_npu_tp_shared and not get_is_capture_mode()
+        ) and shared_output is not None:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
+            )
+            shared_output = None
+        else:
+            final_hidden_states = self.experts(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
+        if not _is_cuda and not _use_aiter and not self._fuse_npu_tp_routed_scale:
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
@@ -680,8 +823,28 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _prequantize_npu_tp_input(self, hidden_states):
+        if not _is_npu:
+            return None
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import prequantize_tp_input
+
+        return prequantize_tp_input(
+            self.experts, hidden_states, getattr(self, "shared_experts", None)
+        )
+
+    def _forward_shared_experts(
+        self, hidden_states: torch.Tensor, pre_quant_input=None
+    ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            if _is_npu and pre_quant_input is not None:
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    supports_quantized_linear,
+                )
+
+                if supports_quantized_linear(self.shared_experts.gate_up_proj):
+                    return self.shared_experts(
+                        hidden_states, gateup_pre_quant=pre_quant_input
+                    )
             return self.shared_experts(hidden_states)
         else:
             return None
@@ -762,6 +925,30 @@ class Glm4MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # NPU: fuse add+RMSNorm+quant into the FFN boundary read when every
+        # sparse-MoE consumer (router gate, W13, shared experts) accepts one
+        # typed activation contract. A float gate without online
+        # quantization keeps the unfused reference norm.
+        self.ffn_quant_format = ""
+        if _is_npu:
+            import dataclasses as _dataclasses
+
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                select_linear_boundary_quant_format,
+                select_moe_boundary_quant_format,
+            )
+            from sglang.srt.layers.layer_boundary.residual.add_norm import (
+                NORM_QUANT_READOUT,
+            )
+
+            self.ffn_quant_format = (
+                select_moe_boundary_quant_format(self.mlp)
+                if self.is_layer_sparse
+                else select_linear_boundary_quant_format([self.mlp.gate_up_proj])
+            )
+            if self.ffn_quant_format:
+                ffn = _dataclasses.replace(ffn, read=NORM_QUANT_READOUT)
+
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
@@ -808,6 +995,15 @@ class Glm4MoeDecoderLayer(nn.Module):
         return ""
 
     def _detect_attn_quant_format(self):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.norm_gate import (
+                select_linear_boundary_quant_format,
+            )
+
+            self.attn_quant_format = select_linear_boundary_quant_format(
+                [self.self_attn.qkv_proj]
+            )
+            return
         self.attn_quant_format = self._detect_fp8_per_token_quant(
             self.self_attn.qkv_proj, "attn"
         )
@@ -859,7 +1055,15 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            **(
+                {"quant_format": self.ffn_quant_format}
+                if getattr(self, "ffn_quant_format", "")
+                else {}
+            ),
+        )
 
         hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
@@ -1016,6 +1220,12 @@ class Glm4MoeForCausalLM(nn.Module):
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         """Why this checkpoint cannot fuse its shared expert, or None. Asked by
         the loader before any layer is built."""
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                tp_fused_shared_expert_reason,
+            )
+
+            return tp_fused_shared_expert_reason(hf_config, quant_config)
         if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
@@ -1038,6 +1248,14 @@ class Glm4MoeForCausalLM(nn.Module):
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                npu_tp_shared_expert_count,
+            )
+
+            self.num_fused_shared_experts = npu_tp_shared_expert_count(
+                self.config, self.quant_config, self.num_fused_shared_experts
+            )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

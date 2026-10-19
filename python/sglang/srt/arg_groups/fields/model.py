@@ -176,6 +176,23 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    online_quantization: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Opt-in online quantization of selected projections after "
+                "checkpoint loading, as 'TARGET:SCHEME' pairs separated by "
+                "commas (e.g. 'gate:w8a8_mxfp8,qkv:w8a8_mxfp8'). Targets: "
+                "'gate' (the routed-expert MoE router gate), 'moe', "
+                "'shared_expert', 'qkv', 'dense', 'all'. Schemes alias the "
+                "Ascend quantization registry: 'w8a8_mxfp8', 'w4a8_mxfp', "
+                "'w4a4_mxfp4', 'w8a8_dynamic' (INT8), 'w4a4_dynamic' (INT4). "
+                "Unlike --quantization this never changes checkpoint "
+                "semantics by default: quantization happens once, after "
+                "loading, and is an explicit accuracy experiment."
+            ),
+        ),
+    ] = None
     quantization_param_path: A[
         Optional[str],
         Arg(

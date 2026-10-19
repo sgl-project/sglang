@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSitu,
     NPUSituMXFP8Quant,
     NPUSwiglu,
+    NPUSwigluClamp,
     NPUSwigluDeepEPKernel,
     NPUSwigluMxfp8Quant,
     NPUSwigluOAI,
@@ -29,30 +30,34 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 
 
 def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
-    """Whether gmm1 runs matmul+swiglu+requant fused (no separate activation)."""
-    # The fused gmm1 kernel (npu_grouped_matmul_swiglu_quant_v2) applies plain
-    # SiLU with no clamp. Models whose activation is SiLU-with-clamp
-    # (swiglu_limit, e.g. DSV4) must keep the unfused path so the clamp is
-    # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
-    has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
+    """The fused activation emits MXFP8, which W2 must consume directly."""
+    from sglang.srt.hardware_backend.npu.moe.contracts import MXFP8, moe_input_contract
 
     if config.activation == "situ":
         return False
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
-    if has_clamp:
-        # MXFP8 has no unfused gmm1 path at all, so a swiglu_limit
-        # checkpoint cannot be served by it.
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            raise NotImplementedError(
-                "NPUMXFP8MoEMethod has no unfused gmm1 path, and the fused "
-                "gmm1 kernel applies SiLU without clamp — a swiglu_limit "
-                "checkpoint cannot be served by this method."
-            )
-        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
-    if isinstance(kernel, NPUMXFP8MoEMethod):
-        return True
-    return kernel.use_fused_gmm1
+    if not isinstance(
+        config.layer.w2_kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)
+    ):
+        return False
+    if (
+        moe_input_contract(kernel) != MXFP8
+        or moe_input_contract(config.layer.w2_kernel) != MXFP8
+        or getattr(config.layer, "w13_scale_bias", None) is not None
+        or getattr(config.layer, "w13_weight_bias", None) is not None
+    ):
+        return False
+    if (
+        config.activation != "silu"
+        or not config.is_gated
+        or config.swiglu_limit is not None
+        or config.gemm1_alpha is not None
+        or config.gemm1_beta is not None
+        or config.gemm1_clamp_limit is not None
+    ):
+        return False
+    return isinstance(kernel, NPUMXFP8MoEMethod) or kernel.use_fused_gmm1
 
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -94,6 +99,7 @@ class AscendRunnerInput(RunnerInput):
     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
     expert_tokens: torch.Tensor
     group_list_type: int  # 0 or 1 (passed to NPU ops)
+    source_dtype: Optional[torch.dtype] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -120,24 +126,27 @@ class AscendRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
+        if get_moe_a2a_backend().is_none() and (
+            not config.is_gated
+            or config.gemm1_beta is not None
+            or (config.activation == "silu" and config.gemm1_alpha is not None)
+        ):
+            raise ValueError(
+                "Native Ascend MoE requires gated activations without gemm1_beta; "
+                "scaled SiLU must use the explicit situ or npu_swiglu_oai method"
+            )
         kernel = config.layer.w2_kernel
-
-        if _uses_fused_gmm1(kernel, config):
-            # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
-            # gate/up + swiglu + requant into gmm1, so there is no separate
-            # activation step — run() skips it. Left None on purpose so that
-            # reaching for it fails loudly instead of silently applying an
-            # unfused swiglu to already-requantised activations. This holds
-            # for both dispatchers: ascend_tp gets its activation quant fused
-            # into routing, DeepEP dispatches bf16 and gmm1 quantises it
-            # itself.
-            self.activation = None
-        elif (
-            isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+        # Weight preparation decides layout eligibility; retain the ordinary path.
+        self.use_fused_gmm1 = False
+        self._fused_gmm1_prepared = False
+        if (
+            isinstance(kernel, (NPUW4A8MXFP4MoEMethod, NPUMXFP8MoEMethod))
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
+        elif config.activation == "silu" and config.swiglu_limit is not None:
+            self.activation = NPUSwigluClamp(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(
@@ -172,8 +181,22 @@ class AscendRunnerCore(MoeRunnerCore):
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
-            if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+            if (
+                isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
+                and config.activation == "silu"
+                and config.gemm1_alpha is None
+                and config.gemm1_clamp_limit is None
+                and config.swiglu_limit is None
+            ):
+                from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+                    supports_npu_op,
+                )
+
+                inner = (
+                    NPUSwigluQuant()
+                    if supports_npu_op("npu_dequant_swiglu_quant")
+                    else NPUSwiglu()
+                )
             elif config.activation == "situ":
                 # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
                 # gmm2 requantizes the activations itself, so no quant is
@@ -204,6 +227,19 @@ class AscendRunnerCore(MoeRunnerCore):
             else:
                 self.activation = inner
 
+    def prepare_fused_gmm1(self):
+        from sglang.srt.hardware_backend.npu.moe.tp_fusion import (
+            supports_fused_mxfp_gmm,
+        )
+
+        layer = self.config.layer
+        self.use_fused_gmm1 = _uses_fused_gmm1(layer.w13_kernel, self.config) and (
+            supports_fused_mxfp_gmm(
+                layer.w13_kernel, layer.w13_weight, layer.w13_weight_scale
+            )
+        )
+        self._fused_gmm1_prepared = True
+
     def run(
         self,
         runner_input: AscendRunnerInput,
@@ -215,13 +251,20 @@ class AscendRunnerCore(MoeRunnerCore):
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
         x = runner_input.hidden_states
-        original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+        original_dtype = runner_input.source_dtype or (
+            torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+        )
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
         w13_kernel = self.config.layer.w13_kernel
 
-        if _uses_fused_gmm1(w13_kernel, self.config):
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        capture = get_is_capture_mode() or torch.compiler.is_compiling()
+        if not self._fused_gmm1_prepared and not capture:
+            self.prepare_fused_gmm1()
+        if self.use_fused_gmm1 and not capture:
             # --- w13 projection + activation, fused into one kernel ---
             # The fused gmm1 returns activations already requantised for gmm2,
             # so there is no separate activation step to run.
@@ -314,6 +357,7 @@ def pre_permute_ascend_tp_to_ascend(
         hidden_states_scale=dispatch_output.hidden_states_scale,
         expert_tokens=dispatch_output.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
+        source_dtype=dispatch_output.source_dtype,
     )
 
 

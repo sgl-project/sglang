@@ -2049,7 +2049,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         # the checkpoint's mlp.shared_expert.* onto that slot; otherwise the shared
         # expert weights are silently dropped and accuracy collapses.
         self.num_fused_shared_experts = 0
-        if _use_aiter and not _disable_shared_experts_fusion():
+        if (_use_aiter or _is_npu) and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
@@ -2585,7 +2585,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         self.num_fused_shared_experts = 0
-        if _use_aiter and not _disable_shared_experts_fusion():
+        if (_use_aiter or _is_npu) and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
