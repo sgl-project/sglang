@@ -195,6 +195,17 @@ In PD mode, decode is ranked by step 3 only. The decode request names the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 
+A decode rank picked on arrival only starts decoding once prefill has queued,
+computed and sent the KV, so when prefill queues are long, even ranks with
+equal requests in flight run unequal batches. `--decode-dispatch-limit N` still
+sends every request to prefill on arrival, but sends at most N per prefill DP
+rank on to decode before decode streams their first token; the rest wait at
+the router in arrival order and get their decode rank when they are sent.
+Prefill must start a request before decode connects, so prefill engines need
+`--optimistic-prefill-attempts` above 0. A request that expires or loses its
+client while waiting has its prefill aborted; requests with a caller-set `rid`
+and fan-out requests go to decode at once.
+
 ### Retries
 
 `--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets
@@ -217,6 +228,22 @@ Each retry first waits out a jittered exponential backoff: a random delay in
 doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
 Set the initial backoff to 0 to retry immediately. A backoff never waits past
 the request's stale deadline.
+
+Separately, a send whose pooled HTTP/1.1 connection the worker closed before
+answering (reset, broken pipe or EOF) is repeated once, immediately, on the same
+worker: an engine closing an idle connection never read the request. Idle
+connections leave the pool after 3 s, under SGLang's default 5 s keep-alive.
+
+### Circuit breaker
+
+Each worker has a circuit breaker: after `--cb-threshold` (default 3)
+consecutive failures the worker is taken out of routing until a request already
+sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
+probe request does. Under `--worker-urls` it is the only thing that takes a
+dead or hung worker out of routing, since there is no active health check.
+`--disable-circuit-breaker` turns it off, for example when one worker serves a
+role and an open breaker would reject all of that role's requests; a worker
+that stops answering then keeps its share of traffic.
 
 ### Engines with `--api-key`
 

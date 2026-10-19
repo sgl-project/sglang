@@ -1709,6 +1709,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        # Recapture can follow decode replay, which may change model-owned storage.
+        prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(

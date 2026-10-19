@@ -13,12 +13,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
-    GradientCheckpointingLayer,
-)
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -329,16 +324,6 @@ def create_block_causal_mask(
     output = torch.zeros(mask.shape, dtype=torch.float32, device=index.device)
     output.masked_fill_(~mask, float("-inf"))
     return output.unsqueeze(1)
-
-
-def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
-    """
-    mask: (1,1, L, L)
-    """
-    submask = torch.where(mask[0, 0, :, :] == 0, torch.tensor(1.0), torch.tensor(0.0))
-    submask = mask[i:j, i:j].int().cpu().numpy()
-    for row in submask:
-        print(" ".join(map(str, row)))
 
 
 def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
@@ -1569,27 +1554,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
-class Qwen3ForSequenceClassification(
-    GenericForSequenceClassification, Qwen3PreTrainedModel
-):
-    pass
-
-
-class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrainedModel):
-    pass
-
-
-class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
-    base_model_prefix = (
-        "transformer"  # For BC, where `transformer` was used instead of `model`
-    )
-
-
 __all__ = [
     "Qwen3ForCausalLM",
-    "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
     "Qwen3Model",
-    "Qwen3ForSequenceClassification",
-    "Qwen3ForTokenClassification",
 ]
