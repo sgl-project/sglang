@@ -486,7 +486,9 @@ class TestStaticMambaSlotBudget(CustomTestCase):
             _static_mamba_slots=static,
             tree_cache=SimpleNamespace(
                 req_to_token_pool=SimpleNamespace(
-                    enable_mamba_extra_buffer_lazy=lazy
+                    # main's pool exposes the initial tracking slots directly
+                    # (2 with overlap, 1 in lazy mode) instead of the lazy flag.
+                    mamba_initial_tracking_slots=1 if lazy else 2
                 )
             ),
         )
@@ -495,9 +497,11 @@ class TestStaticMambaSlotBudget(CustomTestCase):
     def _req(self, boundary, prefix_len=0, branching=None, has_pool_idx=False):
         return SimpleNamespace(
             system_prefix_boundary=boundary,
-            prefix_indices=list(range(prefix_len)),
+            prefix_len=prefix_len,
             mamba_branching_seqlen=branching,
-            mamba_pool_idx=0 if has_pool_idx else None,
+            kv=SimpleNamespace(
+                mamba_pool_idx=0 if has_pool_idx else None
+            ),
         )
 
     def _budget(self, adder, req):
