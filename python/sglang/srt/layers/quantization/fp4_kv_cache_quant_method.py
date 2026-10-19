@@ -42,16 +42,16 @@ import torch
 from torch import Tensor
 
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     GROUP_SIZE as ULTRAQUANT_GROUP_SIZE,
 )
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     UltraQuantKVQuantizeUtil,
 )
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     code_bytes as ultraquant_code_bytes,
 )
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     n_groups as ultraquant_n_groups,
 )
 from sglang.srt.runtime_context import get_platform

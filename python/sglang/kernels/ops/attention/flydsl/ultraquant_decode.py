@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.ultraquant_tensor import code_bytes, n_groups
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import code_bytes, n_groups
 from sglang.srt.utils import is_gfx95_supported, next_power_of_2
 
 _HEAD_SIZE = 256

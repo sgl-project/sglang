@@ -22,7 +22,7 @@ from sglang.kernels.ops.kvcache.ultraquant import (
     ultraquant_rotate,
     ultraquant_store,
 )
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     UltraQuantKVQuantizeUtil,
     code_bytes,
     hadamard_matrix,

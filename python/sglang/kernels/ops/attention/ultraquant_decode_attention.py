@@ -38,7 +38,7 @@ from sglang.kernels.ops.kvcache.ultraquant import (
     dequant_rows,
     ultraquant_rotate,
 )
-from sglang.srt.layers.quantization.ultraquant_tensor import GROUP_SIZE
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import GROUP_SIZE
 
 
 @triton.jit

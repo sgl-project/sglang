@@ -8,7 +8,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     E2M1_LEVELS_SORTED,
     E2M1_MIDPOINTS,
     E2M1_VALUES,

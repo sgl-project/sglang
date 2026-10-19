@@ -10,7 +10,7 @@ from sglang.kernels.ops.kvcache.ultraquant import (
     ultraquant_rotate,
     ultraquant_store,
 )
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     GROUP_SIZE,
     UltraQuantKVQuantizeUtil,
     code_bytes,

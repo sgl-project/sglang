@@ -551,7 +551,7 @@ class TestUltraQuantKVCacheMethod(CustomTestCase):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             UltraQuantKVCacheMethod,
         )
-        from sglang.srt.layers.quantization.ultraquant_tensor import code_bytes
+        from sglang.srt.layers.quantization.quark.ultraquant_tensor import code_bytes
 
         head_dim = 256
         for kv_head_num, page_size in ((1, 1), (2, 1), (4, 64)):
@@ -603,7 +603,7 @@ class TestUltraQuantKVCacheMethod(CustomTestCase):
         return m
 
     def test_full_precision_layer_buffers_match_cell_size(self):
-        from sglang.srt.layers.quantization.ultraquant_tensor import (
+        from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
             code_bytes,
             n_groups,
         )

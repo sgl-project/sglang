@@ -19,7 +19,7 @@ codes and scale bytes into the four structure-of-arrays pool buffers.
 
 ``ultraquant_gather_dequant`` materializes cached slots back into contiguous
 fp16/bf16 for dense prefill. The device helpers are shared with the UltraQuant
-attention kernels. See ``sglang.srt.layers.quantization.ultraquant_tensor`` for
+attention kernels. See ``sglang.srt.layers.quantization.quark.ultraquant_tensor`` for
 the format and the PyTorch reference.
 """
 
@@ -29,7 +29,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.ultraquant_tensor import (
+from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
     CONSTANT_C,
     E2M1_MIDPOINTS,
     E2M1_VALUES,
