@@ -45,7 +45,7 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Zero holds slots until requests finish; if unset, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
