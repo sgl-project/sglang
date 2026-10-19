@@ -166,3 +166,15 @@ for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
         )
     )
 del _fn
+for _fn in ("silu_and_mul_clamp", "silu_and_mul_contig_post_quant"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.silu_and_mul_clamp:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+            ),
+        )
+    )
+del _fn

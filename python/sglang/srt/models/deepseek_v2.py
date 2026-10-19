@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.moe.dsv4 import (
+from sglang.kernels.ops.activation.silu_and_mul_clamp import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )

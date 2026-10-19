@@ -252,25 +252,9 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="moe.silu_and_mul_clamp",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_clamp",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
-    )
-)
-register_kernel(
-    KernelSpec(
         op="moe.silu_and_mul_masked_post_quant",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.dsv4:silu_and_mul_masked_post_quant",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="moe.silu_and_mul_contig_post_quant",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_contig_post_quant",
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )

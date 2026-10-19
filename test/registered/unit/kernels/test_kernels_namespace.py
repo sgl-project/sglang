@@ -243,6 +243,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "layernorm.rmsnorm_fanout",
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
+        "activation.silu_and_mul_clamp",
         "moe.gemma4_routing",
         "moe.shared_expert_gate",
         "memory.adler32",
