@@ -973,6 +973,73 @@ def build_low_ratio_decode_stream(
 
 
 @triton.jit
+def _dspark_block_stream_kernel(
+    state_slot_ptr,  # [N] int
+    positions_ptr,  # [N] int
+    indptr_ptr,  # [N+1] int32
+    indices_ptr,  # [*] int32 (out)
+    ring_stride,
+    block_size,
+    win: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per token of a DSpark draft block: its request's window ``[prefix - n,
+    prefix)``, n = min(prefix, win), then the whole block ``[prefix, prefix +
+    block_size)``, as ring rows ``slot*ring + pos%ring`` at indptr[t]; prefix is
+    the position of the block's first row."""
+    t = tl.program_id(0)
+    first = t - t % block_size
+    slot = tl.load(state_slot_ptr + first).to(tl.int64)
+    prefix = tl.load(positions_ptr + first).to(tl.int64)
+    n = tl.minimum(prefix, win)
+    base = tl.load(indptr_ptr + t)
+    i = tl.arange(0, BLOCK_N)
+    abs_pos = prefix - n + i
+    tl.store(
+        indices_ptr + base + i,
+        (slot * ring_stride + abs_pos % ring_stride).to(tl.int32),
+        mask=i < n + block_size,
+    )
+
+
+def build_dspark_block_streams(
+    *,
+    state_slot: torch.Tensor,  # [N] int, request-major
+    positions: torch.Tensor,  # [N] int, prefix + i on row i of a block
+    block_size: int,
+    win: int,
+    ring_stride: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode streams of a DeepSeek-V4.1 DSpark draft block (``block_size`` rows
+    per request): every row reads its request's last ``win`` committed positions
+    and the whole block, not a causal window -- the paged draft's block window
+    (``BuildDsparkSwaRingIndices``) over the unified SWA ring."""
+    device = state_slot.device
+    N = state_slot.shape[0]
+    assert N % block_size == 0, f"{N=} rows are not whole blocks of {block_size}"
+    assert ring_stride >= win + block_size, (
+        f"a ring of {ring_stride} rows cannot hold the {win}-row window and the "
+        f"{block_size}-row block at once"
+    )
+    prefix = positions.reshape(-1, block_size)[:, :1].to(torch.int32)
+    lengths = (torch.clamp(prefix, max=win) + block_size).expand(-1, block_size)
+    indptr = _lengths_to_indptr(lengths.reshape(-1))
+    indices = torch.empty(N * (win + block_size), dtype=torch.int32, device=device)
+    if N > 0:
+        _dspark_block_stream_kernel[(N,)](
+            state_slot.contiguous(),
+            positions.contiguous(),
+            indptr,
+            indices,
+            ring_stride,
+            block_size,
+            win=win,
+            BLOCK_N=triton.next_power_of_2(win + block_size),
+        )
+    return indices, indptr
+
+
+@triton.jit
 def _v41_decode_lengths_kernel(
     seq_lens_ptr,  # [N] int
     swa_len_ptr,  # [N] int
