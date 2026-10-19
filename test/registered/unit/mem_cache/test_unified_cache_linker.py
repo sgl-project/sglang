@@ -19,6 +19,7 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
+from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -431,6 +432,37 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
+
+    def test_store_ack_publishes_host_tier_kv_events(self):
+        if self.tree_core_backend != "python":
+            self.skipTest("published by the Python TreeCore only")
+        self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        cache, allocator, req_pool = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
+        linker = _InMemoryUnifiedCacheLinker(defaultdict(set))
+        linker.kv_event_medium = StorageMedium.CPU
+        cache.init_cache_linker(linker)
+
+        def stored(events, medium):
+            return [
+                h
+                for e in events
+                if isinstance(e, BlockStored) and e.medium == medium
+                for h in e.block_hashes
+            ]
+
+        cache.take_events()
+        self._insert(cache, allocator, req_pool, list(range(1, 9)))
+        events = cache.take_events()
+        self.assertEqual(len(stored(events, StorageMedium.GPU)), 4)
+        self.assertEqual(stored(events, StorageMedium.CPU), [])
+        linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        self.assertEqual(
+            stored(cache.take_events(), StorageMedium.CPU),
+            stored(events, StorageMedium.GPU),
+        )
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(

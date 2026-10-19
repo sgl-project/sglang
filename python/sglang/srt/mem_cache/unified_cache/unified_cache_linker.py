@@ -30,11 +30,13 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -133,6 +135,8 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    # KV-event medium for pages the store acknowledges; None publishes nothing.
+    kv_event_medium: Optional[StorageMedium] = None
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -249,6 +253,17 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
+        self.kv_event_medium = cache_linker.kv_event_medium
+        if self.kv_event_medium is not None and not isinstance(
+            cache.tree_core.kv_events, KVCacheEventRecorder
+        ):
+            logger.warning(
+                "External store residency events need the Python TreeCore; "
+                "not publishing them."
+            )
+            self.kv_event_medium = None
+        if self.kv_event_medium is not None:
+            cache.tree_core.external_cache_medium = self.kv_event_medium
 
     @property
     def layer_done_counter(self) -> object:
