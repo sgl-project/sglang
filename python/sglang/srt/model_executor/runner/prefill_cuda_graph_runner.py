@@ -376,8 +376,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_context_size = prefill_config.max_context_size
         self.max_seq_len = prefill_config.max_seq_len
         if model_runner.attn_backend.prefill_cuda_graph_context_unbounded:
-            # The backend still captures at max_seq_len; its
-            # can_run_prefill_cuda_graph judges which contexts replay.
+            # The backend's can_run_prefill_cuda_graph judges which contexts replay.
             self.max_seq_len = None
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,

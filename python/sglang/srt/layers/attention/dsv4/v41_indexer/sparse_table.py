@@ -82,7 +82,7 @@ class _SparsePrefillTable(_SparseTable):
     request_ids: torch.Tensor  # [rows] int32 row-pair ids, see _row_pair_ids
     q_dtype: torch.dtype
     page_size: int  # index-K pool page size (slots)
-    # rows of each request, in row order; None for a table of gathered rows
+    # rows of each request, in row order; None for rows gathered without them
     rows_per_request: Optional[List[int]]
 
     def tail(self, rows_per_request: List[int]) -> _SparsePrefillTable:
@@ -226,8 +226,10 @@ class SparseTableBackend:
         """The candidate source under the prefill CUDA graph: publish over the live
         rows, then return the table of the graph's ``num_rows`` rows (live rows first,
         padding rows repeat the last live row) as the tensors its consumers read.
-        With ``shared``, the tensors sit in this layer's buffers that every captured
-        bucket reads; a replay copies its live table there, one graph at a time."""
+        With ``shared`` (at capture) they are views of this layer's buffers, so every
+        bucket reads one address; at replay eager_on_graph copies the live table
+        there, one graph at a time. The shapes, DeepGEMM's sparse schedule included,
+        depend only on the row and block counts, so the copy always fits."""
         published = self.publish_prefill(inputs)
         assert published is not None, "candidate source published no sparse table"
         live = published.blocks.shape[0]

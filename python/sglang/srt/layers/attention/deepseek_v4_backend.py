@@ -1014,8 +1014,7 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
 
 
 # Rows per logits chunk of the ratio-1/2 indexer metadata under the prefill CUDA
-# graph; its width is the captured max_seq_len, or the live context when any
-# context replays.
+# graph; its width is _prefill_graph_context_width.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
@@ -1087,7 +1086,7 @@ class DSV4Metadata:
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
         if not two_level:
-            # The captured full-top-k fallback reads the ratio-1/2 lengths and
+            # The captured full top-k fallback reads the ratio-1/2 lengths and
             # page tables by address: refresh them in place.
             maybe_copy_inplace(
                 self.c1_indexer_metadata, src=static_metadata.c1_indexer_metadata
@@ -1281,8 +1280,7 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
-        # Prefill CUDA graph source projection buffers per ratio; graphs captured on
-        # an older (smaller) allocation keep it alive themselves.
+        # Prefill CUDA graph source projection buffers per ratio, newest first.
         self._source_proj_bufs: Dict[int, list] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
@@ -3820,10 +3818,8 @@ class DeepseekV4AttnBackend(
 
     @property
     def prefill_cuda_graph_context_unbounded(self) -> bool:
-        """Whether a prefill graph replay admits any context length: the full
-        top-k layers score as an eager break and the consumers score a fixed
-        candidate window, so only c4/c128 compress metadata would still be
-        captured at a context width."""
+        """Whether a prefill graph replay admits any context length: with two-level
+        candidates only c4/c128 compress metadata would be captured at a width."""
         return (
             self.low_ratio_prefill_graph
             and self._prefill_graph_two_level()
@@ -3834,12 +3830,9 @@ class DeepseekV4AttnBackend(
     def _prefill_graph_full_topk_break(self, layer, x, q_lora, pos, forward_batch):
         """Eager break of the prefill CUDA graph: one full top-k layer's dense
         scoring and top-k over the live batch (any context length), writing the
-        persistent sparse indices the attention break reads. The candidate
-        source also returns its block table over the rows the captured consumers
-        run on (the bounded-replay tail block, else the whole bucket);
-        eager_on_graph copies the returned tensors into the addresses the
-        consumers were captured with (DeepGEMM's sparse schedule is fixed-size
-        for fixed rows and block count)."""
+        persistent sparse indices the attention break reads. The candidate source
+        also returns its block table for the captured consumers (the bounded-replay
+        tail block, else the whole bucket; SparseTableBackend.publish_prefill_graph)."""
         indexer = layer.indexer
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:
