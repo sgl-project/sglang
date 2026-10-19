@@ -20,12 +20,18 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestDecodeHiCacheTreeCore(CustomTestCase):
     def test_storage_probe_and_prefetch_use_node_handles(self):
+        for is_eagle, prefetched in ((False, [4, 5]), (True, [4, 5, 6])):
+            with self.subTest(is_eagle=is_eagle):
+                self._check_storage_probe_and_prefetch(is_eagle, prefetched)
+
+    def _check_storage_probe_and_prefetch(self, is_eagle, prefetched):
         ongoing_prefetch = {}
 
         def register_prefetch(req_id, *_args, **_kwargs):
             ongoing_prefetch[req_id] = object()
 
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=is_eagle),
             hicache_storage_pass_prefix_keys=True,
             ongoing_prefetch=ongoing_prefetch,
             has_ongoing_prefetch=ongoing_prefetch.__contains__,
@@ -75,7 +81,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         tree_cache.prefetch_from_storage.assert_called_once_with(
             req.cache_request_handle,
             22,
-            [4, 5],
+            prefetched,
             "h2",
             ["h0", "h1"],
             extra_key="model",
@@ -84,6 +90,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
             hicache_storage_pass_prefix_keys=True,
             ongoing_prefetch={},
             get_last_hash_value=Mock(side_effect=KeyError(22)),
@@ -116,6 +123,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
     def test_restored_indices_read_off_the_restored_path(self):
         restored_path = torch.tensor([10, 11, 12, 13, 14])
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
             init_load_back=Mock(return_value=(2, "restored")),
             path_device_indices=Mock(return_value=restored_path),
             lock=Mock(return_value="restore-lock"),
