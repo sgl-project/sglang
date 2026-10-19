@@ -393,7 +393,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
     @staticmethod
     def _resolve_gate_fallback_backend() -> str:
         try:
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (  # noqa: F401
+            from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (  # noqa: F401
                 sigmoid_gate_mul,
             )
         except ImportError:
@@ -498,7 +498,7 @@ class HYV4Attention(DeepseekV2AttentionMLA):
                 f"output shape: {tuple(gate.shape)} != {tuple(attn_out.shape)}"
             )
         if backend == "triton" and attn_out.is_cuda:
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+            from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (
                 sigmoid_gate_mul,
             )
 

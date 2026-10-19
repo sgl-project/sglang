@@ -173,7 +173,7 @@ def test_import_stays_metadata_only():
         ("moe.situ_and_mul_masked_post_quant", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_fused_tma", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
-        ("attention.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),
+        ("elementwise.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),
         ("attention.fused_kda_decode_mtp_dspark", KernelBackend.CUTE_DSL, "cuda"),
         ("attention.flydsl_kimi_k3_kda_decode_with_f_b", KernelBackend.FLYDSL, "hip"),
         ("communication.all_reduce_push_res", KernelBackend.JIT, "cuda"),

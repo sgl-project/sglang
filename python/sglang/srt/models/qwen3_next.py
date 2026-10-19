@@ -806,7 +806,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             if _is_hip:
-                from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                from sglang.kernels.ops.elementwise.sigmoid_gate_mul import (
                     sigmoid_gate_mul,
                 )
 

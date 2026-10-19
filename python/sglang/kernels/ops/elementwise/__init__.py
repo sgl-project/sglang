@@ -55,3 +55,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="elementwise.kimi_k3_mla_output_gate",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.mla_output_gate:kimi_k3_mla_output_gate",
+        capabilities=CUDA_ONLY,
+    )
+)
