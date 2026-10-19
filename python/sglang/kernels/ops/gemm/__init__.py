@@ -442,7 +442,6 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:try_nvfp4_moe",
         capabilities=_SM120,
-        description="Native Nemotron NVFP4 MoE for M <= 4; None keeps the CUTLASS path.",
     )
 )
 register_kernel(
