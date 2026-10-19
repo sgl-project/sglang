@@ -44,11 +44,14 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     _CONFIGS,
     CacheConfig,
     UnifiedRadixCacheFixtures,
+    _config_attrs,
     _device_value,
     _host_value,
     _match_prefix,
     _node_key_length,
     _node_parent,
+    _requires,
+    _requires_hicache,
     build_fixture,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -233,10 +236,9 @@ class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
 
 
 class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
+    @_requires_hicache
     def test_hicache_load_back_restores_data(self):
         """Loading back an evicted node restores the backed-up cache data."""
-        if self._skip_unsupported_hicache_test():
-            return
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         base = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, base)
@@ -288,14 +290,16 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
         cache.sanity_check()
 
+    @_requires(
+        lambda cfg: (
+            cfg.has_swa
+            and not cfg.has_mamba
+            and cfg.page_size in (1, 4)
+            and cfg.sliding_window_size == 4
+        ),
+        "requires Full+SWA with window_size=4",
+    )
     def test_swa_branching_seqlen_uses_device_full_hit(self):
-        if (
-            not self.cfg.has_swa
-            or self.cfg.has_mamba
-            or self.cfg.page_size not in (1, 4)
-            or self.cfg.sliding_window_size != 4
-        ):
-            self.skipTest("requires Full+SWA with window_size=4")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         window = self.cfg.sliding_window_size
         window_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
@@ -328,14 +332,16 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(rematch.device_prefix_len, result.swa_branching_seqlen)
         self.assertIsNone(rematch.swa_branching_seqlen)
 
+    @_requires(
+        lambda cfg: (
+            cfg.has_swa
+            and not cfg.has_mamba
+            and cfg.page_size == 1
+            and cfg.sliding_window_size == 4
+        ),
+        "requires page_size=1 Full+SWA with window_size=4",
+    )
     def test_swa_branching_seqlen_uses_host_full_hit(self):
-        if (
-            not self.cfg.has_swa
-            or self.cfg.has_mamba
-            or self.cfg.page_size != 1
-            or self.cfg.sliding_window_size != 4
-        ):
-            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         window = self.cfg.sliding_window_size
         prefix = self._make_seq(1, window)
@@ -384,14 +390,16 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(rematch.device_prefix_len, result.swa_branching_seqlen)
         self.assertIsNone(rematch.swa_branching_seqlen)
 
+    @_requires(
+        lambda cfg: (
+            cfg.has_swa
+            and not cfg.has_mamba
+            and cfg.page_size == 1
+            and cfg.sliding_window_size == 4
+        ),
+        "requires page_size=1 Full+SWA with window_size=4",
+    )
     def test_swa_branching_seqlen_caps_insert_after_forward(self):
-        if (
-            not self.cfg.has_swa
-            or self.cfg.has_mamba
-            or self.cfg.page_size != 1
-            or self.cfg.sliding_window_size != 4
-        ):
-            self.skipTest("requires page_size=1 Full+SWA with window_size=4")
         cache, _, _ = build_fixture(self.cfg)
         swa = cache.components[ComponentType.SWA]
         req = mock.Mock(
@@ -425,9 +433,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         swa.commit_insert_component_data(mock.Mock(), False, params, result, [])
         self.assertTrue(result.swa_branch_inserted)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         chunk_size = mamba_cache_chunk_size()
         tokens = self._make_seq(1, chunk_size + 1)
@@ -450,9 +460,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(with_hicache.last_device_node, tree_h.root_node_handle())
         self.assertIsNone(with_hicache.mamba_branching_seqlen)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_mamba_branching_seqlen_uses_device_full_hit_under_hicache(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chunk_size = mamba_cache_chunk_size()
         prefix = self._make_seq(1, chunk_size)
@@ -473,9 +485,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_mamba_branching_from_host_full_is_reusable_after_insert(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chunk_size = mamba_cache_chunk_size()
         prefix = self._make_seq(1, chunk_size)
@@ -541,9 +555,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             _host_value(cache, second_match.last_device_node, ComponentType.MAMBA)
         )
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -575,9 +591,10 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: cfg.page_size == 1, "page_size=1 keeps the expected suffix precise"
+    )
     def test_scheduler_hicache_aux_only_load_back_appends_full_device_indices(self):
-        if self.cfg.page_size != 1:
-            self.skipTest("page_size=1 keeps the expected suffix precise")
         aux = None
         if self.cfg.has_swa and not self.cfg.has_mamba:
             aux = ComponentType.SWA
@@ -622,9 +639,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_scheduler_hicache_load_back_fallback_keeps_old_anchor(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -665,9 +684,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_load_failure(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -704,9 +725,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_capacity_failure(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -751,9 +774,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_load_back_abort_frees_unpublished_mamba_slot(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -782,9 +807,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         )
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_load_back_load_failure_frees_unpublished_mamba_slot(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -812,9 +839,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         )
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_load_back_abort_keeps_preexisting_mamba_slot(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -840,9 +869,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         )
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_load_back_success_publishes_fresh_mamba_slot(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -871,15 +902,17 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self._finish_pending_loads(cache)
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: (
+            cfg.has_mamba
+            and not cfg.has_swa
+            and cfg.page_size == 1
+            and not cfg.enable_mamba_extra_buffer
+            and not cfg.enable_int8_mamba_checkpoint
+        ),
+        "requires page_size=1 Full+Mamba without extra buffers",
+    )
     def test_admission_keeps_mamba_h2d_destination_on_full_overdelivery(self):
-        if (
-            not self.cfg.has_mamba
-            or self.cfg.has_swa
-            or self.cfg.page_size != 1
-            or self.cfg.enable_mamba_extra_buffer
-            or self.cfg.enable_int8_mamba_checkpoint
-        ):
-            self.skipTest("requires page_size=1 Full+Mamba without extra buffers")
         cache, allocator, pool = build_fixture(replace(self.cfg, kv_size=20))
         self._init_hicache(cache, write_policy="write_back")
         tokens = list(range(12))
@@ -927,9 +960,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         pool.mamba_allocator.free(other_slots)
         cache.unlock(req.lock)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_load_back_success_copies_mamba_state_into_request_slot(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -966,9 +1001,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             self.assertTrue(torch.equal(actual, expected))
         self._release_ongoing_load_back_locks(cache)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_prepare_load_back_mamba(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -1011,9 +1048,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertIsNone(comp.prepare_load_back(root, req=req2).allocated_mamba_slot)
         self.assertIsNone(req2.kv.mamba_pool_idx)
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_prepare_load_back_skips_device_present_node(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -1037,9 +1076,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
 
+    @_requires(
+        lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
+        "requires page_size=1 Full+Mamba",
+    )
     def test_prepare_load_back_mamba_pool_exhausted(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
@@ -1071,13 +1112,13 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
+    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires(
+        lambda cfg: not cfg.has_mamba,
+        "SWA-only path keeps the chain construction simple",
+    )
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self.cfg.has_mamba:
-            # Mamba's per-insert req allocation exhausts max_num_reqs on long chains.
-            self.skipTest("SWA-only path keeps the chain construction simple")
         ps = self.cfg.page_size
         sw = self.cfg.sliding_window_size
         expected_pages = (sw + ps - 1) // ps
@@ -1115,6 +1156,15 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires(
+        lambda cfg: not cfg.has_mamba,
+        "SWA-only path keeps the chain construction simple",
+    )
+    @_requires(
+        lambda cfg: cfg.sliding_window_size > cfg.page_size,
+        "window must span past the leaf to reach the pin",
+    )
     def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
         """A second load-back must not claim nodes pinned by an in-flight one.
 
@@ -1123,13 +1173,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         pinned node and hit the commit pin assert. The spec build must degrade
         to an empty spec instead (the caller recomputes).
         """
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the chain construction simple")
-        if self.cfg.sliding_window_size <= self.cfg.page_size:
-            # A window within one page never reaches the pinned ancestor.
-            self.skipTest("window must span past the leaf to reach the pin")
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         # commit_load_back pins its source nodes only under write-back; run the
@@ -1169,16 +1212,17 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(kv_xfer.nodes_to_load, [b])
         self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
 
+    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires(
+        lambda cfg: not cfg.has_mamba,
+        "SWA-only path keeps the chain construction simple",
+    )
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
         """LOAD_BACK commit must:
         (1) restore SWA cd.value via _restore_device_value (host LRU -> device LRU),
         (2) rewrite full_to_swa_index_mapping[full_idx] = new_swa_idx for every
             loaded chunk so subsequent SWA reads via translate_loc_from_full_to_swa
             return the freshly allocated SWA slot."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the chain construction simple")
 
         cache, allocator, _, chain, window_pages = self._swa_finalize_setup()
 
@@ -1265,14 +1309,14 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
                 ComponentType.SWA, y, CacheTransferPhase.LOAD_BACK
             )
 
+    @_requires(lambda cfg: cfg.has_swa, "requires SWA")
+    @_requires(lambda cfg: not cfg.has_mamba, "SWA-only path")
+    @_requires(
+        lambda cfg: cfg.page_size <= 1,
+        "page_size==1 for direct swa_attn_allocator access",
+    )
     def test_hicache_swa_load_back_uses_full_pool_capacity(self):
         """load_back should gate Full KV load on Full pool capacity only."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path")
-        if self.cfg.page_size > 1:
-            self.skipTest("page_size==1 for direct swa_attn_allocator access")
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
 
@@ -1358,7 +1402,9 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheFixtures):
 for _cfg in _CONFIGS:
     _name = f"Test_{_cfg.label}"
     globals()[_name] = type(
-        _name, (UnifiedRadixCacheLoadBackSuite, CustomTestCase), {"cfg": _cfg}
+        _name,
+        (UnifiedRadixCacheLoadBackSuite, CustomTestCase),
+        _config_attrs(UnifiedRadixCacheLoadBackSuite, _cfg),
     )
     globals()[_name].__module__ = __name__
 del _cfg, _name

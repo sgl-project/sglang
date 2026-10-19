@@ -508,6 +508,40 @@ _CONFIGS: list[CacheConfig] = [
 ]
 
 
+def _requires(predicate, reason):
+    """Run a suite test only under the configs that satisfy ``predicate``.
+
+    Stacked requirements are checked top to bottom and stop at the first that
+    fails, so a lower one may assume the ones above it hold.
+    """
+
+    def decorate(test):
+        requirements = getattr(test, "_cfg_requirements", ())
+        test._cfg_requirements = ((predicate, reason), *requirements)
+        return test
+
+    return decorate
+
+
+def _supports_hicache(cfg):
+    return not (cfg.has_swa and cfg.has_mamba)
+
+
+_requires_hicache = _requires(
+    _supports_hicache, "HiCache unit fixture does not support SWA + Mamba stacks"
+)
+
+
+def _config_attrs(suite, cfg):
+    """Bind ``suite`` to ``cfg``, hiding the tests whose requirements it fails."""
+    attrs = {"cfg": cfg}
+    for name, test in vars(suite).items():
+        requirements = getattr(test, "_cfg_requirements", ())
+        if not all(predicate(cfg) for predicate, _ in requirements):
+            attrs[name] = None
+    return attrs
+
+
 class UnifiedRadixCacheFixtures:
     cfg: CacheConfig
     _rid: int = 0
