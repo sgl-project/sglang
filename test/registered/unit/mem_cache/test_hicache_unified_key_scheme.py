@@ -1,5 +1,7 @@
 import threading
 import unittest
+from dataclasses import replace
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +12,7 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.hicache_key_scheme import derive_namespace, namespace_digest
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
@@ -119,13 +122,14 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
 
 
 class TestControllerUnifiedKeys(CustomTestCase):
-    def _controller(self, *, mla=False):
+    def _controller(self, *, mla=False, grouped=True):
         device_pool = object.__new__(MLATokenToKVPool) if mla else SimpleNamespace()
         # FP8 variants share a uint8 storage view but require distinct keys.
         device_pool.dtype = torch.float8_e4m3fn
         device_pool.store_dtype = torch.uint8
+        # Buffer-info host pools expose the physical dtype and no device_pool.
         host_pool = SimpleNamespace(
-            device_pool=device_pool,
+            dtype=torch.uint8,
             head_num=0 if mla else 4,
             head_group_num=1,
             start_layer=4,
@@ -144,9 +148,16 @@ class TestControllerUnifiedKeys(CustomTestCase):
         controller = object.__new__(HiCacheController)
         controller.page_size = 16
         controller.storage_host_pool = host_pool
-        controller.mem_pool_host = SimpleNamespace(entries=[host_pool])
-        # A composite device pool need not describe its anchor's physical KV.
-        controller.mem_pool_device = SimpleNamespace(dtype=torch.float16)
+        if grouped:
+            anchor = SimpleNamespace(host_pool=host_pool, device_pool=device_pool)
+            controller.mem_pool_host = SimpleNamespace(
+                entries=[anchor], anchor_entry=anchor
+            )
+            # A composite device pool need not describe its anchor's physical KV.
+            controller.mem_pool_device = SimpleNamespace(dtype=torch.float16)
+        else:
+            controller.mem_pool_host = host_pool
+            controller.mem_pool_device = device_pool
         return controller
 
     def _suffixes(self, controller, *, attn_cp_size=1):
@@ -205,6 +216,14 @@ class TestControllerUnifiedKeys(CustomTestCase):
             self._suffixes(self._controller(mla=True)),
             [f"{namespace_digest(namespace)}_L4-8"],
         )
+
+    def test_standalone_and_grouped_pools_share_logical_identity(self):
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                self.assertEqual(
+                    self._suffixes(self._controller(mla=mla, grouped=False)),
+                    self._suffixes(self._controller(mla=mla)),
+                )
 
     def test_full_page_cp_keeps_attention_tp_shard_keys(self):
         for mla in (False, True):
@@ -288,7 +307,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
 
     def test_attention_dp_config_uses_local_tp_and_cp_ranks(self):
         controller = self._controller(mla=True)
-        controller.mem_pool_device = controller.storage_host_pool.device_pool
+        controller.mem_pool_device = controller.mem_pool_host.anchor_entry.device_pool
         controller.mem_pool_host.layout = "page_unified"
         controller.storage_host_pool.storage_format_tag = None
         controller.enable_storage_metrics = False
@@ -383,6 +402,51 @@ class TestFileBackendUnifiedKeys(CustomTestCase):
         config.attn_cp_size = 4
         HiCacheFile._init_config_suffix(backend, config)
         self.assertEqual(backend.config_suffix, "_ukv1-abc_L0-80_H1")
+        self.assertEqual(backend.tp_config_suffix, backend.config_suffix)
+
+    def test_file_round_trip_and_eviction_ownership_follow_writer_election(self):
+        # Full-page CP replicas share files; MLA also shares across TP ranks.
+        cases = (
+            (False, 1, 0, True),
+            (False, 1, 1, False),
+            (True, 0, 0, True),
+            (True, 1, 0, False),
+            (True, 0, 1, False),
+        )
+        value = torch.arange(16, dtype=torch.uint8)
+        for mla, tp_rank, cp_rank, owns_files in cases:
+            with (
+                self.subTest(mla=mla, tp_rank=tp_rank, cp_rank=cp_rank),
+                TemporaryDirectory() as directory,
+                envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(directory),
+            ):
+                owner_config = replace(
+                    self._config(["ukv1-abc_L0-80" + ("" if mla else "_H1")]),
+                    is_mla_model=mla,
+                    tp_rank=0 if mla else tp_rank,
+                    attn_cp_size=2,
+                    extra_config={
+                        "enable_metadata_cache": True,
+                        "metadata_ttl": 60,
+                        "max_size": "32",
+                        "min_free_space": "0",
+                        "eviction_ratio": 1.0,
+                    },
+                )
+                writer = HiCacheFile(owner_config)
+                self.assertTrue(writer.set("existing", value))
+
+                # Initializing another rank scans shared files for metadata,
+                # while its evictor must track only the elected writer's files.
+                backend = HiCacheFile(
+                    replace(owner_config, tp_rank=tp_rank, attn_cp_rank=cp_rank)
+                )
+                self.assertTrue(backend.exists("existing"))
+                restored = torch.empty_like(value)
+                self.assertIs(backend.get("existing", restored), restored)
+                torch.testing.assert_close(restored, value)
+                self.assertEqual(backend.set("new", value), owns_files)
+                self.assertTrue(writer.exists("existing"))
 
     def test_rank_suffix_path_is_unchanged(self):
         backend = HiCacheFile.__new__(HiCacheFile)

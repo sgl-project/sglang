@@ -404,21 +404,33 @@ class HiCacheFile(HiCacheStorage):
                     f"--hicache-storage-layer-partition."
                 )
             self.config_suffix = f"_{storage_config.unified_suffixes[0]}"
+            # Unified keys currently support only a single KV pool, without
+            # TP-sharded sidecars. Keep all key lookups in its chunk namespace.
+            self.tp_config_suffix = self.config_suffix
             return
         model_name = storage_config.model_name
         model_name = "-".join(model_name.split("/")) if model_name else ""
-        self.config_suffix = f"_{model_name}"
-        if not storage_config.is_mla_model:
-            self.config_suffix += f"_{storage_config.tp_rank}_{storage_config.tp_size}"
+        shard_suffix = ""
         if storage_config.pp_size > 1:
-            self.config_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+            shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
         # Under NSA context parallel each CP rank holds a disjoint slice of
         # every page, so give each rank its own file key to avoid a cross-rank
         # write race.
         if storage_config.attn_cp_size > 1:
-            self.config_suffix += (
+            shard_suffix += (
                 f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
             )
+        # MLA KV is replicated across TP ranks and shares one file per page;
+        # TP-sharded state is keyed by tp_config_suffix instead.
+        self.tp_config_suffix = (
+            f"_{model_name}_{storage_config.tp_rank}_{storage_config.tp_size}"
+            f"{shard_suffix}"
+        )
+        self.config_suffix = (
+            f"_{model_name}{shard_suffix}"
+            if storage_config.is_mla_model
+            else self.tp_config_suffix
+        )
 
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
@@ -467,11 +479,23 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        if storage_config.unified_suffixes is not None:
+            # Match the controller's writer election: unified full-page CP
+            # replicas share keys, and MLA also replicates across TP ranks.
+            owns_unified = attn_cp_rank == 0 and (
+                not storage_config.is_mla_model or tp_rank == 0
+            )
+            owned_suffixes = (self.config_suffix,) if owns_unified else ()
+        else:
+            # Each rank creates and evicts its TP-sharded files; rank 0 also
+            # owns the shared MLA files.
+            owned_suffixes = (self.tp_config_suffix,)
+            if storage_config.is_mla_model and tp_rank == 0:
+                owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
-            self.config_suffix,
+            owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
-            is_mla_model=storage_config.is_mla_model,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
@@ -479,6 +503,9 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if key.endswith(f".{PoolName.MAMBA.value}"):
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
@@ -496,7 +523,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            if stem.endswith((self.config_suffix, self.tp_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(

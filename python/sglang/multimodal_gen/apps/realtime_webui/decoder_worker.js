@@ -1,50 +1,6 @@
 const RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb";
-const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
-const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-
-let lastFrame = null;
-
-function reset() {
-  lastFrame = null;
-}
-
-async function gunzipBytes(payload) {
-  if (typeof DecompressionStream === "undefined") {
-    throw new Error("This browser does not support gzip stream decoding");
-  }
-  const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream("gzip"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-async function restoreDeltaGzipFrames(header, payload) {
-  const frameBytes = Number(header.bytes_per_frame);
-  const count = Number(header.num_frames);
-  const expectedSize = frameBytes * count;
-  const restored = await gunzipBytes(payload);
-  if (restored.length !== expectedSize) {
-    throw new Error(`delta payload size mismatch: expected ${expectedSize}, got ${restored.length}`);
-  }
-
-  let previous = header.delta_reference === "previous-frame" ? lastFrame : null;
-  if (header.delta_reference === "previous-frame") {
-    if (!previous) throw new Error("Missing previous frame for delta payload");
-    if (previous.byteLength !== frameBytes) {
-      throw new Error("Previous frame size does not match current delta payload");
-    }
-  }
-
-  for (let f = 0; f < count; f++) {
-    const offset = f * frameBytes;
-    if (previous) {
-      for (let i = 0; i < frameBytes; i++) restored[offset + i] ^= previous[i];
-    }
-    previous = restored.slice(offset, offset + frameBytes);
-  }
-  lastFrame = previous;
-  return restored;
-}
 
 function rawFramesToRgbaBuffers(header, payload) {
   const width = Number(header.width);
@@ -130,16 +86,6 @@ async function decode(header, payload) {
     };
   } else if (header.content_type === RAW_RGB_CONTENT_TYPE) {
     rawPayload = new Uint8Array(payload);
-    const frameBytes = Number(header.bytes_per_frame);
-    const count = Number(header.num_frames);
-    lastFrame = count > 0
-      ? rawPayload.slice((count - 1) * frameBytes, count * frameBytes)
-      : null;
-  } else if (
-    header.content_type === RAW_RGB_DELTA_GZIP_CONTENT_TYPE ||
-    header.content_type === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE
-  ) {
-    rawPayload = await restoreDeltaGzipFrames(header, payload);
   } else {
     throw new Error(`Unsupported content type ${header.content_type}`);
   }
@@ -156,10 +102,6 @@ async function decode(header, payload) {
 self.onmessage = async (event) => {
   const message = event.data;
   try {
-    if (message.type === "reset") {
-      reset();
-      return;
-    }
     const result = await decode(message.header, message.payload);
     self.postMessage({ type: "decoded", ...result }, result.frames);
   } catch (error) {

@@ -50,16 +50,26 @@ def _pinned_host_pool(host_pool_cls, device_pool, **kwargs):
     cudaErrorHostMemoryAlreadyRegistered. Parametrized cases would then pass or
     fail on allocator reuse, which says nothing about the layout.
     """
+    from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
     from sglang.srt.mem_cache.pool_host.common import (
         ALLOC_MEMORY_FUNCS,
         alloc_with_pin_memory,
     )
 
+    buffer_info = device_pool.get_device_pool_infos()[0].buffer_info
+    if isinstance(buffer_info, MLABufferInfo):
+        kwargs.update(
+            target_layer_num=device_pool.layer_num,
+            override_kv_cache_dim=device_pool.kv_cache_dim,
+        )
     original = ALLOC_MEMORY_FUNCS[DEVICE]
     ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
     try:
         return host_pool_cls(
-            device_pool,
+            buffer_info,
+            device_capacity_tokens=device_pool.size,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=PAGE_SIZE,
