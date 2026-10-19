@@ -651,6 +651,46 @@ pub mod media_input {
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHiCacheStorageRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AttachHiCacheStorageRequest {
+    /// Required and non-null in the Python HTTP API; handlers validate presence.
+    /// An empty string is passed through for scheduler-side backend validation.
+    #[prost(string, optional, tag = "1")]
+    pub hicache_storage_backend: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub hicache_storage_backend_extra_config_json:
+        ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub hicache_storage_prefetch_policy: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub hicache_write_policy: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DetachHiCacheStorageRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearHiCacheStorageRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HiCacheStatus {
+    #[prost(string, optional, tag = "1")]
+    pub hicache_storage_backend: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub hicache_storage_backend_extra_config:
+        ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub hicache_storage_prefetch_policy: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub hicache_write_policy: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Structured gRPC result. HTTP preserves the Python endpoint's plain-text response.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HiCacheStorageResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckResponse {

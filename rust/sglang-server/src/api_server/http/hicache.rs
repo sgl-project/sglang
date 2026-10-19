@@ -4,25 +4,16 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
-    body::Bytes,
-    extract::State,
+    Json, Router,
+    extract::{State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 
-use serde::Deserialize;
+use sglang_api_types::api::v1 as api;
 
 use super::app::AppState;
-
-#[derive(Deserialize)]
-struct AttachHiCacheStorageReqInputBody {
-    hicache_storage_backend: String,
-    hicache_storage_backend_extra_config_json: Option<String>,
-    hicache_storage_prefetch_policy: Option<String>,
-    hicache_write_policy: Option<String>,
-}
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -38,34 +29,22 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
     axum::Json(state.core.hicache_status().await).into_response()
 }
 
-async fn attach(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    if body.is_empty() {
+async fn attach(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::AttachHiCacheStorageRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.body_text()).into_response(),
+    };
+    if body.hicache_storage_backend.is_none() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Request body is required.\n",
+            "missing field `hicache_storage_backend`",
         )
             .into_response();
     }
-    let body: AttachHiCacheStorageReqInputBody = match serde_json::from_slice(&body) {
-        Ok(body) => body,
-        Err(error) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("Invalid attach request: {error}\n"),
-            )
-                .into_response();
-        }
-    };
-    match state
-        .core
-        .attach_hicache_storage(
-            body.hicache_storage_backend,
-            body.hicache_storage_backend_extra_config_json,
-            body.hicache_storage_prefetch_policy,
-            body.hicache_write_policy,
-        )
-        .await
-    {
+    match state.core.attach_hicache_storage(body).await {
         Ok(output) => {
             let (status, summary) = if output.success {
                 (StatusCode::OK, "HiCache storage backend attached.")
@@ -101,18 +80,12 @@ async fn detach(State(state): State<Arc<AppState>>) -> Response {
 async fn clear(State(state): State<Arc<AppState>>) -> Response {
     match state.core.clear_hicache_storage().await {
         Ok(output) => {
-            let (status, summary) = if output.success {
-                (
-                    StatusCode::OK,
-                    "Hierarchical cache storage backend cleared.\n",
-                )
+            let status = if output.success {
+                StatusCode::OK
             } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Failed to clear hierarchical cache storage backend.\n",
-                )
+                StatusCode::BAD_REQUEST
             };
-            (status, summary).into_response()
+            (status, "Hierarchical cache storage backend cleared.\n").into_response()
         }
         Err(error) => (error.http_status(), error.to_string()).into_response(),
     }
@@ -139,12 +112,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::api_server::core::{CoreConfig, CoreHandle};
-    use crate::message::{
-        config::ServerArgs,
-        io_struct::{AttachHiCacheStorageReqInput, ControlRequest},
-        request::RequestKind,
-        response::ResponseItem,
-    };
+    use crate::message::{config::ServerArgs, request::RequestKind, response::ResponseItem};
     use crate::tokenizer_manager::wiring::TmEvent;
 
     fn app() -> (Router, flume::Receiver<TmEvent>) {
@@ -243,18 +211,7 @@ mod tests {
     /// Clear maps scheduler success to HTTP 200 and failure to HTTP 400.
     #[tokio::test]
     async fn clear_relays_success_and_failure() {
-        for (success, status, text) in [
-            (
-                true,
-                StatusCode::OK,
-                "Hierarchical cache storage backend cleared.\n",
-            ),
-            (
-                false,
-                StatusCode::BAD_REQUEST,
-                "Failed to clear hierarchical cache storage backend.\n",
-            ),
-        ] {
+        for (success, status) in [(true, StatusCode::OK), (false, StatusCode::BAD_REQUEST)] {
             assert_eq!(
                 exchange(
                     "POST",
@@ -265,7 +222,10 @@ mod tests {
                     reply(json!({"success": success}))
                 )
                 .await,
-                (status, text.into())
+                (
+                    status,
+                    "Hierarchical cache storage backend cleared.\n".into()
+                )
             );
         }
     }
@@ -310,9 +270,9 @@ mod tests {
         }
     }
 
-    /// Malformed scheduler replies produce HTTP 500 for attach, detach, and clear.
+    /// Malformed replies and scheduler errors produce HTTP 500 for all three operations.
     #[tokio::test]
-    async fn control_operations_reject_invalid_scheduler_replies() {
+    async fn control_operations_report_scheduler_errors() {
         for (method, uri, tag, operation, input, fields) in [
             (
                 "POST",
@@ -339,102 +299,31 @@ mod tests {
                 json!(["file", null, null, null]),
             ),
         ] {
-            for bytes in [
-                rmp_serde::to_vec_named(&json!({"message": "missing success"})).unwrap(),
-                rmp_serde::to_vec_named(&json!({"success": "false"})).unwrap(),
-                vec![0xc1], // Reserved MessagePack byte: not a valid response.
-            ] {
-                let (status, body) = exchange(
-                    method,
-                    uri,
-                    input.clone(),
-                    tag,
-                    fields.clone(),
-                    ResponseItem::Control(Bytes::from(bytes)),
-                )
-                .await;
-                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-                assert!(
-                    body.contains(&format!("invalid HiCache {operation} response")),
-                    "{body}"
-                );
-            }
-        }
-    }
-
-    /// Scheduler errors reach the HTTP response with their diagnostic message.
-    #[tokio::test]
-    async fn control_operations_relay_scheduler_errors() {
-        for (method, uri, tag, input, fields) in [
-            (
-                "POST",
-                "/hicache/storage-backend/clear",
-                "ClearHiCacheReqInput",
-                Value::Null,
-                json!([]),
-            ),
-            (
-                "DELETE",
-                "/hicache/storage-backend",
-                "DetachHiCacheStorageReqInput",
-                Value::Null,
-                json!([]),
-            ),
-            (
-                "PUT",
-                "/hicache/storage-backend",
-                "AttachHiCacheStorageReqInput",
-                json!({"hicache_storage_backend": "file"}),
-                json!(["file", null, null, null]),
-            ),
-        ] {
-            let (status, body) = exchange(
-                method,
-                uri,
-                input,
-                tag,
-                fields,
-                ResponseItem::Error(crate::utils::error::Error::Internal(
+            for (response, expected_error) in [
+                (
+                    reply(json!({"message": "missing success"})),
+                    format!("invalid HiCache {operation} response"),
+                ),
+                (
+                    reply(json!({"success": "false"})),
+                    format!("invalid HiCache {operation} response"),
+                ),
+                (
+                    ResponseItem::Control(Bytes::from_static(&[0xc1])),
+                    format!("invalid HiCache {operation} response"),
+                ),
+                (
+                    ResponseItem::Error(crate::utils::error::Error::Internal(
+                        "backend unavailable".into(),
+                    )),
                     "backend unavailable".into(),
-                )),
-            )
-            .await;
-            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-            assert!(body.contains("backend unavailable"), "{body}");
-        }
-    }
-
-    /// Attach uses the Python MessagePack field order, including null optional fields.
-    #[test]
-    fn attach_wire_matches_python_field_order_and_optional_values() {
-        for optional in [
-            None,
-            Some(("{\"path\":\"/tmp/cache\"}", "timeout", "write_through")),
-        ] {
-            let (config, prefetch, write) = optional.map_or((None, None, None), |(c, p, w)| {
-                (Some(c.to_owned()), Some(p.to_owned()), Some(w.to_owned()))
-            });
-            let request =
-                ControlRequest::AttachHiCacheStorageReqInput(AttachHiCacheStorageReqInput::new(
-                    "attach-test".into(),
-                    "file".into(),
-                    config.clone(),
-                    prefetch.clone(),
-                    write.clone(),
-                ));
-            let actual: Value = rmp_serde::from_slice(&request.encode().unwrap()).unwrap();
-            assert_eq!(
-                actual,
-                json!([
-                    "AttachHiCacheStorageReqInput",
-                    "attach-test",
-                    null,
-                    "file",
-                    config,
-                    prefetch,
-                    write
-                ])
-            );
+                ),
+            ] {
+                let (status, body) =
+                    exchange(method, uri, input.clone(), tag, fields.clone(), response).await;
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(body.contains(&expected_error), "{body}");
+            }
         }
     }
 
@@ -470,13 +359,65 @@ mod tests {
         }
     }
 
+    /// Python accepts empty names and null options; backend validation belongs to the scheduler.
+    #[tokio::test]
+    async fn attach_preserves_empty_strings_and_accepts_null_options() {
+        for (body, fields) in [
+            (
+                json!({"hicache_storage_backend": ""}),
+                json!(["", null, null, null]),
+            ),
+            (
+                json!({
+                    "hicache_storage_backend": "file",
+                    "hicache_storage_backend_extra_config_json": null,
+                    "hicache_storage_prefetch_policy": null,
+                    "hicache_write_policy": null,
+                }),
+                json!(["file", null, null, null]),
+            ),
+            (
+                json!({
+                    "hicache_storage_backend": "file",
+                    "hicache_storage_backend_extra_config_json": "",
+                    "hicache_storage_prefetch_policy": "",
+                    "hicache_write_policy": "",
+                }),
+                json!(["file", "", "", ""]),
+            ),
+        ] {
+            assert_eq!(
+                exchange(
+                    "PUT",
+                    "/hicache/storage-backend",
+                    body,
+                    "AttachHiCacheStorageReqInput",
+                    fields,
+                    reply(json!({"success": true}))
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+    }
+
     /// Empty bodies, invalid JSON, and missing backend fields fail before scheduler submission.
     #[tokio::test]
     async fn attach_rejects_invalid_body_before_scheduler_submission() {
         for (body, expected_error) in [
-            ("", "Request body is required.\n"),
-            ("{", "Invalid attach request:"),
+            ("", "EOF while parsing"),
+            ("{", "EOF while parsing"),
             ("{}", "missing field `hicache_storage_backend`"),
+            (
+                r#"{"hicache_storage_backend":null}"#,
+                "missing field `hicache_storage_backend`",
+            ),
+            (r#"{"hicache_storage_backend":1}"#, "invalid type"),
+            (
+                r#"{"hicache_storage_backend":"file","hicache_write_policy":{}}"#,
+                "invalid type",
+            ),
         ] {
             let (router, intake) = app();
             let response = tokio::time::timeout(
@@ -513,16 +454,15 @@ mod tests {
     async fn get_status_returns_python_configuration_fields() {
         let (router, _intake) = app();
         let body = read_status(&router).await;
-        let fields = body.as_object().expect("status must be a JSON object");
-        assert_eq!(fields.len(), 4);
-        for name in [
-            "hicache_storage_backend",
-            "hicache_storage_backend_extra_config",
-            "hicache_storage_prefetch_policy",
-            "hicache_write_policy",
-        ] {
-            assert!(fields.contains_key(name), "missing {name}");
-        }
+        assert_eq!(
+            body,
+            json!({
+                "hicache_storage_backend": null,
+                "hicache_storage_backend_extra_config": null,
+                "hicache_storage_prefetch_policy": null,
+                "hicache_write_policy": null,
+            })
+        );
     }
 
     /// Only successful attach/detach operations update GET. Omitted options and

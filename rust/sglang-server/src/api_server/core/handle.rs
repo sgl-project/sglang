@@ -10,7 +10,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
+use sglang_api_types::api::v1 as api;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
@@ -45,13 +46,7 @@ pub(crate) struct CoreConfig {
 }
 
 /// HiCache configuration returned by `GET /hicache/storage-backend`.
-#[derive(Clone, Debug, Default, serde::Serialize)]
-pub(crate) struct HiCacheStatus {
-    hicache_storage_backend: Option<String>,
-    hicache_storage_backend_extra_config: Option<String>,
-    hicache_storage_prefetch_policy: Option<String>,
-    hicache_write_policy: Option<String>,
-}
+pub(crate) type HiCacheStatus = api::HiCacheStatus;
 
 impl From<&ServerArgs> for HiCacheStatus {
     fn from(args: &ServerArgs) -> Self {
@@ -122,7 +117,7 @@ struct CoreInner {
     is_disaggregation: bool,
     mm_limits: BTreeMap<String, usize>,
     metadata: CoreMetadata,
-    hicache: Mutex<HiCacheStatus>,
+    hicache: RwLock<HiCacheStatus>,
 }
 
 impl CoreHandle {
@@ -140,7 +135,7 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
-                hicache: Mutex::new(config.hicache),
+                hicache: RwLock::new(config.hicache),
                 metadata: config.metadata,
             }),
         }
@@ -289,7 +284,7 @@ impl CoreHandle {
     }
 
     pub(crate) async fn hicache_status(&self) -> HiCacheStatus {
-        self.inner.hicache.lock().await.clone()
+        self.inner.hicache.read().await.clone()
     }
 
     pub(crate) async fn clear_hicache_storage(&self) -> Result<ClearHiCacheOutput, CoreError> {
@@ -304,7 +299,7 @@ impl CoreHandle {
     }
 
     pub(crate) async fn detach_hicache_storage(&self) -> Result<DetachHiCacheOutput, CoreError> {
-        let mut config = self.inner.hicache.lock().await;
+        let mut config = self.inner.hicache.write().await;
         let bytes = self
             .control(ControlRequest::DetachHiCacheStorageReqInput(
                 DetachHiCacheStorageReqInput::new(Rid::new().to_string()),
@@ -322,20 +317,20 @@ impl CoreHandle {
 
     pub(crate) async fn attach_hicache_storage(
         &self,
-        hicache_storage_backend: String,
-        hicache_storage_backend_extra_config_json: Option<String>,
-        hicache_storage_prefetch_policy: Option<String>,
-        hicache_write_policy: Option<String>,
+        body: api::AttachHiCacheStorageRequest,
     ) -> Result<AttachHiCacheOutput, CoreError> {
-        let mut config = self.inner.hicache.lock().await;
+        let backend = body.hicache_storage_backend.as_ref().ok_or_else(|| {
+            CoreError::InvalidArgument("missing field `hicache_storage_backend`".into())
+        })?;
+        let mut config = self.inner.hicache.write().await;
         let bytes = self
             .control(ControlRequest::AttachHiCacheStorageReqInput(
                 AttachHiCacheStorageReqInput::new(
                     Rid::new().to_string(),
-                    hicache_storage_backend.clone(),
-                    hicache_storage_backend_extra_config_json.clone(),
-                    hicache_storage_prefetch_policy.clone(),
-                    hicache_write_policy.clone(),
+                    backend.clone(),
+                    body.hicache_storage_backend_extra_config_json.clone(),
+                    body.hicache_storage_prefetch_policy.clone(),
+                    body.hicache_write_policy.clone(),
                 ),
             ))
             .await?;
@@ -343,14 +338,14 @@ impl CoreHandle {
             CoreError::InvalidResponse(format!("invalid HiCache attach response: {error}"))
         })?;
         if output.success {
-            config.hicache_storage_backend = Some(hicache_storage_backend);
-            if let Some(value) = hicache_storage_backend_extra_config_json {
+            config.hicache_storage_backend = body.hicache_storage_backend;
+            if let Some(value) = body.hicache_storage_backend_extra_config_json {
                 config.hicache_storage_backend_extra_config = Some(value);
             }
-            if let Some(value) = hicache_storage_prefetch_policy {
+            if let Some(value) = body.hicache_storage_prefetch_policy {
                 config.hicache_storage_prefetch_policy = Some(value);
             }
-            if let Some(value) = hicache_write_policy {
+            if let Some(value) = body.hicache_write_policy {
                 config.hicache_write_policy = Some(value);
             }
         }
@@ -1349,5 +1344,59 @@ mod tests {
             .unwrap();
         assert_eq!(task.await.unwrap().unwrap(), vec![1, 2]);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// GET snapshots share the read lock, while an in-flight attach excludes readers.
+    #[tokio::test]
+    async fn hicache_readers_wait_for_successful_configuration_update() {
+        let h = Harness::unbounded(8);
+        // Readers can share the lock, but a writer must wait for them to finish.
+        let reader = h.handle.inner.hicache.read().await;
+        assert!(h.handle.inner.hicache.try_read().is_ok());
+        assert!(h.handle.inner.hicache.try_write().is_err());
+        drop(reader);
+
+        // Run attach separately so this test can act as the scheduler.
+        let handle = h.handle.clone();
+        let attach = tokio::spawn(async move {
+            handle
+                .attach_hicache_storage(api::AttachHiCacheStorageRequest {
+                    hicache_storage_backend: Some("file".into()),
+                    ..Default::default()
+                })
+                .await
+        });
+        let TmEvent::Intake { request, admission } =
+            tokio::time::timeout(Duration::from_secs(5), h.intake_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected control intake");
+        };
+        assert!(admission.try_accept());
+        // Attach holds the write lock while waiting for the scheduler response.
+        assert!(h.handle.inner.hicache.try_read().is_err());
+        // Reply successfully so attach can update the configuration and release the lock.
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"success": true})).unwrap(),
+            )))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), attach)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Once attach completes, GET can read the updated configuration.
+        assert_eq!(
+            h.handle
+                .hicache_status()
+                .await
+                .hicache_storage_backend
+                .as_deref(),
+            Some("file")
+        );
     }
 }

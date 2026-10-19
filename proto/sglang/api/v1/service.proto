@@ -9,6 +9,7 @@ syntax = "proto3";
 package sglang.api.v1;
 
 import "sglang/api/v1/generate.proto";
+import "sglang/api/v1/hicache.proto";
 import "sglang/json/v1/options.proto";
 
 service SglangService {
@@ -27,6 +28,14 @@ service SglangService {
   // `/server_info`: one control round-trip, shaped through the runtime-metric
   // allowlist (never the raw server-args dump, which embeds keys).
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
+  // `/hicache/storage-backend`: configuration snapshot and runtime attach/detach.
+  rpc GetHiCacheStorage(GetHiCacheStorageRequest) returns (HiCacheStatus);
+  rpc AttachHiCacheStorage(AttachHiCacheStorageRequest) returns (HiCacheStorageResponse);
+  rpc DetachHiCacheStorage(DetachHiCacheStorageRequest) returns (HiCacheStorageResponse);
+
+  // `/hicache/storage-backend/clear`: clear the storage backend's cached entries.
+  rpc ClearHiCacheStorage(ClearHiCacheStorageRequest) returns (HiCacheStorageResponse);
 }
 
 message HealthCheckRequest {}
