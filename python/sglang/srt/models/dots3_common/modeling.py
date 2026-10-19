@@ -79,7 +79,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -484,14 +484,15 @@ class Dots3MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if fused_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        elif not self.experts.should_fuse_routed_scaling_factor_in_topk:
+        elif not fused_in_topk:
             final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states

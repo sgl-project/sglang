@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
@@ -23,7 +24,10 @@ def _set_dummy_server_args():
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
-def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
+@pytest.mark.parametrize("use_aiter", [False, True])
+def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch, use_aiter):
+    # Hash routing leaves scaling to the MoE epilogue, including on AITER.
+    monkeypatch.setattr(topk_module, "_use_aiter", use_aiter)
     monkeypatch.setattr(hash_topk_module, "_is_xpu", False)
     monkeypatch.setattr(
         hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
@@ -131,6 +135,7 @@ def test_deepep_empty_forward_does_not_append_shared_slot_twice():
         experts=FakeExperts(),
         alt_stream=None,
         routed_scaling_factor=1.0,
+        routed_scaling_factor_fused_in_topk=True,
     )
 
     hidden_states = torch.empty((0, 4), dtype=torch.float32)

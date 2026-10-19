@@ -59,7 +59,11 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKOutputFormat,
+    is_routed_scaling_factor_fused_in_topk,
+)
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
     is_shared_experts_fusion_disabled,
@@ -388,16 +392,16 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
 
+        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if fused_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                final_hidden_states *= self.routed_scaling_factor
+        elif not fused_in_topk:
+            final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 

@@ -182,5 +182,35 @@ def test_router_is_asked_for_the_total_width(monkeypatch, use_aiter):
     )
 
 
+@pytest.mark.parametrize("use_aiter", [True, False])
+def test_routed_weights_carry_the_factor_where_later_steps_skip_it(
+    monkeypatch, use_aiter
+):
+    """AITER routing must fold the scale even without shared slots."""
+    from sglang.srt.layers.moe import topk as topk_mod
+
+    monkeypatch.setenv("SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK", "1")
+    monkeypatch.setattr(topk_mod, "_use_aiter", use_aiter, raising=False)
+
+    hidden, bias, logits = _inputs(48)
+    weights, _ = topk_mod.biased_grouped_topk_gpu(
+        hidden_states=hidden,
+        gating_output=logits,
+        correction_bias=bias,
+        topk=TOPK_ROUTED,
+        renormalize=True,
+        num_expert_group=8,
+        topk_group=1,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=SCALE,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    want = SCALE if use_aiter else 1.0
+    torch.testing.assert_close(
+        weights.sum(-1), torch.full_like(weights[:, 0], want), rtol=1e-5, atol=1e-5
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

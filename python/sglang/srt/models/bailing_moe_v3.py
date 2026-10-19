@@ -47,7 +47,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.multi_gate import (
     create_multi_gate_mm_indices,
@@ -604,11 +604,11 @@ class BailingMoE(nn.Module):
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,
-        # so apply it here unless the selected runner fuses it into TopK weights.
+        # so apply it here unless top-k already folded it into the routed weights.
         # This scales only routed expert output; shared experts are added unscaled.
         self._apply_routed_scaling_factor_on_output = (
             self._enable_a2a_moe
-            and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            and not is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
             and self.routed_scaling_factor is not None
             and self.routed_scaling_factor != 1.0
         )
