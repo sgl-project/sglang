@@ -17,7 +17,9 @@ from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
+    fp8_grid_quantize,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
@@ -255,3 +257,22 @@ def wo_a_fp8_grid_matmul(
     if fp8_grid:
         return Fp8GridActivation(y)
     return y.view(o.shape[0], wo_a.shape[0], wo_a.shape[1])
+
+
+def wo_a_prefill_matmul(o: torch.Tensor, wo_a: torch.Tensor, emit_fp8: bool = False):
+    """Prefill wo_a as a token-major bmm (wo_b's layout, no flatten copy); with emit_fp8 it
+    returns wo_b's MXFP8 input. None in batch-invariant / deterministic mode."""
+    if (
+        is_batch_invariant_mode_enabled()
+        or get_exec().deterministic.enable_deterministic_inference
+        or not (o.dtype == wo_a.dtype == torch.bfloat16 and o.stride(2) == 1)
+    ):
+        return None
+    T, G, _ = o.shape
+    R = wo_a.shape[1]
+    y = torch.empty((T, G, R), dtype=o.dtype, device=o.device)
+    with torch.no_grad():
+        torch.bmm(o.transpose(0, 1), wo_a.transpose(1, 2), out=y.transpose(0, 1))
+    if emit_fp8:
+        return Mxfp8Activation(*fp8_grid_quantize(y.view(T, G * R)))
+    return y
