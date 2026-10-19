@@ -122,6 +122,11 @@ class WeightCacheDaemonArgs:
                     "heterogeneous transfer host/registry URL require an active mode"
                 )
             return
+        if self.gpu_id is not None or self.tp_rank is not None:
+            raise ValueError(
+                "weight heterogeneous transfer does not support single-rank launch "
+                "with --gpu-id or --tp-rank; omit these flags to launch all local ranks"
+            )
         if not self.weight_heterogeneous_transfer_host:
             raise ValueError("active heterogeneous transfer mode requires a host")
         if self.weight_heterogeneous_transfer_port <= 0:
@@ -550,6 +555,7 @@ class WeightCacheDaemon:
                     model=self.model,
                     device_uuid=self.device_uuid,
                     registry_url=self.weight_heterogeneous_transfer_registry_url,
+                    timeout=resolving_view(server_args).weight_cache_timeout,
                 )
             )
             logger.info(
@@ -1199,14 +1205,9 @@ if __name__ == "__main__":
 
     from sglang.srt.server_args import prepare_server_args
 
-    server_args = prepare_server_args(server_argv)
     daemon_args = WeightCacheDaemonArgs.from_cli_args(worker_ns)
+    server_args = prepare_server_args(server_argv)
     if daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
-        weight_manifest_server, registry_url = _prepare_weight_heterogeneous_transfer(
-            server_args,
-            daemon_args,
-            expected_rank_count=1,
-        )
         gpu_id = (
             daemon_args.gpu_id
             if daemon_args.gpu_id is not None
@@ -1219,22 +1220,14 @@ if __name__ == "__main__":
         )
         device_uuid = current_platform.get_device_uuid(gpu_id)
         cleanup_stale_daemon_files(device_uuid, force=daemon_args.force)
-        child_daemon_args = dataclasses.replace(
-            daemon_args,
-            weight_heterogeneous_transfer_registry_url=registry_url,
+        run_weight_cache_daemon(
+            server_args,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            pp_rank=daemon_args.pp_rank,
+            dist_init_method=daemon_args.dist_init_method,
+            daemon_args=daemon_args,
         )
-        try:
-            run_weight_cache_daemon(
-                server_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=daemon_args.pp_rank,
-                dist_init_method=daemon_args.dist_init_method,
-                daemon_args=child_daemon_args,
-            )
-        finally:
-            if weight_manifest_server is not None:
-                weight_manifest_server.close()
     else:
         launch_weight_cache_daemons(
             server_args,

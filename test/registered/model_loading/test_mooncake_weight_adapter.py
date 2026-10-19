@@ -940,8 +940,9 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                     model=MagicMock(),
                     device_uuid="GPU-shared",
                     registry_url="tcp://source:31999",
+                    timeout=1800,
                 )
-        fetch.assert_called_once_with("tcp://source:31999")
+        fetch.assert_called_once_with("tcp://source:31999", timeout=1800)
         pull.assert_not_called()
 
     def test_target_allows_distinct_device_uuid(self):
@@ -951,6 +952,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 model=MagicMock(),
                 device_uuid="GPU-target",
                 registry_url="tcp://source:31999",
+                timeout=1800,
             )
         pull.assert_called_once()
 

@@ -857,6 +857,7 @@ def transfer_weights_from_source_daemons(
     model: Any,
     device_uuid: str,
     registry_url: str,
+    timeout: float,
 ) -> dict[str, int]:
     """Complete a target copy using only the source and target daemons."""
     import torch.distributed as dist
@@ -866,7 +867,7 @@ def transfer_weights_from_source_daemons(
     if dist.get_rank() == 0:
         try:
             source_group_result[0] = {
-                "manifest": fetch_weight_manifest(registry_url),
+                "manifest": fetch_weight_manifest(registry_url, timeout=timeout),
                 "error": None,
             }
         except Exception as error:
