@@ -60,6 +60,7 @@ register_kernel(
         op="elementwise.row_sum",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.elementwise.row_sum:row_sum",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
