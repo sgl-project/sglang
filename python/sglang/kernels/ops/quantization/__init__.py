@@ -156,3 +156,13 @@ register_kernel(
         ),
     )
 )
+
+# act_quant also has a TileLang implementation (act_quant_tilelang, used on HIP);
+# KernelBackend has no TileLang provenance, so only the Triton one is inventoried.
+register_kernel(
+    KernelSpec(
+        op="quantization.act_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.act_quant_triton:act_quant",
+    )
+)
