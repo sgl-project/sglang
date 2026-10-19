@@ -2,6 +2,8 @@
 
 Same contract: the reduction order is fixed by the kernel (tl.sum's pairwise
 tree), not by the CUDA runtime version, so results are stable across toolkits.
+The match does not hold when K is a multiple of 16: Triton specializes such a K
+and splits each row across lanes. The router top-k it serves is 8.
 """
 
 from __future__ import annotations
