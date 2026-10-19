@@ -499,6 +499,10 @@ def _apply_wo_a_bf16_matmul(
         )
         and _hip.wo_a_split_k_allowed()
     )
+    if is_prefill and hip_fast_path:
+        y = _hip.wo_a_prefill_matmul(o, wo_a, emit_fp8=emit_fp8)
+        if y is not None:
+            return y
     if (
         (
             fast_path
