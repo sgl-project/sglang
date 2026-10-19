@@ -13,9 +13,9 @@ from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
-    UnifiedRadixCacheFixtures,
     build_fixture,
 )
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
 

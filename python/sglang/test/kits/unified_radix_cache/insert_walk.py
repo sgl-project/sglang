@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.fixtures import (
-    UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,
     node_children,
@@ -27,6 +26,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_host_lock_ref,
     node_parent,
 )
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 
 
 class ResumableInsertWalkSWAFixtures(UnifiedRadixCacheFixtures):

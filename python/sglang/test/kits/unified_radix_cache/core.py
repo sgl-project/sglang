@@ -31,11 +31,11 @@ from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
-    UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,
     node_device_value,
 )
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.mem_cache_utils import finish_req
 
 

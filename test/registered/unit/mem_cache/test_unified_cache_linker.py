@@ -46,12 +46,12 @@ from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
-    UnifiedRadixCacheFixtures,
     build_fixture,
     node_children,
     node_device_lock_ref,
     node_device_value,
 )
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

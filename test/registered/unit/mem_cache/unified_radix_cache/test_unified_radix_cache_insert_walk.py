@@ -41,7 +41,6 @@ from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
-    UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,
     node_children,
@@ -58,6 +57,7 @@ from sglang.test.kits.unified_radix_cache.insert_walk import (
     SegmentLockProtocolFixtures,
     StreamingSessionLockLifecycleFixtures,
 )
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")

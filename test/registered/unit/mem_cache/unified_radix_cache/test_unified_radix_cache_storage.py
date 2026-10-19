@@ -55,7 +55,6 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires_swa_only,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
-    UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,
     node_device_lock_ref,
@@ -65,6 +64,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_token_ids,
     write_backup,
 )
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.kits.unified_radix_cache.storage import (
     AnchorLockOutcomePolicyFixtures,
     ExtraPoolFullComponent,
