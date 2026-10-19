@@ -1137,11 +1137,13 @@ def mhc_pre(
             assert n_splits == 1
             if hc_hidden_size == 16384:
                 hidden_block = 256
-            elif hc_hidden_size == 28672:
+            elif hc_hidden_size in (20480, 28672):
+                # V4.1 hidden_size=5120, hc_mult=4. The existing split-K
+                # kernel supports this width with its 128-element K tile.
                 hidden_block = 128
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 20480, 28672}}, "
                     f"got {hc_hidden_size}"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
@@ -2233,6 +2235,20 @@ def _hc_mix_stats_partial_kernel(
 
 
 @triton.jit
+def _hc_mix_stats_partial_sm80_simt(X, FN, PM, PS):
+    """Experimental M1/K20480/MIX24: FP32 SIMT, 80 fixed K256 partials."""
+    s = tl.program_id(0)
+    n = tl.arange(0, 32)
+    k = s * 256 + tl.arange(0, 256)
+    x = tl.load(X + k).to(tl.float32)
+    fn = tl.load(FN + n[:, None] * 20480 + k[None, :], n[:, None] < 24, 0)
+    mix = tl.sum(fn * x[None, :], axis=1)
+    square = tl.sum(x * x, axis=0)
+    tl.store(PM + s * 24 + n, mix, n < 24)
+    tl.store(PS + s, square)
+
+
+@triton.jit
 def _hc_mix_stats_reduce_kernel(
     part_mix_ptr,
     part_sq_ptr,
@@ -2432,6 +2448,86 @@ def _hc_mix_reduce_sinkhorn_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
+@triton.jit
+def _hc_mix_reduce_sinkhorn_kernel_tile(
+    part_mix_ptr,
+    part_sq_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """Same arithmetic as ``_hc_mix_reduce_sinkhorn_kernel``, tiled over slices.
+
+    The production kernel walks the NUM_SLICES slices with one load per partial,
+    i.e. 4 * NUM_SLICES loads, and the sum-of-squares is a scalar load on a single
+    lane: at the live decode shape that is 320 loads, 80 of them 4-byte scalar
+    transactions, issued by one warp (num_warps=1 is the fastest of the sweep
+    because the (1, 24)-shaped vectors leave most lanes idle anyway).
+
+    This variant issues four loads in total - one (BLOCK_S, HC) tile for the pre
+    partial, one for post, one (BLOCK_S, HC*HC) tile for comb and one (BLOCK_S,)
+    vector for the sum of squares - and reduces each along the slice axis, so
+    every lane participates. The cost is that the slice-axis reduction becomes a
+    tree instead of the production kernel's sequential accumulation, which is a
+    different but equally valid FP32 summation order (typically the more accurate
+    one); the host only enables it behind an experimental flag and the numerics
+    are compared before use.
+    """
+    row = tl.program_id(0)
+    if row >= m:
+        return
+    s = tl.arange(0, BLOCK_S)
+    smask = s < NUM_SLICES
+    off = s * m + row
+    j = tl.arange(0, HC)
+    jj = j[:, None]
+    kk = j[None, :]
+    c16 = tl.arange(0, HC * HC)
+
+    v_pre = tl.load(part_mix_ptr + off[:, None] * MIX + j[None, :],
+                    mask=smask[:, None], other=0.0)
+    v_post = tl.load(part_mix_ptr + off[:, None] * MIX + HC + j[None, :],
+                     mask=smask[:, None], other=0.0)
+    v_comb = tl.load(part_mix_ptr + off[:, None] * MIX + 2 * HC + c16[None, :],
+                     mask=smask[:, None], other=0.0)
+    sq = tl.sum(tl.load(part_sq_ptr + off, mask=smask, other=0.0), axis=0)
+
+    a_pre = tl.sum(v_pre, axis=0)
+    a_post = tl.sum(v_post, axis=0)
+    a_comb = tl.reshape(tl.sum(v_comb, axis=0), (HC, HC))
+
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    tl.store(pre_ptr + row * HC + j, pre)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    tl.store(post_ptr + row * HC + j, post)
+
+    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
+    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
+
+
 def hc_mix_stats_sinkhorn(
     x_flat: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2465,24 +2561,47 @@ def hc_mix_stats_sinkhorn(
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
-    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
-        x_flat,
-        hc_fn,
-        part_mix,
-        part_sq,
-        m,
-        k,
-        x_flat.stride(0),
-        hc_fn.stride(0),
-        MIX=mix,
-        MIX_PAD=mix_pad,
-        NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
-        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_HC_MIX_NUM_STAGES,
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    sm80_simt = (
+        envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and envs.SGLANG_DSV41_SM80_MHC_SIMT_STATS.get() == "1"
+        and not is_batch_invariant_mode_enabled()
+        and not _is_hip
+        and torch.version.hip is None
+        and x_flat.is_cuda
+        and x_flat.dtype == torch.bfloat16
+        and hc_fn.dtype == torch.float32
+        and hc_fn.device == x_flat.device
+        and x_flat.is_contiguous()
+        and hc_fn.is_contiguous()
+        and (m, k, mix, hc_mult, num_slices) == (1, 20480, 24, 4, 80)
+        and torch.cuda.get_device_capability(x_flat.device) == (8, 0)
     )
+    if sm80_simt:
+        _hc_mix_stats_partial_sm80_simt[(80,)](
+            x_flat, hc_fn, part_mix, part_sq,
+            num_warps=8, enable_fp_fusion=False,
+        )
+    else:
+        _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
+            x_flat,
+            hc_fn,
+            part_mix,
+            part_sq,
+            m,
+            k,
+            x_flat.stride(0),
+            hc_fn.stride(0),
+            MIX=mix,
+            MIX_PAD=mix_pad,
+            NUM_SLICES=num_slices,
+            BLOCK_M=block_m,
+            BLOCK_K=_HC_MIX_BLOCK_K,
+            DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+            num_warps=_HC_MIX_NUM_WARPS,
+            num_stages=_HC_MIX_NUM_STAGES,
+        )
     if _is_hip:
         hc_mix_reduce_sinkhorn_vec(
             part_mix,
@@ -2499,6 +2618,36 @@ def hc_mix_stats_sinkhorn(
             num_slices=num_slices,
             sinkhorn_iters=sinkhorn_iters,
             hc_eps=hc_eps,
+        )
+        return pre, post, comb
+    if (
+        envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and envs.SGLANG_DSV41_SM80_MHC_REDUCE_TILE.get() == "1"
+        and not is_batch_invariant_mode_enabled()
+        and torch.version.hip is None
+        and x_flat.is_cuda
+        and x_flat.dtype == torch.bfloat16
+        and (m, k, mix, hc_mult, num_slices) == (1, 20480, 24, 4, 80)
+        and torch.cuda.get_device_capability(x_flat.device) == (8, 0)
+    ):
+        _hc_mix_reduce_sinkhorn_kernel_tile[(m,)](
+            part_mix,
+            part_sq,
+            hc_scale.float().contiguous(),
+            hc_base.float().contiguous(),
+            pre,
+            post,
+            comb,
+            m,
+            1.0 / k,
+            rms_eps,
+            MIX=mix,
+            HC=hc_mult,
+            NUM_SLICES=num_slices,
+            ITERS=sinkhorn_iters,
+            EPS=hc_eps,
+            BLOCK_S=triton.next_power_of_2(num_slices),
+            num_warps=4,
         )
         return pre, post, comb
     _hc_mix_reduce_sinkhorn_kernel[(m,)](

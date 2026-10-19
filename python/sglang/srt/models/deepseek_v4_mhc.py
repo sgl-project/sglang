@@ -289,13 +289,22 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     use_bf16_projection = bf16_parts is not None and (
         hopper_medium or 4096 <= x_flat.shape[0] <= 65536
     )
+    sm80_fused_stats = (
+        envs.SGLANG_DSV41_SM80_MHC_FUSED_STATS.get() == "1"
+        and envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and x.is_cuda
+        and torch.version.hip is None
+        and x_flat.shape == (1, 20480)
+        and cfg.mult == 4
+        and torch.cuda.get_device_capability(x.device) == (8, 0)
+    )
     hopper_fused_stats = get_platform().is_sm90 and (
         x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
     )
     # gfx950 uses the fused Triton port at every row count (MI350X).
     use_fused_stats = _is_gfx95_supported or (
         torch.version.cuda is not None
-        and (get_platform().is_blackwell or hopper_fused_stats)
+        and (get_platform().is_blackwell or hopper_fused_stats or sm80_fused_stats)
     )
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
@@ -411,6 +420,21 @@ def _combine(
         return norm(x[:, 0, :])
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
+    sm80_fused_combine = (
+        envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and envs.SGLANG_DSV41_SM80_MHC_COMBINE_NORM.get() == "1"
+        and not is_batch_invariant_mode_enabled()
+        and x.is_cuda
+        and torch.version.hip is None
+        and x.dtype == torch.bfloat16
+        and not quantize
+        and x_flat.shape == (1, 20480)
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and x_flat.is_contiguous()
+        and norm.weight.is_contiguous()
+        and torch.cuda.get_device_capability(x.device) == (8, 0)
+    )
     hopper_fused = (
         get_platform().is_sm90
         and not quantize
@@ -419,7 +443,7 @@ def _combine(
     )
     if (
         x.is_cuda
-        and (get_platform().is_blackwell or hopper_fused)
+        and (get_platform().is_blackwell or hopper_fused or sm80_fused_combine)
         and x.dtype == torch.bfloat16
         and apply_pre.stride(1) == 1
         and cfg.mult == 4
@@ -479,6 +503,33 @@ def post(
         from sglang.srt.models.deepseek_v4 import get_mhc_ops
 
         return get_mhc_ops().mhc_post(x, residual, post_mix, comb)
+
+    # Opt-in SM80 narrow-batch post-mix. The split-H Triton kernel is already
+    # used on Blackwell and on SM90 narrow batches but SM80 falls through to the
+    # one-CTA TileLang kernel, which runs the whole 4 x hidden update on a single
+    # SM (measured 5.99us vs 2.36us on A100, bitwise identical output at the real
+    # decode shape). Conditions are the ones the kernel actually needs: HC=4 is
+    # baked into its unrolled channel loop, and it indexes contiguous tensors.
+    if (
+        envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+        and envs.SGLANG_DSV41_SM80_MHC_POST_SPLIT_H.get() == "1"
+        and torch.version.hip is None
+        and x.is_cuda
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and 0 < x.shape[0] <= 8
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and residual.dtype == torch.bfloat16
+        and residual.shape == (x.shape[0], 4, 5120)
+        and residual.is_contiguous()
+        and post_mix.dtype == torch.float32
+        and post_mix.is_contiguous()
+        and comb.dtype == torch.float32
+        and comb.is_contiguous()
+        and torch.cuda.get_device_capability(x.device) == (8, 0)
+    ):
+        return mhc_post_split_h(x, residual, post_mix, comb)
 
     if (
         get_platform().is_blackwell

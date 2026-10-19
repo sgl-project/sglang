@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.dsv4.sm80_utils import is_dsv41_sm80_experimental
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
@@ -1071,6 +1072,10 @@ class MqaAttentionBase(nn.Module):
         )
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
+        if is_dsv41_sm80_experimental(
+            "deepseek_v41" if self.is_dsv41 else None, self.attn_sink.device
+        ):
+            return self.n_local_heads
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
@@ -2429,8 +2434,27 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        # 38 of this checkpoint's 40 layers have compress_ratio 1 or 2, and on
+        # SM80 they currently take neither overlap path: `enable_multi_stream`
+        # excludes ratios 1 and 2, and `low_ratio_multi_stream` is gated to
+        # Blackwell/gfx95. `_forward_prepare_low_ratio_multi_stream` is exactly
+        # the branch overlap the SM80 decode wants - it forks the K/V cache write
+        # and the indexer/compressor cache chain onto side streams while the Q
+        # chain runs on the current stream - and the work it moves is a set of
+        # kernels the single-stream path already runs. Extend it to SM80 behind
+        # an experimental flag so the default behaviour is untouched.
+        _low_ratio_multistream_sm80 = (
+            _is_cuda
+            and envs.SGLANG_DSV41_SM80_EXPERIMENTAL.get() == "1"
+            and envs.SGLANG_DSV41_SM80_LOW_RATIO_MULTISTREAM.get() == "1"
+            and torch.cuda.get_device_capability()[0] == 8
+        )
         low_ratio_multi_stream = (
-            ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
+            (
+                (_is_cuda and get_platform().is_blackwell)
+                or _is_gfx95_supported
+                or _low_ratio_multistream_sm80
+            )
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
             and (
@@ -3414,15 +3438,48 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         )
         transport = self.ffn_boundary.transport_context(forward_batch)
         with self.ffn_boundary.exit(forward_batch) as output:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                input_ids=transport.input_ids,
-                input_ids_global=transport.input_ids_global,
-                skip_shared_experts=transport.do_shared_local,
-                return_moe_output=transport.return_moe_output,
-                leave_output_sum=True,
-            )
+            if (
+                envs.SGLANG_DSV41_SM80_FFN_GRAPH.get() == "1"
+                and not transport.return_moe_output
+                and not transport._use_cp
+                and not transport._use_tp_moe_gather
+                and not transport._use_tp_attn_a2a_scatter
+                and not transport.do_shared_local
+                and forward_batch.forward_mode.is_decode()
+            ):
+                from sglang.srt.models.dsv41_sm80_segment_graph import (
+                    Dsv41Sm80FfnSegmentGraph,
+                )
+
+                if not hasattr(self, "_sm80_ffn_graph"):
+                    self._sm80_ffn_graph = Dsv41Sm80FfnSegmentGraph(
+                        self.config.model_type
+                    )
+                hidden_states = self._sm80_ffn_graph(
+                    lambda h, ids, ids_global: self.mlp(
+                        h,
+                        forward_batch,
+                        input_ids=ids,
+                        input_ids_global=ids_global,
+                        skip_shared_experts=False,
+                        return_moe_output=False,
+                        leave_output_sum=True,
+                    ),
+                    hidden_states,
+                    transport.input_ids,
+                    transport.input_ids_global,
+                    is_decode=True,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    input_ids=transport.input_ids,
+                    input_ids_global=transport.input_ids_global,
+                    skip_shared_experts=transport.do_shared_local,
+                    return_moe_output=transport.return_moe_output,
+                    leave_output_sum=True,
+                )
             return output.finish(hidden_states)
 
     @functools.cached_property

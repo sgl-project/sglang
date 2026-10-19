@@ -32,6 +32,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
     fused_k_norm_rope_uniform_fp8,
 )
+from sglang.kernels.ops.attention.dsv4.sm80_utils import is_dsv41_sm80_experimental
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -198,12 +199,26 @@ def resolve_compressed_kv_layout(
     return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
 
 
-def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
-    """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
-    family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
-    AITER attention."""
+def select_dsv4_kv_layout(
+    *, is_dsv41: bool = False, device=None
+) -> Tuple[KVLayout, Optional[str]]:
+    """Select a family pool's layout without broadening other models' policy.
+
+    The experimental SM80 adapter reads only V4.1 packed layouts; the normal
+    SM100 / SM103 FlashMLA and gfx950 AITER policy remains unchanged.
+    """
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if is_dsv41_sm80_experimental("deepseek_v41" if is_dsv41 else None, device):
+        if get_exec().kernel.dsv4_attn_backend == "trtllm":
+            raise ValueError("experimental DeepSeek-V4.1 SM80 does not support trtllm")
+        if envs.SGLANG_DSV4_KV_LAYOUT.is_set() and mode == "v4":
+            raise ValueError(
+                "experimental DeepSeek-V4.1 SM80 does not support explicit V4 "
+                "KV layout; unset SGLANG_DSV4_KV_LAYOUT or use auto/v41"
+            )
+        assert mode in ("v4", "v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
+        return KVLayout.V41, option
     if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
         mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":

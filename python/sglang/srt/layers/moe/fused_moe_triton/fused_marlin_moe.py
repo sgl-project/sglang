@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.sm80_utils import is_dsv41_sm80_experimental
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
@@ -116,7 +117,13 @@ def swiglu_limit_func(
     d = input.shape[1] // 2
     if (
         _is_cuda
-        and get_platform().is_sm90
+        and (
+            get_platform().is_sm90
+            or (
+                input.dtype == torch.bfloat16
+                and is_dsv41_sm80_experimental("deepseek_v41", input.device)
+            )
+        )
         and input.is_cuda
         and input.dtype in (torch.bfloat16, torch.float16)
         and d % 16 == 0
