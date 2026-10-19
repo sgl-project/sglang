@@ -1536,14 +1536,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            **(
-                dict(
-                    enable_mamba2_spec_replay=True,
-                    mamba2_replay_dtype=mamba2_replay_dtype,
-                )
-                if enable_mamba2_spec_replay
-                else {}
-            ),
+            enable_mamba2_spec_replay=enable_mamba2_spec_replay,
+            mamba2_replay_dtype=mamba2_replay_dtype,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1584,14 +1578,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            **(
-                dict(
-                    enable_mamba2_spec_replay=True,
-                    mamba2_replay_dtype=mamba2_replay_dtype,
-                )
-                if enable_mamba2_spec_replay
-                else {}
-            ),
+            enable_mamba2_spec_replay=enable_mamba2_spec_replay,
+            mamba2_replay_dtype=mamba2_replay_dtype,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

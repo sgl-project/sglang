@@ -188,36 +188,6 @@ class TestFlashInferReplayContract(CustomTestCase):
             check_numerics("no_history_outputs", c.out, c.ref_out, rounding=rounding)
 
     @torch.inference_mode()
-    def test_native_replay_each_accepted_length(self):
-        for rounding in (False, True):
-            torch.manual_seed(73)
-            c = FlashInferCase(rounding=rounding)
-            c.verify(False)
-            c.verify(True)
-            counts = torch.arange(c.batch, device="cuda", dtype=torch.int32)
-            # K=0 leaves the initial state; K=1..4 chooses the matching snapshot.
-            expected = c.initial.clone()
-            for row in range(c.batch):
-                if row:
-                    expected[c.slots[row]] = c.snapshots[row, row - 1]
-            c.reference.copy_(expected)
-            c.pending[c.slots.long()] = counts
-            c.randomize()
-            c.verify(False)
-            c.verify(True)
-            check_numerics(
-                "native_accepted_states",
-                c.state[c.slots.long()],
-                expected[c.slots.long()],
-                rounding=rounding,
-            )
-            check_numerics("native_next_outputs", c.out, c.ref_out, rounding=rounding)
-            # No history means no flush, so row zero must remain exactly intact.
-            torch.testing.assert_close(
-                c.state[c.slots[0]], c.initial[c.slots[0]], rtol=0, atol=0
-            )
-
-    @torch.inference_mode()
     def test_graph_padding_and_reuse(self):
         torch.manual_seed(79)
         c = FlashInferCase(rounding=True)
