@@ -717,9 +717,7 @@ class SchedulerMetricsReporter:
         Grafana down, so the previously published rate is left in place -
         mirroring the decode-path guard in report_decode_stats.
         """
-        cache_hit_rate = _prefill_cache_hit_rate(
-            effective_hit_tokens, total_tokens
-        )
+        cache_hit_rate = _prefill_cache_hit_rate(effective_hit_tokens, total_tokens)
         if cache_hit_rate is not None:
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -843,9 +841,7 @@ class SchedulerMetricsReporter:
                 total_tokens,
                 now,
             )
-            self._record_prefill_cache_hit_rate(
-                effective_hit_tokens, total_tokens
-            )
+            self._record_prefill_cache_hit_rate(effective_hit_tokens, total_tokens)
             self.metrics_collector.increment_effective_prefill_tokens(
                 input_tokens=effective_input_tokens,
                 device_hit_tokens=prefill_stats.log_device_hit_tokens,
